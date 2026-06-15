@@ -23,6 +23,15 @@ native-agent run \
   --reasoning-effort low
 ```
 
+Instead of the individual spec flags, you can pass the whole run spec as a JSON
+file (the `AgentRunSpec.to_json` shape — see [docs/CONTRACTS.md](docs/CONTRACTS.md)
+and `examples/run-spec.json`). Transport flags such as gateway URLs and tokens
+still apply:
+
+```bash
+native-agent run --spec examples/run-spec.json
+```
+
 The default mode is `propose`, which means the runner creates a proposal package
 without committing to tenant source-of-truth storage. Local CLI runs default to
 `--workspace-backend overlay`, so writes are staged in an overlay and emitted as

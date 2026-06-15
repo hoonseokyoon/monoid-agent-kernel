@@ -4,6 +4,7 @@ import json
 import os
 import time
 import base64
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +69,18 @@ def main() -> None:
 
 
 @main.command()
-@click.option("--workspace", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--spec",
+    "spec_file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help=(
+        "Load the full run spec from a JSON file (AgentRunSpec.to_json shape). "
+        "When set, individual spec flags are ignored; runtime flags "
+        "(gateway URLs/tokens, --event-sink-module, --stream-json, --no-status-file, --tool-module) still apply."
+    ),
+)
+@click.option("--workspace", type=click.Path(path_type=Path), default=None)
 @click.option("--instruction", type=str, default="")
 @click.option("--instruction-file", type=click.Path(path_type=Path), default=None)
 @click.option(
@@ -184,7 +196,8 @@ def main() -> None:
 @click.option("--no-status-file", is_flag=True, help="Disable status.json updates.")
 def run(
     *,
-    workspace: Path,
+    spec_file: Path | None,
+    workspace: Path | None,
     instruction: str,
     instruction_file: Path | None,
     model_provider: str,
@@ -239,82 +252,95 @@ def run(
     no_status_file: bool,
 ) -> None:
     """Run an agent against a local workspace."""
-    if instruction_file is not None:
-        instruction = instruction_file.read_text(encoding="utf-8")
-    if not instruction.strip():
-        raise click.ClickException("--instruction or --instruction-file is required")
+    if spec_file is not None:
+        if workspace is not None:
+            raise click.ClickException("--spec cannot be combined with --workspace; the spec file is authoritative")
+        try:
+            spec = AgentRunSpec.from_json(json.loads(spec_file.read_text(encoding="utf-8")))
+        except Exception as exc:
+            raise click.ClickException(f"failed to load --spec: {exc}") from exc
+        if run_id is not None:
+            spec = replace(spec, run_id=run_id)
+    else:
+        if workspace is None:
+            raise click.ClickException("--workspace (or --spec) is required")
+        if instruction_file is not None:
+            instruction = instruction_file.read_text(encoding="utf-8")
+        if not instruction.strip():
+            raise click.ClickException("--instruction or --instruction-file is required")
 
-    try:
-        tool_policy = _load_tool_policy(
-            tool_policy_file,
-            allow_tool=allow_tool,
-            deny_tool=deny_tool,
-            ask_tool=ask_tool,
-        )
-        permission_policy = _load_permission_policy(
-            permission_policy_file,
-            deny_path=deny_path,
-            redact_path=redact_path,
-        )
-        shell_policy = ShellPolicy().merged(
-            enabled=enable_shell,
-            approval_mode=shell_approval_mode,
-            timeout_s=shell_timeout_s,
-            max_output_bytes=shell_max_output_bytes,
-            execution_workspace=shell_execution_workspace,
-            env_allowlist=shell_env,
-        )
-        web_policy = _load_web_policy(
-            web_policy_file,
-            enabled=enable_web or enable_web_context,
-            context_enabled=True if enable_web_context else None,
-            allow_domains=web_allow_domain,
-            block_domains=web_block_domain,
-            max_searches=web_max_searches,
-            max_fetches=web_max_fetches,
-            max_contexts=web_max_contexts,
-            max_results=web_max_results,
-            max_context_tokens=web_context_max_tokens,
-            max_context_urls=web_context_max_urls,
-            max_context_snippets=web_context_max_snippets,
-            max_response_bytes=web_max_response_bytes,
-            timeout_s=web_timeout_s,
-        )
-    except Exception as exc:
-        raise click.ClickException(str(exc)) from exc
-    if web_policy.enabled and not web_gateway_url:
-        raise click.ClickException("--enable-web or --enable-web-context requires --web-gateway-url")
+        try:
+            tool_policy = _load_tool_policy(
+                tool_policy_file,
+                allow_tool=allow_tool,
+                deny_tool=deny_tool,
+                ask_tool=ask_tool,
+            )
+            permission_policy = _load_permission_policy(
+                permission_policy_file,
+                deny_path=deny_path,
+                redact_path=redact_path,
+            )
+            shell_policy = ShellPolicy().merged(
+                enabled=enable_shell,
+                approval_mode=shell_approval_mode,
+                timeout_s=shell_timeout_s,
+                max_output_bytes=shell_max_output_bytes,
+                execution_workspace=shell_execution_workspace,
+                env_allowlist=shell_env,
+            )
+            web_policy = _load_web_policy(
+                web_policy_file,
+                enabled=enable_web or enable_web_context,
+                context_enabled=True if enable_web_context else None,
+                allow_domains=web_allow_domain,
+                block_domains=web_block_domain,
+                max_searches=web_max_searches,
+                max_fetches=web_max_fetches,
+                max_contexts=web_max_contexts,
+                max_results=web_max_results,
+                max_context_tokens=web_context_max_tokens,
+                max_context_urls=web_context_max_urls,
+                max_context_snippets=web_context_max_snippets,
+                max_response_bytes=web_max_response_bytes,
+                timeout_s=web_timeout_s,
+            )
+        except Exception as exc:
+            raise click.ClickException(str(exc)) from exc
 
-    spec_kwargs: dict[str, Any] = {}
-    if run_id is not None:
-        spec_kwargs["run_id"] = run_id
-    spec = AgentRunSpec(
-        instruction=instruction,
-        workspace_root=workspace,
-        run_root=run_root,
-        mode=mode,  # type: ignore[arg-type]
-        workspace_backend=workspace_backend,  # type: ignore[arg-type]
-        model=ModelConfig(
-            provider=model_provider,  # type: ignore[arg-type]
-            model=model,
-            reasoning=ReasoningConfig(
-                effort=reasoning_effort,  # type: ignore[arg-type]
-                summary=reasoning_summary,  # type: ignore[arg-type]
+        spec_kwargs: dict[str, Any] = {}
+        if run_id is not None:
+            spec_kwargs["run_id"] = run_id
+        spec = AgentRunSpec(
+            instruction=instruction,
+            workspace_root=workspace,
+            run_root=run_root,
+            mode=mode,  # type: ignore[arg-type]
+            workspace_backend=workspace_backend,  # type: ignore[arg-type]
+            model=ModelConfig(
+                provider=model_provider,  # type: ignore[arg-type]
+                model=model,
+                reasoning=ReasoningConfig(
+                    effort=reasoning_effort,  # type: ignore[arg-type]
+                    summary=reasoning_summary,  # type: ignore[arg-type]
+                ),
+                gateway_url=llm_gateway_url,
             ),
-            gateway_url=llm_gateway_url,
-        ),
-        limits=RunLimits(
-            max_steps=max_steps,
-            max_tool_calls=max_tool_calls,
-            max_bytes_read=max_bytes_read,
-            max_duration_s=max_duration_s,
-        ),
-        permission_policy=permission_policy,
-        tool_policy=tool_policy,
-        shell_policy=shell_policy,
-        web_policy=web_policy,
-        **spec_kwargs,
-    )
+            limits=RunLimits(
+                max_steps=max_steps,
+                max_tool_calls=max_tool_calls,
+                max_bytes_read=max_bytes_read,
+                max_duration_s=max_duration_s,
+            ),
+            permission_policy=permission_policy,
+            tool_policy=tool_policy,
+            shell_policy=shell_policy,
+            web_policy=web_policy,
+            **spec_kwargs,
+        )
+
+    if spec.web_policy.enabled and not web_gateway_url:
+        raise click.ClickException("--enable-web or --enable-web-context requires --web-gateway-url")
     _human_echo(f"run_id: {spec.run_id}", stream_json=stream_json)
     _human_echo(f"run_dir: {spec.run_root / spec.run_id}", stream_json=stream_json)
 
@@ -332,7 +358,7 @@ def run(
         spec=spec,
         model_adapter=_model_adapter(
             spec.model,
-            llm_gateway_url=llm_gateway_url,
+            llm_gateway_url=llm_gateway_url or spec.model.gateway_url,
             llm_gateway_token_env=llm_gateway_token_env,
             llm_gateway_token_file=llm_gateway_token_file,
             allow_direct_provider_api=allow_direct_provider_api,
@@ -340,14 +366,14 @@ def run(
         tool_providers=providers,
         event_sinks=tuple(extra_sinks),
         status_file=not no_status_file,
-        permission_policy=permission_policy,
+        permission_policy=spec.permission_policy,
         web_gateway_client=(
             WebGatewayClient(
                 web_gateway_url,
                 token_env=web_gateway_token_env,
                 token_file=web_gateway_token_file,
             )
-            if web_policy.enabled and web_gateway_url
+            if spec.web_policy.enabled and web_gateway_url
             else None
         ),
     ).run()

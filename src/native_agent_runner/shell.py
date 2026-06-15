@@ -118,6 +118,24 @@ class ShellPolicy:
             command_rules=rules,
         ).validated()
 
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "approval_mode": self.approval_mode,
+            "shell": self.shell,
+            "default_timeout_s": self.default_timeout_s,
+            "max_timeout_s": self.max_timeout_s,
+            "default_startup_wait_s": self.default_startup_wait_s,
+            "max_startup_wait_s": self.max_startup_wait_s,
+            "default_max_output_bytes": self.default_max_output_bytes,
+            "max_output_bytes": self.max_output_bytes,
+            "cwd_root": self.cwd_root,
+            "execution_workspace": self.execution_workspace,
+            "env_allowlist": list(self.env_allowlist),
+            "inherit_env_allowlist": list(self.inherit_env_allowlist),
+            "command_rules": [rule.to_json() for rule in self.command_rules],
+        }
+
     def merged(
         self,
         *,

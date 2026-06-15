@@ -1,0 +1,14 @@
+{
+  "instruction": "Read notes.md and write a clearer summary to SUMMARY.md.",
+  "workspace_root": "examples/workspaces/edit_markdown_notes",
+  "run_root": "runs",
+  "mode": "propose",
+  "workspace_backend": "overlay",
+  "model": {
+    "provider": "gateway",
+    "model": "gpt-5.5",
+    "gateway_url": "http://127.0.0.1:8080/internal/llm/turns",
+    "reasoning": {"effort": "low"}
+  },
+  "limits": {"max_steps": 20}
+}

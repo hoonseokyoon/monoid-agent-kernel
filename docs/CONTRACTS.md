@@ -34,6 +34,26 @@ Import everything below from `native_agent_runner.contracts` (single stable surf
 - `AgentRunResult`, `AgentArtifact` (`core/result.py`) — `status` (`completed`|`failed`|`limited`),
   `final_text`, `run_dir`, `diff_path`, `proposal_path`, `artifacts`, `metrics`, `error`, `error_code`.
 
+**Spec serialization.** `AgentRunSpec.to_json()` / `AgentRunSpec.from_json(dict)` round-trip the entire run
+definition (model, limits, capabilities, and all four policies) as one JSON object — this is the portable spec
+contract. The CLI consumes it via `native-agent run --spec spec.json` (an alternative to the individual flags;
+transport flags such as gateway URLs and tokens still apply). Shape:
+
+```json
+{
+  "instruction": "...", "workspace_root": "/ws", "run_root": "runs", "run_id": "...",
+  "mode": "propose", "workspace_backend": "overlay",
+  "model": {"provider": "gateway", "model": "gpt-5.5", "gateway_url": "...",
+            "reasoning": {"effort": "medium", "summary": "off"}, "retry": {...}},
+  "limits": {"max_steps": 30, "max_tool_calls": 100, "max_bytes_read": 1000000, "max_duration_s": 900},
+  "capabilities": null,
+  "permission_policy": {...}, "tool_policy": {...}, "shell_policy": {...}, "web_policy": {...},
+  "metadata": {}
+}
+```
+Only `instruction` and `workspace_root` are required; everything else falls back to defaults. See
+`examples/run-spec.json`.
+
 ### 1.2 Model adapter contract
 
 Implement this to plug in any model/transport. `providers/base.py`:
