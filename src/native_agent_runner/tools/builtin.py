@@ -123,8 +123,8 @@ def _fs_tree(workspace: LocalWorkspaceBackend) -> ToolSpec:
 def _fs_stat(workspace: LocalWorkspaceBackend) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
-        rel, abs_path = workspace.resolve_existing_or_parent(path)
-        kind = workspace._effective_kind(rel, abs_path)
+        rel, _abs_path = workspace.resolve_existing_or_parent(path)
+        kind = workspace.path_kind(path)
         if kind is None:
             return ToolResult(ok=True, content={"path": rel, "exists": False})
         if kind == "file":

@@ -18,6 +18,11 @@ def utc_timestamp() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def sha256_bytes(data: bytes) -> str:
+    """SHA-256 hex digest of raw bytes."""
+    return hashlib.sha256(data).hexdigest()
+
+
 def canonical_sha256(payload: dict[str, Any], *, drop: tuple[str, ...] = ()) -> str:
     """SHA-256 hex digest of ``payload`` serialized as canonical JSON.
 

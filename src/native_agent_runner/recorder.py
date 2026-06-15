@@ -7,14 +7,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
-from native_agent_runner.core._util import canonical_sha256, write_json_atomic
+from native_agent_runner.core._util import canonical_sha256, sha256_bytes, write_json_atomic
 from native_agent_runner.core.events import AgentEvent, EventBus, EventSink, make_agent_event
 from native_agent_runner.core.manifest import RunManifest
 from native_agent_runner.core.result import AgentArtifact
-from native_agent_runner.workspace.local import sha256_bytes
 
 if TYPE_CHECKING:
-    from native_agent_runner.workspace.local import ChangedEntry, LocalWorkspaceBackend
+    from native_agent_runner.core.workspace import ChangedEntry
+    from native_agent_runner.workspace.local import LocalWorkspaceBackend
 
 
 @dataclass

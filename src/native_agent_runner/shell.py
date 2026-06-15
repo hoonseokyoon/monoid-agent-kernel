@@ -491,8 +491,8 @@ def validate_cwd(
 ) -> str:
     rel = normalize_workspace_path(cwd or ".")
     _check_shell_path_allowed(rel, permission_policy)
-    resolved_rel, abs_path = workspace.resolve_existing_or_parent(rel)
-    kind = workspace._effective_kind(resolved_rel, abs_path)
+    resolved_rel, _abs_path = workspace.resolve_existing_or_parent(rel)
+    kind = workspace.path_kind(rel)
     if kind != "dir":
         raise WorkspaceError(f"shell cwd is not a directory: {resolved_rel}")
     return resolved_rel

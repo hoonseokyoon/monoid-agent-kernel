@@ -2,47 +2,27 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
-import hashlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from native_agent_runner.core._util import utc_timestamp
+from native_agent_runner.core._util import sha256_bytes, utc_timestamp
 from native_agent_runner.core.spec import RunMode, WorkspaceBackendKind
+from native_agent_runner.core.workspace import ChangedEntry, FileEntry
 from native_agent_runner.errors import WorkspaceError
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
 
+# Re-exported from core so existing ``workspace.local`` import sites keep working.
+__all__ = ["ChangedEntry", "FileEntry", "LocalWorkspaceBackend", "sha256_bytes"]
+
 WORKSPACE_BASE_SCHEMA_VERSION = "native-agent-runner.workspace-base.v1"
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def _glob_matches(path: str, pattern: str) -> bool:
     if pattern in {"**", "**/*"}:
         return True
     return fnmatch.fnmatch(path, pattern)
-
-
-@dataclass
-class FileEntry:
-    path: str
-    kind: str
-    size: int = 0
-
-
-@dataclass(frozen=True)
-class ChangedEntry:
-    path: str
-    kind: str
-    size: int = 0
-    sha256: str | None = None
-    content: bytes | None = None
-    base_sha256: str | None = None
-    proposed_sha256: str | None = None
-    change_kind: str = "modified"
 
 
 @dataclass(frozen=True)
@@ -849,6 +829,15 @@ class LocalWorkspaceBackend:
         if rel in self._overlay:
             return self._overlay[rel]
         return self._read_disk_optional(rel)
+
+    def path_kind(self, path: str | None) -> str | None:
+        """Effective kind of a workspace path: ``"file"``, ``"dir"``, or ``None``.
+
+        Accounts for staged overlay/deletes, so it reflects the proposed state
+        rather than only what is on disk.
+        """
+        rel, abs_path = self.resolve_existing_or_parent(path)
+        return self._effective_kind(rel, abs_path)
 
     def _effective_kind(self, rel: str, abs_path: Path) -> str | None:
         if rel in self._overlay:

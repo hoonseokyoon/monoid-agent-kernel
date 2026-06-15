@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from native_agent_runner.core._util import utc_timestamp
-from native_agent_runner.workspace.local import LocalWorkspaceBackend, sha256_bytes
+from native_agent_runner.core._util import sha256_bytes, utc_timestamp
+from native_agent_runner.workspace.local import LocalWorkspaceBackend
 from native_agent_runner.workspace.paths import is_within
 
 WORKSPACE_INDEX_SCHEMA_VERSION = "native-agent-runner.workspace-index.v1"
