@@ -8,13 +8,19 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from native_agent_runner.core._util import sha256_bytes, utc_timestamp
-from native_agent_runner.core.spec import RunMode, WorkspaceBackendKind
-from native_agent_runner.core.workspace import ChangedEntry, FileEntry
+from native_agent_runner.core.spec import AgentRunSpec, RunMode, WorkspaceBackendKind
+from native_agent_runner.core.workspace import ChangedEntry, FileEntry, Workspace
 from native_agent_runner.errors import WorkspaceError
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
 
 # Re-exported from core so existing ``workspace.local`` import sites keep working.
-__all__ = ["ChangedEntry", "FileEntry", "LocalWorkspaceBackend", "sha256_bytes"]
+__all__ = [
+    "ChangedEntry",
+    "FileEntry",
+    "LocalWorkspaceBackend",
+    "default_local_workspace_factory",
+    "sha256_bytes",
+]
 
 WORKSPACE_BASE_SCHEMA_VERSION = "native-agent-runner.workspace-base.v1"
 
@@ -943,3 +949,17 @@ class LocalWorkspaceBackend:
                 lineterm="\n",
             )
         )
+
+
+def default_local_workspace_factory(spec: AgentRunSpec) -> Workspace:
+    """Build the default local-filesystem workspace from a run spec.
+
+    This is ``AgentLoop.workspace_factory``'s default; integrators can supply
+    their own factory to back the engine with a different workspace.
+    """
+    return LocalWorkspaceBackend(
+        spec.workspace_root,
+        mode=spec.mode,
+        max_bytes_read=spec.limits.max_bytes_read,
+        backend_kind=spec.workspace_backend,
+    )

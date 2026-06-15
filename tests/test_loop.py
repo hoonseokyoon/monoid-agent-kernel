@@ -11,7 +11,7 @@ from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.shell import ShellPolicy
 from native_agent_runner.tools.policy import ToolPolicy
-from native_agent_runner.workspace.local import sha256_bytes
+from native_agent_runner.workspace.local import default_local_workspace_factory, sha256_bytes
 
 
 def _python_command(code: str) -> str:
@@ -144,6 +144,36 @@ def test_loop_staging_backend_writes_to_staging_workspace_and_records_proposal(t
     metrics = json.loads(result.run_dir.joinpath("metrics.json").read_text(encoding="utf-8"))
     assert metrics["workspace_backend"] == "staging"
     assert validate_run_dir(result.run_dir) == []
+
+
+def test_loop_uses_injected_workspace_factory(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("data\n", encoding="utf-8")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "done"}, "call_finish"),),
+            ),
+        ]
+    )
+    spec = AgentRunSpec(
+        instruction="noop",
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+        mode="propose",
+    )
+    seen: list[AgentRunSpec] = []
+
+    def factory(run_spec: AgentRunSpec):
+        seen.append(run_spec)
+        return default_local_workspace_factory(run_spec)
+
+    result = AgentLoop(spec=spec, model_adapter=adapter, workspace_factory=factory).run()
+
+    assert result.status == "completed"
+    assert seen == [spec]
 
 
 def test_validate_run_dir_rejects_malformed_transcript(tmp_path: Path) -> None:

@@ -53,7 +53,7 @@ from native_agent_runner.web import (
     public_url_preview,
 )
 from native_agent_runner.core.workspace import Workspace
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from native_agent_runner.workspace.local import default_local_workspace_factory
 
 
 SYSTEM_PROMPT = """You are a local workspace agent.
@@ -546,16 +546,13 @@ class AgentLoop:
     cancellation_token: CancellationToken | None = None
     shell_approval_provider: ShellApprovalProvider | None = None
     web_gateway_client: WebGatewayClient | None = None
+    workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
 
     def run(self) -> AgentRunResult:
         if self.permission_policy == PermissionPolicy() and self.spec.permission_policy != PermissionPolicy():
             self.permission_policy = self.spec.permission_policy
-        workspace = LocalWorkspaceBackend(
-            self.spec.workspace_root,
-            mode=self.spec.mode,
-            max_bytes_read=self.spec.limits.max_bytes_read,
-            backend_kind=self.spec.workspace_backend,
-        )
+        workspace_factory = self.workspace_factory or default_local_workspace_factory
+        workspace = workspace_factory(self.spec)
         recorder = AgentRecorder(
             self.spec.run_root,
             self.spec.run_id,
