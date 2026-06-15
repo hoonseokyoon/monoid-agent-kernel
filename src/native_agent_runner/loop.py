@@ -81,13 +81,6 @@ class AgentToolContext(ToolContext):
     shell_calls: int = 0
     failed_shell_calls: int = 0
     total_shell_duration_s: float = 0.0
-    background_jobs_started: int = 0
-    background_jobs_finished: int = 0
-    background_jobs_failed: int = 0
-    background_jobs_cancelled: int = 0
-    background_job_duration_s_total: float = 0.0
-    background_job_bytes_stdout: int = 0
-    background_job_bytes_stderr: int = 0
     web_search_calls: int = 0
     web_fetch_calls: int = 0
     web_context_calls: int = 0
@@ -233,7 +226,6 @@ class AgentToolContext(ToolContext):
                 )
                 raise
             self.shell_calls += 1
-            self.background_jobs_started += 1
             content = job.started_content(self.recorder.run_dir)
             self.recorder.emit(
                 "shell.exec.finished",
@@ -988,10 +980,22 @@ class AgentLoop:
                 "mode": context.workspace.mode,
             },
         )
+        self._emit_workspace_proposal(context, recorder)
+
+    def _emit_workspace_proposal(
+        self,
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        *,
+        turn_id: str | None = None,
+        parent_id: str | None = None,
+    ) -> None:
         diff_text = context.workspace.diff_patch()
         diff_path = recorder.write_diff(diff_text)
         recorder.emit(
             "workspace.diff.updated",
+            turn_id=turn_id,
+            parent_id=parent_id,
             data={
                 "path": str(diff_path.relative_to(recorder.run_dir)),
                 "bytes": len(diff_text.encode("utf-8")),
@@ -1001,6 +1005,8 @@ class AgentLoop:
         proposal_payload = recorder.write_proposal_snapshot(context.workspace, diff_path)
         recorder.emit(
             "workspace.proposal.updated",
+            turn_id=turn_id,
+            parent_id=parent_id,
             data=public_proposal_payload(proposal_payload, self.permission_policy),
         )
 
@@ -1251,25 +1257,7 @@ class AgentLoop:
                     "mode": context.workspace.mode,
                 },
             )
-            diff_text = context.workspace.diff_patch()
-            diff_path = recorder.write_diff(diff_text)
-            recorder.emit(
-                "workspace.diff.updated",
-                turn_id=turn_id,
-                parent_id=parent_id,
-                data={
-                    "path": str(diff_path.relative_to(recorder.run_dir)),
-                    "bytes": len(diff_text.encode("utf-8")),
-                    "changed_paths": [public_path(path, self.permission_policy) for path in context.workspace.changed_paths()],
-                },
-            )
-            proposal_payload = recorder.write_proposal_snapshot(context.workspace, diff_path)
-            recorder.emit(
-                "workspace.proposal.updated",
-                turn_id=turn_id,
-                parent_id=parent_id,
-                data=public_proposal_payload(proposal_payload, self.permission_policy),
-            )
+            self._emit_workspace_proposal(context, recorder, turn_id=turn_id, parent_id=parent_id)
         elif spec.side_effect == "read" and spec.path_args:
             recorder.emit(
                 "workspace.file.read",
@@ -1289,25 +1277,7 @@ class AgentLoop:
                     "mode": context.workspace.mode,
                 },
             )
-            diff_text = context.workspace.diff_patch()
-            diff_path = recorder.write_diff(diff_text)
-            recorder.emit(
-                "workspace.diff.updated",
-                turn_id=turn_id,
-                parent_id=parent_id,
-                data={
-                    "path": str(diff_path.relative_to(recorder.run_dir)),
-                    "bytes": len(diff_text.encode("utf-8")),
-                    "changed_paths": [public_path(path, self.permission_policy) for path in context.workspace.changed_paths()],
-                },
-            )
-            proposal_payload = recorder.write_proposal_snapshot(context.workspace, diff_path)
-            recorder.emit(
-                "workspace.proposal.updated",
-                turn_id=turn_id,
-                parent_id=parent_id,
-                data=public_proposal_payload(proposal_payload, self.permission_policy),
-            )
+            self._emit_workspace_proposal(context, recorder, turn_id=turn_id, parent_id=parent_id)
 
     def _check_permissions(
         self,
