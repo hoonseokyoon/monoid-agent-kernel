@@ -13,8 +13,7 @@ from native_agent_runner.core.manifest import RunManifest
 from native_agent_runner.core.result import AgentArtifact
 
 if TYPE_CHECKING:
-    from native_agent_runner.core.workspace import ChangedEntry
-    from native_agent_runner.workspace.local import LocalWorkspaceBackend
+    from native_agent_runner.core.workspace import ChangedEntry, Workspace
 
 
 @dataclass
@@ -227,7 +226,7 @@ class AgentRecorder:
         write_json_atomic(path, payload)
         return path
 
-    def write_proposal_snapshot(self, workspace: LocalWorkspaceBackend, diff_path: Path) -> dict[str, Any]:
+    def write_proposal_snapshot(self, workspace: Workspace, diff_path: Path) -> dict[str, Any]:
         proposal_path = self.run_dir / "proposal.json"
         files_dir = self.run_dir / "proposal" / "files"
         files_dir.mkdir(parents=True, exist_ok=True)

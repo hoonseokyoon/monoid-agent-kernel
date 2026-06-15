@@ -8,7 +8,12 @@ imports them back from here.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+from native_agent_runner.core.spec import RunMode, WorkspaceBackendKind
 
 
 @dataclass
@@ -28,3 +33,109 @@ class ChangedEntry:
     base_sha256: str | None = None
     proposed_sha256: str | None = None
     change_kind: str = "modified"
+
+
+class Workspace(Protocol):
+    """The workspace surface the agent engine depends on.
+
+    ``LocalWorkspaceBackend`` is the reference implementation; integrators may
+    supply their own via ``AgentLoop.workspace_factory``. This Protocol is for
+    static typing only (not ``@runtime_checkable``) — the engine never branches
+    on the concrete type.
+    """
+
+    root: Path
+    mode: RunMode
+    backend_kind: WorkspaceBackendKind
+    max_bytes_read: int
+
+    def normalize(self, path: str | None) -> str:
+        ...
+
+    def resolve_existing_or_parent(
+        self, path: str | None, *, for_write: bool = False
+    ) -> tuple[str, Path]:
+        ...
+
+    def path_kind(self, path: str | None) -> str | None:
+        ...
+
+    def exists(self, path: str | None) -> bool:
+        ...
+
+    def read_bytes(self, path: str | None, *, max_bytes: int | None = None) -> tuple[bytes, str]:
+        ...
+
+    def write_bytes(
+        self,
+        path: str | None,
+        data: bytes,
+        *,
+        create_dirs: bool = False,
+        expected_sha256: str | None = None,
+    ) -> str:
+        ...
+
+    def mkdir(self, path: str | None) -> str:
+        ...
+
+    def copy_path(
+        self,
+        source_path: str | None,
+        destination_path: str | None,
+        *,
+        overwrite: bool = False,
+        create_dirs: bool = False,
+        recursive: bool = False,
+        max_entries: int = 1000,
+        max_bytes: int = 50_000_000,
+    ) -> dict[str, int | str]:
+        ...
+
+    def move_path(
+        self,
+        source_path: str | None,
+        destination_path: str | None,
+        *,
+        overwrite: bool = False,
+        create_dirs: bool = False,
+        recursive: bool = False,
+        max_entries: int = 1000,
+        max_bytes: int = 50_000_000,
+    ) -> dict[str, int | str]:
+        ...
+
+    def delete_path(
+        self,
+        path: str | None,
+        *,
+        recursive: bool = False,
+        max_entries: int = 1000,
+        max_bytes: int = 50_000_000,
+    ) -> dict[str, int | str]:
+        ...
+
+    def list_entries(
+        self, path: str | None = ".", *, recursive: bool = False, max_entries: int = 200
+    ) -> list[FileEntry]:
+        ...
+
+    def glob(self, pattern: str, *, root: str | None = ".", max_matches: int = 200) -> list[str]:
+        ...
+
+    def text_files(
+        self, root: str | None = ".", *, file_glob: str | None = None, max_files: int = 500
+    ) -> Iterable[str]:
+        ...
+
+    def diff_patch(self) -> str:
+        ...
+
+    def changed_paths(self) -> list[str]:
+        ...
+
+    def changed_entries(self) -> list[ChangedEntry]:
+        ...
+
+    def workspace_base_payload(self, run_id: str) -> dict[str, Any]:
+        ...

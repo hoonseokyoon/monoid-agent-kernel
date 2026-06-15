@@ -21,7 +21,7 @@ from native_agent_runner.shell import (
     ResolvedShellExecutionWorkspace,
     ShellPolicy,
 )
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
 
 import native_agent_runner.shell as shell_runtime
@@ -160,7 +160,7 @@ class BackgroundJob:
 @dataclass
 class BackgroundJobManager:
     run_id: str
-    workspace: LocalWorkspaceBackend
+    workspace: Workspace
     recorder: AgentRecorder
     shell_policy: ShellPolicy
     permission_policy: PermissionPolicy

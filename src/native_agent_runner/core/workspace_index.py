@@ -5,14 +5,14 @@ from pathlib import Path
 from typing import Any
 
 from native_agent_runner.core._util import sha256_bytes, utc_timestamp
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.workspace.paths import is_within
 
 WORKSPACE_INDEX_SCHEMA_VERSION = "native-agent-runner.workspace-index.v1"
 
 
 def build_workspace_index(
-    workspace: LocalWorkspaceBackend,
+    workspace: Workspace,
     *,
     run_id: str,
     max_entries: int = 500,

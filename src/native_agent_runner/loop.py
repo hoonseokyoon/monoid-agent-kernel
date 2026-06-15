@@ -52,6 +52,7 @@ from native_agent_runner.web import (
     public_query_preview,
     public_url_preview,
 )
+from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.workspace.local import LocalWorkspaceBackend
 
 
@@ -64,7 +65,7 @@ Respect tool errors and permissions. Finish by calling run.finish with a concise
 @dataclass
 class AgentToolContext(ToolContext):
     run_id: str
-    workspace: LocalWorkspaceBackend
+    workspace: Workspace
     recorder: AgentRecorder
     job_manager: BackgroundJobManager
     final_text: str = ""

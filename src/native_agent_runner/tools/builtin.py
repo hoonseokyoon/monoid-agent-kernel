@@ -5,10 +5,10 @@ from typing import Any
 
 from native_agent_runner.errors import WorkspaceError
 from native_agent_runner.tools.base import ToolContext, ToolResult, ToolSpec
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from native_agent_runner.core.workspace import Workspace
 
 
-def builtin_tools(workspace: LocalWorkspaceBackend) -> list[ToolSpec]:
+def builtin_tools(workspace: Workspace) -> list[ToolSpec]:
     return [
         _fs_list(workspace),
         _fs_tree(workspace),
@@ -57,7 +57,7 @@ def _text_from_bytes(data: bytes, path: str) -> str:
         raise WorkspaceError(f"file is not utf-8 text: {path}") from exc
 
 
-def _fs_list(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_list(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         entries = workspace.list_entries(
             args.get("path", "."),
@@ -86,7 +86,7 @@ def _fs_list(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _fs_tree(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_tree(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = args.get("path", ".")
         depth = int(args.get("depth", 2))
@@ -120,7 +120,7 @@ def _fs_tree(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _fs_stat(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_stat(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
         rel, _abs_path = workspace.resolve_existing_or_parent(path)
@@ -151,7 +151,7 @@ def _fs_stat(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _fs_read(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_read(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
         max_bytes = int(args.get("max_bytes", workspace.max_bytes_read))
@@ -190,7 +190,7 @@ def _fs_read(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _fs_glob(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_glob(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         matches = workspace.glob(
             str(args["pattern"]),
@@ -217,7 +217,7 @@ def _fs_glob(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _text_search(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _text_search(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         pattern = str(args["pattern"])
         root = str(args.get("root", "."))
@@ -262,7 +262,7 @@ def _text_search(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _fs_write(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_write(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
         content = str(args["content"])
@@ -293,7 +293,7 @@ def _fs_write(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _fs_patch(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_patch(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
         data, digest = workspace.read_bytes(path)
@@ -352,7 +352,7 @@ def _fs_patch(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _fs_mkdir(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_mkdir(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = workspace.mkdir(str(args["path"]))
         return ToolResult(ok=True, content={"path": path})
@@ -383,7 +383,7 @@ def _file_operation_schema(required: list[str]) -> dict[str, Any]:
     )
 
 
-def _fs_copy(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_copy(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         result = workspace.copy_path(
             str(args["source_path"]),
@@ -407,7 +407,7 @@ def _fs_copy(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _fs_move(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_move(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         result = workspace.move_path(
             str(args["source_path"]),
@@ -431,7 +431,7 @@ def _fs_move(workspace: LocalWorkspaceBackend) -> ToolSpec:
     )
 
 
-def _fs_delete(workspace: LocalWorkspaceBackend) -> ToolSpec:
+def _fs_delete(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         result = workspace.delete_path(
             str(args["path"]),

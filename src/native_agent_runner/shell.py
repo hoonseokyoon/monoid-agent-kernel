@@ -16,7 +16,7 @@ from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
 
 if TYPE_CHECKING:
-    from native_agent_runner.workspace.local import LocalWorkspaceBackend
+    from native_agent_runner.core.workspace import Workspace
 
 ShellApprovalMode = Literal["backend", "auto-approve", "deny"]
 ShellKind = Literal["auto", "bash", "powershell"]
@@ -362,7 +362,7 @@ class _WorkspaceSnapshot:
 
 def execute_shell(
     *,
-    workspace: LocalWorkspaceBackend,
+    workspace: Workspace,
     policy: ShellPolicy,
     permission_policy: PermissionPolicy,
     command: str,
@@ -485,7 +485,7 @@ def _execution_result_from_proc(
 
 
 def validate_cwd(
-    workspace: LocalWorkspaceBackend,
+    workspace: Workspace,
     cwd: str,
     permission_policy: PermissionPolicy,
 ) -> str:
@@ -499,7 +499,7 @@ def validate_cwd(
 
 
 def materialize_workspace(
-    workspace: LocalWorkspaceBackend,
+    workspace: Workspace,
     target_root: Path,
     permission_policy: PermissionPolicy,
 ) -> _WorkspaceSnapshot:
@@ -544,7 +544,7 @@ def scan_materialized_workspace(
 
 
 def sync_workspace_changes(
-    workspace: LocalWorkspaceBackend,
+    workspace: Workspace,
     before: _WorkspaceSnapshot,
     after: _WorkspaceSnapshot,
 ) -> list[str]:
