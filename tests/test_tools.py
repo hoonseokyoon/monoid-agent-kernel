@@ -196,13 +196,13 @@ def test_tool_policy_matches_core_id_exported_name_and_glob(tmp_path: Path) -> N
     registry = _registry(workspace)
     capabilities = frozenset(
         {
-            "filesystem.read",
+            "fs.read",
             "text.search",
-            "artifact.emit",
+            "artifact.control",
             "run.control",
-            "filesystem.write",
-            "filesystem.patch",
-            "filesystem.mkdir",
+            "fs.write",
+            "fs.patch",
+            "fs.mkdir",
         }
     )
 
@@ -228,7 +228,7 @@ def test_tool_policy_matches_core_id_exported_name_and_glob(tmp_path: Path) -> N
 def test_tool_policy_precedence_and_allowlist_visibility(tmp_path: Path) -> None:
     workspace = LocalWorkspaceBackend(tmp_path)
     registry = _registry(workspace)
-    capabilities = frozenset({"filesystem.read", "filesystem.write", "run.control"})
+    capabilities = frozenset({"fs.read", "fs.write", "run.control"})
 
     view = registry.policy_view(
         ToolPolicy(
@@ -249,7 +249,7 @@ def test_tool_policy_read_only_hides_mutation_tools(tmp_path: Path) -> None:
     workspace = LocalWorkspaceBackend(tmp_path)
     registry = _registry(workspace)
 
-    view = registry.policy_view(ToolPolicy(), frozenset({"filesystem.read", "text.search", "run.control"}))
+    view = registry.policy_view(ToolPolicy(), frozenset({"fs.read", "text.search", "run.control"}))
 
     visible = {spec.id for spec in registry.visible_specs(view)}
     assert "fs.write" not in visible
@@ -262,7 +262,7 @@ def test_web_tools_are_capability_and_tool_policy_controlled(tmp_path: Path) -> 
     workspace = LocalWorkspaceBackend(tmp_path)
     registry = _registry(workspace)
 
-    disabled = registry.policy_view(ToolPolicy(), frozenset({"filesystem.read", "run.control"}))
+    disabled = registry.policy_view(ToolPolicy(), frozenset({"fs.read", "run.control"}))
     assert "web.search" not in {spec.id for spec in registry.visible_specs(disabled)}
     assert "web.context" not in {spec.id for spec in registry.visible_specs(disabled)}
     assert disabled.hidden_tools["web.search"] == "missing_capability"

@@ -23,7 +23,7 @@ def _tool() -> ToolSpec:
         id="fs.read",
         description="Read a file.",
         input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
-        capability="filesystem.read",
+        capability="fs.read",
         side_effect="read",
         handler=handler,
         path_args=("path",),

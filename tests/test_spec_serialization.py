@@ -39,7 +39,7 @@ def _populated_spec() -> AgentRunSpec:
             retry=ModelRetryConfig(max_attempts=5, retry_on=("gateway_timeout",)),
         ),
         limits=RunLimits(max_steps=7, max_tool_calls=11, max_bytes_read=123, max_duration_s=None),
-        capabilities=frozenset({"filesystem.read", "run.control"}),
+        capabilities=frozenset({"fs.read", "run.control"}),
         permission_policy=PermissionPolicy(deny_patterns=(".env",), redact_patterns=("*.key",)),
         tool_policy=ToolPolicy(allowed_tools=("fs.read",), denied_tools=("shell.exec",)),
         shell_policy=ShellPolicy(

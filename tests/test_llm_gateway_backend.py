@@ -47,7 +47,7 @@ def _payload(*, previous_turn_handle: str | None = None) -> dict:
                 "name": "fs_read",
                 "description": "Read file.",
                 "input_schema": {"type": "object"},
-                "capability": "filesystem.read",
+                "capability": "fs.read",
                 "side_effect": "read",
             }
         ],

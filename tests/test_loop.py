@@ -81,7 +81,7 @@ def test_loop_read_write_finish_happy_path(tmp_path: Path) -> None:
     assert manifest["model"] == "gpt-5.5"
     assert manifest["workspace_backend"] == "overlay"
     assert manifest["workspace_base_path"] == "workspace.base.json"
-    assert "filesystem.read" in manifest["capabilities"]
+    assert "fs.read" in manifest["capabilities"]
     assert manifest["tool_policy"]["visible_tools"]
     assert any(tool["id"] == "fs.write" for tool in manifest["tool_specs"])
     assert manifest["workspace_index_path"] == "workspace.index.json"

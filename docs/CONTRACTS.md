@@ -153,7 +153,7 @@ Source of truth: `providers/gateway.py` (`_payload`, `_parse_gateway_response`).
   "system_prompt": "...",
   "tools": [
     {"id": "fs.read", "name": "fs_read", "description": "...",
-     "input_schema": { /* JSON Schema */ }, "capability": "filesystem.read", "side_effect": "read"}
+     "input_schema": { /* JSON Schema */ }, "capability": "fs.read", "side_effect": "read"}
   ],
   "reasoning": {"effort": "medium", "summary": "auto"},   // omitted when default/off
   "instruction": "...",                                    // FIRST turn only

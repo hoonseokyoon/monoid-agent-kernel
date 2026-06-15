@@ -146,20 +146,20 @@ class RunLimits:
 
 def default_capabilities(mode: RunMode) -> frozenset[str]:
     base = {
-        "filesystem.read",
+        "fs.read",
         "text.search",
-        "artifact.emit",
+        "artifact.control",
         "run.control",
     }
     if mode in {"propose", "apply"}:
         base.update(
             {
-                "filesystem.write",
-                "filesystem.patch",
-                "filesystem.mkdir",
-                "filesystem.copy",
-                "filesystem.move",
-                "filesystem.delete",
+                "fs.write",
+                "fs.patch",
+                "fs.mkdir",
+                "fs.copy",
+                "fs.move",
+                "fs.delete",
             }
         )
     return frozenset(base)
