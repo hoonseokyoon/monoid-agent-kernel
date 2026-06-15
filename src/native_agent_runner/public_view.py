@@ -101,7 +101,7 @@ def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dic
 
 def preview_value(key: str, value: Any, policy: PermissionPolicy) -> Any:
     lowered = key.lower()
-    if _is_sensitive_key(lowered) or _looks_like_private_key(value):
+    if _is_content_field(lowered):
         return redacted_value(value)
     if lowered in {"path", "root", "cwd"} and isinstance(value, str) and policy.is_path_redacted(value):
         return redacted_value(value)
@@ -128,23 +128,8 @@ def redacted_value(value: Any) -> dict[str, Any]:
     return {"redacted": True, "type": type(value).__name__}
 
 
-def _is_sensitive_key(lowered_key: str) -> bool:
-    if lowered_key in {"content", "old", "new", "old_text", "new_text"}:
-        return True
-    return any(
-        fragment in lowered_key
-        for fragment in (
-            "token",
-            "secret",
-            "password",
-            "credential",
-            "authorization",
-            "api_key",
-            "apikey",
-            "private_key",
-        )
-    )
-
-
-def _looks_like_private_key(value: Any) -> bool:
-    return isinstance(value, str) and "PRIVATE KEY" in value.upper()
+def _is_content_field(lowered_key: str) -> bool:
+    # File-content fields are kept out of the public event stream; full content
+    # lives only in the private transcript/proposal artifacts. Secret redaction
+    # beyond this (and PermissionPolicy.redact_patterns) is the integrator's job.
+    return lowered_key in {"content", "old", "new", "old_text", "new_text"}

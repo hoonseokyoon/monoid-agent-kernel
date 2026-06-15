@@ -14,6 +14,7 @@ from native_agent_runner.loop import AgentLoop
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from native_agent_runner.public_view import args_preview
 from native_agent_runner.recorder import JsonlEventSink, MemoryEventSink, StatusJsonSink
 
 
@@ -168,6 +169,26 @@ def test_public_events_redact_tool_arguments_and_policy_redacted_paths(tmp_path:
     index_text = result.run_dir.joinpath("workspace.index.json").read_text(encoding="utf-8")
     assert ".env" in index_text
     assert "TOKEN=secret" not in index_text
+
+
+def test_args_preview_redacts_content_fields_only_not_secret_named_keys() -> None:
+    preview = args_preview(
+        {
+            "content": "file body",
+            "old_text": "before",
+            "api_key": "sk-secret",
+            "authorization": "Bearer xyz",
+            "note": "has PRIVATE KEY here",
+        },
+        PermissionPolicy(),
+    )
+    # (a) file-content fields stay redacted
+    assert preview["content"] == {"redacted": True, "type": "str", "bytes": len(b"file body")}
+    assert preview["old_text"]["redacted"] is True
+    # (b) removed: secret-named keys and PRIVATE-KEY values are NOT scrubbed by the core
+    assert preview["api_key"] == "sk-secret"
+    assert preview["authorization"] == "Bearer xyz"
+    assert preview["note"] == "has PRIVATE KEY here"
 
 
 def test_status_projection_redacts_paths_from_manifest_policy(tmp_path: Path) -> None:

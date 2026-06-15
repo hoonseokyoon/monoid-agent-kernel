@@ -85,6 +85,12 @@ events and status projection only; private run artifacts such as
 `transcript.jsonl`, `proposal.json`, and `proposal/files/` keep real paths and
 contents.
 
+Public events are not heuristically scrubbed for secrets. The runner keeps
+file-content fields out of the public stream and masks `redact_patterns` paths,
+but it does not guess at secret-bearing arguments by name. Redacting secrets that
+flow through tool arguments or shell commands is the integrating backend's
+responsibility — wrap or post-process the event stream via an `EventSink`.
+
 For machine-readable real-time progress:
 
 ```bash

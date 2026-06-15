@@ -117,6 +117,12 @@ class EventSink(Protocol):
   `debug`|`info`|`warning`|`error`.
 - Pass sinks via `AgentLoop(..., event_sinks=(...))`, or the CLI `--event-sink-module path.py:make_sink`.
 - Built-in sinks: `JsonlEventSink`, `MemoryEventSink`, `StatusJsonSink`, `StdoutJsonlSink`.
+- **Secret handling**: public events are *not* heuristically scrubbed for secrets. The core only keeps
+  file-content fields out of the public stream (full content lives in the private `transcript.jsonl` /
+  `proposal`) and masks paths matching `PermissionPolicy.redact_patterns`. Any other redaction —
+  secret-bearing tool arguments, tokens embedded in shell commands, etc. — is the integrator's
+  responsibility; `EventSink` is the seam to add it (wrap or post-process events before they leave
+  the trust boundary).
 
 ### 1.5 Policy contracts
 
