@@ -319,7 +319,7 @@ def test_openai_payload_uses_reasoning_effort() -> None:
             {
                 "system_prompt": "sys",
                 "tools": (),
-                "previous_response_id": None,
+                "previous_turn_handle": None,
                 "instruction": "hello",
                 "observations": (),
             },

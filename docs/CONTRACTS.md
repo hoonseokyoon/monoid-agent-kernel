@@ -64,14 +64,18 @@ class ModelAdapter(Protocol):
 ```
 
 - `ModelRequest`: `instruction`, `system_prompt`, `tools: tuple[ToolSpec, ...]`,
-  `previous_response_id: str | None`, `observations: tuple[ToolObservation, ...]`.
+  `previous_turn_handle: str | None`, `observations: tuple[ToolObservation, ...]`.
 - `ModelTurn`: `response_id`, `final_text`, `tool_calls: tuple[ToolCall, ...]`,
   `usage: dict[str, int]`, `raw`.
 - `ToolCall`: `id`, `name`, `arguments: dict`.
 - `ToolObservation`: `call_id`, `tool_name`, `output: dict`.
-- **Turn threading**: first turn sends `instruction` with `previous_response_id=None`. Subsequent
-  turns send `previous_response_id` (the prior `ModelTurn.response_id`) plus `observations` (tool
+- **Turn threading**: first turn sends `instruction` with `previous_turn_handle=None`. Subsequent
+  turns send `previous_turn_handle` (the prior `ModelTurn.response_id`) plus `observations` (tool
   results); `instruction` is omitted. The adapter is responsible for conversation continuity.
+  The provider-neutral `previous_turn_handle` is a rename of the former `previous_response_id`
+  (event/transcript `data` keys renamed in place under `native-agent-runner.event.v1`; no version
+  bump). `OpenAIModelAdapter` maps it to OpenAI's own `previous_response_id` wire field;
+  `GatewayModelAdapter` sends it as `previous_turn_handle`.
 - **Errors**: raise `ModelAdapterError` (`errors.py`) with `provider_error_code`, `retryable`,
   `http_status`. `ModelRetryConfig.retry_on` (a tuple of error codes) gates which codes the core
   retries; only `retryable=True` codes present in `retry_on` are retried with backoff.

@@ -180,11 +180,11 @@ TRANSCRIPT_RECORD_SCHEMA: dict[str, Any] = {
     "oneOf": [
         {
             "type": "object",
-            "required": ["kind", "step", "previous_response_id", "observations"],
+            "required": ["kind", "step", "previous_turn_handle", "observations"],
             "properties": {
                 "kind": {"const": "model_request"},
                 "step": {"type": "integer", "minimum": 1},
-                "previous_response_id": {"type": ["string", "null"]},
+                "previous_turn_handle": {"type": ["string", "null"]},
                 "observations": {"type": "array", "items": {"type": "object"}},
             },
             "additionalProperties": True,

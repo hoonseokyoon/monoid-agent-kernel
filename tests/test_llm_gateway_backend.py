@@ -69,7 +69,7 @@ def test_llm_gateway_validates_token_model_and_returns_opaque_turn_handle() -> N
 
         class Adapter:
             def next_turn(self, request):
-                seen_previous_ids.append(request.previous_response_id)
+                seen_previous_ids.append(request.previous_turn_handle)
                 if index == 0:
                     return ModelTurn(
                         response_id="provider_response_secret_1",

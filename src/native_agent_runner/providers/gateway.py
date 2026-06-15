@@ -132,8 +132,8 @@ class GatewayModelAdapter:
             payload.setdefault("reasoning", {})
             payload["reasoning"]["summary"] = reasoning.summary
 
-        if request.previous_response_id:
-            payload["previous_turn_handle"] = request.previous_response_id
+        if request.previous_turn_handle:
+            payload["previous_turn_handle"] = request.previous_turn_handle
             payload["observations"] = [
                 {
                     "call_id": observation.call_id,

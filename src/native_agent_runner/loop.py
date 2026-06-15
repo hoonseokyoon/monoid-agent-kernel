@@ -600,7 +600,7 @@ class AgentLoop:
         provider_error_code = ""
         provider_http_status: int | None = None
         final_text = ""
-        previous_response_id: str | None = None
+        previous_turn_handle: str | None = None
         pending_observations: tuple[ToolObservation, ...] = ()
         total_tool_calls = 0
         total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -652,20 +652,20 @@ class AgentLoop:
                 turn_started = recorder.emit(
                     "model.turn.started",
                     turn_id=turn_id,
-                    data={"step": step, "previous_response_id": previous_response_id},
+                    data={"step": step, "previous_turn_handle": previous_turn_handle},
                 )
                 request = ModelRequest(
                     instruction=self.spec.instruction,
                     system_prompt=SYSTEM_PROMPT,
                     tools=tuple(visible_tool_specs),
-                    previous_response_id=previous_response_id,
+                    previous_turn_handle=previous_turn_handle,
                     observations=pending_observations,
                 )
                 recorder.transcript(
                     {
                         "kind": "model_request",
                         "step": step,
-                        "previous_response_id": previous_response_id,
+                        "previous_turn_handle": previous_turn_handle,
                         "observations": [obs.__dict__ for obs in pending_observations],
                     }
                 )
@@ -696,7 +696,7 @@ class AgentLoop:
                     raise ModelAdapterError(str(exc)) from exc
                 self._check_run_boundary(deadline)
                 _accumulate_usage(total_usage, turn)
-                previous_response_id = turn.response_id or previous_response_id
+                previous_turn_handle = turn.response_id or previous_turn_handle
                 recorder.transcript(
                     {
                         "kind": "model_turn",

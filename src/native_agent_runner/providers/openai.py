@@ -58,8 +58,8 @@ class OpenAIModelAdapter:
             payload.setdefault("reasoning", {})
             payload["reasoning"]["summary"] = reasoning.summary
 
-        if request.previous_response_id:
-            payload["previous_response_id"] = request.previous_response_id
+        if request.previous_turn_handle:
+            payload["previous_response_id"] = request.previous_turn_handle
             payload["input"] = [_observation_input_item(observation) for observation in request.observations]
         else:
             payload["input"] = [{"role": "user", "content": request.instruction}]

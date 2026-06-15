@@ -45,7 +45,7 @@ def test_gateway_payload_is_provider_keyless_and_uses_opaque_turn_handle(tmp_pat
         instruction="Inspect files.",
         system_prompt="sys",
         tools=(_tool(),),
-        previous_response_id=None,
+        previous_turn_handle=None,
     )
 
     payload = adapter._payload(request)
@@ -64,7 +64,7 @@ def test_gateway_payload_is_provider_keyless_and_uses_opaque_turn_handle(tmp_pat
             instruction="ignored on followup",
             system_prompt="sys",
             tools=(_tool(),),
-            previous_response_id="opaque-turn-handle",
+            previous_turn_handle="opaque-turn-handle",
             observations=(ToolObservation("call_1", "fs_read", {"ok": True}),),
         )
     )

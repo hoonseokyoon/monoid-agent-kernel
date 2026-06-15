@@ -83,7 +83,7 @@ class LlmGatewayBackend:
                 instruction=request.instruction,
                 system_prompt=request.system_prompt,
                 tools=request.tools,
-                previous_response_id=provider_previous_response_id,
+                previous_turn_handle=provider_previous_response_id,
                 observations=request.observations,
             )
         )

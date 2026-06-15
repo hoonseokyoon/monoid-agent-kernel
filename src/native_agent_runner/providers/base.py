@@ -34,7 +34,7 @@ class ModelRequest:
     instruction: str
     system_prompt: str
     tools: tuple[ToolSpec, ...]
-    previous_response_id: str | None
+    previous_turn_handle: str | None
     observations: tuple[ToolObservation, ...] = ()
 
 
