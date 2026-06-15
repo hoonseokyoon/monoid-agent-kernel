@@ -101,9 +101,16 @@ Phase 6  모듈화 프로파일 (선택)     목표(1) 강화: 경량/중량 프
 
 ---
 
-## 4. Phase 2 — 계약 표면 정리 (C) 🟠 중리스크
+## 4. Phase 2 — 계약 표면 정리 (C) 🟠 중리스크 ✅ 완료
 
 목표(3)을 단단히. 통합자가 의존하는 표면을 건드리므로 **CONTRACTS.md 동시 갱신** 필수.
+
+> **완료(2026-06-16).** C1~C5 전부 구현·커밋. 결정: C2는 권고(b 단일 reducer)를 뒤집어
+> **(a) 타입별 `data` 스키마**로 진행(두 reader는 라이브 sink vs 사후 projection으로 시간 범위·
+> 출력 모양이 정당하게 달라 통합 대신 발생원에서 drift 차단). C1은 **버전 범프 없이 개명**
+> (event.v1 미동결). C4는 **옵션 A**(turn 프로토콜에 `is_background` 추가, wire 관통). 정정: C1은
+> core 데이터클래스 + 이벤트/transcript 키 두 표면 누수였고 OpenAI wire 키는 정당하므로 유지.
+> `proposal.*` 라이프사이클 이벤트는 loop가 아니라 cli/reference backend가 emit.
 
 | ID | 작업 | 위치 | 목표 | 리스크 |
 |----|------|------|------|--------|
@@ -113,8 +120,10 @@ Phase 6  모듈화 프로파일 (선택)     목표(1) 강화: 경량/중량 프
 | C4 | `OpenAIModelAdapter`의 `background_job` 문자열 스니핑 제거 → `ToolObservation` 플래그로 | `openai.py:78-91` | (2)(3) | 저 |
 | C5 | `_proposal_file_payload` 도메인 로직을 core로 (CLI·backend 중복 해소) | `cli.py:1270-1297` ↔ `service.py:380-417` | (3)(4) | 저 |
 
-**의사결정 필요:** C2는 (a) 스키마 검증 강화 vs (b) reducer 통합 중 택1. 권장은 **(b) 단일 reducer**
-— drift 원인을 구조적으로 제거하고, 그 위에 스키마는 점진 도입.
+**의사결정(확정):** C2는 **(a) 타입별 `data` 스키마** 채택. 당초 (b) 단일 reducer를 권고했으나,
+조사 결과 두 reader는 시간 범위(실행 중 라이브 vs 사후 재구성)와 출력 모양이 정당하게 달라 통합이
+가치보다 리스크가 커서 (a)로 뒤집음. `EVENT_DATA_SCHEMAS`(타입별)를 `validate_run_dir`에 배선해
+drift를 발생원에서 차단하고, 엄격도(`additionalProperties`)는 점진 적용.
 
 **완료 기준:** CONTRACTS.md와 코드 일치, 어댑터 3종 테스트 녹색, status/projection 출력 동일.
 
