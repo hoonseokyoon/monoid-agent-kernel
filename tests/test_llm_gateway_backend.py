@@ -9,12 +9,12 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from native_agent_runner.backend.http import create_backend_server
-from native_agent_runner.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.backend.tokens import TokenManager
+from native_agent_runner.reference.backend.http import create_backend_server
+from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
+from native_agent_runner.reference._shared.tokens import TokenManager
 from native_agent_runner.errors import ModelAdapterError, PermissionDenied
-from native_agent_runner.llm_gateway.http import create_llm_gateway_server
-from native_agent_runner.llm_gateway.service import LlmGatewayBackend
+from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
+from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
 from native_agent_runner.providers.base import ModelTurn, ToolCall
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 

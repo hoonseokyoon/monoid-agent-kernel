@@ -6,18 +6,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from native_agent_runner.errors import NativeAgentError, PermissionDenied
-from native_agent_runner.web import WebGatewayError
-from native_agent_runner.web_gateway.service import WebGatewayBackend
+from native_agent_runner.errors import ModelAdapterError, NativeAgentError, PermissionDenied
+from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
+from native_agent_runner.providers.gateway import (
+    GATEWAY_AUTH_ERROR,
+    GATEWAY_BAD_REQUEST,
+    GATEWAY_BAD_RESPONSE,
+    GATEWAY_SERVER_ERROR,
+)
 
 
-def make_web_gateway_handler(
-    gateway: WebGatewayBackend,
+def make_llm_gateway_handler(
+    gateway: LlmGatewayBackend,
     *,
     admin_token: str | None,
 ) -> type[BaseHTTPRequestHandler]:
-    class WebGatewayHttpHandler(BaseHTTPRequestHandler):
-        server_version = "NativeAgentRunnerWebGateway/0.9"
+    class LlmGatewayHttpHandler(BaseHTTPRequestHandler):
+        server_version = "NativeAgentRunnerLlmGateway/0.2"
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
@@ -26,7 +31,7 @@ def make_web_gateway_handler(
                     self._write_json({"ok": True})
                     return
                 parts = [part for part in parsed.path.split("/") if part]
-                if len(parts) == 5 and parts[:3] == ["internal", "web", "tenants"] and parts[4] == "usage":
+                if len(parts) == 5 and parts[:3] == ["internal", "llm", "tenants"] and parts[4] == "usage":
                     self._require_admin()
                     self._write_json(gateway.tenant_usage(parts[3]))
                     return
@@ -37,14 +42,8 @@ def make_web_gateway_handler(
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             try:
-                if parsed.path == "/internal/web/search":
-                    self._write_json(gateway.handle_search(self._bearer_token(), self._read_json()))
-                    return
-                if parsed.path == "/internal/web/fetch":
-                    self._write_json(gateway.handle_fetch(self._bearer_token(), self._read_json()))
-                    return
-                if parsed.path == "/internal/web/context":
-                    self._write_json(gateway.handle_context(self._bearer_token(), self._read_json()))
+                if parsed.path == "/internal/llm/turns":
+                    self._write_json(gateway.handle_turn(self._bearer_token(), self._read_json()))
                     return
                 self._write_error(HTTPStatus.NOT_FOUND, "not found")
             except Exception as exc:
@@ -80,35 +79,55 @@ def make_web_gateway_handler(
 
         def _write_exception(self, exc: Exception) -> None:
             if isinstance(exc, PermissionDenied):
-                self._write_error(HTTPStatus.UNAUTHORIZED, str(exc), error_code="web_auth_error")
-            elif isinstance(exc, WebGatewayError):
                 self._write_error(
-                    _status_for_web_error(exc),
+                    HTTPStatus.UNAUTHORIZED,
                     str(exc),
-                    error_code=exc.error_code,
+                    error_code=GATEWAY_AUTH_ERROR,
+                    retryable=False,
+                )
+            elif isinstance(exc, ModelAdapterError):
+                status = _model_error_status(exc)
+                self._write_error(
+                    status,
+                    str(exc),
+                    error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
+                    retryable=exc.retryable,
                 )
             elif isinstance(exc, ValueError):
-                self._write_error(HTTPStatus.BAD_REQUEST, str(exc), error_code="web_bad_request")
+                self._write_error(
+                    HTTPStatus.BAD_REQUEST,
+                    str(exc),
+                    error_code=GATEWAY_BAD_REQUEST,
+                    retryable=False,
+                )
             elif isinstance(exc, NativeAgentError):
                 self._write_error(
                     HTTPStatus.BAD_REQUEST,
                     str(exc),
-                    error_code=getattr(exc, "error_code", "web_bad_request"),
+                    error_code=getattr(exc, "error_code", GATEWAY_BAD_REQUEST),
+                    retryable=False,
                 )
             else:
-                self._write_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), error_code="web_server_error")
+                self._write_error(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    str(exc),
+                    error_code=GATEWAY_SERVER_ERROR,
+                    retryable=True,
+                )
 
         def _write_error(
             self,
             status: HTTPStatus,
             message: str,
             *,
-            error_code: str = "web_gateway_error",
+            error_code: str = GATEWAY_BAD_RESPONSE,
+            retryable: bool = False,
         ) -> None:
             self._write_json(
                 {
                     "error": message,
                     "error_code": error_code,
+                    "retryable": retryable,
                     "http_status": int(status),
                 },
                 status=status,
@@ -122,24 +141,23 @@ def make_web_gateway_handler(
             self.end_headers()
             self.wfile.write(body)
 
-    return WebGatewayHttpHandler
+    return LlmGatewayHttpHandler
 
 
-def _status_for_web_error(exc: WebGatewayError) -> HTTPStatus:
-    if exc.error_code == "web_policy_denied":
-        return HTTPStatus.FORBIDDEN
-    if exc.error_code == "web_not_found":
-        return HTTPStatus.NOT_FOUND
-    if exc.error_code.endswith("_limit_exceeded"):
-        return HTTPStatus.TOO_MANY_REQUESTS
-    return HTTPStatus.BAD_REQUEST
+def _model_error_status(exc: ModelAdapterError) -> HTTPStatus:
+    if exc.http_status is not None and 400 <= exc.http_status <= 599:
+        try:
+            return HTTPStatus(exc.http_status)
+        except ValueError:
+            pass
+    return HTTPStatus.SERVICE_UNAVAILABLE if exc.retryable else HTTPStatus.BAD_GATEWAY
 
 
-def create_web_gateway_server(
-    gateway: WebGatewayBackend,
+def create_llm_gateway_server(
+    gateway: LlmGatewayBackend,
     *,
     host: str,
     port: int,
     admin_token: str,
 ) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_web_gateway_handler(gateway, admin_token=admin_token))
+    return ThreadingHTTPServer((host, port), make_llm_gateway_handler(gateway, admin_token=admin_token))

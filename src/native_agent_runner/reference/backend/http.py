@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from native_agent_runner.backend.service import BackendRunRequest, RunnerBackend
+from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
 from native_agent_runner.errors import NativeAgentError, PermissionDenied
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.shell import ShellPolicy

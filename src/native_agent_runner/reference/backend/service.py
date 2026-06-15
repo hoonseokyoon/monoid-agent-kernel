@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from native_agent_runner.backend.tokens import TokenError, TokenManager
+from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.events import AgentEvent, EventSink
 from native_agent_runner.core.packages import (

@@ -11,9 +11,9 @@ from urllib.request import Request, urlopen
 import pytest
 from click.testing import CliRunner
 
-from native_agent_runner.backend.http import create_backend_server
-from native_agent_runner.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.backend.tokens import TokenManager
+from native_agent_runner.reference.backend.http import create_backend_server
+from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
+from native_agent_runner.reference._shared.tokens import TokenManager
 from native_agent_runner.cli import main
 from native_agent_runner.core.packages import (
     apply_package,

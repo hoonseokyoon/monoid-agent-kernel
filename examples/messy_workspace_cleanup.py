@@ -20,8 +20,8 @@ from urllib.request import Request, urlopen
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_ROOT / "src"))
 
-from native_agent_runner.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.backend.tokens import TokenClaims, TokenManager
+from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
+from native_agent_runner.reference._shared.tokens import TokenClaims, TokenManager
 from native_agent_runner.core.packages import (
     apply_package,
     create_approval,
@@ -30,8 +30,8 @@ from native_agent_runner.core.packages import (
     write_approval,
 )
 from native_agent_runner.core.spec import ModelConfig
-from native_agent_runner.llm_gateway.http import create_llm_gateway_server
-from native_agent_runner.llm_gateway.service import LlmGatewayBackend
+from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
+from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
 from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolCall
 from native_agent_runner.scenario_scoring import score_messy_workspace_result
 

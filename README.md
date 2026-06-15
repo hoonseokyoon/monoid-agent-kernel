@@ -4,6 +4,15 @@ Standalone API-backed agent harness for safe, structured file work in a local
 workspace. This research package intentionally has no dependency on CSP runtime
 modules. CSP integration is a later adapter layer.
 
+## Boundary: core vs reference
+
+The supported integration surface is the **core runner plus its contracts**, exposed from
+`native_agent_runner` and collected in `native_agent_runner.contracts`. The `backend`,
+`llm_gateway`, and `web_gateway` packages live under `native_agent_runner.reference` and are
+**example implementations** — the core never imports them, and real integrators are expected to
+build their own services against the contracts. See [docs/CONTRACTS.md](docs/CONTRACTS.md) for the
+Python and HTTP wire contracts.
+
 ## Run
 
 ```bash
@@ -108,7 +117,10 @@ native-agent job logs <job_id> --run <run_id> --stream stdout --tail-bytes 4096
 native-agent job cancel <job_id> --run <run_id>
 ```
 
-## Backend
+## Backend (reference)
+
+> Reference example (`native_agent_runner.reference.backend`). Not part of the supported public
+> surface — build your own backend against the contracts in [docs/CONTRACTS.md](docs/CONTRACTS.md).
 
 The standalone backend issues run tokens, starts runner jobs, and exposes status,
 result, event, and tenant usage APIs. It still uses the keyless gateway model
@@ -293,6 +305,10 @@ can be enforced.
 
 `OpenAIModelAdapter` is retained for local smoke tests. CLI use requires both
 `--model-provider openai` and `--allow-direct-provider-api`.
+
+To target your own LLM gateway, implement the `ModelAdapter` protocol or the
+`native-agent-runner.llm-turn.v1` HTTP contract documented in
+[docs/CONTRACTS.md](docs/CONTRACTS.md).
 
 ## Defaults
 

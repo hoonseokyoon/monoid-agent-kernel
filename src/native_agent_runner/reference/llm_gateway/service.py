@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from native_agent_runner.backend.tokens import TokenClaims, TokenError, TokenManager
+from native_agent_runner.reference._shared.tokens import TokenClaims, TokenError, TokenManager
 from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
 from native_agent_runner.errors import ModelAdapterError, PermissionDenied
 from native_agent_runner.providers.base import ModelAdapter, ModelRequest, ModelTurn, ToolObservation

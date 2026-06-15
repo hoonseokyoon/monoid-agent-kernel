@@ -9,9 +9,9 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from native_agent_runner.backend.http import create_backend_server
-from native_agent_runner.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.backend.tokens import TokenError, TokenManager
+from native_agent_runner.reference.backend.http import create_backend_server
+from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
+from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
 from native_agent_runner.errors import PermissionDenied
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.providers.base import ModelTurn

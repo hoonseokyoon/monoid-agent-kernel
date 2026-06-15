@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from native_agent_runner.backend.tokens import TokenClaims, TokenError, TokenManager
+from native_agent_runner.reference._shared.tokens import TokenClaims, TokenError, TokenManager
 from native_agent_runner.errors import PermissionDenied
 from native_agent_runner.web import (
     WebGatewayError,

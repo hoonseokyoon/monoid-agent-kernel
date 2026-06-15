@@ -9,9 +9,9 @@ from typing import Any
 
 import click
 
-from native_agent_runner.backend.http import create_backend_server
-from native_agent_runner.backend.service import RunnerBackend
-from native_agent_runner.backend.tokens import TokenManager
+from native_agent_runner.reference.backend.http import create_backend_server
+from native_agent_runner.reference.backend.service import RunnerBackend
+from native_agent_runner.reference._shared.tokens import TokenManager
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
@@ -37,8 +37,8 @@ from native_agent_runner.jobs import (
     read_job_log_text,
     request_job_cancel,
 )
-from native_agent_runner.llm_gateway.http import create_llm_gateway_server
-from native_agent_runner.llm_gateway.service import LlmGatewayBackend
+from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
+from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.providers.base import ModelAdapter
@@ -49,15 +49,15 @@ from native_agent_runner.shell import ShellPolicy
 from native_agent_runner.tools.policy import ToolPolicy
 from native_agent_runner.tool_loader import load_tool_provider
 from native_agent_runner.web import WebGatewayClient, WebPolicy
-from native_agent_runner.web_gateway.http import create_web_gateway_server
-from native_agent_runner.web_gateway.providers import (
+from native_agent_runner.reference.web_gateway.http import create_web_gateway_server
+from native_agent_runner.reference.web_gateway.providers import (
     BraveLlmContextProvider,
     BraveSearchProvider,
     CompositeWebProvider,
     HttpFetchProvider,
     SearchFetchContextProvider,
 )
-from native_agent_runner.web_gateway.service import FakeWebProvider, WebGatewayBackend
+from native_agent_runner.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from native_agent_runner.workspace.local import sha256_bytes
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
 
