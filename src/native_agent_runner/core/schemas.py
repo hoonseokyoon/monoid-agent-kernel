@@ -30,6 +30,232 @@ EVENT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+# Per-event-type `data` schemas. The envelope above covers everything except
+# `data`, which is the implicit contract the two consumers (recorder.StatusJsonSink
+# and core.projections) read. These schemas pin that contract per event type so
+# drift between producer (emit) and consumers is caught by validate_run_dir.
+#
+# Strictness is staged. Events whose payload is fully enumerable at the emit site
+# use `additionalProperties: False`. Events whose payload is assembled from
+# to_public_json()/snapshot/merged dicts (shell, web, approval, job, proposal
+# lifecycle, workspace snapshots) use `additionalProperties: True` and document
+# only the load-bearing keys; tightening them is a follow-up. `required` lists
+# only keys that are always emitted AND read by a consumer or otherwise essential.
+_STR: dict[str, Any] = {"type": "string"}
+_STR_NULL: dict[str, Any] = {"type": ["string", "null"]}
+_INT: dict[str, Any] = {"type": "integer"}
+_NUM: dict[str, Any] = {"type": "number"}
+_BOOL: dict[str, Any] = {"type": "boolean"}
+_OBJ: dict[str, Any] = {"type": "object"}
+_STR_ARRAY: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
+_OBJ_ARRAY: dict[str, Any] = {"type": "array", "items": {"type": "object"}}
+
+
+def _data_schema(
+    properties: dict[str, Any],
+    *,
+    required: tuple[str, ...] = (),
+    additional: bool = False,
+) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(required),
+        "additionalProperties": additional,
+    }
+
+
+EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
+    "run.started": _data_schema(
+        {
+            "workspace": _STR,
+            "run_dir": _STR,
+            "manifest_path": _STR,
+            "mode": _STR,
+            "workspace_backend": _STR,
+            "workspace_base_path": _STR,
+            "model_provider": _STR,
+            "model": _STR,
+            "reasoning_effort": _STR,
+            "visible_tools": _STR_ARRAY,
+        },
+        required=("mode", "workspace_backend", "model"),
+    ),
+    "run.finished": _data_schema(
+        {
+            "status": _STR,
+            "error": _STR,
+            "error_code": _STR,
+            "final_text": _STR,
+            "duration_s": _NUM,
+            "diff_path": _STR,
+            "proposal_path": _STR,
+            "metrics_path": _STR,
+        },
+        required=("status",),
+    ),
+    "run.failed": _data_schema(
+        {"error": _STR, "error_code": _STR, "type": _STR},
+        required=("error_code",),
+    ),
+    "run.waiting": _data_schema(
+        {"reason": _STR, "jobs": _OBJ_ARRAY},
+    ),
+    "run.resumed": _data_schema(
+        {"reason": _STR, "job_ids": _STR_ARRAY, "count": _INT},
+    ),
+    "model.turn.started": _data_schema(
+        {"step": _INT, "previous_turn_handle": _STR_NULL},
+        required=("step",),
+    ),
+    "model.turn.finished": _data_schema(
+        {
+            "step": _INT,
+            "response_id": _STR_NULL,
+            "tool_calls": _INT,
+            "has_final": _BOOL,
+            "usage": _OBJ,
+        },
+        required=("step",),
+    ),
+    "metrics.updated": _data_schema(
+        {
+            "step": _INT,
+            "tool_calls": _INT,
+            "input_tokens": _INT,
+            "output_tokens": _INT,
+            "total_tokens": _INT,
+            "web_search_calls": _INT,
+            "web_fetch_calls": _INT,
+            "web_context_calls": _INT,
+            "web_failed_calls": _INT,
+        },
+    ),
+    "tool.call.started": _data_schema(
+        {
+            "call_id": _STR,
+            "tool": _STR,
+            "capability": _STR_NULL,
+            "side_effect": _STR_NULL,
+            "paths": _STR_ARRAY,
+            "args_preview": _OBJ,
+        },
+        required=("call_id", "tool"),
+    ),
+    "tool.call.finished": _data_schema(
+        {"call_id": _STR, "tool": _STR, "ok": _BOOL, "error": _STR, "error_code": _STR},
+        required=("call_id", "tool", "ok"),
+    ),
+    "tool.call.failed": _data_schema(
+        {"call_id": _STR, "tool": _STR, "ok": _BOOL, "error": _STR, "error_code": _STR},
+        required=("call_id", "tool", "ok"),
+    ),
+    "tool.approval.requested": _data_schema({}, additional=True),
+    "tool.approval.approved": _data_schema({}, additional=True),
+    "tool.approval.denied": _data_schema({}, additional=True),
+    "shell.exec.started": _data_schema({}, additional=True),
+    "shell.exec.finished": _data_schema({}, additional=True),
+    "shell.exec.failed": _data_schema({}, additional=True),
+    "job.started": _data_schema({"job_id": _STR_NULL}, additional=True),
+    "job.output.updated": _data_schema({"job_id": _STR_NULL}, additional=True),
+    "job.finished": _data_schema({"job_id": _STR_NULL}, additional=True),
+    "job.timed_out": _data_schema({"job_id": _STR_NULL}, additional=True),
+    "job.cancelled": _data_schema({"job_id": _STR_NULL}, additional=True),
+    "job.output_limited": _data_schema({"job_id": _STR_NULL}, additional=True),
+    "job.failed": _data_schema({"job_id": _STR_NULL}, additional=True),
+    "web.search.started": _data_schema({}, additional=True),
+    "web.search.finished": _data_schema({}, additional=True),
+    "web.search.failed": _data_schema({}, additional=True),
+    "web.fetch.started": _data_schema({}, additional=True),
+    "web.fetch.finished": _data_schema({}, additional=True),
+    "web.fetch.failed": _data_schema({}, additional=True),
+    "web.context.started": _data_schema({}, additional=True),
+    "web.context.finished": _data_schema({}, additional=True),
+    "web.context.failed": _data_schema({}, additional=True),
+    "permission.denied": _data_schema(
+        {
+            "call_id": _STR,
+            "tool": _STR,
+            "requested_tool": _STR,
+            "error": _STR,
+            "error_code": _STR,
+            "policy_decision": _STR_NULL,
+            "policy_reason": _STR_NULL,
+        },
+        required=("tool",),
+    ),
+    "workspace.file.read": _data_schema(
+        {"tool": _STR, "paths": _STR_ARRAY},
+        required=("tool",),
+    ),
+    "workspace.file.changed": _data_schema(
+        {
+            "tool": _STR,
+            "job_id": _STR_NULL,
+            "paths": _STR_ARRAY,
+            "result": _OBJ,
+            "mode": _STR,
+        },
+        additional=True,
+    ),
+    "workspace.diff.updated": _data_schema(
+        {"path": _STR, "bytes": _INT, "changed_paths": _STR_ARRAY},
+    ),
+    "workspace.proposal.updated": _data_schema(
+        {"changed_paths": _STR_ARRAY, "proposal_hash": _STR_NULL, "diff_sha256": _STR_NULL},
+        additional=True,
+    ),
+    "proposal.ready": _data_schema(
+        {"proposal_hash": _STR_NULL, "diff_sha256": _STR_NULL, "changed_paths": _STR_ARRAY},
+    ),
+    "proposal.package.exported": _data_schema(
+        {"package_hash": _STR, "package_path": _STR},
+        required=("package_hash",),
+        additional=True,
+    ),
+    "proposal.approved": _data_schema(
+        {"approval_hash": _STR, "package_hash": _STR},
+        required=("approval_hash",),
+        additional=True,
+    ),
+    "proposal.rejected": _data_schema(
+        {"approval_hash": _STR, "package_hash": _STR},
+        required=("approval_hash",),
+        additional=True,
+    ),
+    "proposal.applied": _data_schema(
+        {
+            "status": _STR,
+            "approval_hash": _STR_NULL,
+            "package_hash": _STR_NULL,
+            "applied_paths": _STR_ARRAY,
+            "conflicts": _OBJ_ARRAY,
+        },
+        required=("status",),
+        additional=True,
+    ),
+    "proposal.conflict": _data_schema(
+        {
+            "status": _STR,
+            "approval_hash": _STR_NULL,
+            "package_hash": _STR_NULL,
+            "applied_paths": _STR_ARRAY,
+            "conflicts": _OBJ_ARRAY,
+        },
+        required=("status",),
+        additional=True,
+    ),
+    "proposal.stale": _data_schema({}, additional=True),
+    "artifact.emitted": _data_schema(
+        {"artifact_id": _STR, "path": _STR, "kind": _STR},
+        required=("artifact_id",),
+    ),
+    "plan.updated": _data_schema(
+        {"items": _OBJ_ARRAY},
+        required=("items",),
+    ),
+}
+
 MANIFEST_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": [
@@ -490,6 +716,7 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     events_path = run_dir / "events.jsonl"
     if events_path.exists():
         _validate_jsonl_file(events_path, EVENT_SCHEMA, issues)
+        _validate_event_data(events_path, issues)
     transcript_path = run_dir / "transcript.jsonl"
     if transcript_path.exists():
         _validate_jsonl_file(transcript_path, TRANSCRIPT_RECORD_SCHEMA, issues)
@@ -529,6 +756,27 @@ def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[Valida
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {exc.msg}"))
             continue
         _validate_object(payload, schema, issues, f"{path.name}:{index}")
+
+
+def _validate_event_data(path: Path, issues: list[ValidationIssue]) -> None:
+    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # envelope pass already reported malformed lines
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        schema = EVENT_DATA_SCHEMAS.get(event_type) if isinstance(event_type, str) else None
+        if schema is None:
+            issues.append(
+                ValidationIssue(f"{path.name}:{index}", f"no data schema for event type: {event_type!r}")
+            )
+            continue
+        data = event.get("data")
+        _validate_object(data if isinstance(data, dict) else {}, schema, issues, f"{path.name}:{index}.data")
 
 
 def _validate_manifest_workspace_index(run_dir: Path, issues: list[ValidationIssue]) -> None:

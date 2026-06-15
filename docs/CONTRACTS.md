@@ -119,6 +119,13 @@ class EventSink(Protocol):
   `event_id`, `seq`, `run_id`, `timestamp`, plus type/level/payload. `AgentEventType` enumerates all
   event kinds (run/model/tool/shell/job/web/workspace/proposal/...); `AgentEventLevel` is
   `debug`|`info`|`warning`|`error`.
+- **Per-type `data` contract**: the envelope is validated by `EVENT_SCHEMA`; each event type's
+  `data` payload is pinned by `EVENT_DATA_SCHEMAS` (`core/schemas.py`), keyed by `AgentEventType`.
+  `validate_run_dir` validates every event's `data` against its type schema (and flags any event
+  type with no schema). Stable events use `additionalProperties: false`; events whose payload is
+  assembled from `to_public_json()`/snapshots (shell/web/approval/job/proposal-lifecycle/workspace
+  snapshots) are `additionalProperties: true` and will be tightened over time. Consumers
+  (`StatusJsonSink`, `core.projections`) read this contracted shape.
 - Pass sinks via `AgentLoop(..., event_sinks=(...))`, or the CLI `--event-sink-module path.py:make_sink`.
 - Built-in sinks: `JsonlEventSink`, `MemoryEventSink`, `StatusJsonSink`, `StdoutJsonlSink`.
 - **Secret handling**: public events are *not* heuristically scrubbed for secrets. The core only keeps
