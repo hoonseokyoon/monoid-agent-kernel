@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
 from native_agent_runner.core.cancellation import CancellationToken
-from native_agent_runner.core.events import AgentEvent, EventSink
+from native_agent_runner.core.events import AgentEvent
 from native_agent_runner.core.packages import (
     apply_package,
     create_approval,
@@ -29,7 +29,7 @@ from native_agent_runner.core.spec import (
     RunMode,
     WorkspaceBackendKind,
 )
-from native_agent_runner.errors import NativeAgentError, PermissionDenied
+from native_agent_runner.errors import PermissionDenied
 from native_agent_runner.jobs import (
     get_job_artifact,
     list_job_artifacts,

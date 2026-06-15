@@ -132,14 +132,3 @@ class ToolRegistry:
     def visible_specs(self, policy: NormalizedToolPolicy) -> list[ToolSpec]:
         visible = set(policy.visible_tools)
         return [spec for spec in self.specs() if spec.id in visible]
-
-    def provider_schemas(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "name": spec.exported_name,
-                "description": spec.description,
-                "parameters": spec.input_schema,
-            }
-            for spec in self.specs()
-        ]

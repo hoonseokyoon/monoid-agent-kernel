@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.errors import ToolExecutionError, ToolPolicyError, WorkspaceError
+from native_agent_runner.errors import ToolPolicyError, WorkspaceError
 from native_agent_runner.tools.base import ToolRegistry
 from native_agent_runner.tools.builtin import builtin_tools
 from native_agent_runner.tools.policy import ToolPolicy

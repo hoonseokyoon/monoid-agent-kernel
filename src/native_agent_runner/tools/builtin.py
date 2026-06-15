@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fnmatch
-import json
 from typing import Any
 
 from native_agent_runner.errors import WorkspaceError

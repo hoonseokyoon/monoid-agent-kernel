@@ -3,13 +3,12 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.events import AgentEvent, EventSink
 from native_agent_runner.core.manifest import build_run_manifest
-from native_agent_runner.core.result import AgentArtifact, AgentRunResult
+from native_agent_runner.core.result import AgentRunResult
 from native_agent_runner.core.spec import AgentRunSpec
 from native_agent_runner.core.workspace_index import build_workspace_index
 from native_agent_runner.errors import (
