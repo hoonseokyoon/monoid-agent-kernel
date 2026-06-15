@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from native_agent_runner._proc import file_size, spawn_process, terminate_process
+from native_agent_runner.core._util import write_json_atomic
 from native_agent_runner.errors import ToolExecutionError, WorkspaceError
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.public_view import public_path
@@ -192,9 +193,9 @@ class BackgroundJobManager:
         if not command.strip():
             raise ToolExecutionError("shell command is required", error_code="shell_exec_error")
         self.shell_policy.check_command(command)
-        cwd_rel = shell_runtime._validate_cwd(self.workspace, cwd, self.permission_policy)
-        safe_env = shell_runtime._build_env(self.shell_policy, env)
-        argv = shell_runtime._shell_argv(self.shell_policy.effective_shell(), command)
+        cwd_rel = shell_runtime.validate_cwd(self.workspace, cwd, self.permission_policy)
+        safe_env = shell_runtime.build_env(self.shell_policy, env)
+        argv = shell_runtime.shell_argv(self.shell_policy.effective_shell(), command)
         cwd_abs, tmp_root, before_snapshot = self._prepare_workspace(cwd_rel, execution_workspace)
 
         job_id = f"job_{uuid.uuid4().hex[:12]}"
@@ -205,7 +206,7 @@ class BackgroundJobManager:
         job = BackgroundJob(
             job_id=job_id,
             command=command,
-            command_preview=shell_runtime._preview_command(command),
+            command_preview=shell_runtime.preview_command(command),
             cwd=cwd_rel,
             status="running",
             started_at=time.time(),
@@ -286,7 +287,7 @@ class BackgroundJobManager:
         with self._condition:
             if job.process is not None and job.status == "running":
                 job.status = "cancelled"
-                shell_runtime._terminate_process(job.process)
+                terminate_process(job.process)
             self._condition.notify_all()
         return {"job_id": job_id, "cancel_requested": True, "status": job.status}
 
@@ -366,7 +367,7 @@ class BackgroundJobManager:
             return cwd_abs, None, None
 
         tmp_root = Path(tempfile.mkdtemp(prefix="native-agent-shell-job-")).resolve()
-        before = shell_runtime._materialize_workspace(self.workspace, tmp_root, self.permission_policy)
+        before = shell_runtime.materialize_workspace(self.workspace, tmp_root, self.permission_policy)
         cwd_abs = (tmp_root / cwd_rel).resolve()
         if not is_within(tmp_root, cwd_abs):
             raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
@@ -379,8 +380,8 @@ class BackgroundJobManager:
         try:
             self._monitor_process(job)
             if job.execution_workspace == "isolated-copy" and job.status == "exited":
-                after = shell_runtime._scan_materialized_workspace(job.tmp_root, self.permission_policy)
-                changed = shell_runtime._sync_workspace_changes(self.workspace, job.before_snapshot, after)
+                after = shell_runtime.scan_materialized_workspace(job.tmp_root, self.permission_policy)
+                changed = shell_runtime.sync_workspace_changes(self.workspace, job.before_snapshot, after)
                 job.changed_paths = tuple(changed)
             elif job.execution_workspace == "direct":
                 job.changed_paths = tuple(self.workspace.changed_paths())
@@ -389,8 +390,8 @@ class BackgroundJobManager:
             job.error = str(exc)
             job.finished_at = time.time()
         finally:
-            job.stdout_bytes = _file_size(job.stdout_path)
-            job.stderr_bytes = _file_size(job.stderr_path)
+            job.stdout_bytes = file_size(job.stdout_path)
+            job.stderr_bytes = file_size(job.stderr_path)
             if job.finished_at is None:
                 job.finished_at = time.time()
             job.ready_for_reentry = True
@@ -410,22 +411,22 @@ class BackgroundJobManager:
             return
         while process.poll() is None:
             now = time.time()
-            stdout_bytes = _file_size(job.stdout_path)
-            stderr_bytes = _file_size(job.stderr_path)
+            stdout_bytes = file_size(job.stdout_path)
+            stderr_bytes = file_size(job.stderr_path)
             total_bytes = stdout_bytes + stderr_bytes
             if job.cancel_path.exists():
                 job.status = "cancelled"
-                shell_runtime._terminate_process(process)
+                terminate_process(process)
                 break
             if now - job.started_at >= job.timeout_s:
                 job.status = "timed_out"
                 job.timed_out = True
-                shell_runtime._terminate_process(process)
+                terminate_process(process)
                 break
             if total_bytes > job.max_output_bytes:
                 job.status = "output_limited"
                 job.output_truncated = True
-                shell_runtime._terminate_process(process)
+                terminate_process(process)
                 break
             if total_bytes != job._last_output_event_bytes and now - job._last_output_event_at >= 0.25:
                 job.stdout_bytes = stdout_bytes
@@ -442,8 +443,8 @@ class BackgroundJobManager:
             job.exit_code = process.wait(timeout=2)
         if job.status == "running":
             job.status = "exited"
-        job.stdout_bytes = _file_size(job.stdout_path)
-        job.stderr_bytes = _file_size(job.stderr_path)
+        job.stdout_bytes = file_size(job.stdout_path)
+        job.stderr_bytes = file_size(job.stderr_path)
         if job.stdout_bytes + job.stderr_bytes > job.max_output_bytes:
             job.output_truncated = True
             if job.status == "exited":
@@ -456,7 +457,7 @@ class BackgroundJobManager:
                 job = self.jobs[job_id]
                 if job.status != "running":
                     return
-                if _file_size(job.stdout_path) + _file_size(job.stderr_path) > 0:
+                if file_size(job.stdout_path) + file_size(job.stderr_path) > 0:
                     return
             time.sleep(0.02)
 
@@ -478,7 +479,7 @@ class BackgroundJobManager:
         return payload
 
     def _write_job(self, job: BackgroundJob) -> None:
-        _write_json_atomic(job.job_path, job.to_json(self.recorder.run_dir))
+        write_json_atomic(job.job_path, job.to_json(self.recorder.run_dir))
 
     def _cleanup_tmp(self, job: BackgroundJob) -> None:
         if job.tmp_root is not None:
@@ -569,39 +570,12 @@ def _spawn_process(
     stdout_path: Path,
     stderr_path: Path,
 ) -> subprocess.Popen[bytes]:
-    creationflags = 0
-    preexec_fn = None
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        preexec_fn = os.setsid
     stdout_handle = stdout_path.open("ab")
     stderr_handle = stderr_path.open("ab")
     try:
-        return subprocess.Popen(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            creationflags=creationflags,
-            preexec_fn=preexec_fn,
+        return spawn_process(
+            argv, cwd=cwd, env=env, stdout=stdout_handle, stderr=stderr_handle
         )
     finally:
         stdout_handle.close()
         stderr_handle.close()
-
-
-def _file_size(path: Path) -> int:
-    try:
-        return path.stat().st_size
-    except FileNotFoundError:
-        return 0
-
-
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)

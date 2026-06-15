@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 import tempfile
 import time
@@ -10,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from native_agent_runner._policy_util import dedupe, str_tuple
+from native_agent_runner._proc import file_size, spawn_process, terminate_process
 from native_agent_runner.errors import PermissionDenied, ToolExecutionError, WorkspaceError
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
@@ -111,9 +112,15 @@ class ShellPolicy:
             execution_workspace=_execution_workspace(
                 str(payload.get("execution_workspace") or "auto")
             ),
-            env_allowlist=_string_tuple(payload.get("env_allowlist") or ()),
-            inherit_env_allowlist=_string_tuple(
-                payload.get("inherit_env_allowlist") or _DEFAULT_INHERIT_ENV
+            env_allowlist=str_tuple(
+                payload.get("env_allowlist") or (),
+                type_error="expected an array of strings",
+                empty_error="empty string is not allowed",
+            ),
+            inherit_env_allowlist=str_tuple(
+                payload.get("inherit_env_allowlist") or _DEFAULT_INHERIT_ENV,
+                type_error="expected an array of strings",
+                empty_error="empty string is not allowed",
             ),
             command_rules=rules,
         ).validated()
@@ -162,7 +169,7 @@ class ShellPolicy:
             execution_workspace=self.execution_workspace
             if execution_workspace is None
             else _execution_workspace(execution_workspace),
-            env_allowlist=tuple(dict.fromkeys((*self.env_allowlist, *env_allowlist))),
+            env_allowlist=dedupe((*self.env_allowlist, *env_allowlist)),
             inherit_env_allowlist=self.inherit_env_allowlist,
             command_rules=self.command_rules,
         ).validated()
@@ -221,23 +228,7 @@ class ShellPolicy:
             raise ToolExecutionError("shell command not allowed by policy", error_code="shell_policy_denied")
 
     def to_manifest(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "approval_mode": self.approval_mode,
-            "shell": self.shell,
-            "effective_shell": self.effective_shell(),
-            "default_timeout_s": self.default_timeout_s,
-            "max_timeout_s": self.max_timeout_s,
-            "default_startup_wait_s": self.default_startup_wait_s,
-            "max_startup_wait_s": self.max_startup_wait_s,
-            "default_max_output_bytes": self.default_max_output_bytes,
-            "max_output_bytes": self.max_output_bytes,
-            "cwd_root": self.cwd_root,
-            "execution_workspace": self.execution_workspace,
-            "env_allowlist": list(self.env_allowlist),
-            "inherit_env_allowlist": list(self.inherit_env_allowlist),
-            "command_rules": [rule.to_json() for rule in self.command_rules],
-        }
+        return {**self.to_json(), "effective_shell": self.effective_shell()}
 
 
 @dataclass(frozen=True)
@@ -259,7 +250,7 @@ class ShellApprovalRequest:
 
     @property
     def command_preview(self) -> str:
-        return _preview_command(self.command)
+        return preview_command(self.command)
 
     @property
     def timeout_s(self) -> int:
@@ -388,9 +379,9 @@ def execute_shell(
     if not command.strip():
         raise ToolExecutionError("shell command is required", error_code="shell_exec_error")
     policy.check_command(command)
-    cwd_rel = _validate_cwd(workspace, cwd, permission_policy)
-    safe_env = _build_env(policy, env)
-    shell_argv = _shell_argv(policy.effective_shell(), command)
+    cwd_rel = validate_cwd(workspace, cwd, permission_policy)
+    safe_env = build_env(policy, env)
+    argv = shell_argv(policy.effective_shell(), command)
     resolved_execution_workspace = execution_workspace or policy.effective_execution_workspace(workspace.backend_kind)
 
     if resolved_execution_workspace == "direct":
@@ -400,7 +391,7 @@ def execute_shell(
         if not cwd_abs.exists() or not cwd_abs.is_dir():
             raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
         proc_result = _run_subprocess(
-            shell_argv,
+            argv,
             cwd=cwd_abs,
             env=safe_env,
             timeout_s=timeout_s,
@@ -418,7 +409,7 @@ def execute_shell(
 
     with tempfile.TemporaryDirectory(prefix="native-agent-shell-") as tmp:
         tmp_root = Path(tmp)
-        before = _materialize_workspace(workspace, tmp_root, permission_policy)
+        before = materialize_workspace(workspace, tmp_root, permission_policy)
         cwd_abs = (tmp_root / cwd_rel).resolve()
         if not is_within(tmp_root.resolve(), cwd_abs):
             raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
@@ -426,7 +417,7 @@ def execute_shell(
             raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
 
         proc_result = _run_subprocess(
-            shell_argv,
+            argv,
             cwd=cwd_abs,
             env=safe_env,
             timeout_s=timeout_s,
@@ -452,8 +443,8 @@ def execute_shell(
                 effective_max_output_bytes=max_output_bytes,
                 execution_workspace=resolved_execution_workspace,
             )
-        after = _scan_materialized_workspace(tmp_root, permission_policy)
-        changed_paths = _sync_workspace_changes(workspace, before, after)
+        after = scan_materialized_workspace(tmp_root, permission_policy)
+        changed_paths = sync_workspace_changes(workspace, before, after)
         return _execution_result_from_proc(
             proc_result,
             changed_paths=tuple(changed_paths),
@@ -493,7 +484,7 @@ def _execution_result_from_proc(
     )
 
 
-def _validate_cwd(
+def validate_cwd(
     workspace: LocalWorkspaceBackend,
     cwd: str,
     permission_policy: PermissionPolicy,
@@ -507,7 +498,7 @@ def _validate_cwd(
     return resolved_rel
 
 
-def _materialize_workspace(
+def materialize_workspace(
     workspace: LocalWorkspaceBackend,
     target_root: Path,
     permission_policy: PermissionPolicy,
@@ -532,7 +523,7 @@ def _materialize_workspace(
     return snapshot
 
 
-def _scan_materialized_workspace(
+def scan_materialized_workspace(
     root: Path,
     permission_policy: PermissionPolicy,
 ) -> _WorkspaceSnapshot:
@@ -552,7 +543,7 @@ def _scan_materialized_workspace(
     return _WorkspaceSnapshot(files=files, dirs=dirs)
 
 
-def _sync_workspace_changes(
+def sync_workspace_changes(
     workspace: LocalWorkspaceBackend,
     before: _WorkspaceSnapshot,
     after: _WorkspaceSnapshot,
@@ -601,34 +592,20 @@ def _run_subprocess(
     stderr_path = Path(stderr_file.name)
     stdout_file.close()
     stderr_file.close()
-    creationflags = 0
-    preexec_fn = None
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        preexec_fn = os.setsid
-
     with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
-        process = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            creationflags=creationflags,
-            preexec_fn=preexec_fn,
+        process = spawn_process(
+            argv, cwd=cwd, env=env, stdout=stdout_handle, stderr=stderr_handle
         )
         timed_out = False
         output_truncated = False
         while process.poll() is None:
             if time.time() - started >= timeout_s:
                 timed_out = True
-                _terminate_process(process)
+                terminate_process(process)
                 break
-            if _file_size(stdout_path) + _file_size(stderr_path) > max_output_bytes:
+            if file_size(stdout_path) + file_size(stderr_path) > max_output_bytes:
                 output_truncated = True
-                _terminate_process(process)
+                terminate_process(process)
                 break
             time.sleep(0.02)
         try:
@@ -637,8 +614,8 @@ def _run_subprocess(
             process.kill()
             exit_code = process.wait(timeout=2)
 
-    stdout_bytes = _file_size(stdout_path)
-    stderr_bytes = _file_size(stderr_path)
+    stdout_bytes = file_size(stdout_path)
+    stderr_bytes = file_size(stderr_path)
     if stdout_bytes + stderr_bytes > max_output_bytes:
         output_truncated = True
     stdout = _read_output(stdout_path, max_output_bytes)
@@ -658,23 +635,7 @@ def _run_subprocess(
     }
 
 
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        else:
-            os.killpg(process.pid, signal.SIGTERM)
-    except Exception:
-        process.kill()
-
-
-def _build_env(policy: ShellPolicy, requested: Mapping[str, Any]) -> dict[str, str]:
+def build_env(policy: ShellPolicy, requested: Mapping[str, Any]) -> dict[str, str]:
     env: dict[str, str] = {}
     inherited = set(policy.inherit_env_allowlist)
     for key in inherited:
@@ -688,7 +649,7 @@ def _build_env(policy: ShellPolicy, requested: Mapping[str, Any]) -> dict[str, s
     return env
 
 
-def _shell_argv(shell: Literal["bash", "powershell"], command: str) -> list[str]:
+def shell_argv(shell: Literal["bash", "powershell"], command: str) -> list[str]:
     if shell == "powershell":
         return [
             "powershell",
@@ -722,15 +683,6 @@ def _sensitive_env_key(key: str) -> bool:
     return any(fragment in upper for fragment in _SENSITIVE_ENV_FRAGMENTS)
 
 
-def _string_tuple(value: Any) -> tuple[str, ...]:
-    if isinstance(value, str):
-        raise ValueError("expected an array of strings")
-    result = tuple(str(item) for item in value)
-    if any(not item.strip() for item in result):
-        raise ValueError("empty string is not allowed")
-    return result
-
-
 def _approval_mode(value: str) -> ShellApprovalMode:
     if value not in {"backend", "auto-approve", "deny"}:
         raise ValueError(f"unsupported shell approval mode: {value}")
@@ -749,19 +701,12 @@ def _execution_workspace(value: str) -> ShellExecutionWorkspace:
     return value  # type: ignore[return-value]
 
 
-def _file_size(path: Path) -> int:
-    try:
-        return path.stat().st_size
-    except FileNotFoundError:
-        return 0
-
-
 def _read_output(path: Path, max_bytes: int) -> str:
     data = path.read_bytes()[:max_bytes]
     return data.decode("utf-8", errors="replace")
 
 
-def _preview_command(command: str) -> str:
+def preview_command(command: str) -> str:
     single_line = " ".join(command.split())
     if len(single_line.encode("utf-8")) <= 240:
         return single_line
