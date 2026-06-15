@@ -97,6 +97,10 @@ class ToolProvider(Protocol):
 - `ToolSpec`: `id`, `description`, `input_schema` (JSON Schema, validated with Draft 2020-12),
   `capability` (gating string), `side_effect` (`read`|`write`|`artifact`|`run`|`shell`), `handler`,
   `provider_name`, `path_args`. `exported_name` is `provider_name` or `id` with dots→underscores.
+  Declarative engine hints (the loop branches on these, never on tool ids): `preview_kind`
+  (`args`|`shell`|`web`), `emits_workspace_diff` (emit `workspace.file.changed` + proposal after a
+  successful call), `changed_paths_source` (`path_args`|`result_content`), `result_payload_kind`
+  (`paths`|`shell_exec`), `skip_emit_if_background`.
 - `ToolHandler = Callable[[ToolContext, dict], ToolResult]`.
 - `ToolResult`: `ok`, `content: dict`, `error`, `error_code`; `to_observation()` is what the model sees.
 - `ToolContext` is the protocol the handler receives (artifact/plan/finish/shell/job/web operations).
@@ -106,6 +110,10 @@ class ToolProvider(Protocol):
   capabilities. Defaults derive from `mode` (`default_capabilities` in `core/spec.py`); enabling
   `shell_policy`/`web_policy` adds `shell.exec`/`job.control`/`web.*`. `ToolPolicy`
   (allow/deny/ask) further filters visibility. See `examples/custom_tools/word_count_tool.py`.
+  A stale call to a tool whose capability is not granted is rejected with `error_code`
+  `capability_disabled` (this replaced the tool-specific `shell_disabled`/`web_disabled` codes on
+  the dispatch path; those codes still surface from the runtime shell/web gateway when an enabled
+  capability's service is unconfigured).
 
 ### 1.4 Event contract
 

@@ -411,7 +411,7 @@ def test_agent_loop_web_context_events_metrics_and_private_transcript(tmp_path: 
         thread.join(timeout=5)
 
 
-def test_agent_loop_web_disabled_hides_tool_and_stale_call_reports_web_disabled(tmp_path: Path) -> None:
+def test_agent_loop_web_disabled_hides_tool_and_stale_call_reports_capability_disabled(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     adapter = FakeModelAdapter(
@@ -430,10 +430,10 @@ def test_agent_loop_web_disabled_hides_tool_and_stale_call_reports_web_disabled(
     assert result.status == "completed"
     assert "web.search" not in {tool.id for tool in adapter.requests[0].tools}
     transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
-    assert "web_disabled" in transcript
+    assert "capability_disabled" in transcript
 
 
-def test_agent_loop_web_context_disabled_hides_tool_and_stale_call_reports_web_disabled(tmp_path: Path) -> None:
+def test_agent_loop_web_context_disabled_hides_tool_and_stale_call_reports_capability_disabled(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     adapter = FakeModelAdapter(
@@ -457,7 +457,7 @@ def test_agent_loop_web_context_disabled_hides_tool_and_stale_call_reports_web_d
     assert result.status == "completed"
     assert "web.context" not in {tool.id for tool in adapter.requests[0].tools}
     transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
-    assert "web_disabled" in transcript
+    assert "capability_disabled" in transcript
 
 
 def test_full_stack_fake_llm_runner_backend_and_web_gateway_contract(tmp_path: Path) -> None:

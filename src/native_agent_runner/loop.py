@@ -1038,10 +1038,11 @@ class AgentLoop:
                 f"tool requires approval: {spec.id}",
                 error_code="tool_approval_required",
             )
-        if spec.id == "shell.exec" and spec.capability not in capabilities:
-            raise PermissionDenied("shell is disabled", error_code="shell_disabled")
-        if spec.id.startswith("web.") and spec.capability not in capabilities:
-            raise PermissionDenied("web is disabled", error_code="web_disabled")
+        if spec.capability not in capabilities:
+            raise PermissionDenied(
+                f"capability disabled: {spec.capability}",
+                error_code="capability_disabled",
+            )
 
     def _invoke_handler(
         self,

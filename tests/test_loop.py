@@ -310,7 +310,7 @@ def test_loop_permission_denied_for_write_in_read_only(tmp_path: Path) -> None:
     assert "fs.write" not in {tool["id"] for tool in manifest["tool_specs"]}
     assert {"tool": "fs.write", "reason": "missing_capability"} in manifest["tool_policy"]["hidden_tools"]
     assert {"tool": "fs.delete", "reason": "missing_capability"} in manifest["tool_policy"]["hidden_tools"]
-    assert "missing capability" in result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
+    assert "capability_disabled" in result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
 
 
 def test_loop_tool_policy_filters_model_visible_tools(tmp_path: Path) -> None:
@@ -466,7 +466,7 @@ def test_loop_tool_policy_deny_and_ask_for_delete(tmp_path: Path) -> None:
     assert "tool_approval_required" in ask_result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
 
 
-def test_loop_shell_disabled_hides_tool_and_stale_call_reports_shell_disabled(tmp_path: Path) -> None:
+def test_loop_shell_disabled_hides_tool_and_stale_call_reports_capability_disabled(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     adapter = FakeModelAdapter(
@@ -485,7 +485,7 @@ def test_loop_shell_disabled_hides_tool_and_stale_call_reports_shell_disabled(tm
     assert result.status == "completed"
     assert "shell.exec" not in {tool.id for tool in adapter.requests[0].tools}
     transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
-    assert "shell_disabled" in transcript
+    assert "capability_disabled" in transcript
     manifest = json.loads(result.run_dir.joinpath("manifest.json").read_text(encoding="utf-8"))
     assert manifest["shell_policy"]["enabled"] is False
     assert {"tool": "shell.exec", "reason": "missing_capability"} in manifest["tool_policy"]["hidden_tools"]
