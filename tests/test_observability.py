@@ -191,6 +191,29 @@ def test_args_preview_redacts_content_fields_only_not_secret_named_keys() -> Non
     assert preview["note"] == "has PRIVATE KEY here"
 
 
+def test_example_redacting_event_sink_scrubs_secret_named_values() -> None:
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "examples" / "redacting_event_sink.py"
+    module_spec = importlib.util.spec_from_file_location("example_redacting_sink", path)
+    assert module_spec is not None and module_spec.loader is not None
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+
+    inner = MemoryEventSink()
+    bus = EventBus(run_id="r1", sinks=(module.RedactingEventSink(inner),))
+    bus.emit(
+        "tool.call.started",
+        data={"args_preview": {"api_key": "sk-secret", "path": "a.txt"}},
+    )
+    bus.emit("tool.call.finished", data={"note": "-----BEGIN PRIVATE KEY-----"})
+
+    preview = inner.events[0].data["args_preview"]
+    assert preview["api_key"] == "[redacted]"
+    assert preview["path"] == "a.txt"
+    assert inner.events[1].data["note"] == "[redacted]"
+
+
 def test_status_projection_redacts_paths_from_manifest_policy(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

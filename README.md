@@ -310,6 +310,18 @@ native-agent run \
 The function must return an object with `emit(event)` and `close()` methods, or
 an iterable of those objects.
 
+`examples/redacting_event_sink.py` is a ready-to-copy sink that masks
+secret-looking values before forwarding — the recommended place to add secret
+redaction now that the core no longer guesses at secrets (see above):
+
+```bash
+native-agent run \
+  --workspace . \
+  --instruction "Inspect this workspace." \
+  --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
+  --event-sink-module examples/redacting_event_sink.py:make_sink
+```
+
 ## Model Provider Boundary
 
 `GatewayModelAdapter` is the default path. It sends normalized model-turn

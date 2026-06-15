@@ -122,7 +122,7 @@ class EventSink(Protocol):
   `proposal`) and masks paths matching `PermissionPolicy.redact_patterns`. Any other redaction —
   secret-bearing tool arguments, tokens embedded in shell commands, etc. — is the integrator's
   responsibility; `EventSink` is the seam to add it (wrap or post-process events before they leave
-  the trust boundary).
+  the trust boundary). See `examples/redacting_event_sink.py` for a ready-to-copy wrapping sink.
 
 ### 1.5 Policy contracts
 
