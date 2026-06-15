@@ -1,0 +1,1295 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+import base64
+from pathlib import Path
+from typing import Any
+
+import click
+
+from native_agent_runner.backend.http import create_backend_server
+from native_agent_runner.backend.service import RunnerBackend
+from native_agent_runner.backend.tokens import TokenManager
+from native_agent_runner.core.spec import (
+    AgentRunSpec,
+    ModelConfig,
+    ReasoningConfig,
+    RunLimits,
+)
+from native_agent_runner.core.schemas import validate_run_dir
+from native_agent_runner.core.packages import (
+    apply_package,
+    create_approval,
+    export_package,
+    import_package,
+    inspect_package,
+    verify_package,
+    write_apply_result,
+    write_approval,
+)
+from native_agent_runner.core.projections import project_run_status
+from native_agent_runner.event_loader import load_event_sinks
+from native_agent_runner.jobs import (
+    get_job_artifact,
+    list_job_artifacts,
+    read_job_log_text,
+    request_job_cancel,
+)
+from native_agent_runner.llm_gateway.http import create_llm_gateway_server
+from native_agent_runner.llm_gateway.service import LlmGatewayBackend
+from native_agent_runner.loop import AgentLoop
+from native_agent_runner.permissions import PermissionPolicy
+from native_agent_runner.providers.base import ModelAdapter
+from native_agent_runner.providers.gateway import GatewayModelAdapter
+from native_agent_runner.providers.openai import OpenAIModelAdapter
+from native_agent_runner.recorder import StdoutJsonlSink, append_event_to_run
+from native_agent_runner.shell import ShellPolicy
+from native_agent_runner.tools.policy import ToolPolicy
+from native_agent_runner.tool_loader import load_tool_provider
+from native_agent_runner.web import WebGatewayClient, WebPolicy
+from native_agent_runner.web_gateway.http import create_web_gateway_server
+from native_agent_runner.web_gateway.providers import (
+    BraveLlmContextProvider,
+    BraveSearchProvider,
+    CompositeWebProvider,
+    HttpFetchProvider,
+    SearchFetchContextProvider,
+)
+from native_agent_runner.web_gateway.service import FakeWebProvider, WebGatewayBackend
+from native_agent_runner.workspace.local import sha256_bytes
+from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
+
+
+@click.group()
+def main() -> None:
+    """Run a standalone native agent harness."""
+
+
+@main.command()
+@click.option("--workspace", type=click.Path(path_type=Path), required=True)
+@click.option("--instruction", type=str, default="")
+@click.option("--instruction-file", type=click.Path(path_type=Path), default=None)
+@click.option(
+    "--model-provider",
+    type=click.Choice(["gateway", "openai"]),
+    default="gateway",
+    show_default=True,
+)
+@click.option("--model", type=str, default="gpt-5.5", show_default=True)
+@click.option("--llm-gateway-url", type=str, default=None, help="Internal CSP LLM gateway URL.")
+@click.option(
+    "--llm-gateway-token-env",
+    type=str,
+    default="NAR_LLM_GATEWAY_TOKEN",
+    show_default=True,
+    help="Environment variable containing a short-lived gateway token.",
+)
+@click.option(
+    "--llm-gateway-token-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="File containing a short-lived gateway token.",
+)
+@click.option(
+    "--allow-direct-provider-api",
+    is_flag=True,
+    help="Allow direct provider API access for local smoke tests only.",
+)
+@click.option(
+    "--reasoning-effort",
+    type=click.Choice(["default", "none", "minimal", "low", "medium", "high", "xhigh"]),
+    default="medium",
+    show_default=True,
+)
+@click.option(
+    "--reasoning-summary",
+    type=click.Choice(["off", "auto", "detailed"]),
+    default="off",
+    show_default=True,
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["read-only", "propose", "apply"]),
+    default="propose",
+    show_default=True,
+)
+@click.option(
+    "--workspace-backend",
+    type=click.Choice(["overlay", "staging"]),
+    default="overlay",
+    show_default=True,
+)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--run-id", type=str, default=None, help="Use a specific run id.")
+@click.option("--max-steps", type=int, default=30, show_default=True)
+@click.option("--max-tool-calls", type=int, default=100, show_default=True)
+@click.option("--max-bytes-read", type=int, default=1_000_000, show_default=True)
+@click.option("--max-duration-s", type=int, default=900, show_default=True)
+@click.option("--tool-module", multiple=True, help="Load custom tools from path.py:function.")
+@click.option("--allow-tool", multiple=True, help="Allow a tool by id, exported name, or namespace glob.")
+@click.option("--deny-tool", multiple=True, help="Deny a tool by id, exported name, or namespace glob.")
+@click.option("--ask-tool", multiple=True, help="Require approval for a tool by id, exported name, or namespace glob.")
+@click.option("--tool-policy-file", type=click.Path(path_type=Path), default=None)
+@click.option("--deny-path", multiple=True, help="Deny workspace paths matching a backend-provided glob.")
+@click.option("--redact-path", multiple=True, help="Redact matching paths from public events and projections.")
+@click.option("--permission-policy-file", type=click.Path(path_type=Path), default=None)
+@click.option("--enable-shell", is_flag=True, help="Expose shell.exec for this run.")
+@click.option(
+    "--shell-approval-mode",
+    type=click.Choice(["auto-approve", "deny"]),
+    default="deny",
+    show_default=True,
+)
+@click.option("--shell-timeout-s", type=int, default=None, help="Default shell command timeout.")
+@click.option("--shell-max-output-bytes", type=int, default=None, help="Default shell output cap.")
+@click.option(
+    "--shell-execution-workspace",
+    type=click.Choice(["auto", "isolated-copy", "direct"]),
+    default="auto",
+    show_default=True,
+)
+@click.option("--shell-env", multiple=True, help="Allow a model-supplied environment variable key.")
+@click.option("--enable-web", is_flag=True, help="Expose web.search and web.fetch for this run.")
+@click.option("--web-gateway-url", type=str, default=None, help="Internal CSP WebGateway base URL.")
+@click.option(
+    "--web-gateway-token-env",
+    type=str,
+    default="NAR_WEB_GATEWAY_TOKEN",
+    show_default=True,
+    help="Environment variable containing a short-lived WebGateway token.",
+)
+@click.option(
+    "--web-gateway-token-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="File containing a short-lived WebGateway token.",
+)
+@click.option("--web-allow-domain", multiple=True, help="Allow a WebGateway domain pattern.")
+@click.option("--web-block-domain", multiple=True, help="Block a WebGateway domain pattern.")
+@click.option("--web-max-searches", type=int, default=None, help="Maximum web.search calls.")
+@click.option("--web-max-fetches", type=int, default=None, help="Maximum web.fetch calls.")
+@click.option("--enable-web-context", is_flag=True, help="Expose web.context for this run.")
+@click.option("--web-max-contexts", type=int, default=None, help="Maximum web.context calls.")
+@click.option("--web-max-results", type=int, default=None, help="Maximum web.search results.")
+@click.option("--web-context-max-tokens", type=int, default=None, help="Maximum web.context token budget.")
+@click.option("--web-context-max-urls", type=int, default=None, help="Maximum web.context source URLs.")
+@click.option("--web-context-max-snippets", type=int, default=None, help="Maximum web.context snippets.")
+@click.option("--web-max-response-bytes", type=int, default=None, help="Maximum web.fetch response bytes.")
+@click.option("--web-timeout-s", type=int, default=None, help="Default web.fetch timeout.")
+@click.option("--web-policy-file", type=click.Path(path_type=Path), default=None)
+@click.option("--event-sink-module", multiple=True, help="Load custom event sinks from path.py:function.")
+@click.option("--stream-json", is_flag=True, help="Stream public events as JSONL on stdout.")
+@click.option("--no-status-file", is_flag=True, help="Disable status.json updates.")
+def run(
+    *,
+    workspace: Path,
+    instruction: str,
+    instruction_file: Path | None,
+    model_provider: str,
+    model: str,
+    llm_gateway_url: str | None,
+    llm_gateway_token_env: str,
+    llm_gateway_token_file: Path | None,
+    allow_direct_provider_api: bool,
+    reasoning_effort: str,
+    reasoning_summary: str,
+    mode: str,
+    workspace_backend: str,
+    run_root: Path,
+    run_id: str | None,
+    max_steps: int,
+    max_tool_calls: int,
+    max_bytes_read: int,
+    max_duration_s: int,
+    tool_module: tuple[str, ...],
+    allow_tool: tuple[str, ...],
+    deny_tool: tuple[str, ...],
+    ask_tool: tuple[str, ...],
+    tool_policy_file: Path | None,
+    deny_path: tuple[str, ...],
+    redact_path: tuple[str, ...],
+    permission_policy_file: Path | None,
+    enable_shell: bool,
+    shell_approval_mode: str,
+    shell_timeout_s: int | None,
+    shell_max_output_bytes: int | None,
+    shell_execution_workspace: str,
+    shell_env: tuple[str, ...],
+    enable_web: bool,
+    web_gateway_url: str | None,
+    web_gateway_token_env: str,
+    web_gateway_token_file: Path | None,
+    web_allow_domain: tuple[str, ...],
+    web_block_domain: tuple[str, ...],
+    web_max_searches: int | None,
+    web_max_fetches: int | None,
+    enable_web_context: bool,
+    web_max_contexts: int | None,
+    web_max_results: int | None,
+    web_context_max_tokens: int | None,
+    web_context_max_urls: int | None,
+    web_context_max_snippets: int | None,
+    web_max_response_bytes: int | None,
+    web_timeout_s: int | None,
+    web_policy_file: Path | None,
+    event_sink_module: tuple[str, ...],
+    stream_json: bool,
+    no_status_file: bool,
+) -> None:
+    """Run an agent against a local workspace."""
+    if instruction_file is not None:
+        instruction = instruction_file.read_text(encoding="utf-8")
+    if not instruction.strip():
+        raise click.ClickException("--instruction or --instruction-file is required")
+
+    try:
+        tool_policy = _load_tool_policy(
+            tool_policy_file,
+            allow_tool=allow_tool,
+            deny_tool=deny_tool,
+            ask_tool=ask_tool,
+        )
+        permission_policy = _load_permission_policy(
+            permission_policy_file,
+            deny_path=deny_path,
+            redact_path=redact_path,
+        )
+        shell_policy = ShellPolicy().merged(
+            enabled=enable_shell,
+            approval_mode=shell_approval_mode,
+            timeout_s=shell_timeout_s,
+            max_output_bytes=shell_max_output_bytes,
+            execution_workspace=shell_execution_workspace,
+            env_allowlist=shell_env,
+        )
+        web_policy = _load_web_policy(
+            web_policy_file,
+            enabled=enable_web or enable_web_context,
+            context_enabled=True if enable_web_context else None,
+            allow_domains=web_allow_domain,
+            block_domains=web_block_domain,
+            max_searches=web_max_searches,
+            max_fetches=web_max_fetches,
+            max_contexts=web_max_contexts,
+            max_results=web_max_results,
+            max_context_tokens=web_context_max_tokens,
+            max_context_urls=web_context_max_urls,
+            max_context_snippets=web_context_max_snippets,
+            max_response_bytes=web_max_response_bytes,
+            timeout_s=web_timeout_s,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    if web_policy.enabled and not web_gateway_url:
+        raise click.ClickException("--enable-web or --enable-web-context requires --web-gateway-url")
+
+    spec_kwargs: dict[str, Any] = {}
+    if run_id is not None:
+        spec_kwargs["run_id"] = run_id
+    spec = AgentRunSpec(
+        instruction=instruction,
+        workspace_root=workspace,
+        run_root=run_root,
+        mode=mode,  # type: ignore[arg-type]
+        workspace_backend=workspace_backend,  # type: ignore[arg-type]
+        model=ModelConfig(
+            provider=model_provider,  # type: ignore[arg-type]
+            model=model,
+            reasoning=ReasoningConfig(
+                effort=reasoning_effort,  # type: ignore[arg-type]
+                summary=reasoning_summary,  # type: ignore[arg-type]
+            ),
+            gateway_url=llm_gateway_url,
+        ),
+        limits=RunLimits(
+            max_steps=max_steps,
+            max_tool_calls=max_tool_calls,
+            max_bytes_read=max_bytes_read,
+            max_duration_s=max_duration_s,
+        ),
+        permission_policy=permission_policy,
+        tool_policy=tool_policy,
+        shell_policy=shell_policy,
+        web_policy=web_policy,
+        **spec_kwargs,
+    )
+    _human_echo(f"run_id: {spec.run_id}", stream_json=stream_json)
+    _human_echo(f"run_dir: {spec.run_root / spec.run_id}", stream_json=stream_json)
+
+    try:
+        providers = tuple(load_tool_provider(item) for item in tool_module)
+        extra_sinks = []
+        if stream_json:
+            extra_sinks.append(StdoutJsonlSink())
+        for item in event_sink_module:
+            extra_sinks.extend(load_event_sinks(item))
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    result = AgentLoop(
+        spec=spec,
+        model_adapter=_model_adapter(
+            spec.model,
+            llm_gateway_url=llm_gateway_url,
+            llm_gateway_token_env=llm_gateway_token_env,
+            llm_gateway_token_file=llm_gateway_token_file,
+            allow_direct_provider_api=allow_direct_provider_api,
+        ),
+        tool_providers=providers,
+        event_sinks=tuple(extra_sinks),
+        status_file=not no_status_file,
+        permission_policy=permission_policy,
+        web_gateway_client=(
+            WebGatewayClient(
+                web_gateway_url,
+                token_env=web_gateway_token_env,
+                token_file=web_gateway_token_file,
+            )
+            if web_policy.enabled and web_gateway_url
+            else None
+        ),
+    ).run()
+    _human_echo(f"status: {result.status}", stream_json=stream_json)
+    if result.final_text:
+        _human_echo(f"summary: {result.final_text}", stream_json=stream_json)
+    if result.error:
+        raise click.ClickException(result.error)
+
+
+@main.command()
+@click.argument("run_dir_or_id", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--from-start", is_flag=True, help="Read events from the beginning of the file.")
+@click.option("--follow", is_flag=True, help="Keep waiting for new events.")
+@click.option("--json", "json_output", is_flag=True, help="Print raw JSONL events.")
+def watch(run_dir_or_id: str, run_root: Path, from_start: bool, follow: bool, json_output: bool) -> None:
+    """Watch a run's public events."""
+    events_path = _resolve_events_path(run_dir_or_id, run_root)
+    if not events_path.exists():
+        raise click.ClickException(f"events.jsonl not found: {events_path}")
+
+    start_from_beginning = from_start or not follow
+    with events_path.open("r", encoding="utf-8") as handle:
+        if not start_from_beginning:
+            handle.seek(0, 2)
+        while True:
+            line = handle.readline()
+            if line:
+                click.echo(line.rstrip("\n") if json_output else _compact_event_line(line))
+                continue
+            if not follow:
+                break
+            time.sleep(0.25)
+
+
+@main.command("status")
+@click.argument("run_dir_or_id", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def status_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
+    """Project a run directory into compact status state."""
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    payload = project_run_status(run_dir)
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    click.echo(f"run_id: {payload.get('run_id', '')}")
+    click.echo(f"status: {payload.get('status', '')}")
+    if payload.get("error_code"):
+        click.echo(f"error_code: {payload['error_code']}")
+    if payload.get("current_step") is not None:
+        click.echo(f"current_step: {payload['current_step']}")
+    if payload.get("current_tool"):
+        click.echo(f"current_tool: {payload['current_tool']}")
+    if payload.get("waiting_for_background_jobs"):
+        click.echo("waiting_for_background_jobs: true")
+    if payload.get("running_jobs"):
+        click.echo(f"running_jobs: {len(payload['running_jobs'])}")
+    if payload.get("proposal_hash"):
+        click.echo(f"proposal_hash: {payload['proposal_hash']}")
+    if payload.get("changed_paths"):
+        click.echo(f"changed_paths: {', '.join(map(str, payload['changed_paths']))}")
+
+
+@main.command("jobs")
+@click.argument("run_dir_or_id", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def jobs_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
+    """List background shell jobs for a run."""
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    payload = {"run_dir": str(run_dir), "jobs": list_job_artifacts(run_dir)}
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    for job in payload["jobs"]:
+        click.echo(
+            f"{job.get('job_id', '')} {job.get('status', '')} "
+            f"exit={job.get('exit_code', '')} duration={float(job.get('duration_s') or 0):.3f}s"
+        )
+
+
+@main.group("job")
+def job_group() -> None:
+    """Inspect or control one background shell job."""
+
+
+@job_group.command("status")
+@click.argument("job_id", type=str)
+@click.option("--run", "run_dir_or_id", type=str, required=True)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def job_status_command(job_id: str, run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
+    """Show one background job status."""
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    payload = get_job_artifact(run_dir, job_id)
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    click.echo(f"job_id: {payload.get('job_id', '')}")
+    click.echo(f"status: {payload.get('status', '')}")
+    click.echo(f"exit_code: {payload.get('exit_code', '')}")
+    click.echo(f"duration_s: {payload.get('duration_s', '')}")
+    click.echo(f"stdout_bytes: {payload.get('stdout_bytes', 0)}")
+    click.echo(f"stderr_bytes: {payload.get('stderr_bytes', 0)}")
+
+
+@job_group.command("logs")
+@click.argument("job_id", type=str)
+@click.option("--run", "run_dir_or_id", type=str, required=True)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--stream", "stream_name", type=click.Choice(["stdout", "stderr"]), default="stdout", show_default=True)
+@click.option("--tail-bytes", type=int, default=None)
+@click.option("--offset", type=int, default=None)
+@click.option("--follow", is_flag=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def job_logs_command(
+    job_id: str,
+    run_dir_or_id: str,
+    run_root: Path,
+    stream_name: str,
+    tail_bytes: int | None,
+    offset: int | None,
+    follow: bool,
+    json_output: bool,
+) -> None:
+    """Read stdout or stderr for one background job."""
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    next_offset = offset
+    while True:
+        payload = read_job_log_text(
+            run_dir,
+            job_id,
+            stream=stream_name,  # type: ignore[arg-type]
+            tail_bytes=tail_bytes if next_offset is None else None,
+            offset=next_offset,
+        )
+        if json_output:
+            click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        elif payload.get("content"):
+            click.echo(payload["content"], nl=False)
+        next_offset = int(payload.get("next_offset") or 0)
+        if not follow:
+            break
+        time.sleep(0.5)
+
+
+@job_group.command("cancel")
+@click.argument("job_id", type=str)
+@click.option("--run", "run_dir_or_id", type=str, required=True)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def job_cancel_command(job_id: str, run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
+    """Request cancellation for one background job."""
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    payload = request_job_cancel(run_dir, job_id)
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        click.echo(f"cancel_requested: {payload['job_id']}")
+
+
+@main.command()
+@click.argument("run_dir_or_id", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--file", "file_path", type=str, default=None, help="Show one proposed file's snapshot content.")
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def proposal(run_dir_or_id: str, run_root: Path, file_path: str | None, json_output: bool) -> None:
+    """Inspect a run's proposal snapshot."""
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    proposal_path = run_dir / "proposal.json"
+    if not proposal_path.exists():
+        raise click.ClickException(f"proposal.json not found: {proposal_path}")
+    payload = json.loads(proposal_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise click.ClickException("proposal.json must contain an object")
+    if file_path is not None:
+        file_payload = _proposal_file_payload(run_dir, payload, file_path)
+        if json_output:
+            click.echo(json.dumps(file_payload, ensure_ascii=False, sort_keys=True))
+        else:
+            click.echo(file_payload["content"])
+        return
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    click.echo(f"run_id: {payload.get('run_id', '')}")
+    click.echo(f"mode: {payload.get('mode', '')}")
+    click.echo(f"diff: {payload.get('diff_path', '')} ({payload.get('diff_bytes', 0)} bytes)")
+    files = payload.get("files") if isinstance(payload.get("files"), list) else []
+    for file in files:
+        if isinstance(file, dict):
+            click.echo(
+                f"{file.get('change_kind', file.get('kind', '?')):>9} "
+                f"{file.get('size', 0):>8} {file.get('path', '')}"
+            )
+
+
+@main.command("validate")
+@click.argument("run_dir_or_id", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def validate(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
+    """Validate a run directory's public contract artifacts."""
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    issues = validate_run_dir(run_dir)
+    payload = {
+        "run_dir": str(run_dir),
+        "ok": not issues,
+        "issues": [issue.__dict__ for issue in issues],
+    }
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    elif issues:
+        for issue in issues:
+            click.echo(f"{issue.path}: {issue.message}")
+    else:
+        click.echo("ok")
+    if issues:
+        raise click.ClickException("run directory validation failed")
+
+
+@main.group("package")
+def package_group() -> None:
+    """Export, approve, and apply proposal packages."""
+
+
+@package_group.command("export")
+@click.argument("run_dir_or_id", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def package_export(run_dir_or_id: str, run_root: Path, output: Path, json_output: bool) -> None:
+    """Export a run directory as a deterministic proposal tar package."""
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    try:
+        payload = export_package(run_dir, output)
+        append_event_to_run(
+            run_dir,
+            "proposal.package.exported",
+            data={"package_hash": payload["package_hash"], "package_path": str(output)},
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        click.echo(f"package: {output}")
+        click.echo(f"package_hash: {payload['package_hash']}")
+
+
+@package_group.command("verify")
+@click.argument("package_or_run_dir", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def package_verify(package_or_run_dir: str, run_root: Path, json_output: bool) -> None:
+    """Verify proposal package hashes and required files."""
+    source = _resolve_package_source(package_or_run_dir, run_root)
+    result = verify_package(source)
+    payload = {
+        "ok": result.ok,
+        "issues": list(result.issues),
+        "source_kind": result.source_kind,
+        "package": result.package,
+    }
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    elif result.ok:
+        click.echo("ok")
+        click.echo(f"package_hash: {result.package.get('package_hash', '')}")
+    else:
+        for issue in result.issues:
+            click.echo(issue)
+    if not result.ok:
+        raise click.ClickException("package verification failed")
+
+
+@package_group.command("inspect")
+@click.argument("package_or_run_dir", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def package_inspect(package_or_run_dir: str, run_root: Path, json_output: bool) -> None:
+    """Inspect a proposal package summary."""
+    source = _resolve_package_source(package_or_run_dir, run_root)
+    payload = inspect_package(source)
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    click.echo(f"ok: {payload['ok']}")
+    click.echo(f"package_hash: {payload.get('package', {}).get('package_hash', '')}")
+    click.echo(f"changed_paths: {', '.join(map(str, payload.get('proposal', {}).get('changed_paths', [])))}")
+
+
+@package_group.command("import")
+@click.argument("package_or_run_dir", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def package_import(package_or_run_dir: str, run_root: Path, output: Path, json_output: bool) -> None:
+    """Import a proposal package into a verified staging directory."""
+    source = _resolve_package_source(package_or_run_dir, run_root)
+    try:
+        payload = import_package(source, output)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        click.echo(f"imported: {payload['output']}")
+        click.echo(f"package_hash: {payload['package_hash']}")
+
+
+@package_group.command("approve")
+@click.argument("package_or_run_dir", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--approver", type=str, required=True)
+@click.option("--path", "approved_path", multiple=True, help="Approve one changed workspace path. Repeatable.")
+@click.option("--note", type=str, default="")
+@click.option("--output", type=click.Path(path_type=Path), default=None)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def package_approve(
+    package_or_run_dir: str,
+    run_root: Path,
+    approver: str,
+    approved_path: tuple[str, ...],
+    note: str,
+    output: Path | None,
+    json_output: bool,
+) -> None:
+    """Create an approval record for a package."""
+    source = _resolve_package_source(package_or_run_dir, run_root)
+    try:
+        approval = create_approval(
+            source,
+            approver_id=approver,
+            approved_paths=approved_path or None,
+            note=note,
+        )
+        output_path = output or (_source_run_dir(source) / "approval.json" if source.is_dir() else Path("approval.json"))
+        write_approval(output_path, approval)
+        _append_package_event_if_run_dir(
+            source,
+            "proposal.approved",
+            {"approval_hash": approval["approval_hash"], "package_hash": approval["package_hash"]},
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    if json_output:
+        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True))
+    else:
+        click.echo(f"approval: {output_path}")
+        click.echo(f"approval_hash: {approval['approval_hash']}")
+
+
+@package_group.command("reject")
+@click.argument("package_or_run_dir", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--approver", type=str, required=True)
+@click.option("--reason", type=str, required=True)
+@click.option("--output", type=click.Path(path_type=Path), default=None)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def package_reject(
+    package_or_run_dir: str,
+    run_root: Path,
+    approver: str,
+    reason: str,
+    output: Path | None,
+    json_output: bool,
+) -> None:
+    """Create a rejection record for a package."""
+    source = _resolve_package_source(package_or_run_dir, run_root)
+    try:
+        approval = create_approval(source, approver_id=approver, decision="rejected", note=reason)
+        output_path = output or (_source_run_dir(source) / "approval.json" if source.is_dir() else Path("approval.json"))
+        write_approval(output_path, approval)
+        _append_package_event_if_run_dir(
+            source,
+            "proposal.rejected",
+            {"approval_hash": approval["approval_hash"], "package_hash": approval["package_hash"]},
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    if json_output:
+        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True))
+    else:
+        click.echo(f"approval: {output_path}")
+        click.echo(f"approval_hash: {approval['approval_hash']}")
+
+
+@package_group.command("apply")
+@click.argument("package_or_run_dir", type=str)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option("--approval", "approval_path", type=click.Path(path_type=Path), required=True)
+@click.option("--target", type=click.Path(path_type=Path), required=True)
+@click.option("--dry-run", is_flag=True)
+@click.option("--output", type=click.Path(path_type=Path), default=None)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+def package_apply(
+    package_or_run_dir: str,
+    run_root: Path,
+    approval_path: Path,
+    target: Path,
+    dry_run: bool,
+    output: Path | None,
+    json_output: bool,
+) -> None:
+    """Apply an approved package to a local reference target."""
+    source = _resolve_package_source(package_or_run_dir, run_root)
+    try:
+        result = apply_package(source, approval=approval_path, target=target, dry_run=dry_run)
+        output_path = output or (_source_run_dir(source) / "apply-result.json" if source.is_dir() else Path("apply-result.json"))
+        write_apply_result(output_path, result)
+        event_type = "proposal.conflict" if result.status == "conflict" else "proposal.applied"
+        _append_package_event_if_run_dir(
+            source,
+            event_type,
+            {
+                "status": result.status,
+                "approval_hash": result.approval_hash,
+                "package_hash": result.package_hash,
+                "applied_paths": list(result.applied_paths),
+                "conflicts": [conflict.to_json() for conflict in result.conflicts],
+            },
+            level="warning" if result.status == "conflict" else "info",
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    payload = result.to_json()
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        click.echo(f"status: {payload['status']}")
+        click.echo(f"apply_result: {output_path}")
+
+
+@main.group()
+def backend() -> None:
+    """Run the standalone runner backend."""
+
+
+@backend.command("serve")
+@click.option("--host", type=str, default="127.0.0.1", show_default=True)
+@click.option("--port", type=int, default=8765, show_default=True)
+@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--workspace-root",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    required=True,
+    help="Allowed workspace root. Repeat for multiple roots.",
+)
+@click.option(
+    "--apply-root",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    help="Allowed local reference apply root. Repeat for multiple roots.",
+)
+@click.option("--llm-gateway-url", type=str, required=True, help="Internal CSP LLM gateway URL.")
+@click.option("--web-gateway-url", type=str, default=None, help="Internal CSP WebGateway base URL.")
+@click.option(
+    "--admin-token-env",
+    type=str,
+    default="NAR_BACKEND_ADMIN_TOKEN",
+    show_default=True,
+    help="Environment variable containing the backend admin token.",
+)
+@click.option(
+    "--token-secret-env",
+    type=str,
+    default="NAR_BACKEND_TOKEN_SECRET",
+    show_default=True,
+    help="Environment variable containing a 32+ byte HMAC signing secret.",
+)
+@click.option(
+    "--ephemeral-token-secret",
+    is_flag=True,
+    help="Use an in-memory signing secret for local development.",
+)
+def backend_serve(
+    *,
+    host: str,
+    port: int,
+    run_root: Path,
+    workspace_root: tuple[Path, ...],
+    apply_root: tuple[Path, ...],
+    llm_gateway_url: str,
+    web_gateway_url: str | None,
+    admin_token_env: str,
+    token_secret_env: str,
+    ephemeral_token_secret: bool,
+) -> None:
+    """Serve token issuance, run submission, status, result, and events APIs."""
+    admin_token = os.environ.get(admin_token_env)
+    if not admin_token:
+        raise click.ClickException(f"{admin_token_env} is required")
+    if ephemeral_token_secret:
+        token_manager = TokenManager.ephemeral()
+    else:
+        signing_secret = os.environ.get(token_secret_env)
+        if not signing_secret:
+            raise click.ClickException(
+                f"{token_secret_env} is required, or pass --ephemeral-token-secret for local development"
+            )
+        token_manager = TokenManager.from_secret(signing_secret)
+
+    runner_backend = RunnerBackend(
+        run_root=run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=workspace_root,
+        allowed_apply_roots=apply_root,
+        llm_gateway_url=llm_gateway_url,
+        web_gateway_url=web_gateway_url,
+    )
+    server = create_backend_server(runner_backend, host=host, port=port, admin_token=admin_token)
+    click.echo(f"runner backend listening on http://{host}:{port}")
+    click.echo(f"allowed workspace roots: {', '.join(str(path.resolve()) for path in workspace_root)}")
+    if apply_root:
+        click.echo(f"allowed apply roots: {', '.join(str(path.resolve()) for path in apply_root)}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        click.echo("runner backend stopped")
+    finally:
+        server.server_close()
+
+
+@main.group("llm-gateway")
+def llm_gateway() -> None:
+    """Run the standalone LLM gateway backend."""
+
+
+@llm_gateway.command("serve")
+@click.option("--host", type=str, default="127.0.0.1", show_default=True)
+@click.option("--port", type=int, default=8080, show_default=True)
+@click.option(
+    "--admin-token-env",
+    type=str,
+    default="NAR_LLM_GATEWAY_ADMIN_TOKEN",
+    show_default=True,
+    help="Environment variable containing the LLM gateway admin token.",
+)
+@click.option(
+    "--token-secret-env",
+    type=str,
+    default="NAR_BACKEND_TOKEN_SECRET",
+    show_default=True,
+    help="Environment variable containing the shared 32+ byte HMAC signing secret.",
+)
+@click.option(
+    "--ephemeral-token-secret",
+    is_flag=True,
+    help="Use an in-memory signing secret for local development.",
+)
+def llm_gateway_serve(
+    *,
+    host: str,
+    port: int,
+    admin_token_env: str,
+    token_secret_env: str,
+    ephemeral_token_secret: bool,
+) -> None:
+    """Serve the internal LLM turn API consumed by GatewayModelAdapter."""
+    admin_token = os.environ.get(admin_token_env)
+    if not admin_token:
+        raise click.ClickException(f"{admin_token_env} is required")
+    if ephemeral_token_secret:
+        token_manager = TokenManager.ephemeral()
+    else:
+        signing_secret = os.environ.get(token_secret_env)
+        if not signing_secret:
+            raise click.ClickException(
+                f"{token_secret_env} is required, or pass --ephemeral-token-secret for local development"
+            )
+        token_manager = TokenManager.from_secret(signing_secret)
+
+    gateway = LlmGatewayBackend(token_manager=token_manager)
+    server = create_llm_gateway_server(gateway, host=host, port=port, admin_token=admin_token)
+    click.echo(f"LLM gateway listening on http://{host}:{port}")
+    click.echo("turn endpoint: /internal/llm/turns")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        click.echo("LLM gateway stopped")
+    finally:
+        server.server_close()
+
+
+@main.group("web-gateway")
+def web_gateway() -> None:
+    """Run the standalone reference WebGateway backend."""
+
+
+@web_gateway.command("serve")
+@click.option("--host", type=str, default="127.0.0.1", show_default=True)
+@click.option("--port", type=int, default=8090, show_default=True)
+@click.option(
+    "--provider",
+    type=click.Choice(["fake", "brave-http"]),
+    default="fake",
+    show_default=True,
+    help="Web provider implementation. brave-http uses Brave for search and direct HTTP for fetch.",
+)
+@click.option(
+    "--context-provider",
+    type=click.Choice(["none", "search-fetch", "brave-llm"]),
+    default="none",
+    show_default=True,
+    help="Optional LLM context provider for /internal/web/context.",
+)
+@click.option(
+    "--brave-api-key-env",
+    type=str,
+    default="BRAVE_SEARCH_API_KEY",
+    show_default=True,
+    help="Environment variable containing the Brave Search API key.",
+)
+@click.option("--brave-country", type=str, default="US", show_default=True)
+@click.option("--brave-search-lang", type=str, default="en", show_default=True)
+@click.option(
+    "--brave-llm-context-endpoint",
+    type=str,
+    default="https://api.search.brave.com/res/v1/llm/context",
+    show_default=True,
+)
+@click.option("--provider-timeout-s", type=int, default=10, show_default=True)
+@click.option("--fetch-timeout-s", type=int, default=20, show_default=True)
+@click.option("--fetch-max-raw-bytes", type=int, default=2_000_000, show_default=True)
+@click.option("--fetch-user-agent", type=str, default=None)
+@click.option(
+    "--admin-token-env",
+    type=str,
+    default="NAR_WEB_GATEWAY_ADMIN_TOKEN",
+    show_default=True,
+    help="Environment variable containing the WebGateway admin token.",
+)
+@click.option(
+    "--token-secret-env",
+    type=str,
+    default="NAR_BACKEND_TOKEN_SECRET",
+    show_default=True,
+    help="Environment variable containing the shared 32+ byte HMAC signing secret.",
+)
+@click.option(
+    "--ephemeral-token-secret",
+    is_flag=True,
+    help="Use an in-memory signing secret for local development.",
+)
+def web_gateway_serve(
+    *,
+    host: str,
+    port: int,
+    provider: str,
+    context_provider: str,
+    brave_api_key_env: str,
+    brave_country: str,
+    brave_search_lang: str,
+    brave_llm_context_endpoint: str,
+    provider_timeout_s: int,
+    fetch_timeout_s: int,
+    fetch_max_raw_bytes: int,
+    fetch_user_agent: str | None,
+    admin_token_env: str,
+    token_secret_env: str,
+    ephemeral_token_secret: bool,
+) -> None:
+    """Serve the internal web.search/web.fetch/web.context API consumed by WebGatewayClient."""
+    admin_token = os.environ.get(admin_token_env)
+    if not admin_token:
+        raise click.ClickException(f"{admin_token_env} is required")
+    if ephemeral_token_secret:
+        token_manager = TokenManager.ephemeral()
+    else:
+        signing_secret = os.environ.get(token_secret_env)
+        if not signing_secret:
+            raise click.ClickException(
+                f"{token_secret_env} is required, or pass --ephemeral-token-secret for local development"
+            )
+        token_manager = TokenManager.from_secret(signing_secret)
+
+    try:
+        web_provider = _build_web_provider(
+            provider,
+            context_provider=context_provider,
+            brave_api_key_env=brave_api_key_env,
+            brave_country=brave_country,
+            brave_search_lang=brave_search_lang,
+            brave_llm_context_endpoint=brave_llm_context_endpoint,
+            provider_timeout_s=provider_timeout_s,
+            fetch_timeout_s=fetch_timeout_s,
+            fetch_max_raw_bytes=fetch_max_raw_bytes,
+            fetch_user_agent=fetch_user_agent,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    gateway = WebGatewayBackend(token_manager=token_manager, provider=web_provider)
+    server = create_web_gateway_server(gateway, host=host, port=port, admin_token=admin_token)
+    click.echo(f"WebGateway listening on http://{host}:{port}")
+    click.echo(f"provider: {provider}")
+    click.echo(f"context provider: {context_provider}")
+    click.echo("search endpoint: /internal/web/search")
+    click.echo("fetch endpoint: /internal/web/fetch")
+    click.echo("context endpoint: /internal/web/context")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        click.echo("WebGateway stopped")
+    finally:
+        server.server_close()
+
+
+def _human_echo(message: str, *, stream_json: bool) -> None:
+    click.echo(message, err=stream_json)
+
+
+def _build_web_provider(
+    provider: str,
+    *,
+    context_provider: str,
+    brave_api_key_env: str,
+    brave_country: str,
+    brave_search_lang: str,
+    brave_llm_context_endpoint: str,
+    provider_timeout_s: int,
+    fetch_timeout_s: int,
+    fetch_max_raw_bytes: int,
+    fetch_user_agent: str | None,
+):
+    if provider == "fake":
+        return FakeWebProvider()
+    if provider == "brave-http":
+        search_provider = BraveSearchProvider.from_env(
+            api_key_env=brave_api_key_env,
+            country=brave_country,
+            search_lang=brave_search_lang,
+            timeout_s=provider_timeout_s,
+        )
+        fetch_provider = HttpFetchProvider(
+            timeout_s=fetch_timeout_s,
+            max_raw_bytes=fetch_max_raw_bytes,
+                user_agent=fetch_user_agent or "native-agent-runner-webgateway/0.11",
+        )
+        selected_context_provider = None
+        if context_provider == "search-fetch":
+            selected_context_provider = SearchFetchContextProvider(
+                search_provider=search_provider,
+                fetch_provider=fetch_provider,
+            )
+        elif context_provider == "brave-llm":
+            selected_context_provider = BraveLlmContextProvider.from_env(
+                api_key_env=brave_api_key_env,
+                endpoint=brave_llm_context_endpoint,
+                country=brave_country,
+                search_lang=brave_search_lang,
+                timeout_s=provider_timeout_s,
+            )
+        return CompositeWebProvider(
+            search_provider=search_provider,
+            fetch_provider=fetch_provider,
+            context_provider=selected_context_provider,
+        )
+    raise ValueError(f"unsupported web provider: {provider}")
+
+
+def _model_adapter(
+    config: ModelConfig,
+    *,
+    llm_gateway_url: str | None,
+    llm_gateway_token_env: str,
+    llm_gateway_token_file: Path | None,
+    allow_direct_provider_api: bool,
+) -> ModelAdapter:
+    if config.provider == "gateway":
+        return GatewayModelAdapter(
+            config,
+            gateway_url=llm_gateway_url,
+            token_env=llm_gateway_token_env,
+            token_file=llm_gateway_token_file,
+        )
+    if config.provider == "openai":
+        if not allow_direct_provider_api:
+            raise click.ClickException(
+                "--model-provider openai requires --allow-direct-provider-api; "
+                "container runs must use --model-provider gateway"
+            )
+        return OpenAIModelAdapter(config, allow_direct_provider_api=True)
+    raise click.ClickException(f"unsupported model provider: {config.provider}")
+
+
+def _load_tool_policy(
+    policy_file: Path | None,
+    *,
+    allow_tool: tuple[str, ...],
+    deny_tool: tuple[str, ...],
+    ask_tool: tuple[str, ...],
+) -> ToolPolicy:
+    policy = ToolPolicy()
+    if policy_file is not None:
+        try:
+            payload = json.loads(policy_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid tool policy JSON: {exc.msg}") from exc
+        policy = ToolPolicy.from_json(payload)
+    return policy.merged(allow=allow_tool, deny=deny_tool, ask=ask_tool)
+
+
+def _load_permission_policy(
+    policy_file: Path | None,
+    *,
+    deny_path: tuple[str, ...],
+    redact_path: tuple[str, ...],
+) -> PermissionPolicy:
+    policy = PermissionPolicy()
+    if policy_file is not None:
+        try:
+            payload = json.loads(policy_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid permission policy JSON: {exc.msg}") from exc
+        policy = PermissionPolicy.from_json(payload)
+    return policy.merged(deny_patterns=deny_path, redact_patterns=redact_path)
+
+
+def _load_web_policy(
+    policy_file: Path | None,
+    *,
+    enabled: bool,
+    context_enabled: bool | None = None,
+    allow_domains: tuple[str, ...],
+    block_domains: tuple[str, ...],
+    max_searches: int | None,
+    max_fetches: int | None,
+    max_contexts: int | None,
+    max_results: int | None,
+    max_context_tokens: int | None,
+    max_context_urls: int | None,
+    max_context_snippets: int | None,
+    max_response_bytes: int | None,
+    timeout_s: int | None,
+) -> WebPolicy:
+    policy = WebPolicy()
+    if policy_file is not None:
+        try:
+            payload = json.loads(policy_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid web policy JSON: {exc.msg}") from exc
+        policy = WebPolicy.from_json(payload)
+    return policy.merged(
+        enabled=enabled or policy.enabled,
+        context_enabled=context_enabled,
+        allowed_domains=allow_domains,
+        blocked_domains=block_domains,
+        max_search_calls=max_searches,
+        max_fetch_calls=max_fetches,
+        max_context_calls=max_contexts,
+        max_results=max_results,
+        max_context_tokens=max_context_tokens,
+        max_context_urls=max_context_urls,
+        max_context_snippets=max_context_snippets,
+        max_response_bytes=max_response_bytes,
+        timeout_s=timeout_s,
+    )
+
+
+def _resolve_events_path(run_dir_or_id: str, run_root: Path) -> Path:
+    return _resolve_run_dir(run_dir_or_id, run_root) / "events.jsonl"
+
+
+def _resolve_run_dir(run_dir_or_id: str, run_root: Path) -> Path:
+    candidate = Path(run_dir_or_id)
+    return candidate if candidate.exists() else run_root / run_dir_or_id
+
+
+def _resolve_package_source(package_or_run_dir: str, run_root: Path) -> Path:
+    candidate = Path(package_or_run_dir)
+    return candidate if candidate.exists() else run_root / package_or_run_dir
+
+
+def _source_run_dir(source: Path) -> Path:
+    return source.resolve()
+
+
+def _append_package_event_if_run_dir(
+    source: Path,
+    event_type: str,
+    data: dict[str, Any],
+    *,
+    level: str = "info",
+) -> None:
+    if source.is_dir():
+        append_event_to_run(source.resolve(), event_type, data=data, level=level)
+
+
+def _proposal_file_payload(run_dir: Path, proposal: dict[str, Any], file_path: str) -> dict[str, Any]:
+    rel = normalize_workspace_path(file_path)
+    files = proposal.get("files")
+    if not isinstance(files, list):
+        raise click.ClickException("proposal.json has no files array")
+    file_info = next((item for item in files if isinstance(item, dict) and item.get("path") == rel), None)
+    if file_info is None:
+        raise click.ClickException(f"proposal file not found: {rel}")
+    snapshot_path = file_info.get("snapshot_path")
+    if not isinstance(snapshot_path, str) or not snapshot_path:
+        raise click.ClickException(f"proposal path is not a file: {rel}")
+    abs_path = (run_dir / snapshot_path).resolve()
+    if not is_within(run_dir.resolve(), abs_path):
+        raise click.ClickException("proposal snapshot path escapes run directory")
+    data = abs_path.read_bytes()
+    payload: dict[str, Any] = {
+        "path": rel,
+        "kind": "file",
+        "size": len(data),
+        "sha256": sha256_bytes(data),
+    }
+    try:
+        payload["encoding"] = "utf-8"
+        payload["content"] = data.decode("utf-8")
+    except UnicodeDecodeError:
+        payload["encoding"] = "base64"
+        payload["content"] = base64.b64encode(data).decode("ascii")
+    return payload
+
+
+def _compact_event_line(line: str) -> str:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return line.rstrip("\n")
+    data = event.get("data") or {}
+    suffix = ""
+    if "status" in data:
+        suffix = f" status={data['status']}"
+    elif "job_id" in data:
+        suffix = f" job={data['job_id']}"
+    elif "tool" in data:
+        suffix = f" tool={data['tool']}"
+    elif "paths" in data:
+        suffix = f" paths={','.join(map(str, data['paths']))}"
+    elif "error" in data and data["error"]:
+        suffix = f" error={data['error']}"
+    return f"{event.get('seq', '?'):>4} {event.get('type', '?')}{suffix}"
+
+
+if __name__ == "__main__":
+    main()

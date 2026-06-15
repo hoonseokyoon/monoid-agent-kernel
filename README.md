@@ -1,0 +1,307 @@
+# Native Agent Runner v0.11.0
+
+Standalone API-backed agent harness for safe, structured file work in a local
+workspace. This research package intentionally has no dependency on CSP runtime
+modules. CSP integration is a later adapter layer.
+
+## Run
+
+```bash
+native-agent run \
+  --workspace examples/workspaces/edit_markdown_notes \
+  --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
+  --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
+  --reasoning-effort low
+```
+
+The default mode is `propose`, which means the runner creates a proposal package
+without committing to tenant source-of-truth storage. Local CLI runs default to
+`--workspace-backend overlay`, so writes are staged in an overlay and emitted as
+`runs/<run_id>/diff.patch` and `runs/<run_id>/proposal.json` without modifying
+the workspace. Container/CSP-style runs can use `--workspace-backend staging`,
+where tools and shell write directly to a staging workspace and the runner
+compares that workspace with `workspace.base.json` to generate the proposal.
+Use `--mode apply` for local direct workspace writes.
+
+The default model provider is `gateway`. Container runs should call an internal
+CSP LLM gateway with a short-lived run token. The runner should not receive
+OpenAI, Anthropic, or other provider API keys.
+
+Web tools are also gateway-backed. `web.search`, `web.fetch`, and `web.context`
+are disabled by default; when enabled, the runner calls a CSP WebGateway with a
+short-lived `web_gateway` token. The runner does not perform direct web egress
+and does not receive search-provider credentials. `web.context` returns
+LLM-ready grounding context through a provider-neutral ContextProvider contract.
+
+Shell is disabled by default and is enabled per run. `shell.exec` supports
+foreground commands and background jobs. A background call returns a `job_id`
+immediately; if `resume_on_exit=true`, the runner waits when the model has no
+immediate tool work and re-enters the model with a `background_job_result`
+observation when the job exits, times out, is cancelled, or hits the output
+limit. Background jobs are run-scoped and are cleaned up when the run finishes.
+
+Path permission defaults are permissive. The runner records every
+root-contained path it can inspect and treats files such as `.env`,
+`tokenizer.json`, `secret_santa.md`, and `*.key` as normal workspace files.
+Backends can explicitly deny or redact paths per run:
+
+```bash
+native-agent run \
+  --workspace examples/workspaces/edit_markdown_notes \
+  --instruction "Inspect this workspace." \
+  --deny-path ".env" \
+  --redact-path "*.key"
+```
+
+`--permission-policy-file policy.json` accepts:
+
+```json
+{
+  "deny_patterns": [".env", "*.key"],
+  "redact_patterns": ["internal/**"]
+}
+```
+
+`deny_patterns` blocks tool and shell access. `redact_patterns` affects public
+events and status projection only; private run artifacts such as
+`transcript.jsonl`, `proposal.json`, and `proposal/files/` keep real paths and
+contents.
+
+For machine-readable real-time progress:
+
+```bash
+native-agent run \
+  --workspace examples/workspaces/edit_markdown_notes \
+  --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
+  --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
+  --stream-json
+```
+
+`--stream-json` writes public redacted events to stdout as JSON Lines. Human
+status output goes to stderr in this mode.
+
+## Watch
+
+Replay or follow a run's public event stream:
+
+```bash
+native-agent watch <run_id> --run-root ./runs --from-start --json
+native-agent watch <run_id> --run-root ./runs --follow
+```
+
+`--json` prints raw JSONL events. The default watch output is a compact human
+view.
+
+Inspect the current proposed output snapshot:
+
+```bash
+native-agent proposal <run_id> --run-root ./runs
+native-agent proposal <run_id> --run-root ./runs --file SUMMARY.md --json
+```
+
+Inspect background shell jobs and logs:
+
+```bash
+native-agent jobs <run_id> --run-root ./runs
+native-agent job status <job_id> --run <run_id> --run-root ./runs --json
+native-agent job logs <job_id> --run <run_id> --stream stdout --tail-bytes 4096
+native-agent job cancel <job_id> --run <run_id>
+```
+
+## Backend
+
+The standalone backend issues run tokens, starts runner jobs, and exposes status,
+result, event, and tenant usage APIs. It still uses the keyless gateway model
+provider. Provider API keys stay outside the runner backend.
+
+Start a local LLM gateway. This process is the provider-credential boundary:
+
+```bash
+export NAR_BACKEND_ADMIN_TOKEN="admin-dev-token"
+export NAR_LLM_GATEWAY_ADMIN_TOKEN="llm-admin-dev-token"
+export NAR_BACKEND_TOKEN_SECRET="replace-with-32-plus-random-bytes"
+
+native-agent llm-gateway serve \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+Start the runner backend in another process. It shares the token signing secret
+with the LLM and Web gateways so it can issue scoped gateway tokens:
+
+```bash
+native-agent backend serve \
+  --workspace-root /workspaces \
+  --run-root ./runs \
+  --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
+  --web-gateway-url http://127.0.0.1:8090
+```
+
+For local contract testing, start the reference fake WebGateway:
+
+```bash
+export NAR_WEB_GATEWAY_ADMIN_TOKEN="web-admin-dev-token"
+
+native-agent web-gateway serve \
+  --host 127.0.0.1 \
+  --port 8090 \
+  --provider fake
+```
+
+For a real search smoke, use Brave Search for `web.search` and the gateway's
+direct HTTP fetcher for `web.fetch`. Add `--context-provider brave-llm` to use
+Brave's LLM Context endpoint for `web.context`, or `--context-provider
+search-fetch` to build context from the configured search/fetch providers.
+Provider credentials stay in the WebGateway process and are never passed to the
+runner:
+
+```bash
+export BRAVE_SEARCH_API_KEY="..."
+
+native-agent web-gateway serve \
+  --host 127.0.0.1 \
+  --port 8090 \
+  --provider brave-http \
+  --context-provider brave-llm \
+  --brave-api-key-env BRAVE_SEARCH_API_KEY
+```
+
+Create a run:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8765/v1/runs \
+  -H "Authorization: Bearer $NAR_BACKEND_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "tenant_a",
+    "user_id": "user_a",
+    "workspace_root": "/workspaces/demo",
+    "instruction": "Read notes.md and create SUMMARY.md.",
+    "mode": "propose"
+  }'
+```
+
+The response includes a `run_token`. Use that token for:
+
+```bash
+curl -H "Authorization: Bearer $RUN_TOKEN" \
+  http://127.0.0.1:8765/v1/runs/$RUN_ID/status
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
+  http://127.0.0.1:8765/v1/runs/$RUN_ID/result
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
+  http://127.0.0.1:8765/v1/runs/$RUN_ID/events
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
+  http://127.0.0.1:8765/v1/runs/$RUN_ID/proposal
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
+  http://127.0.0.1:8765/v1/runs/$RUN_ID/proposal/files/SUMMARY.md
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
+  http://127.0.0.1:8765/v1/runs/$RUN_ID/jobs
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
+  http://127.0.0.1:8765/v1/runs/$RUN_ID/jobs/$JOB_ID/logs?stream=stdout
+```
+
+Tenant usage is admin-scoped:
+
+```bash
+curl -H "Authorization: Bearer $NAR_BACKEND_ADMIN_TOKEN" \
+  http://127.0.0.1:8765/v1/tenants/tenant_a/usage
+```
+
+The backend generates a separate `llm_gateway` token for the runner-to-gateway
+call. That token is passed only to `GatewayModelAdapter` and is not returned from
+the run APIs. For web-enabled runs, it also generates a separate `web_gateway`
+token for `WebGatewayClient`.
+
+The LLM gateway validates `llm_gateway` tokens, enforces model/reasoning claims,
+calls the provider adapter, stores provider continuation ids server-side, and
+returns only opaque `turn_handle` values to the runner. Its usage endpoint is
+admin-scoped:
+
+```bash
+curl -H "Authorization: Bearer $NAR_LLM_GATEWAY_ADMIN_TOKEN" \
+  http://127.0.0.1:8080/internal/llm/tenants/tenant_a/usage
+```
+
+The WebGateway validates `web_gateway` tokens, enforces `WebPolicy`, calls a web
+provider adapter, and reports tenant usage. v0.11 includes the deterministic
+fake provider plus real search/fetch/context provider composition:
+
+- `BraveSearchProvider`: Brave Search API for result discovery
+- `HttpFetchProvider`: direct HTTP fetch + lightweight HTML-to-text extraction
+- `BraveLlmContextProvider`: Brave LLM Context API normalized behind
+  `ContextProvider`
+- `SearchFetchContextProvider`: provider-agnostic context builder from
+  search/fetch results
+- `CompositeWebProvider`: search/fetch split so Brave can later be replaced by
+  Serper or a CSP-owned context builder without changing runner tools
+
+```bash
+curl -H "Authorization: Bearer $NAR_WEB_GATEWAY_ADMIN_TOKEN" \
+  http://127.0.0.1:8090/internal/web/tenants/tenant_a/usage
+```
+
+## Outputs
+
+Each run writes:
+
+- `events.jsonl`: public redacted event stream
+- `transcript.jsonl`: private debug/replay transcript with full tool payloads
+- `status.json`: latest run status for polling
+- `metrics.json`: final counters and timing
+- `manifest.json`: run contract, visible tools, policies, workspace backend
+- `workspace.base.json`: base snapshot used for proposal comparison
+- `workspace.index.json`: context/index artifact
+- `diff.patch`: proposed or applied workspace diff
+- `proposal.json`: proposed output snapshot metadata
+- `proposal/files/`: materialized changed-file snapshots
+- `artifacts/jobs/<job_id>/job.json`: background job status
+- `artifacts/jobs/<job_id>/stdout.log`
+- `artifacts/jobs/<job_id>/stderr.log`
+- `artifacts/`
+
+`events.jsonl` remains public/redacted. Proposed file contents are exposed only
+through the run directory snapshot or run-token protected backend proposal APIs.
+
+## Event Sinks
+
+Programmatic callers can pass sinks to `AgentLoop(..., event_sinks=(...))`.
+CLI callers can load sinks with:
+
+```bash
+native-agent run \
+  --workspace . \
+  --instruction "Inspect this workspace." \
+  --event-sink-module ./my_sink.py:make_sink
+```
+
+The function must return an object with `emit(event)` and `close()` methods, or
+an iterable of those objects.
+
+## Model Provider Boundary
+
+`GatewayModelAdapter` is the default path. It sends normalized model-turn
+requests to a CSP-owned LLM gateway and can authenticate with
+`NAR_LLM_GATEWAY_TOKEN` or `--llm-gateway-token-file`. Provider credentials stay
+inside CSP backend infrastructure, where tenant usage, budgets, and rate limits
+can be enforced.
+
+`OpenAIModelAdapter` is retained for local smoke tests. CLI use requires both
+`--model-provider openai` and `--allow-direct-provider-api`.
+
+## Defaults
+
+- model provider: `gateway`
+- model: `gpt-5.5`
+- reasoning effort: `medium`
+- mode: `propose`
+- shell disabled by default
+- web.search/web.fetch/web.context disabled by default and available only through WebGateway
+- file mutation tools include write, patch, mkdir, copy, move, and delete in
+  `propose` and `apply` modes
+- no path deny/redact policy unless explicitly provided

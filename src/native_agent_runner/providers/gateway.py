@@ -1,0 +1,275 @@
+from __future__ import annotations
+
+import json
+import os
+import random
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from native_agent_runner.core.spec import ModelConfig
+from native_agent_runner.errors import ModelAdapterError
+from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolCall
+from native_agent_runner.tools.base import ToolSpec
+
+DEFAULT_GATEWAY_URL_ENV = "NAR_LLM_GATEWAY_URL"
+DEFAULT_GATEWAY_TOKEN_ENV = "NAR_LLM_GATEWAY_TOKEN"
+
+GATEWAY_TIMEOUT = "gateway_timeout"
+GATEWAY_NETWORK_ERROR = "gateway_network_error"
+GATEWAY_RATE_LIMITED = "gateway_rate_limited"
+GATEWAY_SERVER_ERROR = "gateway_server_error"
+GATEWAY_AUTH_ERROR = "gateway_auth_error"
+GATEWAY_BAD_RESPONSE = "gateway_bad_response"
+GATEWAY_BAD_REQUEST = "gateway_bad_request"
+
+
+@dataclass
+class GatewayModelAdapter:
+    config: ModelConfig
+    gateway_url: str | None = None
+    token: str | None = None
+    token_env: str = DEFAULT_GATEWAY_TOKEN_ENV
+    token_file: Path | None = None
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        url = self._resolve_gateway_url()
+        payload = self._payload(request)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        retry = self.config.retry
+        max_attempts = max(1, retry.max_attempts)
+        last_error: ModelAdapterError | None = None
+        for attempt in range(1, max_attempts + 1):
+            http_request = Request(
+                url,
+                data=body,
+                headers=self._headers(),
+                method="POST",
+            )
+            try:
+                with urlopen(http_request, timeout=self.config.timeout_s) as response:
+                    response_body = response.read()
+                try:
+                    data = json.loads(response_body.decode("utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise ModelAdapterError(
+                        "LLM gateway returned invalid JSON",
+                        provider_error_code=GATEWAY_BAD_RESPONSE,
+                    ) from exc
+                return _parse_gateway_response(data)
+            except ModelAdapterError as exc:
+                last_error = exc
+                if not _should_retry(exc, attempt, max_attempts, retry.retry_on):
+                    raise
+                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+            except HTTPError as exc:
+                last_error = _error_from_http_error(exc)
+                if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
+                    raise last_error from exc
+                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+            except URLError as exc:
+                last_error = ModelAdapterError(
+                    f"LLM gateway request failed: {exc.reason}",
+                    provider_error_code=GATEWAY_NETWORK_ERROR,
+                    retryable=True,
+                )
+                if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
+                    raise last_error from exc
+                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+            except TimeoutError as exc:
+                last_error = ModelAdapterError(
+                    "LLM gateway request timed out",
+                    provider_error_code=GATEWAY_TIMEOUT,
+                    retryable=True,
+                )
+                if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
+                    raise last_error from exc
+                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+        if last_error is not None:
+            raise last_error
+        raise ModelAdapterError("LLM gateway request failed", provider_error_code=GATEWAY_NETWORK_ERROR)
+
+    def _resolve_gateway_url(self) -> str:
+        url = self.gateway_url or self.config.gateway_url or os.environ.get(DEFAULT_GATEWAY_URL_ENV)
+        if not url:
+            raise ModelAdapterError(
+                f"LLM gateway URL is required via --llm-gateway-url or {DEFAULT_GATEWAY_URL_ENV}"
+            )
+        return url
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "native-agent-runner/0.2",
+        }
+        token = self._resolve_gateway_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _resolve_gateway_token(self) -> str | None:
+        if self.token is not None:
+            return self.token
+        if self.token_file is not None:
+            return self.token_file.read_text(encoding="utf-8").strip()
+        return os.environ.get(self.token_env)
+
+    def _payload(self, request: ModelRequest) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "protocol": "native-agent-runner.llm-turn.v1",
+            "model": self.config.model,
+            "system_prompt": request.system_prompt,
+            "tools": [_gateway_tool_schema(tool) for tool in request.tools],
+        }
+        reasoning = self.config.reasoning
+        if reasoning.effort != "default":
+            payload["reasoning"] = {"effort": reasoning.effort}
+        if reasoning.summary != "off":
+            payload.setdefault("reasoning", {})
+            payload["reasoning"]["summary"] = reasoning.summary
+
+        if request.previous_response_id:
+            payload["previous_turn_handle"] = request.previous_response_id
+            payload["observations"] = [
+                {
+                    "call_id": observation.call_id,
+                    "tool_name": observation.tool_name,
+                    "output": observation.output,
+                }
+                for observation in request.observations
+            ]
+        else:
+            payload["instruction"] = request.instruction
+        return payload
+
+
+def _gateway_tool_schema(tool: ToolSpec) -> dict[str, Any]:
+    return {
+        "id": tool.id,
+        "name": tool.exported_name,
+        "description": tool.description,
+        "input_schema": tool.input_schema,
+        "capability": tool.capability,
+        "side_effect": tool.side_effect,
+    }
+
+
+def _parse_gateway_response(data: dict[str, Any]) -> ModelTurn:
+    if "error" in data:
+        raise ModelAdapterError(
+            str(data["error"]),
+            provider_error_code=str(data.get("error_code") or GATEWAY_BAD_RESPONSE),
+            retryable=bool(data.get("retryable", False)),
+            http_status=int(data["http_status"]) if data.get("http_status") is not None else None,
+        )
+    raw_calls = data.get("tool_calls") or ()
+    tool_calls: list[ToolCall] = []
+    for raw in raw_calls:
+        if not isinstance(raw, dict):
+            raise ModelAdapterError(
+                "LLM gateway returned an invalid tool call",
+                provider_error_code=GATEWAY_BAD_RESPONSE,
+            )
+        args = raw.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError as exc:
+                raise ModelAdapterError(
+                    f"invalid gateway tool call arguments for {raw.get('name')}",
+                    provider_error_code=GATEWAY_BAD_RESPONSE,
+                ) from exc
+        if not isinstance(args, dict):
+            raise ModelAdapterError(
+                f"invalid gateway tool call arguments for {raw.get('name')}",
+                provider_error_code=GATEWAY_BAD_RESPONSE,
+            )
+        tool_calls.append(
+            ToolCall(
+                id=str(raw.get("id") or raw.get("call_id") or ""),
+                name=str(raw.get("name") or ""),
+                arguments=args,
+            )
+        )
+
+    usage = data.get("usage") or {}
+    return ModelTurn(
+        response_id=data.get("response_id") or data.get("turn_handle"),
+        final_text=data.get("final_text"),
+        tool_calls=tuple(tool_calls),
+        usage={
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        },
+        raw=data,
+    )
+
+
+def _error_from_http_error(exc: HTTPError) -> ModelAdapterError:
+    detail = exc.read().decode("utf-8", errors="replace")
+    error_payload: dict[str, Any] = {}
+    try:
+        parsed = json.loads(detail)
+        if isinstance(parsed, dict):
+            error_payload = parsed
+    except json.JSONDecodeError:
+        pass
+    status = int(exc.code)
+    provider_error_code = str(error_payload.get("error_code") or _error_code_for_http_status(status))
+    retryable = bool(error_payload.get("retryable", _retryable_for_http_status(status)))
+    message = str(error_payload.get("error") or detail or f"HTTP {status}")
+    return ModelAdapterError(
+        f"LLM gateway returned HTTP {status}: {message}",
+        provider_error_code=provider_error_code,
+        retryable=retryable,
+        http_status=status,
+    )
+
+
+def _error_code_for_http_status(status: int) -> str:
+    if status == 429:
+        return GATEWAY_RATE_LIMITED
+    if status in {401, 403}:
+        return GATEWAY_AUTH_ERROR
+    if 500 <= status <= 599:
+        return GATEWAY_SERVER_ERROR
+    if 400 <= status <= 499:
+        return GATEWAY_BAD_REQUEST
+    return GATEWAY_BAD_RESPONSE
+
+
+def _retryable_for_http_status(status: int) -> bool:
+    return status == 429 or 500 <= status <= 599
+
+
+def _should_retry(
+    error: ModelAdapterError,
+    attempt: int,
+    max_attempts: int,
+    retry_on: tuple[str, ...],
+) -> bool:
+    return (
+        attempt < max_attempts
+        and error.retryable
+        and bool(error.provider_error_code)
+        and error.provider_error_code in retry_on
+    )
+
+
+def _sleep_before_retry(
+    attempt: int,
+    initial_delay_s: float,
+    max_delay_s: float,
+    backoff_multiplier: float,
+    jitter_s: float,
+) -> None:
+    delay = min(max_delay_s, initial_delay_s * (backoff_multiplier ** max(0, attempt - 1)))
+    if jitter_s > 0:
+        delay += random.uniform(0, jitter_s)
+    if delay > 0:
+        time.sleep(delay)

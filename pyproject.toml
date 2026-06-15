@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "native-agent-runner"
+version = "0.11.0"
+description = "Standalone lightweight API-backed agent harness for safe file work"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    "click>=8.1",
+    "jsonschema>=4.21",
+    "openai>=1.80",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+]
+
+[project.scripts]
+native-agent = "native_agent_runner.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/native_agent_runner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
