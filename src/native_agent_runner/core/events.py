@@ -3,8 +3,9 @@ from __future__ import annotations
 import uuid
 import threading
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
+
+from native_agent_runner.core._util import utc_timestamp
 
 EVENT_SCHEMA_VERSION = "native-agent-runner.event.v1"
 
@@ -133,10 +134,6 @@ class EventBus:
             sink.close()
 
 
-def _utc_timestamp() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
-
 def make_agent_event(
     *,
     run_id: str,
@@ -154,7 +151,7 @@ def make_agent_event(
         run_id=run_id,
         turn_id=turn_id,
         parent_id=parent_id,
-        timestamp=_utc_timestamp(),
+        timestamp=utc_timestamp(),
         type=event_type,
         level=level,
         data=dict(data or {}),

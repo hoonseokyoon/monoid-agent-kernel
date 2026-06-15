@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
+from native_agent_runner.core._util import canonical_sha256, write_json_atomic
 from native_agent_runner.core.events import AgentEvent, EventBus, EventSink, make_agent_event
 from native_agent_runner.core.manifest import RunManifest
 from native_agent_runner.core.result import AgentArtifact
@@ -213,17 +214,17 @@ class AgentRecorder:
 
     def write_manifest(self, manifest: RunManifest) -> Path:
         manifest_path = self.run_dir / "manifest.json"
-        _write_json_atomic(manifest_path, manifest.to_json())
+        write_json_atomic(manifest_path, manifest.to_json())
         return manifest_path
 
     def write_workspace_index(self, payload: dict[str, Any]) -> Path:
         path = self.run_dir / "workspace.index.json"
-        _write_json_atomic(path, payload)
+        write_json_atomic(path, payload)
         return path
 
     def write_workspace_base(self, payload: dict[str, Any]) -> Path:
         path = self.run_dir / "workspace.base.json"
-        _write_json_atomic(path, payload)
+        write_json_atomic(path, payload)
         return path
 
     def write_proposal_snapshot(self, workspace: LocalWorkspaceBackend, diff_path: Path) -> dict[str, Any]:
@@ -246,8 +247,8 @@ class AgentRecorder:
             "changed_paths": [entry["path"] for entry in files],
             "files": files,
         }
-        payload["proposal_hash"] = _canonical_payload_sha256(payload)
-        _write_json_atomic(proposal_path, payload)
+        payload["proposal_hash"] = canonical_sha256(payload, drop=("proposal_hash",))
+        write_json_atomic(proposal_path, payload)
         return payload
 
     def write_metrics(self, metrics: dict[str, Any]) -> Path:
@@ -314,13 +315,6 @@ def append_event_to_run(
     return event
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
-
-
 def _run_id_from_run_dir(run_dir: Path) -> str:
     status_path = run_dir / "status.json"
     if status_path.exists():
@@ -372,16 +366,4 @@ def _update_status_last_event(run_dir: Path, event: AgentEvent) -> None:
     status["updated_at"] = event.timestamp
     if event.type.startswith("proposal."):
         status["proposal_event"] = event.data
-    _write_json_atomic(status_path, status)
-
-
-def _canonical_payload_sha256(payload: dict[str, Any]) -> str:
-    canonical = dict(payload)
-    canonical.pop("proposal_hash", None)
-    data = json.dumps(
-        canonical,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return sha256_bytes(data)
+    write_json_atomic(status_path, status)

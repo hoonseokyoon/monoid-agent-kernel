@@ -5,10 +5,10 @@ import fnmatch
 import hashlib
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from native_agent_runner.core._util import utc_timestamp
 from native_agent_runner.core.spec import RunMode, WorkspaceBackendKind
 from native_agent_runner.errors import WorkspaceError
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
@@ -459,7 +459,7 @@ class LocalWorkspaceBackend:
         return {
             "schema_version": WORKSPACE_BASE_SCHEMA_VERSION,
             "run_id": run_id,
-            "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "created_at": utc_timestamp(),
             "workspace_root": str(self.root),
             "workspace_backend": self.backend_kind,
             "entries": list(self._base_entries),
@@ -848,8 +848,6 @@ class LocalWorkspaceBackend:
             return None
         if rel in self._overlay:
             return self._overlay[rel]
-        if self._uses_overlay():
-            return self._read_disk_optional(rel)
         return self._read_disk_optional(rel)
 
     def _effective_kind(self, rel: str, abs_path: Path) -> str | None:

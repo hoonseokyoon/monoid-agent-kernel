@@ -8,10 +8,10 @@ import tarfile
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
+from native_agent_runner.core._util import canonical_sha256, utc_timestamp, write_json_atomic
 from native_agent_runner.errors import PermissionDenied, WorkspaceError
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
 
@@ -69,7 +69,7 @@ class ApplyResult:
             "approval_hash": self.approval_hash,
             "package_hash": self.package_hash,
         }
-        payload["apply_hash"] = self.apply_hash or _canonical_sha256(payload, drop=("apply_hash",))
+        payload["apply_hash"] = self.apply_hash or canonical_sha256(payload, drop=("apply_hash",))
         return payload
 
 
@@ -82,7 +82,7 @@ class _PackageSource:
 def export_package(run_dir: Path, output: Path) -> dict[str, Any]:
     run_dir = run_dir.resolve()
     package = build_package_manifest(run_dir)
-    _write_json_atomic(run_dir / "proposal.package.json", package)
+    write_json_atomic(run_dir / "proposal.package.json", package)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(output, "w") as archive:
         _add_deterministic_file(archive, run_dir / "proposal.package.json", "proposal.package.json")
@@ -119,12 +119,12 @@ def build_package_manifest(run_dir: Path) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema_version": PACKAGE_SCHEMA_VERSION,
         "run_id": str(proposal.get("run_id") or manifest.get("run_id") or run_dir.name),
-        "created_at": str(manifest.get("created_at") or _utc_timestamp()),
+        "created_at": str(manifest.get("created_at") or utc_timestamp()),
         "proposal_hash": str(proposal["proposal_hash"]),
         "diff_sha256": str(proposal["diff_sha256"]),
         "files": file_entries,
     }
-    payload["package_hash"] = _canonical_sha256(payload, drop=("package_hash",))
+    payload["package_hash"] = canonical_sha256(payload, drop=("package_hash",))
     return payload
 
 
@@ -228,15 +228,15 @@ def create_approval(
             "approved_paths": sorted(approved),
             "rejected_paths": sorted(rejected),
             "approver_id": approver_id,
-            "approved_at": approved_at or _utc_timestamp(),
+            "approved_at": approved_at or utc_timestamp(),
             "note": note,
         }
-        payload["approval_hash"] = _canonical_sha256(payload, drop=("approval_hash",))
+        payload["approval_hash"] = canonical_sha256(payload, drop=("approval_hash",))
         return payload
 
 
 def write_approval(path: Path, approval: dict[str, Any]) -> Path:
-    _write_json_atomic(path, approval)
+    write_json_atomic(path, approval)
     return path
 
 
@@ -325,7 +325,7 @@ def apply_package(
 
 
 def write_apply_result(path: Path, result: ApplyResult) -> Path:
-    _write_json_atomic(path, result.to_json())
+    write_json_atomic(path, result.to_json())
     return path
 
 
@@ -365,7 +365,7 @@ def _verify_materialized_source(package_source: _PackageSource) -> PackageVerifi
 def _verify_package_payload(root: Path, package: dict[str, Any], issues: list[str]) -> None:
     if package.get("schema_version") != PACKAGE_SCHEMA_VERSION:
         issues.append("unsupported package schema")
-    expected_hash = _canonical_sha256(package, drop=("package_hash",))
+    expected_hash = canonical_sha256(package, drop=("package_hash",))
     if package.get("package_hash") != expected_hash:
         issues.append("package_hash mismatch")
     seen: set[str] = set()
@@ -515,7 +515,7 @@ def _write_snapshot(root: Path, file_info: dict[str, Any], target_path: Path) ->
 def _verify_approval_for_package(approval: dict[str, Any], package: dict[str, Any]) -> None:
     if approval.get("schema_version") != APPROVAL_SCHEMA_VERSION:
         raise WorkspaceError("unsupported approval schema")
-    expected_hash = _canonical_sha256(approval, drop=("approval_hash",))
+    expected_hash = canonical_sha256(approval, drop=("approval_hash",))
     if approval.get("approval_hash") != expected_hash:
         raise WorkspaceError("approval_hash mismatch")
     if approval.get("package_hash") != package.get("package_hash"):
@@ -646,7 +646,7 @@ def _extract_tar_safely(source: Path, root: Path) -> None:
 
 
 def _copy_package_source(source_root: Path, package: dict[str, Any], output_root: Path) -> None:
-    _write_json_atomic(output_root / "proposal.package.json", package)
+    write_json_atomic(output_root / "proposal.package.json", package)
     for rel in _package_paths(package):
         safe_rel = _safe_package_path(rel)
         source = (source_root / safe_rel).resolve()
@@ -666,13 +666,6 @@ def _read_json(path_or_payload: Path | dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise WorkspaceError(f"{path_or_payload.name} must contain an object")
     return payload
-
-
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
 
 
 def _safe_package_path(raw: str) -> str:
@@ -721,19 +714,6 @@ def _proposal_changed_paths(root: Path) -> tuple[str, ...]:
     return tuple(str(path) for path in proposal.get("changed_paths") or ())
 
 
-def _canonical_sha256(payload: dict[str, Any], *, drop: tuple[str, ...]) -> str:
-    canonical = dict(payload)
-    for key in drop:
-        canonical.pop(key, None)
-    data = json.dumps(
-        canonical,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
-
-
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -757,7 +737,3 @@ def _approval_id(
         separators=(",", ":"),
     ).encode("utf-8")
     return "approval_" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()[:12]).decode("ascii").rstrip("=")
-
-
-def _utc_timestamp() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")

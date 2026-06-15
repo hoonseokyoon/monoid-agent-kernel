@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
+from native_agent_runner.core._util import utc_timestamp
 from native_agent_runner.core.spec import AgentRunSpec
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.tools.base import ToolSpec
@@ -49,7 +49,7 @@ def build_run_manifest(
     return RunManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         run_id=spec.run_id,
-        created_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        created_at=utc_timestamp(),
         mode=spec.mode,
         workspace_backend=spec.workspace_backend,
         workspace_root=str(spec.workspace_root),

@@ -8,6 +8,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from native_agent_runner.core._util import canonical_sha256
 from native_agent_runner.workspace.paths import normalize_workspace_path
 
 
@@ -579,7 +580,7 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
     if not isinstance(proposal, dict):
         return
     expected_proposal_hash = proposal.get("proposal_hash")
-    actual_proposal_hash = _canonical_sha256(proposal)
+    actual_proposal_hash = canonical_sha256(proposal, drop=("proposal_hash",))
     if expected_proposal_hash != actual_proposal_hash:
         issues.append(ValidationIssue("proposal.json.proposal_hash", "proposal hash mismatch"))
     diff_rel = proposal.get("diff_path")
@@ -614,7 +615,7 @@ def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> No
         return
     if not isinstance(package, dict):
         return
-    if package.get("package_hash") != _canonical_sha256(package, "package_hash"):
+    if package.get("package_hash") != canonical_sha256(package, drop=("package_hash",)):
         issues.append(ValidationIssue("proposal.package.json.package_hash", "package hash mismatch"))
     seen: set[str] = set()
     for index, file_info in enumerate(package.get("files") or []):
@@ -643,20 +644,6 @@ def _validate_canonical_hash(path: Path, hash_key: str, issues: list[ValidationI
     if not isinstance(payload, dict):
         return
     expected = payload.get(hash_key)
-    actual = _canonical_sha256(payload, hash_key)
+    actual = canonical_sha256(payload, drop=(hash_key,))
     if expected != actual:
         issues.append(ValidationIssue(f"{path.name}.{hash_key}", f"{hash_key} mismatch"))
-
-
-def _canonical_sha256(payload: dict[str, Any], *drop: str) -> str:
-    canonical = dict(payload)
-    drop_keys = drop or ("proposal_hash",)
-    for key in drop_keys:
-        canonical.pop(key, None)
-    data = json.dumps(
-        canonical,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from native_agent_runner.core._util import utc_timestamp
 from native_agent_runner.workspace.local import LocalWorkspaceBackend, sha256_bytes
 from native_agent_runner.workspace.paths import is_within
 
@@ -69,7 +69,7 @@ def build_workspace_index(
     return {
         "schema_version": WORKSPACE_INDEX_SCHEMA_VERSION,
         "run_id": run_id,
-        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "generated_at": utc_timestamp(),
         "workspace_root": str(root),
         "max_entries": max_entries,
         "max_hash_bytes": max_hash_bytes,
