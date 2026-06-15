@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from typing import Any, Literal, Protocol
 
+from native_agent_runner._policy_util import dedupe
 from native_agent_runner.errors import ToolPolicyError
 
 ToolPolicyDecisionKind = Literal["allow", "ask", "deny"]
@@ -46,9 +47,9 @@ class ToolPolicy:
 
     def merged(self, *, allow: Iterable[str] = (), deny: Iterable[str] = (), ask: Iterable[str] = ()) -> ToolPolicy:
         return ToolPolicy(
-            allowed_tools=_dedupe((*self.allowed_tools, *allow)),
-            denied_tools=_dedupe((*self.denied_tools, *deny)),
-            ask_tools=_dedupe((*self.ask_tools, *ask)),
+            allowed_tools=dedupe((*self.allowed_tools, *allow)),
+            denied_tools=dedupe((*self.denied_tools, *deny)),
+            ask_tools=dedupe((*self.ask_tools, *ask)),
         )
 
 
@@ -72,13 +73,7 @@ class NormalizedToolPolicy:
     _ask_set: frozenset[str] = field(default_factory=frozenset, repr=False)
 
     def decision_for(self, tool_id: str) -> ToolPolicyDecision:
-        if tool_id in self._denied_set:
-            return ToolPolicyDecision("deny", "denied_by_tool_policy", tool_id)
-        if tool_id in self._ask_set:
-            return ToolPolicyDecision("ask", "tool_approval_required", tool_id)
-        if self._allowed_set and tool_id not in self._allowed_set:
-            return ToolPolicyDecision("deny", "not_in_tool_allowlist", None)
-        return ToolPolicyDecision("allow", "allowed_by_tool_policy", tool_id if self._allowed_set else None)
+        return _decision_for(tool_id, self._allowed_set, self._denied_set, self._ask_set)
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -167,7 +162,7 @@ def _resolve_references(
         if not matches:
             raise ToolPolicyError(f"{field_name} reference matched no registered tools: {ref}")
         matched.extend(matches)
-    return _dedupe(matched)
+    return dedupe(matched)
 
 
 def _matches_reference(reference: str, specs: list[PolicyToolSpec]) -> list[str]:
@@ -201,14 +196,3 @@ def _tuple_from_payload(payload: dict[str, Any], *keys: str) -> tuple[str, ...]:
             raise ToolPolicyError(f"tool_policy.{key} entries must be strings")
         return tuple(value)
     return ()
-
-
-def _dedupe(values: Iterable[str]) -> tuple[str, ...]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return tuple(result)

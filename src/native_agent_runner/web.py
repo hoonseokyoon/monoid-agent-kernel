@@ -10,6 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from native_agent_runner._policy_util import dedupe, str_tuple
 from native_agent_runner.errors import NativeAgentError
 
 DEFAULT_WEB_GATEWAY_TOKEN_ENV = "NAR_WEB_GATEWAY_TOKEN"
@@ -64,8 +65,16 @@ class WebPolicy:
             search_enabled=bool(payload.get("search_enabled", True)),
             fetch_enabled=bool(payload.get("fetch_enabled", True)),
             context_enabled=bool(payload.get("context_enabled", False)),
-            allowed_domains=_string_tuple(payload.get("allowed_domains") or ()),
-            blocked_domains=_string_tuple(payload.get("blocked_domains") or ()),
+            allowed_domains=str_tuple(
+                payload.get("allowed_domains") or (),
+                type_error="web policy domain lists must be arrays",
+                normalize=True,
+            ),
+            blocked_domains=str_tuple(
+                payload.get("blocked_domains") or (),
+                type_error="web policy domain lists must be arrays",
+                normalize=True,
+            ),
             max_search_calls=int(payload.get("max_search_calls", 20)),
             max_fetch_calls=int(payload.get("max_fetch_calls", 50)),
             max_context_calls=int(payload.get("max_context_calls", 10)),
@@ -122,8 +131,8 @@ class WebPolicy:
             search_enabled=self.search_enabled,
             fetch_enabled=self.fetch_enabled,
             context_enabled=self.context_enabled if context_enabled is None else context_enabled,
-            allowed_domains=tuple(dict.fromkeys((*self.allowed_domains, *allowed_domains))),
-            blocked_domains=tuple(dict.fromkeys((*self.blocked_domains, *blocked_domains))),
+            allowed_domains=dedupe((*self.allowed_domains, *allowed_domains)),
+            blocked_domains=dedupe((*self.blocked_domains, *blocked_domains)),
             max_search_calls=self.max_search_calls if max_search_calls is None else max_search_calls,
             max_fetch_calls=self.max_fetch_calls if max_fetch_calls is None else max_fetch_calls,
             max_context_calls=self.max_context_calls if max_context_calls is None else max_context_calls,
@@ -321,12 +330,6 @@ def domain_matches(domain: str, pattern: str) -> bool:
         suffix = normalized_pattern[2:]
         return domain == suffix or domain.endswith(f".{suffix}")
     return domain == normalized_pattern
-
-
-def _string_tuple(value: Any) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)):
-        raise ValueError("web policy domain lists must be arrays")
-    return tuple(str(item).strip().lower() for item in value if str(item).strip())
 
 
 def _optional_positive_int(value: Any, default: int) -> int:
