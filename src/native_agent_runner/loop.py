@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -337,14 +338,67 @@ class AgentToolContext(ToolContext):
             "background_job_bytes_stderr": sum(int(job.get("stderr_bytes") or 0) for job in jobs),
         }
 
-    def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _check_web_enabled(
+        self,
+        *,
+        feature_enabled: bool,
+        calls: int,
+        max_calls: int,
+        disabled_message: str,
+        limit_message: str,
+        limit_code: str,
+    ) -> None:
         if self.web_gateway_client is None or not self.web_policy.enabled:
             raise ToolExecutionError("web gateway is not configured", error_code="web_disabled")
-        if not self.web_policy.search_enabled:
-            raise ToolExecutionError("web search is disabled", error_code="web_disabled")
-        if self.web_search_calls >= self.web_policy.max_search_calls:
-            raise ToolExecutionError("web search call limit exceeded", error_code="web_search_limit_exceeded")
+        if not feature_enabled:
+            raise ToolExecutionError(disabled_message, error_code="web_disabled")
+        if calls >= max_calls:
+            raise ToolExecutionError(limit_message, error_code=limit_code)
 
+    def _run_web_call(
+        self,
+        prefix: str,
+        *,
+        event_data: dict[str, Any],
+        call: Callable[[], dict[str, Any]],
+        on_success: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        started = self.recorder.emit(
+            f"{prefix}.started",
+            turn_id=self.current_turn_id,
+            parent_id=self.current_tool_event_id,
+            data=event_data,
+        )
+        try:
+            result = call()
+        except Exception as exc:
+            self.web_failed_calls += 1
+            self.recorder.emit(
+                f"{prefix}.failed",
+                turn_id=self.current_turn_id,
+                parent_id=started.event_id,
+                data={**event_data, "error": _public_error_message(str(exc)), "error_code": error_code_for_exception(exc)},
+                level="warning",
+            )
+            raise
+        finished_extra = on_success(result)
+        self.recorder.emit(
+            f"{prefix}.finished",
+            turn_id=self.current_turn_id,
+            parent_id=started.event_id,
+            data={**event_data, **finished_extra},
+        )
+        return result
+
+    def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._check_web_enabled(
+            feature_enabled=self.web_policy.search_enabled,
+            calls=self.web_search_calls,
+            max_calls=self.web_policy.max_search_calls,
+            disabled_message="web search is disabled",
+            limit_message="web search call limit exceeded",
+            limit_code="web_search_limit_exceeded",
+        )
         query = str(args["query"])
         requested_max_results = args.get("max_results")
         effective_max_results = self.web_policy.effective_max_results(requested_max_results)
@@ -357,53 +411,38 @@ class AgentToolContext(ToolContext):
             "recency_days": args.get("recency_days"),
             "locale": args.get("locale"),
         }
-        started = self.recorder.emit(
-            "web.search.started",
-            turn_id=self.current_turn_id,
-            parent_id=self.current_tool_event_id,
-            data=event_data,
+        payload = {
+            "protocol": "native-agent-runner.web-search.v1",
+            "query": query,
+            "max_results": effective_max_results,
+            "allowed_domains": list(args.get("allowed_domains") or ()),
+            "blocked_domains": list(args.get("blocked_domains") or ()),
+            "recency_days": args.get("recency_days"),
+            "locale": args.get("locale"),
+        }
+
+        def on_success(result: dict[str, Any]) -> dict[str, Any]:
+            result_count = int(result.get("result_count") or len(result.get("results") or ()))
+            self.web_search_calls += 1
+            self.web_result_count += result_count
+            return {"result_count": result_count}
+
+        return self._run_web_call(
+            "web.search",
+            event_data=event_data,
+            call=lambda: self.web_gateway_client.search(payload),
+            on_success=on_success,
         )
-        try:
-            result = self.web_gateway_client.search(
-                {
-                    "protocol": "native-agent-runner.web-search.v1",
-                    "query": query,
-                    "max_results": effective_max_results,
-                    "allowed_domains": list(args.get("allowed_domains") or ()),
-                    "blocked_domains": list(args.get("blocked_domains") or ()),
-                    "recency_days": args.get("recency_days"),
-                    "locale": args.get("locale"),
-                }
-            )
-        except Exception as exc:
-            self.web_failed_calls += 1
-            self.recorder.emit(
-                "web.search.failed",
-                turn_id=self.current_turn_id,
-                parent_id=started.event_id,
-                data={**event_data, "error": _public_error_message(str(exc)), "error_code": error_code_for_exception(exc)},
-                level="warning",
-            )
-            raise
-        result_count = int(result.get("result_count") or len(result.get("results") or ()))
-        self.web_search_calls += 1
-        self.web_result_count += result_count
-        self.recorder.emit(
-            "web.search.finished",
-            turn_id=self.current_turn_id,
-            parent_id=started.event_id,
-            data={**event_data, "result_count": result_count},
-        )
-        return result
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        if self.web_gateway_client is None or not self.web_policy.enabled:
-            raise ToolExecutionError("web gateway is not configured", error_code="web_disabled")
-        if not self.web_policy.fetch_enabled:
-            raise ToolExecutionError("web fetch is disabled", error_code="web_disabled")
-        if self.web_fetch_calls >= self.web_policy.max_fetch_calls:
-            raise ToolExecutionError("web fetch call limit exceeded", error_code="web_fetch_limit_exceeded")
-
+        self._check_web_enabled(
+            feature_enabled=self.web_policy.fetch_enabled,
+            calls=self.web_fetch_calls,
+            max_calls=self.web_policy.max_fetch_calls,
+            disabled_message="web fetch is disabled",
+            limit_message="web fetch call limit exceeded",
+            limit_code="web_fetch_limit_exceeded",
+        )
         url = str(args["url"])
         requested_timeout_s = args.get("timeout_s")
         requested_max_bytes = args.get("max_bytes")
@@ -418,56 +457,40 @@ class AgentToolContext(ToolContext):
             "requested_max_bytes": requested_max_bytes,
             "effective_max_bytes": effective_max_bytes,
         }
-        started = self.recorder.emit(
-            "web.fetch.started",
-            turn_id=self.current_turn_id,
-            parent_id=self.current_tool_event_id,
-            data=event_data,
-        )
-        try:
-            result = self.web_gateway_client.fetch(
-                {
-                    "protocol": "native-agent-runner.web-fetch.v1",
-                    "url": url,
-                    "format": args.get("format") or "text",
-                    "timeout_s": effective_timeout_s,
-                    "max_bytes": effective_max_bytes,
-                }
-            )
-        except Exception as exc:
-            self.web_failed_calls += 1
-            self.recorder.emit(
-                "web.fetch.failed",
-                turn_id=self.current_turn_id,
-                parent_id=started.event_id,
-                data={**event_data, "error": _public_error_message(str(exc)), "error_code": error_code_for_exception(exc)},
-                level="warning",
-            )
-            raise
-        content_bytes = int(result.get("content_bytes") or len(str(result.get("content") or "").encode("utf-8")))
-        self.web_fetch_calls += 1
-        self.web_bytes_returned += content_bytes
-        self.recorder.emit(
-            "web.fetch.finished",
-            turn_id=self.current_turn_id,
-            parent_id=started.event_id,
-            data={
-                **event_data,
+        payload = {
+            "protocol": "native-agent-runner.web-fetch.v1",
+            "url": url,
+            "format": args.get("format") or "text",
+            "timeout_s": effective_timeout_s,
+            "max_bytes": effective_max_bytes,
+        }
+
+        def on_success(result: dict[str, Any]) -> dict[str, Any]:
+            content_bytes = int(result.get("content_bytes") or len(str(result.get("content") or "").encode("utf-8")))
+            self.web_fetch_calls += 1
+            self.web_bytes_returned += content_bytes
+            return {
                 "final_domain": domain_from_url(str(result.get("final_url") or url)),
                 "content_bytes": content_bytes,
                 "truncated": bool(result.get("truncated", False)),
-            },
+            }
+
+        return self._run_web_call(
+            "web.fetch",
+            event_data=event_data,
+            call=lambda: self.web_gateway_client.fetch(payload),
+            on_success=on_success,
         )
-        return result
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
-        if self.web_gateway_client is None or not self.web_policy.enabled:
-            raise ToolExecutionError("web gateway is not configured", error_code="web_disabled")
-        if not self.web_policy.context_enabled:
-            raise ToolExecutionError("web context is disabled", error_code="web_disabled")
-        if self.web_context_calls >= self.web_policy.max_context_calls:
-            raise ToolExecutionError("web context call limit exceeded", error_code="web_context_limit_exceeded")
-
+        self._check_web_enabled(
+            feature_enabled=self.web_policy.context_enabled,
+            calls=self.web_context_calls,
+            max_calls=self.web_policy.max_context_calls,
+            disabled_message="web context is disabled",
+            limit_message="web context call limit exceeded",
+            limit_code="web_context_limit_exceeded",
+        )
         query = str(args["query"])
         requested_max_tokens = args.get("max_tokens")
         requested_max_urls = args.get("max_urls")
@@ -488,53 +511,36 @@ class AgentToolContext(ToolContext):
             "recency_days": args.get("recency_days"),
             "locale": args.get("locale"),
         }
-        started = self.recorder.emit(
-            "web.context.started",
-            turn_id=self.current_turn_id,
-            parent_id=self.current_tool_event_id,
-            data=event_data,
-        )
-        try:
-            result = self.web_gateway_client.context(
-                {
-                    "protocol": "native-agent-runner.web-context.v1",
-                    "query": query,
-                    "max_tokens": effective_max_tokens,
-                    "max_urls": effective_max_urls,
-                    "max_snippets": effective_max_snippets,
-                    "allowed_domains": list(args.get("allowed_domains") or ()),
-                    "blocked_domains": list(args.get("blocked_domains") or ()),
-                    "recency_days": args.get("recency_days"),
-                    "locale": args.get("locale"),
-                }
-            )
-        except Exception as exc:
-            self.web_failed_calls += 1
-            self.recorder.emit(
-                "web.context.failed",
-                turn_id=self.current_turn_id,
-                parent_id=started.event_id,
-                data={**event_data, "error": _public_error_message(str(exc)), "error_code": error_code_for_exception(exc)},
-                level="warning",
-            )
-            raise
-        source_count = int(result.get("source_count") or len(result.get("sources") or ()))
-        context_bytes = int(result.get("context_bytes") or len(str(result.get("context") or "").encode("utf-8")))
-        self.web_context_calls += 1
-        self.web_context_source_count += source_count
-        self.web_context_bytes_returned += context_bytes
-        self.recorder.emit(
-            "web.context.finished",
-            turn_id=self.current_turn_id,
-            parent_id=started.event_id,
-            data={
-                **event_data,
+        payload = {
+            "protocol": "native-agent-runner.web-context.v1",
+            "query": query,
+            "max_tokens": effective_max_tokens,
+            "max_urls": effective_max_urls,
+            "max_snippets": effective_max_snippets,
+            "allowed_domains": list(args.get("allowed_domains") or ()),
+            "blocked_domains": list(args.get("blocked_domains") or ()),
+            "recency_days": args.get("recency_days"),
+            "locale": args.get("locale"),
+        }
+
+        def on_success(result: dict[str, Any]) -> dict[str, Any]:
+            source_count = int(result.get("source_count") or len(result.get("sources") or ()))
+            context_bytes = int(result.get("context_bytes") or len(str(result.get("context") or "").encode("utf-8")))
+            self.web_context_calls += 1
+            self.web_context_source_count += source_count
+            self.web_context_bytes_returned += context_bytes
+            return {
                 "source_count": source_count,
                 "context_bytes": context_bytes,
                 "estimated_tokens": result.get("estimated_tokens"),
-            },
+            }
+
+        return self._run_web_call(
+            "web.context",
+            event_data=event_data,
+            call=lambda: self.web_gateway_client.context(payload),
+            on_success=on_success,
         )
-        return result
 
 
 @dataclass
