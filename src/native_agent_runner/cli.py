@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import base64
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -31,6 +30,7 @@ from native_agent_runner.core.packages import (
     write_approval,
 )
 from native_agent_runner.core.projections import project_run_status
+from native_agent_runner.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from native_agent_runner.event_loader import load_event_sinks
 from native_agent_runner.jobs import (
     get_job_artifact,
@@ -59,8 +59,6 @@ from native_agent_runner.reference.web_gateway.providers import (
     SearchFetchContextProvider,
 )
 from native_agent_runner.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
-from native_agent_runner.workspace.local import sha256_bytes
-from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
 
 
 @click.group()
@@ -1268,33 +1266,10 @@ def _append_package_event_if_run_dir(
 
 
 def _proposal_file_payload(run_dir: Path, proposal: dict[str, Any], file_path: str) -> dict[str, Any]:
-    rel = normalize_workspace_path(file_path)
-    files = proposal.get("files")
-    if not isinstance(files, list):
-        raise click.ClickException("proposal.json has no files array")
-    file_info = next((item for item in files if isinstance(item, dict) and item.get("path") == rel), None)
-    if file_info is None:
-        raise click.ClickException(f"proposal file not found: {rel}")
-    snapshot_path = file_info.get("snapshot_path")
-    if not isinstance(snapshot_path, str) or not snapshot_path:
-        raise click.ClickException(f"proposal path is not a file: {rel}")
-    abs_path = (run_dir / snapshot_path).resolve()
-    if not is_within(run_dir.resolve(), abs_path):
-        raise click.ClickException("proposal snapshot path escapes run directory")
-    data = abs_path.read_bytes()
-    payload: dict[str, Any] = {
-        "path": rel,
-        "kind": "file",
-        "size": len(data),
-        "sha256": sha256_bytes(data),
-    }
     try:
-        payload["encoding"] = "utf-8"
-        payload["content"] = data.decode("utf-8")
-    except UnicodeDecodeError:
-        payload["encoding"] = "base64"
-        payload["content"] = base64.b64encode(data).decode("ascii")
-    return payload
+        return read_proposal_file_payload(run_dir, proposal, file_path)
+    except ProposalFileError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _compact_event_line(line: str) -> str:

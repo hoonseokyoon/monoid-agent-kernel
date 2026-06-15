@@ -4,7 +4,6 @@ import json
 import threading
 import time
 import uuid
-import base64
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +19,7 @@ from native_agent_runner.core.packages import (
     write_apply_result,
     write_approval,
 )
+from native_agent_runner.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from native_agent_runner.core.result import AgentRunResult
 from native_agent_runner.core.spec import (
     AgentRunSpec,
@@ -44,9 +44,7 @@ from native_agent_runner.recorder import append_event_to_run
 from native_agent_runner.shell import AutoApproveShellApprovalProvider, DenyShellApprovalProvider, ShellPolicy
 from native_agent_runner.tools.policy import ToolPolicy
 from native_agent_runner.web import WebGatewayClient, WebPolicy
-from native_agent_runner.workspace.local import sha256_bytes
 from native_agent_runner.workspace.paths import is_within
-from native_agent_runner.workspace.paths import normalize_workspace_path
 
 BackendRunState = Literal["queued", "running", "completed", "failed", "limited"]
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
@@ -380,41 +378,23 @@ class RunnerBackend:
     def proposal_file(self, run_id: str, token: str, path: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)
         record = self._record(run_id)
-        payload = self._read_proposal(record)
-        if payload is None:
+        proposal = self._read_proposal(record)
+        if proposal is None:
             raise ValueError("proposal snapshot is not ready")
-        rel = normalize_workspace_path(path)
-        files = payload.get("files")
-        if not isinstance(files, list):
-            raise ValueError("proposal snapshot is invalid")
-        file_info = next((item for item in files if isinstance(item, dict) and item.get("path") == rel), None)
-        if file_info is None:
-            raise KeyError(f"proposal file not found: {rel}")
-        snapshot_path = file_info.get("snapshot_path")
-        if not isinstance(snapshot_path, str) or not snapshot_path:
-            raise ValueError(f"proposal path is not a file: {rel}")
-        abs_path = (record.run_dir / snapshot_path).resolve()
-        if not is_within(record.run_dir.resolve(), abs_path):
-            raise PermissionDenied("proposal snapshot path escapes run directory")
-        if not abs_path.exists() or not abs_path.is_file():
-            raise KeyError(f"proposal snapshot file not found: {rel}")
-        data = abs_path.read_bytes()
-        response = {
+        try:
+            file_payload = read_proposal_file_payload(record.run_dir, proposal, path)
+        except ProposalFileError as exc:
+            if exc.reason in {"not_found", "snapshot_missing"}:
+                raise KeyError(str(exc)) from exc
+            if exc.reason == "escapes_run_dir":
+                raise PermissionDenied(str(exc)) from exc
+            raise ValueError(str(exc)) from exc
+        return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
             "status": record.status,
-            "path": rel,
-            "kind": "file",
-            "size": len(data),
-            "sha256": sha256_bytes(data),
+            **file_payload,
         }
-        try:
-            response["encoding"] = "utf-8"
-            response["content"] = data.decode("utf-8")
-        except UnicodeDecodeError:
-            response["encoding"] = "base64"
-            response["content"] = base64.b64encode(data).decode("ascii")
-        return response
 
     def export_proposal_package(self, run_id: str, token: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)
