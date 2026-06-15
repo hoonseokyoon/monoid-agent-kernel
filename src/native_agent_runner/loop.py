@@ -1233,37 +1233,43 @@ class AgentLoop:
         turn_id: str,
         parent_id: str | None,
     ) -> None:
-        if spec.id == "shell.exec":
-            if result.content.get("job_id") and result.content.get("status") == "running":
-                return
-            changed_paths = [
-                public_path(str(path), self.permission_policy)
-                for path in result.content.get("changed_paths", [])
-            ]
-            recorder.emit(
-                "workspace.file.changed",
-                turn_id=turn_id,
-                parent_id=parent_id,
-                data={
-                    "tool": spec.id,
-                    "paths": changed_paths,
-                    "result": {
-                        "exit_code": result.content.get("exit_code"),
-                        "duration_s": result.content.get("duration_s"),
-                        "stdout_bytes": result.content.get("stdout_bytes"),
-                        "stderr_bytes": result.content.get("stderr_bytes"),
-                    },
-                    "mode": context.workspace.mode,
-                },
-            )
-            self._emit_workspace_proposal(context, recorder, turn_id=turn_id, parent_id=parent_id)
-        elif spec.side_effect == "read" and spec.path_args:
+        if spec.side_effect == "read" and spec.path_args:
             recorder.emit(
                 "workspace.file.read",
                 turn_id=turn_id,
                 parent_id=parent_id,
                 data={"tool": spec.id, "paths": _public_paths_from_args(spec, arguments, self.permission_policy)},
             )
+        elif spec.emits_workspace_diff:
+            if (
+                spec.skip_emit_if_background
+                and result.content.get("job_id")
+                and result.content.get("status") == "running"
+            ):
+                return
+            if spec.changed_paths_source == "result_content":
+                paths = [
+                    public_path(str(path), self.permission_policy)
+                    for path in result.content.get("changed_paths", [])
+                ]
+            else:
+                paths = _public_paths_from_args(spec, arguments, self.permission_policy)
+            if spec.result_payload_kind == "shell_exec":
+                result_payload = _shell_result_payload(result)
+            else:
+                result_payload = public_result_content(result.content, self.permission_policy)
+            recorder.emit(
+                "workspace.file.changed",
+                turn_id=turn_id,
+                parent_id=parent_id,
+                data={
+                    "tool": spec.id,
+                    "paths": paths,
+                    "result": result_payload,
+                    "mode": context.workspace.mode,
+                },
+            )
+            self._emit_workspace_proposal(context, recorder, turn_id=turn_id, parent_id=parent_id)
         elif spec.side_effect == "write" and spec.path_args:
             recorder.emit(
                 "workspace.file.changed",
@@ -1314,6 +1320,15 @@ def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
         total_usage[key] += int(turn.usage.get(key, 0))
 
 
+def _shell_result_payload(result: ToolResult) -> dict[str, Any]:
+    return {
+        "exit_code": result.content.get("exit_code"),
+        "duration_s": result.content.get("duration_s"),
+        "stdout_bytes": result.content.get("stdout_bytes"),
+        "stderr_bytes": result.content.get("stderr_bytes"),
+    }
+
+
 def _tool_start_data(
     call_name: str,
     call_id: str,
@@ -1321,13 +1336,13 @@ def _tool_start_data(
     arguments: dict[str, Any],
     permission_policy: PermissionPolicy,
 ) -> dict[str, Any]:
-    preview = (
-        shell_args_preview(arguments, permission_policy)
-        if spec is not None and spec.id == "shell.exec"
-        else web_args_preview(arguments, permission_policy)
-        if spec is not None and spec.id.startswith("web.")
-        else args_preview(arguments, permission_policy)
-    )
+    preview_kind = spec.preview_kind if spec is not None else "args"
+    if preview_kind == "shell":
+        preview = shell_args_preview(arguments, permission_policy)
+    elif preview_kind == "web":
+        preview = web_args_preview(arguments, permission_policy)
+    else:
+        preview = args_preview(arguments, permission_policy)
     return {
         "call_id": call_id,
         "tool": call_name,

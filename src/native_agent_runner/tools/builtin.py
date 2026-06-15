@@ -499,6 +499,11 @@ def _shell_exec() -> ToolSpec:
         side_effect="shell",
         handler=handler,
         path_args=("cwd",),
+        preview_kind="shell",
+        emits_workspace_diff=True,
+        changed_paths_source="result_content",
+        result_payload_kind="shell_exec",
+        skip_emit_if_background=True,
     )
 
 
@@ -607,6 +612,7 @@ def _web_search() -> ToolSpec:
         capability="web.search",
         side_effect="read",
         handler=handler,
+        preview_kind="web",
     )
 
 
@@ -629,6 +635,7 @@ def _web_fetch() -> ToolSpec:
         capability="web.fetch",
         side_effect="read",
         handler=handler,
+        preview_kind="web",
     )
 
 
@@ -655,6 +662,7 @@ def _web_context() -> ToolSpec:
         capability="web.context",
         side_effect="read",
         handler=handler,
+        preview_kind="web",
     )
 
 

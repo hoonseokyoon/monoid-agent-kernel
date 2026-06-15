@@ -10,6 +10,9 @@ from native_agent_runner.errors import ToolExecutionError
 from native_agent_runner.tools.policy import NormalizedToolPolicy, ToolPolicy, normalize_tool_policy
 
 ToolSideEffect = Literal["read", "write", "artifact", "run", "shell"]
+ToolPreviewKind = Literal["args", "shell", "web"]
+ToolChangedPathsSource = Literal["path_args", "result_content"]
+ToolResultPayloadKind = Literal["paths", "shell_exec"]
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,12 @@ class ToolSpec:
     handler: ToolHandler
     provider_name: str | None = None
     path_args: tuple[str, ...] = ()
+    # Declarative hints the engine uses instead of branching on tool identity.
+    preview_kind: ToolPreviewKind = "args"
+    emits_workspace_diff: bool = False
+    changed_paths_source: ToolChangedPathsSource = "path_args"
+    result_payload_kind: ToolResultPayloadKind = "paths"
+    skip_emit_if_background: bool = False
 
     @property
     def exported_name(self) -> str:
