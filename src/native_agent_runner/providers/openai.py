@@ -7,6 +7,7 @@ from typing import Any
 
 from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.errors import ModelAdapterError
+from native_agent_runner.providers._common import build_reasoning_payload, normalize_usage
 from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolCall
 
 
@@ -51,12 +52,9 @@ class OpenAIModelAdapter:
             "instructions": request.system_prompt,
             "tools": [_openai_tool_schema(tool) for tool in request.tools],
         }
-        reasoning = self.config.reasoning
-        if reasoning.effort != "default":
-            payload["reasoning"] = {"effort": reasoning.effort}
-        if reasoning.summary != "off":
-            payload.setdefault("reasoning", {})
-            payload["reasoning"]["summary"] = reasoning.summary
+        reasoning_payload = build_reasoning_payload(self.config.reasoning)
+        if reasoning_payload:
+            payload["reasoning"] = reasoning_payload
 
         if request.previous_turn_handle:
             payload["previous_response_id"] = request.previous_turn_handle
@@ -76,7 +74,7 @@ def _openai_tool_schema(tool: Any) -> dict[str, Any]:
 
 
 def _observation_input_item(observation: Any) -> dict[str, Any]:
-    if observation.tool_name == "background_job" or observation.call_id.startswith("background:"):
+    if observation.is_background:
         return {
             "role": "user",
             "content": (
@@ -117,12 +115,7 @@ def _parse_response(data: dict[str, Any]) -> ModelTurn:
         elif item_type in {"output_text", "text"}:
             text_parts.append(str(item.get("text") or ""))
 
-    usage = data.get("usage") or {}
-    usage_out = {
-        "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
-        "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
-        "total_tokens": int(usage.get("total_tokens") or 0),
-    }
+    usage_out = normalize_usage(data.get("usage"), legacy_aliases=True)
     return ModelTurn(
         response_id=data.get("id"),
         final_text="".join(text_parts).strip() or None,

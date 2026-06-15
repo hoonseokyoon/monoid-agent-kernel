@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.errors import ModelAdapterError
+from native_agent_runner.providers._common import build_reasoning_payload, normalize_usage
 from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolCall
 from native_agent_runner.tools.base import ToolSpec
 
@@ -125,12 +126,9 @@ class GatewayModelAdapter:
             "system_prompt": request.system_prompt,
             "tools": [_gateway_tool_schema(tool) for tool in request.tools],
         }
-        reasoning = self.config.reasoning
-        if reasoning.effort != "default":
-            payload["reasoning"] = {"effort": reasoning.effort}
-        if reasoning.summary != "off":
-            payload.setdefault("reasoning", {})
-            payload["reasoning"]["summary"] = reasoning.summary
+        reasoning_payload = build_reasoning_payload(self.config.reasoning)
+        if reasoning_payload:
+            payload["reasoning"] = reasoning_payload
 
         if request.previous_turn_handle:
             payload["previous_turn_handle"] = request.previous_turn_handle
@@ -139,6 +137,7 @@ class GatewayModelAdapter:
                     "call_id": observation.call_id,
                     "tool_name": observation.tool_name,
                     "output": observation.output,
+                    "is_background": observation.is_background,
                 }
                 for observation in request.observations
             ]
@@ -196,16 +195,11 @@ def _parse_gateway_response(data: dict[str, Any]) -> ModelTurn:
             )
         )
 
-    usage = data.get("usage") or {}
     return ModelTurn(
         response_id=data.get("response_id") or data.get("turn_handle"),
         final_text=data.get("final_text"),
         tool_calls=tuple(tool_calls),
-        usage={
-            "input_tokens": int(usage.get("input_tokens") or 0),
-            "output_tokens": int(usage.get("output_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        },
+        usage=normalize_usage(data.get("usage")),
         raw=data,
     )
 

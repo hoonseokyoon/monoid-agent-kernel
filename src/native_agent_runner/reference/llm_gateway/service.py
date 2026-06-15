@@ -222,4 +222,5 @@ def _parse_observation(raw: dict[str, Any]) -> ToolObservation:
         call_id=str(raw["call_id"]),
         tool_name=str(raw.get("tool_name") or ""),
         output=dict(raw.get("output") or {}),
+        is_background=bool(raw.get("is_background", False)),
     )

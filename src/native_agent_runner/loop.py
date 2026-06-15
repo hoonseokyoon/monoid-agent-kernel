@@ -909,6 +909,7 @@ class AgentLoop:
                 call_id=f"background:{job_id}",
                 tool_name="background_job",
                 output=payload,
+                is_background=True,
             )
             recorder.transcript(
                 {

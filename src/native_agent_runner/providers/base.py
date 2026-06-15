@@ -18,6 +18,7 @@ class ToolObservation:
     call_id: str
     tool_name: str
     output: dict[str, Any]
+    is_background: bool = False
 
 
 @dataclass(frozen=True)

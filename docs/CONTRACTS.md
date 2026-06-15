@@ -68,7 +68,9 @@ class ModelAdapter(Protocol):
 - `ModelTurn`: `response_id`, `final_text`, `tool_calls: tuple[ToolCall, ...]`,
   `usage: dict[str, int]`, `raw`.
 - `ToolCall`: `id`, `name`, `arguments: dict`.
-- `ToolObservation`: `call_id`, `tool_name`, `output: dict`.
+- `ToolObservation`: `call_id`, `tool_name`, `output: dict`, `is_background: bool` (set when the
+  observation carries a completed background-job result; adapters branch on this flag rather than
+  sniffing the tool name / call-id).
 - **Turn threading**: first turn sends `instruction` with `previous_turn_handle=None`. Subsequent
   turns send `previous_turn_handle` (the prior `ModelTurn.response_id`) plus `observations` (tool
   results); `instruction` is omitted. The adapter is responsible for conversation continuity.
@@ -170,7 +172,8 @@ Source of truth: `providers/gateway.py` (`_payload`, `_parse_gateway_response`).
   "instruction": "...",                                    // FIRST turn only
   "previous_turn_handle": "...",                           // SUBSEQUENT turns only
   "observations": [                                        // SUBSEQUENT turns only
-    {"call_id": "...", "tool_name": "fs.read", "output": { /* ToolResult.to_observation() */ }}
+    {"call_id": "...", "tool_name": "fs.read", "output": { /* ToolResult.to_observation() */ },
+     "is_background": false}                                // true for background-job re-entry results
   ]
 }
 ```
