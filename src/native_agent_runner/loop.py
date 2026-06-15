@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from native_agent_runner.core.cancellation import CancellationToken
-from native_agent_runner.core.events import EventSink
+from native_agent_runner.core.events import AgentEvent, EventSink
 from native_agent_runner.core.manifest import build_run_manifest
 from native_agent_runner.core.result import AgentArtifact, AgentRunResult
 from native_agent_runner.core.spec import AgentRunSpec
@@ -1005,106 +1005,77 @@ class AgentLoop:
             data=public_proposal_payload(proposal_payload, self.permission_policy),
         )
 
-    def _execute_tool_call(
+    def _emit_tool_started(
         self,
+        recorder: AgentRecorder,
         *,
         call_name: str,
         call_id: str,
+        spec: ToolSpec | None,
         arguments: dict[str, Any],
-        registry: ToolRegistry,
-        tool_policy: NormalizedToolPolicy,
-        context: AgentToolContext,
-        recorder: AgentRecorder,
-        capabilities: frozenset[str],
         turn_id: str,
         parent_id: str | None,
-        step: int,
-    ) -> ToolObservation:
-        spec: ToolSpec | None = None
-        result: ToolResult
-        started_event = None
-        policy_decision = ""
-        policy_reason = ""
-        try:
-            spec = registry.resolve(call_name)
-            started_event = recorder.emit(
-                "tool.call.started",
-                turn_id=turn_id,
-                parent_id=parent_id,
-                data=_tool_start_data(call_name, call_id, spec, arguments, self.permission_policy),
-            )
-            decision = tool_policy.decision_for(spec.id)
-            policy_decision = decision.decision
-            policy_reason = decision.reason
-            if decision.decision == "deny":
-                raise PermissionDenied(
-                    f"tool denied by policy: {spec.id}",
-                    error_code="tool_policy_denied",
-                )
-            if decision.decision == "ask":
-                raise PermissionDenied(
-                    f"tool requires approval: {spec.id}",
-                    error_code="tool_approval_required",
-                )
-            if spec.id == "shell.exec" and spec.capability not in capabilities:
-                raise PermissionDenied("shell is disabled", error_code="shell_disabled")
-            if spec.id.startswith("web.") and spec.capability not in capabilities:
-                raise PermissionDenied("web is disabled", error_code="web_disabled")
-            registry.validate_args(spec, arguments)
-            self._check_permissions(spec, arguments, capabilities)
-            context.current_tool_call_id = call_id
-            context.current_turn_id = turn_id
-            context.current_tool_event_id = started_event.event_id
-            try:
-                result = spec.handler(context, arguments)
-            finally:
-                context.current_tool_call_id = ""
-                context.current_turn_id = None
-                context.current_tool_event_id = None
-            if result.ok:
-                self._emit_side_effect_event(spec, arguments, result, context, recorder, turn_id, started_event.event_id)
-        except ToolExecutionError as exc:
-            if started_event is None:
-                started_event = recorder.emit(
-                    "tool.call.started",
-                    turn_id=turn_id,
-                    parent_id=parent_id,
-                    data=_tool_start_data(call_name, call_id, spec, arguments, self.permission_policy),
-                )
-            result = ToolResult(ok=False, error=str(exc), error_code=error_code_for_exception(exc))
-        except PermissionDenied as exc:
-            result = ToolResult(ok=False, error=str(exc), error_code=error_code_for_exception(exc))
-            recorder.emit(
-                "permission.denied",
-                turn_id=turn_id,
-                parent_id=started_event.event_id if started_event else parent_id,
-                data={
-                    "call_id": call_id,
-                    "tool": spec.id if spec is not None else call_name,
-                    "requested_tool": call_name,
-                    "error": _public_error_message(str(exc)),
-                    "error_code": result.error_code,
-                    "policy_decision": policy_decision or None,
-                    "policy_reason": policy_reason or None,
-                },
-                level="warning",
-            )
-        except (NativeAgentError, ValueError, TypeError) as exc:
-            result = ToolResult(
-                ok=False,
-                error=str(exc),
-                error_code=error_code_for_exception(exc)
-                if isinstance(exc, NativeAgentError)
-                else "tool_handler_error",
-            )
-            if started_event is None:
-                started_event = recorder.emit(
-                    "tool.call.started",
-                    turn_id=turn_id,
-                    parent_id=parent_id,
-                    data=_tool_start_data(call_name, call_id, spec, arguments, self.permission_policy),
-                )
+    ) -> AgentEvent:
+        return recorder.emit(
+            "tool.call.started",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data=_tool_start_data(call_name, call_id, spec, arguments, self.permission_policy),
+        )
 
+    def _authorize_tool(self, spec: ToolSpec, decision: Any, capabilities: frozenset[str]) -> None:
+        if decision.decision == "deny":
+            raise PermissionDenied(
+                f"tool denied by policy: {spec.id}",
+                error_code="tool_policy_denied",
+            )
+        if decision.decision == "ask":
+            raise PermissionDenied(
+                f"tool requires approval: {spec.id}",
+                error_code="tool_approval_required",
+            )
+        if spec.id == "shell.exec" and spec.capability not in capabilities:
+            raise PermissionDenied("shell is disabled", error_code="shell_disabled")
+        if spec.id.startswith("web.") and spec.capability not in capabilities:
+            raise PermissionDenied("web is disabled", error_code="web_disabled")
+
+    def _invoke_handler(
+        self,
+        spec: ToolSpec,
+        context: AgentToolContext,
+        arguments: dict[str, Any],
+        *,
+        call_id: str,
+        turn_id: str,
+        recorder: AgentRecorder,
+        started_event: AgentEvent,
+    ) -> ToolResult:
+        context.current_tool_call_id = call_id
+        context.current_turn_id = turn_id
+        context.current_tool_event_id = started_event.event_id
+        try:
+            result = spec.handler(context, arguments)
+        finally:
+            context.current_tool_call_id = ""
+            context.current_turn_id = None
+            context.current_tool_event_id = None
+        if result.ok:
+            self._emit_side_effect_event(spec, arguments, result, context, recorder, turn_id, started_event.event_id)
+        return result
+
+    def _finalize_tool_call(
+        self,
+        recorder: AgentRecorder,
+        *,
+        spec: ToolSpec | None,
+        result: ToolResult,
+        started_event: AgentEvent | None,
+        call_name: str,
+        call_id: str,
+        step: int,
+        turn_id: str,
+        parent_id: str | None,
+    ) -> ToolObservation:
         observation = ToolObservation(
             call_id=call_id,
             tool_name=call_name,
@@ -1135,6 +1106,112 @@ class AgentLoop:
             level="info" if result.ok else "warning",
         )
         return observation
+
+    def _execute_tool_call(
+        self,
+        *,
+        call_name: str,
+        call_id: str,
+        arguments: dict[str, Any],
+        registry: ToolRegistry,
+        tool_policy: NormalizedToolPolicy,
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        capabilities: frozenset[str],
+        turn_id: str,
+        parent_id: str | None,
+        step: int,
+    ) -> ToolObservation:
+        spec: ToolSpec | None = None
+        result: ToolResult
+        started_event: AgentEvent | None = None
+        policy_decision = ""
+        policy_reason = ""
+        try:
+            spec = registry.resolve(call_name)
+            started_event = self._emit_tool_started(
+                recorder,
+                call_name=call_name,
+                call_id=call_id,
+                spec=spec,
+                arguments=arguments,
+                turn_id=turn_id,
+                parent_id=parent_id,
+            )
+            decision = tool_policy.decision_for(spec.id)
+            policy_decision = decision.decision
+            policy_reason = decision.reason
+            self._authorize_tool(spec, decision, capabilities)
+            registry.validate_args(spec, arguments)
+            self._check_permissions(spec, arguments, capabilities)
+            result = self._invoke_handler(
+                spec,
+                context,
+                arguments,
+                call_id=call_id,
+                turn_id=turn_id,
+                recorder=recorder,
+                started_event=started_event,
+            )
+        except ToolExecutionError as exc:
+            if started_event is None:
+                started_event = self._emit_tool_started(
+                    recorder,
+                    call_name=call_name,
+                    call_id=call_id,
+                    spec=spec,
+                    arguments=arguments,
+                    turn_id=turn_id,
+                    parent_id=parent_id,
+                )
+            result = ToolResult(ok=False, error=str(exc), error_code=error_code_for_exception(exc))
+        except PermissionDenied as exc:
+            result = ToolResult(ok=False, error=str(exc), error_code=error_code_for_exception(exc))
+            recorder.emit(
+                "permission.denied",
+                turn_id=turn_id,
+                parent_id=started_event.event_id if started_event else parent_id,
+                data={
+                    "call_id": call_id,
+                    "tool": spec.id if spec is not None else call_name,
+                    "requested_tool": call_name,
+                    "error": _public_error_message(str(exc)),
+                    "error_code": result.error_code,
+                    "policy_decision": policy_decision or None,
+                    "policy_reason": policy_reason or None,
+                },
+                level="warning",
+            )
+        except (NativeAgentError, ValueError, TypeError) as exc:
+            result = ToolResult(
+                ok=False,
+                error=str(exc),
+                error_code=error_code_for_exception(exc)
+                if isinstance(exc, NativeAgentError)
+                else "tool_handler_error",
+            )
+            if started_event is None:
+                started_event = self._emit_tool_started(
+                    recorder,
+                    call_name=call_name,
+                    call_id=call_id,
+                    spec=spec,
+                    arguments=arguments,
+                    turn_id=turn_id,
+                    parent_id=parent_id,
+                )
+
+        return self._finalize_tool_call(
+            recorder,
+            spec=spec,
+            result=result,
+            started_event=started_event,
+            call_name=call_name,
+            call_id=call_id,
+            step=step,
+            turn_id=turn_id,
+            parent_id=parent_id,
+        )
 
     def _check_run_boundary(self, deadline: float | None) -> None:
         if self.cancellation_token is not None and self.cancellation_token.requested:
