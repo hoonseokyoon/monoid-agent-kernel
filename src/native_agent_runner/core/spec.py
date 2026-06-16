@@ -207,21 +207,41 @@ class AgentRunSpec:
             raise ValueError("spec.instruction is required")
         if not payload.get("workspace_root"):
             raise ValueError("spec.workspace_root is required")
+        # Lazy import avoids a module-load cycle (profiles imports spec types).
+        from native_agent_runner.core.profiles import resolve_profile
+
+        profile_name = payload.get("profile")
+        profile = resolve_profile(str(profile_name)) if profile_name else None
+        metadata = dict(payload.get("metadata") or {})
+        if profile is not None:
+            metadata.setdefault("profile", profile.name)
         capabilities = payload.get("capabilities")
         kwargs: dict[str, Any] = {
             "instruction": str(payload["instruction"]),
             "workspace_root": Path(str(payload["workspace_root"])),
             "run_root": Path(str(payload.get("run_root") or "runs")),
-            "mode": payload.get("mode", "propose"),
+            "mode": payload["mode"] if "mode" in payload else (profile.mode if profile else "propose"),
             "workspace_backend": payload.get("workspace_backend", "overlay"),
             "model": ModelConfig.from_json(payload.get("model")),
-            "limits": RunLimits.from_json(payload.get("limits")),
+            "limits": (
+                RunLimits.from_json(payload["limits"])
+                if "limits" in payload
+                else (profile.limits if profile else RunLimits())
+            ),
             "capabilities": None if capabilities is None else frozenset(str(c) for c in capabilities),
             "permission_policy": PermissionPolicy.from_json(payload.get("permission_policy")),
             "tool_policy": ToolPolicy.from_json(payload.get("tool_policy")),
-            "shell_policy": ShellPolicy.from_json(payload.get("shell_policy")),
-            "web_policy": WebPolicy.from_json(payload.get("web_policy")),
-            "metadata": dict(payload.get("metadata") or {}),
+            "shell_policy": (
+                ShellPolicy.from_json(payload["shell_policy"])
+                if "shell_policy" in payload
+                else (profile.shell_policy if profile else ShellPolicy())
+            ),
+            "web_policy": (
+                WebPolicy.from_json(payload["web_policy"])
+                if "web_policy" in payload
+                else (profile.web_policy if profile else WebPolicy())
+            ),
+            "metadata": metadata,
         }
         run_id = payload.get("run_id")
         if run_id:

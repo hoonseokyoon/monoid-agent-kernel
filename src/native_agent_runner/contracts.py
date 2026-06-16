@@ -24,6 +24,14 @@ from native_agent_runner.core.spec import (
 )
 from native_agent_runner.core.result import AgentArtifact, AgentRunResult
 
+# Configuration profiles (named capability/limits presets)
+from native_agent_runner.core.profiles import (
+    AGENT_PROFILES,
+    PROFILE_NAMES,
+    AgentProfile,
+    resolve_profile,
+)
+
 # Model adapter contract
 from native_agent_runner.providers.base import (
     ModelAdapter,
@@ -72,6 +80,11 @@ __all__ = [
     "RunLimits",
     "AgentArtifact",
     "AgentRunResult",
+    # configuration profiles
+    "AgentProfile",
+    "AGENT_PROFILES",
+    "PROFILE_NAMES",
+    "resolve_profile",
     # model adapter contract
     "ModelAdapter",
     "ModelRequest",
