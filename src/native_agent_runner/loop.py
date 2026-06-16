@@ -40,7 +40,7 @@ from native_agent_runner.shell import (
     ShellPolicy,
     ShellApprovalProvider,
 )
-from native_agent_runner.tool_services import CallContext, ShellService, WebService
+from native_agent_runner.tool_services import CallContext, JobsService, ShellService, WebService
 from native_agent_runner.tools.base import ToolContext, ToolProvider, ToolRegistry, ToolResult, ToolSpec
 from native_agent_runner.tools.builtin import builtin_tools
 from native_agent_runner.tools.policy import NormalizedToolPolicy
@@ -63,13 +63,12 @@ class AgentToolContext(ToolContext):
     job_manager: BackgroundJobManager
     shell_service: ShellService
     web_service: WebService
+    jobs_service: JobsService
     final_text: str = ""
     finished: bool = False
     plan: list[dict[str, Any]] = field(default_factory=list)
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
-    current_tool_call_id: str = ""
-    current_turn_id: str | None = None
-    current_tool_event_id: str | None = None
+    _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
 
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
@@ -114,57 +113,31 @@ class AgentToolContext(ToolContext):
         self.finished = True
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.shell_service.execute(args, self._call_context())
-
-    def _call_context(self) -> CallContext:
-        return CallContext(
-            tool_call_id=self.current_tool_call_id,
-            turn_id=self.current_turn_id,
-            tool_event_id=self.current_tool_event_id,
-        )
+        return self.shell_service.execute(args, self._current_call)
 
     def list_jobs(self) -> list[dict[str, Any]]:
-        return self.job_manager.list_jobs()
+        return self.jobs_service.list_jobs()
 
     def job_status(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.status(str(args["job_id"]))
+        return self.jobs_service.status(args)
 
     def job_logs(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.logs(
-            str(args["job_id"]),
-            stream=str(args.get("stream") or "stdout"),  # type: ignore[arg-type]
-            tail_bytes=args.get("tail_bytes"),
-            offset=args.get("offset"),
-        )
+        return self.jobs_service.logs(args)
 
     def job_cancel(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.cancel(str(args["job_id"]))
+        return self.jobs_service.cancel(args)
 
     def job_wait(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.wait(str(args["job_id"]), timeout_s=args.get("timeout_s"))
-
-    def background_metrics(self) -> dict[str, Any]:
-        jobs = self.job_manager.list_jobs()
-        terminal_jobs = [job for job in jobs if job.get("status") != "running"]
-        failed_statuses = {"failed", "timed_out", "output_limited"}
-        return {
-            "background_jobs_started": len(jobs),
-            "background_jobs_finished": sum(1 for job in terminal_jobs if job.get("status") == "exited"),
-            "background_jobs_failed": sum(1 for job in terminal_jobs if job.get("status") in failed_statuses),
-            "background_jobs_cancelled": sum(1 for job in terminal_jobs if job.get("status") == "cancelled"),
-            "background_job_duration_s_total": sum(float(job.get("duration_s") or 0.0) for job in terminal_jobs),
-            "background_job_bytes_stdout": sum(int(job.get("stdout_bytes") or 0) for job in jobs),
-            "background_job_bytes_stderr": sum(int(job.get("stderr_bytes") or 0) for job in jobs),
-        }
+        return self.jobs_service.wait(args)
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.search(args, self._call_context())
+        return self.web_service.search(args, self._current_call)
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.fetch(args, self._call_context())
+        return self.web_service.fetch(args, self._current_call)
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.context(args, self._call_context())
+        return self.web_service.context(args, self._current_call)
 
 
 @dataclass
@@ -215,6 +188,7 @@ class AgentLoop:
             recorder=recorder,
             web_gateway_client=self.web_gateway_client,
         )
+        jobs_service = JobsService(job_manager=job_manager)
         context = AgentToolContext(
             self.spec.run_id,
             workspace,
@@ -222,6 +196,7 @@ class AgentLoop:
             job_manager,
             shell_service,
             web_service,
+            jobs_service,
             permission_policy=self.permission_policy,
         )
         registry = ToolRegistry()
@@ -449,7 +424,7 @@ class AgentLoop:
             context.job_manager.cancel_all()
             diff_path = recorder.write_diff(workspace.diff_patch())
             proposal_payload = recorder.write_proposal_snapshot(workspace, diff_path)
-            background_metrics = context.background_metrics()
+            background_metrics = context.jobs_service.background_metrics()
             metrics = {
                 "status": status,
                 "duration_s": time.time() - started,
@@ -690,15 +665,15 @@ class AgentLoop:
         recorder: AgentRecorder,
         started_event: AgentEvent,
     ) -> ToolResult:
-        context.current_tool_call_id = call_id
-        context.current_turn_id = turn_id
-        context.current_tool_event_id = started_event.event_id
+        context._current_call = CallContext(
+            tool_call_id=call_id,
+            turn_id=turn_id,
+            tool_event_id=started_event.event_id,
+        )
         try:
             result = spec.handler(context, arguments)
         finally:
-            context.current_tool_call_id = ""
-            context.current_turn_id = None
-            context.current_tool_event_id = None
+            context._current_call = CallContext("", None, None)
         if result.ok:
             self._emit_side_effect_event(spec, arguments, result, context, recorder, turn_id, started_event.event_id)
         return result
