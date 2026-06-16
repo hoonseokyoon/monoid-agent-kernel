@@ -26,6 +26,7 @@ from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.providers.base import ModelAdapter, ModelRequest, ModelTurn, ToolObservation
 from native_agent_runner.public_view import (
     args_preview,
+    public_error_message,
     public_path,
     public_proposal_payload,
     public_result_content,
@@ -37,11 +38,9 @@ from native_agent_runner.shell import (
     AutoApproveShellApprovalProvider,
     DenyShellApprovalProvider,
     ShellPolicy,
-    ShellApprovalDecision,
     ShellApprovalProvider,
-    ShellApprovalRequest,
-    execute_shell,
 )
+from native_agent_runner.tool_services import CallContext, ShellService
 from native_agent_runner.tools.base import ToolContext, ToolProvider, ToolRegistry, ToolResult, ToolSpec
 from native_agent_runner.tools.builtin import builtin_tools
 from native_agent_runner.tools.policy import NormalizedToolPolicy
@@ -68,20 +67,16 @@ class AgentToolContext(ToolContext):
     workspace: Workspace
     recorder: AgentRecorder
     job_manager: BackgroundJobManager
+    shell_service: ShellService
     final_text: str = ""
     finished: bool = False
     plan: list[dict[str, Any]] = field(default_factory=list)
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
-    shell_policy: ShellPolicy = field(default_factory=ShellPolicy)
-    shell_approval_provider: ShellApprovalProvider | None = None
     web_policy: WebPolicy = field(default_factory=WebPolicy)
     web_gateway_client: WebGatewayClient | None = None
     current_tool_call_id: str = ""
     current_turn_id: str | None = None
     current_tool_event_id: str | None = None
-    shell_calls: int = 0
-    failed_shell_calls: int = 0
-    total_shell_duration_s: float = 0.0
     web_search_calls: int = 0
     web_fetch_calls: int = 0
     web_context_calls: int = 0
@@ -134,167 +129,14 @@ class AgentToolContext(ToolContext):
         self.finished = True
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
-        command = str(args["command"])
-        cwd = str(args.get("cwd") or ".")
-        requested_timeout_s = args.get("timeout_s")
-        requested_max_output_bytes = args.get("max_output_bytes")
-        requested_startup_wait_s = args.get("startup_wait_s")
-        timeout_s = self.shell_policy.effective_timeout(requested_timeout_s)
-        max_output_bytes = self.shell_policy.effective_output_limit(requested_max_output_bytes)
-        startup_wait_s = self.shell_policy.effective_startup_wait(requested_startup_wait_s)
-        execution_workspace = self.shell_policy.effective_execution_workspace(self.workspace.backend_kind)
-        background = bool(args.get("background", False))
-        resume_on_exit = bool(args.get("resume_on_exit", True))
-        env = args.get("env") or {}
-        if not isinstance(env, dict):
-            raise ToolExecutionError("shell env must be an object", error_code="tool_args_invalid")
-        request = ShellApprovalRequest(
-            run_id=self.run_id,
-            tool_call_id=self.current_tool_call_id,
-            command=command,
-            cwd=cwd,
-            requested_timeout_s=int(requested_timeout_s) if requested_timeout_s is not None else None,
-            effective_timeout_s=timeout_s,
-            requested_max_output_bytes=int(requested_max_output_bytes) if requested_max_output_bytes is not None else None,
-            effective_max_output_bytes=max_output_bytes,
-            execution_workspace=execution_workspace,
-            requested_startup_wait_s=int(requested_startup_wait_s) if requested_startup_wait_s is not None else None,
-            effective_startup_wait_s=startup_wait_s,
-            background=background,
-            resume_on_exit=resume_on_exit,
-            env_keys=tuple(sorted(str(key) for key in env)),
-        )
-        approval_parent = self.current_tool_event_id
-        self.recorder.emit(
-            "tool.approval.requested",
-            turn_id=self.current_turn_id,
-            parent_id=approval_parent,
-            data=request.to_public_json(),
-        )
-        provider = self.shell_approval_provider
-        if provider is None:
-            decision = ShellApprovalDecision(
-                approved=False,
-                reason="shell approval provider unavailable",
-                approver_id="none",
-            )
-        else:
-            decision = provider.approve_shell(request)
-        approval_event_type = "tool.approval.approved" if decision.approved else "tool.approval.denied"
-        self.recorder.emit(
-            approval_event_type,
-            turn_id=self.current_turn_id,
-            parent_id=approval_parent,
-            data={**request.to_public_json(), **decision.to_public_json()},
-            level="info" if decision.approved else "warning",
-        )
-        if not decision.approved:
-            raise ToolExecutionError(decision.reason or "shell approval denied", error_code="tool_approval_denied")
+        return self.shell_service.execute(args, self._call_context())
 
-        shell_started = self.recorder.emit(
-            "shell.exec.started",
+    def _call_context(self) -> CallContext:
+        return CallContext(
+            tool_call_id=self.current_tool_call_id,
             turn_id=self.current_turn_id,
-            parent_id=approval_parent,
-            data=request.to_public_json(),
+            tool_event_id=self.current_tool_event_id,
         )
-        if background:
-            try:
-                job = self.job_manager.start_shell_job(
-                    command=command,
-                    cwd=cwd,
-                    timeout_s=timeout_s,
-                    max_output_bytes=max_output_bytes,
-                    startup_wait_s=startup_wait_s,
-                    env=env,
-                    requested_timeout_s=request.requested_timeout_s,
-                    requested_max_output_bytes=request.requested_max_output_bytes,
-                    requested_startup_wait_s=request.requested_startup_wait_s,
-                    execution_workspace=execution_workspace,
-                    resume_on_exit=resume_on_exit,
-                )
-            except Exception as exc:
-                self.failed_shell_calls += 1
-                self.recorder.emit(
-                    "shell.exec.failed",
-                    turn_id=self.current_turn_id,
-                    parent_id=shell_started.event_id,
-                    data={
-                        **request.to_public_json(),
-                        "error": _public_error_message(str(exc)),
-                        "error_code": error_code_for_exception(exc),
-                    },
-                    level="warning",
-                )
-                raise
-            self.shell_calls += 1
-            content = job.started_content(self.recorder.run_dir)
-            self.recorder.emit(
-                "shell.exec.finished",
-                turn_id=self.current_turn_id,
-                parent_id=shell_started.event_id,
-                data={
-                    **request.to_public_json(),
-                    "job_id": job.job_id,
-                    "status": job.status,
-                    "stdout_path": content["stdout_path"],
-                    "stderr_path": content["stderr_path"],
-                },
-            )
-            return content
-        try:
-            result = execute_shell(
-                workspace=self.workspace,
-                policy=self.shell_policy,
-                permission_policy=self.permission_policy,
-                command=command,
-                cwd=cwd,
-                timeout_s=timeout_s,
-                max_output_bytes=max_output_bytes,
-                env=env,
-                requested_timeout_s=request.requested_timeout_s,
-                requested_max_output_bytes=request.requested_max_output_bytes,
-                execution_workspace=execution_workspace,
-            )
-        except Exception as exc:
-            self.failed_shell_calls += 1
-            self.recorder.emit(
-                "shell.exec.failed",
-                turn_id=self.current_turn_id,
-                parent_id=shell_started.event_id,
-                data={
-                    **request.to_public_json(),
-                    "error": _public_error_message(str(exc)),
-                    "error_code": error_code_for_exception(exc),
-                },
-                level="warning",
-            )
-            raise
-        self.shell_calls += 1
-        self.total_shell_duration_s += result.duration_s
-        if result.timed_out or result.output_truncated:
-            self.failed_shell_calls += 1
-        self.recorder.emit(
-            "shell.exec.failed" if result.timed_out or result.output_truncated else "shell.exec.finished",
-            turn_id=self.current_turn_id,
-            parent_id=shell_started.event_id,
-            data={
-                **request.to_public_json(),
-                "exit_code": result.exit_code,
-                "timed_out": result.timed_out,
-                "output_truncated": result.output_truncated,
-                "duration_s": result.duration_s,
-                "stdout_bytes": result.stdout_bytes,
-                "stderr_bytes": result.stderr_bytes,
-                "requested_timeout_s": result.requested_timeout_s,
-                "effective_timeout_s": result.effective_timeout_s,
-                "requested_max_output_bytes": result.requested_max_output_bytes,
-                "effective_max_output_bytes": result.effective_max_output_bytes,
-                "execution_workspace": result.execution_workspace,
-                "changed_paths": [public_path(path, self.permission_policy) for path in result.changed_paths],
-            },
-            level="warning" if result.timed_out or result.output_truncated else "info",
-        )
-        return result.to_tool_content()
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self.job_manager.list_jobs()
@@ -369,7 +211,7 @@ class AgentToolContext(ToolContext):
                 f"{prefix}.failed",
                 turn_id=self.current_turn_id,
                 parent_id=started.event_id,
-                data={**event_data, "error": _public_error_message(str(exc)), "error_code": error_code_for_exception(exc)},
+                data={**event_data, "error": public_error_message(str(exc)), "error_code": error_code_for_exception(exc)},
                 level="warning",
             )
             raise
@@ -566,17 +408,25 @@ class AgentLoop:
             shell_policy=self.spec.shell_policy,
             permission_policy=self.permission_policy,
         )
+        shell_service = ShellService(
+            run_id=self.spec.run_id,
+            workspace=workspace,
+            recorder=recorder,
+            job_manager=job_manager,
+            shell_policy=self.spec.shell_policy,
+            permission_policy=self.permission_policy,
+            approval_provider=_shell_approval_provider(
+                self.spec.shell_policy,
+                self.shell_approval_provider,
+            ),
+        )
         context = AgentToolContext(
             self.spec.run_id,
             workspace,
             recorder,
             job_manager,
+            shell_service,
             permission_policy=self.permission_policy,
-            shell_policy=self.spec.shell_policy,
-            shell_approval_provider=_shell_approval_provider(
-                self.spec.shell_policy,
-                self.shell_approval_provider,
-            ),
             web_policy=self.spec.web_policy,
             web_gateway_client=self.web_gateway_client,
         )
@@ -795,7 +645,7 @@ class AgentLoop:
             recorder.emit(
                 "run.failed",
                 data={
-                    "error": _public_error_message(error),
+                    "error": public_error_message(error),
                     "error_code": error_code,
                     "type": type(exc).__name__,
                 },
@@ -816,9 +666,7 @@ class AgentLoop:
                 "requested_reasoning_effort": self.spec.model.reasoning.effort,
                 "effective_reasoning_effort": self.spec.model.reasoning.effort,
                 "error_code": error_code,
-                "shell_calls": context.shell_calls,
-                "failed_shell_calls": context.failed_shell_calls,
-                "total_shell_duration_s": context.total_shell_duration_s,
+                **context.shell_service.metrics(),
                 **background_metrics,
                 "web_search_calls": context.web_search_calls,
                 "web_fetch_calls": context.web_fetch_calls,
@@ -856,7 +704,7 @@ class AgentLoop:
                 "run.finished",
                 data={
                     "status": status,
-                    "error": _public_error_message(error),
+                    "error": public_error_message(error),
                     "error_code": error_code,
                     "final_text": final_text,
                     "duration_s": metrics["duration_s"],
@@ -1105,7 +953,7 @@ class AgentLoop:
                 "call_id": call_id,
                 "tool": call_name,
                 "ok": result.ok,
-                "error": _public_error_message(result.error),
+                "error": public_error_message(result.error),
                 "error_code": result.error_code,
             },
             level="info" if result.ok else "warning",
@@ -1180,7 +1028,7 @@ class AgentLoop:
                     "call_id": call_id,
                     "tool": spec.id if spec is not None else call_name,
                     "requested_tool": call_name,
-                    "error": _public_error_message(str(exc)),
+                    "error": public_error_message(str(exc)),
                     "error_code": result.error_code,
                     "policy_decision": policy_decision or None,
                     "policy_reason": policy_reason or None,
@@ -1364,11 +1212,3 @@ def _public_paths_from_args(
         for name in spec.path_args
         if name in arguments and arguments[name] is not None
     ]
-
-
-def _public_error_message(error: str) -> str:
-    if not error:
-        return ""
-    if "PRIVATE KEY" in error.upper():
-        return "[redacted-sensitive-error]"
-    return error

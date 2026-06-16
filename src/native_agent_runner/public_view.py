@@ -12,6 +12,14 @@ def public_path(path: str, policy: PermissionPolicy) -> str:
     return REDACTED_PATH if policy.is_path_redacted(path) else path
 
 
+def public_error_message(error: str) -> str:
+    if not error:
+        return ""
+    if "PRIVATE KEY" in error.upper():
+        return "[redacted-sensitive-error]"
+    return error
+
+
 def public_result_content(content: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
     public: dict[str, Any] = {}
     for key, value in content.items():
