@@ -26,6 +26,10 @@ class AgentProfile:
     shell_policy: ShellPolicy
     web_policy: WebPolicy
     limits: RunLimits
+    # Persona/role segments appended to the base system prompt. The three built-in
+    # weight-class profiles leave this empty (they tune capability, not identity);
+    # a specialization profile (e.g. a coding agent) carries its persona here.
+    persona_segments: tuple[str, ...] = ()
 
 
 AGENT_PROFILES: dict[str, AgentProfile] = {

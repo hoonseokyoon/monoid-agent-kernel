@@ -5,6 +5,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from native_agent_runner.core.content import (
+    ContentPart,
+    TextPart,
+    content_part_from_json,
+    content_part_to_json,
+)
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.shell import ShellPolicy
 from native_agent_runner.tools.policy import ToolPolicy
@@ -180,7 +186,23 @@ class AgentRunSpec:
     tool_policy: ToolPolicy = field(default_factory=ToolPolicy)
     shell_policy: ShellPolicy = field(default_factory=ShellPolicy)
     web_policy: WebPolicy = field(default_factory=WebPolicy)
+    system_prompt_base: str | None = None
+    persona_segments: tuple[str, ...] = ()
+    # Richer multimodal input superset of `instruction` (contract-only for now;
+    # see core/content.py). Empty => the run uses `instruction` as a single text part.
+    input: tuple[ContentPart, ...] = ()
     metadata: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def effective_input(self) -> tuple[ContentPart, ...]:
+        """The canonical input parts: explicit `input` if given, else a single
+        text part synthesized from `instruction`."""
+        return self.input or (TextPart(self.instruction),)
+
+    @classmethod
+    def from_instruction(cls, instruction: str, **kwargs: Any) -> AgentRunSpec:
+        """Convenience constructor for the common text-only case."""
+        return cls(instruction=instruction, **kwargs)
 
     def effective_capabilities(self) -> frozenset[str]:
         if self.capabilities is not None:
@@ -241,6 +263,17 @@ class AgentRunSpec:
                 if "web_policy" in payload
                 else (profile.web_policy if profile else WebPolicy())
             ),
+            "system_prompt_base": payload.get("system_prompt_base"),
+            "persona_segments": (
+                tuple(str(s) for s in payload["persona_segments"])
+                if "persona_segments" in payload
+                else (profile.persona_segments if profile else ())
+            ),
+            "input": (
+                tuple(content_part_from_json(p) for p in payload["input"])
+                if "input" in payload
+                else ()
+            ),
             "metadata": metadata,
         }
         run_id = payload.get("run_id")
@@ -263,5 +296,8 @@ class AgentRunSpec:
             "tool_policy": self.tool_policy.to_json(),
             "shell_policy": self.shell_policy.to_json(),
             "web_policy": self.web_policy.to_json(),
+            "system_prompt_base": self.system_prompt_base,
+            "persona_segments": list(self.persona_segments),
+            "input": [content_part_to_json(p) for p in self.input],
             "metadata": dict(self.metadata),
         }

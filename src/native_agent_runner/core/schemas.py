@@ -118,6 +118,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         required=("step",),
     ),
+    "model.input.degraded": _data_schema(
+        {"dropped_part_types": _STR_ARRAY, "reason": _STR},
+        required=("reason",),
+    ),
     "metrics.updated": _data_schema(
         {
             "step": _INT,

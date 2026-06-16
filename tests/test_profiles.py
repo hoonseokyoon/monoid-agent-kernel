@@ -70,6 +70,33 @@ def test_profile_recorded_in_metadata() -> None:
     assert spec.metadata["profile"] == "heavyweight"
 
 
+def test_builtin_profiles_carry_no_persona() -> None:
+    # The three weight-class presets tune capability, not identity.
+    for name in PROFILE_NAMES:
+        assert resolve_profile(name).persona_segments == ()
+
+
+def test_profile_persona_segments_flow_into_spec() -> None:
+    from dataclasses import replace
+
+    from native_agent_runner.core.profiles import AGENT_PROFILES
+
+    coding = replace(
+        AGENT_PROFILES["standard"],
+        name="coding",
+        persona_segments=("You specialize in software engineering.",),
+    )
+    AGENT_PROFILES["coding"] = coding
+    try:
+        spec = _spec({"profile": "coding"})
+        assert spec.persona_segments == ("You specialize in software engineering.",)
+        # An explicit persona_segments key overrides the profile's.
+        overridden = _spec({"profile": "coding", "persona_segments": ["custom"]})
+        assert overridden.persona_segments == ("custom",)
+    finally:
+        del AGENT_PROFILES["coding"]
+
+
 def test_unknown_profile_raises() -> None:
     with pytest.raises(ValueError, match="unknown profile"):
         _spec({"profile": "ultra"})

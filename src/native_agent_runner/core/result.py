@@ -24,6 +24,8 @@ class AgentRunResult:
     diff_path: Path
     proposal_path: Path
     artifacts: tuple[AgentArtifact, ...] = ()
+    final_outputs: tuple[str, ...] = ()
+    final_notes: str | None = None
     metrics: dict[str, object] = field(default_factory=dict)
     error: str = ""
     error_code: str = ""

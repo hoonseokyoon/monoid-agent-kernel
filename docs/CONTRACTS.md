@@ -32,13 +32,16 @@ Import everything below from `native_agent_runner.contracts` (single stable surf
   `model: ModelConfig`, `limits: RunLimits`, `capabilities`, and the policy objects.
 - `ModelConfig`, `ReasoningConfig`, `RunLimits`, `ModelRetryConfig` (`core/spec.py`) — model + run knobs.
 - `AgentRunResult`, `AgentArtifact` (`core/result.py`) — `status` (`completed`|`failed`|`limited`),
-  `final_text`, `run_dir`, `diff_path`, `proposal_path`, `artifacts`, `metrics`, `error`, `error_code`.
+  `final_text`, `run_dir`, `diff_path`, `proposal_path`, `artifacts`, `final_outputs`
+  (the `outputs` list from `run.finish`), `final_notes` (the optional `notes` from `run.finish`),
+  `metrics`, `error`, `error_code`.
 
 ### 1.1a Profiles (capability/limits presets)
 
 - `AgentProfile`, `AGENT_PROFILES`, `PROFILE_NAMES`, `resolve_profile(name)` (`core/profiles.py`) — named
-  "weight class" presets. A profile sets `mode` + `shell_policy` + `web_policy` + `limits`; capabilities are
-  derived from those, so it is the single source. Presets:
+  "weight class" presets. A profile sets `mode` + `shell_policy` + `web_policy` + `limits` (capabilities are
+  derived from those, so it is the single source) and may optionally carry `persona_segments` for a
+  specialization profile. Presets:
 
   | profile | mode | shell | web | limits (steps/tool_calls/duration_s) |
   |---------|------|-------|-----|--------------------------------------|
@@ -66,11 +69,32 @@ transport flags such as gateway URLs and tokens still apply). Shape:
   "limits": {"max_steps": 30, "max_tool_calls": 100, "max_bytes_read": 1000000, "max_duration_s": 900},
   "capabilities": null,
   "permission_policy": {...}, "tool_policy": {...}, "shell_policy": {...}, "web_policy": {...},
+  "system_prompt_base": null, "persona_segments": [],
+  "input": [],
   "metadata": {}
 }
 ```
 Only `instruction` and `workspace_root` are required; everything else falls back to defaults. See
 `examples/run-spec.json`.
+
+**System prompt composition.** The agent's identity prompt is composed, not hardcoded:
+`system_prompt_base` (a general-purpose default in `core/prompt.py` when `null`) plus
+`persona_segments` (role/specialization text appended in order). This keeps the core a *general*
+agent while specialization is layered in as a module. A profile may carry `persona_segments`
+(the three weight-class presets do not); an explicit `persona_segments` key overrides the profile's.
+On the CLI: `--persona <text>` (repeatable) and `--system-prompt-file <path>`. The composed prompt
+is computed once at bootstrap and sent on every turn.
+
+**Multimodal input (contract-only).** `input` is a richer superset of `instruction`: a list of
+content parts (`core/content.py`), each `{"type": "text"|"image"|"document", ...}` (`image`/`document`
+carry `source_ref` + `mime_type`). `effective_input` is `input` if set, else a single text part from
+`instruction`. **Only text is forwarded today** — the types, JSON codec, the `media.input` capability
+(off by default), and the adapter `supports_multimodal` negotiation flag land now; provider
+forwarding and `fs.read` extraction of non-text files are deferred. When a run's `effective_input`
+contains non-text parts, the core emits a `model.input.degraded` warning event
+(`{dropped_part_types, reason}`; reason `adapter_lacks_multimodal` | `capability_not_granted` |
+`not_yet_forwarded`) and proceeds with text only. `input` is part of the spec round-trip but is not
+copied into the manifest.
 
 ### 1.2 Model adapter contract
 
@@ -92,6 +116,11 @@ class ModelAdapter(Protocol):
 - **Turn threading**: first turn sends `instruction` with `previous_turn_handle=None`. Subsequent
   turns send `previous_turn_handle` (the prior `ModelTurn.response_id`) plus `observations` (tool
   results); `instruction` is omitted. The adapter is responsible for conversation continuity.
+  The core never re-sends prior turns: each request carries only `system_prompt` + `tools` and
+  either (first turn) `instruction` or (later turns) the opaque `previous_turn_handle` +
+  `observations`. The handle is the sole continuity key, so a **stateless** provider/gateway MUST
+  reconstruct the full conversation history behind that handle server-side; a stateful provider
+  (e.g. OpenAI Responses) may map the handle to its own continuation id instead.
   The provider-neutral `previous_turn_handle` is a rename of the former `previous_response_id`
   (event/transcript `data` keys renamed in place under `native-agent-runner.event.v1`; no version
   bump). `OpenAIModelAdapter` maps it to OpenAI's own `previous_response_id` wire field;
@@ -120,7 +149,15 @@ class ToolProvider(Protocol):
   successful call), `changed_paths_source` (`path_args`|`result_content`), `result_payload_kind`
   (`paths`|`shell_exec`), `skip_emit_if_background`.
 - `ToolHandler = Callable[[ToolContext, dict], ToolResult]`.
-- `ToolResult`: `ok`, `content: dict`, `error`, `error_code`; `to_observation()` is what the model sees.
+- `ToolResult`: `ok`, `content: dict`, `error`, `error_code`, `retryable: bool`, `category: str`.
+  `to_observation()` is what the model sees, shaped as a stable envelope so handler `content` keys
+  never collide with the status/error fields:
+  `{"ok": bool, "result": <content dict>}` on success, and on failure additionally
+  `{"error": {"message", "code", "category", "retryable"}}`. `category` is one of
+  `tool`|`policy`|`workspace`|`internal`; `retryable` tells the model whether re-attempting the call
+  (e.g. with different arguments) may help — it is informational and unrelated to gateway transport
+  retries (`ModelAdapterError.retryable`). Background-job re-entry observations carry the job-result
+  payload directly (flagged by `ToolObservation.is_background`) and do not use this envelope.
 - `ToolContext` is the protocol the handler receives (artifact/plan/finish/shell/job/web operations).
 - Register via `AgentLoop(..., tool_providers=(MyProvider(),))`, or from the CLI with
   `--tool-module path.py:get_tools`. Builtin tools are always present; custom tools are additive.
@@ -172,6 +209,30 @@ class EventSink(Protocol):
   domain filters.
 - `ToolPolicy` (`tools/policy.py`) — allow/deny/ask rules over tool visibility.
 
+### 1.6 Context providers
+
+Inject extra system context without subclassing the loop or the model adapter, in two layers
+(`core/context.py`, exported from `contracts`):
+
+```python
+class ContextProvider(Protocol):
+    def static_segment(self) -> str | None: ...          # folded into the prompt once at bootstrap
+    def dynamic_segment(self, turn: TurnContext) -> str | None: ...  # appended every turn
+```
+
+- `static_segment()` is composed alongside `persona_segments` (see "System prompt composition"),
+  so it is fixed for the whole run. `dynamic_segment(turn)` is re-evaluated each turn and **appended
+  to that turn's `system_prompt`** — no new wire field, since providers already receive `system_prompt`
+  every turn. Both return `None`/blank to contribute nothing.
+- `TurnContext` is a read-only snapshot: `step`, `remaining_steps`, `remaining_tool_calls`,
+  `deadline_s` (seconds left, or `None`), `plan` (the `run.update_plan` items), and
+  `pending_observation_count`. It carries only plain data — the `Workspace` is intentionally not on
+  the contract.
+- Register via `AgentLoop(..., context_providers=(MyProvider(),))`. With no providers the per-turn
+  prompt is byte-identical to the static composed prompt (default behavior unchanged).
+- Opt-in built-in: `AgentLoop(..., inject_workspace_index=True)` folds a compact initial workspace
+  file listing into the static prompt (`render_workspace_index_segment`); off by default.
+
 ---
 
 ## 2. HTTP wire contracts
@@ -198,7 +259,9 @@ Source of truth: `providers/gateway.py` (`_payload`, `_parse_gateway_response`).
   "instruction": "...",                                    // FIRST turn only
   "previous_turn_handle": "...",                           // SUBSEQUENT turns only
   "observations": [                                        // SUBSEQUENT turns only
-    {"call_id": "...", "tool_name": "fs.read", "output": { /* ToolResult.to_observation() */ },
+    {"call_id": "...", "tool_name": "fs.read",
+     "output": {"ok": true, "result": { /* tool content */ }},  // ToolResult.to_observation();
+                                                                 // failure: {"ok": false, "error": {...}}
      "is_background": false}                                // true for background-job re-entry results
   ]
 }

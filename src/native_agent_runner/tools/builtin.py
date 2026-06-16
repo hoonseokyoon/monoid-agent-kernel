@@ -49,6 +49,10 @@ def _object_schema(properties: dict[str, Any], *, required: list[str] | None = N
 
 
 def _text_from_bytes(data: bytes, path: str) -> str:
+    # TODO(multimodal): when the `media.input`/read capability is granted and a
+    # provider advertises multimodal support, return a typed content part
+    # (ImagePart/DocumentPart from core/content.py) here instead of rejecting
+    # binary/non-utf8 files. Contract is defined; extraction is deferred.
     if b"\x00" in data:
         raise WorkspaceError(f"binary file cannot be read as text: {path}")
     try:

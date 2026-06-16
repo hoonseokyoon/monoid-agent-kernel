@@ -7,7 +7,14 @@ from typing import Any
 
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.events import AgentEvent, EventSink
+from native_agent_runner.core.content import MEDIA_INPUT_CAPABILITY, non_text_part_types
+from native_agent_runner.core.context import (
+    ContextProvider,
+    TurnContext,
+    render_workspace_index_segment,
+)
 from native_agent_runner.core.manifest import build_run_manifest
+from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
 from native_agent_runner.core.result import AgentRunResult
 from native_agent_runner.core.spec import AgentRunSpec
 from native_agent_runner.core.workspace_index import build_workspace_index
@@ -49,10 +56,25 @@ from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.workspace.local import default_local_workspace_factory
 
 
-SYSTEM_PROMPT = """You are a local workspace agent.
-Use only the provided tools to inspect or modify files. Do not invent files you have not read.
-Respect tool errors and permissions. Finish by calling run.finish with a concise summary.
-"""
+def _failure_result(exc: Exception, *, error_code: str | None = None) -> ToolResult:
+    """Build a failed ToolResult from an exception, carrying the model-facing
+    retry/category signal. Raw ``ValueError``/``TypeError`` are treated as tool
+    handler errors (retryable, "tool") to match their ``tool_handler_error`` code."""
+    if error_code is not None:
+        code = error_code
+    elif isinstance(exc, NativeAgentError):
+        code = error_code_for_exception(exc)
+    else:
+        code = "tool_handler_error"
+    retryable = getattr(exc, "retryable", code == "tool_handler_error")
+    category = getattr(exc, "category", "tool" if code == "tool_handler_error" else "internal")
+    return ToolResult(
+        ok=False,
+        error=str(exc),
+        error_code=code,
+        retryable=bool(retryable),
+        category=str(category),
+    )
 
 
 @dataclass
@@ -65,6 +87,8 @@ class AgentToolContext(ToolContext):
     web_service: WebService
     jobs_service: JobsService
     final_text: str = ""
+    final_outputs: list[str] = field(default_factory=list)
+    final_notes: str | None = None
     finished: bool = False
     plan: list[dict[str, Any]] = field(default_factory=list)
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
@@ -108,8 +132,9 @@ class AgentToolContext(ToolContext):
         self.recorder.emit("plan.updated", data={"items": items})
 
     def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
-        del outputs, notes
         self.final_text = summary
+        self.final_outputs = list(outputs)
+        self.final_notes = notes
         self.finished = True
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -171,6 +196,7 @@ class _RunResources:
     capabilities: frozenset[str]
     started: float
     deadline: float | None
+    system_prompt: str
 
 
 @dataclass
@@ -185,6 +211,8 @@ class AgentLoop:
     shell_approval_provider: ShellApprovalProvider | None = None
     web_gateway_client: WebGatewayClient | None = None
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
+    context_providers: tuple[ContextProvider, ...] = ()
+    inject_workspace_index: bool = False
 
     def run(self) -> AgentRunResult:
         res = self._bootstrap()
@@ -285,8 +313,20 @@ class AgentLoop:
             if self.spec.limits.max_duration_s is not None
             else None
         )
-        workspace_index_path = recorder.write_workspace_index(
-            build_workspace_index(workspace, run_id=self.spec.run_id)
+        workspace_index = build_workspace_index(workspace, run_id=self.spec.run_id)
+        workspace_index_path = recorder.write_workspace_index(workspace_index)
+        static_segments: list[str] = []
+        if self.inject_workspace_index:
+            index_segment = render_workspace_index_segment(workspace_index)
+            if index_segment:
+                static_segments.append(index_segment)
+        for provider in self.context_providers:
+            segment = provider.static_segment()
+            if segment and segment.strip():
+                static_segments.append(segment)
+        system_prompt = compose_system_prompt(
+            self.spec.system_prompt_base or BASE_SYSTEM_PROMPT,
+            (*self.spec.persona_segments, *static_segments),
         )
         workspace_base_path = recorder.write_workspace_base(
             workspace.workspace_base_payload(self.spec.run_id)
@@ -315,6 +355,7 @@ class AgentLoop:
                 "visible_tools": [tool.id for tool in visible_tool_specs],
             },
         )
+        self._warn_on_unforwarded_multimodal(recorder, capabilities)
         return _RunResources(
             workspace=workspace,
             recorder=recorder,
@@ -325,7 +366,50 @@ class AgentLoop:
             capabilities=capabilities,
             started=started,
             deadline=deadline,
+            system_prompt=system_prompt,
         )
+
+    def _warn_on_unforwarded_multimodal(
+        self, recorder: AgentRecorder, capabilities: frozenset[str]
+    ) -> None:
+        """Multimodal input is a contract-only surface for now: non-text parts are
+        accepted on the spec but not yet threaded to any provider. Emit a warning
+        naming the dropped part types and why, so the degradation is observable."""
+        dropped = non_text_part_types(self.spec.effective_input)
+        if not dropped:
+            return
+        if not getattr(self.model_adapter, "supports_multimodal", False):
+            reason = "adapter_lacks_multimodal"
+        elif MEDIA_INPUT_CAPABILITY not in capabilities:
+            reason = "capability_not_granted"
+        else:
+            reason = "not_yet_forwarded"
+        recorder.emit(
+            "model.input.degraded",
+            data={"dropped_part_types": dropped, "reason": reason},
+            level="warning",
+        )
+
+    def _dynamic_context_segment(self, state: RunState, res: _RunResources, step: int) -> str:
+        """Join each context provider's per-turn segment. Empty when no providers
+        contribute, so the turn prompt stays byte-identical to the static prompt."""
+        if not self.context_providers:
+            return ""
+        limits = self.spec.limits
+        turn = TurnContext(
+            step=step,
+            remaining_steps=max(0, limits.max_steps - step),
+            remaining_tool_calls=max(0, limits.max_tool_calls - state.total_tool_calls),
+            deadline_s=(res.deadline - time.time()) if res.deadline is not None else None,
+            plan=tuple(res.context.plan),
+            pending_observation_count=len(state.pending_observations),
+        )
+        segments = []
+        for provider in self.context_providers:
+            segment = provider.dynamic_segment(turn)
+            if segment and segment.strip():
+                segments.append(segment.strip())
+        return "\n\n".join(segments)
 
     def _run_steps(self, state: RunState, res: _RunResources) -> None:
         context = res.context
@@ -342,9 +426,15 @@ class AgentLoop:
                 turn_id=turn_id,
                 data={"step": step, "previous_turn_handle": state.previous_turn_handle},
             )
+            dynamic_segment = self._dynamic_context_segment(state, res, step)
+            turn_system_prompt = (
+                res.system_prompt
+                if not dynamic_segment
+                else f"{res.system_prompt}\n\n{dynamic_segment}"
+            )
             request = ModelRequest(
                 instruction=self.spec.instruction,
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=turn_system_prompt,
                 tools=tuple(res.visible_tool_specs),
                 previous_turn_handle=state.previous_turn_handle,
                 observations=state.pending_observations,
@@ -544,6 +634,8 @@ class AgentLoop:
             diff_path=diff_path,
             proposal_path=run_dir / "proposal.json",
             artifacts=artifacts,
+            final_outputs=tuple(context.final_outputs),
+            final_notes=context.final_notes,
             metrics=metrics,
             error=state.error,
             error_code=state.error_code,
@@ -835,9 +927,9 @@ class AgentLoop:
                     turn_id=turn_id,
                     parent_id=parent_id,
                 )
-            result = ToolResult(ok=False, error=str(exc), error_code=error_code_for_exception(exc))
+            result = _failure_result(exc)
         except PermissionDenied as exc:
-            result = ToolResult(ok=False, error=str(exc), error_code=error_code_for_exception(exc))
+            result = _failure_result(exc)
             recorder.emit(
                 "permission.denied",
                 turn_id=turn_id,
@@ -854,13 +946,7 @@ class AgentLoop:
                 level="warning",
             )
         except (NativeAgentError, ValueError, TypeError) as exc:
-            result = ToolResult(
-                ok=False,
-                error=str(exc),
-                error_code=error_code_for_exception(exc)
-                if isinstance(exc, NativeAgentError)
-                else "tool_handler_error",
-            )
+            result = _failure_result(exc)
             if started_event is None:
                 started_event = self._emit_tool_started(
                     recorder,

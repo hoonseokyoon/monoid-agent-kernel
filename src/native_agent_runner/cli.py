@@ -200,11 +200,26 @@ def main() -> None:
     default=None,
     help="Apply a capability/limits preset; explicit flags override it.",
 )
+@click.option(
+    "--persona",
+    "persona",
+    multiple=True,
+    help="Append a persona/role segment to the base system prompt (repeatable). "
+    "Overrides any persona from --profile.",
+)
+@click.option(
+    "--system-prompt-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Override the base system prompt with the contents of this file.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
     *,
     profile: str | None,
+    persona: tuple[str, ...],
+    system_prompt_file: Path | None,
     spec_file: Path | None,
     workspace: Path | None,
     instruction: str,
@@ -294,6 +309,11 @@ def run(
         base_limits = agent_profile.limits if agent_profile else RunLimits()
         base_shell = agent_profile.shell_policy if agent_profile else ShellPolicy()
         base_web = agent_profile.web_policy if agent_profile else WebPolicy()
+        base_persona = agent_profile.persona_segments if agent_profile else ()
+        resolved_persona = tuple(persona) if _explicit("persona") else base_persona
+        resolved_system_prompt_base = (
+            system_prompt_file.read_text(encoding="utf-8") if system_prompt_file else None
+        )
 
         resolved_mode = mode if _explicit("mode") else base_mode
         resolved_limits = RunLimits(
@@ -368,6 +388,8 @@ def run(
             tool_policy=tool_policy,
             shell_policy=shell_policy,
             web_policy=web_policy,
+            system_prompt_base=resolved_system_prompt_base,
+            persona_segments=resolved_persona,
             **spec_kwargs,
         )
 

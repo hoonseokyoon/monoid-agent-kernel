@@ -49,6 +49,8 @@ def _populated_spec() -> AgentRunSpec:
             command_rules=(ShellCommandRule(action="allow", prefix="ls"),),
         ),
         web_policy=WebPolicy(enabled=True, context_enabled=True, allowed_domains=("a.com",)),
+        system_prompt_base="You are a custom base agent.",
+        persona_segments=("Specialize in X.", "Be terse."),
         metadata={"tenant": "t1", "n": 3},
     )
 

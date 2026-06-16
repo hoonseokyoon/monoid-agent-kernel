@@ -19,6 +19,90 @@ def _python_command(code: str) -> str:
     return f'python -c "{escaped}"'
 
 
+def _finish_only_adapter() -> FakeModelAdapter:
+    return FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "done"}, "call_finish"),),
+            ),
+        ]
+    )
+
+
+def test_default_system_prompt_is_composed_base(tmp_path: Path) -> None:
+    from native_agent_runner.core.prompt import compose_system_prompt
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = _finish_only_adapter()
+    spec = AgentRunSpec(
+        instruction="Inspect.",
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+    )
+
+    AgentLoop(spec=spec, model_adapter=adapter).run()
+
+    assert adapter.requests[0].system_prompt == compose_system_prompt()
+
+
+def test_persona_segments_appended_to_system_prompt(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = _finish_only_adapter()
+    spec = AgentRunSpec(
+        instruction="Inspect.",
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+        persona_segments=("You specialize in software engineering.",),
+    )
+
+    AgentLoop(spec=spec, model_adapter=adapter).run()
+
+    prompt = adapter.requests[0].system_prompt
+    assert prompt.endswith("You specialize in software engineering.\n")
+    # Every turn carries the same composed prompt.
+    assert all(req.system_prompt == prompt for req in adapter.requests)
+
+
+def test_run_finish_surfaces_outputs_and_notes(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("rough notes\n", encoding="utf-8")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(
+                    fake_tool_call(
+                        "run_finish",
+                        {
+                            "summary": "Reviewed the notes",
+                            "outputs": ["notes.md", "SUMMARY.md"],
+                            "notes": "No changes were necessary.",
+                        },
+                        "call_finish",
+                    ),
+                ),
+            ),
+        ]
+    )
+    spec = AgentRunSpec(
+        instruction="Review the notes.",
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+        mode="propose",
+    )
+
+    result = AgentLoop(spec=spec, model_adapter=adapter).run()
+
+    assert result.status == "completed"
+    assert result.final_text == "Reviewed the notes"
+    assert result.final_outputs == ("notes.md", "SUMMARY.md")
+    assert result.final_notes == "No changes were necessary."
+
+
 def test_loop_read_write_finish_happy_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -60,6 +144,8 @@ def test_loop_read_write_finish_happy_path(tmp_path: Path) -> None:
 
     assert result.status == "completed"
     assert result.final_text == "Created SUMMARY.md"
+    assert result.final_outputs == ("SUMMARY.md",)
+    assert result.final_notes is None
     assert not workspace.joinpath("SUMMARY.md").exists()
     assert "+Clean summary" in result.diff_path.read_text(encoding="utf-8")
     proposal = json.loads(result.proposal_path.read_text(encoding="utf-8"))
@@ -591,7 +677,7 @@ def test_loop_background_shell_job_reenters_with_result_observation(tmp_path: Pa
     assert result.final_text == "background job completed"
     assert workspace.joinpath("job-result.txt").read_text(encoding="utf-8") == "job done\n"
     assert any(
-        obs.output.get("job_id") and obs.output.get("status") == "running"
+        obs.output["result"].get("job_id") and obs.output["result"].get("status") == "running"
         for obs in adapter.requests[1].observations
     )
     assert any(

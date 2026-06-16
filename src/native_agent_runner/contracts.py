@@ -32,6 +32,18 @@ from native_agent_runner.core.profiles import (
     resolve_profile,
 )
 
+# Context providers (pluggable static + per-turn system context)
+from native_agent_runner.core.context import ContextProvider, TurnContext
+
+# Multimodal input content parts (contract-only surface; see core/content.py)
+from native_agent_runner.core.content import (
+    MEDIA_INPUT_CAPABILITY,
+    ContentPart,
+    DocumentPart,
+    ImagePart,
+    TextPart,
+)
+
 # Model adapter contract
 from native_agent_runner.providers.base import (
     ModelAdapter,
@@ -85,6 +97,15 @@ __all__ = [
     "AGENT_PROFILES",
     "PROFILE_NAMES",
     "resolve_profile",
+    # context providers
+    "ContextProvider",
+    "TurnContext",
+    # multimodal input content parts (contract-only)
+    "ContentPart",
+    "TextPart",
+    "ImagePart",
+    "DocumentPart",
+    "MEDIA_INPUT_CAPABILITY",
     # model adapter contract
     "ModelAdapter",
     "ModelRequest",

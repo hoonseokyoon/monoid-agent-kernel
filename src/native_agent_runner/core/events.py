@@ -17,6 +17,7 @@ AgentEventType = Literal[
     "run.resumed",
     "model.turn.started",
     "model.turn.finished",
+    "model.input.degraded",
     "tool.call.started",
     "tool.call.finished",
     "tool.call.failed",

@@ -21,11 +21,21 @@ class ToolResult:
     content: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     error_code: str = ""
+    retryable: bool = False
+    category: str = ""
 
     def to_observation(self) -> dict[str, Any]:
-        if self.ok:
-            return {"ok": True, **self.content}
-        return {"ok": False, **self.content, "error": self.error, "error_code": self.error_code}
+        """Model-facing payload. The handler's ``content`` lives under ``result`` so
+        domain keys can never collide with the ``ok``/``error`` envelope."""
+        obs: dict[str, Any] = {"ok": self.ok, "result": self.content}
+        if not self.ok:
+            obs["error"] = {
+                "message": self.error,
+                "code": self.error_code,
+                "category": self.category,
+                "retryable": self.retryable,
+            }
+        return obs
 
 
 class ToolContext(Protocol):

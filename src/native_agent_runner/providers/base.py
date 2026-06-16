@@ -40,6 +40,13 @@ class ModelRequest:
 
 
 class ModelAdapter(Protocol):
+    # Optional capability flag. The loop reads it via
+    # ``getattr(adapter, "supports_multimodal", False)``; an adapter that can
+    # accept non-text content parts sets it True. Defaulting off keeps existing
+    # adapters valid without declaring it. Multimodal forwarding itself is not
+    # yet implemented (see core/content.py) — this is the negotiation seam.
+    supports_multimodal: bool = False
+
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         ...
 
