@@ -22,7 +22,7 @@ class ToolResult:
     error: str = ""
     error_code: str = ""
     retryable: bool = False
-    category: str = ""
+    category: str = "tool"
 
     def to_observation(self) -> dict[str, Any]:
         """Model-facing payload. The handler's ``content`` lives under ``result`` so
@@ -32,7 +32,7 @@ class ToolResult:
             obs["error"] = {
                 "message": self.error,
                 "code": self.error_code,
-                "category": self.category,
+                "category": self.category or "tool",
                 "retryable": self.retryable,
             }
         return obs

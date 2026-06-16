@@ -36,6 +36,12 @@ def test_failure_envelope_shape() -> None:
     }
 
 
+def test_failure_envelope_defaults_to_tool_category() -> None:
+    obs = ToolResult(ok=False, error="boom", error_code="shell_timeout").to_observation()
+
+    assert obs["error"]["category"] == "tool"
+
+
 def test_failure_result_maps_exception_retry_signal() -> None:
     tool = _failure_result(ToolExecutionError("nope"))
     assert (tool.ok, tool.error_code, tool.category, tool.retryable) == (

@@ -88,10 +88,12 @@ is computed once at bootstrap and sent on every turn.
 **Multimodal input (contract-only).** `input` is a richer superset of `instruction`: a list of
 content parts (`core/content.py`), each `{"type": "text"|"image"|"document", ...}` (`image`/`document`
 carry `source_ref` + `mime_type`). `effective_input` is `input` if set, else a single text part from
-`instruction`. **Only text is forwarded today** — the types, JSON codec, the `media.input` capability
-(off by default), and the adapter `supports_multimodal` negotiation flag land now; provider
-forwarding and `fs.read` extraction of non-text files are deferred. When a run's `effective_input`
-contains non-text parts, the core emits a `model.input.degraded` warning event
+`instruction`. **Only text is forwarded today** — explicit text parts are joined into the first-turn
+instruction, and an explicit input with no text parts uses the legacy `instruction` string as its
+text fallback. The types, JSON codec, the `media.input` capability (off by default), and the adapter
+`supports_multimodal` negotiation flag land now; provider forwarding and `fs.read` extraction of
+non-text files are deferred. When a run's `effective_input` contains non-text parts, the core emits a
+`model.input.degraded` warning event
 (`{dropped_part_types, reason}`; reason `adapter_lacks_multimodal` | `capability_not_granted` |
 `not_yet_forwarded`) and proceeds with text only. `input` is part of the spec round-trip but is not
 copied into the manifest.

@@ -53,6 +53,32 @@ def test_effective_input_uses_explicit_parts() -> None:
     assert spec.effective_input == parts
 
 
+def test_effective_text_instruction_uses_explicit_text_parts() -> None:
+    spec = AgentRunSpec(
+        instruction="fallback",
+        workspace_root=Path("/ws"),
+        run_root=Path("runs"),
+        input=(
+            TextPart("first"),
+            ImagePart(source_ref="i.png", mime_type="image/png"),
+            TextPart("second"),
+        ),
+    )
+
+    assert spec.effective_text_instruction == "first\n\nsecond"
+
+
+def test_effective_text_instruction_falls_back_when_input_has_no_text() -> None:
+    spec = AgentRunSpec(
+        instruction="describe the image",
+        workspace_root=Path("/ws"),
+        run_root=Path("runs"),
+        input=(ImagePart(source_ref="i.png", mime_type="image/png"),),
+    )
+
+    assert spec.effective_text_instruction == "describe the image"
+
+
 def test_non_text_part_types_helper() -> None:
     parts = (
         TextPart("a"),
@@ -105,6 +131,29 @@ def test_non_text_input_emits_degraded_warning(tmp_path: Path) -> None:
     assert degraded[0]["level"] == "warning"
     assert degraded[0]["data"]["dropped_part_types"] == ["image"]
     assert degraded[0]["data"]["reason"] == "adapter_lacks_multimodal"
+
+
+def test_explicit_text_input_is_sent_to_model(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "done"}, "c"),),
+            )
+        ]
+    )
+    spec = AgentRunSpec(
+        instruction="fallback",
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+        input=(TextPart("explicit text"),),
+    )
+
+    AgentLoop(spec=spec, model_adapter=adapter).run()
+
+    assert adapter.requests[0].instruction == "explicit text"
 
 
 def test_text_only_input_emits_no_degraded_warning(tmp_path: Path) -> None:

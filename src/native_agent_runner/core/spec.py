@@ -199,6 +199,21 @@ class AgentRunSpec:
         text part synthesized from `instruction`."""
         return self.input or (TextPart(self.instruction),)
 
+    @property
+    def effective_text_instruction(self) -> str:
+        """Text forwarded to current text-only model adapters.
+
+        Explicit text parts take precedence. If an explicit multimodal input has
+        no text parts, fall back to the legacy instruction string so first-turn
+        gateway requests remain valid while non-text forwarding is deferred.
+        """
+        text_segments = [
+            part.text.strip()
+            for part in self.effective_input
+            if isinstance(part, TextPart) and part.text.strip()
+        ]
+        return "\n\n".join(text_segments) or self.instruction
+
     @classmethod
     def from_instruction(cls, instruction: str, **kwargs: Any) -> AgentRunSpec:
         """Convenience constructor for the common text-only case."""

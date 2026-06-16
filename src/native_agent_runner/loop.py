@@ -433,7 +433,7 @@ class AgentLoop:
                 else f"{res.system_prompt}\n\n{dynamic_segment}"
             )
             request = ModelRequest(
-                instruction=self.spec.instruction,
+                instruction=self.spec.effective_text_instruction,
                 system_prompt=turn_system_prompt,
                 tools=tuple(res.visible_tool_specs),
                 previous_turn_handle=state.previous_turn_handle,
