@@ -141,6 +141,39 @@ class AgentToolContext(ToolContext):
 
 
 @dataclass
+class RunState:
+    """Mutable state threaded through a run's steps and teardown."""
+
+    status: str = "completed"
+    error: str = ""
+    error_code: str = ""
+    provider_error_code: str = ""
+    provider_http_status: int | None = None
+    final_text: str = ""
+    previous_turn_handle: str | None = None
+    pending_observations: tuple[ToolObservation, ...] = ()
+    total_tool_calls: int = 0
+    total_usage: dict[str, int] = field(
+        default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    )
+
+
+@dataclass
+class _RunResources:
+    """Objects assembled by bootstrap and reused across a run's phases."""
+
+    workspace: Workspace
+    recorder: AgentRecorder
+    context: AgentToolContext
+    registry: ToolRegistry
+    tool_policy: NormalizedToolPolicy
+    visible_tool_specs: list[ToolSpec]
+    capabilities: frozenset[str]
+    started: float
+    deadline: float | None
+
+
+@dataclass
 class AgentLoop:
     spec: AgentRunSpec
     model_adapter: ModelAdapter
@@ -154,6 +187,41 @@ class AgentLoop:
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
 
     def run(self) -> AgentRunResult:
+        res = self._bootstrap()
+        state = RunState()
+        try:
+            self._run_steps(state, res)
+        except (RunCancelled, RunTimeout) as exc:
+            state.status = "limited"
+            state.error = str(exc)
+            state.error_code = error_code_for_exception(exc)
+            state.final_text = (
+                "Stopped because the run was cancelled."
+                if state.error_code == "cancelled"
+                else "Stopped after reaching max duration."
+            )
+        except Exception as exc:  # controlled recording boundary for standalone CLI
+            state.status = "failed"
+            state.error = str(exc)
+            state.error_code = error_code_for_exception(exc)
+            if isinstance(exc, ModelAdapterError):
+                state.provider_error_code = exc.provider_error_code
+                state.provider_http_status = exc.http_status
+            state.final_text = ""
+            res.recorder.emit(
+                "run.failed",
+                data={
+                    "error": public_error_message(state.error),
+                    "error_code": state.error_code,
+                    "type": type(exc).__name__,
+                },
+                level="error",
+            )
+        finally:
+            result = self._finalize(state, res)
+        return result
+
+    def _bootstrap(self) -> _RunResources:
         if self.permission_policy == PermissionPolicy() and self.spec.permission_policy != PermissionPolicy():
             self.permission_policy = self.spec.permission_policy
         workspace_factory = self.workspace_factory or default_local_workspace_factory
@@ -211,16 +279,6 @@ class AgentLoop:
             recorder.close()
             raise
         visible_tool_specs = registry.visible_specs(tool_policy)
-        status = "completed"
-        error = ""
-        error_code = ""
-        provider_error_code = ""
-        provider_http_status: int | None = None
-        final_text = ""
-        previous_turn_handle: str | None = None
-        pending_observations: tuple[ToolObservation, ...] = ()
-        total_tool_calls = 0
-        total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         started = time.time()
         deadline = (
             started + self.spec.limits.max_duration_s
@@ -242,7 +300,6 @@ class AgentLoop:
             workspace_base_path=str(workspace_base_path.relative_to(recorder.run_dir).as_posix()),
         )
         recorder.write_manifest(manifest)
-
         recorder.emit(
             "run.started",
             data={
@@ -258,239 +315,238 @@ class AgentLoop:
                 "visible_tools": [tool.id for tool in visible_tool_specs],
             },
         )
+        return _RunResources(
+            workspace=workspace,
+            recorder=recorder,
+            context=context,
+            registry=registry,
+            tool_policy=tool_policy,
+            visible_tool_specs=visible_tool_specs,
+            capabilities=capabilities,
+            started=started,
+            deadline=deadline,
+        )
 
-        try:
-            for step in range(1, self.spec.limits.max_steps + 1):
-                self._check_run_boundary(deadline)
-                background_observations = self._pop_background_observations(context, recorder, step)
-                if background_observations:
-                    pending_observations = (*pending_observations, *background_observations)
-                turn_id = f"turn_{step:04d}"
-                turn_started = recorder.emit(
-                    "model.turn.started",
-                    turn_id=turn_id,
-                    data={"step": step, "previous_turn_handle": previous_turn_handle},
-                )
-                request = ModelRequest(
-                    instruction=self.spec.instruction,
-                    system_prompt=SYSTEM_PROMPT,
-                    tools=tuple(visible_tool_specs),
-                    previous_turn_handle=previous_turn_handle,
-                    observations=pending_observations,
-                )
-                recorder.transcript(
-                    {
-                        "kind": "model_request",
-                        "step": step,
-                        "previous_turn_handle": previous_turn_handle,
-                        "observations": [obs.__dict__ for obs in pending_observations],
-                    }
-                )
-                try:
-                    turn = self.model_adapter.next_turn(request)
-                except ModelAdapterError as exc:
-                    provider_error_code = exc.provider_error_code
-                    provider_http_status = exc.http_status
-                    recorder.transcript(
-                        {
-                            "kind": "model_turn",
-                            "step": step,
-                            "response_id": None,
-                            "final_text": None,
-                            "tool_calls": [],
-                            "usage": {},
-                            "error": str(exc),
-                            "error_code": exc.error_code,
-                            "provider_error_code": exc.provider_error_code,
-                            "retryable": exc.retryable,
-                            "http_status": exc.http_status,
-                        }
-                    )
-                    raise
-                except NativeAgentError:
-                    raise
-                except Exception as exc:
-                    raise ModelAdapterError(str(exc)) from exc
-                self._check_run_boundary(deadline)
-                _accumulate_usage(total_usage, turn)
-                previous_turn_handle = turn.response_id or previous_turn_handle
+    def _run_steps(self, state: RunState, res: _RunResources) -> None:
+        context = res.context
+        recorder = res.recorder
+        deadline = res.deadline
+        for step in range(1, self.spec.limits.max_steps + 1):
+            self._check_run_boundary(deadline)
+            background_observations = self._pop_background_observations(context, recorder, step)
+            if background_observations:
+                state.pending_observations = (*state.pending_observations, *background_observations)
+            turn_id = f"turn_{step:04d}"
+            turn_started = recorder.emit(
+                "model.turn.started",
+                turn_id=turn_id,
+                data={"step": step, "previous_turn_handle": state.previous_turn_handle},
+            )
+            request = ModelRequest(
+                instruction=self.spec.instruction,
+                system_prompt=SYSTEM_PROMPT,
+                tools=tuple(res.visible_tool_specs),
+                previous_turn_handle=state.previous_turn_handle,
+                observations=state.pending_observations,
+            )
+            recorder.transcript(
+                {
+                    "kind": "model_request",
+                    "step": step,
+                    "previous_turn_handle": state.previous_turn_handle,
+                    "observations": [obs.__dict__ for obs in state.pending_observations],
+                }
+            )
+            try:
+                turn = self.model_adapter.next_turn(request)
+            except ModelAdapterError as exc:
+                state.provider_error_code = exc.provider_error_code
+                state.provider_http_status = exc.http_status
                 recorder.transcript(
                     {
                         "kind": "model_turn",
                         "step": step,
-                        "response_id": turn.response_id,
-                        "final_text": turn.final_text,
-                        "tool_calls": [call.__dict__ for call in turn.tool_calls],
-                        "usage": turn.usage,
+                        "response_id": None,
+                        "final_text": None,
+                        "tool_calls": [],
+                        "usage": {},
+                        "error": str(exc),
+                        "error_code": exc.error_code,
+                        "provider_error_code": exc.provider_error_code,
+                        "retryable": exc.retryable,
+                        "http_status": exc.http_status,
                     }
                 )
-                recorder.emit(
-                    "model.turn.finished",
-                    turn_id=turn_id,
-                    parent_id=turn_started.event_id,
-                    data={
-                        "step": step,
-                        "response_id": turn.response_id,
-                        "tool_calls": len(turn.tool_calls),
-                        "has_final": bool(turn.final_text),
-                        "usage": turn.usage,
-                    },
-                )
-                recorder.emit(
-                    "metrics.updated",
-                    turn_id=turn_id,
-                    parent_id=turn_started.event_id,
-                    data={
-                        "step": step,
-                        "tool_calls": total_tool_calls,
-                        "input_tokens": total_usage["input_tokens"],
-                        "output_tokens": total_usage["output_tokens"],
-                        "total_tokens": total_usage["total_tokens"],
-                        "web_search_calls": context.web_service.web_search_calls,
-                        "web_fetch_calls": context.web_service.web_fetch_calls,
-                        "web_context_calls": context.web_service.web_context_calls,
-                        "web_failed_calls": context.web_service.web_failed_calls,
-                    },
-                )
-
-                if not turn.tool_calls:
-                    if context.job_manager.has_resume_jobs():
-                        self._wait_for_background_jobs(context, recorder, deadline)
-                        pending_observations = ()
-                        continue
-                    if turn.final_text:
-                        final_text = turn.final_text
-                        break
-                    raise ModelAdapterError("model returned neither final text nor tool calls")
-
-                observations: list[ToolObservation] = []
-                for call in turn.tool_calls:
-                    self._check_run_boundary(deadline)
-                    total_tool_calls += 1
-                    if total_tool_calls > self.spec.limits.max_tool_calls:
-                        status = "limited"
-                        final_text = "Stopped after reaching max tool calls."
-                        error_code = "max_tool_calls_exceeded"
-                        break
-                    observation = self._execute_tool_call(
-                        call_name=call.name,
-                        call_id=call.id,
-                        arguments=call.arguments,
-                        registry=registry,
-                        tool_policy=tool_policy,
-                        context=context,
-                        recorder=recorder,
-                        capabilities=capabilities,
-                        turn_id=turn_id,
-                        parent_id=turn_started.event_id,
-                        step=step,
-                    )
-                    observations.append(observation)
-                    self._check_run_boundary(deadline)
-                pending_observations = tuple(observations)
-
-                if context.finished:
-                    final_text = context.final_text
-                    break
-                if status == "limited":
-                    break
-            else:
-                status = "limited"
-                final_text = "Stopped after reaching max steps."
-                error_code = "max_steps_exceeded"
-        except (RunCancelled, RunTimeout) as exc:
-            status = "limited"
-            error = str(exc)
-            error_code = error_code_for_exception(exc)
-            final_text = "Stopped because the run was cancelled." if error_code == "cancelled" else "Stopped after reaching max duration."
-        except Exception as exc:  # controlled recording boundary for standalone CLI
-            status = "failed"
-            error = str(exc)
-            error_code = error_code_for_exception(exc)
-            if isinstance(exc, ModelAdapterError):
-                provider_error_code = exc.provider_error_code
-                provider_http_status = exc.http_status
-            final_text = ""
-            recorder.emit(
-                "run.failed",
-                data={
-                    "error": public_error_message(error),
-                    "error_code": error_code,
-                    "type": type(exc).__name__,
-                },
-                level="error",
+                raise
+            except NativeAgentError:
+                raise
+            except Exception as exc:
+                raise ModelAdapterError(str(exc)) from exc
+            self._check_run_boundary(deadline)
+            _accumulate_usage(state.total_usage, turn)
+            state.previous_turn_handle = turn.response_id or state.previous_turn_handle
+            recorder.transcript(
+                {
+                    "kind": "model_turn",
+                    "step": step,
+                    "response_id": turn.response_id,
+                    "final_text": turn.final_text,
+                    "tool_calls": [call.__dict__ for call in turn.tool_calls],
+                    "usage": turn.usage,
+                }
             )
-        finally:
-            context.job_manager.cancel_all()
-            diff_path = recorder.write_diff(workspace.diff_patch())
-            proposal_payload = recorder.write_proposal_snapshot(workspace, diff_path)
-            background_metrics = context.jobs_service.background_metrics()
-            metrics = {
-                "status": status,
-                "duration_s": time.time() - started,
-                "steps_limit": self.spec.limits.max_steps,
-                "tool_calls": total_tool_calls,
-                "changed_paths": workspace.changed_paths(),
-                "workspace_backend": self.spec.workspace_backend,
-                "requested_reasoning_effort": self.spec.model.reasoning.effort,
-                "effective_reasoning_effort": self.spec.model.reasoning.effort,
-                "error_code": error_code,
-                **context.shell_service.metrics(),
-                **background_metrics,
-                **context.web_service.metrics(),
-                **total_usage,
-            }
-            if provider_error_code:
-                metrics["provider_error_code"] = provider_error_code
-            if provider_http_status is not None:
-                metrics["provider_http_status"] = provider_http_status
-            if error:
-                metrics["error"] = error
-            recorder.write_metrics(metrics)
             recorder.emit(
-                "workspace.proposal.updated",
+                "model.turn.finished",
+                turn_id=turn_id,
+                parent_id=turn_started.event_id,
+                data={
+                    "step": step,
+                    "response_id": turn.response_id,
+                    "tool_calls": len(turn.tool_calls),
+                    "has_final": bool(turn.final_text),
+                    "usage": turn.usage,
+                },
+            )
+            recorder.emit(
+                "metrics.updated",
+                turn_id=turn_id,
+                parent_id=turn_started.event_id,
+                data={
+                    "step": step,
+                    "tool_calls": state.total_tool_calls,
+                    "input_tokens": state.total_usage["input_tokens"],
+                    "output_tokens": state.total_usage["output_tokens"],
+                    "total_tokens": state.total_usage["total_tokens"],
+                    "web_search_calls": context.web_service.web_search_calls,
+                    "web_fetch_calls": context.web_service.web_fetch_calls,
+                    "web_context_calls": context.web_service.web_context_calls,
+                    "web_failed_calls": context.web_service.web_failed_calls,
+                },
+            )
+
+            if not turn.tool_calls:
+                if context.job_manager.has_resume_jobs():
+                    self._wait_for_background_jobs(context, recorder, deadline)
+                    state.pending_observations = ()
+                    continue
+                if turn.final_text:
+                    state.final_text = turn.final_text
+                    break
+                raise ModelAdapterError("model returned neither final text nor tool calls")
+
+            observations: list[ToolObservation] = []
+            for call in turn.tool_calls:
+                self._check_run_boundary(deadline)
+                state.total_tool_calls += 1
+                if state.total_tool_calls > self.spec.limits.max_tool_calls:
+                    state.status = "limited"
+                    state.final_text = "Stopped after reaching max tool calls."
+                    state.error_code = "max_tool_calls_exceeded"
+                    break
+                observation = self._execute_tool_call(
+                    call_name=call.name,
+                    call_id=call.id,
+                    arguments=call.arguments,
+                    registry=res.registry,
+                    tool_policy=res.tool_policy,
+                    context=context,
+                    recorder=recorder,
+                    capabilities=res.capabilities,
+                    turn_id=turn_id,
+                    parent_id=turn_started.event_id,
+                    step=step,
+                )
+                observations.append(observation)
+                self._check_run_boundary(deadline)
+            state.pending_observations = tuple(observations)
+
+            if context.finished:
+                state.final_text = context.final_text
+                break
+            if state.status == "limited":
+                break
+        else:
+            state.status = "limited"
+            state.final_text = "Stopped after reaching max steps."
+            state.error_code = "max_steps_exceeded"
+
+    def _build_metrics(self, state: RunState, res: _RunResources) -> dict[str, Any]:
+        context = res.context
+        metrics = {
+            "status": state.status,
+            "duration_s": time.time() - res.started,
+            "steps_limit": self.spec.limits.max_steps,
+            "tool_calls": state.total_tool_calls,
+            "changed_paths": res.workspace.changed_paths(),
+            "workspace_backend": self.spec.workspace_backend,
+            "requested_reasoning_effort": self.spec.model.reasoning.effort,
+            "effective_reasoning_effort": self.spec.model.reasoning.effort,
+            "error_code": state.error_code,
+            **context.shell_service.metrics(),
+            **context.jobs_service.background_metrics(),
+            **context.web_service.metrics(),
+            **state.total_usage,
+        }
+        if state.provider_error_code:
+            metrics["provider_error_code"] = state.provider_error_code
+        if state.provider_http_status is not None:
+            metrics["provider_http_status"] = state.provider_http_status
+        if state.error:
+            metrics["error"] = state.error
+        return metrics
+
+    def _finalize(self, state: RunState, res: _RunResources) -> AgentRunResult:
+        context = res.context
+        recorder = res.recorder
+        workspace = res.workspace
+        context.job_manager.cancel_all()
+        diff_path = recorder.write_diff(workspace.diff_patch())
+        proposal_payload = recorder.write_proposal_snapshot(workspace, diff_path)
+        metrics = self._build_metrics(state, res)
+        recorder.write_metrics(metrics)
+        recorder.emit(
+            "workspace.proposal.updated",
             data=public_proposal_payload(proposal_payload, self.permission_policy),
-            )
-            recorder.emit(
-                "proposal.ready",
-                data={
-                    "proposal_hash": proposal_payload.get("proposal_hash"),
-                    "diff_sha256": proposal_payload.get("diff_sha256"),
-                    "changed_paths": [
-                        public_path(str(path), self.permission_policy)
-                        for path in proposal_payload.get("changed_paths", [])
-                    ],
-                },
-            )
-            recorder.emit(
-                "run.finished",
-                data={
-                    "status": status,
-                    "error": public_error_message(error),
-                    "error_code": error_code,
-                    "final_text": final_text,
-                    "duration_s": metrics["duration_s"],
-                    "diff_path": str(diff_path.relative_to(recorder.run_dir)),
-                    "proposal_path": "proposal.json",
-                    "metrics_path": "metrics.json",
-                },
-                level="error" if status == "failed" else "info",
-            )
-            artifacts = tuple(recorder.artifacts)
-            run_dir = recorder.run_dir
-            recorder.close()
-
+        )
+        recorder.emit(
+            "proposal.ready",
+            data={
+                "proposal_hash": proposal_payload.get("proposal_hash"),
+                "diff_sha256": proposal_payload.get("diff_sha256"),
+                "changed_paths": [
+                    public_path(str(path), self.permission_policy)
+                    for path in proposal_payload.get("changed_paths", [])
+                ],
+            },
+        )
+        recorder.emit(
+            "run.finished",
+            data={
+                "status": state.status,
+                "error": public_error_message(state.error),
+                "error_code": state.error_code,
+                "final_text": state.final_text,
+                "duration_s": metrics["duration_s"],
+                "diff_path": str(diff_path.relative_to(recorder.run_dir)),
+                "proposal_path": "proposal.json",
+                "metrics_path": "metrics.json",
+            },
+            level="error" if state.status == "failed" else "info",
+        )
+        artifacts = tuple(recorder.artifacts)
+        run_dir = recorder.run_dir
+        recorder.close()
         return AgentRunResult(
             run_id=self.spec.run_id,
-            status=status,  # type: ignore[arg-type]
-            final_text=final_text,
+            status=state.status,  # type: ignore[arg-type]
+            final_text=state.final_text,
             run_dir=run_dir,
             diff_path=diff_path,
             proposal_path=run_dir / "proposal.json",
             artifacts=artifacts,
             metrics=metrics,
-            error=error,
-            error_code=error_code,
+            error=state.error,
+            error_code=state.error_code,
         )
 
     def _pop_background_observations(
