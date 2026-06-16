@@ -305,7 +305,7 @@ def test_cli_enable_web_requires_gateway_url(monkeypatch: pytest.MonkeyPatch, tm
     )
 
     assert result.exit_code != 0
-    assert "--enable-web or --enable-web-context requires --web-gateway-url" in result.output
+    assert "--web-gateway-url is required" in result.output
 
 
 def test_openai_payload_uses_reasoning_effort() -> None:
@@ -367,3 +367,61 @@ def test_openai_smoke_example_workspace(tmp_path: Path) -> None:
     assert result.run_dir.joinpath("events.jsonl").exists()
     assert result.run_dir.joinpath("transcript.jsonl").exists()
     assert result.run_dir.joinpath("metrics.json").exists()
+
+
+def _run_with_profile(monkeypatch, tmp_path, *extra_args):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+    monkeypatch.setattr("native_agent_runner.cli._model_adapter", lambda *_a, **_k: adapter)
+    result = CliRunner().invoke(
+        main,
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--instruction",
+            "Finish.",
+            "--run-root",
+            str(tmp_path / "runs"),
+            *extra_args,
+        ],
+    )
+    return result, adapter
+
+
+def test_cli_profile_lightweight_exposes_read_only_tools(monkeypatch, tmp_path: Path) -> None:
+    result, adapter = _run_with_profile(monkeypatch, tmp_path, "--profile", "lightweight")
+    assert result.exit_code == 0, result.output
+    exposed = {tool.id for tool in adapter.requests[0].tools}
+    assert "fs.read" in exposed
+    assert "fs.write" not in exposed
+    assert "shell.exec" not in exposed
+
+
+def test_cli_profile_heavyweight_exposes_shell_and_web(monkeypatch, tmp_path: Path) -> None:
+    # heavyweight enables web, which requires a gateway URL.
+    result, adapter = _run_with_profile(
+        monkeypatch, tmp_path, "--profile", "heavyweight", "--web-gateway-url", "http://localhost"
+    )
+    assert result.exit_code == 0, result.output
+    exposed = {tool.id for tool in adapter.requests[0].tools}
+    assert {"fs.write", "shell.exec", "web.search"}.issubset(exposed)
+
+
+def test_cli_explicit_flag_overrides_profile(monkeypatch, tmp_path: Path) -> None:
+    # lightweight is read-only; --mode propose should re-enable writes.
+    result, adapter = _run_with_profile(
+        monkeypatch, tmp_path, "--profile", "lightweight", "--mode", "propose"
+    )
+    assert result.exit_code == 0, result.output
+    exposed = {tool.id for tool in adapter.requests[0].tools}
+    assert "fs.write" in exposed
+
+
+def test_cli_profile_conflicts_with_spec(tmp_path: Path) -> None:
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps({"instruction": "x", "workspace_root": "ws"}), encoding="utf-8")
+    result = CliRunner().invoke(main, ["run", "--spec", str(spec_file), "--profile", "standard"])
+    assert result.exit_code != 0
+    assert "--profile cannot be combined with --spec" in result.output

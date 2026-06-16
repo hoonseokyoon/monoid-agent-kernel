@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import click
+from click.core import ParameterSource
 
+from native_agent_runner.core.profiles import PROFILE_NAMES, resolve_profile
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import RunnerBackend
 from native_agent_runner.reference._shared.tokens import TokenManager
@@ -192,8 +194,17 @@ def main() -> None:
 @click.option("--event-sink-module", multiple=True, help="Load custom event sinks from path.py:function.")
 @click.option("--stream-json", is_flag=True, help="Stream public events as JSONL on stdout.")
 @click.option("--no-status-file", is_flag=True, help="Disable status.json updates.")
+@click.option(
+    "--profile",
+    type=click.Choice(PROFILE_NAMES),
+    default=None,
+    help="Apply a capability/limits preset; explicit flags override it.",
+)
+@click.pass_context
 def run(
+    ctx: click.Context,
     *,
+    profile: str | None,
     spec_file: Path | None,
     workspace: Path | None,
     instruction: str,
@@ -253,6 +264,10 @@ def run(
     if spec_file is not None:
         if workspace is not None:
             raise click.ClickException("--spec cannot be combined with --workspace; the spec file is authoritative")
+        if profile is not None:
+            raise click.ClickException(
+                '--profile cannot be combined with --spec; put "profile" inside the spec file'
+            )
         try:
             spec = AgentRunSpec.from_json(json.loads(spec_file.read_text(encoding="utf-8")))
         except Exception as exc:
@@ -267,6 +282,27 @@ def run(
         if not instruction.strip():
             raise click.ClickException("--instruction or --instruction-file is required")
 
+        # A profile supplies base values for mode/limits/shell/web; any flag the
+        # user passes on the command line overrides it. With no profile the bases
+        # equal the option defaults, so behavior is identical to before.
+        agent_profile = resolve_profile(profile) if profile else None
+
+        def _explicit(name: str) -> bool:
+            return ctx.get_parameter_source(name) == ParameterSource.COMMANDLINE
+
+        base_mode = agent_profile.mode if agent_profile else "propose"
+        base_limits = agent_profile.limits if agent_profile else RunLimits()
+        base_shell = agent_profile.shell_policy if agent_profile else ShellPolicy()
+        base_web = agent_profile.web_policy if agent_profile else WebPolicy()
+
+        resolved_mode = mode if _explicit("mode") else base_mode
+        resolved_limits = RunLimits(
+            max_steps=max_steps if _explicit("max_steps") else base_limits.max_steps,
+            max_tool_calls=max_tool_calls if _explicit("max_tool_calls") else base_limits.max_tool_calls,
+            max_bytes_read=max_bytes_read if _explicit("max_bytes_read") else base_limits.max_bytes_read,
+            max_duration_s=max_duration_s if _explicit("max_duration_s") else base_limits.max_duration_s,
+        )
+
         try:
             tool_policy = _load_tool_policy(
                 tool_policy_file,
@@ -279,8 +315,8 @@ def run(
                 deny_path=deny_path,
                 redact_path=redact_path,
             )
-            shell_policy = ShellPolicy().merged(
-                enabled=enable_shell,
+            shell_policy = base_shell.merged(
+                enabled=enable_shell or base_shell.enabled,
                 approval_mode=shell_approval_mode,
                 timeout_s=shell_timeout_s,
                 max_output_bytes=shell_max_output_bytes,
@@ -289,6 +325,7 @@ def run(
             )
             web_policy = _load_web_policy(
                 web_policy_file,
+                base=base_web,
                 enabled=enable_web or enable_web_context,
                 context_enabled=True if enable_web_context else None,
                 allow_domains=web_allow_domain,
@@ -309,11 +346,13 @@ def run(
         spec_kwargs: dict[str, Any] = {}
         if run_id is not None:
             spec_kwargs["run_id"] = run_id
+        if agent_profile is not None:
+            spec_kwargs["metadata"] = {"profile": agent_profile.name}
         spec = AgentRunSpec(
             instruction=instruction,
             workspace_root=workspace,
             run_root=run_root,
-            mode=mode,  # type: ignore[arg-type]
+            mode=resolved_mode,  # type: ignore[arg-type]
             workspace_backend=workspace_backend,  # type: ignore[arg-type]
             model=ModelConfig(
                 provider=model_provider,  # type: ignore[arg-type]
@@ -324,12 +363,7 @@ def run(
                 ),
                 gateway_url=llm_gateway_url,
             ),
-            limits=RunLimits(
-                max_steps=max_steps,
-                max_tool_calls=max_tool_calls,
-                max_bytes_read=max_bytes_read,
-                max_duration_s=max_duration_s,
-            ),
+            limits=resolved_limits,
             permission_policy=permission_policy,
             tool_policy=tool_policy,
             shell_policy=shell_policy,
@@ -338,7 +372,10 @@ def run(
         )
 
     if spec.web_policy.enabled and not web_gateway_url:
-        raise click.ClickException("--enable-web or --enable-web-context requires --web-gateway-url")
+        raise click.ClickException(
+            "web is enabled (via --enable-web/--enable-web-context or a profile); "
+            "--web-gateway-url is required"
+        )
     _human_echo(f"run_id: {spec.run_id}", stream_json=stream_json)
     _human_echo(f"run_dir: {spec.run_root / spec.run_id}", stream_json=stream_json)
 
@@ -1198,6 +1235,7 @@ def _load_permission_policy(
 def _load_web_policy(
     policy_file: Path | None,
     *,
+    base: WebPolicy | None = None,
     enabled: bool,
     context_enabled: bool | None = None,
     allow_domains: tuple[str, ...],
@@ -1212,7 +1250,7 @@ def _load_web_policy(
     max_response_bytes: int | None,
     timeout_s: int | None,
 ) -> WebPolicy:
-    policy = WebPolicy()
+    policy = base if base is not None else WebPolicy()
     if policy_file is not None:
         try:
             payload = json.loads(policy_file.read_text(encoding="utf-8"))

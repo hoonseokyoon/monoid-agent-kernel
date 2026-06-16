@@ -34,6 +34,24 @@ Import everything below from `native_agent_runner.contracts` (single stable surf
 - `AgentRunResult`, `AgentArtifact` (`core/result.py`) — `status` (`completed`|`failed`|`limited`),
   `final_text`, `run_dir`, `diff_path`, `proposal_path`, `artifacts`, `metrics`, `error`, `error_code`.
 
+### 1.1a Profiles (capability/limits presets)
+
+- `AgentProfile`, `AGENT_PROFILES`, `PROFILE_NAMES`, `resolve_profile(name)` (`core/profiles.py`) — named
+  "weight class" presets. A profile sets `mode` + `shell_policy` + `web_policy` + `limits`; capabilities are
+  derived from those, so it is the single source. Presets:
+
+  | profile | mode | shell | web | limits (steps/tool_calls/duration_s) |
+  |---------|------|-------|-----|--------------------------------------|
+  | `lightweight` | `read-only` | off | off | 15 / 40 / 300 |
+  | `standard` | `propose` | off | off | 30 / 100 / 900 (= no-profile defaults) |
+  | `heavyweight` | `propose` | on | on | 60 / 200 / 1800 |
+
+- A profile is a **base**; any field set explicitly overrides it. In a spec JSON, add `"profile":
+  "lightweight"` (explicit keys like `"shell_policy"` still win); the resolved profile name is recorded in
+  `metadata.profile`. On the CLI, `--profile <name>` (explicit flags override; `--profile` cannot be combined
+  with `--spec` — put `"profile"` inside the spec file). `workspace_backend` and `model` are not set by
+  profiles. `heavyweight` enables web, so a web gateway URL is still required to run.
+
 **Spec serialization.** `AgentRunSpec.to_json()` / `AgentRunSpec.from_json(dict)` round-trip the entire run
 definition (model, limits, capabilities, and all four policies) as one JSON object — this is the portable spec
 contract. The CLI consumes it via `native-agent run --spec spec.json` (an alternative to the individual flags;

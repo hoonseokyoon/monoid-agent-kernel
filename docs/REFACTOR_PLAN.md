@@ -199,9 +199,17 @@ god object 해체. Phase 3 이후 경계가 정리된 상태에서 진행.
 
 ---
 
-## 8. Phase 6 — 모듈화 프로파일 (선택) · 목표(1) 강화
+## 8. Phase 6 — 모듈화 프로파일 (선택) · 목표(1) 강화 ✅ 완료
 
 목표(1)의 "경량~중량 *구성*"을 일급 개념으로. 현재는 capability/policy를 수동 조립해야 함.
+
+> **완료(2026-06-16): M1·M2.** 상세 `~/.claude/plans/phase-6-profiles.md`. 신설 `core/profiles.py`
+> (`AgentProfile`·`AGENT_PROFILES`·`resolve_profile`·`PROFILE_NAMES`), contracts 노출. 프로파일은
+> `mode`+`shell_policy`+`web_policy`+`limits`만 정하고 capabilities는 `effective_capabilities()`가 유도
+> (단일 출처). 3종: lightweight(read-only/15·40·300), standard(propose=현 기본, 하위호환),
+> heavyweight(shell+web/60·200·1800). `from_json`은 `"profile"` 키(명시 키가 오버라이드, 이름은
+> metadata.profile 기록), CLI는 `--profile`(`get_parameter_source`로 명시 플래그만 오버라이드;
+> `--spec`와 동시 금지). workspace_backend·model은 프로파일 미관여.
 
 | ID | 작업 | 목표 |
 |----|------|------|
