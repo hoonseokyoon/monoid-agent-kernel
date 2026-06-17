@@ -196,7 +196,7 @@ class ToolSurfaceSnapshot:
     authorizations: dict[str, ToolAuthorization]
     delta_notice: str = ""
     surface_hash: str = ""
-    policy_warnings: tuple[str, ...] = ()
+    surface_warnings: tuple[str, ...] = ()
 
     def authorization_for(self, binding_id: str) -> ToolAuthorization | None:
         return self.authorizations.get(binding_id)
@@ -224,7 +224,7 @@ class ToolSurfaceSnapshot:
                 for binding_id, authorization in sorted(self.authorizations.items())
             },
             "delta_notice": self.delta_notice,
-            "policy_warnings": list(self.policy_warnings),
+            "surface_warnings": list(self.surface_warnings),
         }
 
 

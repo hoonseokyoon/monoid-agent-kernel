@@ -11,12 +11,14 @@ heuristic that used to live (always-on, unconfigurable) in the core as opt-in in
 Use it from the CLI:
 
     native-agent run --workspace . --instruction "..." \
+        --runtime-config-file examples/runtime-config.json \
         --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
         --event-sink-module examples/redacting_event_sink.py:make_sink
 
 or programmatically:
 
-    AgentLoop(..., event_sinks=(RedactingEventSink(JsonlEventSink(path)),))
+    AgentLoop(..., runtime_config_provider=provider,
+        event_sinks=(RedactingEventSink(JsonlEventSink(path)),))
 """
 
 from __future__ import annotations

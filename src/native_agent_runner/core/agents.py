@@ -391,17 +391,35 @@ def compile_bound_tool_catalog(config: AgentRuntimeConfig, registry: ToolRegistr
     bound: list[BoundTool] = []
     seen_binding_ids: set[str] = set()
     seen_model_names: set[str] = set()
+    seen_call_names: dict[str, str] = {}
+
+    def reserve_call_name(name: str, owner: str) -> None:
+        previous = seen_call_names.get(name)
+        if previous is not None and previous != owner:
+            raise AgentConfigError(f"duplicate tool call name: {name}")
+        seen_call_names[name] = owner
+
+    if config.tool_search.enabled:
+        reserve_call_name(config.tool_search.binding_id, "tool_search")
+        reserve_call_name(config.tool_search.model_name, "tool_search")
+
     for binding in config.tools:
         if binding.binding_id in seen_binding_ids:
             raise AgentConfigError(f"duplicate tool binding_id: {binding.binding_id}")
+        if config.tool_search.enabled and binding.binding_id == config.tool_search.binding_id:
+            raise AgentConfigError(f"duplicate tool binding_id: {binding.binding_id}")
         seen_binding_ids.add(binding.binding_id)
+        reserve_call_name(binding.binding_id, binding.binding_id)
         spec = specs.get(binding.ref.tool_id)
         if spec is None:
             raise AgentConfigError(f"runtime config references unknown registry tool: {binding.ref.tool_id}")
         model_name = _resolved_model_name(binding, spec)
         if model_name in seen_model_names:
             raise AgentConfigError(f"duplicate tool model_name: {model_name}")
+        if config.tool_search.enabled and model_name == config.tool_search.model_name:
+            raise AgentConfigError(f"duplicate tool model_name: {model_name}")
         seen_model_names.add(model_name)
+        reserve_call_name(model_name, binding.binding_id)
         _validate_binding_runtime(binding)
         authorization = ToolAuthorization(
             tool_id=spec.id,

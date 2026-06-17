@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any
 
 from native_agent_runner.core.cancellation import CancellationToken
@@ -250,6 +250,8 @@ class _RunResources:
 class AgentLoop:
     spec: AgentRunSpec
     model_adapter: ModelAdapter
+    _: KW_ONLY
+    runtime_config_provider: RuntimeConfigProvider
     tool_providers: tuple[ToolProvider, ...] = ()
     dynamic_tool_providers: tuple[DynamicToolProvider, ...] = ()
     tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
@@ -262,7 +264,6 @@ class AgentLoop:
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
     context_providers: tuple[ContextProvider, ...] = ()
     inject_workspace_index: bool = False
-    runtime_config_provider: RuntimeConfigProvider | None = None
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
 
     def run(self) -> AgentRunResult:
@@ -501,11 +502,6 @@ class AgentLoop:
         return tuple(providers)
 
     def _current_runtime_config(self, registry: ToolRegistry, *, validate: bool = True) -> AgentRuntimeConfig:
-        if self.runtime_config_provider is None:
-            raise AgentConfigError(
-                "runtime config provider is required",
-                error_code="agent_config_missing",
-            )
         config = (
             self.runtime_config_provider.current_config(self.spec.run_id)
         )
@@ -1167,8 +1163,8 @@ class AgentLoop:
         bound_tool: BoundTool | None = None
         result: ToolResult
         started_event: AgentEvent | None = None
-        policy_decision = ""
-        policy_reason = ""
+        surface_decision = ""
+        surface_reason = ""
         try:
             if _is_tool_search_call(call_name, bound_catalog):
                 binding_id = bound_catalog.tool_search.binding_id
@@ -1193,8 +1189,8 @@ class AgentLoop:
                         f"tool binding denied by config: {binding_id}",
                         error_code="tool_binding_denied",
                     )
-                policy_decision = authorization.decision
-                policy_reason = authorization.reason
+                surface_decision = authorization.decision
+                surface_reason = authorization.reason
                 if authorization.decision == "ask":
                     raise PermissionDenied(
                         f"tool binding requires approval: {binding_id}",
@@ -1219,8 +1215,8 @@ class AgentLoop:
                 )
                 preview_authorization = surface_snapshot.authorization_for(bound_tool.binding_id)
                 if preview_authorization is not None:
-                    policy_decision = preview_authorization.decision
-                    policy_reason = preview_authorization.reason
+                    surface_decision = preview_authorization.decision
+                    surface_reason = preview_authorization.reason
                 authorization = self._authorize_surface_tool(
                     bound_tool,
                     surface_snapshot,
@@ -1264,8 +1260,8 @@ class AgentLoop:
                     "requested_tool": call_name,
                     "error": public_error_message(str(exc)),
                     "error_code": result.error_code,
-                    "policy_decision": policy_decision or None,
-                    "policy_reason": policy_reason or None,
+                    "surface_decision": surface_decision or None,
+                    "surface_reason": surface_reason or None,
                 },
                 level="warning",
             )

@@ -9,7 +9,9 @@ from native_agent_runner.core.agents import (
     PromptSpec,
     RegistryToolRef,
     ToolBinding,
+    ToolSearchConfig,
     generated_tool_bindings,
+    validate_runtime_config,
 )
 from native_agent_runner.core.schemas import validate_run_dir
 from native_agent_runner.core.tool_surface import ToolGuidance
@@ -18,6 +20,7 @@ from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.tools.builtin import builtin_tools
+from native_agent_runner.tools.base import ToolRegistry
 from native_agent_runner.workspace.local import LocalWorkspaceBackend
 
 
@@ -156,3 +159,61 @@ def test_unknown_runtime_tool_ref_fails_run(tmp_path: Path) -> None:
     assert result.status == "failed"
     assert result.error_code == "agent_config_invalid"
     assert "missing.tool" in result.error
+
+
+def test_agent_loop_requires_runtime_config_provider(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+
+    try:
+        AgentLoop(
+            AgentRunSpec(instruction="Finish.", workspace_root=workspace, run_root=tmp_path / "runs"),
+            adapter,
+        )
+    except TypeError as exc:
+        assert "runtime_config_provider" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("AgentLoop accepted a missing runtime_config_provider")
+
+
+def test_tool_search_binding_identity_conflicts_are_rejected(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register_many(builtin_tools(LocalWorkspaceBackend(_workspace(tmp_path))))
+
+    binding_id_conflict = _config(
+        ToolBinding(
+            binding_id="tool.search",
+            model_name="read_file",
+            ref=RegistryToolRef("fs.read"),
+        )
+    )
+    model_name_conflict = _config(
+        ToolBinding(
+            binding_id="read_file",
+            model_name="tool_search",
+            ref=RegistryToolRef("fs.read"),
+        )
+    )
+    cross_call_name_conflict = AgentRuntimeConfig(
+        definition_id="test-agent",
+        tools=(
+            ToolBinding(
+                binding_id="read_file",
+                model_name="read_file",
+                ref=RegistryToolRef("fs.read"),
+            ),
+        ),
+        tool_search=ToolSearchConfig(enabled=True, binding_id="search_tools", model_name="read_file"),
+    )
+
+    for config, expected in (
+        (binding_id_conflict, "duplicate tool binding_id: tool.search"),
+        (model_name_conflict, "duplicate tool model_name: tool_search"),
+        (cross_call_name_conflict, "duplicate tool call name: read_file"),
+    ):
+        try:
+            validate_runtime_config(config, registry)
+        except Exception as exc:
+            assert expected in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"accepted invalid config: {expected}")

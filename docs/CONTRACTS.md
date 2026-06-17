@@ -19,7 +19,7 @@ and web gateway integration.
 
 ### AgentLoop
 
-`AgentLoop(spec, model_adapter, runtime_config_provider=..., tool_providers=(),
+`AgentLoop(spec, model_adapter, *, runtime_config_provider, tool_providers=(),
 event_sinks=(), status_file=True, permission_policy=PermissionPolicy(),
 cancellation_token=None, shell_approval_provider=None, web_gateway_client=None)`
 runs a single agent against one workspace.

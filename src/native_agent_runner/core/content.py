@@ -1,12 +1,9 @@
 """Provider-neutral content parts for multimodal input.
 
-This is the **contract surface only** for multimodal work (see REFACTOR_PLAN
-Round 2, W2). The types and JSON codecs land now so the input shape is stable;
-only ``TextPart`` is actually forwarded to a model today. ``ImagePart`` /
-``DocumentPart`` are accepted and round-trip, but the runner does not yet thread
-them to providers and no provider advertises multimodal support — when non-text
-parts are present the loop emits a ``model.input.degraded`` warning and proceeds
-with text only.
+This module defines the stable input shape for multimodal work. Only
+``TextPart`` is forwarded to a model today. ``ImagePart`` and ``DocumentPart``
+are accepted and round-trip through JSON; when non-text parts are present, the
+loop emits a ``model.input.degraded`` warning and proceeds with text only.
 
 Deferred (explicit follow-up): threading parts into ``ModelRequest``, provider
 multimodal payload mapping, and ``fs.read`` extraction of non-text files.

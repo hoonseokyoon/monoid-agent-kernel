@@ -80,6 +80,7 @@ Backends can explicitly deny or redact paths per run:
 native-agent run \
   --workspace examples/workspaces/edit_markdown_notes \
   --instruction "Inspect this workspace." \
+  --runtime-config-file examples/runtime-config.json \
   --deny-path ".env" \
   --redact-path "*.key"
 ```
@@ -110,6 +111,7 @@ For machine-readable real-time progress:
 native-agent run \
   --workspace examples/workspaces/edit_markdown_notes \
   --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
+  --runtime-config-file examples/runtime-config.json \
   --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
   --stream-json
 ```
@@ -345,13 +347,15 @@ through the run directory snapshot or run-token protected backend proposal APIs.
 
 ## Event Sinks
 
-Programmatic callers can pass sinks to `AgentLoop(..., event_sinks=(...))`.
+Programmatic callers can pass sinks to
+`AgentLoop(..., runtime_config_provider=provider, event_sinks=(...))`.
 CLI callers can load sinks with:
 
 ```bash
 native-agent run \
   --workspace . \
   --instruction "Inspect this workspace." \
+  --runtime-config-file examples/runtime-config.json \
   --event-sink-module ./my_sink.py:make_sink
 ```
 
@@ -366,6 +370,7 @@ redaction now that the core no longer guesses at secrets (see above):
 native-agent run \
   --workspace . \
   --instruction "Inspect this workspace." \
+  --runtime-config-file examples/runtime-config.json \
   --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
   --event-sink-module examples/redacting_event_sink.py:make_sink
 ```
