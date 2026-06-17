@@ -20,6 +20,7 @@ from native_agent_runner.core.spec import (
     ReasoningConfig,
     RunLimits,
 )
+from native_agent_runner.core.tool_surface import ToolSurfacePolicy
 from native_agent_runner.core.schemas import validate_run_dir
 from native_agent_runner.core.packages import (
     apply_package,
@@ -144,6 +145,7 @@ def main() -> None:
 @click.option("--deny-tool", multiple=True, help="Deny a tool by id, exported name, or namespace glob.")
 @click.option("--ask-tool", multiple=True, help="Require approval for a tool by id, exported name, or namespace glob.")
 @click.option("--tool-policy-file", type=click.Path(path_type=Path), default=None)
+@click.option("--tool-surface-policy-file", type=click.Path(path_type=Path), default=None)
 @click.option("--deny-path", multiple=True, help="Deny workspace paths matching a backend-provided glob.")
 @click.option("--redact-path", multiple=True, help="Redact matching paths from public events and projections.")
 @click.option("--permission-policy-file", type=click.Path(path_type=Path), default=None)
@@ -245,6 +247,7 @@ def run(
     deny_tool: tuple[str, ...],
     ask_tool: tuple[str, ...],
     tool_policy_file: Path | None,
+    tool_surface_policy_file: Path | None,
     deny_path: tuple[str, ...],
     redact_path: tuple[str, ...],
     permission_policy_file: Path | None,
@@ -289,6 +292,11 @@ def run(
             raise click.ClickException(f"failed to load --spec: {exc}") from exc
         if run_id is not None:
             spec = replace(spec, run_id=run_id)
+        if tool_surface_policy_file is not None:
+            try:
+                spec = replace(spec, tool_surface_policy=_load_tool_surface_policy(tool_surface_policy_file))
+            except Exception as exc:
+                raise click.ClickException(f"failed to load --tool-surface-policy-file: {exc}") from exc
     else:
         if workspace is None:
             raise click.ClickException("--workspace (or --spec) is required")
@@ -330,6 +338,7 @@ def run(
                 deny_tool=deny_tool,
                 ask_tool=ask_tool,
             )
+            tool_surface_policy = _load_tool_surface_policy(tool_surface_policy_file)
             permission_policy = _load_permission_policy(
                 permission_policy_file,
                 deny_path=deny_path,
@@ -386,6 +395,7 @@ def run(
             limits=resolved_limits,
             permission_policy=permission_policy,
             tool_policy=tool_policy,
+            tool_surface_policy=tool_surface_policy,
             shell_policy=shell_policy,
             web_policy=web_policy,
             system_prompt_base=resolved_system_prompt_base,
@@ -1236,6 +1246,16 @@ def _load_tool_policy(
             raise ValueError(f"invalid tool policy JSON: {exc.msg}") from exc
         policy = ToolPolicy.from_json(payload)
     return policy.merged(allow=allow_tool, deny=deny_tool, ask=ask_tool)
+
+
+def _load_tool_surface_policy(policy_file: Path | None) -> ToolSurfacePolicy:
+    if policy_file is None:
+        return ToolSurfacePolicy()
+    try:
+        payload = json.loads(policy_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid tool surface policy JSON: {exc.msg}") from exc
+    return ToolSurfacePolicy.from_json(payload)
 
 
 def _load_permission_policy(

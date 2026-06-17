@@ -16,6 +16,7 @@ def builtin_tools(workspace: Workspace) -> list[ToolSpec]:
         _fs_read(workspace),
         _fs_glob(workspace),
         _text_search(workspace),
+        _tool_search(),
         _fs_write(workspace),
         _fs_patch(workspace),
         _fs_mkdir(workspace),
@@ -59,6 +60,29 @@ def _text_from_bytes(data: bytes, path: str) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise WorkspaceError(f"file is not utf-8 text: {path}") from exc
+
+
+def _tool_search() -> ToolSpec:
+    def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(ok=True, content=context.search_tools(args))
+
+    return ToolSpec(
+        id="tool.search",
+        description=(
+            "Search tools available through the current Tool Surface. "
+            "Returned tools can be loaded for the next turn."
+        ),
+        input_schema=_object_schema(
+            {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "minimum": 1},
+            },
+            required=["query"],
+        ),
+        capability="tool.search",
+        side_effect="read",
+        handler=handler,
+    )
 
 
 def _fs_list(workspace: Workspace) -> ToolSpec:

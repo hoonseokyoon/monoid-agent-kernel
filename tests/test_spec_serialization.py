@@ -14,6 +14,7 @@ from native_agent_runner.core.spec import (
     ReasoningConfig,
     RunLimits,
 )
+from native_agent_runner.core.tool_surface import ToolExposureRule, ToolGuidance, ToolSurfacePolicy
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter
@@ -42,6 +43,15 @@ def _populated_spec() -> AgentRunSpec:
         capabilities=frozenset({"fs.read", "run.control"}),
         permission_policy=PermissionPolicy(deny_patterns=(".env",), redact_patterns=("*.key",)),
         tool_policy=ToolPolicy(allowed_tools=("fs.read",), denied_tools=("shell.exec",)),
+        tool_surface_policy=ToolSurfacePolicy(
+            rules=(
+                ToolExposureRule(
+                    tool="fs.read",
+                    exposure="searchable",
+                    guidance=ToolGuidance(summary="Use for workspace reads."),
+                ),
+            )
+        ),
         shell_policy=ShellPolicy(
             enabled=True,
             approval_mode="auto-approve",

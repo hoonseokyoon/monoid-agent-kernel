@@ -13,6 +13,9 @@ The supported integration surface is the **core runner plus its contracts**, exp
 build their own services against the contracts. See [docs/CONTRACTS.md](docs/CONTRACTS.md) for the
 Python and HTTP wire contracts.
 
+For the planned dynamic tool availability, search, policy, and guidance surface, see
+[docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md).
+
 ## Run
 
 ```bash

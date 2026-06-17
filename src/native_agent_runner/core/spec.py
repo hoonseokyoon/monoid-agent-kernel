@@ -11,6 +11,7 @@ from native_agent_runner.core.content import (
     content_part_from_json,
     content_part_to_json,
 )
+from native_agent_runner.core.tool_surface import ToolSurfacePolicy
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.shell import ShellPolicy
 from native_agent_runner.tools.policy import ToolPolicy
@@ -154,6 +155,7 @@ def default_capabilities(mode: RunMode) -> frozenset[str]:
     base = {
         "fs.read",
         "text.search",
+        "tool.search",
         "artifact.control",
         "run.control",
     }
@@ -184,6 +186,7 @@ class AgentRunSpec:
     capabilities: frozenset[str] | None = None
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     tool_policy: ToolPolicy = field(default_factory=ToolPolicy)
+    tool_surface_policy: ToolSurfacePolicy = field(default_factory=ToolSurfacePolicy)
     shell_policy: ShellPolicy = field(default_factory=ShellPolicy)
     web_policy: WebPolicy = field(default_factory=WebPolicy)
     system_prompt_base: str | None = None
@@ -268,6 +271,7 @@ class AgentRunSpec:
             "capabilities": None if capabilities is None else frozenset(str(c) for c in capabilities),
             "permission_policy": PermissionPolicy.from_json(payload.get("permission_policy")),
             "tool_policy": ToolPolicy.from_json(payload.get("tool_policy")),
+            "tool_surface_policy": ToolSurfacePolicy.from_json(payload.get("tool_surface_policy")),
             "shell_policy": (
                 ShellPolicy.from_json(payload["shell_policy"])
                 if "shell_policy" in payload
@@ -309,6 +313,7 @@ class AgentRunSpec:
             "capabilities": None if self.capabilities is None else sorted(self.capabilities),
             "permission_policy": self.permission_policy.to_json(),
             "tool_policy": self.tool_policy.to_json(),
+            "tool_surface_policy": self.tool_surface_policy.to_json(),
             "shell_policy": self.shell_policy.to_json(),
             "web_policy": self.web_policy.to_json(),
             "system_prompt_base": self.system_prompt_base,

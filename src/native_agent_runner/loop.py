@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from native_agent_runner.core.cancellation import CancellationToken
@@ -17,6 +17,15 @@ from native_agent_runner.core.manifest import build_run_manifest
 from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
 from native_agent_runner.core.result import AgentRunResult
 from native_agent_runner.core.spec import AgentRunSpec
+from native_agent_runner.core.tool_surface import (
+    DefaultToolSurfaceResolver,
+    ToolAuthorization,
+    ToolSearchEntry,
+    ToolSurfacePolicy,
+    ToolSurfaceResolver,
+    ToolSurfaceSnapshot,
+    tool_surface_manifest,
+)
 from native_agent_runner.core.workspace_index import build_workspace_index
 from native_agent_runner.errors import (
     ModelAdapterError,
@@ -29,7 +38,7 @@ from native_agent_runner.errors import (
     error_code_for_exception,
 )
 from native_agent_runner.jobs import BackgroundJobManager
-from native_agent_runner.permissions import PermissionPolicy
+from native_agent_runner.permissions import PermissionPolicy, matches_path_patterns
 from native_agent_runner.providers.base import ModelAdapter, ModelRequest, ModelTurn, ToolObservation
 from native_agent_runner.public_view import (
     args_preview,
@@ -48,10 +57,16 @@ from native_agent_runner.shell import (
     ShellApprovalProvider,
 )
 from native_agent_runner.tool_services import CallContext, JobsService, ShellService, WebService
-from native_agent_runner.tools.base import ToolContext, ToolProvider, ToolRegistry, ToolResult, ToolSpec
+from native_agent_runner.tools.base import (
+    DynamicToolProvider,
+    ToolContext,
+    ToolProvider,
+    ToolRegistry,
+    ToolResult,
+    ToolSpec,
+)
 from native_agent_runner.tools.builtin import builtin_tools
-from native_agent_runner.tools.policy import NormalizedToolPolicy
-from native_agent_runner.web import WebGatewayClient
+from native_agent_runner.web import WebGatewayClient, domain_allowed, domain_from_url
 from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.workspace.local import default_local_workspace_factory
 
@@ -92,6 +107,9 @@ class AgentToolContext(ToolContext):
     finished: bool = False
     plan: list[dict[str, Any]] = field(default_factory=list)
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
+    tool_search_entries: tuple[ToolSearchEntry, ...] = ()
+    tool_search_max_results: int = 5
+    _requested_tool_loads: list[str] = field(default_factory=list)
     _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
 
     def emit_artifact(
@@ -164,6 +182,30 @@ class AgentToolContext(ToolContext):
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.web_service.context(args, self._current_call)
 
+    def configure_tool_search(self, entries: tuple[ToolSearchEntry, ...], max_results: int) -> None:
+        self.tool_search_entries = entries
+        self.tool_search_max_results = max_results
+
+    def search_tools(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = str(args.get("query") or "").strip().lower()
+        requested_max = args.get("max_results")
+        max_results = min(
+            self.tool_search_max_results,
+            int(requested_max) if requested_max is not None else self.tool_search_max_results,
+        )
+        ranked = _rank_tool_search_entries(query, self.tool_search_entries)
+        results = [entry.to_json() for entry in ranked[:max_results]]
+        for item in results:
+            tool_id = str(item.get("tool_id") or "")
+            if tool_id and tool_id not in self._requested_tool_loads:
+                self._requested_tool_loads.append(tool_id)
+        return {"results": results, "count": len(results)}
+
+    def consume_tool_load_requests(self) -> tuple[str, ...]:
+        requested = tuple(self._requested_tool_loads)
+        self._requested_tool_loads.clear()
+        return requested
+
 
 @dataclass
 class RunState:
@@ -177,6 +219,9 @@ class RunState:
     final_text: str = ""
     previous_turn_handle: str | None = None
     pending_observations: tuple[ToolObservation, ...] = ()
+    pending_tool_loads: tuple[str, ...] = ()
+    tool_call_counts: dict[str, int] = field(default_factory=dict)
+    previous_surface_snapshot: ToolSurfaceSnapshot | None = None
     total_tool_calls: int = 0
     total_usage: dict[str, int] = field(
         default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -190,9 +235,7 @@ class _RunResources:
     workspace: Workspace
     recorder: AgentRecorder
     context: AgentToolContext
-    registry: ToolRegistry
-    tool_policy: NormalizedToolPolicy
-    visible_tool_specs: list[ToolSpec]
+    base_tool_specs: tuple[ToolSpec, ...]
     capabilities: frozenset[str]
     started: float
     deadline: float | None
@@ -204,6 +247,8 @@ class AgentLoop:
     spec: AgentRunSpec
     model_adapter: ModelAdapter
     tool_providers: tuple[ToolProvider, ...] = ()
+    dynamic_tool_providers: tuple[DynamicToolProvider, ...] = ()
+    tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
     event_sinks: tuple[EventSink, ...] = ()
     status_file: bool = True
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
@@ -295,24 +340,39 @@ class AgentLoop:
             jobs_service,
             permission_policy=self.permission_policy,
         )
-        registry = ToolRegistry()
-        registry.register_many(builtin_tools(workspace))
+        base_registry = ToolRegistry()
+        base_registry.register_many(builtin_tools(workspace))
         for provider in self.tool_providers:
-            registry.register_many(provider.get_tools(context))
+            base_registry.register_many(provider.get_tools(context))
 
         capabilities = self.spec.effective_capabilities()
         try:
-            tool_policy = registry.policy_view(self.spec.tool_policy, capabilities)
+            initial_tool_policy = base_registry.policy_view(self.spec.tool_policy, capabilities)
         except ToolPolicyError:
             recorder.close()
             raise
-        visible_tool_specs = registry.visible_specs(tool_policy)
         started = time.time()
         deadline = (
             started + self.spec.limits.max_duration_s
             if self.spec.limits.max_duration_s is not None
             else None
         )
+        initial_turn = TurnContext(
+            step=1,
+            remaining_steps=max(0, self.spec.limits.max_steps - 1),
+            remaining_tool_calls=self.spec.limits.max_tool_calls,
+            deadline_s=(deadline - time.time()) if deadline is not None else None,
+            plan=(),
+            pending_observation_count=0,
+        )
+        initial_surface = self.tool_surface_resolver.resolve(
+            registry=base_registry,
+            run_spec=self._surface_spec(),
+            turn=initial_turn,
+            legacy_tool_policy=initial_tool_policy,
+            capabilities=capabilities,
+        )
+        initial_visible_tool_specs = list(initial_surface.immediate_tools)
         workspace_index = build_workspace_index(workspace, run_id=self.spec.run_id)
         workspace_index_path = recorder.write_workspace_index(workspace_index)
         static_segments: list[str] = []
@@ -333,9 +393,15 @@ class AgentLoop:
         )
         manifest = build_run_manifest(
             self.spec,
-            tool_specs=visible_tool_specs,
+            tool_specs=initial_visible_tool_specs,
             permission_policy=self.permission_policy,
-            tool_policy=tool_policy.to_manifest(),
+            tool_policy=initial_tool_policy.to_manifest(),
+            tool_surface=tool_surface_manifest(
+                resolver=self.tool_surface_resolver,
+                policy=ToolSurfacePolicy.from_json(self.spec.tool_surface_policy),
+                dynamic_enabled=bool(self._dynamic_providers()),
+                initial_catalog_count=len(base_registry.specs()),
+            ),
             workspace_index_path=str(workspace_index_path.relative_to(recorder.run_dir).as_posix()),
             workspace_base_path=str(workspace_base_path.relative_to(recorder.run_dir).as_posix()),
         )
@@ -352,7 +418,7 @@ class AgentLoop:
                 "model_provider": self.spec.model.provider,
                 "model": self.spec.model.model,
                 "reasoning_effort": self.spec.model.reasoning.effort,
-                "visible_tools": [tool.id for tool in visible_tool_specs],
+                "visible_tools": [tool.id for tool in initial_visible_tool_specs],
             },
         )
         self._warn_on_unforwarded_multimodal(recorder, capabilities)
@@ -360,9 +426,7 @@ class AgentLoop:
             workspace=workspace,
             recorder=recorder,
             context=context,
-            registry=registry,
-            tool_policy=tool_policy,
-            visible_tool_specs=visible_tool_specs,
+            base_tool_specs=tuple(base_registry.specs()),
             capabilities=capabilities,
             started=started,
             deadline=deadline,
@@ -395,8 +459,17 @@ class AgentLoop:
         contribute, so the turn prompt stays byte-identical to the static prompt."""
         if not self.context_providers:
             return ""
+        turn = self._turn_context(state, res, step)
+        segments = []
+        for provider in self.context_providers:
+            segment = provider.dynamic_segment(turn)
+            if segment and segment.strip():
+                segments.append(segment.strip())
+        return "\n\n".join(segments)
+
+    def _turn_context(self, state: RunState, res: _RunResources, step: int) -> TurnContext:
         limits = self.spec.limits
-        turn = TurnContext(
+        return TurnContext(
             step=step,
             remaining_steps=max(0, limits.max_steps - step),
             remaining_tool_calls=max(0, limits.max_tool_calls - state.total_tool_calls),
@@ -404,12 +477,31 @@ class AgentLoop:
             plan=tuple(res.context.plan),
             pending_observation_count=len(state.pending_observations),
         )
-        segments = []
-        for provider in self.context_providers:
-            segment = provider.dynamic_segment(turn)
-            if segment and segment.strip():
-                segments.append(segment.strip())
-        return "\n\n".join(segments)
+
+    def _registry_for_turn(
+        self,
+        context: AgentToolContext,
+        turn: TurnContext,
+        res: _RunResources,
+    ) -> ToolRegistry:
+        registry = ToolRegistry()
+        registry.register_many(res.base_tool_specs)
+        for provider in self._dynamic_providers():
+            registry.register_many(provider.get_tools_for_turn(context, turn))
+        return registry
+
+    def _dynamic_providers(self) -> tuple[DynamicToolProvider, ...]:
+        providers: list[DynamicToolProvider] = list(self.dynamic_tool_providers)
+        for provider in self.tool_providers:
+            method = getattr(provider, "get_tools_for_turn", None)
+            if callable(method):
+                providers.append(provider)  # type: ignore[arg-type]
+        return tuple(providers)
+
+    def _surface_spec(self) -> AgentRunSpec:
+        if self.permission_policy == self.spec.permission_policy:
+            return self.spec
+        return replace(self.spec, permission_policy=self.permission_policy)
 
     def _run_steps(self, state: RunState, res: _RunResources) -> None:
         context = res.context
@@ -426,7 +518,50 @@ class AgentLoop:
                 turn_id=turn_id,
                 data={"step": step, "previous_turn_handle": state.previous_turn_handle},
             )
+            turn_context = self._turn_context(state, res, step)
+            turn_registry = self._registry_for_turn(context, turn_context, res)
+            try:
+                turn_tool_policy = turn_registry.policy_view(self.spec.tool_policy, res.capabilities)
+            except ToolPolicyError:
+                raise
+            surface_snapshot = self.tool_surface_resolver.resolve(
+                registry=turn_registry,
+                run_spec=self._surface_spec(),
+                turn=turn_context,
+                legacy_tool_policy=turn_tool_policy,
+                capabilities=res.capabilities,
+                pending_tool_loads=state.pending_tool_loads,
+                previous_snapshot=state.previous_surface_snapshot,
+                call_counts=state.tool_call_counts,
+            )
+            if not surface_snapshot.turn_id:
+                surface_snapshot = replace(surface_snapshot, turn_id=turn_id)
+            context.configure_tool_search(
+                surface_snapshot.search_entries,
+                self.spec.tool_surface_policy.search_top_k,
+            )
+            snapshot_payload = surface_snapshot.to_transcript_json()
+            snapshot_payload["step"] = step
+            recorder.transcript(snapshot_payload)
+            if (
+                state.previous_surface_snapshot is None
+                or state.previous_surface_snapshot.surface_hash != surface_snapshot.surface_hash
+            ):
+                recorder.emit(
+                    "tool.surface.updated",
+                    turn_id=turn_id,
+                    parent_id=turn_started.event_id,
+                    data=surface_snapshot.to_public_json(),
+                )
+            state.previous_surface_snapshot = surface_snapshot
+            state.pending_tool_loads = ()
             dynamic_segment = self._dynamic_context_segment(state, res, step)
+            if surface_snapshot.delta_notice:
+                dynamic_segment = (
+                    surface_snapshot.delta_notice
+                    if not dynamic_segment
+                    else f"{dynamic_segment}\n\n{surface_snapshot.delta_notice}"
+                )
             turn_system_prompt = (
                 res.system_prompt
                 if not dynamic_segment
@@ -435,7 +570,7 @@ class AgentLoop:
             request = ModelRequest(
                 instruction=self.spec.effective_text_instruction,
                 system_prompt=turn_system_prompt,
-                tools=tuple(res.visible_tool_specs),
+                tools=surface_snapshot.immediate_tools,
                 previous_turn_handle=state.previous_turn_handle,
                 observations=state.pending_observations,
             )
@@ -445,6 +580,7 @@ class AgentLoop:
                     "step": step,
                     "previous_turn_handle": state.previous_turn_handle,
                     "observations": [obs.__dict__ for obs in state.pending_observations],
+                    "tool_surface_hash": surface_snapshot.surface_hash,
                 }
             )
             try:
@@ -537,8 +673,9 @@ class AgentLoop:
                     call_name=call.name,
                     call_id=call.id,
                     arguments=call.arguments,
-                    registry=res.registry,
-                    tool_policy=res.tool_policy,
+                    registry=turn_registry,
+                    surface_snapshot=surface_snapshot,
+                    call_counts=state.tool_call_counts,
                     context=context,
                     recorder=recorder,
                     capabilities=res.capabilities,
@@ -548,6 +685,7 @@ class AgentLoop:
                 )
                 observations.append(observation)
                 self._check_run_boundary(deadline)
+            state.pending_tool_loads = _dedupe((*state.pending_tool_loads, *context.consume_tool_load_requests()))
             state.pending_observations = tuple(observations)
 
             if context.finished:
@@ -802,6 +940,99 @@ class AgentLoop:
                 error_code="capability_disabled",
             )
 
+    def _authorize_surface_tool(
+        self,
+        spec: ToolSpec,
+        snapshot: ToolSurfaceSnapshot,
+        capabilities: frozenset[str],
+        call_counts: dict[str, int],
+    ) -> ToolAuthorization:
+        immediate_tool_ids = {tool.id for tool in snapshot.immediate_tools}
+        authorization = snapshot.authorization_for(spec.id)
+        if authorization is not None and authorization.decision == "deny":
+            if authorization.reason == "missing_capability":
+                raise PermissionDenied(
+                    f"capability disabled: {spec.capability}",
+                    error_code="capability_disabled",
+                )
+            raise PermissionDenied(
+                f"tool denied by policy: {spec.id}",
+                error_code="tool_policy_denied",
+            )
+        if spec.id not in immediate_tool_ids or authorization is None:
+            raise PermissionDenied(
+                f"tool is not available in this turn: {spec.id}",
+                error_code="tool_not_in_surface",
+            )
+        if authorization.decision == "ask":
+            raise PermissionDenied(
+                f"tool requires approval: {spec.id}",
+                error_code="tool_approval_required",
+            )
+        if spec.capability not in capabilities:
+            raise PermissionDenied(
+                f"capability disabled: {spec.capability}",
+                error_code="capability_disabled",
+            )
+        max_calls = authorization.quota.max_calls_per_run
+        if max_calls is not None and call_counts.get(spec.id, 0) >= max_calls:
+            raise PermissionDenied(
+                f"tool quota exceeded: {spec.id}",
+                error_code="tool_quota_exceeded",
+            )
+        return authorization
+
+    def _check_tool_surface_scope(
+        self,
+        spec: ToolSpec,
+        arguments: dict[str, Any],
+        authorization: ToolAuthorization,
+    ) -> None:
+        scope = authorization.surface_scope
+        paths = tuple(
+            str(arguments[name])
+            for name in spec.path_args
+            if name in arguments and arguments[name] is not None
+        )
+        for path in paths:
+            if scope.allowed_paths and not matches_path_patterns(path, scope.allowed_paths):
+                raise PermissionDenied(
+                    f"tool path outside allowed scope: {spec.id}",
+                    error_code="tool_scope_denied",
+                )
+            if scope.denied_paths and matches_path_patterns(path, scope.denied_paths):
+                raise PermissionDenied(
+                    f"tool path denied by scope: {spec.id}",
+                    error_code="tool_scope_denied",
+                )
+        if spec.preview_kind == "web":
+            for url in _urls_from_args(arguments):
+                if not url:
+                    continue
+                if not domain_allowed(
+                    domain_from_url(url),
+                    allowed_domains=scope.allowed_domains,
+                    blocked_domains=scope.blocked_domains,
+                ):
+                    raise PermissionDenied(
+                        f"tool web domain denied by scope: {spec.id}",
+                        error_code="tool_scope_denied",
+                    )
+        if spec.preview_kind == "shell":
+            command = str(arguments.get("command") or "")
+            if any(command.strip().startswith(prefix) for prefix in scope.command_deny_prefixes):
+                raise PermissionDenied(
+                    f"tool shell command denied by scope: {spec.id}",
+                    error_code="tool_scope_denied",
+                )
+            if scope.command_allow_prefixes and not any(
+                command.strip().startswith(prefix) for prefix in scope.command_allow_prefixes
+            ):
+                raise PermissionDenied(
+                    f"tool shell command outside allowed scope: {spec.id}",
+                    error_code="tool_scope_denied",
+                )
+
     def _invoke_handler(
         self,
         spec: ToolSpec,
@@ -877,7 +1108,8 @@ class AgentLoop:
         call_id: str,
         arguments: dict[str, Any],
         registry: ToolRegistry,
-        tool_policy: NormalizedToolPolicy,
+        surface_snapshot: ToolSurfaceSnapshot,
+        call_counts: dict[str, int],
         context: AgentToolContext,
         recorder: AgentRecorder,
         capabilities: frozenset[str],
@@ -901,12 +1133,20 @@ class AgentLoop:
                 turn_id=turn_id,
                 parent_id=parent_id,
             )
-            decision = tool_policy.decision_for(spec.id)
-            policy_decision = decision.decision
-            policy_reason = decision.reason
-            self._authorize_tool(spec, decision, capabilities)
+            preview_authorization = surface_snapshot.authorization_for(spec.id)
+            if preview_authorization is not None:
+                policy_decision = preview_authorization.decision
+                policy_reason = preview_authorization.reason
+            authorization = self._authorize_surface_tool(
+                spec,
+                surface_snapshot,
+                capabilities,
+                call_counts,
+            )
             registry.validate_args(spec, arguments)
+            self._check_tool_surface_scope(spec, arguments, authorization)
             self._check_permissions(spec, arguments, capabilities)
+            call_counts[spec.id] = call_counts.get(spec.id, 0) + 1
             result = self._invoke_handler(
                 spec,
                 context,
@@ -1071,6 +1311,53 @@ def _shell_approval_provider(
 def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
     for key in ("input_tokens", "output_tokens", "total_tokens"):
         total_usage[key] += int(turn.usage.get(key, 0))
+
+
+def _dedupe(items: tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return tuple(out)
+
+
+def _rank_tool_search_entries(
+    query: str,
+    entries: tuple[ToolSearchEntry, ...],
+) -> list[ToolSearchEntry]:
+    terms = [term for term in query.lower().split() if term]
+    if not terms:
+        return list(entries)
+
+    def score(entry: ToolSearchEntry) -> int:
+        haystack = " ".join(
+            [
+                entry.tool_id,
+                entry.exported_name,
+                entry.title,
+                entry.summary,
+                entry.guidance.summary,
+                entry.guidance.policy,
+            ]
+        ).lower()
+        return sum(1 for term in terms if term in haystack)
+
+    scored = [(score(entry), index, entry) for index, entry in enumerate(entries)]
+    return [entry for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1])) if value > 0]
+
+
+def _urls_from_args(arguments: dict[str, Any]) -> tuple[str, ...]:
+    urls: list[str] = []
+    raw_url = arguments.get("url")
+    if isinstance(raw_url, str):
+        urls.append(raw_url)
+    raw_urls = arguments.get("urls")
+    if isinstance(raw_urls, list | tuple):
+        urls.extend(str(item) for item in raw_urls)
+    return tuple(urls)
 
 
 def _shell_result_payload(result: ToolResult) -> dict[str, Any]:

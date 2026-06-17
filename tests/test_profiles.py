@@ -23,7 +23,7 @@ def test_lightweight_is_read_only_with_no_write_shell_web() -> None:
     assert spec.web_policy.enabled is False
     assert spec.limits.max_steps == 15
     assert spec.effective_capabilities() == frozenset(
-        {"fs.read", "text.search", "artifact.control", "run.control"}
+        {"fs.read", "text.search", "tool.search", "artifact.control", "run.control"}
     )
 
 

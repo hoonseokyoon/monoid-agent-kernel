@@ -34,6 +34,18 @@ from native_agent_runner.core.profiles import (
 
 # Context providers (pluggable static + per-turn system context)
 from native_agent_runner.core.context import ContextProvider, TurnContext
+from native_agent_runner.core.tool_surface import (
+    DefaultToolSurfaceResolver,
+    ToolAuthorization,
+    ToolExposureRule,
+    ToolGuidance,
+    ToolQuota,
+    ToolScope,
+    ToolSearchEntry,
+    ToolSurfacePolicy,
+    ToolSurfaceResolver,
+    ToolSurfaceSnapshot,
+)
 
 # Multimodal input content parts (contract-only surface; see core/content.py)
 from native_agent_runner.core.content import (
@@ -55,6 +67,7 @@ from native_agent_runner.providers.base import (
 
 # Tool contract
 from native_agent_runner.tools.base import (
+    DynamicToolProvider,
     ToolContext,
     ToolHandler,
     ToolProvider,
@@ -100,6 +113,16 @@ __all__ = [
     # context providers
     "ContextProvider",
     "TurnContext",
+    "DefaultToolSurfaceResolver",
+    "ToolAuthorization",
+    "ToolExposureRule",
+    "ToolGuidance",
+    "ToolQuota",
+    "ToolScope",
+    "ToolSearchEntry",
+    "ToolSurfacePolicy",
+    "ToolSurfaceResolver",
+    "ToolSurfaceSnapshot",
     # multimodal input content parts (contract-only)
     "ContentPart",
     "TextPart",
@@ -113,6 +136,7 @@ __all__ = [
     "ToolCall",
     "ToolObservation",
     # tool contract
+    "DynamicToolProvider",
     "ToolContext",
     "ToolHandler",
     "ToolProvider",

@@ -21,6 +21,7 @@ AgentEventType = Literal[
     "tool.call.started",
     "tool.call.finished",
     "tool.call.failed",
+    "tool.surface.updated",
     "tool.approval.requested",
     "tool.approval.approved",
     "tool.approval.denied",

@@ -78,6 +78,9 @@ class ToolContext(Protocol):
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def search_tools(self, args: dict[str, Any]) -> dict[str, Any]:
+        ...
+
 
 ToolHandler = Callable[[ToolContext, dict[str, Any]], ToolResult]
 
@@ -98,6 +101,9 @@ class ToolSpec:
     changed_paths_source: ToolChangedPathsSource = "path_args"
     result_payload_kind: ToolResultPayloadKind = "paths"
     skip_emit_if_background: bool = False
+    guidance: dict[str, Any] = field(default_factory=dict)
+    examples: tuple[dict[str, Any], ...] = ()
+    annotations: dict[str, Any] = field(default_factory=dict)
 
     @property
     def exported_name(self) -> str:
@@ -106,6 +112,11 @@ class ToolSpec:
 
 class ToolProvider(Protocol):
     def get_tools(self, context: ToolContext) -> Iterable[ToolSpec]:
+        ...
+
+
+class DynamicToolProvider(Protocol):
+    def get_tools_for_turn(self, context: ToolContext, turn: Any) -> Iterable[ToolSpec]:
         ...
 
 

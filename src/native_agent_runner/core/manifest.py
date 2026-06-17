@@ -27,6 +27,7 @@ class RunManifest:
     capabilities: list[str]
     permission_policy: dict[str, Any]
     tool_policy: dict[str, Any]
+    tool_surface: dict[str, Any]
     shell_policy: dict[str, Any]
     web_policy: dict[str, Any]
     tool_specs: list[dict[str, Any]]
@@ -43,6 +44,7 @@ def build_run_manifest(
     tool_specs: list[ToolSpec],
     permission_policy: PermissionPolicy,
     tool_policy: dict[str, Any],
+    tool_surface: dict[str, Any] | None = None,
     workspace_index_path: str = "workspace.index.json",
     workspace_base_path: str = "workspace.base.json",
 ) -> RunManifest:
@@ -66,6 +68,7 @@ def build_run_manifest(
         capabilities=sorted(spec.effective_capabilities()),
         permission_policy=permission_policy.to_json(),
         tool_policy=tool_policy,
+        tool_surface=dict(tool_surface or {}),
         shell_policy=spec.shell_policy.to_manifest(),
         web_policy=spec.web_policy.to_manifest(),
         tool_specs=[_tool_spec_payload(tool) for tool in tool_specs],
@@ -83,4 +86,7 @@ def _tool_spec_payload(tool: ToolSpec) -> dict[str, Any]:
         "capability": tool.capability,
         "side_effect": tool.side_effect,
         "path_args": list(tool.path_args),
+        "guidance": dict(tool.guidance),
+        "examples": [dict(item) for item in tool.examples],
+        "annotations": dict(tool.annotations),
     }
