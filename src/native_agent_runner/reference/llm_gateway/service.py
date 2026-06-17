@@ -85,6 +85,7 @@ class LlmGatewayBackend:
                 tools=request.tools,
                 previous_turn_handle=provider_previous_response_id,
                 observations=request.observations,
+                model=ModelConfig(provider="openai", model=request.model, reasoning=request.reasoning),
             )
         )
         turn_handle = self._record_turn(claims, request, turn)
@@ -121,12 +122,7 @@ class LlmGatewayBackend:
         request: LlmGatewayTurnRequest,
         claims: TokenClaims,
     ) -> None:
-        allowed_model = claims.metadata.get("model")
-        if allowed_model is not None and request.model != allowed_model:
-            raise PermissionDenied("model is not allowed by llm_gateway token")
-        allowed_effort = claims.metadata.get("reasoning_effort")
-        if allowed_effort is not None and request.reasoning.effort != allowed_effort:
-            raise PermissionDenied("reasoning effort is not allowed by llm_gateway token")
+        del request, claims
 
     def _provider_previous_response_id(
         self,

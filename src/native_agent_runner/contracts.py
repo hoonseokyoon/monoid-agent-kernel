@@ -24,32 +24,34 @@ from native_agent_runner.core.spec import (
 )
 from native_agent_runner.core.result import AgentArtifact, AgentRunResult
 
-# Configuration profiles (named capability/limits presets)
-from native_agent_runner.core.profiles import (
-    AGENT_PROFILES,
-    PROFILE_NAMES,
-    AgentProfile,
-    resolve_profile,
-)
-
 # Context providers (pluggable static + per-turn system context)
 from native_agent_runner.core.context import ContextProvider, TurnContext
+from native_agent_runner.core.agents import (
+    AgentDefinition,
+    AgentRuntimeConfig,
+    BoundTool,
+    BoundToolCatalog,
+    PromptSpec,
+    RegistryToolRef,
+    RuntimeConfigProvider,
+    ToolBinding,
+    ToolSearchConfig,
+    compile_bound_tool_catalog,
+    generated_tool_bindings,
+)
 from native_agent_runner.core.tool_surface import (
     DefaultToolSurfaceResolver,
     ToolAuthorization,
-    ToolExposureRule,
     ToolGuidance,
     ToolQuota,
     ToolScope,
     ToolSearchEntry,
-    ToolSurfacePolicy,
     ToolSurfaceResolver,
     ToolSurfaceSnapshot,
 )
 
 # Multimodal input content parts (contract-only surface; see core/content.py)
 from native_agent_runner.core.content import (
-    MEDIA_INPUT_CAPABILITY,
     ContentPart,
     DocumentPart,
     ImagePart,
@@ -86,11 +88,8 @@ from native_agent_runner.core.events import (
     EventSink,
 )
 
-# Policy contracts
+# Permission boundary
 from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.shell import ShellPolicy
-from native_agent_runner.tools.policy import ToolPolicy
-from native_agent_runner.web import WebPolicy
 
 # Gateway client seam (the contract the core calls across for web tools)
 from native_agent_runner.web import WebGatewayClient
@@ -105,22 +104,26 @@ __all__ = [
     "RunLimits",
     "AgentArtifact",
     "AgentRunResult",
-    # configuration profiles
-    "AgentProfile",
-    "AGENT_PROFILES",
-    "PROFILE_NAMES",
-    "resolve_profile",
     # context providers
+    "AgentDefinition",
+    "AgentRuntimeConfig",
+    "BoundTool",
+    "BoundToolCatalog",
+    "PromptSpec",
+    "RegistryToolRef",
+    "RuntimeConfigProvider",
+    "ToolBinding",
+    "ToolSearchConfig",
+    "compile_bound_tool_catalog",
+    "generated_tool_bindings",
     "ContextProvider",
     "TurnContext",
     "DefaultToolSurfaceResolver",
     "ToolAuthorization",
-    "ToolExposureRule",
     "ToolGuidance",
     "ToolQuota",
     "ToolScope",
     "ToolSearchEntry",
-    "ToolSurfacePolicy",
     "ToolSurfaceResolver",
     "ToolSurfaceSnapshot",
     # multimodal input content parts (contract-only)
@@ -128,7 +131,6 @@ __all__ = [
     "TextPart",
     "ImagePart",
     "DocumentPart",
-    "MEDIA_INPUT_CAPABILITY",
     # model adapter contract
     "ModelAdapter",
     "ModelRequest",
@@ -150,11 +152,8 @@ __all__ = [
     "AgentEventLevel",
     "AgentEventType",
     "EventSink",
-    # policy contracts
+    # permission boundary
     "PermissionPolicy",
-    "ShellPolicy",
-    "ToolPolicy",
-    "WebPolicy",
     # gateway client seam
     "WebGatewayClient",
 ]

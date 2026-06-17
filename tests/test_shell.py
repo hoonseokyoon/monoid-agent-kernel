@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.shell import ShellPolicy, execute_shell
+from native_agent_runner.shell import ShellExecutionOptions, execute_shell
 from native_agent_runner.workspace.local import LocalWorkspaceBackend
 
 
@@ -15,7 +15,7 @@ def _python_command(code: str) -> str:
 
 
 def test_shell_policy_defaults_json_and_manifest() -> None:
-    policy = ShellPolicy.from_json(
+    policy = ShellExecutionOptions.from_json(
         {
             "enabled": True,
             "approval_mode": "auto-approve",
@@ -42,7 +42,7 @@ def test_shell_exec_materializes_workspace_and_syncs_to_propose_overlay(tmp_path
 
     result = execute_shell(
         workspace=workspace,
-        policy=ShellPolicy(enabled=True, approval_mode="auto-approve"),
+        policy=ShellExecutionOptions(enabled=True, approval_mode="auto-approve"),
         permission_policy=PermissionPolicy(),
         command=_python_command("from pathlib import Path; Path('SUMMARY.md').write_text('summary\\n', encoding='utf-8')"),
         cwd=".",
@@ -63,7 +63,7 @@ def test_shell_exec_direct_workspace_for_staging_backend(tmp_path: Path) -> None
     workspace_root.mkdir()
     workspace_root.joinpath("notes.md").write_text("notes\n", encoding="utf-8")
     workspace = LocalWorkspaceBackend(workspace_root, mode="propose", backend_kind="staging")
-    policy = ShellPolicy(enabled=True, approval_mode="auto-approve")
+    policy = ShellExecutionOptions(enabled=True, approval_mode="auto-approve")
 
     result = execute_shell(
         workspace=workspace,
@@ -87,7 +87,7 @@ def test_shell_requested_limits_are_recorded_separately_from_effective_limits(tm
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     workspace = LocalWorkspaceBackend(workspace_root, mode="propose", backend_kind="staging")
-    policy = ShellPolicy(
+    policy = ShellExecutionOptions(
         enabled=True,
         approval_mode="auto-approve",
         default_timeout_s=5,
@@ -123,7 +123,7 @@ def test_direct_shell_leaves_generated_paths_for_backend_policy(tmp_path: Path) 
 
     result = execute_shell(
         workspace=workspace,
-        policy=ShellPolicy(enabled=True, approval_mode="auto-approve"),
+        policy=ShellExecutionOptions(enabled=True, approval_mode="auto-approve"),
         permission_policy=PermissionPolicy(),
         command=_python_command("from pathlib import Path; Path('.env').write_text('secret', encoding='utf-8')"),
         cwd=".",
@@ -144,7 +144,7 @@ def test_isolated_copy_shell_allows_secret_looking_paths_by_default(tmp_path: Pa
 
     result = execute_shell(
         workspace=workspace,
-        policy=ShellPolicy(enabled=True, approval_mode="auto-approve"),
+        policy=ShellExecutionOptions(enabled=True, approval_mode="auto-approve"),
         permission_policy=PermissionPolicy(),
         command=_python_command("from pathlib import Path; Path('.env').write_text('secret', encoding='utf-8')"),
         cwd=".",
@@ -168,7 +168,7 @@ def test_shell_env_filters_provider_keys(
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     workspace = LocalWorkspaceBackend(workspace_root, mode="propose")
-    policy = ShellPolicy(
+    policy = ShellExecutionOptions(
         enabled=True,
         approval_mode="auto-approve",
         env_allowlist=("SAFE_VAR", "OPENAI_API_KEY"),
@@ -197,7 +197,7 @@ def test_shell_rejects_bad_cwd_and_explicitly_denied_output_path(tmp_path: Path)
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     workspace = LocalWorkspaceBackend(workspace_root, mode="propose")
-    policy = ShellPolicy(enabled=True, approval_mode="auto-approve")
+    policy = ShellExecutionOptions(enabled=True, approval_mode="auto-approve")
 
     with pytest.raises(Exception):
         execute_shell(
@@ -228,7 +228,7 @@ def test_shell_timeout_and_output_cap(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     workspace = LocalWorkspaceBackend(workspace_root, mode="propose")
-    policy = ShellPolicy(enabled=True, approval_mode="auto-approve")
+    policy = ShellExecutionOptions(enabled=True, approval_mode="auto-approve")
 
     timeout_result = execute_shell(
         workspace=workspace,

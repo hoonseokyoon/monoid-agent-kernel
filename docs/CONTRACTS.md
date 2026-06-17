@@ -1,252 +1,196 @@
 # Integration Contracts
 
-This document defines the stable surface other systems integrate against. It has two parts:
+This document defines the supported integration surface for native-agent-runner.
+Import Python contracts from `native_agent_runner.contracts`. Treat
+`native_agent_runner.reference.*` as runnable examples for backend, LLM gateway,
+and web gateway integration.
 
-1. **Python contracts** — the types and protocols you import from `native_agent_runner.contracts`
-   to embed the runner or extend it (tools, model adapters, event sinks).
-2. **HTTP wire contracts** — the request/response shapes the core runner exchanges with an LLM
-   gateway and a web gateway, so you can build your own gateways.
+## Boundary
 
-## Boundary rule
+- Core exports the runner, contracts, providers, tools, workspace, permission,
+  shell execution, and web gateway client modules.
+- Reference packages implement example services. Core code has no dependency on
+  `native_agent_runner.reference`.
+- Agent configuration enters the engine through `AgentRuntimeConfig`. Legacy
+  tool/shell/web policy inputs have left the core, backend, and CLI execution
+  paths.
 
-- **Core** = `native_agent_runner.contracts` plus the engine it re-exports (`loop`, `core/*`,
-  `providers/*`, `tools/*`, `workspace/*`, `permissions`, `shell`, `web`).
-- **Reference** = `native_agent_runner.reference.{backend,llm_gateway,web_gateway}`. These are
-  **examples**. The core never imports them; you are expected to build your own.
-- Invariant: nothing under the core imports `native_agent_runner.reference`. Keep it that way.
+## Python Contracts
 
----
+### AgentLoop
 
-## 1. Python contracts
+`AgentLoop(spec, model_adapter, runtime_config_provider=..., tool_providers=(),
+event_sinks=(), status_file=True, permission_policy=PermissionPolicy(),
+cancellation_token=None, shell_approval_provider=None, web_gateway_client=None)`
+runs a single agent against one workspace.
 
-Import everything below from `native_agent_runner.contracts` (single stable surface).
+`runtime_config_provider` is required. The loop reads the current config at
+bootstrap and at each turn boundary. A config change applies to the next turn.
+The `ToolSurfaceSnapshot` and `BoundToolCatalog` used by a turn stay fixed for
+that turn.
 
-### 1.1 Engine entry / result
+### AgentRunSpec
 
-- `AgentLoop` (`loop.py`) — the engine. Constructor:
-  `AgentLoop(spec, model_adapter, tool_providers=(), event_sinks=(), status_file=True,
-  permission_policy=PermissionPolicy(), cancellation_token=None, shell_approval_provider=None,
-  web_gateway_client=None)`. Call `.run() -> AgentRunResult`.
-- `AgentRunSpec` (`core/spec.py`) — the run definition: `instruction`, `workspace_root`, `run_root`,
-  `run_id`, `mode` (`read-only`|`propose`|`apply`), `workspace_backend` (`overlay`|`staging`),
-  `model: ModelConfig`, `limits: RunLimits`, `capabilities`, and the policy objects.
-- `ModelConfig`, `ReasoningConfig`, `RunLimits`, `ModelRetryConfig` (`core/spec.py`) — model + run knobs.
-- `AgentRunResult`, `AgentArtifact` (`core/result.py`) — `status` (`completed`|`failed`|`limited`),
-  `final_text`, `run_dir`, `diff_path`, `proposal_path`, `artifacts`, `final_outputs`
-  (the `outputs` list from `run.finish`), `final_notes` (the optional `notes` from `run.finish`),
-  `metrics`, `error`, `error_code`.
+`AgentRunSpec` contains run-specific values:
 
-### 1.1a Profiles (capability/limits presets)
+- `instruction`, `input`
+- `workspace_root`, `run_root`, `run_id`
+- `mode`: `read-only`, `propose`, or `apply`
+- `workspace_backend`: `overlay` or `staging`
+- `limits: RunLimits`
+- `permission_policy: PermissionPolicy`
+- `metadata`
 
-- `AgentProfile`, `AGENT_PROFILES`, `PROFILE_NAMES`, `resolve_profile(name)` (`core/profiles.py`) — named
-  "weight class" presets. A profile sets `mode` + `shell_policy` + `web_policy` + `limits` (capabilities are
-  derived from those, so it is the single source) and may optionally carry `persona_segments` for a
-  specialization profile. Presets:
+It does not carry model, prompt, tool, shell, or web settings. Those values live
+in runtime config.
 
-  | profile | mode | shell | web | limits (steps/tool_calls/duration_s) |
-  |---------|------|-------|-----|--------------------------------------|
-  | `lightweight` | `read-only` | off | off | 15 / 40 / 300 |
-  | `standard` | `propose` | off | off | 30 / 100 / 900 (= no-profile defaults) |
-  | `heavyweight` | `propose` | on | on | 60 / 200 / 1800 |
+### AgentDefinition And Runtime Config
 
-- A profile is a **base**; any field set explicitly overrides it. In a spec JSON, add `"profile":
-  "lightweight"` (explicit keys like `"shell_policy"` still win); the resolved profile name is recorded in
-  `metadata.profile`. On the CLI, `--profile <name>` (explicit flags override; `--profile` cannot be combined
-  with `--spec` — put `"profile"` inside the spec file). `workspace_backend` and `model` are not set by
-  profiles. `heavyweight` enables web, so a web gateway URL is still required to run.
+`AgentDefinition` is a reusable blueprint:
 
-**Spec serialization.** `AgentRunSpec.to_json()` / `AgentRunSpec.from_json(dict)` round-trip the entire run
-definition (model, limits, capabilities, and all four policies) as one JSON object — this is the portable spec
-contract. The CLI consumes it via `native-agent run --spec spec.json` (an alternative to the individual flags;
-transport flags such as gateway URLs and tokens still apply). Shape:
+- `id`, `version`, `description`
+- `model: ModelConfig | None`
+- `prompt: PromptSpec`
+- `tools: tuple[ToolBinding, ...]`
+- `tool_search: ToolSearchConfig`
+- `metadata`
+
+`AgentRuntimeConfig` is the effective config for a run:
+
+- `definition_id`
+- `config_version`
+- `model: ModelConfig | None`
+- `prompt: PromptSpec`
+- `tools: tuple[ToolBinding, ...]`
+- `tool_search: ToolSearchConfig`
+- `metadata`
+- `config_hash`
+
+`ToolBinding` is the public tool unit:
 
 ```json
 {
-  "instruction": "...", "workspace_root": "/ws", "run_root": "runs", "run_id": "...",
-  "mode": "propose", "workspace_backend": "overlay",
-  "model": {"provider": "gateway", "model": "gpt-5.5", "gateway_url": "...",
-            "reasoning": {"effort": "medium", "summary": "off"}, "retry": {...}},
-  "limits": {"max_steps": 30, "max_tool_calls": 100, "max_bytes_read": 1000000, "max_duration_s": 900},
-  "capabilities": null,
-  "permission_policy": {...}, "tool_policy": {...}, "shell_policy": {...}, "web_policy": {...},
-  "system_prompt_base": null, "persona_segments": [],
-  "input": [],
+  "binding_id": "read_notes",
+  "model_name": "read_notes",
+  "ref": {"kind": "registry", "tool_id": "fs.read"},
+  "exposure": "immediate",
+  "authorization": "allow",
+  "guidance": {"summary": "Read source files before editing."},
+  "scope": {"allowed_paths": ["docs/**"]},
+  "quota": {"max_calls_per_run": 20},
+  "runtime": {},
+  "title": "Read notes",
+  "summary": "Read a workspace file.",
+  "risk": "read",
   "metadata": {}
 }
 ```
-Only `instruction` and `workspace_root` are required; everything else falls back to defaults. See
-`examples/run-spec.json`.
 
-**System prompt composition.** The agent's identity prompt is composed, not hardcoded:
-`system_prompt_base` (a general-purpose default in `core/prompt.py` when `null`) plus
-`persona_segments` (role/specialization text appended in order). This keeps the core a *general*
-agent while specialization is layered in as a module. A profile may carry `persona_segments`
-(the three weight-class presets do not); an explicit `persona_segments` key overrides the profile's.
-On the CLI: `--persona <text>` (repeatable) and `--system-prompt-file <path>`. The composed prompt
-is computed once at bootstrap and sent on every turn.
+The same registry tool can appear multiple times with different `binding_id`,
+`model_name`, guidance, scope, quota, and runtime settings. Duplicate
+`binding_id` values and duplicate resolved `model_name` values fail validation.
+Unknown registry tool refs fail validation with `AgentConfigError`.
 
-**Multimodal input (contract-only).** `input` is a richer superset of `instruction`: a list of
-content parts (`core/content.py`), each `{"type": "text"|"image"|"document", ...}` (`image`/`document`
-carry `source_ref` + `mime_type`). `effective_input` is `input` if set, else a single text part from
-`instruction`. **Only text is forwarded today** — explicit text parts are joined into the first-turn
-instruction, and an explicit input with no text parts uses the legacy `instruction` string as its
-text fallback. The types, JSON codec, the `media.input` capability (off by default), and the adapter
-`supports_multimodal` negotiation flag land now; provider forwarding and `fs.read` extraction of
-non-text files are deferred. When a run's `effective_input` contains non-text parts, the core emits a
-`model.input.degraded` warning event
-(`{dropped_part_types, reason}`; reason `adapter_lacks_multimodal` | `capability_not_granted` |
-`not_yet_forwarded`) and proceeds with text only. `input` is part of the spec round-trip but is not
-copied into the manifest.
+`compile_bound_tool_catalog(config, registry)` produces a `BoundToolCatalog`.
+The model receives only bound model-facing `ToolSpec`s. Tool execution resolves
+`model_name -> BoundTool -> base ToolSpec.handler`.
 
-### 1.2 Model adapter contract
+### Tool Surface
 
-Implement this to plug in any model/transport. `providers/base.py`:
+`DefaultToolSurfaceResolver` consumes a `BoundToolCatalog`, turn context,
+pending binding loads, previous snapshot, and call counts. It returns a
+`ToolSurfaceSnapshot`:
 
-```python
-class ModelAdapter(Protocol):
-    def next_turn(self, request: ModelRequest) -> ModelTurn: ...
+- `immediate_tools`: model-facing bound specs available this turn
+- `searchable_tools`: bound specs indexed for `tool.search`
+- `search_entries`: binding-aware search metadata
+- `hidden_tool_ids`: hidden or denied binding ids
+- `authorizations`: `binding_id -> ToolAuthorization`
+- `surface_hash`, `delta_notice`
+
+Unbound registry tools stay outside the surface. Hidden or denied bindings stay
+outside model tools and search results. Tool search uses `binding_id` for search
+results and pending loads.
+
+### Model Adapter
+
+Implement `ModelAdapter.next_turn(request: ModelRequest) -> ModelTurn`.
+
+`ModelRequest` carries:
+
+- `instruction`
+- `system_prompt`
+- `tools: tuple[ToolSpec, ...]`
+- `previous_turn_handle`
+- `observations`
+- `model: ModelConfig | None`
+
+Adapters must use `request.model` for turn-level model selection when present.
+`GatewayModelAdapter` and `OpenAIModelAdapter` follow that rule.
+
+### Tool Contract
+
+Add tools with `ToolProvider.get_tools(context) -> Iterable[ToolSpec]`.
+
+`ToolSpec` still describes a registry tool: id, description, JSON schema,
+side-effect class, handler, provider name, path args, preview hints, guidance,
+examples, and annotations. Registry specs are implementation tools. Bindings
+decide model-facing names, guidance, exposure, authorization, scope, quota, and
+runtime settings.
+
+`ToolResult.to_observation()` returns:
+
+```json
+{"ok": true, "result": {"value": "..."}}
 ```
 
-- `ModelRequest`: `instruction`, `system_prompt`, `tools: tuple[ToolSpec, ...]`,
-  `previous_turn_handle: str | None`, `observations: tuple[ToolObservation, ...]`.
-- `ModelTurn`: `response_id`, `final_text`, `tool_calls: tuple[ToolCall, ...]`,
-  `usage: dict[str, int]`, `raw`.
-- `ToolCall`: `id`, `name`, `arguments: dict`.
-- `ToolObservation`: `call_id`, `tool_name`, `output: dict`, `is_background: bool` (set when the
-  observation carries a completed background-job result; adapters branch on this flag rather than
-  sniffing the tool name / call-id).
-- **Turn threading**: first turn sends `instruction` with `previous_turn_handle=None`. Subsequent
-  turns send `previous_turn_handle` (the prior `ModelTurn.response_id`) plus `observations` (tool
-  results); `instruction` is omitted. The adapter is responsible for conversation continuity.
-  The core never re-sends prior turns: each request carries only `system_prompt` + `tools` and
-  either (first turn) `instruction` or (later turns) the opaque `previous_turn_handle` +
-  `observations`. The handle is the sole continuity key, so a **stateless** provider/gateway MUST
-  reconstruct the full conversation history behind that handle server-side; a stateful provider
-  (e.g. OpenAI Responses) may map the handle to its own continuation id instead.
-  The provider-neutral `previous_turn_handle` is a rename of the former `previous_response_id`
-  (event/transcript `data` keys renamed in place under `native-agent-runner.event.v1`; no version
-  bump). `OpenAIModelAdapter` maps it to OpenAI's own `previous_response_id` wire field;
-  `GatewayModelAdapter` sends it as `previous_turn_handle`.
-- **Errors**: raise `ModelAdapterError` (`errors.py`) with `provider_error_code`, `retryable`,
-  `http_status`. `ModelRetryConfig.retry_on` (a tuple of error codes) gates which codes the core
-  retries; only `retryable=True` codes present in `retry_on` are retried with backoff.
+Failures return:
 
-`GatewayModelAdapter` (`providers/gateway.py`) is the default HTTP implementation;
-`OpenAIModelAdapter` and `FakeModelAdapter` also implement the protocol.
-
-### 1.3 Tool contract
-
-Add domain-specific tools by implementing a provider. `tools/base.py`:
-
-```python
-class ToolProvider(Protocol):
-    def get_tools(self, context: ToolContext) -> Iterable[ToolSpec]: ...
+```json
+{
+  "ok": false,
+  "result": {},
+  "error": {
+    "message": "...",
+    "code": "tool_handler_error",
+    "category": "tool",
+    "retryable": true
+  }
+}
 ```
 
-- `ToolSpec`: `id`, `description`, `input_schema` (JSON Schema, validated with Draft 2020-12),
-  `capability` (gating string), `side_effect` (`read`|`write`|`artifact`|`run`|`shell`), `handler`,
-  `provider_name`, `path_args`. `exported_name` is `provider_name` or `id` with dots→underscores.
-  Declarative engine hints (the loop branches on these, never on tool ids): `preview_kind`
-  (`args`|`shell`|`web`), `emits_workspace_diff` (emit `workspace.file.changed` + proposal after a
-  successful call), `changed_paths_source` (`path_args`|`result_content`), `result_payload_kind`
-  (`paths`|`shell_exec`), `skip_emit_if_background`.
-- `ToolHandler = Callable[[ToolContext, dict], ToolResult]`.
-- `ToolResult`: `ok`, `content: dict`, `error`, `error_code`, `retryable: bool`, `category: str`.
-  `to_observation()` is what the model sees, shaped as a stable envelope so handler `content` keys
-  never collide with the status/error fields:
-  `{"ok": bool, "result": <content dict>}` on success, and on failure additionally
-  `{"error": {"message", "code", "category", "retryable"}}`. `category` is one of
-  `tool`|`policy`|`workspace`|`internal`; `retryable` tells the model whether re-attempting the call
-  (e.g. with different arguments) may help — it is informational and unrelated to gateway transport
-  retries (`ModelAdapterError.retryable`). Background-job re-entry observations carry the job-result
-  payload directly (flagged by `ToolObservation.is_background`) and do not use this envelope.
-- `ToolContext` is the protocol the handler receives (artifact/plan/finish/shell/job/web operations).
-- Register via `AgentLoop(..., tool_providers=(MyProvider(),))`, or from the CLI with
-  `--tool-module path.py:get_tools`. Builtin tools are always present; custom tools are additive.
-- **Capability gating**: a tool is visible only if its `capability` is in the run's effective
-  capabilities. Defaults derive from `mode` (`default_capabilities` in `core/spec.py`); enabling
-  `shell_policy`/`web_policy` adds `shell.exec`/`job.control`/`web.*`. `ToolPolicy`
-  (allow/deny/ask) further filters visibility. See `examples/custom_tools/word_count_tool.py`.
-  A stale call to a tool whose capability is not granted is rejected with `error_code`
-  `capability_disabled` (this replaced the tool-specific `shell_disabled`/`web_disabled` codes on
-  the dispatch path; those codes still surface from the runtime shell/web gateway when an enabled
-  capability's service is unconfigured).
+### Shell And Web Bindings
 
-### 1.4 Event contract
+Shell availability is the presence of an exposed `shell.exec` binding.
 
-Observe a run by implementing `EventSink` (`core/events.py`):
+- command allow/deny prefixes and env allowlist live in `ToolBinding.scope`
+- timeout, output, startup wait, approval mode, shell kind, and execution
+  workspace live in `ToolBinding.runtime.shell`
+- `ShellExecutionOptions` is an internal low-level execution options object
 
-```python
-class EventSink(Protocol):
-    def emit(self, event: AgentEvent) -> None: ...
-    def close(self) -> None: ...
-```
+Web availability is the presence of exposed `web.search`, `web.fetch`, and
+`web.context` bindings.
 
-- `AgentEvent` carries `schema_version` (`EVENT_SCHEMA_VERSION = "native-agent-runner.event.v1"`),
-  `event_id`, `seq`, `run_id`, `timestamp`, plus type/level/payload. `AgentEventType` enumerates all
-  event kinds (run/model/tool/shell/job/web/workspace/proposal/...); `AgentEventLevel` is
-  `debug`|`info`|`warning`|`error`.
-- **Per-type `data` contract**: the envelope is validated by `EVENT_SCHEMA`; each event type's
-  `data` payload is pinned by `EVENT_DATA_SCHEMAS` (`core/schemas.py`), keyed by `AgentEventType`.
-  `validate_run_dir` validates every event's `data` against its type schema (and flags any event
-  type with no schema). Stable events use `additionalProperties: false`; events whose payload is
-  assembled from `to_public_json()`/snapshots (shell/web/approval/job/proposal-lifecycle/workspace
-  snapshots) are `additionalProperties: true` and will be tightened over time. Consumers
-  (`StatusJsonSink`, `core.projections`) read this contracted shape.
-- Pass sinks via `AgentLoop(..., event_sinks=(...))`, or the CLI `--event-sink-module path.py:make_sink`.
-- Built-in sinks: `JsonlEventSink`, `MemoryEventSink`, `StatusJsonSink`, `StdoutJsonlSink`.
-- **Secret handling**: public events are *not* heuristically scrubbed for secrets. The core only keeps
-  file-content fields out of the public stream (full content lives in the private `transcript.jsonl` /
-  `proposal`) and masks paths matching `PermissionPolicy.redact_patterns`. Any other redaction —
-  secret-bearing tool arguments, tokens embedded in shell commands, etc. — is the integrator's
-  responsibility; `EventSink` is the seam to add it (wrap or post-process events before they leave
-  the trust boundary). See `examples/redacting_event_sink.py` for a ready-to-copy wrapping sink.
+- domain allow/block lists live in `ToolBinding.scope`
+- result limits, context limits, timeout, response-byte limits, and call limits
+  live in `ToolBinding.runtime.web`
+- gateway requests include `binding_id`, `max_calls`, and effective constraints
 
-### 1.5 Policy contracts
+### Permission Boundary
 
-- `PermissionPolicy` (`permissions.py`) — `deny_patterns` (block tool/shell path access),
-  `redact_patterns` (mask in public events/status only; private artifacts keep real values).
-- `ShellPolicy` (`shell.py`) — enable/disable shell, approval mode, timeouts, env allowlists.
-- `WebPolicy` (`web.py`) — enable web and per-capability (search/fetch/context) flags, call limits,
-  domain filters.
-- `ToolPolicy` (`tools/policy.py`) — allow/deny/ask rules over tool visibility.
+`PermissionPolicy` remains the workspace/public-output boundary:
 
-### 1.6 Context providers
+- `deny_patterns` block workspace path access
+- `redact_patterns` mask public events and projections
 
-Inject extra system context without subclassing the loop or the model adapter, in two layers
-(`core/context.py`, exported from `contracts`):
+It does not grant tools. Tool availability and execution constraints come from
+bindings.
 
-```python
-class ContextProvider(Protocol):
-    def static_segment(self) -> str | None: ...          # folded into the prompt once at bootstrap
-    def dynamic_segment(self, turn: TurnContext) -> str | None: ...  # appended every turn
-```
+## HTTP Contracts
 
-- `static_segment()` is composed alongside `persona_segments` (see "System prompt composition"),
-  so it is fixed for the whole run. `dynamic_segment(turn)` is re-evaluated each turn and **appended
-  to that turn's `system_prompt`** — no new wire field, since providers already receive `system_prompt`
-  every turn. Both return `None`/blank to contribute nothing.
-- `TurnContext` is a read-only snapshot: `step`, `remaining_steps`, `remaining_tool_calls`,
-  `deadline_s` (seconds left, or `None`), `plan` (the `run.update_plan` items), and
-  `pending_observation_count`. It carries only plain data — the `Workspace` is intentionally not on
-  the contract.
-- Register via `AgentLoop(..., context_providers=(MyProvider(),))`. With no providers the per-turn
-  prompt is byte-identical to the static composed prompt (default behavior unchanged).
-- Opt-in built-in: `AgentLoop(..., inject_workspace_index=True)` folds a compact initial workspace
-  file listing into the static prompt (`render_workspace_index_segment`); off by default.
+### LLM Gateway
 
----
-
-## 2. HTTP wire contracts
-
-The core sends an opaque `Authorization: Bearer <token>` on every gateway call. The token scheme is
-a **reference convention** (see §3) — your gateway may validate tokens however it likes.
-
-### 2.1 LLM gateway
-
-Source of truth: `providers/gateway.py` (`_payload`, `_parse_gateway_response`).
-
-**Request** — `POST <gateway-url>` (default path in the reference impl: `/internal/llm/turns`):
+`GatewayModelAdapter` sends `POST <gateway-url>`.
 
 ```json
 {
@@ -254,74 +198,134 @@ Source of truth: `providers/gateway.py` (`_payload`, `_parse_gateway_response`).
   "model": "gpt-5.5",
   "system_prompt": "...",
   "tools": [
-    {"id": "fs.read", "name": "fs_read", "description": "...",
-     "input_schema": { /* JSON Schema */ }, "capability": "fs.read", "side_effect": "read"}
+    {
+      "id": "read_notes",
+      "name": "read_notes",
+      "description": "...",
+      "input_schema": {},
+      "capability": "fs.read",
+      "side_effect": "read"
+    }
   ],
-  "reasoning": {"effort": "medium", "summary": "auto"},   // omitted when default/off
-  "instruction": "...",                                    // FIRST turn only
-  "previous_turn_handle": "...",                           // SUBSEQUENT turns only
-  "observations": [                                        // SUBSEQUENT turns only
-    {"call_id": "...", "tool_name": "fs.read",
-     "output": {"ok": true, "result": { /* tool content */ }},  // ToolResult.to_observation();
-                                                                 // failure: {"ok": false, "error": {...}}
-     "is_background": false}                                // true for background-job re-entry results
-  ]
+  "reasoning": {"effort": "medium", "summary": "off"},
+  "instruction": "First turn text"
 }
 ```
 
-**Success response** (`native-agent-runner.llm-turn-result.v1`):
+Subsequent turns send `previous_turn_handle` and `observations` instead of
+`instruction`.
+
+Successful response:
 
 ```json
 {
-  "turn_handle": "...",          // or "response_id"; either is accepted
-  "final_text": "..." | null,
+  "protocol": "native-agent-runner.llm-turn-result.v1",
+  "turn_handle": "turn_...",
+  "final_text": null,
   "tool_calls": [
-    {"id": "...", "name": "fs_read", "arguments": { /* dict or JSON string */ }}
-    // "call_id" accepted as an alias for "id"
+    {"call_id": "call_1", "name": "read_notes", "arguments": {"path": "notes.md"}}
   ],
   "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 }
 ```
 
-**Error response** (any of these triggers a `ModelAdapterError`):
+The reference LLM gateway token authenticates run identity. The request model
+selects the turn model.
+
+### Web Gateway
+
+The runner calls:
+
+- `POST /internal/web/search`
+- `POST /internal/web/fetch`
+- `POST /internal/web/context`
+
+Every request includes binding constraints:
 
 ```json
-{"error": "...", "error_code": "gateway_rate_limited", "retryable": true, "http_status": 429}
+{
+  "protocol": "native-agent-runner.web-search.v1",
+  "binding_id": "search_docs",
+  "query": "native runtime config",
+  "max_results": 5,
+  "max_calls": 20,
+  "allowed_domains": ["docs.example.test"],
+  "blocked_domains": []
+}
 ```
 
-Retryable codes used by the core: `gateway_timeout`, `gateway_network_error`,
-`gateway_rate_limited`, `gateway_server_error` (also inferred from HTTP 429 / 5xx). The gateway is
-expected to hold provider credentials and store provider continuation state behind `turn_handle`.
+The reference gateway enforces per-run/binding call counters and the
+per-request domain/limit constraints. Web gateway tokens authenticate run
+identity.
 
-### 2.2 Web gateway
+### Reference Backend
 
-Source of truth: request bodies in `loop.py`; response bodies in
-`reference/web_gateway/service.py`; client + error envelope in `web.py`.
+Run creation requires `agent_definition` or `runtime_config`.
 
-**Endpoints**: `POST /internal/web/search`, `/internal/web/fetch`, `/internal/web/context`.
+`POST /v1/runs` request shape:
 
-| Call | Request protocol | Key request fields | Response protocol | Key response fields |
-|------|------------------|--------------------|-------------------|---------------------|
-| search | `native-agent-runner.web-search.v1` | `query`, `max_results`, `allowed_domains`, `blocked_domains`, `recency_days`, `locale` | `…web-search-result.v1` | `results[]` (`title`,`url`,`domain`,`snippet`,`source`), `result_count`, `effective_max_results` |
-| fetch | `native-agent-runner.web-fetch.v1` | `url`, `format`, `timeout_s`, `max_bytes` | `…web-fetch-result.v1` | `final_url`, `domain`, `title`, `content`, `content_bytes`, `truncated`, `effective_*` |
-| context | `native-agent-runner.web-context.v1` | `query`, `max_tokens`, `max_urls`, `max_snippets`, `allowed_domains`, `blocked_domains`, `recency_days`, `locale` | `…web-context-result.v1` | `context`, `sources[]`, `chunks[]`, `estimated_tokens`, `effective_*` |
+```json
+{
+  "tenant_id": "tenant_a",
+  "user_id": "user_a",
+  "workspace_root": "/workspaces/demo",
+  "instruction": "Read notes.md and create SUMMARY.md.",
+  "mode": "propose",
+  "runtime_config": {
+    "definition_id": "coding-agent",
+    "config_version": 1,
+    "model": {"provider": "gateway", "model": "gpt-5.5"},
+    "prompt": {"runtime_segments": ["Prefer concise edits."]},
+    "tools": [
+      {"binding_id": "read_file", "ref": {"kind": "registry", "tool_id": "fs.read"}},
+      {"binding_id": "finish", "ref": {"kind": "registry", "tool_id": "run.finish"}}
+    ],
+    "tool_search": {"enabled": true, "top_k": 5}
+  }
+}
+```
 
-**Error response** (raises `WebGatewayError`): `{"error": "...", "error_code": "...", "http_status": 0}`.
+Runtime config API:
 
----
+- `GET /v1/runs/{run_id}/runtime-config`
+- `POST /v1/runs/{run_id}/runtime-config`
 
-## 3. Token model (reference only)
+Replacement request:
 
-The reference services sign claims with HMAC-SHA256 (`reference/_shared/tokens.py`,
-`TokenManager`) and use three token kinds (`run_access`, `llm_gateway`, `web_gateway`). This is a
-**convention of the reference backend**, not a core requirement: the core only emits an opaque
-bearer token to its gateways. When you build your own backend you may use any auth scheme — the
-only contract is the `Authorization: Bearer <token>` header on gateway calls.
+```json
+{
+  "expected_version": 1,
+  "issuer": "backend",
+  "reason": "update guidance",
+  "config": {
+    "definition_id": "coding-agent",
+    "config_version": 2,
+    "model": {"provider": "gateway", "model": "gpt-5.5"},
+    "tools": [
+      {
+        "binding_id": "read_file",
+        "ref": {"kind": "registry", "tool_id": "fs.read"},
+        "guidance": {"summary": "Read the smallest relevant file first."}
+      },
+      {"binding_id": "finish", "ref": {"kind": "registry", "tool_id": "run.finish"}}
+    ]
+  }
+}
+```
 
----
+The backend validates schema, registry resolvability, duplicate binding ids,
+and duplicate model names. A version mismatch returns HTTP 400.
 
-## 4. Worked examples
+## Run Artifacts
 
-- `examples/full_stack_integration.py` — runner + reference LLM gateway + reference backend wired together.
-- `examples/custom_tools/word_count_tool.py` — a minimal custom `ToolProvider`.
-- `examples/messy_workspace_cleanup.py` — an end-to-end propose-mode run.
+Manifest and transcript are binding-aware:
+
+- `manifest.json.agent_config`: definition id, config version, config hash
+- `manifest.json.tool_surface`: resolver, tool search settings, bound catalog count
+- `tool_surface_snapshot`: immediate/searchable bound tool specs and binding
+  authorizations
+- `agent_runtime_config_snapshot`: definition id, config version/hash, binding ids
+- `agent.config.updated`: emitted when the loop observes a new config hash
+
+Replay uses recorded snapshots. Current registry state does not reinterpret an
+old turn.

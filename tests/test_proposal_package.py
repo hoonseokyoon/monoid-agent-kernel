@@ -11,6 +11,8 @@ from urllib.request import Request, urlopen
 import pytest
 from click.testing import CliRunner
 
+from conftest import runtime_config, runtime_provider
+
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
 from native_agent_runner.reference._shared.tokens import TokenManager
@@ -29,6 +31,10 @@ from native_agent_runner.errors import PermissionDenied, WorkspaceError
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+
+
+def _provider(*tool_ids: str):
+    return runtime_provider(runtime_config(*(tool_ids or ("fs.write", "fs.delete", "run.finish"))))
 
 
 def _run_with_created_and_modified_files(tmp_path: Path) -> tuple[Path, Path]:
@@ -62,6 +68,7 @@ def _run_with_created_and_modified_files(tmp_path: Path) -> tuple[Path, Path]:
             run_root=tmp_path / "runs",
         ),
         model_adapter=adapter,
+        runtime_config_provider=_provider("fs.write", "run.finish"),
     ).run()
     return workspace, result.run_dir
 
@@ -199,6 +206,7 @@ def test_package_apply_deleted_file_and_directory_entries(tmp_path: Path) -> Non
             run_root=tmp_path / "runs",
         ),
         model_adapter=adapter,
+        runtime_config_provider=_provider("fs.delete", "run.finish"),
     ).run()
 
     assert result.status == "completed"
@@ -361,6 +369,7 @@ def test_backend_package_endpoints_auth_disabled_apply_and_allowed_apply(tmp_pat
                 "user_id": "user_a",
                 "workspace_root": str(workspace),
                 "instruction": "Create summary.",
+                "runtime_config": runtime_config("fs.write", "run.finish").to_json(),
             },
             token="admin",
         )
@@ -415,6 +424,7 @@ def test_backend_apply_endpoint_disabled_without_apply_roots(tmp_path: Path) -> 
             user_id="user_a",
             workspace_root=workspace,
             instruction="Finish.",
+            runtime_config=runtime_config("run.finish"),
         )
     )
     backend.wait_for_run(submission.run_id, timeout_s=5)
@@ -468,6 +478,7 @@ def test_backend_package_apply_endpoint_handles_deletion_package(tmp_path: Path)
                 "user_id": "user_a",
                 "workspace_root": str(workspace),
                 "instruction": "Delete old file.",
+                "runtime_config": runtime_config("fs.delete", "run.finish").to_json(),
             },
             token="admin",
         )

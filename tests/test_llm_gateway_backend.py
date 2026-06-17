@@ -9,6 +9,8 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from conftest import runtime_config
+
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
 from native_agent_runner.reference._shared.tokens import TokenManager
@@ -31,7 +33,7 @@ def _llm_token(manager: TokenManager, *, run_id: str = "run_1", tenant_id: str =
         tenant_id=tenant_id,
         user_id="user_a",
         ttl_s=600,
-        metadata={"model": "gpt-5.5", "reasoning_effort": "low"},
+        metadata={"agent_config_hash": "test"},
     )
 
 
@@ -60,7 +62,7 @@ def _payload(*, previous_turn_handle: str | None = None) -> dict:
     return payload
 
 
-def test_llm_gateway_validates_token_model_and_returns_opaque_turn_handle() -> None:
+def test_llm_gateway_validates_token_and_returns_opaque_turn_handle() -> None:
     manager = _token_manager()
     seen_previous_ids: list[str | None] = []
 
@@ -97,10 +99,9 @@ def test_llm_gateway_validates_token_model_and_returns_opaque_turn_handle() -> N
     assert seen_previous_ids == [None, "provider_response_secret_1"]
     assert gateway.tenant_usage("tenant_a")["total_tokens"] == 14
 
-    bad_payload = _payload()
-    bad_payload["model"] = "other-model"
-    with pytest.raises(PermissionDenied):
-        gateway.handle_turn(token, bad_payload)
+    other_model = _payload()
+    other_model["model"] = "other-model"
+    assert gateway.handle_turn(token, other_model)["turn_handle"].startswith("turn_")
 
 
 def test_llm_gateway_rejects_cross_run_turn_handle() -> None:
@@ -219,7 +220,7 @@ def test_runner_backend_can_use_http_llm_gateway_end_to_end(tmp_path: Path) -> N
                 user_id="user_a",
                 workspace_root=workspace,
                 instruction="Finish through gateway.",
-                reasoning_effort="medium",
+                runtime_config=runtime_config("run.finish"),
             )
         )
         assert runner_backend.wait_for_run(submission.run_id, timeout_s=5) == "completed"
@@ -302,6 +303,7 @@ def test_fake_full_stack_contract_propose_proposal_usage_and_auth(tmp_path: Path
                 "workspace_root": str(workspace),
                 "instruction": "Read notes.md and propose SUMMARY.md.",
                 "mode": "propose",
+                "runtime_config": runtime_config("fs.read", "fs.write", "run.finish").to_json(),
             },
             token="runner-admin",
         )

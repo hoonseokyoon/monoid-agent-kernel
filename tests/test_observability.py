@@ -6,6 +6,8 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
+from conftest import runtime_config, runtime_provider
+
 from native_agent_runner.cli import main
 from native_agent_runner.core.events import EventBus
 from native_agent_runner.core.projections import project_run_status
@@ -16,6 +18,25 @@ from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.public_view import args_preview
 from native_agent_runner.recorder import JsonlEventSink, MemoryEventSink, StatusJsonSink
+
+
+DEFAULT_TOOLS = (
+    "fs.read",
+    "fs.write",
+    "fs.patch",
+    "fs.list",
+    "run.finish",
+)
+
+
+def _provider(*tool_ids: str):
+    return runtime_provider(runtime_config(*(tool_ids or DEFAULT_TOOLS)))
+
+
+def _runtime_config_file(tmp_path: Path, *tool_ids: str) -> Path:
+    path = tmp_path / "runtime-config.json"
+    path.write_text(json.dumps(runtime_config(*(tool_ids or ("run.finish",))).to_json()), encoding="utf-8")
+    return path
 
 
 def _events(run_dir: Path) -> list[dict]:
@@ -90,7 +111,7 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     )
     spec = AgentRunSpec(instruction="Clean notes.", workspace_root=workspace, run_root=tmp_path / "runs")
 
-    result = AgentLoop(spec=spec, model_adapter=adapter).run()
+    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run()
 
     types = [event["type"] for event in _events(result.run_dir)]
     assert types[0] == "run.started"
@@ -154,6 +175,7 @@ def test_public_events_redact_tool_arguments_and_policy_redacted_paths(tmp_path:
         spec=spec,
         model_adapter=adapter,
         permission_policy=PermissionPolicy(redact_patterns=(".env",)),
+        runtime_config_provider=_provider(),
     ).run()
 
     events_text = result.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8")
@@ -238,6 +260,7 @@ def test_status_projection_redacts_paths_from_manifest_policy(tmp_path: Path) ->
         spec=spec,
         model_adapter=adapter,
         permission_policy=PermissionPolicy(redact_patterns=(".env",)),
+        runtime_config_provider=_provider(),
     ).run()
 
     proposal = json.loads(result.run_dir.joinpath("proposal.json").read_text(encoding="utf-8"))
@@ -270,6 +293,7 @@ def test_loop_records_unknown_malformed_and_permission_failures_as_events(tmp_pa
         spec=spec,
         model_adapter=adapter,
         permission_policy=PermissionPolicy(deny_patterns=(".env",)),
+        runtime_config_provider=_provider(),
     ).run()
 
     events = _events(result.run_dir)
@@ -302,7 +326,7 @@ def test_loop_limited_status_is_public_event(tmp_path: Path) -> None:
         limits=RunLimits(max_steps=1, max_tool_calls=0),
     )
 
-    result = AgentLoop(spec=spec, model_adapter=adapter).run()
+    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.list", "run.finish")).run()
 
     final_event = _events(result.run_dir)[-1]
     assert result.status == "limited"
@@ -351,6 +375,7 @@ def make_sink():
     monkeypatch.setenv("NAR_TEST_SINK_PATH", str(sink_output))
     runner, has_separate_stderr = _isolated_cli_runner()
     run_root = tmp_path / "runs"
+    config_file = _runtime_config_file(tmp_path, "run.finish")
 
     result = runner.invoke(
         main,
@@ -364,6 +389,8 @@ def make_sink():
             str(run_root),
             "--run-id",
             "cli_stream",
+            "--runtime-config-file",
+            str(config_file),
             "--stream-json",
             "--event-sink-module",
             f"{sink_module}:make_sink",
@@ -421,6 +448,7 @@ def test_cli_normal_mode_prints_run_identity_before_completion(tmp_path: Path, m
 
     monkeypatch.setattr("native_agent_runner.cli.GatewayModelAdapter", FakeCliGatewayAdapter)
     runner = CliRunner()
+    config_file = _runtime_config_file(tmp_path, "run.finish")
     result = runner.invoke(
         main,
         [
@@ -433,6 +461,8 @@ def test_cli_normal_mode_prints_run_identity_before_completion(tmp_path: Path, m
             str(tmp_path / "runs"),
             "--run-id",
             "cli_normal",
+            "--runtime-config-file",
+            str(config_file),
         ],
     )
 
@@ -462,7 +492,7 @@ def test_cli_proposal_command_reads_snapshot_file(tmp_path: Path) -> None:
         ]
     )
     spec = AgentRunSpec(instruction="Write summary.", workspace_root=workspace, run_root=tmp_path / "runs")
-    result = AgentLoop(spec=spec, model_adapter=adapter).run()
+    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.write", "run.finish")).run()
 
     runner = CliRunner()
     summary = runner.invoke(main, ["proposal", str(result.run_dir), "--file", "SUMMARY.md", "--json"])

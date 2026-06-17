@@ -37,10 +37,11 @@ class GatewayModelAdapter:
     token_file: Path | None = None
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
-        url = self._resolve_gateway_url()
+        config = request.model or self.config
+        url = self._resolve_gateway_url(config)
         payload = self._payload(request)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        retry = self.config.retry
+        retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
         for attempt in range(1, max_attempts + 1):
@@ -51,7 +52,7 @@ class GatewayModelAdapter:
                 method="POST",
             )
             try:
-                with urlopen(http_request, timeout=self.config.timeout_s) as response:
+                with urlopen(http_request, timeout=config.timeout_s) as response:
                     response_body = response.read()
                 try:
                     data = json.loads(response_body.decode("utf-8"))
@@ -93,8 +94,8 @@ class GatewayModelAdapter:
             raise last_error
         raise ModelAdapterError("LLM gateway request failed", provider_error_code=GATEWAY_NETWORK_ERROR)
 
-    def _resolve_gateway_url(self) -> str:
-        url = self.gateway_url or self.config.gateway_url or os.environ.get(DEFAULT_GATEWAY_URL_ENV)
+    def _resolve_gateway_url(self, config: ModelConfig) -> str:
+        url = self.gateway_url or config.gateway_url or self.config.gateway_url or os.environ.get(DEFAULT_GATEWAY_URL_ENV)
         if not url:
             raise ModelAdapterError(
                 f"LLM gateway URL is required via --llm-gateway-url or {DEFAULT_GATEWAY_URL_ENV}"
@@ -120,13 +121,14 @@ class GatewayModelAdapter:
         return os.environ.get(self.token_env)
 
     def _payload(self, request: ModelRequest) -> dict[str, Any]:
+        config = request.model or self.config
         payload: dict[str, Any] = {
             "protocol": "native-agent-runner.llm-turn.v1",
-            "model": self.config.model,
+            "model": config.model,
             "system_prompt": request.system_prompt,
             "tools": [_gateway_tool_schema(tool) for tool in request.tools],
         }
-        reasoning_payload = build_reasoning_payload(self.config.reasoning)
+        reasoning_payload = build_reasoning_payload(config.reasoning)
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
 

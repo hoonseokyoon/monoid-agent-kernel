@@ -4,10 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.errors import ToolPolicyError, WorkspaceError
+from native_agent_runner.errors import ToolExecutionError, WorkspaceError
 from native_agent_runner.tools.base import ToolRegistry
 from native_agent_runner.tools.builtin import builtin_tools
-from native_agent_runner.tools.policy import ToolPolicy
 from native_agent_runner.workspace.local import LocalWorkspaceBackend, sha256_bytes
 
 
@@ -191,101 +190,10 @@ def test_file_operation_net_zero_create_delete_and_create_move(tmp_path: Path) -
     assert changes[0].content == b"draft"
 
 
-def test_tool_policy_matches_core_id_exported_name_and_glob(tmp_path: Path) -> None:
-    workspace = LocalWorkspaceBackend(tmp_path)
-    registry = _registry(workspace)
-    capabilities = frozenset(
-        {
-            "fs.read",
-            "text.search",
-            "artifact.control",
-            "run.control",
-            "fs.write",
-            "fs.patch",
-            "fs.mkdir",
-        }
-    )
+def test_registry_lookup_by_core_id_and_exported_name(tmp_path: Path) -> None:
+    registry = _registry(LocalWorkspaceBackend(tmp_path))
 
-    view = registry.policy_view(
-        ToolPolicy(
-            allowed_tools=("fs.read", "text_search", "run.*"),
-            denied_tools=("artifact.*",),
-            ask_tools=("fs.patch",),
-        ),
-        capabilities,
-    )
-
-    assert view.allowed_tools == ("fs.read", "text.search", "run.update_plan", "run.finish")
-    assert view.denied_tools == ("artifact.emit", "artifact.list")
-    assert view.ask_tools == ("fs.patch",)
-    assert view.decision_for("artifact.emit").decision == "deny"
-    assert view.decision_for("fs.patch").decision == "ask"
-    assert view.decision_for("fs.read").decision == "allow"
-    assert "artifact.emit" not in view.visible_tools
-    assert "fs.patch" in view.visible_tools
-
-
-def test_tool_policy_precedence_and_allowlist_visibility(tmp_path: Path) -> None:
-    workspace = LocalWorkspaceBackend(tmp_path)
-    registry = _registry(workspace)
-    capabilities = frozenset({"fs.read", "fs.write", "run.control"})
-
-    view = registry.policy_view(
-        ToolPolicy(
-            allowed_tools=("fs.*", "run.finish"),
-            denied_tools=("fs.write",),
-            ask_tools=("fs.read",),
-        ),
-        capabilities,
-    )
-
-    visible = {spec.id for spec in registry.visible_specs(view)}
-    assert view.decision_for("fs.write").decision == "deny"
-    assert view.decision_for("fs.read").decision == "ask"
-    assert visible == {"fs.read", "fs.list", "fs.tree", "fs.stat", "fs.glob", "run.finish"}
-
-
-def test_tool_policy_read_only_hides_mutation_tools(tmp_path: Path) -> None:
-    workspace = LocalWorkspaceBackend(tmp_path)
-    registry = _registry(workspace)
-
-    view = registry.policy_view(ToolPolicy(), frozenset({"fs.read", "text.search", "run.control"}))
-
-    visible = {spec.id for spec in registry.visible_specs(view)}
-    assert "fs.write" not in visible
-    assert "fs.patch" not in visible
-    assert "fs.mkdir" not in visible
-    assert view.hidden_tools["fs.write"] == "missing_capability"
-
-
-def test_web_tools_are_capability_and_tool_policy_controlled(tmp_path: Path) -> None:
-    workspace = LocalWorkspaceBackend(tmp_path)
-    registry = _registry(workspace)
-
-    disabled = registry.policy_view(ToolPolicy(), frozenset({"fs.read", "run.control"}))
-    assert "web.search" not in {spec.id for spec in registry.visible_specs(disabled)}
-    assert "web.context" not in {spec.id for spec in registry.visible_specs(disabled)}
-    assert disabled.hidden_tools["web.search"] == "missing_capability"
-    assert disabled.hidden_tools["web.context"] == "missing_capability"
-
-    enabled = registry.policy_view(
-        ToolPolicy(denied_tools=("web.fetch",), ask_tools=("web.context",)),
-        frozenset({"web.search", "web.fetch", "web.context", "run.control"}),
-    )
-    visible = {spec.id for spec in registry.visible_specs(enabled)}
-    assert "web.search" in visible
-    assert "web.fetch" not in visible
-    assert "web.context" in visible
-    assert enabled.hidden_tools["web.fetch"] == "denied_by_tool_policy"
-    assert enabled.decision_for("web.context").decision == "ask"
-
-
-def test_tool_policy_invalid_unknown_reference_and_unmatched_glob(tmp_path: Path) -> None:
-    workspace = LocalWorkspaceBackend(tmp_path)
-    registry = _registry(workspace)
-
-    with pytest.raises(ToolPolicyError):
-        registry.policy_view(ToolPolicy(allowed_tools=("fs.missing",)), frozenset())
-
-    with pytest.raises(ToolPolicyError):
-        registry.policy_view(ToolPolicy(denied_tools=("network.*",)), frozenset())
+    assert registry.resolve("fs.read").id == "fs.read"
+    assert registry.resolve("fs_read").id == "fs.read"
+    with pytest.raises(ToolExecutionError):
+        registry.resolve("fs.missing")

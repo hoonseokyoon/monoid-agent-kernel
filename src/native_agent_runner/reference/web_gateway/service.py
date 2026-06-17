@@ -8,7 +8,6 @@ from native_agent_runner.reference._shared.tokens import TokenClaims, TokenError
 from native_agent_runner.errors import PermissionDenied
 from native_agent_runner.web import (
     WebGatewayError,
-    WebPolicy,
     domain_allowed,
     domain_from_url,
 )
@@ -49,7 +48,7 @@ DEFAULT_FAKE_CORPUS: tuple[dict[str, str], ...] = (
         "url": "https://docs.example.test/native-agent-runner/policy",
         "title": "Web Policy and Tenant Usage",
         "content": (
-            "WebPolicy controls allowed domains, blocked domains, call limits, result limits, "
+            "Tool bindings carry allowed domains, blocked domains, call limits, result limits, "
             "timeouts, and response byte caps. Tenant usage is counted by the gateway."
         ),
     },
@@ -115,11 +114,10 @@ class FakeWebProvider:
         results = [
             result
             for result in self.search(query, max_results=max_urls)
-            if _domain_allowed_by_all(
+            if domain_allowed(
                 str(result.get("domain") or domain_from_url(str(result.get("url") or ""))),
-                WebPolicy(allowed_domains=allowed_domains, blocked_domains=blocked_domains),
-                (),
-                (),
+                allowed_domains=allowed_domains,
+                blocked_domains=blocked_domains,
             )
         ][:max_urls]
         chunks: list[dict[str, Any]] = []
@@ -198,6 +196,7 @@ class _RunWebCounts:
     search_calls: int = 0
     fetch_calls: int = 0
     context_calls: int = 0
+    binding_calls: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -210,24 +209,22 @@ class WebGatewayBackend:
 
     def handle_search(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
-        policy = self._policy_from_claims(claims)
-        if not policy.enabled or not policy.search_enabled:
-            raise WebGatewayError("web search is disabled", error_code="web_disabled")
-        self._check_search_limit(claims, policy)
+        self._check_binding_limit(claims, payload, error_code="web_search_limit_exceeded")
         query = str(payload.get("query") or "")
         if not query.strip():
             raise ValueError("query is required")
-        effective_max_results = policy.effective_max_results(payload.get("max_results"))
+        effective_max_results = max(1, int(payload.get("max_results") or 5))
         request_allowed = _domain_tuple(payload.get("allowed_domains") or ())
         request_blocked = _domain_tuple(payload.get("blocked_domains") or ())
         raw_results = self.provider.search(query, max_results=effective_max_results)
         results = [
             result
             for result in raw_results
-            if _result_allowed(result, policy=policy, request_allowed=request_allowed, request_blocked=request_blocked)
+            if _result_allowed(result, request_allowed=request_allowed, request_blocked=request_blocked)
         ][:effective_max_results]
         with self._lock:
             self._counts(claims.run_id).search_calls += 1
+            self._increment_binding_count(claims, payload)
             usage = self._tenant_usage(claims.tenant_id)
             usage.search_calls += 1
             usage.result_count += len(results)
@@ -242,21 +239,21 @@ class WebGatewayBackend:
 
     def handle_fetch(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
-        policy = self._policy_from_claims(claims)
-        if not policy.enabled or not policy.fetch_enabled:
-            raise WebGatewayError("web fetch is disabled", error_code="web_disabled")
-        self._check_fetch_limit(claims, policy)
+        self._check_binding_limit(claims, payload, error_code="web_fetch_limit_exceeded")
         url = str(payload.get("url") or "")
         if not url.strip():
             raise ValueError("url is required")
         domain = domain_from_url(url)
         request_allowed = _domain_tuple(payload.get("allowed_domains") or ())
         request_blocked = _domain_tuple(payload.get("blocked_domains") or ())
-        if not _domain_allowed_by_all(domain, policy, request_allowed, request_blocked):
-            raise WebGatewayError(f"domain is not allowed by web policy: {domain}", error_code="web_policy_denied")
+        if not domain_allowed(domain, allowed_domains=request_allowed, blocked_domains=request_blocked):
+            raise WebGatewayError(
+                f"domain is not allowed by binding constraints: {domain}",
+                error_code="web_binding_denied",
+            )
         output_format = str(payload.get("format") or "text")
-        effective_timeout_s = policy.effective_timeout_s(payload.get("timeout_s"))
-        effective_max_bytes = policy.effective_max_response_bytes(payload.get("max_bytes"))
+        effective_timeout_s = max(1, int(payload.get("timeout_s") or 30))
+        effective_max_bytes = max(1, int(payload.get("max_bytes") or 100_000))
         fetched = self.provider.fetch(url, format=output_format)
         content = str(fetched.get("content") or "")
         encoded = content.encode("utf-8")
@@ -284,6 +281,7 @@ class WebGatewayBackend:
         }
         with self._lock:
             self._counts(claims.run_id).fetch_calls += 1
+            self._increment_binding_count(claims, payload)
             usage = self._tenant_usage(claims.tenant_id)
             usage.fetch_calls += 1
             usage.bytes_returned += content_bytes
@@ -291,18 +289,15 @@ class WebGatewayBackend:
 
     def handle_context(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
-        policy = self._policy_from_claims(claims)
-        if not policy.enabled or not policy.context_enabled:
-            raise WebGatewayError("web context is disabled", error_code="web_disabled")
-        self._check_context_limit(claims, policy)
+        self._check_binding_limit(claims, payload, error_code="web_context_limit_exceeded")
         query = str(payload.get("query") or "")
         if not query.strip():
             raise ValueError("query is required")
         request_allowed = _domain_tuple(payload.get("allowed_domains") or ())
         request_blocked = _domain_tuple(payload.get("blocked_domains") or ())
-        effective_max_tokens = policy.effective_max_context_tokens(payload.get("max_tokens"))
-        effective_max_urls = policy.effective_max_context_urls(payload.get("max_urls"))
-        effective_max_snippets = policy.effective_max_context_snippets(payload.get("max_snippets"))
+        effective_max_tokens = max(1, int(payload.get("max_tokens") or 8_192))
+        effective_max_urls = max(1, int(payload.get("max_urls") or 8))
+        effective_max_snippets = max(1, int(payload.get("max_snippets") or 50))
         provider_result = self.provider.context(
             query,
             max_tokens=effective_max_tokens,
@@ -310,10 +305,10 @@ class WebGatewayBackend:
             max_snippets=effective_max_snippets,
             locale=_optional_string(payload.get("locale")),
             freshness=_freshness_from_payload(payload),
-            allowed_domains=tuple(dict.fromkeys((*policy.allowed_domains, *request_allowed))),
-            blocked_domains=tuple(dict.fromkeys((*policy.blocked_domains, *request_blocked))),
+            allowed_domains=request_allowed,
+            blocked_domains=request_blocked,
         )
-        filtered = _filter_context_result(provider_result, policy, request_allowed, request_blocked)
+        filtered = _filter_context_result(provider_result, request_allowed, request_blocked)
         context = str(filtered.get("context") or "")
         encoded = context.encode("utf-8")
         context_bytes = len(encoded)
@@ -338,6 +333,7 @@ class WebGatewayBackend:
         }
         with self._lock:
             self._counts(claims.run_id).context_calls += 1
+            self._increment_binding_count(claims, payload)
             usage = self._tenant_usage(claims.tenant_id)
             usage.context_calls += 1
             usage.context_source_count += len(sources)
@@ -354,26 +350,22 @@ class WebGatewayBackend:
         except TokenError as exc:
             raise PermissionDenied(str(exc)) from exc
 
-    def _policy_from_claims(self, claims: TokenClaims) -> WebPolicy:
-        return WebPolicy.from_json(claims.metadata.get("web_policy"))
-
-    def _check_search_limit(self, claims: TokenClaims, policy: WebPolicy) -> None:
+    def _check_binding_limit(self, claims: TokenClaims, payload: dict[str, Any], *, error_code: str) -> None:
+        binding_id = str(payload.get("binding_id") or "").strip()
+        max_calls = int(payload.get("max_calls") or 0)
+        if not binding_id or max_calls <= 0:
+            return
         with self._lock:
-            if self._counts(claims.run_id).search_calls >= policy.max_search_calls:
+            if self._counts(claims.run_id).binding_calls.get(binding_id, 0) >= max_calls:
                 self._tenant_usage(claims.tenant_id).failed_calls += 1
-                raise WebGatewayError("web search call limit exceeded", error_code="web_search_limit_exceeded")
+                raise WebGatewayError("web binding call limit exceeded", error_code=error_code)
 
-    def _check_fetch_limit(self, claims: TokenClaims, policy: WebPolicy) -> None:
-        with self._lock:
-            if self._counts(claims.run_id).fetch_calls >= policy.max_fetch_calls:
-                self._tenant_usage(claims.tenant_id).failed_calls += 1
-                raise WebGatewayError("web fetch call limit exceeded", error_code="web_fetch_limit_exceeded")
-
-    def _check_context_limit(self, claims: TokenClaims, policy: WebPolicy) -> None:
-        with self._lock:
-            if self._counts(claims.run_id).context_calls >= policy.max_context_calls:
-                self._tenant_usage(claims.tenant_id).failed_calls += 1
-                raise WebGatewayError("web context call limit exceeded", error_code="web_context_limit_exceeded")
+    def _increment_binding_count(self, claims: TokenClaims, payload: dict[str, Any]) -> None:
+        binding_id = str(payload.get("binding_id") or "").strip()
+        if not binding_id:
+            return
+        counts = self._counts(claims.run_id)
+        counts.binding_calls[binding_id] = counts.binding_calls.get(binding_id, 0) + 1
 
     def _counts(self, run_id: str) -> _RunWebCounts:
         return self._run_counts.setdefault(run_id, _RunWebCounts())
@@ -385,22 +377,13 @@ class WebGatewayBackend:
 def _result_allowed(
     result: dict[str, Any],
     *,
-    policy: WebPolicy,
     request_allowed: tuple[str, ...],
     request_blocked: tuple[str, ...],
 ) -> bool:
-    return _domain_allowed_by_all(str(result.get("domain") or domain_from_url(str(result.get("url") or ""))), policy, request_allowed, request_blocked)
-
-
-def _domain_allowed_by_all(
-    domain: str,
-    policy: WebPolicy,
-    request_allowed: tuple[str, ...],
-    request_blocked: tuple[str, ...],
-) -> bool:
-    return (
-        domain_allowed(domain, allowed_domains=policy.allowed_domains, blocked_domains=policy.blocked_domains)
-        and domain_allowed(domain, allowed_domains=request_allowed, blocked_domains=request_blocked)
+    return domain_allowed(
+        str(result.get("domain") or domain_from_url(str(result.get("url") or ""))),
+        allowed_domains=request_allowed,
+        blocked_domains=request_blocked,
     )
 
 
@@ -412,7 +395,6 @@ def _domain_tuple(value: Any) -> tuple[str, ...]:
 
 def _filter_context_result(
     result: dict[str, Any],
-    policy: WebPolicy,
     request_allowed: tuple[str, ...],
     request_blocked: tuple[str, ...],
 ) -> dict[str, Any]:
@@ -422,11 +404,10 @@ def _filter_context_result(
         source
         for source in sources
         if isinstance(source, dict)
-        and _domain_allowed_by_all(
+        and domain_allowed(
             str(source.get("domain") or domain_from_url(str(source.get("url") or ""))),
-            policy,
-            request_allowed,
-            request_blocked,
+            allowed_domains=request_allowed,
+            blocked_domains=request_blocked,
         )
     ]
     allowed_domains = {
@@ -441,16 +422,15 @@ def _filter_context_result(
         and (
             not str(chunk.get("domain") or domain_from_url(str(chunk.get("url") or "")))
             or str(chunk.get("domain") or domain_from_url(str(chunk.get("url") or ""))) in allowed_domains
-            or _domain_allowed_by_all(
+            or domain_allowed(
                 str(chunk.get("domain") or domain_from_url(str(chunk.get("url") or ""))),
-                policy,
-                request_allowed,
-                request_blocked,
+                allowed_domains=request_allowed,
+                blocked_domains=request_blocked,
             )
         )
     ]
     context = str(result.get("context") or "")
-    filters_active = bool(policy.allowed_domains or request_allowed or request_blocked or policy.blocked_domains)
+    filters_active = bool(request_allowed or request_blocked)
     if filters_active and (len(allowed_sources) != len(sources) or len(allowed_chunks) != len(chunks)):
         context = "\n\n".join(str(chunk.get("text") or "") for chunk in allowed_chunks if isinstance(chunk, dict))
     if filters_active:

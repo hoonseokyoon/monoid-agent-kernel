@@ -7,9 +7,14 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
+from native_agent_runner.core.agents import (
+    AgentDefinition,
+    AgentRuntimeConfig,
+    RuntimeConfigProvider,
+    validate_runtime_config,
+)
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.events import AgentEvent
 from native_agent_runner.core.packages import (
@@ -24,11 +29,11 @@ from native_agent_runner.core.result import AgentRunResult
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
-    ReasoningConfig,
     RunLimits,
     RunMode,
     WorkspaceBackendKind,
 )
+from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.errors import PermissionDenied
 from native_agent_runner.jobs import (
     get_job_artifact,
@@ -40,10 +45,10 @@ from native_agent_runner.loop import AgentLoop
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.providers.base import ModelAdapter
 from native_agent_runner.providers.gateway import GatewayModelAdapter
+from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
 from native_agent_runner.recorder import append_event_to_run
-from native_agent_runner.shell import AutoApproveShellApprovalProvider, DenyShellApprovalProvider, ShellPolicy
-from native_agent_runner.tools.policy import ToolPolicy
-from native_agent_runner.web import WebGatewayClient, WebPolicy
+from native_agent_runner.tools.builtin import builtin_tools
+from native_agent_runner.web import WebGatewayClient
 from native_agent_runner.workspace.paths import is_within
 
 BackendRunState = Literal["queued", "running", "completed", "failed", "limited"]
@@ -58,17 +63,13 @@ class BackendRunRequest:
     instruction: str
     mode: RunMode = "propose"
     workspace_backend: WorkspaceBackendKind = "overlay"
-    model: str = "gpt-5.5"
-    reasoning_effort: str = "medium"
-    reasoning_summary: str = "off"
     max_steps: int = 30
     max_tool_calls: int = 100
     max_bytes_read: int = 1_000_000
     max_duration_s: int | None = 900
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
-    tool_policy: ToolPolicy = field(default_factory=ToolPolicy)
-    shell_policy: ShellPolicy = field(default_factory=ShellPolicy)
-    web_policy: WebPolicy = field(default_factory=WebPolicy)
+    agent_definition: AgentDefinition | None = None
+    runtime_config: AgentRuntimeConfig | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -116,6 +117,9 @@ class BackendRunRecord:
     last_event_seq: int = 0
     last_event_type: str = ""
     cancellation_token: CancellationToken = field(default_factory=CancellationToken)
+    runtime_config: AgentRuntimeConfig | None = None
+    runtime_config_issuer: str = ""
+    runtime_config_reason: str = ""
 
 
 @dataclass
@@ -178,6 +182,24 @@ class BackendRunStateSink:
         return None
 
 
+class BackendRuntimeConfigProvider(RuntimeConfigProvider):
+    def __init__(self, backend: RunnerBackend, run_id: str) -> None:
+        self._backend = backend
+        self._run_id = run_id
+
+    def current_config(self, run_id: str) -> AgentRuntimeConfig | None:
+        del run_id
+        return self._backend.current_runtime_config(self._run_id)
+
+
+def _backend_builtin_tool_specs() -> tuple[Any, ...]:
+    return tuple(builtin_tools(cast(Workspace, None)))
+
+
+def _runtime_config_uses_web(config: AgentRuntimeConfig) -> bool:
+    return any(binding.ref.tool_id.startswith("web.") for binding in config.tools)
+
+
 @dataclass
 class RunnerBackend:
     run_root: Path
@@ -217,6 +239,16 @@ class RunnerBackend:
             user_id=request.user_id,
             ttl_s=self.run_token_ttl_s,
         )
+        tool_specs = _backend_builtin_tool_specs()
+        initial_runtime_config = request.runtime_config
+        runtime_config_issuer = "submit_run"
+        runtime_config_reason = "initial runtime config"
+        if initial_runtime_config is None and request.agent_definition is not None:
+            initial_runtime_config = AgentRuntimeConfig.from_definition(request.agent_definition)
+            runtime_config_reason = "initial agent definition"
+        elif initial_runtime_config is None:
+            raise ValueError("agent_definition or runtime_config is required")
+        validate_runtime_config(initial_runtime_config, tool_specs)
         llm_gateway_token = self.token_manager.issue(
             kind="llm_gateway",
             audience="csp.llm-gateway",
@@ -224,15 +256,12 @@ class RunnerBackend:
             tenant_id=request.tenant_id,
             user_id=request.user_id,
             ttl_s=self.llm_gateway_token_ttl_s,
-            metadata={
-                "model": request.model,
-                "reasoning_effort": request.reasoning_effort,
-            },
+            metadata={"agent_config_hash": initial_runtime_config.config_hash},
         )
         web_gateway_token = ""
-        if request.web_policy.enabled:
+        if _runtime_config_uses_web(initial_runtime_config):
             if not self.web_gateway_url:
-                raise ValueError("web_gateway_url is required when web_policy.enabled is true")
+                raise ValueError("web_gateway_url is required when runtime config binds web tools")
             web_gateway_token = self.token_manager.issue(
                 kind="web_gateway",
                 audience="csp.web-gateway",
@@ -240,7 +269,7 @@ class RunnerBackend:
                 tenant_id=request.tenant_id,
                 user_id=request.user_id,
                 ttl_s=self.web_gateway_token_ttl_s,
-                metadata={"web_policy": request.web_policy.to_json()},
+                metadata={"agent_config_hash": initial_runtime_config.config_hash},
             )
         record = BackendRunRecord(
             run_id=run_id,
@@ -253,6 +282,9 @@ class RunnerBackend:
             run_token_sha256=TokenManager.token_sha256(run_token),
             llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
             web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
+            runtime_config=initial_runtime_config,
+            runtime_config_issuer=runtime_config_issuer,
+            runtime_config_reason=runtime_config_reason,
         )
         with self._lock:
             self._records[run_id] = record
@@ -272,6 +304,33 @@ class RunnerBackend:
             result_url=f"/v1/runs/{run_id}/result",
             events_url=f"/v1/runs/{run_id}/events",
             proposal_url=f"/v1/runs/{run_id}/proposal",
+        )
+
+    def _run_spec_for_request(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        workspace_root: Path,
+    ) -> AgentRunSpec:
+        return AgentRunSpec(
+            instruction=request.instruction,
+            workspace_root=workspace_root,
+            run_root=self.run_root,
+            run_id=run_id,
+            mode=request.mode,
+            workspace_backend=request.workspace_backend,
+            limits=RunLimits(
+                max_steps=request.max_steps,
+                max_tool_calls=request.max_tool_calls,
+                max_bytes_read=request.max_bytes_read,
+                max_duration_s=request.max_duration_s,
+            ),
+            permission_policy=request.permission_policy,
+            metadata={
+                **request.metadata,
+                "tenant_id": request.tenant_id,
+                "user_id": request.user_id,
+            },
         )
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
@@ -373,6 +432,82 @@ class RunnerBackend:
                 "cancel_requested": True,
                 "error": record.error,
                 "error_code": record.error_code,
+            }
+
+    def current_runtime_config(self, run_id: str) -> AgentRuntimeConfig | None:
+        record = self._record(run_id)
+        with self._lock:
+            return record.runtime_config
+
+    def runtime_config(self, run_id: str, token: str) -> dict[str, Any]:
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            config = record.runtime_config
+            if config is None:
+                return {
+                    "run_id": record.run_id,
+                    "tenant_id": record.tenant_id,
+                    "ready": False,
+                    "config_version": 0,
+                    "config_hash": "",
+                    "issuer": record.runtime_config_issuer,
+                    "reason": record.runtime_config_reason,
+                }
+            return {
+                "run_id": record.run_id,
+                "tenant_id": record.tenant_id,
+                "ready": True,
+                "issuer": record.runtime_config_issuer,
+                "reason": record.runtime_config_reason,
+                "config": config.to_json(),
+                "config_version": config.config_version,
+                "config_hash": config.config_hash,
+            }
+
+    def replace_runtime_config(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        expected_version: int,
+        issuer: str,
+        reason: str,
+        config: AgentRuntimeConfig,
+    ) -> dict[str, Any]:
+        self._authorize_run(run_id, token)
+        validate_runtime_config(config, _backend_builtin_tool_specs())
+        record = self._record(run_id)
+        with self._lock:
+            if record.status in {"completed", "failed", "limited"}:
+                raise ValueError("cannot update runtime config for a terminal run")
+            current_version = record.runtime_config.config_version if record.runtime_config else 0
+            if expected_version != current_version:
+                raise ValueError(
+                    f"runtime config version mismatch: expected {expected_version}, current {current_version}"
+                )
+            if config.config_version <= current_version:
+                config = AgentRuntimeConfig(
+                    definition_id=config.definition_id,
+                    config_version=current_version + 1,
+                    model=config.model,
+                    prompt=config.prompt,
+                    tools=config.tools,
+                    tool_search=config.tool_search,
+                    metadata=config.metadata,
+                )
+            record.runtime_config = config
+            record.runtime_config_issuer = issuer
+            record.runtime_config_reason = reason
+            return {
+                "run_id": record.run_id,
+                "tenant_id": record.tenant_id,
+                "ready": True,
+                "issuer": issuer,
+                "reason": reason,
+                "config": config.to_json(),
+                "config_version": config.config_version,
+                "config_hash": config.config_hash,
             }
 
     def proposal_file(self, run_id: str, token: str, path: str) -> dict[str, Any]:
@@ -591,48 +726,23 @@ class RunnerBackend:
         llm_gateway_token: str,
         web_gateway_token: str,
     ) -> None:
-        spec = AgentRunSpec(
-            instruction=request.instruction,
-            workspace_root=workspace_root,
-            run_root=self.run_root,
-            run_id=run_id,
-            mode=request.mode,
-            workspace_backend=request.workspace_backend,
-            model=ModelConfig(
-                provider="gateway",
-                model=request.model,
-                reasoning=ReasoningConfig(
-                    effort=request.reasoning_effort,  # type: ignore[arg-type]
-                    summary=request.reasoning_summary,  # type: ignore[arg-type]
-                ),
-                gateway_url=self.llm_gateway_url,
-            ),
-            limits=RunLimits(
-                max_steps=request.max_steps,
-                max_tool_calls=request.max_tool_calls,
-                max_bytes_read=request.max_bytes_read,
-                max_duration_s=request.max_duration_s,
-            ),
-            permission_policy=request.permission_policy,
-            tool_policy=request.tool_policy,
-            shell_policy=request.shell_policy,
-            web_policy=request.web_policy,
-            metadata={
-                **request.metadata,
-                "tenant_id": request.tenant_id,
-                "user_id": request.user_id,
-            },
-        )
+        spec = self._run_spec_for_request(run_id, request, workspace_root)
         try:
-            adapter = self._build_model_adapter(spec, llm_gateway_token)
+            runtime_config = self.current_runtime_config(run_id)
+            adapter = self._build_model_adapter(
+                spec,
+                llm_gateway_token,
+                runtime_config.model if runtime_config is not None else None,
+            )
             result = AgentLoop(
                 spec=spec,
                 model_adapter=adapter,
                 event_sinks=(BackendRunStateSink(self, run_id),),
                 permission_policy=request.permission_policy,
                 cancellation_token=self._record(run_id).cancellation_token,
-                shell_approval_provider=self._shell_approval_provider(request),
-                web_gateway_client=self._web_gateway_client(request, web_gateway_token),
+                shell_approval_provider=None,
+                web_gateway_client=self._web_gateway_client(web_gateway_token),
+                runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
             ).run()
             with self._lock:
                 record = self._records[run_id]
@@ -652,30 +762,22 @@ class RunnerBackend:
                 record.error_code = getattr(exc, "error_code", "internal_error")
                 record.finished_at = time.time()
 
-    def _build_model_adapter(self, spec: AgentRunSpec, llm_gateway_token: str) -> ModelAdapter:
+    def _build_model_adapter(
+        self,
+        spec: AgentRunSpec,
+        llm_gateway_token: str,
+        model_config: ModelConfig | None,
+    ) -> ModelAdapter:
         if self.model_adapter_factory is not None:
             return self.model_adapter_factory(spec, llm_gateway_token)
-        return GatewayModelAdapter(spec.model, gateway_url=self.llm_gateway_url, token=llm_gateway_token)
-
-    def _shell_approval_provider(
-        self,
-        request: BackendRunRequest,
-    ) -> AutoApproveShellApprovalProvider | DenyShellApprovalProvider | None:
-        if not request.shell_policy.enabled:
-            return None
-        if request.shell_policy.approval_mode == "deny":
-            return DenyShellApprovalProvider()
-        return AutoApproveShellApprovalProvider(approver_id="reference-backend")
+        return GatewayModelAdapter(model_config or ModelConfig(), gateway_url=self.llm_gateway_url, token=llm_gateway_token)
 
     def _web_gateway_client(
         self,
-        request: BackendRunRequest,
         token: str,
     ) -> WebGatewayClient | None:
-        if not request.web_policy.enabled:
+        if not token:
             return None
-        if not self.web_gateway_url:
-            raise ValueError("web_gateway_url is required when web_policy.enabled is true")
         return WebGatewayClient(self.web_gateway_url, token=token)
 
     def _validate_request(self, request: BackendRunRequest) -> None:
@@ -689,9 +791,8 @@ class RunnerBackend:
             raise ValueError(f"unsupported mode: {request.mode}")
         if request.workspace_backend not in {"overlay", "staging"}:
             raise ValueError(f"unsupported workspace_backend: {request.workspace_backend}")
-        request.web_policy.validated()
-        if request.web_policy.enabled and not self.web_gateway_url:
-            raise ValueError("web_gateway_url is required when web_policy.enabled is true")
+        if request.agent_definition is None and request.runtime_config is None:
+            raise ValueError("agent_definition or runtime_config is required")
 
     def _check_workspace_allowed(self, workspace_root: Path) -> None:
         if not workspace_root.exists() or not workspace_root.is_dir():

@@ -39,20 +39,22 @@ class OpenAIModelAdapter:
 
         client = OpenAI(api_key=key)
         payload = self._payload(request)
+        config = request.model or self.config
         try:
-            response = client.responses.create(**payload, timeout=self.config.timeout_s)
+            response = client.responses.create(**payload, timeout=config.timeout_s)
         except TypeError:
             response = client.responses.create(**payload)
         data = response.model_dump() if hasattr(response, "model_dump") else _coerce_response(response)
         return _parse_response(data)
 
     def _payload(self, request: ModelRequest) -> dict[str, Any]:
+        config = request.model or self.config
         payload: dict[str, Any] = {
-            "model": self.config.model,
+            "model": config.model,
             "instructions": request.system_prompt,
             "tools": [_openai_tool_schema(tool) for tool in request.tools],
         }
-        reasoning_payload = build_reasoning_payload(self.config.reasoning)
+        reasoning_payload = build_reasoning_payload(config.reasoning)
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
 

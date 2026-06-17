@@ -1,10 +1,9 @@
 """System-prompt composition.
 
-The agent's identity prompt is composed, not hardcoded: a general-purpose
-``BASE_SYSTEM_PROMPT`` provided by the core, plus zero or more persona/role
-segments supplied per instance (via ``AgentRunSpec`` or a profile). This is how
-the runner stays a *general* agent (goal 2) while specialization — a coding
-agent, a research agent — is layered in as a module rather than baked into core.
+The agent's identity prompt is composed from a general-purpose
+``BASE_SYSTEM_PROMPT`` plus persona/runtime segments supplied by
+``AgentRuntimeConfig.prompt``. This keeps specialization in agent config instead
+of baking it into core.
 
 Static context segments contributed by ``ContextProvider``s (see
 ``core/context.py``) are folded in here at bootstrap as additional persona-level

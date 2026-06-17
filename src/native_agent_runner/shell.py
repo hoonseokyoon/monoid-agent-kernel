@@ -72,7 +72,7 @@ class ShellCommandRule:
 
 
 @dataclass(frozen=True)
-class ShellPolicy:
+class ShellExecutionOptions:
     enabled: bool = False
     approval_mode: ShellApprovalMode = "backend"
     shell: ShellKind = "auto"
@@ -89,11 +89,11 @@ class ShellPolicy:
     command_rules: tuple[ShellCommandRule, ...] = ()
 
     @classmethod
-    def from_json(cls, payload: dict[str, Any] | None) -> ShellPolicy:
+    def from_json(cls, payload: dict[str, Any] | None) -> ShellExecutionOptions:
         if payload is None:
             return cls()
         if not isinstance(payload, dict):
-            raise ValueError("shell_policy must be an object")
+            raise ValueError("shell execution options must be an object")
         rules = tuple(
             ShellCommandRule.from_json(item)
             for item in payload.get("command_rules") or ()
@@ -152,8 +152,8 @@ class ShellPolicy:
         max_output_bytes: int | None = None,
         execution_workspace: str | None = None,
         env_allowlist: tuple[str, ...] = (),
-    ) -> ShellPolicy:
-        return ShellPolicy(
+    ) -> ShellExecutionOptions:
+        return ShellExecutionOptions(
             enabled=self.enabled if enabled is None else enabled,
             approval_mode=self.approval_mode if approval_mode is None else _approval_mode(approval_mode),
             shell=self.shell,
@@ -174,7 +174,7 @@ class ShellPolicy:
             command_rules=self.command_rules,
         ).validated()
 
-    def validated(self) -> ShellPolicy:
+    def validated(self) -> ShellExecutionOptions:
         if self.approval_mode not in {"backend", "auto-approve", "deny"}:
             raise ValueError(f"unsupported shell approval mode: {self.approval_mode}")
         if self.shell not in {"auto", "bash", "powershell"}:
@@ -222,10 +222,10 @@ class ShellPolicy:
     def check_command(self, command: str) -> None:
         deny_matches = [rule for rule in self.command_rules if rule.action == "deny" and rule.matches(command)]
         if deny_matches:
-            raise ToolExecutionError("shell command denied by policy", error_code="shell_policy_denied")
+            raise ToolExecutionError("shell command denied by binding constraints", error_code="shell_binding_denied")
         allow_rules = [rule for rule in self.command_rules if rule.action == "allow"]
         if allow_rules and not any(rule.matches(command) for rule in allow_rules):
-            raise ToolExecutionError("shell command not allowed by policy", error_code="shell_policy_denied")
+            raise ToolExecutionError("shell command not allowed by binding constraints", error_code="shell_binding_denied")
 
     def to_manifest(self) -> dict[str, Any]:
         return {**self.to_json(), "effective_shell": self.effective_shell()}
@@ -363,7 +363,7 @@ class _WorkspaceSnapshot:
 def execute_shell(
     *,
     workspace: Workspace,
-    policy: ShellPolicy,
+    policy: ShellExecutionOptions,
     permission_policy: PermissionPolicy,
     command: str,
     cwd: str,
@@ -635,7 +635,7 @@ def _run_subprocess(
     }
 
 
-def build_env(policy: ShellPolicy, requested: Mapping[str, Any]) -> dict[str, str]:
+def build_env(policy: ShellExecutionOptions, requested: Mapping[str, Any]) -> dict[str, str]:
     env: dict[str, str] = {}
     inherited = set(policy.inherit_env_allowlist)
     for key in inherited:
@@ -665,7 +665,7 @@ def shell_argv(shell: Literal["bash", "powershell"], command: str) -> list[str]:
 
 def _check_shell_path_allowed(rel: str, permission_policy: PermissionPolicy) -> None:
     if _shell_path_denied(rel, permission_policy):
-        raise PermissionDenied(f"shell denied by path policy: {rel}", error_code="shell_policy_denied")
+        raise PermissionDenied(f"shell denied by path boundary: {rel}", error_code="shell_path_denied")
 
 
 def _shell_path_denied(rel: str, permission_policy: PermissionPolicy) -> bool:

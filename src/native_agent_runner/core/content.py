@@ -17,8 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-# Capability that gates multimodal input. Not in any default set — off unless an
-# integrator grants it explicitly via AgentRunSpec.capabilities.
+# Internal marker for the deferred multimodal-forwarding work.
 MEDIA_INPUT_CAPABILITY = "media.input"
 
 

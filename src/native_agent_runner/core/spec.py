@@ -11,11 +11,7 @@ from native_agent_runner.core.content import (
     content_part_from_json,
     content_part_to_json,
 )
-from native_agent_runner.core.tool_surface import ToolSurfacePolicy
 from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.shell import ShellPolicy
-from native_agent_runner.tools.policy import ToolPolicy
-from native_agent_runner.web import WebPolicy
 
 RunMode = Literal["read-only", "propose", "apply"]
 WorkspaceBackendKind = Literal["overlay", "staging"]
@@ -151,28 +147,6 @@ class RunLimits:
         }
 
 
-def default_capabilities(mode: RunMode) -> frozenset[str]:
-    base = {
-        "fs.read",
-        "text.search",
-        "tool.search",
-        "artifact.control",
-        "run.control",
-    }
-    if mode in {"propose", "apply"}:
-        base.update(
-            {
-                "fs.write",
-                "fs.patch",
-                "fs.mkdir",
-                "fs.copy",
-                "fs.move",
-                "fs.delete",
-            }
-        )
-    return frozenset(base)
-
-
 @dataclass(frozen=True)
 class AgentRunSpec:
     instruction: str
@@ -181,16 +155,8 @@ class AgentRunSpec:
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     mode: RunMode = "propose"
     workspace_backend: WorkspaceBackendKind = "overlay"
-    model: ModelConfig = field(default_factory=ModelConfig)
     limits: RunLimits = field(default_factory=RunLimits)
-    capabilities: frozenset[str] | None = None
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
-    tool_policy: ToolPolicy = field(default_factory=ToolPolicy)
-    tool_surface_policy: ToolSurfacePolicy = field(default_factory=ToolSurfacePolicy)
-    shell_policy: ShellPolicy = field(default_factory=ShellPolicy)
-    web_policy: WebPolicy = field(default_factory=WebPolicy)
-    system_prompt_base: str | None = None
-    persona_segments: tuple[str, ...] = ()
     # Richer multimodal input superset of `instruction` (contract-only for now;
     # see core/content.py). Empty => the run uses `instruction` as a single text part.
     input: tuple[ContentPart, ...] = ()
@@ -222,23 +188,6 @@ class AgentRunSpec:
         """Convenience constructor for the common text-only case."""
         return cls(instruction=instruction, **kwargs)
 
-    def effective_capabilities(self) -> frozenset[str]:
-        if self.capabilities is not None:
-            capabilities = set(self.capabilities)
-        else:
-            capabilities = set(default_capabilities(self.mode))
-        if self.shell_policy.enabled:
-            capabilities.add("shell.exec")
-            capabilities.add("job.control")
-        if self.web_policy.enabled:
-            if self.web_policy.search_enabled:
-                capabilities.add("web.search")
-            if self.web_policy.fetch_enabled:
-                capabilities.add("web.fetch")
-            if self.web_policy.context_enabled:
-                capabilities.add("web.context")
-        return frozenset(capabilities)
-
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> AgentRunSpec:
         if not isinstance(payload, dict):
@@ -247,47 +196,19 @@ class AgentRunSpec:
             raise ValueError("spec.instruction is required")
         if not payload.get("workspace_root"):
             raise ValueError("spec.workspace_root is required")
-        # Lazy import avoids a module-load cycle (profiles imports spec types).
-        from native_agent_runner.core.profiles import resolve_profile
-
-        profile_name = payload.get("profile")
-        profile = resolve_profile(str(profile_name)) if profile_name else None
         metadata = dict(payload.get("metadata") or {})
-        if profile is not None:
-            metadata.setdefault("profile", profile.name)
-        capabilities = payload.get("capabilities")
         kwargs: dict[str, Any] = {
             "instruction": str(payload["instruction"]),
             "workspace_root": Path(str(payload["workspace_root"])),
             "run_root": Path(str(payload.get("run_root") or "runs")),
-            "mode": payload["mode"] if "mode" in payload else (profile.mode if profile else "propose"),
+            "mode": payload.get("mode", "propose"),
             "workspace_backend": payload.get("workspace_backend", "overlay"),
-            "model": ModelConfig.from_json(payload.get("model")),
             "limits": (
                 RunLimits.from_json(payload["limits"])
                 if "limits" in payload
-                else (profile.limits if profile else RunLimits())
+                else RunLimits()
             ),
-            "capabilities": None if capabilities is None else frozenset(str(c) for c in capabilities),
             "permission_policy": PermissionPolicy.from_json(payload.get("permission_policy")),
-            "tool_policy": ToolPolicy.from_json(payload.get("tool_policy")),
-            "tool_surface_policy": ToolSurfacePolicy.from_json(payload.get("tool_surface_policy")),
-            "shell_policy": (
-                ShellPolicy.from_json(payload["shell_policy"])
-                if "shell_policy" in payload
-                else (profile.shell_policy if profile else ShellPolicy())
-            ),
-            "web_policy": (
-                WebPolicy.from_json(payload["web_policy"])
-                if "web_policy" in payload
-                else (profile.web_policy if profile else WebPolicy())
-            ),
-            "system_prompt_base": payload.get("system_prompt_base"),
-            "persona_segments": (
-                tuple(str(s) for s in payload["persona_segments"])
-                if "persona_segments" in payload
-                else (profile.persona_segments if profile else ())
-            ),
             "input": (
                 tuple(content_part_from_json(p) for p in payload["input"])
                 if "input" in payload
@@ -308,16 +229,8 @@ class AgentRunSpec:
             "run_id": self.run_id,
             "mode": self.mode,
             "workspace_backend": self.workspace_backend,
-            "model": self.model.to_json(),
             "limits": self.limits.to_json(),
-            "capabilities": None if self.capabilities is None else sorted(self.capabilities),
             "permission_policy": self.permission_policy.to_json(),
-            "tool_policy": self.tool_policy.to_json(),
-            "tool_surface_policy": self.tool_surface_policy.to_json(),
-            "shell_policy": self.shell_policy.to_json(),
-            "web_policy": self.web_policy.to_json(),
-            "system_prompt_base": self.system_prompt_base,
-            "persona_segments": list(self.persona_segments),
             "input": [content_part_to_json(p) for p in self.input],
             "metadata": dict(self.metadata),
         }

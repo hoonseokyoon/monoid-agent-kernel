@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from conftest import runtime_config, runtime_provider
+
 from native_agent_runner.core.context import TurnContext
 from native_agent_runner.core.prompt import compose_system_prompt
 from native_agent_runner.core.spec import AgentRunSpec
@@ -46,6 +48,10 @@ def _spec(tmp_path: Path, workspace: Path) -> AgentRunSpec:
     return AgentRunSpec(instruction="go", workspace_root=workspace, run_root=tmp_path / "runs")
 
 
+def _provider(*tool_ids: str):
+    return runtime_provider(runtime_config(*(tool_ids or ("run.finish",))))
+
+
 def test_static_segment_folded_into_every_turn(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     adapter = _finish_only()
@@ -53,6 +59,7 @@ def test_static_segment_folded_into_every_turn(tmp_path: Path) -> None:
         spec=_spec(tmp_path, workspace),
         model_adapter=adapter,
         context_providers=(_MarkerProvider(static="STATIC-MARKER"),),
+        runtime_config_provider=_provider(),
     ).run()
     assert "STATIC-MARKER" in adapter.requests[0].system_prompt
     assert adapter.requests[0].system_prompt == compose_system_prompt(
@@ -72,6 +79,7 @@ def test_dynamic_segment_appended_per_turn_with_live_turn_data(tmp_path: Path) -
         spec=_spec(tmp_path, workspace),
         model_adapter=adapter,
         context_providers=(_MarkerProvider(dynamic="DYN"),),
+        runtime_config_provider=_provider("fs.list", "run.finish"),
     ).run()
     # Static prompt is unchanged; the dynamic segment is appended and reflects the live step.
     assert adapter.requests[0].system_prompt.startswith(compose_system_prompt())
@@ -87,6 +95,7 @@ def test_no_dynamic_keeps_prompt_equal_to_static(tmp_path: Path) -> None:
         model_adapter=adapter,
         # static only; dynamic_segment returns None
         context_providers=(_MarkerProvider(static="S"),),
+        runtime_config_provider=_provider(),
     ).run()
     expected_static = compose_system_prompt(persona_segments=("S",))
     assert adapter.requests[0].system_prompt == expected_static
@@ -99,6 +108,7 @@ def test_inject_workspace_index_adds_file_listing(tmp_path: Path) -> None:
         spec=_spec(tmp_path, workspace),
         model_adapter=adapter,
         inject_workspace_index=True,
+        runtime_config_provider=_provider(),
     ).run()
     prompt = adapter.requests[0].system_prompt
     assert "Workspace files (initial snapshot):" in prompt

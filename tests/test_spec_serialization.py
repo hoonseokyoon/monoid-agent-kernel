@@ -3,136 +3,96 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-from click.testing import CliRunner
+from conftest import runtime_config, tool_binding
 
-from native_agent_runner.cli import main
-from native_agent_runner.core.spec import (
-    AgentRunSpec,
-    ModelConfig,
-    ModelRetryConfig,
-    ReasoningConfig,
-    RunLimits,
-)
-from native_agent_runner.core.tool_surface import ToolExposureRule, ToolGuidance, ToolSurfacePolicy
+from native_agent_runner.core.agents import AgentRuntimeConfig, PromptSpec, ToolSearchConfig
+from native_agent_runner.core.content import DocumentPart, ImagePart, TextPart
+from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, ReasoningConfig, RunLimits
 from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter
-from native_agent_runner.shell import ShellCommandRule, ShellPolicy
-from native_agent_runner.tools.policy import ToolPolicy
-from native_agent_runner.web import WebPolicy
 
 
-def _populated_spec() -> AgentRunSpec:
-    return AgentRunSpec(
-        instruction="do the thing",
-        workspace_root=Path("/ws"),
-        run_root=Path("runs"),
-        run_id="fixedrunid",
-        mode="apply",
-        workspace_backend="staging",
-        model=ModelConfig(
-            provider="openai",
-            model="gpt-x",
-            timeout_s=42,
-            gateway_url="http://gw/internal/llm/turns",
-            reasoning=ReasoningConfig(effort="high", summary="auto", on_unsupported="omit"),
-            retry=ModelRetryConfig(max_attempts=5, retry_on=("gateway_timeout",)),
-        ),
-        limits=RunLimits(max_steps=7, max_tool_calls=11, max_bytes_read=123, max_duration_s=None),
-        capabilities=frozenset({"fs.read", "run.control"}),
-        permission_policy=PermissionPolicy(deny_patterns=(".env",), redact_patterns=("*.key",)),
-        tool_policy=ToolPolicy(allowed_tools=("fs.read",), denied_tools=("shell.exec",)),
-        tool_surface_policy=ToolSurfacePolicy(
-            rules=(
-                ToolExposureRule(
-                    tool="fs.read",
-                    exposure="searchable",
-                    guidance=ToolGuidance(summary="Use for workspace reads."),
-                ),
-            )
-        ),
-        shell_policy=ShellPolicy(
-            enabled=True,
-            approval_mode="auto-approve",
-            default_timeout_s=30,
-            command_rules=(ShellCommandRule(action="allow", prefix="ls"),),
-        ),
-        web_policy=WebPolicy(enabled=True, context_enabled=True, allowed_domains=("a.com",)),
-        system_prompt_base="You are a custom base agent.",
-        persona_segments=("Specialize in X.", "Be terse."),
-        metadata={"tenant": "t1", "n": 3},
-    )
-
-
-def test_agent_run_spec_round_trip_is_lossless() -> None:
-    spec = _populated_spec()
-    blob = json.dumps(spec.to_json())  # must be JSON-serializable
-    assert AgentRunSpec.from_json(json.loads(blob)) == spec
-
-
-def test_default_spec_round_trip_preserves_run_id() -> None:
-    spec = AgentRunSpec(instruction="x", workspace_root=Path("/w"), run_root=Path("runs"))
-    restored = AgentRunSpec.from_json(spec.to_json())
-    assert restored == spec
-    assert restored.run_id == spec.run_id
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        ModelConfig(provider="fake", model="m", timeout_s=5, gateway_url=None),
-        ModelConfig(reasoning=ReasoningConfig(effort="minimal")),
-        RunLimits(max_duration_s=None),
-        RunLimits(max_duration_s=600),
-        ReasoningConfig(effort="xhigh", summary="detailed"),
-        ModelRetryConfig(max_attempts=2, retry_on=("gateway_rate_limited",)),
-        ShellPolicy(enabled=True, command_rules=(ShellCommandRule(action="deny", prefix="rm"),)),
-    ],
-)
-def test_sub_type_round_trip(value: object) -> None:
-    cls = type(value)
-    assert cls.from_json(value.to_json()) == value  # type: ignore[attr-defined]
-
-
-def test_from_json_requires_instruction_and_workspace() -> None:
-    with pytest.raises(ValueError):
-        AgentRunSpec.from_json({"workspace_root": "/ws"})
-    with pytest.raises(ValueError):
-        AgentRunSpec.from_json({"instruction": "x"})
-
-
-def test_cli_run_accepts_spec_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
+def test_agent_run_spec_round_trip_is_run_specific() -> None:
     spec = AgentRunSpec(
-        instruction="Finish.",
-        workspace_root=workspace,
-        run_root=tmp_path / "runs",
-        mode="apply",
+        instruction="Inspect.",
+        workspace_root=Path("/workspace"),
+        run_root=Path("runs"),
+        run_id="run_123",
+        mode="propose",
+        workspace_backend="staging",
+        limits=RunLimits(max_steps=7, max_tool_calls=11, max_bytes_read=1234, max_duration_s=99),
+        permission_policy=PermissionPolicy(deny_patterns=(".env",), redact_patterns=("*.key",)),
+        input=(TextPart(text="hello"),),
+        metadata={"tenant": "a"},
     )
-    spec_file = tmp_path / "spec.json"
-    spec_file.write_text(json.dumps(spec.to_json()), encoding="utf-8")
 
-    adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
-    monkeypatch.setattr("native_agent_runner.cli._model_adapter", lambda *_args, **_kwargs: adapter)
-    runner = CliRunner()
+    restored = AgentRunSpec.from_json(json.loads(json.dumps(spec.to_json())))
 
-    result = runner.invoke(main, ["run", "--spec", str(spec_file)])
-
-    assert result.exit_code == 0, result.output
-    run_id_line = next(line for line in result.output.splitlines() if line.startswith("run_id: "))
-    run_id = run_id_line.removeprefix("run_id: ")
-    manifest = json.loads((tmp_path / "runs" / run_id / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["mode"] == "apply"
+    assert restored == spec
+    payload = restored.to_json()
+    assert "model" not in payload
+    assert "tools" not in payload
+    assert "tool_policy" not in payload
+    assert "shell_policy" not in payload
+    assert "web_policy" not in payload
 
 
-def test_cli_spec_and_workspace_are_mutually_exclusive(tmp_path: Path) -> None:
-    spec_file = tmp_path / "spec.json"
-    spec_file.write_text(json.dumps({"instruction": "x", "workspace_root": str(tmp_path)}), encoding="utf-8")
-    runner = CliRunner()
+def test_runtime_config_round_trip_hash_and_model() -> None:
+    config = AgentRuntimeConfig(
+        definition_id="coding",
+        config_version=3,
+        model=ModelConfig(model="gpt-x", reasoning=ReasoningConfig(effort="high", summary="auto")),
+        prompt=PromptSpec(persona_segments=("Be direct.",), runtime_segments=("Use concise edits.",)),
+        tools=(
+            tool_binding("fs.read", guidance="Read before writing."),
+            tool_binding("run.finish"),
+        ),
+        tool_search=ToolSearchConfig(enabled=True, top_k=3),
+        metadata={"owner": "platform"},
+    )
 
-    result = runner.invoke(main, ["run", "--spec", str(spec_file), "--workspace", str(tmp_path)])
+    restored = AgentRuntimeConfig.from_json(json.loads(json.dumps(config.to_json())))
 
-    assert result.exit_code != 0
-    assert "cannot be combined" in result.output
+    assert restored == config
+    assert restored.config_hash == config.config_hash
+    assert restored.to_json()["config_hash"] == config.config_hash
+
+
+def test_content_parts_json_round_trip() -> None:
+    spec = AgentRunSpec(
+        instruction="fallback",
+        workspace_root=Path("/workspace"),
+        run_root=Path("runs"),
+        input=(
+            TextPart(text="hello"),
+            ImagePart(source_ref="workspace://image.png", mime_type="image/png"),
+            DocumentPart(source_ref="workspace://doc.pdf", mime_type="application/pdf"),
+        ),
+    )
+
+    restored = AgentRunSpec.from_json(spec.to_json())
+
+    assert restored.input == spec.input
+    assert restored.effective_input == spec.input
+
+
+def test_runtime_config_rejects_duplicate_binding_ids() -> None:
+    config = runtime_config(
+        bindings=(
+            tool_binding("fs.read", binding_id="read"),
+            tool_binding("fs.stat", binding_id="read"),
+        )
+    )
+
+    try:
+        from native_agent_runner.core.agents import validate_runtime_config
+        from native_agent_runner.tools.base import ToolRegistry
+        from native_agent_runner.tools.builtin import builtin_tools
+        from native_agent_runner.workspace.local import LocalWorkspaceBackend
+
+        registry = ToolRegistry()
+        registry.register_many(builtin_tools(LocalWorkspaceBackend(Path("."))))
+        validate_runtime_config(config, registry)
+    except Exception as exc:
+        assert "duplicate tool binding_id" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("duplicate binding id was accepted")

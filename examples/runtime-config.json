@@ -1,0 +1,34 @@
+{
+  "definition_id": "markdown-editor",
+  "config_version": 1,
+  "model": {
+    "provider": "gateway",
+    "model": "gpt-5.5",
+    "gateway_url": "http://127.0.0.1:8080/internal/llm/turns",
+    "reasoning": {"effort": "low", "summary": "off"}
+  },
+  "prompt": {
+    "persona_segments": ["Edit files conservatively and explain the proposed changes briefly."],
+    "runtime_segments": []
+  },
+  "tools": [
+    {
+      "binding_id": "read_file",
+      "model_name": "read_file",
+      "ref": {"kind": "registry", "tool_id": "fs.read"},
+      "guidance": {"summary": "Read existing workspace files before writing."}
+    },
+    {
+      "binding_id": "write_file",
+      "model_name": "write_file",
+      "ref": {"kind": "registry", "tool_id": "fs.write"},
+      "guidance": {"summary": "Write only files needed for the user request."}
+    },
+    {
+      "binding_id": "finish",
+      "model_name": "finish",
+      "ref": {"kind": "registry", "tool_id": "run.finish"}
+    }
+  ],
+  "tool_search": {"enabled": true, "top_k": 5}
+}

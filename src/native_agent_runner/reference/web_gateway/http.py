@@ -126,7 +126,7 @@ def make_web_gateway_handler(
 
 
 def _status_for_web_error(exc: WebGatewayError) -> HTTPStatus:
-    if exc.error_code == "web_policy_denied":
+    if exc.error_code == "web_binding_denied":
         return HTTPStatus.FORBIDDEN
     if exc.error_code == "web_not_found":
         return HTTPStatus.NOT_FOUND

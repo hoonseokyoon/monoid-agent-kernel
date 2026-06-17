@@ -18,8 +18,8 @@ from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.public_view import public_path
 from native_agent_runner.recorder import AgentRecorder
 from native_agent_runner.shell import (
+    ShellExecutionOptions,
     ResolvedShellExecutionWorkspace,
-    ShellPolicy,
 )
 from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
@@ -162,7 +162,6 @@ class BackgroundJobManager:
     run_id: str
     workspace: Workspace
     recorder: AgentRecorder
-    shell_policy: ShellPolicy
     permission_policy: PermissionPolicy
     jobs: dict[str, BackgroundJob] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -176,6 +175,7 @@ class BackgroundJobManager:
     def start_shell_job(
         self,
         *,
+        shell_options: ShellExecutionOptions,
         command: str,
         cwd: str,
         timeout_s: int,
@@ -188,14 +188,14 @@ class BackgroundJobManager:
         execution_workspace: ResolvedShellExecutionWorkspace,
         resume_on_exit: bool,
     ) -> BackgroundJob:
-        if not self.shell_policy.enabled:
+        if not shell_options.enabled:
             raise ToolExecutionError("shell is disabled", error_code="shell_disabled")
         if not command.strip():
             raise ToolExecutionError("shell command is required", error_code="shell_exec_error")
-        self.shell_policy.check_command(command)
+        shell_options.check_command(command)
         cwd_rel = shell_runtime.validate_cwd(self.workspace, cwd, self.permission_policy)
-        safe_env = shell_runtime.build_env(self.shell_policy, env)
-        argv = shell_runtime.shell_argv(self.shell_policy.effective_shell(), command)
+        safe_env = shell_runtime.build_env(shell_options, env)
+        argv = shell_runtime.shell_argv(shell_options.effective_shell(), command)
         cwd_abs, tmp_root, before_snapshot = self._prepare_workspace(cwd_rel, execution_workspace)
 
         job_id = f"job_{uuid.uuid4().hex[:12]}"

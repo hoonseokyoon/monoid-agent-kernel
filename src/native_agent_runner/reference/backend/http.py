@@ -7,12 +7,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from native_agent_runner.core.agents import AgentDefinition, AgentRuntimeConfig
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
 from native_agent_runner.errors import NativeAgentError, PermissionDenied
 from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.shell import ShellPolicy
-from native_agent_runner.tools.policy import ToolPolicy
-from native_agent_runner.web import WebPolicy
 
 
 def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> type[BaseHTTPRequestHandler]:
@@ -39,6 +37,10 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     query = parse_qs(parsed.query)
                     from_seq = int((query.get("from_seq") or ["0"])[0])
                     self._write_json(backend.events(run_id, self._bearer_token(), from_seq=from_seq))
+                    return
+                if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "runtime-config":
+                    run_id = parts[2]
+                    self._write_json(backend.runtime_config(run_id, self._bearer_token()))
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "jobs":
                     run_id = parts[2]
@@ -95,17 +97,21 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                         instruction=str(payload["instruction"]),
                         mode=str(payload.get("mode") or "propose"),  # type: ignore[arg-type]
                         workspace_backend=str(payload.get("workspace_backend") or "overlay"),  # type: ignore[arg-type]
-                        model=str(payload.get("model") or "gpt-5.5"),
-                        reasoning_effort=str(payload.get("reasoning_effort") or "medium"),
-                        reasoning_summary=str(payload.get("reasoning_summary") or "off"),
                         max_steps=int(payload.get("max_steps") or 30),
                         max_tool_calls=int(payload.get("max_tool_calls") or 100),
                         max_bytes_read=int(payload.get("max_bytes_read") or 1_000_000),
                         max_duration_s=None if max_duration_raw is None else int(max_duration_raw),
                         permission_policy=PermissionPolicy.from_json(payload.get("permission_policy")),
-                        tool_policy=ToolPolicy.from_json(payload.get("tool_policy")),
-                        shell_policy=ShellPolicy.from_json(payload.get("shell_policy")),
-                        web_policy=WebPolicy.from_json(payload.get("web_policy")),
+                        agent_definition=(
+                            AgentDefinition.from_json(payload["agent_definition"])
+                            if payload.get("agent_definition") is not None
+                            else None
+                        ),
+                        runtime_config=(
+                            AgentRuntimeConfig.from_json(payload["runtime_config"])
+                            if payload.get("runtime_config") is not None
+                            else None
+                        ),
                         metadata=dict(payload.get("metadata") or {}),
                     )
                     self._write_json(backend.submit_run(request).to_json(), status=HTTPStatus.ACCEPTED)
@@ -118,6 +124,20 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                 if len(parts) == 6 and parts[:2] == ["v1", "runs"] and parts[3] == "jobs" and parts[5] == "cancel":
                     run_id = parts[2]
                     self._write_json(backend.cancel_job(run_id, self._bearer_token(), parts[4]))
+                    return
+                if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "runtime-config":
+                    run_id = parts[2]
+                    payload = self._read_json()
+                    self._write_json(
+                        backend.replace_runtime_config(
+                            run_id,
+                            self._bearer_token(),
+                            expected_version=int(payload.get("expected_version", 0)),
+                            issuer=str(payload.get("issuer") or ""),
+                            reason=str(payload.get("reason") or ""),
+                            config=AgentRuntimeConfig.from_json(payload["config"]),
+                        )
+                    )
                     return
                 if len(parts) == 5 and parts[:2] == ["v1", "runs"] and parts[3] == "proposal":
                     run_id = parts[2]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import argparse
 import json
 import os
@@ -21,7 +23,8 @@ sys.path.insert(0, str(PACKAGE_ROOT / "src"))
 
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
 from native_agent_runner.reference._shared.tokens import TokenClaims, TokenManager
-from native_agent_runner.core.spec import ModelConfig
+from native_agent_runner.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
+from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
 from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
 from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
 from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolCall
@@ -98,8 +101,7 @@ def run_scenario(*, mode: str, model: str, reasoning_effort: str, root: Path) ->
                 workspace_root=workspace,
                 instruction=DEFAULT_INSTRUCTION,
                 mode="propose",
-                model=model,
-                reasoning_effort=reasoning_effort,
+                runtime_config=_runtime_config(model=model, reasoning_effort=reasoning_effort),
                 max_steps=8,
                 max_tool_calls=20,
             )
@@ -147,6 +149,33 @@ def run_scenario(*, mode: str, model: str, reasoning_effort: str, root: Path) ->
         }
     finally:
         stop_gateway()
+
+
+def _runtime_config(*, model: str, reasoning_effort: str) -> AgentRuntimeConfig:
+    return AgentRuntimeConfig(
+        definition_id="full-stack-integration",
+        model=ModelConfig(
+            model=model,
+            reasoning=ReasoningConfig(effort=reasoning_effort),
+        ),
+        tools=(
+            ToolBinding(
+                binding_id="fs_read",
+                model_name="fs_read",
+                ref=RegistryToolRef("fs.read"),
+            ),
+            ToolBinding(
+                binding_id="fs_write",
+                model_name="fs_write",
+                ref=RegistryToolRef("fs.write"),
+            ),
+            ToolBinding(
+                binding_id="run_finish",
+                model_name="run_finish",
+                ref=RegistryToolRef("run.finish"),
+            ),
+        ),
+    )
 
 
 def _start_fake_gateway(token_manager: TokenManager) -> tuple[str, Callable[[], None], Callable[[str], dict[str, Any]]]:

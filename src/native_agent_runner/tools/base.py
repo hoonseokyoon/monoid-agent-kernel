@@ -7,7 +7,6 @@ from typing import Any, Literal, Protocol
 from jsonschema import Draft202012Validator, ValidationError
 
 from native_agent_runner.errors import ToolExecutionError
-from native_agent_runner.tools.policy import NormalizedToolPolicy, ToolPolicy, normalize_tool_policy
 
 ToolSideEffect = Literal["read", "write", "artifact", "run", "shell"]
 ToolPreviewKind = Literal["args", "shell", "web"]
@@ -156,9 +155,3 @@ class ToolRegistry:
     def specs(self) -> list[ToolSpec]:
         return list(self._by_id.values())
 
-    def policy_view(self, policy: ToolPolicy, capabilities: frozenset[str]) -> NormalizedToolPolicy:
-        return normalize_tool_policy(policy, self.specs(), capabilities)
-
-    def visible_specs(self, policy: NormalizedToolPolicy) -> list[ToolSpec]:
-        visible = set(policy.visible_tools)
-        return [spec for spec in self.specs() if spec.id in visible]

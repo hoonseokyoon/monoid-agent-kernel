@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+
+from native_agent_runner.core.tool_surface import ToolAuthorization, ToolScope
 
 
 @dataclass(frozen=True)
@@ -14,3 +17,9 @@ class CallContext:
     tool_call_id: str
     turn_id: str | None
     tool_event_id: str | None
+    binding_id: str = ""
+    tool_id: str = ""
+    model_name: str = ""
+    authorization: ToolAuthorization | None = None
+    scope: ToolScope = ToolScope()
+    runtime: dict[str, Any] | None = None

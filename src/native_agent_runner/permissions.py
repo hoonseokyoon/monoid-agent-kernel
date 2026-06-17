@@ -59,10 +59,6 @@ class PermissionPolicy:
             redact_patterns=dedupe((*self.redact_patterns, *redact_patterns)),
         )
 
-    def check_capability(self, capability: str, capabilities: frozenset[str]) -> None:
-        if capability not in capabilities:
-            raise PermissionDenied(f"missing capability: {capability}")
-
     def check_paths(self, operation: PermissionOperation, paths: tuple[str, ...]) -> None:
         if operation in {"artifact", "run"}:
             return

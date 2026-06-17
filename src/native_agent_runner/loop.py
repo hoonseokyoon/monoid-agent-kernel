@@ -7,21 +7,30 @@ from typing import Any
 
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.events import AgentEvent, EventSink
-from native_agent_runner.core.content import MEDIA_INPUT_CAPABILITY, non_text_part_types
+from native_agent_runner.core.content import non_text_part_types
 from native_agent_runner.core.context import (
     ContextProvider,
     TurnContext,
     render_workspace_index_segment,
 )
+from native_agent_runner.core.agents import (
+    AgentRuntimeConfig,
+    BoundTool,
+    BoundToolCatalog,
+    RuntimeConfigProvider,
+    compile_bound_tool_catalog,
+    runtime_config_diff,
+    transcript_config_snapshot,
+    validate_runtime_config,
+)
 from native_agent_runner.core.manifest import build_run_manifest
 from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
 from native_agent_runner.core.result import AgentRunResult
-from native_agent_runner.core.spec import AgentRunSpec
+from native_agent_runner.core.spec import AgentRunSpec, ModelConfig
 from native_agent_runner.core.tool_surface import (
     DefaultToolSurfaceResolver,
     ToolAuthorization,
     ToolSearchEntry,
-    ToolSurfacePolicy,
     ToolSurfaceResolver,
     ToolSurfaceSnapshot,
     tool_surface_manifest,
@@ -29,12 +38,12 @@ from native_agent_runner.core.tool_surface import (
 from native_agent_runner.core.workspace_index import build_workspace_index
 from native_agent_runner.errors import (
     ModelAdapterError,
+    AgentConfigError,
     NativeAgentError,
     PermissionDenied,
     RunCancelled,
     RunTimeout,
     ToolExecutionError,
-    ToolPolicyError,
     error_code_for_exception,
 )
 from native_agent_runner.jobs import BackgroundJobManager
@@ -50,12 +59,7 @@ from native_agent_runner.public_view import (
     web_args_preview,
 )
 from native_agent_runner.recorder import AgentRecorder
-from native_agent_runner.shell import (
-    AutoApproveShellApprovalProvider,
-    DenyShellApprovalProvider,
-    ShellPolicy,
-    ShellApprovalProvider,
-)
+from native_agent_runner.shell import ShellApprovalProvider
 from native_agent_runner.tool_services import CallContext, JobsService, ShellService, WebService
 from native_agent_runner.tools.base import (
     DynamicToolProvider,
@@ -196,9 +200,9 @@ class AgentToolContext(ToolContext):
         ranked = _rank_tool_search_entries(query, self.tool_search_entries)
         results = [entry.to_json() for entry in ranked[:max_results]]
         for item in results:
-            tool_id = str(item.get("tool_id") or "")
-            if tool_id and tool_id not in self._requested_tool_loads:
-                self._requested_tool_loads.append(tool_id)
+            binding_id = str(item.get("binding_id") or "")
+            if binding_id and binding_id not in self._requested_tool_loads:
+                self._requested_tool_loads.append(binding_id)
         return {"results": results, "count": len(results)}
 
     def consume_tool_load_requests(self) -> tuple[str, ...]:
@@ -219,9 +223,10 @@ class RunState:
     final_text: str = ""
     previous_turn_handle: str | None = None
     pending_observations: tuple[ToolObservation, ...] = ()
-    pending_tool_loads: tuple[str, ...] = ()
+    pending_binding_loads: tuple[str, ...] = ()
     tool_call_counts: dict[str, int] = field(default_factory=dict)
     previous_surface_snapshot: ToolSurfaceSnapshot | None = None
+    previous_runtime_config: AgentRuntimeConfig | None = None
     total_tool_calls: int = 0
     total_usage: dict[str, int] = field(
         default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -236,10 +241,9 @@ class _RunResources:
     recorder: AgentRecorder
     context: AgentToolContext
     base_tool_specs: tuple[ToolSpec, ...]
-    capabilities: frozenset[str]
     started: float
     deadline: float | None
-    system_prompt: str
+    static_segments: tuple[str, ...]
 
 
 @dataclass
@@ -258,11 +262,14 @@ class AgentLoop:
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
     context_providers: tuple[ContextProvider, ...] = ()
     inject_workspace_index: bool = False
+    runtime_config_provider: RuntimeConfigProvider | None = None
+    _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
 
     def run(self) -> AgentRunResult:
-        res = self._bootstrap()
         state = RunState()
+        res: _RunResources | None = None
         try:
+            res = self._bootstrap()
             self._run_steps(state, res)
         except (RunCancelled, RunTimeout) as exc:
             state.status = "limited"
@@ -274,6 +281,9 @@ class AgentLoop:
                 else "Stopped after reaching max duration."
             )
         except Exception as exc:  # controlled recording boundary for standalone CLI
+            res = res or self._bootstrap_resources
+            if res is None:
+                raise
             state.status = "failed"
             state.error = str(exc)
             state.error_code = error_code_for_exception(exc)
@@ -291,6 +301,8 @@ class AgentLoop:
                 level="error",
             )
         finally:
+            if res is None:
+                raise RuntimeError("run failed before recorder initialization")
             result = self._finalize(state, res)
         return result
 
@@ -309,7 +321,6 @@ class AgentLoop:
             run_id=self.spec.run_id,
             workspace=workspace,
             recorder=recorder,
-            shell_policy=self.spec.shell_policy,
             permission_policy=self.permission_policy,
         )
         shell_service = ShellService(
@@ -317,15 +328,10 @@ class AgentLoop:
             workspace=workspace,
             recorder=recorder,
             job_manager=job_manager,
-            shell_policy=self.spec.shell_policy,
             permission_policy=self.permission_policy,
-            approval_provider=_shell_approval_provider(
-                self.spec.shell_policy,
-                self.shell_approval_provider,
-            ),
+            approval_provider=self.shell_approval_provider,
         )
         web_service = WebService(
-            web_policy=self.spec.web_policy,
             recorder=recorder,
             web_gateway_client=self.web_gateway_client,
         )
@@ -345,18 +351,23 @@ class AgentLoop:
         for provider in self.tool_providers:
             base_registry.register_many(provider.get_tools(context))
 
-        capabilities = self.spec.effective_capabilities()
-        try:
-            initial_tool_policy = base_registry.policy_view(self.spec.tool_policy, capabilities)
-        except ToolPolicyError:
-            recorder.close()
-            raise
         started = time.time()
         deadline = (
             started + self.spec.limits.max_duration_s
             if self.spec.limits.max_duration_s is not None
             else None
         )
+        self._bootstrap_resources = _RunResources(
+            workspace=workspace,
+            recorder=recorder,
+            context=context,
+            base_tool_specs=tuple(base_registry.specs()),
+            started=started,
+            deadline=deadline,
+            static_segments=(),
+        )
+        initial_runtime_config = self._current_runtime_config(base_registry)
+        initial_bound_catalog = compile_bound_tool_catalog(initial_runtime_config, base_registry)
         initial_turn = TurnContext(
             step=1,
             remaining_steps=max(0, self.spec.limits.max_steps - 1),
@@ -366,11 +377,8 @@ class AgentLoop:
             pending_observation_count=0,
         )
         initial_surface = self.tool_surface_resolver.resolve(
-            registry=base_registry,
-            run_spec=self._surface_spec(),
+            bound_catalog=initial_bound_catalog,
             turn=initial_turn,
-            legacy_tool_policy=initial_tool_policy,
-            capabilities=capabilities,
         )
         initial_visible_tool_specs = list(initial_surface.immediate_tools)
         workspace_index = build_workspace_index(workspace, run_id=self.spec.run_id)
@@ -384,24 +392,25 @@ class AgentLoop:
             segment = provider.static_segment()
             if segment and segment.strip():
                 static_segments.append(segment)
-        system_prompt = compose_system_prompt(
-            self.spec.system_prompt_base or BASE_SYSTEM_PROMPT,
-            (*self.spec.persona_segments, *static_segments),
-        )
         workspace_base_path = recorder.write_workspace_base(
             workspace.workspace_base_payload(self.spec.run_id)
         )
         manifest = build_run_manifest(
             self.spec,
+            model_config=initial_runtime_config.model or ModelConfig(),
             tool_specs=initial_visible_tool_specs,
             permission_policy=self.permission_policy,
-            tool_policy=initial_tool_policy.to_manifest(),
             tool_surface=tool_surface_manifest(
                 resolver=self.tool_surface_resolver,
-                policy=ToolSurfacePolicy.from_json(self.spec.tool_surface_policy),
+                tool_search=initial_runtime_config.tool_search,
                 dynamic_enabled=bool(self._dynamic_providers()),
-                initial_catalog_count=len(base_registry.specs()),
+                initial_catalog_count=len(initial_bound_catalog.tools),
             ),
+            agent_config={
+                "definition_id": initial_runtime_config.definition_id,
+                "config_version": initial_runtime_config.config_version,
+                "config_hash": initial_runtime_config.config_hash,
+            },
             workspace_index_path=str(workspace_index_path.relative_to(recorder.run_dir).as_posix()),
             workspace_base_path=str(workspace_base_path.relative_to(recorder.run_dir).as_posix()),
         )
@@ -415,39 +424,32 @@ class AgentLoop:
                 "mode": self.spec.mode,
                 "workspace_backend": self.spec.workspace_backend,
                 "workspace_base_path": "workspace.base.json",
-                "model_provider": self.spec.model.provider,
-                "model": self.spec.model.model,
-                "reasoning_effort": self.spec.model.reasoning.effort,
-                "visible_tools": [tool.id for tool in initial_visible_tool_specs],
+                "model_provider": (initial_runtime_config.model or ModelConfig()).provider,
+                "model": (initial_runtime_config.model or ModelConfig()).model,
+                "reasoning_effort": (initial_runtime_config.model or ModelConfig()).reasoning.effort,
+                "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
+                "agent_config_hash": initial_runtime_config.config_hash,
             },
         )
-        self._warn_on_unforwarded_multimodal(recorder, capabilities)
+        self._warn_on_unforwarded_multimodal(recorder)
         return _RunResources(
             workspace=workspace,
             recorder=recorder,
             context=context,
             base_tool_specs=tuple(base_registry.specs()),
-            capabilities=capabilities,
             started=started,
             deadline=deadline,
-            system_prompt=system_prompt,
+            static_segments=tuple(static_segments),
         )
 
-    def _warn_on_unforwarded_multimodal(
-        self, recorder: AgentRecorder, capabilities: frozenset[str]
-    ) -> None:
+    def _warn_on_unforwarded_multimodal(self, recorder: AgentRecorder) -> None:
         """Multimodal input is a contract-only surface for now: non-text parts are
         accepted on the spec but not yet threaded to any provider. Emit a warning
         naming the dropped part types and why, so the degradation is observable."""
         dropped = non_text_part_types(self.spec.effective_input)
         if not dropped:
             return
-        if not getattr(self.model_adapter, "supports_multimodal", False):
-            reason = "adapter_lacks_multimodal"
-        elif MEDIA_INPUT_CAPABILITY not in capabilities:
-            reason = "capability_not_granted"
-        else:
-            reason = "not_yet_forwarded"
+        reason = "not_yet_forwarded" if getattr(self.model_adapter, "supports_multimodal", False) else "adapter_lacks_multimodal"
         recorder.emit(
             "model.input.degraded",
             data={"dropped_part_types": dropped, "reason": reason},
@@ -498,10 +500,63 @@ class AgentLoop:
                 providers.append(provider)  # type: ignore[arg-type]
         return tuple(providers)
 
-    def _surface_spec(self) -> AgentRunSpec:
-        if self.permission_policy == self.spec.permission_policy:
-            return self.spec
-        return replace(self.spec, permission_policy=self.permission_policy)
+    def _current_runtime_config(self, registry: ToolRegistry, *, validate: bool = True) -> AgentRuntimeConfig:
+        if self.runtime_config_provider is None:
+            raise AgentConfigError(
+                "runtime config provider is required",
+                error_code="agent_config_missing",
+            )
+        config = (
+            self.runtime_config_provider.current_config(self.spec.run_id)
+        )
+        if config is None:
+            raise AgentConfigError(
+                "runtime config provider returned no config",
+                error_code="agent_config_missing",
+            )
+        if validate:
+            validate_runtime_config(config, registry)
+        return config
+
+    def _system_prompt_for_config(
+        self,
+        config: AgentRuntimeConfig,
+        static_segments: tuple[str, ...],
+    ) -> str:
+        return compose_system_prompt(
+            config.prompt.system_prompt_base or BASE_SYSTEM_PROMPT,
+            (*config.prompt.persona_segments, *config.prompt.runtime_segments, *static_segments),
+        )
+
+    def _emit_runtime_config_if_changed(
+        self,
+        *,
+        recorder: AgentRecorder,
+        state: RunState,
+        config: AgentRuntimeConfig,
+        step: int,
+        turn_id: str,
+        parent_id: str | None,
+    ) -> None:
+        recorder.transcript(transcript_config_snapshot(config, step=step, turn_id=turn_id))
+        previous = state.previous_runtime_config
+        if previous is not None and previous.config_hash == config.config_hash:
+            return
+        diff = runtime_config_diff(previous, config)
+        recorder.emit(
+            "agent.config.updated",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data={
+                "definition_id": config.definition_id,
+                "config_version": config.config_version,
+                "config_hash": config.config_hash,
+                "previous_config_version": None if previous is None else previous.config_version,
+                "previous_config_hash": None if previous is None else previous.config_hash,
+                "diff": diff,
+            },
+        )
+        state.previous_runtime_config = config
 
     def _run_steps(self, state: RunState, res: _RunResources) -> None:
         context = res.context
@@ -520,17 +575,20 @@ class AgentLoop:
             )
             turn_context = self._turn_context(state, res, step)
             turn_registry = self._registry_for_turn(context, turn_context, res)
-            try:
-                turn_tool_policy = turn_registry.policy_view(self.spec.tool_policy, res.capabilities)
-            except ToolPolicyError:
-                raise
+            runtime_config = self._current_runtime_config(turn_registry)
+            bound_catalog = compile_bound_tool_catalog(runtime_config, turn_registry)
+            self._emit_runtime_config_if_changed(
+                recorder=recorder,
+                state=state,
+                config=runtime_config,
+                step=step,
+                turn_id=turn_id,
+                parent_id=turn_started.event_id,
+            )
             surface_snapshot = self.tool_surface_resolver.resolve(
-                registry=turn_registry,
-                run_spec=self._surface_spec(),
+                bound_catalog=bound_catalog,
                 turn=turn_context,
-                legacy_tool_policy=turn_tool_policy,
-                capabilities=res.capabilities,
-                pending_tool_loads=state.pending_tool_loads,
+                pending_binding_loads=state.pending_binding_loads,
                 previous_snapshot=state.previous_surface_snapshot,
                 call_counts=state.tool_call_counts,
             )
@@ -538,7 +596,7 @@ class AgentLoop:
                 surface_snapshot = replace(surface_snapshot, turn_id=turn_id)
             context.configure_tool_search(
                 surface_snapshot.search_entries,
-                self.spec.tool_surface_policy.search_top_k,
+                runtime_config.tool_search.top_k,
             )
             snapshot_payload = surface_snapshot.to_transcript_json()
             snapshot_payload["step"] = step
@@ -552,9 +610,9 @@ class AgentLoop:
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
                     data=surface_snapshot.to_public_json(),
-                )
+            )
             state.previous_surface_snapshot = surface_snapshot
-            state.pending_tool_loads = ()
+            state.pending_binding_loads = ()
             dynamic_segment = self._dynamic_context_segment(state, res, step)
             if surface_snapshot.delta_notice:
                 dynamic_segment = (
@@ -562,10 +620,11 @@ class AgentLoop:
                     if not dynamic_segment
                     else f"{dynamic_segment}\n\n{surface_snapshot.delta_notice}"
                 )
+            static_system_prompt = self._system_prompt_for_config(runtime_config, res.static_segments)
             turn_system_prompt = (
-                res.system_prompt
+                static_system_prompt
                 if not dynamic_segment
-                else f"{res.system_prompt}\n\n{dynamic_segment}"
+                else f"{static_system_prompt}\n\n{dynamic_segment}"
             )
             request = ModelRequest(
                 instruction=self.spec.effective_text_instruction,
@@ -573,6 +632,7 @@ class AgentLoop:
                 tools=surface_snapshot.immediate_tools,
                 previous_turn_handle=state.previous_turn_handle,
                 observations=state.pending_observations,
+                model=runtime_config.model or ModelConfig(),
             )
             recorder.transcript(
                 {
@@ -673,19 +733,20 @@ class AgentLoop:
                     call_name=call.name,
                     call_id=call.id,
                     arguments=call.arguments,
-                    registry=turn_registry,
+                    bound_catalog=bound_catalog,
                     surface_snapshot=surface_snapshot,
                     call_counts=state.tool_call_counts,
                     context=context,
                     recorder=recorder,
-                    capabilities=res.capabilities,
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
                     step=step,
                 )
                 observations.append(observation)
                 self._check_run_boundary(deadline)
-            state.pending_tool_loads = _dedupe((*state.pending_tool_loads, *context.consume_tool_load_requests()))
+            state.pending_binding_loads = _dedupe(
+                (*state.pending_binding_loads, *context.consume_tool_load_requests())
+            )
             state.pending_observations = tuple(observations)
 
             if context.finished:
@@ -700,6 +761,11 @@ class AgentLoop:
 
     def _build_metrics(self, state: RunState, res: _RunResources) -> dict[str, Any]:
         context = res.context
+        model = (
+            state.previous_runtime_config.model
+            if state.previous_runtime_config is not None and state.previous_runtime_config.model is not None
+            else ModelConfig()
+        )
         metrics = {
             "status": state.status,
             "duration_s": time.time() - res.started,
@@ -707,8 +773,8 @@ class AgentLoop:
             "tool_calls": state.total_tool_calls,
             "changed_paths": res.workspace.changed_paths(),
             "workspace_backend": self.spec.workspace_backend,
-            "requested_reasoning_effort": self.spec.model.reasoning.effort,
-            "effective_reasoning_effort": self.spec.model.reasoning.effort,
+            "requested_reasoning_effort": model.reasoning.effort,
+            "effective_reasoning_effort": model.reasoning.effort,
             "error_code": state.error_code,
             **context.shell_service.metrics(),
             **context.jobs_service.background_metrics(),
@@ -923,61 +989,34 @@ class AgentLoop:
             data=_tool_start_data(call_name, call_id, spec, arguments, self.permission_policy),
         )
 
-    def _authorize_tool(self, spec: ToolSpec, decision: Any, capabilities: frozenset[str]) -> None:
-        if decision.decision == "deny":
-            raise PermissionDenied(
-                f"tool denied by policy: {spec.id}",
-                error_code="tool_policy_denied",
-            )
-        if decision.decision == "ask":
-            raise PermissionDenied(
-                f"tool requires approval: {spec.id}",
-                error_code="tool_approval_required",
-            )
-        if spec.capability not in capabilities:
-            raise PermissionDenied(
-                f"capability disabled: {spec.capability}",
-                error_code="capability_disabled",
-            )
-
     def _authorize_surface_tool(
         self,
-        spec: ToolSpec,
+        bound_tool: BoundTool,
         snapshot: ToolSurfaceSnapshot,
-        capabilities: frozenset[str],
         call_counts: dict[str, int],
     ) -> ToolAuthorization:
-        immediate_tool_ids = {tool.id for tool in snapshot.immediate_tools}
-        authorization = snapshot.authorization_for(spec.id)
+        binding_id = bound_tool.binding_id
+        immediate_binding_ids = {tool.id for tool in snapshot.immediate_tools}
+        authorization = snapshot.authorization_for(binding_id)
         if authorization is not None and authorization.decision == "deny":
-            if authorization.reason == "missing_capability":
-                raise PermissionDenied(
-                    f"capability disabled: {spec.capability}",
-                    error_code="capability_disabled",
-                )
             raise PermissionDenied(
-                f"tool denied by policy: {spec.id}",
-                error_code="tool_policy_denied",
+                f"tool binding denied by config: {binding_id}",
+                error_code="tool_binding_denied",
             )
-        if spec.id not in immediate_tool_ids or authorization is None:
+        if binding_id not in immediate_binding_ids or authorization is None:
             raise PermissionDenied(
-                f"tool is not available in this turn: {spec.id}",
+                f"tool binding is not available in this turn: {binding_id}",
                 error_code="tool_not_in_surface",
             )
         if authorization.decision == "ask":
             raise PermissionDenied(
-                f"tool requires approval: {spec.id}",
+                f"tool binding requires approval: {binding_id}",
                 error_code="tool_approval_required",
             )
-        if spec.capability not in capabilities:
-            raise PermissionDenied(
-                f"capability disabled: {spec.capability}",
-                error_code="capability_disabled",
-            )
         max_calls = authorization.quota.max_calls_per_run
-        if max_calls is not None and call_counts.get(spec.id, 0) >= max_calls:
+        if max_calls is not None and call_counts.get(binding_id, 0) >= max_calls:
             raise PermissionDenied(
-                f"tool quota exceeded: {spec.id}",
+                f"tool binding quota exceeded: {binding_id}",
                 error_code="tool_quota_exceeded",
             )
         return authorization
@@ -1035,7 +1074,7 @@ class AgentLoop:
 
     def _invoke_handler(
         self,
-        spec: ToolSpec,
+        bound_tool: BoundTool,
         context: AgentToolContext,
         arguments: dict[str, Any],
         *,
@@ -1043,11 +1082,19 @@ class AgentLoop:
         turn_id: str,
         recorder: AgentRecorder,
         started_event: AgentEvent,
+        authorization: ToolAuthorization,
     ) -> ToolResult:
+        spec = bound_tool.base_spec
         context._current_call = CallContext(
             tool_call_id=call_id,
             turn_id=turn_id,
             tool_event_id=started_event.event_id,
+            binding_id=bound_tool.binding_id,
+            tool_id=bound_tool.base_spec.id,
+            model_name=bound_tool.model_name,
+            authorization=authorization,
+            scope=authorization.scope,
+            runtime=bound_tool.runtime,
         )
         try:
             result = spec.handler(context, arguments)
@@ -1107,55 +1154,92 @@ class AgentLoop:
         call_name: str,
         call_id: str,
         arguments: dict[str, Any],
-        registry: ToolRegistry,
+        bound_catalog: BoundToolCatalog,
         surface_snapshot: ToolSurfaceSnapshot,
         call_counts: dict[str, int],
         context: AgentToolContext,
         recorder: AgentRecorder,
-        capabilities: frozenset[str],
         turn_id: str,
         parent_id: str | None,
         step: int,
     ) -> ToolObservation:
         spec: ToolSpec | None = None
+        bound_tool: BoundTool | None = None
         result: ToolResult
         started_event: AgentEvent | None = None
         policy_decision = ""
         policy_reason = ""
         try:
-            spec = registry.resolve(call_name)
-            started_event = self._emit_tool_started(
-                recorder,
-                call_name=call_name,
-                call_id=call_id,
-                spec=spec,
-                arguments=arguments,
-                turn_id=turn_id,
-                parent_id=parent_id,
-            )
-            preview_authorization = surface_snapshot.authorization_for(spec.id)
-            if preview_authorization is not None:
-                policy_decision = preview_authorization.decision
-                policy_reason = preview_authorization.reason
-            authorization = self._authorize_surface_tool(
-                spec,
-                surface_snapshot,
-                capabilities,
-                call_counts,
-            )
-            registry.validate_args(spec, arguments)
-            self._check_tool_surface_scope(spec, arguments, authorization)
-            self._check_permissions(spec, arguments, capabilities)
-            call_counts[spec.id] = call_counts.get(spec.id, 0) + 1
-            result = self._invoke_handler(
-                spec,
-                context,
-                arguments,
-                call_id=call_id,
-                turn_id=turn_id,
-                recorder=recorder,
-                started_event=started_event,
-            )
+            if _is_tool_search_call(call_name, bound_catalog):
+                binding_id = bound_catalog.tool_search.binding_id
+                spec = _surface_spec_for_binding(surface_snapshot, binding_id)
+                if spec is None:
+                    raise PermissionDenied(
+                        f"tool binding is not available in this turn: {binding_id}",
+                        error_code="tool_not_in_surface",
+                    )
+                started_event = self._emit_tool_started(
+                    recorder,
+                    call_name=call_name,
+                    call_id=call_id,
+                    spec=spec,
+                    arguments=arguments,
+                    turn_id=turn_id,
+                    parent_id=parent_id,
+                )
+                authorization = surface_snapshot.authorization_for(binding_id)
+                if authorization is None or authorization.decision == "deny":
+                    raise PermissionDenied(
+                        f"tool binding denied by config: {binding_id}",
+                        error_code="tool_binding_denied",
+                    )
+                policy_decision = authorization.decision
+                policy_reason = authorization.reason
+                if authorization.decision == "ask":
+                    raise PermissionDenied(
+                        f"tool binding requires approval: {binding_id}",
+                        error_code="tool_approval_required",
+                    )
+                ToolRegistry().validate_args(spec, arguments)
+                call_counts[binding_id] = call_counts.get(binding_id, 0) + 1
+                result = ToolResult(ok=True, content=context.search_tools(arguments))
+            else:
+                bound_tool = bound_catalog.resolve_model_call(call_name)
+                if bound_tool is None:
+                    raise ToolExecutionError(f"unknown tool: {call_name}", error_code="tool_unknown")
+                spec = bound_tool.model_spec
+                started_event = self._emit_tool_started(
+                    recorder,
+                    call_name=call_name,
+                    call_id=call_id,
+                    spec=spec,
+                    arguments=arguments,
+                    turn_id=turn_id,
+                    parent_id=parent_id,
+                )
+                preview_authorization = surface_snapshot.authorization_for(bound_tool.binding_id)
+                if preview_authorization is not None:
+                    policy_decision = preview_authorization.decision
+                    policy_reason = preview_authorization.reason
+                authorization = self._authorize_surface_tool(
+                    bound_tool,
+                    surface_snapshot,
+                    call_counts,
+                )
+                ToolRegistry().validate_args(spec, arguments)
+                self._check_tool_surface_scope(spec, arguments, authorization)
+                self._check_permissions(bound_tool.base_spec, arguments)
+                call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
+                result = self._invoke_handler(
+                    bound_tool,
+                    context,
+                    arguments,
+                    call_id=call_id,
+                    turn_id=turn_id,
+                    recorder=recorder,
+                    started_event=started_event,
+                    authorization=authorization,
+                )
         except ToolExecutionError as exc:
             if started_event is None:
                 started_event = self._emit_tool_started(
@@ -1281,9 +1365,7 @@ class AgentLoop:
         self,
         spec: ToolSpec,
         arguments: dict[str, Any],
-        capabilities: frozenset[str],
     ) -> None:
-        self.permission_policy.check_capability(spec.capability, capabilities)
         paths = tuple(
             str(arguments[name])
             for name in spec.path_args
@@ -1293,19 +1375,6 @@ class AgentLoop:
             return
         operation = "read" if spec.side_effect in {"read", "artifact"} else "write"
         self.permission_policy.check_paths(operation, paths)  # type: ignore[arg-type]
-
-
-def _shell_approval_provider(
-    policy: ShellPolicy,
-    explicit: ShellApprovalProvider | None,
-) -> ShellApprovalProvider | None:
-    if explicit is not None:
-        return explicit
-    if policy.approval_mode == "auto-approve":
-        return AutoApproveShellApprovalProvider(approver_id="standalone-cli")
-    if policy.approval_mode == "deny":
-        return DenyShellApprovalProvider()
-    return None
 
 
 def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
@@ -1347,6 +1416,20 @@ def _rank_tool_search_entries(
 
     scored = [(score(entry), index, entry) for index, entry in enumerate(entries)]
     return [entry for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1])) if value > 0]
+
+
+def _is_tool_search_call(name: str, catalog: BoundToolCatalog) -> bool:
+    return catalog.tool_search.enabled and name in {
+        catalog.tool_search.binding_id,
+        catalog.tool_search.model_name,
+    }
+
+
+def _surface_spec_for_binding(snapshot: ToolSurfaceSnapshot, binding_id: str) -> ToolSpec | None:
+    for tool in snapshot.immediate_tools:
+        if tool.id == binding_id or str(tool.annotations.get("binding_id") or "") == binding_id:
+            return tool
+    return None
 
 
 def _urls_from_args(arguments: dict[str, Any]) -> tuple[str, ...]:

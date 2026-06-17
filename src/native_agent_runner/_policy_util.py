@@ -1,9 +1,7 @@
-"""Shared coercion helpers for the policy dataclasses.
+"""Shared coercion helpers for execution-boundary dataclasses.
 
-Used by ``PermissionPolicy``, ``ShellPolicy``, ``WebPolicy`` and ``ToolPolicy``
-to parse JSON arrays consistently. Internal only; not part of the supported
-public surface. Each caller keeps its own error type and message so behaviour
-is unchanged from the previous per-module copies.
+Used by permission and runtime execution parsers to keep JSON array handling
+consistent. Internal only; not part of the supported public surface.
 """
 
 from __future__ import annotations

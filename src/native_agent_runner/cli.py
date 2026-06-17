@@ -3,24 +3,21 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import click
-from click.core import ParameterSource
 
-from native_agent_runner.core.profiles import PROFILE_NAMES, resolve_profile
+from native_agent_runner.core.agents import AgentDefinition, AgentRuntimeConfig, RuntimeConfigProvider
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import RunnerBackend
 from native_agent_runner.reference._shared.tokens import TokenManager
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
-    ReasoningConfig,
     RunLimits,
 )
-from native_agent_runner.core.tool_surface import ToolSurfacePolicy
 from native_agent_runner.core.schemas import validate_run_dir
 from native_agent_runner.core.packages import (
     apply_package,
@@ -49,10 +46,8 @@ from native_agent_runner.providers.base import ModelAdapter
 from native_agent_runner.providers.gateway import GatewayModelAdapter
 from native_agent_runner.providers.openai import OpenAIModelAdapter
 from native_agent_runner.recorder import StdoutJsonlSink, append_event_to_run
-from native_agent_runner.shell import ShellPolicy
-from native_agent_runner.tools.policy import ToolPolicy
 from native_agent_runner.tool_loader import load_tool_provider
-from native_agent_runner.web import WebGatewayClient, WebPolicy
+from native_agent_runner.web import WebGatewayClient
 from native_agent_runner.reference.web_gateway.http import create_web_gateway_server
 from native_agent_runner.reference.web_gateway.providers import (
     BraveLlmContextProvider,
@@ -62,6 +57,15 @@ from native_agent_runner.reference.web_gateway.providers import (
     SearchFetchContextProvider,
 )
 from native_agent_runner.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
+
+
+@dataclass(frozen=True)
+class StaticRuntimeConfigProvider(RuntimeConfigProvider):
+    config: AgentRuntimeConfig
+
+    def current_config(self, run_id: str) -> AgentRuntimeConfig | None:
+        del run_id
+        return self.config
 
 
 @click.group()
@@ -76,21 +80,17 @@ def main() -> None:
     type=click.Path(path_type=Path),
     default=None,
     help=(
-        "Load the full run spec from a JSON file (AgentRunSpec.to_json shape). "
+        "Load run-specific values from a JSON file (AgentRunSpec.to_json shape). "
         "When set, individual spec flags are ignored; runtime flags "
-        "(gateway URLs/tokens, --event-sink-module, --stream-json, --no-status-file, --tool-module) still apply."
+        "(runtime config, gateway URLs/tokens, --event-sink-module, --stream-json, "
+        "--no-status-file, --tool-module) still apply."
     ),
 )
+@click.option("--agent-definition-file", type=click.Path(path_type=Path), default=None)
+@click.option("--runtime-config-file", type=click.Path(path_type=Path), default=None)
 @click.option("--workspace", type=click.Path(path_type=Path), default=None)
 @click.option("--instruction", type=str, default="")
 @click.option("--instruction-file", type=click.Path(path_type=Path), default=None)
-@click.option(
-    "--model-provider",
-    type=click.Choice(["gateway", "openai"]),
-    default="gateway",
-    show_default=True,
-)
-@click.option("--model", type=str, default="gpt-5.5", show_default=True)
 @click.option("--llm-gateway-url", type=str, default=None, help="Internal CSP LLM gateway URL.")
 @click.option(
     "--llm-gateway-token-env",
@@ -111,18 +111,6 @@ def main() -> None:
     help="Allow direct provider API access for local smoke tests only.",
 )
 @click.option(
-    "--reasoning-effort",
-    type=click.Choice(["default", "none", "minimal", "low", "medium", "high", "xhigh"]),
-    default="medium",
-    show_default=True,
-)
-@click.option(
-    "--reasoning-summary",
-    type=click.Choice(["off", "auto", "detailed"]),
-    default="off",
-    show_default=True,
-)
-@click.option(
     "--mode",
     type=click.Choice(["read-only", "propose", "apply"]),
     default="propose",
@@ -141,31 +129,9 @@ def main() -> None:
 @click.option("--max-bytes-read", type=int, default=1_000_000, show_default=True)
 @click.option("--max-duration-s", type=int, default=900, show_default=True)
 @click.option("--tool-module", multiple=True, help="Load custom tools from path.py:function.")
-@click.option("--allow-tool", multiple=True, help="Allow a tool by id, exported name, or namespace glob.")
-@click.option("--deny-tool", multiple=True, help="Deny a tool by id, exported name, or namespace glob.")
-@click.option("--ask-tool", multiple=True, help="Require approval for a tool by id, exported name, or namespace glob.")
-@click.option("--tool-policy-file", type=click.Path(path_type=Path), default=None)
-@click.option("--tool-surface-policy-file", type=click.Path(path_type=Path), default=None)
 @click.option("--deny-path", multiple=True, help="Deny workspace paths matching a backend-provided glob.")
 @click.option("--redact-path", multiple=True, help="Redact matching paths from public events and projections.")
 @click.option("--permission-policy-file", type=click.Path(path_type=Path), default=None)
-@click.option("--enable-shell", is_flag=True, help="Expose shell.exec for this run.")
-@click.option(
-    "--shell-approval-mode",
-    type=click.Choice(["auto-approve", "deny"]),
-    default="deny",
-    show_default=True,
-)
-@click.option("--shell-timeout-s", type=int, default=None, help="Default shell command timeout.")
-@click.option("--shell-max-output-bytes", type=int, default=None, help="Default shell output cap.")
-@click.option(
-    "--shell-execution-workspace",
-    type=click.Choice(["auto", "isolated-copy", "direct"]),
-    default="auto",
-    show_default=True,
-)
-@click.option("--shell-env", multiple=True, help="Allow a model-supplied environment variable key.")
-@click.option("--enable-web", is_flag=True, help="Expose web.search and web.fetch for this run.")
 @click.option("--web-gateway-url", type=str, default=None, help="Internal CSP WebGateway base URL.")
 @click.option(
     "--web-gateway-token-env",
@@ -180,60 +146,23 @@ def main() -> None:
     default=None,
     help="File containing a short-lived WebGateway token.",
 )
-@click.option("--web-allow-domain", multiple=True, help="Allow a WebGateway domain pattern.")
-@click.option("--web-block-domain", multiple=True, help="Block a WebGateway domain pattern.")
-@click.option("--web-max-searches", type=int, default=None, help="Maximum web.search calls.")
-@click.option("--web-max-fetches", type=int, default=None, help="Maximum web.fetch calls.")
-@click.option("--enable-web-context", is_flag=True, help="Expose web.context for this run.")
-@click.option("--web-max-contexts", type=int, default=None, help="Maximum web.context calls.")
-@click.option("--web-max-results", type=int, default=None, help="Maximum web.search results.")
-@click.option("--web-context-max-tokens", type=int, default=None, help="Maximum web.context token budget.")
-@click.option("--web-context-max-urls", type=int, default=None, help="Maximum web.context source URLs.")
-@click.option("--web-context-max-snippets", type=int, default=None, help="Maximum web.context snippets.")
-@click.option("--web-max-response-bytes", type=int, default=None, help="Maximum web.fetch response bytes.")
-@click.option("--web-timeout-s", type=int, default=None, help="Default web.fetch timeout.")
-@click.option("--web-policy-file", type=click.Path(path_type=Path), default=None)
 @click.option("--event-sink-module", multiple=True, help="Load custom event sinks from path.py:function.")
 @click.option("--stream-json", is_flag=True, help="Stream public events as JSONL on stdout.")
 @click.option("--no-status-file", is_flag=True, help="Disable status.json updates.")
-@click.option(
-    "--profile",
-    type=click.Choice(PROFILE_NAMES),
-    default=None,
-    help="Apply a capability/limits preset; explicit flags override it.",
-)
-@click.option(
-    "--persona",
-    "persona",
-    multiple=True,
-    help="Append a persona/role segment to the base system prompt (repeatable). "
-    "Overrides any persona from --profile.",
-)
-@click.option(
-    "--system-prompt-file",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Override the base system prompt with the contents of this file.",
-)
 @click.pass_context
 def run(
     ctx: click.Context,
     *,
-    profile: str | None,
-    persona: tuple[str, ...],
-    system_prompt_file: Path | None,
     spec_file: Path | None,
+    agent_definition_file: Path | None,
+    runtime_config_file: Path | None,
     workspace: Path | None,
     instruction: str,
     instruction_file: Path | None,
-    model_provider: str,
-    model: str,
     llm_gateway_url: str | None,
     llm_gateway_token_env: str,
     llm_gateway_token_file: Path | None,
     allow_direct_provider_api: bool,
-    reasoning_effort: str,
-    reasoning_summary: str,
     mode: str,
     workspace_backend: str,
     run_root: Path,
@@ -243,60 +172,28 @@ def run(
     max_bytes_read: int,
     max_duration_s: int,
     tool_module: tuple[str, ...],
-    allow_tool: tuple[str, ...],
-    deny_tool: tuple[str, ...],
-    ask_tool: tuple[str, ...],
-    tool_policy_file: Path | None,
-    tool_surface_policy_file: Path | None,
     deny_path: tuple[str, ...],
     redact_path: tuple[str, ...],
     permission_policy_file: Path | None,
-    enable_shell: bool,
-    shell_approval_mode: str,
-    shell_timeout_s: int | None,
-    shell_max_output_bytes: int | None,
-    shell_execution_workspace: str,
-    shell_env: tuple[str, ...],
-    enable_web: bool,
     web_gateway_url: str | None,
     web_gateway_token_env: str,
     web_gateway_token_file: Path | None,
-    web_allow_domain: tuple[str, ...],
-    web_block_domain: tuple[str, ...],
-    web_max_searches: int | None,
-    web_max_fetches: int | None,
-    enable_web_context: bool,
-    web_max_contexts: int | None,
-    web_max_results: int | None,
-    web_context_max_tokens: int | None,
-    web_context_max_urls: int | None,
-    web_context_max_snippets: int | None,
-    web_max_response_bytes: int | None,
-    web_timeout_s: int | None,
-    web_policy_file: Path | None,
     event_sink_module: tuple[str, ...],
     stream_json: bool,
     no_status_file: bool,
 ) -> None:
     """Run an agent against a local workspace."""
+    del ctx
+    runtime_config = _load_agent_runtime_config(runtime_config_file, agent_definition_file)
     if spec_file is not None:
         if workspace is not None:
             raise click.ClickException("--spec cannot be combined with --workspace; the spec file is authoritative")
-        if profile is not None:
-            raise click.ClickException(
-                '--profile cannot be combined with --spec; put "profile" inside the spec file'
-            )
         try:
             spec = AgentRunSpec.from_json(json.loads(spec_file.read_text(encoding="utf-8")))
         except Exception as exc:
             raise click.ClickException(f"failed to load --spec: {exc}") from exc
         if run_id is not None:
             spec = replace(spec, run_id=run_id)
-        if tool_surface_policy_file is not None:
-            try:
-                spec = replace(spec, tool_surface_policy=_load_tool_surface_policy(tool_surface_policy_file))
-            except Exception as exc:
-                raise click.ClickException(f"failed to load --tool-surface-policy-file: {exc}") from exc
     else:
         if workspace is None:
             raise click.ClickException("--workspace (or --spec) is required")
@@ -305,69 +202,18 @@ def run(
         if not instruction.strip():
             raise click.ClickException("--instruction or --instruction-file is required")
 
-        # A profile supplies base values for mode/limits/shell/web; any flag the
-        # user passes on the command line overrides it. With no profile the bases
-        # equal the option defaults, so behavior is identical to before.
-        agent_profile = resolve_profile(profile) if profile else None
-
-        def _explicit(name: str) -> bool:
-            return ctx.get_parameter_source(name) == ParameterSource.COMMANDLINE
-
-        base_mode = agent_profile.mode if agent_profile else "propose"
-        base_limits = agent_profile.limits if agent_profile else RunLimits()
-        base_shell = agent_profile.shell_policy if agent_profile else ShellPolicy()
-        base_web = agent_profile.web_policy if agent_profile else WebPolicy()
-        base_persona = agent_profile.persona_segments if agent_profile else ()
-        resolved_persona = tuple(persona) if _explicit("persona") else base_persona
-        resolved_system_prompt_base = (
-            system_prompt_file.read_text(encoding="utf-8") if system_prompt_file else None
-        )
-
-        resolved_mode = mode if _explicit("mode") else base_mode
         resolved_limits = RunLimits(
-            max_steps=max_steps if _explicit("max_steps") else base_limits.max_steps,
-            max_tool_calls=max_tool_calls if _explicit("max_tool_calls") else base_limits.max_tool_calls,
-            max_bytes_read=max_bytes_read if _explicit("max_bytes_read") else base_limits.max_bytes_read,
-            max_duration_s=max_duration_s if _explicit("max_duration_s") else base_limits.max_duration_s,
+            max_steps=max_steps,
+            max_tool_calls=max_tool_calls,
+            max_bytes_read=max_bytes_read,
+            max_duration_s=max_duration_s,
         )
 
         try:
-            tool_policy = _load_tool_policy(
-                tool_policy_file,
-                allow_tool=allow_tool,
-                deny_tool=deny_tool,
-                ask_tool=ask_tool,
-            )
-            tool_surface_policy = _load_tool_surface_policy(tool_surface_policy_file)
             permission_policy = _load_permission_policy(
                 permission_policy_file,
                 deny_path=deny_path,
                 redact_path=redact_path,
-            )
-            shell_policy = base_shell.merged(
-                enabled=enable_shell or base_shell.enabled,
-                approval_mode=shell_approval_mode,
-                timeout_s=shell_timeout_s,
-                max_output_bytes=shell_max_output_bytes,
-                execution_workspace=shell_execution_workspace,
-                env_allowlist=shell_env,
-            )
-            web_policy = _load_web_policy(
-                web_policy_file,
-                base=base_web,
-                enabled=enable_web or enable_web_context,
-                context_enabled=True if enable_web_context else None,
-                allow_domains=web_allow_domain,
-                block_domains=web_block_domain,
-                max_searches=web_max_searches,
-                max_fetches=web_max_fetches,
-                max_contexts=web_max_contexts,
-                max_results=web_max_results,
-                max_context_tokens=web_context_max_tokens,
-                max_context_urls=web_context_max_urls,
-                max_context_snippets=web_context_max_snippets,
-                max_response_bytes=web_max_response_bytes,
-                timeout_s=web_timeout_s,
             )
         except Exception as exc:
             raise click.ClickException(str(exc)) from exc
@@ -375,38 +221,20 @@ def run(
         spec_kwargs: dict[str, Any] = {}
         if run_id is not None:
             spec_kwargs["run_id"] = run_id
-        if agent_profile is not None:
-            spec_kwargs["metadata"] = {"profile": agent_profile.name}
         spec = AgentRunSpec(
             instruction=instruction,
             workspace_root=workspace,
             run_root=run_root,
-            mode=resolved_mode,  # type: ignore[arg-type]
+            mode=mode,  # type: ignore[arg-type]
             workspace_backend=workspace_backend,  # type: ignore[arg-type]
-            model=ModelConfig(
-                provider=model_provider,  # type: ignore[arg-type]
-                model=model,
-                reasoning=ReasoningConfig(
-                    effort=reasoning_effort,  # type: ignore[arg-type]
-                    summary=reasoning_summary,  # type: ignore[arg-type]
-                ),
-                gateway_url=llm_gateway_url,
-            ),
             limits=resolved_limits,
             permission_policy=permission_policy,
-            tool_policy=tool_policy,
-            tool_surface_policy=tool_surface_policy,
-            shell_policy=shell_policy,
-            web_policy=web_policy,
-            system_prompt_base=resolved_system_prompt_base,
-            persona_segments=resolved_persona,
             **spec_kwargs,
         )
 
-    if spec.web_policy.enabled and not web_gateway_url:
+    if _runtime_config_uses_web(runtime_config) and not web_gateway_url:
         raise click.ClickException(
-            "web is enabled (via --enable-web/--enable-web-context or a profile); "
-            "--web-gateway-url is required"
+            "runtime config binds web tools; --web-gateway-url is required"
         )
     _human_echo(f"run_id: {spec.run_id}", stream_json=stream_json)
     _human_echo(f"run_dir: {spec.run_root / spec.run_id}", stream_json=stream_json)
@@ -424,8 +252,8 @@ def run(
     result = AgentLoop(
         spec=spec,
         model_adapter=_model_adapter(
-            spec.model,
-            llm_gateway_url=llm_gateway_url or spec.model.gateway_url,
+            runtime_config.model or ModelConfig(),
+            llm_gateway_url=llm_gateway_url or (runtime_config.model.gateway_url if runtime_config.model else None),
             llm_gateway_token_env=llm_gateway_token_env,
             llm_gateway_token_file=llm_gateway_token_file,
             allow_direct_provider_api=allow_direct_provider_api,
@@ -434,13 +262,14 @@ def run(
         event_sinks=tuple(extra_sinks),
         status_file=not no_status_file,
         permission_policy=spec.permission_policy,
+        runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),
         web_gateway_client=(
             WebGatewayClient(
                 web_gateway_url,
                 token_env=web_gateway_token_env,
                 token_file=web_gateway_token_file,
             )
-            if spec.web_policy.enabled and web_gateway_url
+            if _runtime_config_uses_web(runtime_config) and web_gateway_url
             else None
         ),
     ).run()
@@ -1224,38 +1053,37 @@ def _model_adapter(
     if config.provider == "openai":
         if not allow_direct_provider_api:
             raise click.ClickException(
-                "--model-provider openai requires --allow-direct-provider-api; "
-                "container runs must use --model-provider gateway"
+                "OpenAI runtime configs require --allow-direct-provider-api; "
+                "container runs should use a gateway runtime config"
             )
         return OpenAIModelAdapter(config, allow_direct_provider_api=True)
     raise click.ClickException(f"unsupported model provider: {config.provider}")
 
 
-def _load_tool_policy(
-    policy_file: Path | None,
-    *,
-    allow_tool: tuple[str, ...],
-    deny_tool: tuple[str, ...],
-    ask_tool: tuple[str, ...],
-) -> ToolPolicy:
-    policy = ToolPolicy()
-    if policy_file is not None:
-        try:
-            payload = json.loads(policy_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid tool policy JSON: {exc.msg}") from exc
-        policy = ToolPolicy.from_json(payload)
-    return policy.merged(allow=allow_tool, deny=deny_tool, ask=ask_tool)
-
-
-def _load_tool_surface_policy(policy_file: Path | None) -> ToolSurfacePolicy:
-    if policy_file is None:
-        return ToolSurfacePolicy()
+def _load_agent_runtime_config(
+    runtime_config_file: Path | None,
+    agent_definition_file: Path | None,
+) -> AgentRuntimeConfig:
+    if runtime_config_file is not None and agent_definition_file is not None:
+        raise click.ClickException("--runtime-config-file and --agent-definition-file are mutually exclusive")
+    if runtime_config_file is None and agent_definition_file is None:
+        raise click.ClickException("--runtime-config-file or --agent-definition-file is required")
+    config_file = runtime_config_file or agent_definition_file
+    assert config_file is not None
     try:
-        payload = json.loads(policy_file.read_text(encoding="utf-8"))
+        payload = json.loads(config_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid tool surface policy JSON: {exc.msg}") from exc
-    return ToolSurfacePolicy.from_json(payload)
+        raise click.ClickException(f"invalid agent config JSON: {exc.msg}") from exc
+    try:
+        if runtime_config_file is not None:
+            return AgentRuntimeConfig.from_json(payload)
+        return AgentRuntimeConfig.from_definition(AgentDefinition.from_json(payload))
+    except Exception as exc:
+        raise click.ClickException(f"failed to load agent runtime config: {exc}") from exc
+
+
+def _runtime_config_uses_web(config: AgentRuntimeConfig) -> bool:
+    return any(binding.ref.tool_id.startswith("web.") for binding in config.tools)
 
 
 def _load_permission_policy(
@@ -1272,48 +1100,6 @@ def _load_permission_policy(
             raise ValueError(f"invalid permission policy JSON: {exc.msg}") from exc
         policy = PermissionPolicy.from_json(payload)
     return policy.merged(deny_patterns=deny_path, redact_patterns=redact_path)
-
-
-def _load_web_policy(
-    policy_file: Path | None,
-    *,
-    base: WebPolicy | None = None,
-    enabled: bool,
-    context_enabled: bool | None = None,
-    allow_domains: tuple[str, ...],
-    block_domains: tuple[str, ...],
-    max_searches: int | None,
-    max_fetches: int | None,
-    max_contexts: int | None,
-    max_results: int | None,
-    max_context_tokens: int | None,
-    max_context_urls: int | None,
-    max_context_snippets: int | None,
-    max_response_bytes: int | None,
-    timeout_s: int | None,
-) -> WebPolicy:
-    policy = base if base is not None else WebPolicy()
-    if policy_file is not None:
-        try:
-            payload = json.loads(policy_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid web policy JSON: {exc.msg}") from exc
-        policy = WebPolicy.from_json(payload)
-    return policy.merged(
-        enabled=enabled or policy.enabled,
-        context_enabled=context_enabled,
-        allowed_domains=allow_domains,
-        blocked_domains=block_domains,
-        max_search_calls=max_searches,
-        max_fetch_calls=max_fetches,
-        max_context_calls=max_contexts,
-        max_results=max_results,
-        max_context_tokens=max_context_tokens,
-        max_context_urls=max_context_urls,
-        max_context_snippets=max_context_snippets,
-        max_response_bytes=max_response_bytes,
-        timeout_s=timeout_s,
-    )
 
 
 def _resolve_events_path(run_dir_or_id: str, run_root: Path) -> Path:

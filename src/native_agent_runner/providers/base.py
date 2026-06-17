@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.tools.base import ToolSpec
 
 
@@ -35,8 +36,9 @@ class ModelRequest:
     instruction: str
     system_prompt: str
     tools: tuple[ToolSpec, ...]
-    previous_turn_handle: str | None
+    previous_turn_handle: str | None = None
     observations: tuple[ToolObservation, ...] = ()
+    model: ModelConfig | None = None
 
 
 class ModelAdapter(Protocol):

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 from urllib.error import HTTPError
 
 from click.testing import CliRunner
+
+from conftest import runtime_config
 
 from native_agent_runner.cli import main
 from native_agent_runner.core.spec import ModelConfig, ModelRetryConfig, ReasoningConfig
@@ -185,6 +188,11 @@ def test_openai_adapter_requires_explicit_direct_provider_allow(monkeypatch) -> 
 def test_cli_openai_provider_requires_explicit_direct_allow(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    config_file = tmp_path / "runtime.json"
+    config_file.write_text(
+        json.dumps(runtime_config("run.finish", model=ModelConfig(provider="openai")).to_json()),
+        encoding="utf-8",
+    )
     runner = CliRunner()
 
     result = runner.invoke(
@@ -195,10 +203,10 @@ def test_cli_openai_provider_requires_explicit_direct_allow(tmp_path: Path) -> N
             str(workspace),
             "--instruction",
             "Finish.",
-            "--model-provider",
-            "openai",
+            "--runtime-config-file",
+            str(config_file),
         ],
     )
 
     assert result.exit_code != 0
-    assert "--model-provider openai requires --allow-direct-provider-api" in result.output
+    assert "OpenAI runtime configs require --allow-direct-provider-api" in result.output

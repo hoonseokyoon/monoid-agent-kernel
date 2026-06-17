@@ -13,8 +13,14 @@ The supported integration surface is the **core runner plus its contracts**, exp
 build their own services against the contracts. See [docs/CONTRACTS.md](docs/CONTRACTS.md) for the
 Python and HTTP wire contracts.
 
-For the planned dynamic tool availability, search, policy, and guidance surface, see
+For the dynamic binding-based tool surface, see
 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md).
+
+Agent configuration is centered on `AgentDefinition` and mutable
+`AgentRuntimeConfig`. A definition describes the reusable agent blueprint, while
+runtime config carries the current prompt and `ToolBinding` set for a run.
+Backends can replace runtime config during a run; the runner applies the new
+config at the next turn and records config snapshots for audit.
 
 ## Run
 
@@ -22,17 +28,20 @@ For the planned dynamic tool availability, search, policy, and guidance surface,
 native-agent run \
   --workspace examples/workspaces/edit_markdown_notes \
   --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
-  --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
-  --reasoning-effort low
+  --runtime-config-file examples/runtime-config.json \
+  --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns
 ```
 
-Instead of the individual spec flags, you can pass the whole run spec as a JSON
-file (the `AgentRunSpec.to_json` shape — see [docs/CONTRACTS.md](docs/CONTRACTS.md)
-and `examples/run-spec.json`). Transport flags such as gateway URLs and tokens
-still apply:
+Run spec and runtime config are separate. `AgentRunSpec` carries workspace,
+instruction, limits, and permission boundary values. `AgentRuntimeConfig`
+carries model, prompt, tool bindings, guidance, scope, quota, shell runtime, and
+web runtime values. You can pass a run spec JSON file with a runtime config
+file:
 
 ```bash
-native-agent run --spec examples/run-spec.json
+native-agent run \
+  --spec examples/run-spec.json \
+  --runtime-config-file examples/runtime-config.json
 ```
 
 The default mode is `propose`, which means the runner creates a proposal package
@@ -49,14 +58,15 @@ CSP LLM gateway with a short-lived run token. The runner should not receive
 OpenAI, Anthropic, or other provider API keys.
 
 Web tools are also gateway-backed. `web.search`, `web.fetch`, and `web.context`
-are disabled by default; when enabled, the runner calls a CSP WebGateway with a
-short-lived `web_gateway` token. The runner does not perform direct web egress
-and does not receive search-provider credentials. `web.context` returns
+are available when runtime config binds those registry tools. The runner calls a
+CSP WebGateway with a short-lived `web_gateway` token. The runner does not
+perform direct web egress and does not receive search-provider credentials.
+`web.context` returns
 LLM-ready grounding context through a provider-neutral ContextProvider contract.
 
-Shell is disabled by default and is enabled per run. `shell.exec` supports
-foreground commands and background jobs. A background call returns a `job_id`
-immediately; if `resume_on_exit=true`, the runner waits when the model has no
+Shell is available when runtime config binds `shell.exec`. `shell.exec`
+supports foreground commands and background jobs. A background call returns a
+`job_id` immediately; if `resume_on_exit=true`, the runner waits when the model has no
 immediate tool work and re-enters the model with a `background_job_result`
 observation when the job exits, times out, is cancelled, or hits the output
 limit. Background jobs are run-scoped and are cleaned up when the run finishes.
@@ -207,7 +217,18 @@ curl -sS -X POST http://127.0.0.1:8765/v1/runs \
     "user_id": "user_a",
     "workspace_root": "/workspaces/demo",
     "instruction": "Read notes.md and create SUMMARY.md.",
-    "mode": "propose"
+    "mode": "propose",
+    "runtime_config": {
+      "definition_id": "markdown-editor",
+      "config_version": 1,
+      "model": {"provider": "gateway", "model": "gpt-5.5"},
+      "tools": [
+        {"binding_id": "read_file", "ref": {"kind": "registry", "tool_id": "fs.read"}},
+        {"binding_id": "write_file", "ref": {"kind": "registry", "tool_id": "fs.write"}},
+        {"binding_id": "finish", "ref": {"kind": "registry", "tool_id": "run.finish"}}
+      ],
+      "tool_search": {"enabled": true, "top_k": 5}
+    }
   }'
 ```
 
@@ -230,6 +251,29 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/proposal/files/SUMMARY.md
 
 curl -H "Authorization: Bearer $RUN_TOKEN" \
+  http://127.0.0.1:8765/v1/runs/$RUN_ID/runtime-config
+
+curl -sS -X POST http://127.0.0.1:8765/v1/runs/$RUN_ID/runtime-config \
+  -H "Authorization: Bearer $RUN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_version": 1,
+    "issuer": "backend",
+    "reason": "update read guidance",
+    "config": {
+      "definition_id": "coding-agent",
+      "config_version": 2,
+      "tools": [
+        {"binding_id": "read_file",
+         "ref": {"kind": "registry", "tool_id": "fs.read"},
+         "exposure": "immediate",
+         "authorization": "allow",
+         "guidance": {"summary": "Read source files before editing."}}
+      ]
+    }
+  }'
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/jobs
 
 curl -H "Authorization: Bearer $RUN_TOKEN" \
@@ -248,9 +292,10 @@ call. That token is passed only to `GatewayModelAdapter` and is not returned fro
 the run APIs. For web-enabled runs, it also generates a separate `web_gateway`
 token for `WebGatewayClient`.
 
-The LLM gateway validates `llm_gateway` tokens, enforces model/reasoning claims,
-calls the provider adapter, stores provider continuation ids server-side, and
-returns only opaque `turn_handle` values to the runner. Its usage endpoint is
+The LLM gateway validates `llm_gateway` tokens, calls the provider adapter,
+stores provider continuation ids server-side, and returns only opaque
+`turn_handle` values to the runner. The turn request carries the effective
+model from runtime config. Its usage endpoint is
 admin-scoped:
 
 ```bash
@@ -258,8 +303,8 @@ curl -H "Authorization: Bearer $NAR_LLM_GATEWAY_ADMIN_TOKEN" \
   http://127.0.0.1:8080/internal/llm/tenants/tenant_a/usage
 ```
 
-The WebGateway validates `web_gateway` tokens, enforces `WebPolicy`, calls a web
-provider adapter, and reports tenant usage. v0.11 includes the deterministic
+The WebGateway validates `web_gateway` tokens, enforces per-request binding
+constraints, calls a web provider adapter, and reports tenant usage. v0.11 includes the deterministic
 fake provider plus real search/fetch/context provider composition:
 
 - `BraveSearchProvider`: Brave Search API for result discovery
@@ -284,7 +329,7 @@ Each run writes:
 - `transcript.jsonl`: private debug/replay transcript with full tool payloads
 - `status.json`: latest run status for polling
 - `metrics.json`: final counters and timing
-- `manifest.json`: run contract, visible tools, policies, workspace backend
+- `manifest.json`: run contract, agent config metadata, binding-aware tool surface, workspace backend
 - `workspace.base.json`: base snapshot used for proposal comparison
 - `workspace.index.json`: context/index artifact
 - `diff.patch`: proposed or applied workspace diff
@@ -333,8 +378,8 @@ requests to a CSP-owned LLM gateway and can authenticate with
 inside CSP backend infrastructure, where tenant usage, budgets, and rate limits
 can be enforced.
 
-`OpenAIModelAdapter` is retained for local smoke tests. CLI use requires both
-`--model-provider openai` and `--allow-direct-provider-api`.
+`OpenAIModelAdapter` is retained for local smoke tests. CLI use requires
+`runtime_config.model.provider="openai"` and `--allow-direct-provider-api`.
 
 To target your own LLM gateway, implement the `ModelAdapter` protocol or the
 `native-agent-runner.llm-turn.v1` HTTP contract documented in
@@ -342,12 +387,13 @@ To target your own LLM gateway, implement the `ModelAdapter` protocol or the
 
 ## Defaults
 
-- model provider: `gateway`
-- model: `gpt-5.5`
-- reasoning effort: `medium`
+- runtime config is required for CLI and backend runs
+- default model provider inside `ModelConfig`: `gateway`
+- default model inside `ModelConfig`: `gpt-5.5`
+- default reasoning effort inside `ModelConfig`: `medium`
 - mode: `propose`
-- shell disabled by default
-- web.search/web.fetch/web.context disabled by default and available only through WebGateway
+- shell is available only through an exposed `shell.exec` binding
+- web.search/web.fetch/web.context are available only through exposed web bindings and WebGateway
 - file mutation tools include write, patch, mkdir, copy, move, and delete in
-  `propose` and `apply` modes
+  `propose` and `apply` modes when bound in runtime config
 - no path deny/redact policy unless explicitly provided

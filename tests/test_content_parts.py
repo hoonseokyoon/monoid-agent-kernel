@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import runtime_config, runtime_provider
+
 from native_agent_runner.core.content import (
     DocumentPart,
     ImagePart,
@@ -17,6 +19,10 @@ from native_agent_runner.core.spec import AgentRunSpec
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+
+
+def _provider():
+    return runtime_provider(runtime_config("run.finish"))
 
 
 @pytest.mark.parametrize(
@@ -119,7 +125,7 @@ def test_non_text_input_emits_degraded_warning(tmp_path: Path) -> None:
         input=(TextPart("describe the image"), ImagePart(source_ref="i.png", mime_type="image/png")),
     )
 
-    result = AgentLoop(spec=spec, model_adapter=adapter).run()
+    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run()
 
     events = [
         json.loads(line)
@@ -151,7 +157,7 @@ def test_explicit_text_input_is_sent_to_model(tmp_path: Path) -> None:
         input=(TextPart("explicit text"),),
     )
 
-    AgentLoop(spec=spec, model_adapter=adapter).run()
+    AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run()
 
     assert adapter.requests[0].instruction == "explicit text"
 
@@ -169,7 +175,7 @@ def test_text_only_input_emits_no_degraded_warning(tmp_path: Path) -> None:
     )
     spec = AgentRunSpec(instruction="plain text", workspace_root=workspace, run_root=tmp_path / "runs")
 
-    result = AgentLoop(spec=spec, model_adapter=adapter).run()
+    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run()
 
     events = [
         json.loads(line)

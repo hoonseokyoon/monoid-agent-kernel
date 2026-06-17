@@ -43,6 +43,7 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         "completed_jobs": [job for job in jobs if job.get("status") != "running"],
         "current_step": status_payload.get("current_step"),
         "current_tool": status_payload.get("current_tool"),
+        "agent_config": status_payload.get("agent_config") or manifest.get("agent_config") or {},
         "changed_paths": _public_paths(proposal.get("changed_paths") or [], permission_policy),
         "proposal_hash": proposal.get("proposal_hash"),
         "diff_sha256": proposal.get("diff_sha256"),
@@ -87,6 +88,12 @@ def _apply_event_projection(
         elif event_type == "run.resumed":
             projection["status"] = "running"
             projection["waiting_for_background_jobs"] = False
+        elif event_type == "agent.config.updated":
+            projection["agent_config"] = {
+                "definition_id": data.get("definition_id"),
+                "config_version": data.get("config_version"),
+                "config_hash": data.get("config_hash"),
+            }
         elif event_type == "model.turn.started":
             projection["current_step"] = data.get("step")
         elif event_type == "tool.call.started":

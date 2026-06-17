@@ -92,6 +92,12 @@ class StatusJsonSink:
             self.state["status"] = "running"
             self.state["waiting_for_background_jobs"] = False
             self.state["resumed_jobs"] = data.get("job_ids", [])
+        elif event.type == "agent.config.updated":
+            self.state["agent_config"] = {
+                "definition_id": data.get("definition_id"),
+                "config_version": data.get("config_version"),
+                "config_hash": data.get("config_hash"),
+            }
         elif event.type == "model.turn.started":
             self.state["current_turn_id"] = event.turn_id
             self.state["current_step"] = data.get("step")

@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from native_agent_runner.core._util import utc_timestamp
-from native_agent_runner.core.spec import AgentRunSpec
+from native_agent_runner.core.spec import AgentRunSpec, ModelConfig
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.tools.base import ToolSpec
 
@@ -24,12 +24,9 @@ class RunManifest:
     model: str
     reasoning_effort: str
     limits: dict[str, Any]
-    capabilities: list[str]
     permission_policy: dict[str, Any]
-    tool_policy: dict[str, Any]
     tool_surface: dict[str, Any]
-    shell_policy: dict[str, Any]
-    web_policy: dict[str, Any]
+    agent_config: dict[str, Any]
     tool_specs: list[dict[str, Any]]
     metadata: dict[str, Any] = field(default_factory=dict)
     workspace_index_path: str = "workspace.index.json"
@@ -41,10 +38,11 @@ class RunManifest:
 def build_run_manifest(
     spec: AgentRunSpec,
     *,
+    model_config: ModelConfig,
     tool_specs: list[ToolSpec],
     permission_policy: PermissionPolicy,
-    tool_policy: dict[str, Any],
     tool_surface: dict[str, Any] | None = None,
+    agent_config: dict[str, Any] | None = None,
     workspace_index_path: str = "workspace.index.json",
     workspace_base_path: str = "workspace.base.json",
 ) -> RunManifest:
@@ -56,21 +54,18 @@ def build_run_manifest(
         workspace_backend=spec.workspace_backend,
         workspace_root=str(spec.workspace_root),
         workspace_base_path=workspace_base_path,
-        model_provider=spec.model.provider,
-        model=spec.model.model,
-        reasoning_effort=spec.model.reasoning.effort,
+        model_provider=model_config.provider,
+        model=model_config.model,
+        reasoning_effort=model_config.reasoning.effort,
         limits={
             "max_steps": spec.limits.max_steps,
             "max_tool_calls": spec.limits.max_tool_calls,
             "max_bytes_read": spec.limits.max_bytes_read,
             "max_duration_s": spec.limits.max_duration_s,
         },
-        capabilities=sorted(spec.effective_capabilities()),
         permission_policy=permission_policy.to_json(),
-        tool_policy=tool_policy,
         tool_surface=dict(tool_surface or {}),
-        shell_policy=spec.shell_policy.to_manifest(),
-        web_policy=spec.web_policy.to_manifest(),
+        agent_config=dict(agent_config or {}),
         tool_specs=[_tool_spec_payload(tool) for tool in tool_specs],
         metadata=dict(spec.metadata),
         workspace_index_path=workspace_index_path,

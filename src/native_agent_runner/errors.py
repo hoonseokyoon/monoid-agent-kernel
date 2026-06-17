@@ -40,16 +40,16 @@ class ModelAdapterError(NativeAgentError):
 
 
 class PermissionDenied(NativeAgentError):
-    """Raised when a tool call violates capabilities or path policy."""
+    """Raised when a tool call violates a configured boundary."""
 
     error_code = "permission_denied"
     category = "policy"
 
 
-class ToolPolicyError(NativeAgentError):
-    """Raised when a run's tool policy is invalid."""
+class AgentConfigError(NativeAgentError):
+    """Raised when an agent runtime config is invalid for the current run."""
 
-    error_code = "tool_policy_invalid"
+    error_code = "agent_config_invalid"
     category = "policy"
 
 

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from native_agent_runner.tool_services import CallContext, JobsService, ShellService, WebService
-from native_agent_runner.web import WebPolicy
 
 
 def test_call_context_holds_in_flight_ids() -> None:
@@ -18,7 +17,6 @@ def test_shell_service_metrics_start_at_zero() -> None:
         workspace=None,  # type: ignore[arg-type]
         recorder=None,  # type: ignore[arg-type]
         job_manager=None,  # type: ignore[arg-type]
-        shell_policy=None,  # type: ignore[arg-type]
         permission_policy=None,  # type: ignore[arg-type]
     )
     assert service.metrics() == {
@@ -29,7 +27,7 @@ def test_shell_service_metrics_start_at_zero() -> None:
 
 
 def test_web_service_metrics_keys() -> None:
-    service = WebService(web_policy=WebPolicy(), recorder=None)  # type: ignore[arg-type]
+    service = WebService(recorder=None)  # type: ignore[arg-type]
     assert set(service.metrics()) == {
         "web_search_calls",
         "web_fetch_calls",
