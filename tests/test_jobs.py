@@ -139,8 +139,11 @@ def test_reentry_is_idempotent_and_clears_has_resume(tmp_path: Path) -> None:
 
     assert manager.has_resume_jobs() is True
     first = manager.pop_reentry_observations()
-    assert [obs["job_id"] for obs in first] == [job.job_id]
-    assert first[0]["type"] == "background_job_result"
+    # Reentry renders through the ShellResultInjector: a background ToolObservation.
+    assert [obs.output["job_id"] for obs in first] == [job.job_id]
+    assert first[0].output["type"] == "background_job_result"
+    assert first[0].tool_name == "background_job"
+    assert first[0].is_background is True
 
     # Draining is idempotent: a second pop yields nothing and clears the flag.
     assert manager.pop_reentry_observations() == []

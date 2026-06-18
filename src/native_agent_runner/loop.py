@@ -997,26 +997,18 @@ class AgentLoop:
         recorder: AgentRecorder,
         step: int,
     ) -> tuple[ToolObservation, ...]:
-        payloads = context.job_manager.pop_reentry_observations()
-        if not payloads:
+        observations = context.job_manager.pop_reentry_observations()
+        if not observations:
             return ()
         recorder.emit(
             "run.resumed",
             data={
                 "reason": "background_job_result",
-                "job_ids": [str(payload.get("job_id") or "") for payload in payloads],
-                "count": len(payloads),
+                "job_ids": [str(obs.output.get("job_id") or "") for obs in observations],
+                "count": len(observations),
             },
         )
-        observations: list[ToolObservation] = []
-        for payload in payloads:
-            job_id = str(payload.get("job_id") or "")
-            observation = ToolObservation(
-                call_id=f"background:{job_id}",
-                tool_name="background_job",
-                output=payload,
-                is_background=True,
-            )
+        for observation in observations:
             recorder.transcript(
                 {
                     "kind": "tool_observation",
@@ -1026,8 +1018,10 @@ class AgentLoop:
                     "output": observation.output,
                 }
             )
-            self._emit_background_workspace_events(payload, context, recorder)
-            observations.append(observation)
+            # Workspace diffs are shell-specific; gate on the shell result payload
+            # so hitl/automation results don't emit phantom workspace events.
+            if observation.output.get("type") == "background_job_result":
+                self._emit_background_workspace_events(observation.output, context, recorder)
         return tuple(observations)
 
     def _wait_for_background_jobs(

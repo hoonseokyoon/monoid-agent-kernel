@@ -15,6 +15,7 @@ from native_agent_runner._proc import file_size, spawn_process, terminate_proces
 from native_agent_runner.core._util import write_json_atomic
 from native_agent_runner.errors import ToolExecutionError, WorkspaceError
 from native_agent_runner.permissions import PermissionPolicy
+from native_agent_runner.providers.base import ToolObservation
 from native_agent_runner.public_view import public_path
 from native_agent_runner.recorder import AgentRecorder
 from native_agent_runner.shell import (
@@ -48,6 +49,18 @@ class TaskExecutor(Protocol):
     kind: str
 
     def cancel(self, manager: BackgroundJobManager, job: BackgroundJob) -> None:
+        ...
+
+
+class ResultInjector(Protocol):
+    """Pluggable per-kind seam deciding HOW a finished task is injected into the
+    model: as a tool observation (``is_background=False``, keyed to a tool call)
+    or as a new user message (``is_background=True``). This is the "appropriate
+    way, defined by the backend developer"."""
+
+    kind: str
+
+    def observations(self, job: BackgroundJob, run_dir: Path) -> list[ToolObservation]:
         ...
 
 
@@ -363,6 +376,25 @@ class ShellTaskExecutor:
 
 
 @dataclass
+class ShellResultInjector:
+    """Inject a finished shell job as a background observation (user-message
+    shape: ``is_background=True``), preserving the legacy ``background_job``
+    observation contract."""
+
+    kind: str = "shell"
+
+    def observations(self, job: BackgroundJob, run_dir: Path) -> list[ToolObservation]:
+        return [
+            ToolObservation(
+                call_id=f"background:{job.job_id}",
+                tool_name="background_job",
+                output=job.result_observation(run_dir),
+                is_background=True,
+            )
+        ]
+
+
+@dataclass
 class BackgroundJobManager:
     run_id: str
     workspace: Workspace
@@ -370,6 +402,7 @@ class BackgroundJobManager:
     permission_policy: PermissionPolicy
     jobs: dict[str, BackgroundJob] = field(default_factory=dict)
     executors: dict[str, TaskExecutor] = field(default_factory=dict, init=False, repr=False)
+    injectors: dict[str, ResultInjector] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _condition: threading.Condition = field(init=False, repr=False)
     _reentry_queue: list[str] = field(default_factory=list, init=False, repr=False)
@@ -378,6 +411,7 @@ class BackgroundJobManager:
     def __post_init__(self) -> None:
         self._condition = threading.Condition(self._lock)
         self.executors = {"shell": ShellTaskExecutor()}
+        self.injectors = {"shell": ShellResultInjector()}
 
     def _register(self, job: BackgroundJob) -> None:
         with self._condition:
@@ -492,7 +526,10 @@ class BackgroundJobManager:
                 for job in self.jobs.values()
             )
 
-    def pop_reentry_observations(self) -> list[dict[str, Any]]:
+    def pop_reentry_observations(self) -> list[ToolObservation]:
+        """Drain finished resume-tasks and render them through their per-kind
+        ResultInjector. The injector decides the injection shape (tool observation
+        vs user message via ``is_background``)."""
         with self._condition:
             for job in self.jobs.values():
                 if (
@@ -504,11 +541,15 @@ class BackgroundJobManager:
                     self._reentry_queue.append(job.job_id)
             job_ids = list(dict.fromkeys(self._reentry_queue))
             self._reentry_queue.clear()
-            observations = [
-                self.jobs[job_id].result_observation(self.recorder.run_dir)
-                for job_id in job_ids
-                if job_id in self.jobs
-            ]
+            observations: list[ToolObservation] = []
+            for job_id in job_ids:
+                job = self.jobs.get(job_id)
+                if job is None:
+                    continue
+                injector = self.injectors.get(job.kind)
+                if injector is None:
+                    continue
+                observations.extend(injector.observations(job, self.recorder.run_dir))
             self._delivered_reentry_jobs.update(job_id for job_id in job_ids if job_id in self.jobs)
             return observations
 
