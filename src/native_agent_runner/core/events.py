@@ -15,6 +15,7 @@ AgentEventType = Literal[
     "run.failed",
     "run.waiting",
     "run.resumed",
+    "run.awaiting_input",
     "turn.settled",
     "checkpoint.committed",
     "agent.config.updated",

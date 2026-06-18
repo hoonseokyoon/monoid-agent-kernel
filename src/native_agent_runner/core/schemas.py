@@ -105,6 +105,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     "run.resumed": _data_schema(
         {"reason": _STR, "job_ids": _STR_ARRAY, "count": _INT},
     ),
+    "run.awaiting_input": _data_schema(
+        {"reason": _STR, "task_ids": _STR_ARRAY, "prompt": _STR_NULL},
+        required=("reason",),
+    ),
     "turn.settled": _data_schema(
         {"status": _STR, "final_text": _STR, "error_code": _STR, "changed_paths": _STR_ARRAY},
         required=("status",),

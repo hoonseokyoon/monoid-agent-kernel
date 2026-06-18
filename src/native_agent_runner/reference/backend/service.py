@@ -51,7 +51,7 @@ from native_agent_runner.tools.builtin import builtin_tools
 from native_agent_runner.web import WebGatewayClient
 from native_agent_runner.workspace.paths import is_within
 
-BackendRunState = Literal["queued", "running", "completed", "failed", "limited"]
+BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "failed", "limited"]
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
 
 
@@ -734,6 +734,13 @@ class RunnerBackend:
             if event.type == "run.started":
                 record.status = "running"
                 record.started_at = time.time()
+            elif event.type == "run.awaiting_input":
+                # Parked waiting for the next user message or a hosted-task result.
+                if record.status not in {"completed", "failed", "limited"}:
+                    record.status = "awaiting_input"
+            elif event.type in {"run.resumed", "model.turn.started"}:
+                if record.status == "awaiting_input":
+                    record.status = "running"
             elif event.type == "run.finished":
                 status = str(event.data.get("status") or "completed")
                 if status in {"completed", "failed", "limited"}:
