@@ -402,6 +402,11 @@ class AgentLoop:
         session = self._require_open()
         session.res.recorder.emit("run.awaiting_input", data={"reason": "user"})
 
+    def has_pending_tasks(self) -> bool:
+        """Whether the run has resume-tasks still outstanding (not yet drained)."""
+        session = self._require_open()
+        return session.res.context.job_manager.has_resume_jobs()
+
     def wait_for_pending_tasks(self, timeout_s: float) -> bool:
         """Block up to ``timeout_s`` for a pending task to become ready (in-process
         completion or external report). Returns True if one is ready to drain, so

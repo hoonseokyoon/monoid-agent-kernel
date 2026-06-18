@@ -572,6 +572,92 @@ def test_backend_http_cancel_marks_run_limited_with_code(tmp_path: Path) -> None
         thread.join(timeout=5)
 
 
+def _start_server(backend: RunnerBackend):
+    server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    _wait_http_ready(base_url)
+    return server, thread, base_url
+
+
+def _poll(predicate, *, tries: int = 400) -> bool:
+    for _ in range(tries):
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_backend_http_multi_turn_messages_and_task_endpoints(tmp_path: Path) -> None:
+    # One server/worker exercising the full multi-turn HTTP surface: follow-up
+    # messages, task creation with a scoped callback token, and result delivery.
+    # (Detailed worker/injection behavior is covered by the in-process tests above.)
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")])
+    backend.idle_timeout_s = 15.0
+    server, thread, base_url = _start_server(backend)
+    try:
+        created = _json_request(
+            f"{base_url}/v1/runs",
+            {
+                "tenant_id": "tenant_a",
+                "user_id": "user_a",
+                "workspace_root": str(workspace),
+                "instruction": "hello",
+                "runtime_config": _default_config().to_json(),
+                "multi_turn": True,
+            },
+            token="admin",
+        )
+        run_id, run_token = created["run_id"], created["run_token"]
+
+        # First turn settles -> the session parks awaiting the next user message.
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+
+        # A follow-up message is threaded as a second user turn.
+        queued = _json_request(f"{base_url}/v1/runs/{run_id}/messages", {"content": "again"}, token=run_token)
+        assert queued["status"] == "queued"
+        assert _poll(lambda: len([r for a in adapters for r in a.requests if r.instruction]) >= 2)
+        instructions = [r.instruction for a in adapters for r in a.requests if r.instruction]
+        assert "hello" in instructions and "again" in instructions
+
+        # Create an automation task -> scoped callback token + URL.
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+        task = _json_request(
+            f"{base_url}/v1/runs/{run_id}/tasks",
+            {"kind": "automation", "request": {"description": "call external system"}},
+            token=run_token,
+        )
+        task_id = task["task_id"]
+        callback_token = task["callback_token"]
+        assert task["callback_url"] == f"/v1/runs/{run_id}/tasks/{task_id}/result"
+
+        # A bogus token is rejected; the scoped callback token completes the task.
+        with pytest.raises(HTTPError) as exc_info:
+            _json_request(
+                f"{base_url}/v1/runs/{run_id}/tasks/{task_id}/result",
+                {"result": {"answer": "x"}},
+                token="not-a-real-token",
+            )
+        assert exc_info.value.code == 401
+
+        done = _json_request(
+            f"{base_url}{task['callback_url']}",
+            {"result": {"answer": "external done"}},
+            token=callback_token,
+        )
+        assert done.get("delivered") is True
+
+        _json_request(f"{base_url}/v1/runs/{run_id}/cancel", {}, token=run_token)
+        assert backend.wait_for_run(run_id, timeout_s=20) in {"completed", "limited", "failed"}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def _json_request(url: str, payload: dict, *, token: str | None = None) -> dict:
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}

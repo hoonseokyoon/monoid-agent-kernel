@@ -519,10 +519,12 @@ class HostedTaskExecutor:
         *,
         prompt: str = "",
         choices: tuple[str, ...] = (),
-        request: dict[str, Any] | None = None,
         created_by: str = "model",
         resume_on_exit: bool = True,
+        **request: Any,
     ) -> HostedTask:
+        # Known fields are explicit; any other keys (e.g. an automation trigger
+        # payload) are folded into the task's request.
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         task_dir = manager.recorder.artifacts_dir / "tasks" / task_id
         task_dir.mkdir(parents=True, exist_ok=False)
@@ -531,7 +533,7 @@ class HostedTaskExecutor:
             kind=self.kind,
             prompt=str(prompt),
             choices=tuple(str(choice) for choice in choices),
-            request=dict(request or {}),
+            request=dict(request),
             status="running",
             started_at=time.time(),
             resume_on_exit=resume_on_exit,

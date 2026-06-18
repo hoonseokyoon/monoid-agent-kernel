@@ -364,6 +364,35 @@ Replacement request:
 The backend validates schema, registry resolvability, duplicate binding ids,
 and duplicate model names. A version mismatch returns HTTP 400.
 
+### Multi-turn Sessions And Tasks
+
+The run loop is suspend-return at its core: `AgentLoop.run_until_suspended()` runs
+a turn and hands control back when the run settles (awaiting the next user
+message), parks on a hosted task, or hits a limit. `submit()` is the blocking
+wrapper over it; the reference backend's worker uses the non-blocking form to
+drive multi-turn sessions.
+
+Set `"multi_turn": true` on the run-creation request to keep the session open
+after the first turn settles (default `false` closes after one turn). While open,
+the run alternates between `running` and `awaiting_input` (a new
+`run.awaiting_input` event with `reason` `"user"` or `"task"`). HTTP surface:
+
+- `POST /v1/runs/{run_id}/messages` — deliver a follow-up user message (run token).
+  It is queued and consumed as the next user turn when the current one settles.
+- `POST /v1/runs/{run_id}/tasks` — create a hosted task (`{"kind": "hitl" |
+  "automation", "request": {...}}`). Returns `task_id` plus a scoped
+  `callback_token` and `callback_url`.
+- `POST /v1/runs/{run_id}/tasks/{task_id}/result` — deliver a task result
+  (`{"result": {...}, "status": "answered"}`). Authenticated by the per-task
+  callback token (scoped to this run+task) or the run token (operator). Reporting
+  a result wakes a parked run; the result is injected per the kind's
+  `ResultInjector` (a user message for hitl, an async tool result for automation).
+
+Follow-up user messages and task results are separate channels (a message is a new
+user turn; a task result completes a specific task), mirroring the
+add-message-vs-submit-tool-outputs split in comparable agent servers. Session
+length is bounded by idle timeout, max lifetime, and max turns.
+
 ## Run Artifacts
 
 Manifest and transcript are binding-aware:

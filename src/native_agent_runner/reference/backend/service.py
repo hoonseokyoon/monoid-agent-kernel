@@ -226,7 +226,7 @@ class RunnerBackend:
     idle_timeout_s: float = 300.0
     max_session_lifetime_s: float = 1800.0
     max_turns: int = 50
-    task_wait_poll_s: float = 30.0
+    task_wait_poll_s: float = 5.0
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
     _usage: dict[str, TenantUsage] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -841,11 +841,13 @@ class RunnerBackend:
             if suspension.reason in {"terminal", "limited"}:
                 break
             if suspension.reason == "awaiting_tasks":
-                if loop.wait_for_pending_tasks(self.task_wait_poll_s):
-                    suspension = loop.run_until_suspended(None)
-                    continue
+                ready = loop.wait_for_pending_tasks(self.task_wait_poll_s)
                 if self._session_should_stop(record, started, turns):
                     break
+                if ready or not loop.has_pending_tasks():
+                    # A task was delivered (or none remain): resume the pump.
+                    suspension = loop.run_until_suspended(None)
+                # else: tasks still pending after the poll window -> keep waiting.
                 continue
             # settled. One-shot runs close here; multi-turn awaits the next message.
             if not request.multi_turn:

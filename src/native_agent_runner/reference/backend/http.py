@@ -112,6 +112,7 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                             if payload.get("runtime_config") is not None
                             else None
                         ),
+                        multi_turn=bool(payload.get("multi_turn", False)),
                         metadata=dict(payload.get("metadata") or {}),
                     )
                     self._write_json(backend.submit_run(request).to_json(), status=HTTPStatus.ACCEPTED)
