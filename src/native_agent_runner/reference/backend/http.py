@@ -139,6 +139,44 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                         )
                     )
                     return
+                if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "messages":
+                    run_id = parts[2]
+                    payload = self._read_json()
+                    self._write_json(
+                        backend.send_message(run_id, self._bearer_token(), content=str(payload.get("content") or ""))
+                    )
+                    return
+                if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "tasks":
+                    run_id = parts[2]
+                    payload = self._read_json()
+                    self._write_json(
+                        backend.create_task(
+                            run_id,
+                            self._bearer_token(),
+                            kind=str(payload.get("kind") or ""),
+                            request=dict(payload.get("request") or {}),
+                        )
+                    )
+                    return
+                if (
+                    len(parts) == 6
+                    and parts[:2] == ["v1", "runs"]
+                    and parts[3] == "tasks"
+                    and parts[5] == "result"
+                ):
+                    run_id = parts[2]
+                    task_id = parts[4]
+                    payload = self._read_json()
+                    self._write_json(
+                        backend.report_task_result(
+                            run_id,
+                            self._bearer_token(),
+                            task_id=task_id,
+                            result=dict(payload.get("result") or {}),
+                            status=str(payload.get("status") or "answered"),
+                        )
+                    )
+                    return
                 if len(parts) == 5 and parts[:2] == ["v1", "runs"] and parts[3] == "proposal":
                     run_id = parts[2]
                     action = parts[4]

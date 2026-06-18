@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from native_agent_runner.errors import NativeAgentError
 
-TokenKind = Literal["run_access", "llm_gateway", "web_gateway"]
+TokenKind = Literal["run_access", "llm_gateway", "web_gateway", "task_callback"]
 
 
 class TokenError(NativeAgentError):

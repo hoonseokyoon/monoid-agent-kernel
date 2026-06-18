@@ -546,9 +546,10 @@ class RunnerBackend:
         result: dict[str, Any],
         status: str = "answered",
     ) -> dict[str, Any]:
-        """Deliver a hosted-task result (e.g. a human answer) into a running run,
-        waking it if parked. Mirrors the in-process TaskReporter over the live loop."""
-        loop = self._authorize_active_loop(run_id, token)
+        """Deliver a hosted-task result (e.g. a human answer, an automation
+        callback) into a running run, waking it if parked. Accepts a per-task
+        callback token (scoped to this run+task) or the run token (operator)."""
+        loop = self._authorize_task_result(run_id, token, task_id)
         return loop.report_task_result(task_id, result, status=status)
 
     def create_task(
@@ -559,12 +560,46 @@ class RunnerBackend:
         kind: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
-        """Backend-initiated task creation in a running run (automation/hitl)."""
+        """Backend-initiated task creation in a running run (automation/hitl).
+
+        Returns the task id plus a scoped callback token and URL an external system
+        POSTs to when it completes the work (Trigger.dev wait-token style)."""
         loop = self._authorize_active_loop(run_id, token)
-        return {"task_id": loop.create_task(kind, request)}
+        record = self._record(run_id)
+        task_id = loop.create_task(kind, request)
+        callback_token = self.token_manager.issue(
+            kind="task_callback",
+            audience="native-agent-runner.task-callback",
+            run_id=run_id,
+            tenant_id=record.tenant_id,
+            user_id=record.user_id,
+            ttl_s=self.task_callback_token_ttl_s,
+            metadata={"task_id": task_id},
+        )
+        return {
+            "task_id": task_id,
+            "callback_token": callback_token,
+            "callback_url": f"/v1/runs/{run_id}/tasks/{task_id}/result",
+        }
 
     def _authorize_active_loop(self, run_id: str, token: str) -> AgentLoop:
         self._authorize_run(run_id, token)
+        return self._active_loop(run_id)
+
+    def _authorize_task_result(self, run_id: str, token: str, task_id: str) -> AgentLoop:
+        """A task result may be reported with a per-task callback token (scoped to
+        run+task) or the run token (operator). Try the scoped token first."""
+        try:
+            claims = self.token_manager.verify(
+                token, kind="task_callback", audience="native-agent-runner.task-callback", run_id=run_id
+            )
+            if str(claims.metadata.get("task_id") or "") != task_id:
+                raise PermissionDenied("callback token does not match this task")
+        except TokenError:
+            self._authorize_run(run_id, token)
+        return self._active_loop(run_id)
+
+    def _active_loop(self, run_id: str) -> AgentLoop:
         record = self._record(run_id)
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
