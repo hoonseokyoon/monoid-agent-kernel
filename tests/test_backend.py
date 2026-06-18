@@ -243,6 +243,103 @@ def test_backend_multi_turn_session_threads_two_user_messages(tmp_path: Path) ->
     assert "again" in instructions
 
 
+def _recoverable_backend(run_root: Path, token_manager: TokenManager, workspace: Path, adapters: list, turns: list) -> RunnerBackend:
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        adapter = FakeModelAdapter(turns=list(turns))
+        adapters.append(adapter)
+        return adapter
+
+    return RunnerBackend(
+        run_root=run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+    )
+
+
+def test_backend_recovers_parked_hitl_run_from_checkpoint(tmp_path: Path) -> None:
+    # A run parked on a hosted task is durably checkpointed; a *fresh backend* (new
+    # process, empty _records) over the same run_root resumes it from checkpoint.json.
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+
+    def _wait(predicate, tries: int = 1000) -> bool:
+        for _ in range(tries):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    # Process 1: open the run, park on a human-input request, write the checkpoint.
+    crashed: list = []
+    backend1 = _recoverable_backend(
+        run_root,
+        token_manager,
+        workspace,
+        crashed,
+        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick"}, "c1"),))],
+    )
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Name it, ask me.",
+            runtime_config=runtime_config("hitl.request"),
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    run_dir = run_root / run_id
+    assert _wait(lambda: (run_dir / "checkpoint.json").exists())
+    assert (run_dir / "run.json").exists()
+
+    # Process 2: a brand-new backend recovers the parked run from disk. Its adapter
+    # settles the resumed turn (the conversation continues by handle from r1). backend1's
+    # worker is defunct (parked, never answered); we leave it and stop it at the end.
+    resumed: list = []
+    backend2 = _recoverable_backend(
+        run_root,
+        token_manager,
+        workspace,
+        resumed,
+        turns=[ModelTurn(response_id="r2", final_text="named it")],
+    )
+    assert run_id in backend2.recover_runs()
+
+    # Deliver the human answer to the recovered run -> it resumes and completes.
+    def _drain() -> None:
+        for _ in range(1000):
+            if backend2._record(run_id).status in {"completed", "failed", "limited"}:
+                return
+            for task in _running_hitl_tasks(backend2, run_id):
+                try:
+                    backend2.report_task_result(run_id, token, task_id=task.job_id, result={"answer": "Ada"})
+                except Exception:
+                    pass
+            time.sleep(0.01)
+
+    responder = threading.Thread(target=_drain)
+    responder.start()
+    status = backend2.wait_for_run(run_id, timeout_s=20)
+    responder.join(timeout=5)
+
+    assert status == "completed"
+    hitl_obs = [
+        obs
+        for adapter in resumed
+        for request in adapter.requests
+        for obs in request.observations
+        if obs.tool_name == "human_input"
+    ]
+    assert hitl_obs and hitl_obs[0].output["answer"] == "Ada"
+    # The resumed turn continued from the pre-crash handle, not a replayed transcript.
+    assert resumed[0].requests[0].previous_turn_handle == "r1"
+    backend1.cancel_run(run_id, token)  # cleanup: stop the defunct first-process worker
+
+
 def test_backend_single_turn_run_closes_after_first_settle(tmp_path: Path) -> None:
     # Without multi_turn the run closes after the first settle (no awaiting_input hang).
     workspace = _workspace(tmp_path)

@@ -25,8 +25,10 @@ from native_agent_runner.core.packages import (
     write_apply_result,
     write_approval,
 )
+from native_agent_runner.core._util import write_json_atomic
+from native_agent_runner.core.checkpoint import RunCheckpoint, read_checkpoint, write_checkpoint
 from native_agent_runner.core.proposal_file import ProposalFileError, read_proposal_file_payload
-from native_agent_runner.core.result import AgentRunResult
+from native_agent_runner.core.result import AgentRunResult, Suspension
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
@@ -57,6 +59,20 @@ BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "f
 # Sentinel enqueued to wake/stop a session worker blocked on its message queue.
 _CLOSE_SESSION = object()
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
+
+# Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
+_RUN_META_SCHEMA_VERSION = "native-agent-runner.backend-run.v1"
+
+
+def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
+    """Read run.json if present and schema-compatible; ``None`` otherwise (never raises)."""
+    try:
+        payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != _RUN_META_SCHEMA_VERSION:
+        return None
+    return payload
 
 
 @dataclass(frozen=True)
@@ -825,22 +841,36 @@ class RunnerBackend:
         raise TimeoutError(f"run did not finish before timeout: {run_id}")
 
     def _drive_session(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> AgentRunResult:
-        """Drive an open run as a multi-turn session: pump until suspended, then
-        either wait for a parked task to complete or block on the message queue for
-        the next user turn — until idle/lifetime/turn limits, cancel, or close."""
+        """Cold-start driver: open the run, take the first turn, then hand off to the
+        shared open-session loop (also used by checkpoint recovery)."""
         record = self._record(run_id)
         loop.open()
-        started = time.time()
-        turns = 1
         try:
             suspension = loop.run_until_suspended(request.instruction)
         except NativeAgentError:
             # Bootstrap failed (terminal session already recorded); just finalize.
             return loop.close()
+        return self._drive_open_session(record, request, loop, suspension, started=time.time(), turns=1)
+
+    def _drive_open_session(
+        self,
+        record: BackendRunRecord,
+        request: BackendRunRequest,
+        loop: AgentLoop,
+        suspension: Suspension,
+        *,
+        started: float,
+        turns: int,
+    ) -> AgentRunResult:
+        """Drive an already-open run as a multi-turn session: wait for a parked task to
+        complete or block on the message queue for the next user turn — until idle/
+        lifetime/turn limits, cancel, or close. Shared by cold start and recovery; each
+        park point durably checkpoints (loop state + backend message queue)."""
         while True:
             if suspension.reason in {"terminal", "limited"}:
                 break
             if suspension.reason == "awaiting_tasks":
+                self._persist_run_checkpoint(record)
                 ready = loop.wait_for_pending_tasks(self.task_wait_poll_s)
                 if self._session_should_stop(record, started, turns):
                     break
@@ -855,6 +885,7 @@ class RunnerBackend:
             if self._session_should_stop(record, started, turns):
                 break
             loop.await_user_input()
+            self._persist_run_checkpoint(record)
             try:
                 message = record.message_queue.get(timeout=self.idle_timeout_s)
             except queue.Empty:
@@ -864,6 +895,27 @@ class RunnerBackend:
             turns += 1
             suspension = loop.run_until_suspended(message)
         return loop.close()
+
+    def _persist_run_checkpoint(self, record: BackendRunRecord) -> None:
+        """Augment the loop's own park-point checkpoint with the backend-owned message
+        queue, so a follow-up message that arrived but was not yet consumed survives a
+        restart. No-op when the loop refuses a snapshot (a live shell job is parked-on)."""
+        loop = record.loop
+        if loop is None:
+            return
+        checkpoint = loop.snapshot()
+        if checkpoint is None:
+            return
+        # Peek (don't drain) the residual queue; consumed messages are already reflected
+        # in the loop's turn handle / pending input.
+        with record.message_queue.mutex:
+            residual = [
+                message
+                for message in list(record.message_queue.queue)
+                if isinstance(message, str)
+            ]
+        checkpoint.queued_messages = residual
+        write_checkpoint(record.run_dir, checkpoint)
 
     def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
         return (
@@ -900,24 +952,185 @@ class RunnerBackend:
             )
             with self._lock:
                 self._records[run_id].loop = loop
+            # Persist the recovery metadata before the first turn so a crash at any park
+            # point can be resumed (the checkpoint itself is written by the driver).
+            self._write_run_meta(self._record(run_id), request)
             result = self._drive_session(run_id, request, loop)
-            with self._lock:
-                record = self._records[run_id]
-                record.result = result
-                record.status = result.status
-                record.error = result.error
-                record.error_code = result.error_code
-                record.finished_at = time.time()
-                self._usage.setdefault(record.tenant_id, TenantUsage(record.tenant_id)).add_metrics(
-                    result.metrics
-                )
+            self._record_run_result(run_id, result)
         except Exception as exc:
+            self._record_run_failure(run_id, exc)
+
+    def _record_run_result(self, run_id: str, result: AgentRunResult) -> None:
+        with self._lock:
+            record = self._records[run_id]
+            record.result = result
+            record.status = result.status
+            record.error = result.error
+            record.error_code = result.error_code
+            record.finished_at = time.time()
+            self._usage.setdefault(record.tenant_id, TenantUsage(record.tenant_id)).add_metrics(
+                result.metrics
+            )
+
+    def _record_run_failure(self, run_id: str, exc: Exception) -> None:
+        with self._lock:
+            record = self._records[run_id]
+            record.status = "failed"
+            record.error = str(exc)
+            record.error_code = getattr(exc, "error_code", "internal_error")
+            record.finished_at = time.time()
+
+    def _write_run_meta(self, record: BackendRunRecord, request: BackendRunRequest) -> None:
+        """Write run.json — the durable recovery descriptor. Holds everything
+        ``recover_runs`` needs to rebuild a run that was parked when the process died:
+        identity, workspace, limits, policy, and the resolved runtime config (gateway
+        tokens are re-issued on recovery, not stored). A mid-run runtime-config change
+        is not re-persisted here, so recovery uses the config as of run start."""
+        meta = {
+            "schema_version": _RUN_META_SCHEMA_VERSION,
+            "run_id": record.run_id,
+            "tenant_id": record.tenant_id,
+            "user_id": record.user_id,
+            "workspace_root": str(record.workspace_root),
+            "mode": request.mode,
+            "workspace_backend": request.workspace_backend,
+            "multi_turn": request.multi_turn,
+            "limits": {
+                "max_steps": request.max_steps,
+                "max_tool_calls": request.max_tool_calls,
+                "max_bytes_read": request.max_bytes_read,
+                "max_duration_s": request.max_duration_s,
+            },
+            "permission_policy": request.permission_policy.to_json(),
+            "runtime_config": record.runtime_config.to_json() if record.runtime_config else None,
+        }
+        record.run_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(record.run_dir / "run.json", meta)
+
+    def recover_runs(self) -> list[str]:
+        """Scan ``run_root`` for runs left parked by a previous process and resume each
+        from its checkpoint. Returns the recovered run ids. Idempotent: runs already
+        tracked in-memory, terminal checkpoints, and runs missing run.json are skipped."""
+        recovered: list[str] = []
+        if not self.run_root.is_dir():
+            return recovered
+        for run_dir in sorted(path for path in self.run_root.iterdir() if path.is_dir()):
+            run_id = run_dir.name
             with self._lock:
-                record = self._records[run_id]
-                record.status = "failed"
-                record.error = str(exc)
-                record.error_code = getattr(exc, "error_code", "internal_error")
-                record.finished_at = time.time()
+                if run_id in self._records:
+                    continue
+            checkpoint = read_checkpoint(run_dir)
+            if checkpoint is None or checkpoint.terminal:
+                continue
+            meta = _read_run_meta(run_dir)
+            if meta is None:
+                continue
+            try:
+                self._resume_from_checkpoint(run_dir, checkpoint, meta)
+            except Exception:
+                continue
+            recovered.append(run_id)
+        return recovered
+
+    def _resume_from_checkpoint(self, run_dir: Path, checkpoint: RunCheckpoint, meta: dict[str, Any]) -> None:
+        run_id = checkpoint.run_id
+        runtime_config = AgentRuntimeConfig.from_json(meta["runtime_config"])
+        limits = meta.get("limits") or {}
+        request = BackendRunRequest(
+            tenant_id=str(meta["tenant_id"]),
+            user_id=str(meta["user_id"]),
+            workspace_root=Path(meta["workspace_root"]),
+            instruction="",  # the opening turn already ran; recovery resumes from the checkpoint
+            mode=meta.get("mode", "propose"),
+            workspace_backend=meta.get("workspace_backend", "overlay"),
+            max_steps=int(limits.get("max_steps", 30)),
+            max_tool_calls=int(limits.get("max_tool_calls", 100)),
+            max_bytes_read=int(limits.get("max_bytes_read", 1_000_000)),
+            max_duration_s=limits.get("max_duration_s", 900),
+            permission_policy=PermissionPolicy.from_json(meta.get("permission_policy")),
+            runtime_config=runtime_config,
+            multi_turn=bool(meta.get("multi_turn", False)),
+        )
+        workspace_root = request.workspace_root.resolve()
+        # Re-issue gateway tokens — the backend holds the signing key, so the original
+        # (unstored) tokens need not survive the restart.
+        llm_gateway_token = self.token_manager.issue(
+            kind="llm_gateway",
+            audience="csp.llm-gateway",
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            ttl_s=self.llm_gateway_token_ttl_s,
+            metadata={"agent_config_hash": runtime_config.config_hash},
+        )
+        web_gateway_token = ""
+        if _runtime_config_uses_web(runtime_config) and self.web_gateway_url:
+            web_gateway_token = self.token_manager.issue(
+                kind="web_gateway",
+                audience="csp.web-gateway",
+                run_id=run_id,
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                ttl_s=self.web_gateway_token_ttl_s,
+                metadata={"agent_config_hash": runtime_config.config_hash},
+            )
+        record = BackendRunRecord(
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_root=workspace_root,
+            run_dir=run_dir,
+            status="awaiting_input",
+            created_at=time.time(),
+            run_token_sha256="",  # the client still holds its run token (verified cryptographically)
+            llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
+            web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
+            runtime_config=runtime_config,
+            runtime_config_issuer="recover_runs",
+            runtime_config_reason="resumed from checkpoint",
+        )
+        with self._lock:
+            self._records[run_id] = record
+        spec = self._run_spec_for_request(run_id, request, workspace_root)
+        adapter = self._build_model_adapter(spec, llm_gateway_token, runtime_config.model)
+        loop = AgentLoop(
+            spec=spec,
+            model_adapter=adapter,
+            event_sinks=(BackendRunStateSink(self, run_id),),
+            permission_policy=request.permission_policy,
+            cancellation_token=record.cancellation_token,
+            shell_approval_provider=None,
+            web_gateway_client=self._web_gateway_client(web_gateway_token),
+            runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
+        )
+        loop.restore(checkpoint)
+        with self._lock:
+            record.loop = loop
+        for message in checkpoint.queued_messages:
+            record.message_queue.put(message)
+        thread = threading.Thread(
+            target=self._run_recovered_worker,
+            args=(run_id, request, loop),
+            name=f"native-agent-recover-{run_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_recovered_worker(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> None:
+        record = self._record(run_id)
+        try:
+            # Derive the starting park from the restored loop: tasks still pending -> a
+            # hosted-task wait; otherwise a settled park awaiting the next user message.
+            if loop.has_pending_tasks():
+                suspension = Suspension(reason="awaiting_tasks", status="running", has_external=True)
+            else:
+                suspension = Suspension(reason="settled", status="completed")
+            result = self._drive_open_session(
+                record, request, loop, suspension, started=time.time(), turns=1
+            )
+            self._record_run_result(run_id, result)
+        except Exception as exc:
+            self._record_run_failure(run_id, exc)
 
     def _build_model_adapter(
         self,
