@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from native_agent_runner._proc import file_size, spawn_process, terminate_process
 from native_agent_runner.core._util import write_json_atomic
@@ -36,9 +36,25 @@ BackgroundJobStatus = Literal[
 ]
 
 
+class TaskExecutor(Protocol):
+    """Pluggable per-kind executor seam.
+
+    The manager owns the queue/lifecycle/reentry; an executor owns "how does a
+    task of this kind run and when is it done". The in-process shell executor
+    monitors a subprocess; future executors (hitl, automation) may be driven
+    entirely by an external reporter calling ``TaskManager.mark_ready``.
+    """
+
+    kind: str
+
+    def cancel(self, manager: BackgroundJobManager, job: BackgroundJob) -> None:
+        ...
+
+
 @dataclass
 class BackgroundJob:
     job_id: str
+    kind: str
     command: str
     command_preview: str
     cwd: str
@@ -158,22 +174,15 @@ class BackgroundJob:
 
 
 @dataclass
-class BackgroundJobManager:
-    run_id: str
-    workspace: Workspace
-    recorder: AgentRecorder
-    permission_policy: PermissionPolicy
-    jobs: dict[str, BackgroundJob] = field(default_factory=dict)
-    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
-    _condition: threading.Condition = field(init=False, repr=False)
-    _reentry_queue: list[str] = field(default_factory=list, init=False, repr=False)
-    _delivered_reentry_jobs: set[str] = field(default_factory=set, init=False, repr=False)
+class ShellTaskExecutor:
+    """In-process executor for shell tasks: spawn a subprocess, monitor it, and
+    publish completion through ``BackgroundJobManager.mark_ready``."""
 
-    def __post_init__(self) -> None:
-        self._condition = threading.Condition(self._lock)
+    kind: str = "shell"
 
-    def start_shell_job(
+    def start(
         self,
+        manager: BackgroundJobManager,
         *,
         shell_options: ShellExecutionOptions,
         command: str,
@@ -193,18 +202,19 @@ class BackgroundJobManager:
         if not command.strip():
             raise ToolExecutionError("shell command is required", error_code="shell_exec_error")
         shell_options.check_command(command)
-        cwd_rel = shell_runtime.validate_cwd(self.workspace, cwd, self.permission_policy)
+        cwd_rel = shell_runtime.validate_cwd(manager.workspace, cwd, manager.permission_policy)
         safe_env = shell_runtime.build_env(shell_options, env)
         argv = shell_runtime.shell_argv(shell_options.effective_shell(), command)
-        cwd_abs, tmp_root, before_snapshot = self._prepare_workspace(cwd_rel, execution_workspace)
+        cwd_abs, tmp_root, before_snapshot = self._prepare_workspace(manager, cwd_rel, execution_workspace)
 
         job_id = f"job_{uuid.uuid4().hex[:12]}"
-        job_dir = self.recorder.artifacts_dir / "jobs" / job_id
+        job_dir = manager.recorder.artifacts_dir / "jobs" / job_id
         job_dir.mkdir(parents=True, exist_ok=False)
         stdout_path = job_dir / "stdout.log"
         stderr_path = job_dir / "stderr.log"
         job = BackgroundJob(
             job_id=job_id,
+            kind=self.kind,
             command=command,
             command_preview=shell_runtime.preview_command(command),
             cwd=cwd_rel,
@@ -231,24 +241,194 @@ class BackgroundJobManager:
             job.status = "failed"
             job.error = str(exc)
             job.finished_at = time.time()
-            self._write_job(job)
+            manager._write_job(job)
             self._cleanup_tmp(job)
             raise ToolExecutionError(str(exc), error_code="shell_exec_error") from exc
 
-        with self._condition:
-            self.jobs[job_id] = job
-            self._write_job(job)
-        self.recorder.emit("job.started", data=self._public_job_payload(job))
+        manager._register(job)
+        manager.recorder.emit("job.started", data=manager._public_job_payload(job))
         thread = threading.Thread(
             target=self._monitor_job,
-            args=(job_id,),
+            args=(manager, job_id),
             name=f"native-agent-job-{job_id}",
             daemon=True,
         )
         thread.start()
         if startup_wait_s > 0:
-            self._wait_startup(job_id, startup_wait_s)
+            manager._wait_startup(job_id, startup_wait_s)
         return job
+
+    def cancel(self, manager: BackgroundJobManager, job: BackgroundJob) -> None:
+        # Called under manager._condition. Terminate the live subprocess.
+        if job.process is not None and job.status == "running":
+            job.status = "cancelled"
+            terminate_process(job.process)
+
+    def _prepare_workspace(
+        self,
+        manager: BackgroundJobManager,
+        cwd_rel: str,
+        execution_workspace: ResolvedShellExecutionWorkspace,
+    ) -> tuple[Path, Path | None, Any]:
+        if execution_workspace == "direct":
+            cwd_abs = (manager.workspace.root / cwd_rel).resolve()
+            if not is_within(manager.workspace.root, cwd_abs):
+                raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
+            if not cwd_abs.exists() or not cwd_abs.is_dir():
+                raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
+            return cwd_abs, None, None
+
+        tmp_root = Path(tempfile.mkdtemp(prefix="native-agent-shell-job-")).resolve()
+        before = shell_runtime.materialize_workspace(manager.workspace, tmp_root, manager.permission_policy)
+        cwd_abs = (tmp_root / cwd_rel).resolve()
+        if not is_within(tmp_root, cwd_abs):
+            raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
+        if not cwd_abs.exists() or not cwd_abs.is_dir():
+            raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
+        return cwd_abs, tmp_root, before
+
+    def _monitor_job(self, manager: BackgroundJobManager, job_id: str) -> None:
+        job = manager.get_job(job_id)
+        try:
+            self._monitor_process(manager, job)
+            if job.execution_workspace == "isolated-copy" and job.status == "exited":
+                after = shell_runtime.scan_materialized_workspace(job.tmp_root, manager.permission_policy)
+                changed = shell_runtime.sync_workspace_changes(manager.workspace, job.before_snapshot, after)
+                job.changed_paths = tuple(changed)
+            elif job.execution_workspace == "direct":
+                job.changed_paths = tuple(manager.workspace.changed_paths())
+        except Exception as exc:
+            job.status = "failed"
+            job.error = str(exc)
+            job.finished_at = time.time()
+        finally:
+            job.stdout_bytes = file_size(job.stdout_path)
+            job.stderr_bytes = file_size(job.stderr_path)
+            if job.finished_at is None:
+                job.finished_at = time.time()
+            self._cleanup_tmp(job)
+            manager.mark_ready(job)
+
+    def _monitor_process(self, manager: BackgroundJobManager, job: BackgroundJob) -> None:
+        process = job.process
+        if process is None:
+            job.status = "failed"
+            job.error = "process was not started"
+            return
+        while process.poll() is None:
+            now = time.time()
+            stdout_bytes = file_size(job.stdout_path)
+            stderr_bytes = file_size(job.stderr_path)
+            total_bytes = stdout_bytes + stderr_bytes
+            if job.cancel_path.exists():
+                job.status = "cancelled"
+                terminate_process(process)
+                break
+            if now - job.started_at >= job.timeout_s:
+                job.status = "timed_out"
+                job.timed_out = True
+                terminate_process(process)
+                break
+            if total_bytes > job.max_output_bytes:
+                job.status = "output_limited"
+                job.output_truncated = True
+                terminate_process(process)
+                break
+            if total_bytes != job._last_output_event_bytes and now - job._last_output_event_at >= 0.25:
+                job.stdout_bytes = stdout_bytes
+                job.stderr_bytes = stderr_bytes
+                job._last_output_event_at = now
+                job._last_output_event_bytes = total_bytes
+                manager.recorder.emit("job.output.updated", data=manager._public_job_payload(job))
+                manager._write_job(job)
+            time.sleep(0.02)
+        try:
+            job.exit_code = process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            job.exit_code = process.wait(timeout=2)
+        if job.status == "running":
+            job.status = "exited"
+        job.stdout_bytes = file_size(job.stdout_path)
+        job.stderr_bytes = file_size(job.stderr_path)
+        if job.stdout_bytes + job.stderr_bytes > job.max_output_bytes:
+            job.output_truncated = True
+            if job.status == "exited":
+                job.status = "output_limited"
+
+    def _cleanup_tmp(self, job: BackgroundJob) -> None:
+        if job.tmp_root is not None:
+            shutil.rmtree(job.tmp_root, ignore_errors=True)
+            job.tmp_root = None
+
+
+@dataclass
+class BackgroundJobManager:
+    run_id: str
+    workspace: Workspace
+    recorder: AgentRecorder
+    permission_policy: PermissionPolicy
+    jobs: dict[str, BackgroundJob] = field(default_factory=dict)
+    executors: dict[str, TaskExecutor] = field(default_factory=dict, init=False, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _condition: threading.Condition = field(init=False, repr=False)
+    _reentry_queue: list[str] = field(default_factory=list, init=False, repr=False)
+    _delivered_reentry_jobs: set[str] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._condition = threading.Condition(self._lock)
+        self.executors = {"shell": ShellTaskExecutor()}
+
+    def _register(self, job: BackgroundJob) -> None:
+        with self._condition:
+            self.jobs[job.job_id] = job
+            self._write_job(job)
+
+    def mark_ready(self, job: BackgroundJob) -> None:
+        """Single completion entry: publish a finished task to the reentry queue.
+
+        Called by the in-process shell monitor and (for hosted kinds) by an
+        external reporter that has already set ``status``/``result``/``finished_at``."""
+        job.ready_for_reentry = True
+        with self._condition:
+            self._write_job(job)
+            self._emit_terminal_event(job)
+            if job.resume_on_exit:
+                self._reentry_queue.append(job.job_id)
+            self._condition.notify_all()
+
+    def start_shell_job(
+        self,
+        *,
+        shell_options: ShellExecutionOptions,
+        command: str,
+        cwd: str,
+        timeout_s: int,
+        max_output_bytes: int,
+        startup_wait_s: int,
+        env: dict[str, Any],
+        requested_timeout_s: int | None,
+        requested_max_output_bytes: int | None,
+        requested_startup_wait_s: int | None,
+        execution_workspace: ResolvedShellExecutionWorkspace,
+        resume_on_exit: bool,
+    ) -> BackgroundJob:
+        executor = self.executors["shell"]
+        return executor.start(  # type: ignore[attr-defined]
+            self,
+            shell_options=shell_options,
+            command=command,
+            cwd=cwd,
+            timeout_s=timeout_s,
+            max_output_bytes=max_output_bytes,
+            startup_wait_s=startup_wait_s,
+            env=env,
+            requested_timeout_s=requested_timeout_s,
+            requested_max_output_bytes=requested_max_output_bytes,
+            requested_startup_wait_s=requested_startup_wait_s,
+            execution_workspace=execution_workspace,
+            resume_on_exit=resume_on_exit,
+        )
 
     def list_jobs(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -285,9 +465,9 @@ class BackgroundJobManager:
         job = self.get_job(job_id)
         job.cancel_path.write_text("cancel requested\n", encoding="utf-8")
         with self._condition:
-            if job.process is not None and job.status == "running":
-                job.status = "cancelled"
-                terminate_process(job.process)
+            executor = self.executors.get(job.kind)
+            if executor is not None:
+                executor.cancel(self, job)
             self._condition.notify_all()
         return {"job_id": job_id, "cancel_requested": True, "status": job.status}
 
@@ -353,103 +533,6 @@ class BackgroundJobManager:
                     return
             time.sleep(0.05)
 
-    def _prepare_workspace(
-        self,
-        cwd_rel: str,
-        execution_workspace: ResolvedShellExecutionWorkspace,
-    ) -> tuple[Path, Path | None, Any]:
-        if execution_workspace == "direct":
-            cwd_abs = (self.workspace.root / cwd_rel).resolve()
-            if not is_within(self.workspace.root, cwd_abs):
-                raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
-            if not cwd_abs.exists() or not cwd_abs.is_dir():
-                raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
-            return cwd_abs, None, None
-
-        tmp_root = Path(tempfile.mkdtemp(prefix="native-agent-shell-job-")).resolve()
-        before = shell_runtime.materialize_workspace(self.workspace, tmp_root, self.permission_policy)
-        cwd_abs = (tmp_root / cwd_rel).resolve()
-        if not is_within(tmp_root, cwd_abs):
-            raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
-        if not cwd_abs.exists() or not cwd_abs.is_dir():
-            raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
-        return cwd_abs, tmp_root, before
-
-    def _monitor_job(self, job_id: str) -> None:
-        job = self.get_job(job_id)
-        try:
-            self._monitor_process(job)
-            if job.execution_workspace == "isolated-copy" and job.status == "exited":
-                after = shell_runtime.scan_materialized_workspace(job.tmp_root, self.permission_policy)
-                changed = shell_runtime.sync_workspace_changes(self.workspace, job.before_snapshot, after)
-                job.changed_paths = tuple(changed)
-            elif job.execution_workspace == "direct":
-                job.changed_paths = tuple(self.workspace.changed_paths())
-        except Exception as exc:
-            job.status = "failed"
-            job.error = str(exc)
-            job.finished_at = time.time()
-        finally:
-            job.stdout_bytes = file_size(job.stdout_path)
-            job.stderr_bytes = file_size(job.stderr_path)
-            if job.finished_at is None:
-                job.finished_at = time.time()
-            job.ready_for_reentry = True
-            self._cleanup_tmp(job)
-            with self._condition:
-                self._write_job(job)
-                self._emit_terminal_event(job)
-                if job.resume_on_exit:
-                    self._reentry_queue.append(job.job_id)
-                self._condition.notify_all()
-
-    def _monitor_process(self, job: BackgroundJob) -> None:
-        process = job.process
-        if process is None:
-            job.status = "failed"
-            job.error = "process was not started"
-            return
-        while process.poll() is None:
-            now = time.time()
-            stdout_bytes = file_size(job.stdout_path)
-            stderr_bytes = file_size(job.stderr_path)
-            total_bytes = stdout_bytes + stderr_bytes
-            if job.cancel_path.exists():
-                job.status = "cancelled"
-                terminate_process(process)
-                break
-            if now - job.started_at >= job.timeout_s:
-                job.status = "timed_out"
-                job.timed_out = True
-                terminate_process(process)
-                break
-            if total_bytes > job.max_output_bytes:
-                job.status = "output_limited"
-                job.output_truncated = True
-                terminate_process(process)
-                break
-            if total_bytes != job._last_output_event_bytes and now - job._last_output_event_at >= 0.25:
-                job.stdout_bytes = stdout_bytes
-                job.stderr_bytes = stderr_bytes
-                job._last_output_event_at = now
-                job._last_output_event_bytes = total_bytes
-                self.recorder.emit("job.output.updated", data=self._public_job_payload(job))
-                self._write_job(job)
-            time.sleep(0.02)
-        try:
-            job.exit_code = process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            job.exit_code = process.wait(timeout=2)
-        if job.status == "running":
-            job.status = "exited"
-        job.stdout_bytes = file_size(job.stdout_path)
-        job.stderr_bytes = file_size(job.stderr_path)
-        if job.stdout_bytes + job.stderr_bytes > job.max_output_bytes:
-            job.output_truncated = True
-            if job.status == "exited":
-                job.status = "output_limited"
-
     def _wait_startup(self, job_id: str, startup_wait_s: int) -> None:
         deadline = time.time() + startup_wait_s
         while time.time() < deadline:
@@ -480,11 +563,6 @@ class BackgroundJobManager:
 
     def _write_job(self, job: BackgroundJob) -> None:
         write_json_atomic(job.job_path, job.to_json(self.recorder.run_dir))
-
-    def _cleanup_tmp(self, job: BackgroundJob) -> None:
-        if job.tmp_root is not None:
-            shutil.rmtree(job.tmp_root, ignore_errors=True)
-            job.tmp_root = None
 
 
 def list_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:
