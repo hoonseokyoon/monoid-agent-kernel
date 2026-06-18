@@ -21,6 +21,23 @@ class ToolObservation:
     output: dict[str, Any]
     is_background: bool = False
 
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "call_id": self.call_id,
+            "tool_name": self.tool_name,
+            "output": self.output,
+            "is_background": self.is_background,
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, Any]) -> ToolObservation:
+        return cls(
+            call_id=str(payload.get("call_id") or ""),
+            tool_name=str(payload.get("tool_name") or ""),
+            output=dict(payload.get("output") or {}),
+            is_background=bool(payload.get("is_background", False)),
+        )
+
 
 @dataclass(frozen=True)
 class ModelTurn:

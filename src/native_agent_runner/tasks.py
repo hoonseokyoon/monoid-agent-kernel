@@ -476,6 +476,52 @@ class HostedTask:
             "result": self.result,
         }
 
+    def checkpoint_json(self) -> dict[str, Any]:
+        """Durable snapshot for ``run_dir/checkpoint.json``. Unlike ``to_json``
+        (which feeds the public ``task.json``), this carries the fields needed to
+        rebuild a parked task on restore: ``resume_on_exit`` and ``ready_for_reentry``.
+        ``job_path``/``cancel_path`` are derived from ``artifacts_dir`` in
+        ``from_checkpoint`` rather than stored (they are absolute and host-relative)."""
+        return {
+            "task_id": self.job_id,
+            "kind": self.kind,
+            "status": self.status,
+            "created_by": self.created_by,
+            "prompt": self.prompt,
+            "choices": list(self.choices),
+            "request": self.request,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "resume_on_exit": self.resume_on_exit,
+            "error": self.error,
+            "result": self.result,
+            "ready_for_reentry": self.ready_for_reentry,
+        }
+
+    @classmethod
+    def from_checkpoint(cls, payload: dict[str, Any], artifacts_dir: Path) -> HostedTask:
+        """Rebuild a parked hosted task from a checkpoint payload. The task dir
+        layout matches ``HostedTaskExecutor.start``: ``artifacts_dir/tasks/<id>/``."""
+        task_id = str(payload.get("task_id") or "")
+        task_dir = artifacts_dir / "tasks" / task_id
+        return cls(
+            job_id=task_id,
+            kind=str(payload.get("kind") or ""),
+            prompt=str(payload.get("prompt") or ""),
+            status=str(payload.get("status") or "running"),
+            started_at=float(payload.get("started_at") or 0.0),
+            resume_on_exit=bool(payload.get("resume_on_exit", True)),
+            job_path=task_dir / "task.json",
+            cancel_path=task_dir / "cancel.requested",
+            created_by=str(payload.get("created_by") or "model"),
+            choices=tuple(str(choice) for choice in payload.get("choices") or ()),
+            request=dict(payload.get("request") or {}),
+            finished_at=payload.get("finished_at"),
+            error=str(payload.get("error") or ""),
+            result=payload.get("result"),
+            ready_for_reentry=bool(payload.get("ready_for_reentry", False)),
+        )
+
     def started_content(self, run_dir: Path) -> dict[str, Any]:
         del run_dir
         return {
