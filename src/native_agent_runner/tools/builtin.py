@@ -29,6 +29,7 @@ def builtin_tools(workspace: Workspace) -> list[ToolSpec]:
         _job_logs(),
         _job_cancel(),
         _job_wait(),
+        _hitl_request(),
         _web_search(),
         _web_fetch(),
         _web_context(),
@@ -615,6 +616,29 @@ def _job_wait() -> ToolSpec:
         ),
         capability="job.control",
         side_effect="shell",
+        handler=handler,
+    )
+
+
+def _hitl_request() -> ToolSpec:
+    def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(ok=True, content=context.request_human_input(args))
+
+    return ToolSpec(
+        id="hitl.request",
+        description=(
+            "Request input from a human and pause for it. Returns a task_id immediately; "
+            "the run parks until the human answers, then the answer is delivered to you."
+        ),
+        input_schema=_object_schema(
+            {
+                "prompt": {"type": "string"},
+                "choices": {"type": "array", "items": {"type": "string"}},
+            },
+            required=["prompt"],
+        ),
+        capability="hitl.request",
+        side_effect="run",
         handler=handler,
     )
 

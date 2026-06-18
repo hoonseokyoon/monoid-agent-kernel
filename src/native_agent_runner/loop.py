@@ -177,6 +177,17 @@ class AgentToolContext(ToolContext):
     def job_wait(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.jobs_service.wait(args)
 
+    def request_human_input(self, args: dict[str, Any]) -> dict[str, Any]:
+        task = self.job_manager.start_task(
+            "hitl",
+            {
+                "prompt": str(args.get("prompt") or ""),
+                "choices": tuple(str(choice) for choice in (args.get("choices") or ())),
+                "created_by": "model",
+            },
+        )
+        return task.started_content(self.recorder.run_dir)
+
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.web_service.search(args, self._current_call)
 
@@ -392,6 +403,15 @@ class AgentLoop:
             "checkpoint.committed",
             data={"workspace_backend": res.workspace.backend_kind, "changed_paths": []},
         )
+
+    def report_task_result(
+        self, task_id: str, result: dict[str, Any], *, status: str = "answered"
+    ) -> dict[str, Any]:
+        """Complete a hosted task (e.g. a hitl request) from outside the loop —
+        the backend or another thread calls this to deliver a result, waking a
+        parked run. The result is injected per the task kind's ResultInjector."""
+        session = self._require_open()
+        return session.res.context.job_manager.report_result(task_id, result, status=status)
 
     def _require_open(self) -> _Session:
         if self._session is None:

@@ -48,7 +48,7 @@ class TaskExecutor(Protocol):
 
     kind: str
 
-    def cancel(self, manager: BackgroundJobManager, job: BackgroundJob) -> None:
+    def cancel(self, manager: BackgroundJobManager, job: Task) -> None:
         ...
 
 
@@ -160,6 +160,23 @@ class BackgroundJob:
             "effective_startup_wait_s": self.startup_wait_s,
             "execution_workspace": self.execution_workspace,
         }
+
+    def terminal_event(self) -> tuple[str, str]:
+        event_type = {
+            "exited": "job.finished",
+            "timed_out": "job.timed_out",
+            "cancelled": "job.cancelled",
+            "output_limited": "job.output_limited",
+            "failed": "job.failed",
+        }.get(self.status, "job.failed")
+        level = "info" if self.status == "exited" else "warning"
+        return event_type, level
+
+    def public_payload(self, run_dir: Path, permission_policy: PermissionPolicy) -> dict[str, Any]:
+        payload = self.to_json(run_dir)
+        payload["changed_paths"] = self.public_paths(permission_policy)
+        payload.pop("command", None)
+        return payload
 
     def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:
         stdout = read_job_log_text(run_dir, self.job_id, stream="stdout", tail_bytes=tail_bytes)
@@ -395,12 +412,165 @@ class ShellResultInjector:
 
 
 @dataclass
+class HitlTask:
+    """A human-in-the-loop task: created when the agent requests human input,
+    parked until an external reporter calls ``report_result``. It has no
+    in-process monitor — the reporter (backend/test) is the only completion writer.
+    Carries ``job_id`` (not ``task_id``) so it flows through the manager's generic
+    queue unchanged; the rename happens in the final pass."""
+
+    job_id: str
+    kind: str
+    prompt: str
+    status: str
+    started_at: float
+    resume_on_exit: bool
+    job_path: Path
+    cancel_path: Path
+    created_by: str = "model"
+    choices: tuple[str, ...] = ()
+    finished_at: float | None = None
+    error: str = ""
+    result: dict[str, Any] | None = None
+    ready_for_reentry: bool = field(default=False, repr=False)
+
+    @property
+    def duration_s(self) -> float:
+        return (self.finished_at or time.time()) - self.started_at
+
+    def to_json(self, run_dir: Path) -> dict[str, Any]:
+        del run_dir
+        return {
+            "schema_version": "native-agent-runner.task.v1",
+            "task_id": self.job_id,
+            "kind": self.kind,
+            "status": self.status,
+            "created_by": self.created_by,
+            "prompt": self.prompt,
+            "choices": list(self.choices),
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_s": self.duration_s,
+            "error": self.error,
+            "result": self.result,
+        }
+
+    def started_content(self, run_dir: Path) -> dict[str, Any]:
+        del run_dir
+        return {
+            "task_id": self.job_id,
+            "kind": self.kind,
+            "status": self.status,
+            "prompt": self.prompt,
+            "choices": list(self.choices),
+        }
+
+    def terminal_event(self) -> tuple[str, str]:
+        event_type = {
+            "answered": "task.finished",
+            "cancelled": "task.cancelled",
+            "timed_out": "task.timed_out",
+        }.get(self.status, "task.failed")
+        level = "info" if self.status == "answered" else "warning"
+        return event_type, level
+
+    def public_payload(self, run_dir: Path, permission_policy: PermissionPolicy) -> dict[str, Any]:
+        del permission_policy
+        return self.to_json(run_dir)
+
+    def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:
+        del run_dir, tail_bytes
+        return self.result or {"type": "human_input_result", "task_id": self.job_id, "status": self.status}
+
+
+@dataclass
+class HitlTaskExecutor:
+    """In-process executor for human-in-the-loop tasks: register a parked task
+    and wait for an external ``report_result``. No monitor thread."""
+
+    kind: str = "hitl"
+
+    def start(
+        self,
+        manager: BackgroundJobManager,
+        *,
+        prompt: str,
+        choices: tuple[str, ...] = (),
+        created_by: str = "model",
+        resume_on_exit: bool = True,
+    ) -> HitlTask:
+        task_id = f"task_{uuid.uuid4().hex[:12]}"
+        task_dir = manager.recorder.artifacts_dir / "tasks" / task_id
+        task_dir.mkdir(parents=True, exist_ok=False)
+        task = HitlTask(
+            job_id=task_id,
+            kind=self.kind,
+            prompt=str(prompt),
+            choices=tuple(str(choice) for choice in choices),
+            status="running",
+            started_at=time.time(),
+            resume_on_exit=resume_on_exit,
+            created_by=created_by,
+            job_path=task_dir / "task.json",
+            cancel_path=task_dir / "cancel.requested",
+        )
+        manager._register(task)
+        manager.recorder.emit("task.started", data=manager._public_job_payload(task))
+        return task
+
+    def cancel(self, manager: BackgroundJobManager, job: HitlTask) -> None:
+        del manager
+        if job.status == "running":
+            job.status = "cancelled"
+            job.finished_at = time.time()
+
+
+@dataclass
+class HitlResultInjector:
+    """Inject a human answer. Default ``is_background=True`` renders it as a new
+    user message; flip to ``False`` to deliver it as a tool result keyed to the
+    originating ``hitl.request`` call (both shapes supported, per the backend)."""
+
+    kind: str = "hitl"
+    as_user_message: bool = True
+
+    def observations(self, job: HitlTask, run_dir: Path) -> list[ToolObservation]:
+        del run_dir
+        result = dict(job.result or {})
+        answer = str(result.get("answer", ""))
+        message = result.get("message") or (
+            f"Human responded to your request ({job.prompt!r}): {answer}"
+            if answer
+            else f"Human input task {job.job_id} finished with status {job.status}."
+        )
+        output = {
+            "type": "human_input_result",
+            "task_id": job.job_id,
+            "status": job.status,
+            "message": message,
+            **result,
+        }
+        call_id = f"task:{job.job_id}" if self.as_user_message else f"hitl:{job.job_id}"
+        return [
+            ToolObservation(
+                call_id=call_id,
+                tool_name="human_input",
+                output=output,
+                is_background=self.as_user_message,
+            )
+        ]
+
+
+Task = BackgroundJob | HitlTask
+
+
+@dataclass
 class BackgroundJobManager:
     run_id: str
     workspace: Workspace
     recorder: AgentRecorder
     permission_policy: PermissionPolicy
-    jobs: dict[str, BackgroundJob] = field(default_factory=dict)
+    jobs: dict[str, Task] = field(default_factory=dict)
     executors: dict[str, TaskExecutor] = field(default_factory=dict, init=False, repr=False)
     injectors: dict[str, ResultInjector] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -410,13 +580,33 @@ class BackgroundJobManager:
 
     def __post_init__(self) -> None:
         self._condition = threading.Condition(self._lock)
-        self.executors = {"shell": ShellTaskExecutor()}
-        self.injectors = {"shell": ShellResultInjector()}
+        self.executors = {"shell": ShellTaskExecutor(), "hitl": HitlTaskExecutor()}
+        self.injectors = {"shell": ShellResultInjector(), "hitl": HitlResultInjector()}
 
-    def _register(self, job: BackgroundJob) -> None:
+    def _register(self, job: Task) -> None:
         with self._condition:
             self.jobs[job.job_id] = job
             self._write_job(job)
+
+    def start_task(self, kind: str, request: dict[str, Any]) -> Task:
+        """Generic task creation, callable from a tool handler or the backend.
+
+        The executor for ``kind`` decides how the task runs (in-process monitor or
+        parked for an external reporter)."""
+        executor = self.executors.get(kind)
+        if executor is None:
+            raise ToolExecutionError(f"no executor for task kind: {kind}", error_code="task_kind_unknown")
+        return executor.start(self, **request)  # type: ignore[attr-defined]
+
+    def report_result(self, task_id: str, result: dict[str, Any], *, status: str = "answered") -> dict[str, Any]:
+        """External completion entry for hosted tasks (hitl/automation): set the
+        terminal status/result and publish it through the shared reentry pipe."""
+        task = self.get_job(task_id)
+        task.status = status  # type: ignore[assignment]
+        task.finished_at = time.time()
+        task.result = result  # type: ignore[attr-defined]
+        self.mark_ready(task)
+        return {"task_id": task_id, "status": status, "delivered": True}
 
     def mark_ready(self, job: BackgroundJob) -> None:
         """Single completion entry: publish a finished task to the reentry queue.
@@ -586,21 +776,11 @@ class BackgroundJobManager:
             time.sleep(0.02)
 
     def _emit_terminal_event(self, job: BackgroundJob) -> None:
-        event_type = {
-            "exited": "job.finished",
-            "timed_out": "job.timed_out",
-            "cancelled": "job.cancelled",
-            "output_limited": "job.output_limited",
-            "failed": "job.failed",
-        }.get(job.status, "job.failed")
-        level = "info" if job.status == "exited" else "warning"
+        event_type, level = job.terminal_event()
         self.recorder.emit(event_type, data=self._public_job_payload(job), level=level)
 
     def _public_job_payload(self, job: BackgroundJob) -> dict[str, Any]:
-        payload = job.to_json(self.recorder.run_dir)
-        payload["changed_paths"] = job.public_paths(self.permission_policy)
-        payload.pop("command", None)
-        return payload
+        return job.public_payload(self.recorder.run_dir, self.permission_policy)
 
     def _write_job(self, job: BackgroundJob) -> None:
         write_json_atomic(job.job_path, job.to_json(self.recorder.run_dir))

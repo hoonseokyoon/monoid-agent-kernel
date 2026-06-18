@@ -82,13 +82,17 @@ def _openai_tool_schema(tool: Any) -> dict[str, Any]:
 
 def _observation_input_item(observation: Any) -> dict[str, Any]:
     if observation.is_background:
-        return {
-            "role": "user",
-            "content": (
-                "Background shell job completed. Treat this as the result of the previously "
-                f"started job:\n{json.dumps(observation.output, ensure_ascii=False)}"
-            ),
-        }
+        # A background/hosted task result delivered as a new user message. The
+        # injector may pre-format a "message"; otherwise fall back to a generic
+        # async-result preamble (covers shell background jobs).
+        output = observation.output
+        message = output.get("message") if isinstance(output, dict) else None
+        if not message:
+            message = (
+                "An asynchronous task completed. Treat this as the result of the previously "
+                f"started task:\n{json.dumps(output, ensure_ascii=False)}"
+            )
+        return {"role": "user", "content": message}
     return {
         "type": "function_call_output",
         "call_id": observation.call_id,

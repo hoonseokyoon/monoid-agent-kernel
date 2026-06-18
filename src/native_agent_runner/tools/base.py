@@ -68,6 +68,9 @@ class ToolContext(Protocol):
     def job_wait(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def request_human_input(self, args: dict[str, Any]) -> dict[str, Any]:
+        ...
+
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 
