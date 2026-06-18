@@ -47,6 +47,11 @@ class TaskExecutor(Protocol):
     """
 
     kind: str
+    # True for kinds that complete themselves in-process (the shell monitor
+    # thread); False for hosted kinds (hitl/automation) an external reporter
+    # completes. The loop uses this to know whether a parked run awaits external
+    # input vs an in-process job that will finish on its own.
+    in_process: bool
 
     def cancel(self, manager: TaskManager, job: Task) -> None:
         ...
@@ -222,6 +227,7 @@ class ShellTaskExecutor:
     publish completion through ``TaskManager.mark_ready``."""
 
     kind: str = "shell"
+    in_process: bool = True
 
     def start(
         self,
@@ -502,6 +508,7 @@ class HitlTaskExecutor:
     and wait for an external ``report_result``. No monitor thread."""
 
     kind: str = "hitl"
+    in_process: bool = False
 
     def start(
         self,
@@ -732,6 +739,22 @@ class TaskManager:
                 and job.job_id not in self._delivered_reentry_jobs
                 for job in self.jobs.values()
             )
+
+    def external_pending_task_ids(self) -> list[str]:
+        """Undelivered resume-tasks whose executor is NOT in-process — i.e. hosted
+        (hitl/automation) tasks the run is parked on awaiting an external report."""
+        with self._lock:
+            out: list[str] = []
+            for job in self.jobs.values():
+                if (
+                    job.status == "running"
+                    and getattr(job, "resume_on_exit", False)
+                    and job.job_id not in self._delivered_reentry_jobs
+                ):
+                    executor = self.executors.get(job.kind)
+                    if executor is not None and not getattr(executor, "in_process", True):
+                        out.append(job.job_id)
+            return out
 
     def pop_reentry_observations(self) -> list[ToolObservation]:
         """Drain finished resume-tasks and render them through their per-kind

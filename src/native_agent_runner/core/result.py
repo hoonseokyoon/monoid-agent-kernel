@@ -36,6 +36,29 @@ class AgentTurnResult:
 
 
 @dataclass(frozen=True)
+class Suspension:
+    """Why a non-blocking pump (``AgentLoop.run_until_suspended``) returned control.
+
+    ``settled`` — the model produced final text and the run awaits the next user
+    message. ``awaiting_tasks`` — the run parked with no model tool work and
+    pending tasks; ``awaiting_task_ids``/``has_external`` describe the hosted
+    (hitl/automation) tasks a caller must wait on. ``limited`` — a per-submit or
+    session budget was hit. ``terminal`` — cancelled/timed out/failed.
+    For every reason except ``awaiting_tasks`` a settle checkpoint ran and
+    ``turn`` carries its result.
+    """
+
+    reason: Literal["settled", "awaiting_tasks", "limited", "terminal"]
+    status: RunStatus
+    final_text: str = ""
+    error: str = ""
+    error_code: str = ""
+    awaiting_task_ids: tuple[str, ...] = ()
+    has_external: bool = False
+    turn: AgentTurnResult | None = None
+
+
+@dataclass(frozen=True)
 class AgentRunResult:
     run_id: str
     status: RunStatus

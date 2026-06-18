@@ -25,7 +25,7 @@ from native_agent_runner.core.agents import (
 )
 from native_agent_runner.core.manifest import build_run_manifest
 from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
-from native_agent_runner.core.result import AgentRunResult, AgentTurnResult
+from native_agent_runner.core.result import AgentRunResult, AgentTurnResult, Suspension
 from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, input_to_parts, text_from_parts
 from native_agent_runner.core.tool_surface import (
     DefaultToolSurfaceResolver,
@@ -265,6 +265,7 @@ class _Session:
     state: RunState
     res: _RunResources
     session_step: int = 0
+    submit_local_step: int = 0
     terminal: bool = False
 
 
@@ -313,7 +314,27 @@ class AgentLoop:
     def submit(self, user_input: str | tuple[ContentPart, ...]) -> AgentTurnResult:
         """Run one user turn: inject ``user_input`` and step until the model settles
         (no tool calls + final text) or a per-submit limit is hit. The run stays
-        open afterwards; call submit() again to continue or close() to finalize."""
+        open afterwards; call submit() again to continue or close() to finalize.
+
+        Blocking wrapper over ``run_until_suspended``: when the run parks on tasks it
+        waits in-process (shell monitor completes them, or an external thread reports
+        a hosted-task result) and resumes, returning only once the turn settles."""
+        session = self._require_open()
+        suspension = self.run_until_suspended(user_input)
+        while suspension.reason == "awaiting_tasks":
+            self._wait_for_background_jobs(session.res.context, session.res.recorder, session.res.deadline)
+            suspension = self.run_until_suspended(None)
+        assert suspension.turn is not None  # non-awaiting reasons always checkpoint
+        return suspension.turn
+
+    def run_until_suspended(
+        self, user_input: str | tuple[ContentPart, ...] | None = None
+    ) -> Suspension:
+        """Non-blocking pump. With ``user_input`` it starts a new user turn; with
+        ``None`` it resumes a run parked on a task (whose result was already injected
+        via report_task_result). Returns why the run suspended without blocking on
+        tasks — the caller decides how to wait. Every non-``awaiting_tasks`` reason
+        runs a settle checkpoint and attaches the ``AgentTurnResult`` as ``turn``."""
         session = self._require_open()
         if session.terminal:
             raise NativeAgentError(
@@ -321,19 +342,21 @@ class AgentLoop:
                 error_code="run_terminal",
             )
         state, res = session.state, session.res
-        # Per-submit outcome fields describe this turn; reset before running.
-        state.status = "completed"
-        state.error = ""
-        state.error_code = ""
-        state.provider_error_code = ""
-        state.provider_http_status = None
-        state.final_text = ""
-        # A run.finish in a prior submit must not short-circuit this one.
-        res.context.finished = False
-        state.pending_user_input = input_to_parts(user_input)
-        self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
+        if user_input is not None:
+            # Per-submit outcome fields describe this turn; reset before running.
+            state.status = "completed"
+            state.error = ""
+            state.error_code = ""
+            state.provider_error_code = ""
+            state.provider_http_status = None
+            state.final_text = ""
+            # A run.finish in a prior submit must not short-circuit this one.
+            res.context.finished = False
+            state.pending_user_input = input_to_parts(user_input)
+            self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
+            session.submit_local_step = 0
         try:
-            self._run_submit(state, res, session)
+            suspension = self._pump_turn(state, res, session)
         except (RunCancelled, RunTimeout) as exc:
             state.status = "limited"
             state.error = str(exc)
@@ -344,13 +367,28 @@ class AgentLoop:
                 else "Stopped after reaching max duration."
             )
             session.terminal = True
+            return replace(
+                Suspension(reason="terminal", status="limited"),
+                final_text=state.final_text,
+                error=state.error,
+                error_code=state.error_code,
+                turn=self._checkpoint_on_settle(state, res),
+            )
         except Exception as exc:  # controlled recording boundary for standalone CLI
             self._record_failure(state, res, exc)
             session.terminal = True
+            return replace(
+                Suspension(reason="terminal", status="failed"),
+                error=state.error,
+                error_code=state.error_code,
+                turn=self._checkpoint_on_settle(state, res),
+            )
+        if suspension.reason == "awaiting_tasks":
+            return suspension
         if state.error_code == "max_tool_calls_exceeded":
             # Tool-call budget is session-cumulative; once spent the run is done.
             session.terminal = True
-        return self._checkpoint_on_settle(state, res)
+        return replace(suspension, turn=self._checkpoint_on_settle(state, res))
 
     def close(self) -> AgentRunResult:
         """Finalize the run: cancel jobs, write the terminal proposal, emit
@@ -675,15 +713,17 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
-    def _run_submit(self, state: RunState, res: _RunResources, session: _Session) -> None:
+    def _pump_turn(self, state: RunState, res: _RunResources, session: _Session) -> Suspension:
         context = res.context
         recorder = res.recorder
         deadline = res.deadline
-        # Per-submit step budget: each user turn gets a fresh max_steps. session_step
-        # is the global, monotonic turn counter used for unique turn ids.
+        # The per-submit step budget continues across task-wait suspensions within one
+        # submit; session_step is the global, monotonic turn counter for turn ids.
         max_steps = self.spec.limits.max_steps
-        for local_step in range(1, max_steps + 1):
+        while session.submit_local_step < max_steps:
             self._check_run_boundary(deadline)
+            session.submit_local_step += 1
+            local_step = session.submit_local_step
             session.session_step += 1
             step = session.session_step
             background_observations = self._pop_background_observations(context, recorder, step)
@@ -841,15 +881,23 @@ class AgentLoop:
 
             if not turn.tool_calls:
                 if context.job_manager.has_resume_jobs():
-                    self._wait_for_background_jobs(context, recorder, deadline)
+                    # Park without blocking: clear the consumed observations and hand
+                    # control back. The caller waits (in-process monitor completes, or
+                    # an external reporter delivers) and resumes via run_until_suspended.
                     state.pending_observations = ()
-                    continue
+                    external = context.job_manager.external_pending_task_ids()
+                    return Suspension(
+                        reason="awaiting_tasks",
+                        status=state.status,  # type: ignore[arg-type]
+                        awaiting_task_ids=tuple(external),
+                        has_external=bool(external),
+                    )
                 if turn.final_text:
                     state.final_text = turn.final_text
                     # The model has consumed the pending observations and settled;
                     # the next submit must not resend them alongside a new message.
                     state.pending_observations = ()
-                    break
+                    return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
                 raise ModelAdapterError("model returned neither final text nor tool calls")
 
             observations: list[ToolObservation] = []
@@ -883,13 +931,23 @@ class AgentLoop:
 
             if context.finished:
                 state.final_text = context.final_text
-                break
+                return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
             if state.status == "limited":
-                break
-        else:
-            state.status = "limited"
-            state.final_text = "Stopped after reaching max steps."
-            state.error_code = "max_steps_exceeded"
+                return Suspension(
+                    reason="limited",
+                    status=state.status,  # type: ignore[arg-type]
+                    final_text=state.final_text,
+                    error_code=state.error_code,
+                )
+        state.status = "limited"
+        state.final_text = "Stopped after reaching max steps."
+        state.error_code = "max_steps_exceeded"
+        return Suspension(
+            reason="limited",
+            status=state.status,  # type: ignore[arg-type]
+            final_text=state.final_text,
+            error_code=state.error_code,
+        )
 
     def _build_metrics(self, state: RunState, res: _RunResources) -> dict[str, Any]:
         context = res.context
