@@ -35,7 +35,7 @@ from native_agent_runner.core.spec import (
 )
 from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.errors import PermissionDenied
-from native_agent_runner.jobs import (
+from native_agent_runner.tasks import (
     get_job_artifact,
     list_job_artifacts,
     read_job_log_text,

@@ -32,7 +32,7 @@ from native_agent_runner.core.packages import (
 from native_agent_runner.core.projections import project_run_status
 from native_agent_runner.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from native_agent_runner.event_loader import load_event_sinks
-from native_agent_runner.jobs import (
+from native_agent_runner.tasks import (
     get_job_artifact,
     list_job_artifacts,
     read_job_log_text,

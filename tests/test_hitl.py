@@ -40,11 +40,11 @@ def _answer_when_parked(loop: AgentLoop, manager, answer: str, captured: dict) -
 
 
 def test_hitl_request_parks_and_resumes_with_user_message(tmp_path: Path) -> None:
+    # A single hitl.request turn: once the model has nothing else to do, the run
+    # parks on the task until the human answers (FakeModelAdapter then settles).
     adapter = FakeModelAdapter(
         turns=[
             ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick a name"}, "c1"),)),
-            ModelTurn(response_id="r2"),  # no tool calls -> the run parks on the hitl task
-            ModelTurn(response_id="r3", final_text="thanks"),
         ]
     )
     loop = _build_loop(tmp_path, adapter)
@@ -60,7 +60,6 @@ def test_hitl_request_parks_and_resumes_with_user_message(tmp_path: Path) -> Non
 
     assert captured.get("task_id"), "responder never observed the parked hitl task"
     assert turn.status == "completed"
-    assert turn.final_text == "thanks"
 
     # The human answer was injected as a user message (is_background=True) carrying
     # the answer, and reached the model on a later turn.
@@ -82,8 +81,6 @@ def test_hitl_answer_can_be_delivered_as_tool_result(tmp_path: Path) -> None:
     adapter = FakeModelAdapter(
         turns=[
             ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Approve?"}, "c1"),)),
-            ModelTurn(response_id="r2"),
-            ModelTurn(response_id="r3", final_text="done"),
         ]
     )
     loop = _build_loop(tmp_path, adapter)

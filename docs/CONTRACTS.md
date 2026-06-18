@@ -195,6 +195,27 @@ Web availability is the presence of exposed `web.search`, `web.fetch`, and
   live in `ToolBinding.runtime.web`
 - gateway requests include `binding_id`, `max_calls`, and effective constraints
 
+### Async Tasks
+
+Long-running work whose result feeds back to the model — shell background jobs,
+human-in-the-loop requests, automation — flows through one generic task system.
+The core (`TaskManager`) owns the queue, lifecycle, reentry, and artifacts; three
+seams are pluggable:
+
+- `TaskExecutor` — how a task kind runs and when it is done. The shell executor
+  monitors a subprocess in-process; a hosted kind (hitl/automation) has no
+  monitor and is completed by an external reporter.
+- `ResultInjector` — how a finished task is injected into the model: as a tool
+  observation (`is_background=False`) or as a new user message
+  (`is_background=True`). This is the "appropriate way, defined by the integrator".
+- `TaskReporter` — how the backend drives tasks in a running run: `create_task`
+  and `report_result`. Transport-agnostic — only `(task_id, dict)` cross the
+  boundary, so an in-process reporter and a future durable/cross-process reporter
+  share the same shape.
+
+Both the model (via tools such as `hitl.request`) and the backend can create
+tasks; a completed task wakes a parked run through the shared reentry queue.
+
 ### Permission Boundary
 
 `PermissionPolicy` remains the workspace/public-output boundary:

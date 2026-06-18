@@ -46,7 +46,7 @@ from native_agent_runner.errors import (
     ToolExecutionError,
     error_code_for_exception,
 )
-from native_agent_runner.jobs import BackgroundJobManager
+from native_agent_runner.tasks import TaskManager
 from native_agent_runner.permissions import PermissionPolicy, matches_path_patterns
 from native_agent_runner.providers.base import ModelAdapter, ModelRequest, ModelTurn, ToolObservation
 from native_agent_runner.public_view import (
@@ -101,7 +101,7 @@ class AgentToolContext(ToolContext):
     run_id: str
     workspace: Workspace
     recorder: AgentRecorder
-    job_manager: BackgroundJobManager
+    job_manager: TaskManager
     shell_service: ShellService
     web_service: WebService
     jobs_service: JobsService
@@ -436,7 +436,7 @@ class AgentLoop:
             extra_event_sinks=self.event_sinks,
             status_file=self.status_file,
         )
-        job_manager = BackgroundJobManager(
+        job_manager = TaskManager(
             run_id=self.spec.run_id,
             workspace=workspace,
             recorder=recorder,

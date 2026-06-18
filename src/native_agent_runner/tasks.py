@@ -48,7 +48,7 @@ class TaskExecutor(Protocol):
 
     kind: str
 
-    def cancel(self, manager: BackgroundJobManager, job: Task) -> None:
+    def cancel(self, manager: TaskManager, job: Task) -> None:
         ...
 
 
@@ -219,13 +219,13 @@ class BackgroundJob:
 @dataclass
 class ShellTaskExecutor:
     """In-process executor for shell tasks: spawn a subprocess, monitor it, and
-    publish completion through ``BackgroundJobManager.mark_ready``."""
+    publish completion through ``TaskManager.mark_ready``."""
 
     kind: str = "shell"
 
     def start(
         self,
-        manager: BackgroundJobManager,
+        manager: TaskManager,
         *,
         shell_options: ShellExecutionOptions,
         command: str,
@@ -301,7 +301,7 @@ class ShellTaskExecutor:
             manager._wait_startup(job_id, startup_wait_s)
         return job
 
-    def cancel(self, manager: BackgroundJobManager, job: BackgroundJob) -> None:
+    def cancel(self, manager: TaskManager, job: BackgroundJob) -> None:
         # Called under manager._condition. Terminate the live subprocess.
         if job.process is not None and job.status == "running":
             job.status = "cancelled"
@@ -309,7 +309,7 @@ class ShellTaskExecutor:
 
     def _prepare_workspace(
         self,
-        manager: BackgroundJobManager,
+        manager: TaskManager,
         cwd_rel: str,
         execution_workspace: ResolvedShellExecutionWorkspace,
     ) -> tuple[Path, Path | None, Any]:
@@ -330,7 +330,7 @@ class ShellTaskExecutor:
             raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
         return cwd_abs, tmp_root, before
 
-    def _monitor_job(self, manager: BackgroundJobManager, job_id: str) -> None:
+    def _monitor_job(self, manager: TaskManager, job_id: str) -> None:
         job = manager.get_job(job_id)
         try:
             self._monitor_process(manager, job)
@@ -352,7 +352,7 @@ class ShellTaskExecutor:
             self._cleanup_tmp(job)
             manager.mark_ready(job)
 
-    def _monitor_process(self, manager: BackgroundJobManager, job: BackgroundJob) -> None:
+    def _monitor_process(self, manager: TaskManager, job: BackgroundJob) -> None:
         process = job.process
         if process is None:
             job.status = "failed"
@@ -505,7 +505,7 @@ class HitlTaskExecutor:
 
     def start(
         self,
-        manager: BackgroundJobManager,
+        manager: TaskManager,
         *,
         prompt: str,
         choices: tuple[str, ...] = (),
@@ -531,7 +531,7 @@ class HitlTaskExecutor:
         manager.recorder.emit("task.started", data=manager._public_job_payload(task))
         return task
 
-    def cancel(self, manager: BackgroundJobManager, job: HitlTask) -> None:
+    def cancel(self, manager: TaskManager, job: HitlTask) -> None:
         del manager
         if job.status == "running":
             job.status = "cancelled"
@@ -578,7 +578,7 @@ Task = BackgroundJob | HitlTask
 
 
 @dataclass
-class BackgroundJobManager:
+class TaskManager:
     run_id: str
     workspace: Workspace
     recorder: AgentRecorder

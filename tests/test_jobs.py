@@ -1,4 +1,4 @@
-"""Characterization tests pinning current BackgroundJobManager behavior.
+"""Characterization tests pinning current TaskManager behavior.
 
 These lock the shell background-job contract (status transitions, the
 result_observation byte shape, artifact layout, reentry idempotency, and
@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from native_agent_runner.core.events import AgentEvent
-from native_agent_runner.jobs import BackgroundJob, BackgroundJobManager
+from native_agent_runner.tasks import BackgroundJob, TaskManager
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.recorder import AgentRecorder
 from native_agent_runner.shell import ShellExecutionOptions
@@ -36,13 +36,13 @@ class _CaptureSink:
         return None
 
 
-def _manager(tmp_path: Path) -> tuple[BackgroundJobManager, AgentRecorder, _CaptureSink]:
+def _manager(tmp_path: Path) -> tuple[TaskManager, AgentRecorder, _CaptureSink]:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     workspace = LocalWorkspaceBackend(workspace_root, mode="propose", backend_kind="staging")
     sink = _CaptureSink()
     recorder = AgentRecorder(tmp_path / "runs", "run_jobs", extra_event_sinks=(sink,), status_file=False)
-    manager = BackgroundJobManager(
+    manager = TaskManager(
         run_id="run_jobs",
         workspace=workspace,
         recorder=recorder,
@@ -52,7 +52,7 @@ def _manager(tmp_path: Path) -> tuple[BackgroundJobManager, AgentRecorder, _Capt
 
 
 def _start(
-    manager: BackgroundJobManager,
+    manager: TaskManager,
     command: str,
     *,
     timeout_s: int = 10,

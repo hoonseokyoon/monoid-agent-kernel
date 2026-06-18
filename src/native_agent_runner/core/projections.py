@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from native_agent_runner.jobs import list_job_artifacts
+from native_agent_runner.tasks import list_job_artifacts
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.public_view import public_path
 

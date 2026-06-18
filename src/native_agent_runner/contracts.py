@@ -94,6 +94,13 @@ from native_agent_runner.permissions import PermissionPolicy
 # Gateway client seam (the contract the core calls across for web tools)
 from native_agent_runner.web import WebGatewayClient
 
+# Async task seams (executor/injector/reporter the backend plugs in)
+from native_agent_runner.tasks import (
+    ResultInjector,
+    TaskExecutor,
+    TaskReporter,
+)
+
 __all__ = [
     # engine entry / result
     "AgentLoop",
@@ -157,4 +164,8 @@ __all__ = [
     "PermissionPolicy",
     # gateway client seam
     "WebGatewayClient",
+    # async task seams
+    "TaskExecutor",
+    "ResultInjector",
+    "TaskReporter",
 ]

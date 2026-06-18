@@ -5,7 +5,7 @@ from typing import Any
 
 from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.errors import ToolExecutionError, error_code_for_exception
-from native_agent_runner.jobs import BackgroundJobManager
+from native_agent_runner.tasks import TaskManager
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.public_view import public_error_message, public_path
 from native_agent_runner.recorder import AgentRecorder
@@ -34,7 +34,7 @@ class ShellService:
     run_id: str
     workspace: Workspace
     recorder: AgentRecorder
-    job_manager: BackgroundJobManager
+    job_manager: TaskManager
     permission_policy: PermissionPolicy
     approval_provider: ShellApprovalProvider | None = None
     shell_calls: int = 0
