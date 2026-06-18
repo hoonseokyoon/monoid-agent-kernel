@@ -71,6 +71,138 @@ def _backend(tmp_path: Path, workspace: Path, captured_gateway_tokens: list[str]
     )
 
 
+def _hitl_backend(tmp_path: Path, workspace: Path, adapters: list, turns: list) -> RunnerBackend:
+    token_manager = _token_manager()
+
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        adapter = FakeModelAdapter(turns=list(turns))
+        adapters.append(adapter)
+        return adapter
+
+    return RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+    )
+
+
+def _running_hitl_tasks(backend: RunnerBackend, run_id: str) -> list:
+    record = backend._record(run_id)
+    loop = record.loop
+    if loop is None or loop._session is None:
+        return []
+    manager = loop._session.res.context.job_manager
+    return [task for task in list(manager.jobs.values()) if task.kind == "hitl" and task.status == "running"]
+
+
+def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick a name"}, "c1"),))],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Name the project, ask me if unsure.",
+            runtime_config=runtime_config("hitl.request"),
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+
+    def _drain() -> None:
+        for _ in range(1000):
+            if backend._record(run_id).status in {"completed", "failed", "limited"}:
+                return
+            for task in _running_hitl_tasks(backend, run_id):
+                try:
+                    backend.report_task_result(run_id, token, task_id=task.job_id, result={"answer": "Ada"})
+                except Exception:
+                    pass
+            time.sleep(0.01)
+
+    responder = threading.Thread(target=_drain)
+    responder.start()
+    status = backend.wait_for_run(run_id, timeout_s=20)
+    responder.join(timeout=5)
+
+    assert status == "completed"
+    hitl_obs = [
+        obs
+        for adapter in adapters
+        for request in adapter.requests
+        for obs in request.observations
+        if obs.tool_name == "human_input"
+    ]
+    assert hitl_obs, "the human answer never reached the model through the backend"
+    assert hitl_obs[0].output["answer"] == "Ada"
+
+
+def test_backend_create_task_injects_into_running_run(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick a name"}, "c1"),))],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Name it, ask me.",
+            runtime_config=runtime_config("hitl.request"),
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    created: dict = {}
+
+    def _drain() -> None:
+        for _ in range(1000):
+            if backend._record(run_id).status in {"completed", "failed", "limited"}:
+                return
+            running = _running_hitl_tasks(backend, run_id)
+            # Once the model's task is parked, inject a backend-initiated task too.
+            if running and "task_id" not in created:
+                try:
+                    created.update(backend.create_task(run_id, token, kind="hitl", request={"prompt": "backend asks"}))
+                except Exception:
+                    pass
+            for task in _running_hitl_tasks(backend, run_id):
+                try:
+                    backend.report_task_result(run_id, token, task_id=task.job_id, result={"answer": "X"})
+                except Exception:
+                    pass
+            time.sleep(0.01)
+
+    responder = threading.Thread(target=_drain)
+    responder.start()
+    status = backend.wait_for_run(run_id, timeout_s=20)
+    responder.join(timeout=5)
+
+    assert status == "completed"
+    assert created.get("task_id"), "backend-initiated create_task did not return a task id"
+    hitl_obs = [
+        obs
+        for adapter in adapters
+        for request in adapter.requests
+        for obs in request.observations
+        if obs.tool_name == "human_input"
+    ]
+    # Both the model-initiated and backend-initiated tasks were delivered.
+    assert len(hitl_obs) >= 2
+
+
 def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
     manager = _token_manager()
     token = manager.issue(

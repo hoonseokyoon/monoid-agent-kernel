@@ -64,6 +64,19 @@ class ResultInjector(Protocol):
         ...
 
 
+class TaskReporter(Protocol):
+    """The seam a backend uses to drive tasks in a running run: create a task and
+    report its terminal result. Transport-agnostic — only plain ``(task_id, dict)``
+    cross the boundary, so an in-process reporter (the live manager) and a future
+    durable/cross-process reporter share the same shape."""
+
+    def create_task(self, kind: str, request: dict[str, Any]) -> str:
+        ...
+
+    def report_result(self, task_id: str, result: dict[str, Any], *, status: str = "answered") -> dict[str, Any]:
+        ...
+
+
 @dataclass
 class BackgroundJob:
     job_id: str
@@ -597,6 +610,10 @@ class BackgroundJobManager:
         if executor is None:
             raise ToolExecutionError(f"no executor for task kind: {kind}", error_code="task_kind_unknown")
         return executor.start(self, **request)  # type: ignore[attr-defined]
+
+    def create_task(self, kind: str, request: dict[str, Any]) -> str:
+        """TaskReporter entry: create a task and return its id (backend-initiated)."""
+        return self.start_task(kind, request).job_id
 
     def report_result(self, task_id: str, result: dict[str, Any], *, status: str = "answered") -> dict[str, Any]:
         """External completion entry for hosted tasks (hitl/automation): set the

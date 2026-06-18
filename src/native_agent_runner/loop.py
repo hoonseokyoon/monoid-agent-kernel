@@ -413,6 +413,13 @@ class AgentLoop:
         session = self._require_open()
         return session.res.context.job_manager.report_result(task_id, result, status=status)
 
+    def create_task(self, kind: str, request: dict[str, Any]) -> str:
+        """Create a task in the running run from outside the loop (backend-initiated
+        automation/hitl). Returns the task id; its result is delivered later via
+        report_task_result."""
+        session = self._require_open()
+        return session.res.context.job_manager.create_task(kind, request)
+
     def _require_open(self) -> _Session:
         if self._session is None:
             raise NativeAgentError("run is not open; call open() first", error_code="run_not_open")

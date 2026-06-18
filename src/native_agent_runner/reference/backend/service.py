@@ -120,6 +120,7 @@ class BackendRunRecord:
     runtime_config: AgentRuntimeConfig | None = None
     runtime_config_issuer: str = ""
     runtime_config_reason: str = ""
+    loop: AgentLoop | None = None
 
 
 @dataclass
@@ -509,6 +510,43 @@ class RunnerBackend:
                 "config_hash": config.config_hash,
             }
 
+    def report_task_result(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        task_id: str,
+        result: dict[str, Any],
+        status: str = "answered",
+    ) -> dict[str, Any]:
+        """Deliver a hosted-task result (e.g. a human answer) into a running run,
+        waking it if parked. Mirrors the in-process TaskReporter over the live loop."""
+        loop = self._authorize_active_loop(run_id, token)
+        return loop.report_task_result(task_id, result, status=status)
+
+    def create_task(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        kind: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Backend-initiated task creation in a running run (automation/hitl)."""
+        loop = self._authorize_active_loop(run_id, token)
+        return {"task_id": loop.create_task(kind, request)}
+
+    def _authorize_active_loop(self, run_id: str, token: str) -> AgentLoop:
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            if record.status in {"completed", "failed", "limited"}:
+                raise ValueError("cannot drive tasks for a terminal run")
+            loop = record.loop
+        if loop is None:
+            raise ValueError("run has not started")
+        return loop
+
     def proposal_file(self, run_id: str, token: str, path: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)
         record = self._record(run_id)
@@ -733,7 +771,7 @@ class RunnerBackend:
                 llm_gateway_token,
                 runtime_config.model if runtime_config is not None else None,
             )
-            result = AgentLoop(
+            loop = AgentLoop(
                 spec=spec,
                 model_adapter=adapter,
                 event_sinks=(BackendRunStateSink(self, run_id),),
@@ -742,7 +780,10 @@ class RunnerBackend:
                 shell_approval_provider=None,
                 web_gateway_client=self._web_gateway_client(web_gateway_token),
                 runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
-            ).run_once(request.instruction)
+            )
+            with self._lock:
+                self._records[run_id].loop = loop
+            result = loop.run_once(request.instruction)
             with self._lock:
                 record = self._records[run_id]
                 record.result = result
