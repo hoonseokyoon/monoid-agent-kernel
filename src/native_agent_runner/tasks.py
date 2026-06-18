@@ -675,6 +675,41 @@ class TaskManager:
             self.jobs[job.job_id] = job
             self._write_job(job)
 
+    def checkpoint_payload(self) -> dict[str, Any]:
+        """Read-only durable snapshot of the hosted tasks and reentry bookkeeping for
+        ``run_dir/checkpoint.json``. All hosted tasks are captured (not just running
+        ones) so an answered-but-undelivered task's result is not lost on restore.
+        Shell ``BackgroundJob``s are intentionally omitted — they are never restored
+        live (a subprocess can't cross a process boundary)."""
+        with self._lock:
+            return {
+                "hosted_tasks": [
+                    task.checkpoint_json()
+                    for task in self.jobs.values()
+                    if isinstance(task, HostedTask)
+                ],
+                "reentry_queue": list(self._reentry_queue),
+                "delivered_reentry_jobs": sorted(self._delivered_reentry_jobs),
+            }
+
+    def restore_state(
+        self,
+        hosted_tasks: list[HostedTask],
+        *,
+        reentry_queue: list[str],
+        delivered_reentry_jobs: list[str],
+    ) -> None:
+        """Rehydrate parked hosted tasks and reentry bookkeeping into a freshly
+        bootstrapped manager (durable restore). The task.json files already exist on
+        disk, so this only re-registers the in-memory objects — it does not re-write
+        them. Shell jobs are never restored live; see AgentLoop._rehydrate for the
+        crashed-shell -> failed-observation path."""
+        with self._condition:
+            for task in hosted_tasks:
+                self.jobs[task.job_id] = task
+            self._reentry_queue = list(reentry_queue)
+            self._delivered_reentry_jobs = set(delivered_reentry_jobs)
+
     def start_task(self, kind: str, request: dict[str, Any]) -> Task:
         """Generic task creation, callable from a tool handler or the backend.
 
@@ -822,6 +857,20 @@ class TaskManager:
                     if executor is not None and not getattr(executor, "in_process", True):
                         out.append(job.job_id)
             return out
+
+    def outstanding_resume_task_ids(self) -> set[str]:
+        """Read-only: ids of every undelivered resume-task still running, regardless
+        of executor kind. The difference against ``external_pending_task_ids`` is the
+        set of live in-process (shell) tasks — AgentLoop.snapshot() uses it to refuse a
+        snapshot while a shell job is still alive (a live subprocess can't be restored)."""
+        with self._lock:
+            return {
+                job.job_id
+                for job in self.jobs.values()
+                if getattr(job, "resume_on_exit", False)
+                and job.status == "running"
+                and job.job_id not in self._delivered_reentry_jobs
+            }
 
     def pop_reentry_observations(self) -> list[ToolObservation]:
         """Drain finished resume-tasks and render them through their per-kind

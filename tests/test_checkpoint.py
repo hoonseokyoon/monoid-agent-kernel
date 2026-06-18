@@ -1,8 +1,11 @@
-"""Durable-persistence serializers and checkpoint I/O (Phase G)."""
+"""Durable-persistence serializers, checkpoint I/O, and snapshot/restore."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+from conftest import runtime_config, runtime_provider
 
 from native_agent_runner.core.checkpoint import (
     SCHEMA_VERSION,
@@ -10,8 +13,27 @@ from native_agent_runner.core.checkpoint import (
     read_checkpoint,
     write_checkpoint,
 )
-from native_agent_runner.providers.base import ToolObservation
+from native_agent_runner.core.spec import AgentRunSpec
+from native_agent_runner.loop import AgentLoop
+from native_agent_runner.providers.base import ModelTurn, ToolObservation
+from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.tasks import HostedTask
+
+
+def _hitl_parked_loop(spec: AgentRunSpec) -> tuple[AgentLoop, str, Path, Path]:
+    """Open a loop, drive a turn that requests human input, and leave it parked on the
+    hosted task (no close). Returns the loop, the parked task id, the run dir, and the
+    artifacts dir — the setup shared by the restore tests."""
+    provider = runtime_provider(runtime_config("hitl.request"))
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick"}, "c1"),))]
+    )
+    loop = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=provider)
+    loop.open()
+    suspension = loop.run_until_suspended("ask the human")
+    assert suspension.reason == "awaiting_tasks"
+    recorder = loop._session.res.recorder  # type: ignore[union-attr]
+    return loop, suspension.awaiting_task_ids[0], recorder.run_dir, recorder.artifacts_dir
 
 
 def test_tool_observation_round_trip() -> None:
@@ -90,3 +112,85 @@ def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
     path = tmp_path / "checkpoint.json"
     path.write_text(path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "bogus.v0"), encoding="utf-8")
     assert read_checkpoint(tmp_path) is None
+
+
+def test_snapshot_writes_checkpoint_at_hosted_park(tmp_path: Path) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop, _task_id, run_dir, _artifacts = _hitl_parked_loop(spec)
+
+    # The persist hook wrote a non-terminal checkpoint at the awaiting_tasks park.
+    cp = read_checkpoint(run_dir)
+    assert cp is not None
+    assert cp.terminal is False
+    assert cp.previous_turn_handle == "r1"
+    assert len(cp.hosted_tasks) == 1
+    # snapshot() is a pure read: calling it again yields an equal payload, save the
+    # wall-clock remaining_duration_s (a derived countdown, not run state).
+    again = loop.snapshot().to_json()  # type: ignore[union-attr]
+    again.pop("remaining_duration_s")
+    expected = cp.to_json()
+    expected.pop("remaining_duration_s")
+    assert again == expected
+
+
+def test_restore_resumes_parked_hitl_in_fresh_loop(tmp_path: Path) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop1, task_id, run_dir, _artifacts = _hitl_parked_loop(spec)
+    cp = read_checkpoint(run_dir)
+    assert cp is not None
+    del loop1  # simulate process death WITHOUT close()
+
+    # Fresh "process": brand-new loop + adapter over the same run dir.
+    provider = runtime_provider(runtime_config("hitl.request"))
+    adapter2 = FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="thanks")])
+    loop2 = AgentLoop(spec=spec, model_adapter=adapter2, runtime_config_provider=provider)
+    loop2.restore(cp)
+
+    # The hosted task is re-registered, so an external report wakes the parked run.
+    loop2.report_task_result(task_id, {"answer": "Ada"})
+    suspension = loop2.run_until_suspended(None)
+    loop2.close()
+
+    assert suspension.reason == "settled"
+    assert suspension.turn is not None and suspension.turn.final_text == "thanks"
+    # The hitl answer reached the model, and the conversation continued by reference
+    # from the pre-restart turn handle (no transcript replay).
+    hitl_obs = [
+        obs for req in adapter2.requests for obs in req.observations if obs.tool_name == "human_input"
+    ]
+    assert hitl_obs and hitl_obs[0].output["answer"] == "Ada"
+    assert adapter2.requests[0].previous_turn_handle == "r1"
+    # A finalized run leaves no checkpoint behind.
+    assert read_checkpoint(run_dir) is None
+
+
+def test_restore_folds_crashed_shell_job_as_failed_observation(tmp_path: Path) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop1, _task_id, run_dir, artifacts = _hitl_parked_loop(spec)
+    cp = read_checkpoint(run_dir)
+    assert cp is not None
+    del loop1
+
+    # Plant a shell job left "running" on disk — its subprocess was lost on the crash.
+    job_dir = artifacts / "jobs" / "job_dead"
+    job_dir.mkdir(parents=True)
+    (job_dir / "job.json").write_text(
+        json.dumps({"job_id": "job_dead", "status": "running", "command_preview": "sleep 999"}),
+        encoding="utf-8",
+    )
+
+    provider = runtime_provider(runtime_config("hitl.request"))
+    adapter2 = FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="ok")])
+    loop2 = AgentLoop(spec=spec, model_adapter=adapter2, runtime_config_provider=provider)
+    loop2.restore(cp)
+
+    pending = loop2._session.state.pending_observations  # type: ignore[union-attr]
+    failed = [obs for obs in pending if obs.output.get("status") == "failed"]
+    assert failed and failed[0].output["job_id"] == "job_dead"
+    assert failed[0].output["error"] == "process lost on restart"
+    loop2.close()
+
+
+def _mk(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path

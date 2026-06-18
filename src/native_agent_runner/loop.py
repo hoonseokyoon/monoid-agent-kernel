@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any
 
 from native_agent_runner.core.cancellation import CancellationToken
+from native_agent_runner.core.checkpoint import (
+    CHECKPOINT_FILENAME,
+    RunCheckpoint,
+    write_checkpoint,
+)
 from native_agent_runner.core.events import AgentEvent, EventSink
-from native_agent_runner.core.content import ContentPart, non_text_part_types
+from native_agent_runner.core.content import (
+    ContentPart,
+    content_part_from_json,
+    content_part_to_json,
+    non_text_part_types,
+)
 from native_agent_runner.core.context import (
     ContextProvider,
     TurnContext,
@@ -46,7 +57,7 @@ from native_agent_runner.errors import (
     ToolExecutionError,
     error_code_for_exception,
 )
-from native_agent_runner.tasks import TaskManager
+from native_agent_runner.tasks import HostedTask, TaskManager
 from native_agent_runner.permissions import PermissionPolicy, matches_path_patterns
 from native_agent_runner.providers.base import ModelAdapter, ModelRequest, ModelTurn, ToolObservation
 from native_agent_runner.public_view import (
@@ -289,6 +300,7 @@ class AgentLoop:
     inject_workspace_index: bool = False
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
+    _restoring: bool = field(default=False, init=False, repr=False)
 
     def open(self) -> None:
         """Bootstrap the run and leave it idle, ready to accept submit().
@@ -367,22 +379,26 @@ class AgentLoop:
                 else "Stopped after reaching max duration."
             )
             session.terminal = True
-            return replace(
+            result = replace(
                 Suspension(reason="terminal", status="limited"),
                 final_text=state.final_text,
                 error=state.error,
                 error_code=state.error_code,
                 turn=self._checkpoint_on_settle(state, res),
             )
+            self._persist_checkpoint(session)
+            return result
         except Exception as exc:  # controlled recording boundary for standalone CLI
             self._record_failure(state, res, exc)
             session.terminal = True
-            return replace(
+            result = replace(
                 Suspension(reason="terminal", status="failed"),
                 error=state.error,
                 error_code=state.error_code,
                 turn=self._checkpoint_on_settle(state, res),
             )
+            self._persist_checkpoint(session)
+            return result
         if suspension.reason == "awaiting_tasks":
             if suspension.has_external:
                 # Parked on a hosted task awaiting an external report (hitl/automation).
@@ -390,11 +406,14 @@ class AgentLoop:
                     "run.awaiting_input",
                     data={"reason": "task", "task_ids": list(suspension.awaiting_task_ids)},
                 )
+            self._persist_checkpoint(session)
             return suspension
         if state.error_code == "max_tool_calls_exceeded":
             # Tool-call budget is session-cumulative; once spent the run is done.
             session.terminal = True
-        return replace(suspension, turn=self._checkpoint_on_settle(state, res))
+        result = replace(suspension, turn=self._checkpoint_on_settle(state, res))
+        self._persist_checkpoint(session)
+        return result
 
     def await_user_input(self) -> None:
         """Signal that the run is parked awaiting the next user message. A
@@ -427,6 +446,9 @@ class AgentLoop:
         run.finished, close the recorder, and return the cumulative result."""
         session = self._require_open()
         result = self._finalize(session.state, session.res)
+        # A finalized run has nothing to recover: drop any park-point checkpoint so the
+        # backend's restart scanner does not try to resume a completed run.
+        (session.res.recorder.run_dir / CHECKPOINT_FILENAME).unlink(missing_ok=True)
         self._session = None
         return result
 
@@ -483,6 +505,165 @@ class AgentLoop:
         session = self._require_open()
         return session.res.context.job_manager.report_result(task_id, result, status=status)
 
+    # --- durable persistence (state-snapshot at park points) ---
+
+    def snapshot(self) -> RunCheckpoint | None:
+        """Capture the run's park-point state as a ``RunCheckpoint``, or ``None`` when
+        a durable snapshot is unsafe right now. Pure read — never mutates state or jobs.
+
+        Refuses (returns ``None``) while a live in-process (shell) resume-task is still
+        running: its subprocess can't cross a process boundary, so the park only becomes
+        durable once just hosted (hitl/automation) tasks remain. The conversation itself
+        is held by the provider via ``previous_turn_handle``, so the LLM transcript is
+        never serialized here."""
+        session = self._require_open()
+        state = session.state
+        res = session.res
+        manager = res.context.job_manager
+        if manager.has_resume_jobs():
+            hosted = set(manager.external_pending_task_ids())
+            if not manager.outstanding_resume_task_ids().issubset(hosted):
+                return None
+        tasks_payload = manager.checkpoint_payload()
+        pending_input = (
+            [content_part_to_json(part) for part in state.pending_user_input]
+            if state.pending_user_input is not None
+            else None
+        )
+        return RunCheckpoint(
+            run_id=self.spec.run_id,
+            status=state.status,
+            error=state.error,
+            error_code=state.error_code,
+            provider_error_code=state.provider_error_code,
+            provider_http_status=state.provider_http_status,
+            final_text=state.final_text,
+            previous_turn_handle=state.previous_turn_handle,
+            pending_user_input=pending_input,
+            pending_observations=[obs.to_json() for obs in state.pending_observations],
+            pending_binding_loads=list(state.pending_binding_loads),
+            tool_call_counts=dict(state.tool_call_counts),
+            total_tool_calls=state.total_tool_calls,
+            total_usage=dict(state.total_usage),
+            session_step=session.session_step,
+            submit_local_step=session.submit_local_step,
+            terminal=session.terminal,
+            hosted_tasks=tasks_payload["hosted_tasks"],
+            reentry_queue=tasks_payload["reentry_queue"],
+            delivered_reentry_jobs=tasks_payload["delivered_reentry_jobs"],
+            remaining_duration_s=(res.deadline - time.time()) if res.deadline is not None else None,
+            cancellation_requested=bool(
+                self.cancellation_token is not None and self.cancellation_token.requested
+            ),
+        )
+
+    def _persist_checkpoint(self, session: _Session) -> None:
+        """Best-effort durable checkpoint at a park point. No-op when ``snapshot()``
+        refuses (a live shell job is parked-on) — that park is simply not durable yet."""
+        checkpoint = self.snapshot()
+        if checkpoint is not None:
+            write_checkpoint(session.res.recorder.run_dir, checkpoint)
+
+    def restore(self, checkpoint: RunCheckpoint) -> None:
+        """Reopen a previously-checkpointed run, rehydrating its session from
+        ``checkpoint`` instead of starting fresh. Like ``open()`` but: no second
+        ``run.started``/manifest, ``workspace.base.json`` left untouched, parked hosted
+        tasks re-registered, and any in-process shell job that died on the crash folded
+        in as a failed observation so the model re-decides on the next pump."""
+        if self._session is not None:
+            raise NativeAgentError("run is already open", error_code="run_already_open")
+        self._restoring = True
+        try:
+            res = self._bootstrap()
+        finally:
+            self._restoring = False
+        self._rehydrate(checkpoint, res)
+
+    def _rehydrate(self, cp: RunCheckpoint, res: _RunResources) -> None:
+        # Deadline carry-over: downtime while parked does not count against
+        # max_duration_s (a run parked overnight on a human should not time out). Keep
+        # the elapsed-so-far consistent so _build_metrics duration stays sane.
+        if cp.remaining_duration_s is not None:
+            now = time.time()
+            max_duration_s = self.spec.limits.max_duration_s
+            started = (
+                now - (max_duration_s - cp.remaining_duration_s)
+                if max_duration_s is not None
+                else res.started
+            )
+            res = replace(res, deadline=now + cp.remaining_duration_s, started=started)
+        state = RunState(
+            status=cp.status,
+            error=cp.error,
+            error_code=cp.error_code,
+            provider_error_code=cp.provider_error_code,
+            provider_http_status=cp.provider_http_status,
+            final_text=cp.final_text,
+            previous_turn_handle=cp.previous_turn_handle,
+            pending_user_input=(
+                tuple(content_part_from_json(part) for part in cp.pending_user_input)
+                if cp.pending_user_input is not None
+                else None
+            ),
+            pending_observations=tuple(ToolObservation.from_json(obs) for obs in cp.pending_observations),
+            pending_binding_loads=tuple(cp.pending_binding_loads),
+            tool_call_counts=dict(cp.tool_call_counts),
+            total_tool_calls=cp.total_tool_calls,
+            total_usage=dict(cp.total_usage)
+            or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+        manager = res.context.job_manager
+        manager.restore_state(
+            [HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir) for payload in cp.hosted_tasks],
+            reentry_queue=cp.reentry_queue,
+            delivered_reentry_jobs=cp.delivered_reentry_jobs,
+        )
+        crashed = self._crashed_shell_observations(res)
+        if crashed:
+            state.pending_observations = state.pending_observations + crashed
+        if cp.cancellation_requested and self.cancellation_token is not None:
+            self.cancellation_token.cancel()
+        self._session = _Session(
+            state=state,
+            res=res,
+            session_step=cp.session_step,
+            submit_local_step=cp.submit_local_step,
+            terminal=cp.terminal,
+        )
+
+    def _crashed_shell_observations(self, res: _RunResources) -> tuple[ToolObservation, ...]:
+        """A shell ``BackgroundJob`` left ``running`` in ``artifacts/jobs/*/job.json``
+        means its subprocess was lost on the crash (it cannot be restored). Surface
+        each as a failed background-job observation so the model re-decides; the
+        original logs stay on disk untouched."""
+        jobs_dir = res.recorder.artifacts_dir / "jobs"
+        if not jobs_dir.is_dir():
+            return ()
+        observations: list[ToolObservation] = []
+        for job_file in sorted(jobs_dir.glob("*/job.json")):
+            try:
+                payload = json.loads(job_file.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            if payload.get("status") != "running":
+                continue
+            job_id = str(payload.get("job_id") or job_file.parent.name)
+            observations.append(
+                ToolObservation(
+                    call_id=f"background:{job_id}",
+                    tool_name="background_job",
+                    output={
+                        "type": "background_job_result",
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error": "process lost on restart",
+                        "command_preview": str(payload.get("command_preview") or ""),
+                    },
+                    is_background=True,
+                )
+            )
+        return tuple(observations)
+
     def create_task(self, kind: str, request: dict[str, Any]) -> str:
         """Create a task in the running run from outside the loop (backend-initiated
         automation/hitl). Returns the task id; its result is delivered later via
@@ -505,6 +686,7 @@ class AgentLoop:
             self.spec.run_id,
             extra_event_sinks=self.event_sinks,
             status_file=self.status_file,
+            reopen=self._restoring,
         )
         job_manager = TaskManager(
             run_id=self.spec.run_id,
@@ -581,45 +763,50 @@ class AgentLoop:
             segment = provider.static_segment()
             if segment and segment.strip():
                 static_segments.append(segment)
-        workspace_base_path = recorder.write_workspace_base(
-            workspace.workspace_base_payload(self.spec.run_id)
-        )
-        manifest = build_run_manifest(
-            self.spec,
-            model_config=initial_runtime_config.model or ModelConfig(),
-            tool_specs=initial_visible_tool_specs,
-            permission_policy=self.permission_policy,
-            tool_surface=tool_surface_manifest(
-                resolver=self.tool_surface_resolver,
-                tool_search=initial_runtime_config.tool_search,
-                dynamic_enabled=bool(self._dynamic_providers()),
-                initial_catalog_count=len(initial_bound_catalog.tools),
-            ),
-            agent_config={
-                "definition_id": initial_runtime_config.definition_id,
-                "config_version": initial_runtime_config.config_version,
-                "config_hash": initial_runtime_config.config_hash,
-            },
-            workspace_index_path=str(workspace_index_path.relative_to(recorder.run_dir).as_posix()),
-            workspace_base_path=str(workspace_base_path.relative_to(recorder.run_dir).as_posix()),
-        )
-        recorder.write_manifest(manifest)
-        recorder.emit(
-            "run.started",
-            data={
-                "workspace": str(self.spec.workspace_root),
-                "run_dir": str(recorder.run_dir),
-                "manifest_path": "manifest.json",
-                "mode": self.spec.mode,
-                "workspace_backend": self.spec.workspace_backend,
-                "workspace_base_path": "workspace.base.json",
-                "model_provider": (initial_runtime_config.model or ModelConfig()).provider,
-                "model": (initial_runtime_config.model or ModelConfig()).model,
-                "reasoning_effort": (initial_runtime_config.model or ModelConfig()).reasoning.effort,
-                "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
-                "agent_config_hash": initial_runtime_config.config_hash,
-            },
-        )
+        # On restore (_rehydrate) the run dir already holds workspace.base.json,
+        # manifest.json, and a recorded run.started. Re-writing the base would reset
+        # the diff baseline; re-emitting run.started would double the lifecycle. Skip
+        # all bootstrap side-effects and reuse what is already on disk.
+        if not self._restoring:
+            workspace_base_path = recorder.write_workspace_base(
+                workspace.workspace_base_payload(self.spec.run_id)
+            )
+            manifest = build_run_manifest(
+                self.spec,
+                model_config=initial_runtime_config.model or ModelConfig(),
+                tool_specs=initial_visible_tool_specs,
+                permission_policy=self.permission_policy,
+                tool_surface=tool_surface_manifest(
+                    resolver=self.tool_surface_resolver,
+                    tool_search=initial_runtime_config.tool_search,
+                    dynamic_enabled=bool(self._dynamic_providers()),
+                    initial_catalog_count=len(initial_bound_catalog.tools),
+                ),
+                agent_config={
+                    "definition_id": initial_runtime_config.definition_id,
+                    "config_version": initial_runtime_config.config_version,
+                    "config_hash": initial_runtime_config.config_hash,
+                },
+                workspace_index_path=str(workspace_index_path.relative_to(recorder.run_dir).as_posix()),
+                workspace_base_path=str(workspace_base_path.relative_to(recorder.run_dir).as_posix()),
+            )
+            recorder.write_manifest(manifest)
+            recorder.emit(
+                "run.started",
+                data={
+                    "workspace": str(self.spec.workspace_root),
+                    "run_dir": str(recorder.run_dir),
+                    "manifest_path": "manifest.json",
+                    "mode": self.spec.mode,
+                    "workspace_backend": self.spec.workspace_backend,
+                    "workspace_base_path": "workspace.base.json",
+                    "model_provider": (initial_runtime_config.model or ModelConfig()).provider,
+                    "model": (initial_runtime_config.model or ModelConfig()).model,
+                    "reasoning_effort": (initial_runtime_config.model or ModelConfig()).reasoning.effort,
+                    "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
+                    "agent_config_hash": initial_runtime_config.config_hash,
+                },
+            )
         return _RunResources(
             workspace=workspace,
             recorder=recorder,

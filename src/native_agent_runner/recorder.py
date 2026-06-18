@@ -163,6 +163,10 @@ class AgentRecorder:
     run_id: str
     extra_event_sinks: tuple[EventSink, ...] = ()
     status_file: bool = True
+    # Durable restore: reopen an existing run dir instead of requiring a fresh one.
+    # Transcript/events sinks already append, so reopening just tolerates the existing
+    # artifacts dir rather than failing the run-id-collision guard.
+    reopen: bool = False
     run_dir: Path = field(init=False)
     artifacts_dir: Path = field(init=False)
     event_bus: EventBus = field(init=False)
@@ -173,7 +177,7 @@ class AgentRecorder:
     def __post_init__(self) -> None:
         self.run_dir = self.run_root / self.run_id
         self.artifacts_dir = self.run_dir / "artifacts"
-        self.artifacts_dir.mkdir(parents=True, exist_ok=False)
+        self.artifacts_dir.mkdir(parents=True, exist_ok=self.reopen)
         self._transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
         sinks: list[EventSink] = [JsonlEventSink(self.run_dir / "events.jsonl")]
         if self.status_file:
