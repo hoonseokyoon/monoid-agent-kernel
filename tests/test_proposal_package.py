@@ -63,13 +63,12 @@ def _run_with_created_and_modified_files(tmp_path: Path) -> tuple[Path, Path]:
     )
     result = AgentLoop(
         spec=AgentRunSpec(
-            instruction="Prepare package.",
             workspace_root=workspace,
             run_root=tmp_path / "runs",
         ),
         model_adapter=adapter,
         runtime_config_provider=_provider("fs.write", "run.finish"),
-    ).run()
+    ).run_once("Prepare package.")
     return workspace, result.run_dir
 
 
@@ -201,13 +200,12 @@ def test_package_apply_deleted_file_and_directory_entries(tmp_path: Path) -> Non
 
     result = AgentLoop(
         spec=AgentRunSpec(
-            instruction="Delete old files.",
             workspace_root=workspace,
             run_root=tmp_path / "runs",
         ),
         model_adapter=adapter,
         runtime_config_provider=_provider("fs.delete", "run.finish"),
-    ).run()
+    ).run_once("Delete old files.")
 
     assert result.status == "completed"
     assert workspace.joinpath("old.txt").exists()

@@ -16,6 +16,26 @@ class AgentArtifact:
 
 
 @dataclass(frozen=True)
+class AgentTurnResult:
+    """Result of a single ``submit()`` (one user turn settling).
+
+    Non-terminal: the run stays open for further submits. ``proposal_*`` reflect
+    the accumulated workspace changes so far (preview), and ``turn_handle`` is the
+    continuation handle to thread into the next user turn.
+    """
+
+    status: RunStatus
+    final_text: str
+    proposal_path: Path
+    proposal_hash: str
+    changed_paths: tuple[str, ...] = ()
+    turn_handle: str | None = None
+    error: str = ""
+    error_code: str = ""
+    metrics: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class AgentRunResult:
     run_id: str
     status: RunStatus
@@ -29,3 +49,4 @@ class AgentRunResult:
     metrics: dict[str, object] = field(default_factory=dict)
     error: str = ""
     error_code: str = ""
+    final_turn_handle: str | None = None

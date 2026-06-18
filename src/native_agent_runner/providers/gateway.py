@@ -143,8 +143,12 @@ class GatewayModelAdapter:
                 }
                 for observation in request.observations
             ]
+            # Third shape: a new user message delivered on top of an existing
+            # continuation handle (user follow-up). observations is typically empty here.
+            if request.instruction:
+                payload["instruction"] = request.instruction
         else:
-            payload["instruction"] = request.instruction
+            payload["instruction"] = request.instruction or ""
         return payload
 
 

@@ -33,7 +33,13 @@ class ModelTurn:
 
 @dataclass(frozen=True)
 class ModelRequest:
-    instruction: str
+    # The new user message for this turn, or None when the turn only carries tool
+    # observations. Combined with ``previous_turn_handle`` this selects one of three
+    # wire shapes:
+    #   - no handle, instruction set        -> first turn
+    #   - handle set, instruction None       -> tool continuation (observations only)
+    #   - handle set, instruction set        -> user follow-up (the third shape)
+    instruction: str | None
     system_prompt: str
     tools: tuple[ToolSpec, ...]
     previous_turn_handle: str | None = None

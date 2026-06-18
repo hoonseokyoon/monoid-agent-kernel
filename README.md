@@ -33,7 +33,9 @@ native-agent run \
 ```
 
 Run spec and runtime config are separate. `AgentRunSpec` carries workspace,
-instruction, limits, and permission boundary values. `AgentRuntimeConfig`
+limits, and permission boundary values — it no longer carries the instruction,
+which is delivered as the first user turn (CLI `--instruction`, or
+`AgentLoop.run_once()` / `submit()` programmatically). `AgentRuntimeConfig`
 carries model, prompt, tool bindings, guidance, scope, quota, shell runtime, and
 web runtime values. You can pass a run spec JSON file with a runtime config
 file:
@@ -41,8 +43,16 @@ file:
 ```bash
 native-agent run \
   --spec examples/run-spec.json \
+  --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
   --runtime-config-file examples/runtime-config.json
 ```
+
+Programmatic callers drive the run with `AgentLoop.run_once(instruction)` for the
+one-shot case, or `open()` → `submit(user_input)`* → `close()` for a multi-turn
+session in a single run. Each `submit()` settles when the model returns final
+text with no tool calls; the workspace and model continuation thread across
+submits. `commit_checkpoint()` re-baselines the proposal between turns when you
+want incremental apply.
 
 The default mode is `propose`, which means the runner creates a proposal package
 without committing to tenant source-of-truth storage. Local CLI runs default to

@@ -313,7 +313,6 @@ class RunnerBackend:
         workspace_root: Path,
     ) -> AgentRunSpec:
         return AgentRunSpec(
-            instruction=request.instruction,
             workspace_root=workspace_root,
             run_root=self.run_root,
             run_id=run_id,
@@ -743,7 +742,7 @@ class RunnerBackend:
                 shell_approval_provider=None,
                 web_gateway_client=self._web_gateway_client(web_gateway_token),
                 runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
-            ).run()
+            ).run_once(request.instruction)
             with self._lock:
                 record = self._records[run_id]
                 record.result = result

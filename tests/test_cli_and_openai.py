@@ -76,14 +76,17 @@ def test_cli_spec_file_pairs_with_runtime_config(monkeypatch: pytest.MonkeyPatch
     workspace.mkdir()
     spec_file = tmp_path / "spec.json"
     spec_file.write_text(
-        json.dumps({"instruction": "Finish.", "workspace_root": str(workspace), "run_root": str(tmp_path / "runs")}),
+        json.dumps({"workspace_root": str(workspace), "run_root": str(tmp_path / "runs")}),
         encoding="utf-8",
     )
     config_file = _write_config(tmp_path / "runtime.json", "run.finish")
     adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
     monkeypatch.setattr("native_agent_runner.cli._model_adapter", lambda *_args, **_kwargs: adapter)
 
-    result = CliRunner().invoke(main, ["run", "--spec", str(spec_file), "--runtime-config-file", str(config_file)])
+    result = CliRunner().invoke(
+        main,
+        ["run", "--spec", str(spec_file), "--instruction", "Finish.", "--runtime-config-file", str(config_file)],
+    )
 
     assert result.exit_code == 0, result.output
     assert {tool.id for tool in adapter.requests[0].tools} == {"run.finish"}

@@ -22,7 +22,7 @@ from native_agent_runner.core.spec import (
     ReasoningConfig,
     RunLimits,
 )
-from native_agent_runner.core.result import AgentArtifact, AgentRunResult
+from native_agent_runner.core.result import AgentArtifact, AgentRunResult, AgentTurnResult
 
 # Context providers (pluggable static + per-turn system context)
 from native_agent_runner.core.context import ContextProvider, TurnContext
@@ -104,6 +104,7 @@ __all__ = [
     "RunLimits",
     "AgentArtifact",
     "AgentRunResult",
+    "AgentTurnResult",
     # context providers
     "AgentDefinition",
     "AgentRuntimeConfig",

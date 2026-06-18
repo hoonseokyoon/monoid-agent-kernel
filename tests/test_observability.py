@@ -109,9 +109,11 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
             ModelTurn(final_text="done"),
         ]
     )
-    spec = AgentRunSpec(instruction="Clean notes.", workspace_root=workspace, run_root=tmp_path / "runs")
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
 
-    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run()
+    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run_once(
+        "Clean notes."
+    )
 
     types = [event["type"] for event in _events(result.run_dir)]
     assert types[0] == "run.started"
@@ -169,14 +171,14 @@ def test_public_events_redact_tool_arguments_and_policy_redacted_paths(tmp_path:
             ModelTurn(final_text="done"),
         ]
     )
-    spec = AgentRunSpec(instruction="Edit notes.", workspace_root=workspace, run_root=tmp_path / "runs")
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
 
     result = AgentLoop(
         spec=spec,
         model_adapter=adapter,
         permission_policy=PermissionPolicy(redact_patterns=(".env",)),
         runtime_config_provider=_provider(),
-    ).run()
+    ).run_once("Edit notes.")
 
     events_text = result.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8")
     assert "BEGIN PRIVATE KEY" not in events_text
@@ -254,14 +256,14 @@ def test_status_projection_redacts_paths_from_manifest_policy(tmp_path: Path) ->
             ModelTurn(final_text="done"),
         ]
     )
-    spec = AgentRunSpec(instruction="Create env.", workspace_root=workspace, run_root=tmp_path / "runs")
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
 
     result = AgentLoop(
         spec=spec,
         model_adapter=adapter,
         permission_policy=PermissionPolicy(redact_patterns=(".env",)),
         runtime_config_provider=_provider(),
-    ).run()
+    ).run_once("Create env.")
 
     proposal = json.loads(result.run_dir.joinpath("proposal.json").read_text(encoding="utf-8"))
     assert proposal["changed_paths"] == [".env"]
@@ -287,14 +289,14 @@ def test_loop_records_unknown_malformed_and_permission_failures_as_events(tmp_pa
             ModelTurn(final_text="done"),
         ]
     )
-    spec = AgentRunSpec(instruction="Try tools.", workspace_root=workspace, run_root=tmp_path / "runs")
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
 
     result = AgentLoop(
         spec=spec,
         model_adapter=adapter,
         permission_policy=PermissionPolicy(deny_patterns=(".env",)),
         runtime_config_provider=_provider(),
-    ).run()
+    ).run_once("Try tools.")
 
     events = _events(result.run_dir)
     failed = [event for event in events if event["type"] == "tool.call.failed"]
@@ -320,13 +322,14 @@ def test_loop_limited_status_is_public_event(tmp_path: Path) -> None:
         turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),))]
     )
     spec = AgentRunSpec(
-        instruction="Loop.",
         workspace_root=workspace,
         run_root=tmp_path / "runs",
         limits=RunLimits(max_steps=1, max_tool_calls=0),
     )
 
-    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.list", "run.finish")).run()
+    result = AgentLoop(
+        spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.list", "run.finish")
+    ).run_once("Loop.")
 
     final_event = _events(result.run_dir)[-1]
     assert result.status == "limited"
@@ -491,8 +494,10 @@ def test_cli_proposal_command_reads_snapshot_file(tmp_path: Path) -> None:
             ModelTurn(final_text="done"),
         ]
     )
-    spec = AgentRunSpec(instruction="Write summary.", workspace_root=workspace, run_root=tmp_path / "runs")
-    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.write", "run.finish")).run()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    result = AgentLoop(
+        spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.write", "run.finish")
+    ).run_once("Write summary.")
 
     runner = CliRunner()
     summary = runner.invoke(main, ["proposal", str(result.run_dir), "--file", "SUMMARY.md", "--json"])

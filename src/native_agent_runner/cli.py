@@ -185,6 +185,12 @@ def run(
     """Run an agent against a local workspace."""
     del ctx
     runtime_config = _load_agent_runtime_config(runtime_config_file, agent_definition_file)
+    # The instruction is the first user turn, delivered via run_once(); the spec no
+    # longer carries it, so it is required for both --spec and --workspace paths.
+    if instruction_file is not None:
+        instruction = instruction_file.read_text(encoding="utf-8")
+    if not instruction.strip():
+        raise click.ClickException("--instruction or --instruction-file is required")
     if spec_file is not None:
         if workspace is not None:
             raise click.ClickException("--spec cannot be combined with --workspace; the spec file is authoritative")
@@ -197,10 +203,6 @@ def run(
     else:
         if workspace is None:
             raise click.ClickException("--workspace (or --spec) is required")
-        if instruction_file is not None:
-            instruction = instruction_file.read_text(encoding="utf-8")
-        if not instruction.strip():
-            raise click.ClickException("--instruction or --instruction-file is required")
 
         resolved_limits = RunLimits(
             max_steps=max_steps,
@@ -222,7 +224,6 @@ def run(
         if run_id is not None:
             spec_kwargs["run_id"] = run_id
         spec = AgentRunSpec(
-            instruction=instruction,
             workspace_root=workspace,
             run_root=run_root,
             mode=mode,  # type: ignore[arg-type]
@@ -272,7 +273,7 @@ def run(
             if _runtime_config_uses_web(runtime_config) and web_gateway_url
             else None
         ),
-    ).run()
+    ).run_once(instruction)
     _human_echo(f"status: {result.status}", stream_json=stream_json)
     if result.final_text:
         _human_echo(f"summary: {result.final_text}", stream_json=stream_json)

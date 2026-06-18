@@ -7,7 +7,7 @@ from typing import Any
 
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.events import AgentEvent, EventSink
-from native_agent_runner.core.content import non_text_part_types
+from native_agent_runner.core.content import ContentPart, non_text_part_types
 from native_agent_runner.core.context import (
     ContextProvider,
     TurnContext,
@@ -25,8 +25,8 @@ from native_agent_runner.core.agents import (
 )
 from native_agent_runner.core.manifest import build_run_manifest
 from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
-from native_agent_runner.core.result import AgentRunResult
-from native_agent_runner.core.spec import AgentRunSpec, ModelConfig
+from native_agent_runner.core.result import AgentRunResult, AgentTurnResult
+from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, input_to_parts, text_from_parts
 from native_agent_runner.core.tool_surface import (
     DefaultToolSurfaceResolver,
     ToolAuthorization,
@@ -222,6 +222,7 @@ class RunState:
     provider_http_status: int | None = None
     final_text: str = ""
     previous_turn_handle: str | None = None
+    pending_user_input: tuple[ContentPart, ...] | None = None
     pending_observations: tuple[ToolObservation, ...] = ()
     pending_binding_loads: tuple[str, ...] = ()
     tool_call_counts: dict[str, int] = field(default_factory=dict)
@@ -247,6 +248,16 @@ class _RunResources:
 
 
 @dataclass
+class _Session:
+    """Live state for an open run, threaded across multiple submit() calls."""
+
+    state: RunState
+    res: _RunResources
+    session_step: int = 0
+    terminal: bool = False
+
+
+@dataclass
 class AgentLoop:
     spec: AgentRunSpec
     model_adapter: ModelAdapter
@@ -265,13 +276,53 @@ class AgentLoop:
     context_providers: tuple[ContextProvider, ...] = ()
     inject_workspace_index: bool = False
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
+    _session: _Session | None = field(default=None, init=False, repr=False)
 
-    def run(self) -> AgentRunResult:
-        state = RunState()
-        res: _RunResources | None = None
+    def open(self) -> None:
+        """Bootstrap the run and leave it idle, ready to accept submit().
+
+        No model turn happens here. The workspace, recorder, tool registry, and
+        manifest are created and ``run.started`` is emitted. A recordable bootstrap
+        failure (e.g. invalid runtime config) is captured as a terminal failed
+        session so close() still returns a failed result rather than raising."""
+        if self._session is not None:
+            raise NativeAgentError("run is already open", error_code="run_already_open")
         try:
             res = self._bootstrap()
-            self._run_steps(state, res)
+        except Exception as exc:  # controlled recording boundary for standalone CLI
+            res = self._bootstrap_resources
+            if res is None:
+                raise
+            state = RunState()
+            self._record_failure(state, res, exc)
+            self._session = _Session(state=state, res=res, terminal=True)
+            return
+        self._session = _Session(state=RunState(), res=res)
+
+    def submit(self, user_input: str | tuple[ContentPart, ...]) -> AgentTurnResult:
+        """Run one user turn: inject ``user_input`` and step until the model settles
+        (no tool calls + final text) or a per-submit limit is hit. The run stays
+        open afterwards; call submit() again to continue or close() to finalize."""
+        session = self._require_open()
+        if session.terminal:
+            raise NativeAgentError(
+                "run reached a terminal state and cannot accept more input",
+                error_code="run_terminal",
+            )
+        state, res = session.state, session.res
+        # Per-submit outcome fields describe this turn; reset before running.
+        state.status = "completed"
+        state.error = ""
+        state.error_code = ""
+        state.provider_error_code = ""
+        state.provider_http_status = None
+        state.final_text = ""
+        # A run.finish in a prior submit must not short-circuit this one.
+        res.context.finished = False
+        state.pending_user_input = input_to_parts(user_input)
+        self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
+        try:
+            self._run_submit(state, res, session)
         except (RunCancelled, RunTimeout) as exc:
             state.status = "limited"
             state.error = str(exc)
@@ -281,31 +332,71 @@ class AgentLoop:
                 if state.error_code == "cancelled"
                 else "Stopped after reaching max duration."
             )
+            session.terminal = True
         except Exception as exc:  # controlled recording boundary for standalone CLI
-            res = res or self._bootstrap_resources
-            if res is None:
-                raise
-            state.status = "failed"
-            state.error = str(exc)
-            state.error_code = error_code_for_exception(exc)
-            if isinstance(exc, ModelAdapterError):
-                state.provider_error_code = exc.provider_error_code
-                state.provider_http_status = exc.http_status
-            state.final_text = ""
-            res.recorder.emit(
-                "run.failed",
-                data={
-                    "error": public_error_message(state.error),
-                    "error_code": state.error_code,
-                    "type": type(exc).__name__,
-                },
-                level="error",
-            )
-        finally:
-            if res is None:
-                raise RuntimeError("run failed before recorder initialization")
-            result = self._finalize(state, res)
+            self._record_failure(state, res, exc)
+            session.terminal = True
+        if state.error_code == "max_tool_calls_exceeded":
+            # Tool-call budget is session-cumulative; once spent the run is done.
+            session.terminal = True
+        return self._checkpoint_on_settle(state, res)
+
+    def close(self) -> AgentRunResult:
+        """Finalize the run: cancel jobs, write the terminal proposal, emit
+        run.finished, close the recorder, and return the cumulative result."""
+        session = self._require_open()
+        result = self._finalize(session.state, session.res)
+        self._session = None
         return result
+
+    def run_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
+        """One-shot convenience: open() + submit(user_input) + close()."""
+        self.open()
+        try:
+            session = self._require_open()
+            if not session.terminal:
+                self.submit(user_input)
+        finally:
+            result = self.close()
+        return result
+
+    def _record_failure(self, state: RunState, res: _RunResources, exc: Exception) -> None:
+        state.status = "failed"
+        state.error = str(exc)
+        state.error_code = error_code_for_exception(exc)
+        if isinstance(exc, ModelAdapterError):
+            state.provider_error_code = exc.provider_error_code
+            state.provider_http_status = exc.http_status
+        state.final_text = ""
+        res.recorder.emit(
+            "run.failed",
+            data={
+                "error": public_error_message(state.error),
+                "error_code": state.error_code,
+                "type": type(exc).__name__,
+            },
+            level="error",
+        )
+
+    def commit_checkpoint(self) -> None:
+        """Adopt the current proposed workspace state as the new diff baseline.
+
+        Opt-in and never called automatically (at-close approval is the default).
+        After this, subsequent proposals/diffs report only changes made after this
+        point — the building block for incremental apply across a multi-turn run."""
+        session = self._require_open()
+        res = session.res
+        res.workspace.snapshot_current_as_new_baseline()
+        res.recorder.write_workspace_base(res.workspace.workspace_base_payload(self.spec.run_id))
+        res.recorder.emit(
+            "checkpoint.committed",
+            data={"workspace_backend": res.workspace.backend_kind, "changed_paths": []},
+        )
+
+    def _require_open(self) -> _Session:
+        if self._session is None:
+            raise NativeAgentError("run is not open; call open() first", error_code="run_not_open")
+        return self._session
 
     def _bootstrap(self) -> _RunResources:
         if self.permission_policy == PermissionPolicy() and self.spec.permission_policy != PermissionPolicy():
@@ -432,7 +523,6 @@ class AgentLoop:
                 "agent_config_hash": initial_runtime_config.config_hash,
             },
         )
-        self._warn_on_unforwarded_multimodal(recorder)
         return _RunResources(
             workspace=workspace,
             recorder=recorder,
@@ -443,11 +533,13 @@ class AgentLoop:
             static_segments=tuple(static_segments),
         )
 
-    def _warn_on_unforwarded_multimodal(self, recorder: AgentRecorder) -> None:
+    def _warn_on_unforwarded_multimodal(
+        self, parts: tuple[ContentPart, ...], recorder: AgentRecorder
+    ) -> None:
         """Multimodal input is a contract-only surface for now: non-text parts are
-        accepted on the spec but not yet threaded to any provider. Emit a warning
+        accepted on submit() but not yet threaded to any provider. Emit a warning
         naming the dropped part types and why, so the degradation is observable."""
-        dropped = non_text_part_types(self.spec.effective_input)
+        dropped = non_text_part_types(parts)
         if not dropped:
             return
         reason = "not_yet_forwarded" if getattr(self.model_adapter, "supports_multimodal", False) else "adapter_lacks_multimodal"
@@ -457,24 +549,26 @@ class AgentLoop:
             level="warning",
         )
 
-    def _dynamic_context_segment(self, state: RunState, res: _RunResources, step: int) -> str:
+    def _dynamic_context_segment(self, res: _RunResources, turn_context: TurnContext) -> str:
         """Join each context provider's per-turn segment. Empty when no providers
         contribute, so the turn prompt stays byte-identical to the static prompt."""
+        del res
         if not self.context_providers:
             return ""
-        turn = self._turn_context(state, res, step)
         segments = []
         for provider in self.context_providers:
-            segment = provider.dynamic_segment(turn)
+            segment = provider.dynamic_segment(turn_context)
             if segment and segment.strip():
                 segments.append(segment.strip())
         return "\n\n".join(segments)
 
-    def _turn_context(self, state: RunState, res: _RunResources, step: int) -> TurnContext:
+    def _turn_context(
+        self, state: RunState, res: _RunResources, step: int, remaining_steps: int
+    ) -> TurnContext:
         limits = self.spec.limits
         return TurnContext(
             step=step,
-            remaining_steps=max(0, limits.max_steps - step),
+            remaining_steps=remaining_steps,
             remaining_tool_calls=max(0, limits.max_tool_calls - state.total_tool_calls),
             deadline_s=(res.deadline - time.time()) if res.deadline is not None else None,
             plan=tuple(res.context.plan),
@@ -554,12 +648,17 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
-    def _run_steps(self, state: RunState, res: _RunResources) -> None:
+    def _run_submit(self, state: RunState, res: _RunResources, session: _Session) -> None:
         context = res.context
         recorder = res.recorder
         deadline = res.deadline
-        for step in range(1, self.spec.limits.max_steps + 1):
+        # Per-submit step budget: each user turn gets a fresh max_steps. session_step
+        # is the global, monotonic turn counter used for unique turn ids.
+        max_steps = self.spec.limits.max_steps
+        for local_step in range(1, max_steps + 1):
             self._check_run_boundary(deadline)
+            session.session_step += 1
+            step = session.session_step
             background_observations = self._pop_background_observations(context, recorder, step)
             if background_observations:
                 state.pending_observations = (*state.pending_observations, *background_observations)
@@ -569,7 +668,7 @@ class AgentLoop:
                 turn_id=turn_id,
                 data={"step": step, "previous_turn_handle": state.previous_turn_handle},
             )
-            turn_context = self._turn_context(state, res, step)
+            turn_context = self._turn_context(state, res, step, max(0, max_steps - local_step))
             turn_registry = self._registry_for_turn(context, turn_context, res)
             runtime_config = self._current_runtime_config(turn_registry)
             bound_catalog = compile_bound_tool_catalog(runtime_config, turn_registry)
@@ -609,7 +708,7 @@ class AgentLoop:
             )
             state.previous_surface_snapshot = surface_snapshot
             state.pending_binding_loads = ()
-            dynamic_segment = self._dynamic_context_segment(state, res, step)
+            dynamic_segment = self._dynamic_context_segment(res, turn_context)
             if surface_snapshot.delta_notice:
                 dynamic_segment = (
                     surface_snapshot.delta_notice
@@ -622,8 +721,15 @@ class AgentLoop:
                 if not dynamic_segment
                 else f"{static_system_prompt}\n\n{dynamic_segment}"
             )
+            # The new user message is sent only on the first turn that consumes it
+            # (the first turn of this submit); later turns of the same submit carry
+            # observations against the continuation handle.
+            instruction: str | None = None
+            if state.pending_user_input is not None:
+                instruction = text_from_parts(state.pending_user_input) or None
+                state.pending_user_input = None
             request = ModelRequest(
-                instruction=self.spec.effective_text_instruction,
+                instruction=instruction,
                 system_prompt=turn_system_prompt,
                 tools=surface_snapshot.immediate_tools,
                 previous_turn_handle=state.previous_turn_handle,
@@ -713,6 +819,9 @@ class AgentLoop:
                     continue
                 if turn.final_text:
                     state.final_text = turn.final_text
+                    # The model has consumed the pending observations and settled;
+                    # the next submit must not resend them alongside a new message.
+                    state.pending_observations = ()
                     break
                 raise ModelAdapterError("model returned neither final text nor tool calls")
 
@@ -839,6 +948,47 @@ class AgentLoop:
             metrics=metrics,
             error=state.error,
             error_code=state.error_code,
+            final_turn_handle=state.previous_turn_handle,
+        )
+
+    def _checkpoint_on_settle(self, state: RunState, res: _RunResources) -> AgentTurnResult:
+        """Preview-only checkpoint at a settle point: flush the accumulated proposal
+        and metrics, emit ``turn.settled``, and keep the run open. Repeatable — it
+        does not cancel jobs, emit ``proposal.ready``/``run.finished``, or close the
+        recorder. Those happen once in close()/``_finalize``."""
+        recorder = res.recorder
+        workspace = res.workspace
+        diff_path = recorder.write_diff(workspace.diff_patch())
+        proposal_payload = recorder.write_proposal_snapshot(workspace, diff_path)
+        metrics = self._build_metrics(state, res)
+        recorder.write_metrics(metrics)
+        recorder.emit(
+            "workspace.proposal.updated",
+            data=public_proposal_payload(proposal_payload, self.permission_policy),
+        )
+        public_changed = [
+            public_path(str(path), self.permission_policy)
+            for path in proposal_payload.get("changed_paths", [])
+        ]
+        recorder.emit(
+            "turn.settled",
+            data={
+                "status": state.status,
+                "final_text": state.final_text,
+                "error_code": state.error_code,
+                "changed_paths": public_changed,
+            },
+        )
+        return AgentTurnResult(
+            status=state.status,  # type: ignore[arg-type]
+            final_text=state.final_text,
+            proposal_path=recorder.run_dir / "proposal.json",
+            proposal_hash=str(proposal_payload.get("proposal_hash") or ""),
+            changed_paths=tuple(workspace.changed_paths()),
+            turn_handle=state.previous_turn_handle,
+            error=state.error,
+            error_code=state.error_code,
+            metrics=metrics,
         )
 
     def _pop_background_observations(

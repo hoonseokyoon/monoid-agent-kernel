@@ -29,16 +29,35 @@ bootstrap and at each turn boundary. A config change applies to the next turn.
 The `ToolSurfaceSnapshot` and `BoundToolCatalog` used by a turn stay fixed for
 that turn.
 
+The run lifecycle is:
+
+- `open()` — bootstrap and idle (workspace, recorder, tool registry, manifest;
+  emits `run.started`). No model turn yet.
+- `submit(user_input) -> AgentTurnResult` — run one user turn: deliver
+  `user_input` (a `str` or content parts) and step until the model settles (no
+  tool calls + final text) or a per-submit limit. The run stays open. Each
+  `submit()` gets a fresh `max_steps` budget; `max_tool_calls`, token usage, and
+  `max_duration_s` are session-wide. `AgentTurnResult` carries the settle status,
+  final text, the accumulated (preview) proposal, and the continuation
+  `turn_handle`.
+- `commit_checkpoint()` — opt-in: adopt the current proposed workspace state as
+  the new diff baseline, so later proposals report only post-commit changes.
+- `close() -> AgentRunResult` — finalize: cancel jobs, write the terminal
+  proposal, emit `run.finished`, close the recorder.
+- `run_once(user_input) -> AgentRunResult` — one-shot convenience equal to
+  `open()` + `submit(user_input)` + `close()`.
+
 ### AgentRunSpec
 
-`AgentRunSpec` contains run-specific values:
+`AgentRunSpec` is the session descriptor. It carries no user input — the
+instruction(s) flow in through `submit()` / `run_once()`:
 
-- `instruction`, `input`
 - `workspace_root`, `run_root`, `run_id`
 - `mode`: `read-only`, `propose`, or `apply`
 - `workspace_backend`: `overlay` or `staging`
 - `limits: RunLimits`
 - `permission_policy: PermissionPolicy`
+- `input`: optional multimodal content-parts surface (contract-only)
 - `metadata`
 
 It does not carry model, prompt, tool, shell, or web settings. Those values live
@@ -212,8 +231,16 @@ bindings.
 }
 ```
 
-Subsequent turns send `previous_turn_handle` and `observations` instead of
-`instruction`.
+The turn request has three shapes, selected by `previous_turn_handle` and
+`instruction`:
+
+- **first turn** — no `previous_turn_handle`; carries `instruction`.
+- **tool continuation** — `previous_turn_handle` + `observations`; no `instruction`.
+- **user follow-up** — `previous_turn_handle` + `instruction` (a new user message on
+  top of an existing continuation handle; `observations` is empty).
+
+This is what lets one run accept multiple user turns: the runner threads the last
+`turn_handle` into the next user message.
 
 Successful response:
 

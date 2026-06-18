@@ -60,9 +60,14 @@ class OpenAIModelAdapter:
 
         if request.previous_turn_handle:
             payload["previous_response_id"] = request.previous_turn_handle
-            payload["input"] = [_observation_input_item(observation) for observation in request.observations]
+            input_items: list[dict[str, Any]] = []
+            # Third shape: a new user message on top of an existing continuation handle.
+            if request.instruction:
+                input_items.append({"role": "user", "content": request.instruction})
+            input_items.extend(_observation_input_item(observation) for observation in request.observations)
+            payload["input"] = input_items
         else:
-            payload["input"] = [{"role": "user", "content": request.instruction}]
+            payload["input"] = [{"role": "user", "content": request.instruction or ""}]
         return payload
 
 

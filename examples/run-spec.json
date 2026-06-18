@@ -1,5 +1,4 @@
 {
-  "instruction": "Read notes.md and write a clearer summary to SUMMARY.md.",
   "workspace_root": "examples/workspaces/edit_markdown_notes",
   "run_root": "runs",
   "mode": "propose",

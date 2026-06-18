@@ -105,6 +105,13 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     "run.resumed": _data_schema(
         {"reason": _STR, "job_ids": _STR_ARRAY, "count": _INT},
     ),
+    "turn.settled": _data_schema(
+        {"status": _STR, "final_text": _STR, "error_code": _STR, "changed_paths": _STR_ARRAY},
+        required=("status",),
+    ),
+    "checkpoint.committed": _data_schema(
+        {"workspace_backend": _STR, "changed_paths": _STR_ARRAY},
+    ),
     "agent.config.updated": _data_schema(
         {
             "definition_id": _STR,
@@ -905,7 +912,7 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
     if not isinstance(proposal, dict):
         return
     expected_proposal_hash = proposal.get("proposal_hash")
-    actual_proposal_hash = canonical_sha256(proposal, drop=("proposal_hash",))
+    actual_proposal_hash = canonical_sha256(proposal, drop=("proposal_hash", "updated_at"))
     if expected_proposal_hash != actual_proposal_hash:
         issues.append(ValidationIssue("proposal.json.proposal_hash", "proposal hash mismatch"))
     diff_rel = proposal.get("diff_path")

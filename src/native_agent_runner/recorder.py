@@ -252,7 +252,10 @@ class AgentRecorder:
             "changed_paths": [entry["path"] for entry in files],
             "files": files,
         }
-        payload["proposal_hash"] = canonical_sha256(payload, drop=("proposal_hash",))
+        # updated_at is wall-clock metadata, not content; excluding it makes the
+        # proposal_hash a stable content identifier so repeated settle checkpoints
+        # with no workspace change produce the same hash.
+        payload["proposal_hash"] = canonical_sha256(payload, drop=("proposal_hash", "updated_at"))
         write_json_atomic(proposal_path, payload)
         return payload
 

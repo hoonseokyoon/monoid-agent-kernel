@@ -62,9 +62,10 @@ def test_gateway_payload_is_provider_keyless_and_uses_opaque_turn_handle(tmp_pat
     assert "api_key" not in str(payload).lower()
     assert headers["Authorization"] == "Bearer run-token"
 
+    # Tool continuation: handle + observations, no new user message.
     followup = adapter._payload(
         ModelRequest(
-            instruction="ignored on followup",
+            instruction=None,
             system_prompt="sys",
             tools=(_tool(),),
             previous_turn_handle="opaque-turn-handle",
@@ -74,6 +75,20 @@ def test_gateway_payload_is_provider_keyless_and_uses_opaque_turn_handle(tmp_pat
     assert followup["previous_turn_handle"] == "opaque-turn-handle"
     assert "previous_response_id" not in followup
     assert "instruction" not in followup
+    assert followup["observations"][0]["call_id"] == "call_1"
+
+    # Third shape: a new user message on top of an existing continuation handle.
+    user_followup = adapter._payload(
+        ModelRequest(
+            instruction="Now also summarize.",
+            system_prompt="sys",
+            tools=(_tool(),),
+            previous_turn_handle="opaque-turn-handle",
+        )
+    )
+    assert user_followup["previous_turn_handle"] == "opaque-turn-handle"
+    assert user_followup["instruction"] == "Now also summarize."
+    assert user_followup["observations"] == []
 
 
 def test_gateway_response_parser_returns_model_turn() -> None:
