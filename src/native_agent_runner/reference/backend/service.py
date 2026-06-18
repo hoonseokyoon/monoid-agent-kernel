@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 import uuid
@@ -34,7 +35,7 @@ from native_agent_runner.core.spec import (
     WorkspaceBackendKind,
 )
 from native_agent_runner.core.workspace import Workspace
-from native_agent_runner.errors import PermissionDenied
+from native_agent_runner.errors import NativeAgentError, PermissionDenied
 from native_agent_runner.tasks import (
     get_job_artifact,
     list_job_artifacts,
@@ -52,6 +53,9 @@ from native_agent_runner.web import WebGatewayClient
 from native_agent_runner.workspace.paths import is_within
 
 BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "failed", "limited"]
+
+# Sentinel enqueued to wake/stop a session worker blocked on its message queue.
+_CLOSE_SESSION = object()
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
 
 
@@ -70,6 +74,9 @@ class BackendRunRequest:
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     agent_definition: AgentDefinition | None = None
     runtime_config: AgentRuntimeConfig | None = None
+    # When False (default) the run closes after the first turn settles (one-shot).
+    # When True the session stays open awaiting follow-up messages (multi-turn).
+    multi_turn: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -121,6 +128,7 @@ class BackendRunRecord:
     runtime_config_issuer: str = ""
     runtime_config_reason: str = ""
     loop: AgentLoop | None = None
+    message_queue: queue.Queue[Any] = field(default_factory=queue.Queue, repr=False)
 
 
 @dataclass
@@ -213,6 +221,12 @@ class RunnerBackend:
     run_token_ttl_s: int = 3600
     llm_gateway_token_ttl_s: int = 3600
     web_gateway_token_ttl_s: int = 3600
+    task_callback_token_ttl_s: int = 3600
+    # Multi-turn session limits.
+    idle_timeout_s: float = 300.0
+    max_session_lifetime_s: float = 1800.0
+    max_turns: int = 50
+    task_wait_poll_s: float = 30.0
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
     _usage: dict[str, TenantUsage] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -425,14 +439,27 @@ class RunnerBackend:
             record.cancellation_token.cancel()
             record.error = "run cancellation requested"
             record.error_code = "cancelled"
-            return {
-                "run_id": record.run_id,
-                "tenant_id": record.tenant_id,
-                "status": record.status,
-                "cancel_requested": True,
-                "error": record.error,
-                "error_code": record.error_code,
-            }
+        # Wake a worker blocked on its message queue so it stops promptly.
+        record.message_queue.put(_CLOSE_SESSION)
+        return {
+            "run_id": record.run_id,
+            "tenant_id": record.tenant_id,
+            "status": record.status,
+            "cancel_requested": True,
+            "error": record.error,
+            "error_code": record.error_code,
+        }
+
+    def send_message(self, run_id: str, token: str, content: str) -> dict[str, Any]:
+        """Deliver a follow-up user message to a running multi-turn session. It is
+        queued and consumed as the next user turn once the current turn settles."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            if record.status in {"completed", "failed", "limited"}:
+                raise ValueError("cannot send a message to a terminal run")
+        record.message_queue.put(str(content))
+        return {"run_id": run_id, "status": "queued"}
 
     def current_runtime_config(self, run_id: str) -> AgentRuntimeConfig | None:
         record = self._record(run_id)
@@ -762,6 +789,52 @@ class RunnerBackend:
             time.sleep(0.05)
         raise TimeoutError(f"run did not finish before timeout: {run_id}")
 
+    def _drive_session(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> AgentRunResult:
+        """Drive an open run as a multi-turn session: pump until suspended, then
+        either wait for a parked task to complete or block on the message queue for
+        the next user turn — until idle/lifetime/turn limits, cancel, or close."""
+        record = self._record(run_id)
+        loop.open()
+        started = time.time()
+        turns = 1
+        try:
+            suspension = loop.run_until_suspended(request.instruction)
+        except NativeAgentError:
+            # Bootstrap failed (terminal session already recorded); just finalize.
+            return loop.close()
+        while True:
+            if suspension.reason in {"terminal", "limited"}:
+                break
+            if suspension.reason == "awaiting_tasks":
+                if loop.wait_for_pending_tasks(self.task_wait_poll_s):
+                    suspension = loop.run_until_suspended(None)
+                    continue
+                if self._session_should_stop(record, started, turns):
+                    break
+                continue
+            # settled. One-shot runs close here; multi-turn awaits the next message.
+            if not request.multi_turn:
+                break
+            if self._session_should_stop(record, started, turns):
+                break
+            loop.await_user_input()
+            try:
+                message = record.message_queue.get(timeout=self.idle_timeout_s)
+            except queue.Empty:
+                break  # idle timeout
+            if message is _CLOSE_SESSION:
+                break
+            turns += 1
+            suspension = loop.run_until_suspended(message)
+        return loop.close()
+
+    def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
+        return (
+            record.cancellation_token.requested
+            or (time.time() - started) >= self.max_session_lifetime_s
+            or turns >= self.max_turns
+        )
+
     def _run_worker(
         self,
         run_id: str,
@@ -790,7 +863,7 @@ class RunnerBackend:
             )
             with self._lock:
                 self._records[run_id].loop = loop
-            result = loop.run_once(request.instruction)
+            result = self._drive_session(run_id, request, loop)
             with self._lock:
                 record = self._records[run_id]
                 record.result = result

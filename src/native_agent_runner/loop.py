@@ -384,11 +384,38 @@ class AgentLoop:
                 turn=self._checkpoint_on_settle(state, res),
             )
         if suspension.reason == "awaiting_tasks":
+            if suspension.has_external:
+                # Parked on a hosted task awaiting an external report (hitl/automation).
+                res.recorder.emit(
+                    "run.awaiting_input",
+                    data={"reason": "task", "task_ids": list(suspension.awaiting_task_ids)},
+                )
             return suspension
         if state.error_code == "max_tool_calls_exceeded":
             # Tool-call budget is session-cumulative; once spent the run is done.
             session.terminal = True
         return replace(suspension, turn=self._checkpoint_on_settle(state, res))
+
+    def await_user_input(self) -> None:
+        """Signal that the run is parked awaiting the next user message. A
+        multi-turn driver calls this before blocking on its message channel."""
+        session = self._require_open()
+        session.res.recorder.emit("run.awaiting_input", data={"reason": "user"})
+
+    def wait_for_pending_tasks(self, timeout_s: float) -> bool:
+        """Block up to ``timeout_s`` for a pending task to become ready (in-process
+        completion or external report). Returns True if one is ready to drain, so
+        the caller can ``run_until_suspended(None)`` to resume."""
+        session = self._require_open()
+        manager = session.res.context.job_manager
+        deadline = time.time() + max(0.0, timeout_s)
+        while manager.has_resume_jobs():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            if manager.wait_for_reentry(min(0.25, remaining)):
+                return True
+        return False
 
     def close(self) -> AgentRunResult:
         """Finalize the run: cancel jobs, write the terminal proposal, emit

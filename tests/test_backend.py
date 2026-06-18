@@ -203,6 +203,64 @@ def test_backend_create_task_injects_into_running_run(tmp_path: Path) -> None:
     assert len(hitl_obs) >= 2
 
 
+def test_backend_multi_turn_session_threads_two_user_messages(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")])
+    backend.idle_timeout_s = 10.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+
+    def _wait(predicate, tries: int = 1000) -> bool:
+        for _ in range(tries):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    # First turn settles -> session parks awaiting the next user message.
+    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+
+    backend.send_message(run_id, token, content="again")
+    # The follow-up message reaches the model as a second user turn.
+    assert _wait(lambda: len([r for a in adapters for r in a.requests if r.instruction]) >= 2)
+
+    backend.cancel_run(run_id, token)  # stop the open session
+    status = backend.wait_for_run(run_id, timeout_s=20)
+    assert status in {"completed", "limited", "failed"}
+
+    instructions = [r.instruction for a in adapters for r in a.requests if r.instruction]
+    assert "hello" in instructions
+    assert "again" in instructions
+
+
+def test_backend_single_turn_run_closes_after_first_settle(tmp_path: Path) -> None:
+    # Without multi_turn the run closes after the first settle (no awaiting_input hang).
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="done")])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_default_config(),
+        )
+    )
+    status = backend.wait_for_run(submission.run_id, timeout_s=20)
+    assert status == "completed"
+
+
 def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
     manager = _token_manager()
     token = manager.issue(
