@@ -393,6 +393,41 @@ user turn; a task result completes a specific task), mirroring the
 add-message-vs-submit-tool-outputs split in comparable agent servers. Session
 length is bounded by idle timeout, max lifetime, and max turns.
 
+### Durable Persistence
+
+A parked run survives a process restart via a **state-snapshot at the suspend
+points** (the same pattern as LangGraph checkpointers — not an event-sourcing
+replay). Because the conversation is held by reference (`turn_handle`), restore
+never replays the model, so there is no determinism constraint and no
+double-side-effect risk; snapshots are only taken at clean park points.
+
+- `AgentLoop.snapshot() -> RunCheckpoint | None` captures the small mutable run
+  state (turn handle, counters, pending observations, parked hosted tasks) at a
+  park point. It returns `None` — refusing to snapshot — while a live in-process
+  shell job is still running, because a subprocess cannot cross a process boundary.
+- The loop writes `run_dir/checkpoint.json` at each park and deletes it on
+  `close()` (a finalized run has nothing to recover).
+- `AgentLoop.restore(checkpoint)` reopens the run from the checkpoint: it does not
+  re-emit `run.started`, leaves `workspace.base.json` untouched, re-registers
+  parked hosted tasks (so `report_task_result` still wakes the run), carries the
+  remaining duration forward (downtime does not count against `max_duration_s`),
+  and folds any shell job left `running` on disk in as a failed observation so the
+  model re-decides.
+- The reference backend writes `run_dir/run.json` (a recovery descriptor:
+  identity, workspace, limits, policy, resolved runtime config) and exposes
+  `recover_runs()`, which scans `run_root` for non-terminal checkpoints, rebuilds
+  the run (re-issuing gateway tokens from the signing key), `restore()`s the loop,
+  re-enqueues any durably-saved follow-up messages, and resumes the session.
+
+Limitations (v1): workspace *content* changes are not part of the checkpoint —
+overlay writes are in-memory and a hard crash loses in-flight edits (the
+conversation and parked tasks resume; the model re-derives file changes if
+needed). The reference `llm_gateway` keeps turn records in memory, so a gateway
+restart invalidates `turn_handle`; a production gateway (or OpenAI Responses,
+which retains `previous_response_id` server-side) does not have this limit. A
+mid-run runtime-config change is not re-persisted, so recovery uses the config as
+of run start.
+
 ## Run Artifacts
 
 Manifest and transcript are binding-aware:

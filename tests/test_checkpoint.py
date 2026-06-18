@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from conftest import runtime_config, runtime_provider
@@ -13,11 +14,16 @@ from native_agent_runner.core.checkpoint import (
     read_checkpoint,
     write_checkpoint,
 )
-from native_agent_runner.core.spec import AgentRunSpec
+from native_agent_runner.core.spec import AgentRunSpec, RunLimits
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelTurn, ToolObservation
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from native_agent_runner.shell import ShellExecutionOptions
 from native_agent_runner.tasks import HostedTask
+
+
+def _python_command(code: str) -> str:
+    return f'python -c "{code.replace(chr(34), chr(92) + chr(34))}"'
 
 
 def _hitl_parked_loop(spec: AgentRunSpec) -> tuple[AgentLoop, str, Path, Path]:
@@ -189,6 +195,62 @@ def test_restore_folds_crashed_shell_job_as_failed_observation(tmp_path: Path) -
     assert failed and failed[0].output["job_id"] == "job_dead"
     assert failed[0].output["error"] == "process lost on restart"
     loop2.close()
+
+
+def test_snapshot_refuses_while_in_process_shell_job_runs(tmp_path: Path) -> None:
+    spec = AgentRunSpec(
+        workspace_root=_mk(tmp_path / "ws"),
+        run_root=tmp_path / "runs",
+        workspace_backend="staging",
+    )
+    provider = runtime_provider(runtime_config("fs.write"))
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")]),
+        runtime_config_provider=provider,
+    )
+    loop.open()
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    job = manager.start_shell_job(
+        shell_options=ShellExecutionOptions(enabled=True, approval_mode="auto-approve"),
+        command=_python_command("import time; time.sleep(0.6)"),
+        cwd=".",
+        timeout_s=10,
+        max_output_bytes=100_000,
+        startup_wait_s=1,
+        env={},
+        requested_timeout_s=None,
+        requested_max_output_bytes=None,
+        requested_startup_wait_s=None,
+        execution_workspace="direct",
+        resume_on_exit=True,
+    )
+    # A live shell subprocess can't be restored, so the park is not durable yet.
+    assert loop.snapshot() is None
+    manager.wait(job.job_id)  # let the job finish
+    # Once only a finished (hosted-free) park remains, a snapshot is allowed.
+    assert loop.snapshot() is not None
+    loop.close()
+
+
+def test_restore_carries_remaining_deadline(tmp_path: Path) -> None:
+    spec = AgentRunSpec(
+        workspace_root=_mk(tmp_path / "ws"),
+        run_root=tmp_path / "runs",
+        limits=RunLimits(max_duration_s=1000),
+    )
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    cp = RunCheckpoint(run_id=spec.run_id, status="completed", remaining_duration_s=300.0)
+    loop.restore(cp)
+    res = loop._session.res  # type: ignore[union-attr]
+    # Downtime does not count against max_duration_s: the resumed deadline is ~now+remaining,
+    # so the run is not immediately limited even though it was parked for a long time.
+    assert 290.0 < (res.deadline - time.time()) < 300.5
+    loop.close()
 
 
 def _mk(path: Path) -> Path:
