@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -42,21 +43,31 @@ class WebGatewayClient:
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.gateway_url.rstrip('/')}{path}"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = Request(
-            url,
-            data=body,
-            headers=self._headers(),
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=payload.get("timeout_s") or 30) as response:
-                return _decode_json(response.read())
-        except HTTPError as exc:
-            raise _error_from_http(exc) from exc
-        except URLError as exc:
-            raise WebGatewayError(f"web gateway request failed: {exc.reason}") from exc
-        except TimeoutError as exc:
-            raise WebGatewayError("web gateway request timed out", error_code="web_gateway_timeout") from exc
+        timeout_s = payload.get("timeout_s") or 30
+        attempts = 3
+        last_error: WebGatewayError | None = None
+        for attempt in range(attempts):
+            request = Request(url, data=body, headers=self._headers(), method="POST")
+            try:
+                with urlopen(request, timeout=timeout_s) as response:
+                    return _decode_json(response.read())
+            except HTTPError as exc:
+                raise _error_from_http(exc) from exc  # a real HTTP response — never retry
+            except OSError as exc:
+                # Transient connection-level failure (reset / aborted / refused / timeout;
+                # URLError and TimeoutError are OSError subclasses) — retry with a short
+                # backoff before surfacing. The final error preserves the original code/message.
+                if isinstance(exc, TimeoutError):
+                    last_error = WebGatewayError(
+                        "web gateway request timed out", error_code="web_gateway_timeout"
+                    )
+                else:
+                    reason = getattr(exc, "reason", exc)
+                    last_error = WebGatewayError(f"web gateway request failed: {reason}")
+                if attempt < attempts - 1:
+                    time.sleep(0.05 * (attempt + 1))
+        assert last_error is not None
+        raise last_error
 
     def _headers(self) -> dict[str, str]:
         headers = {

@@ -90,6 +90,19 @@ class GatewayModelAdapter:
                 if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
                     raise last_error from exc
                 _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+            except OSError as exc:
+                # A bare connection-level error (reset / aborted / broken pipe), e.g. raised
+                # mid-read after urlopen() returned, is transient and retryable like a
+                # URLError. URLError/TimeoutError (both OSError subclasses) are handled above,
+                # so this catches only the raw connection failures they miss.
+                last_error = ModelAdapterError(
+                    f"LLM gateway connection error: {exc}",
+                    provider_error_code=GATEWAY_NETWORK_ERROR,
+                    retryable=True,
+                )
+                if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
+                    raise last_error from exc
+                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
         if last_error is not None:
             raise last_error
         raise ModelAdapterError("LLM gateway request failed", provider_error_code=GATEWAY_NETWORK_ERROR)
