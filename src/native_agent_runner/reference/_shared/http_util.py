@@ -1,0 +1,86 @@
+"""Shared hardening helpers for the reference HTTP gateways.
+
+The backend, llm-gateway and web-gateway HTTP layers are thin ``BaseHTTPRequestHandler``
+shells with identical request parsing and serving. These helpers centralize the
+production-hardening concerns — bounded request size, per-connection timeouts,
+internal-error redaction (no stack traces to clients), and structured request logging —
+so all three layers harden in one place.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+# Reject a declared request body larger than this outright (DoS / OOM guard). 10 MB
+# comfortably covers a by-value conversation turn while bounding a single request's cost.
+MAX_REQUEST_BYTES = 10_000_000
+# Per-connection socket timeout so a slow or stalled client cannot hold a worker thread
+# (and thus a thread-pool slot) open indefinitely.
+REQUEST_TIMEOUT_S = 30.0
+
+
+class HttpRequestTooLarge(Exception):
+    """The request body's declared Content-Length exceeds ``MAX_REQUEST_BYTES``."""
+
+
+def read_json_limited(handler: BaseHTTPRequestHandler, *, max_bytes: int = MAX_REQUEST_BYTES) -> dict[str, Any]:
+    """Read a JSON object body, rejecting an over-large declared Content-Length before any
+    bytes are read. Returns ``{}`` for an empty body. Raises ``HttpRequestTooLarge`` (-> 413)
+    or ``ValueError`` (-> 400) on a malformed body."""
+    length = int(handler.headers.get("Content-Length") or "0")
+    if length > max_bytes:
+        raise HttpRequestTooLarge(f"request body exceeds the {max_bytes}-byte limit")
+    if length <= 0:
+        return {}
+    try:
+        payload = json.loads(handler.rfile.read(length).decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid JSON request body") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("JSON request body must be an object")
+    return payload
+
+
+def redact_internal_error(logger: Any, handler: BaseHTTPRequestHandler, exc: Exception) -> str:
+    """Log an unexpected (5xx) exception in full server-side under a fresh correlation id and
+    return a generic client-facing message carrying only that id — never the exception text,
+    stack trace, or internal paths."""
+    correlation_id = uuid.uuid4().hex
+    logger.error(
+        "unhandled error [%s] %s %s: %r",
+        correlation_id,
+        getattr(handler, "command", "?"),
+        getattr(handler, "path", "?"),
+        exc,
+        exc_info=exc,
+    )
+    return f"internal server error (ref {correlation_id})"
+
+
+def log_http_request(logger: Any, handler: BaseHTTPRequestHandler, code: Any) -> None:
+    """Structured access log for one request (method, path, status)."""
+    logger.info("http %s %s -> %s", getattr(handler, "command", "?"), getattr(handler, "path", "?"), code)
+
+
+class HardenedThreadingHTTPServer(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` hardened for clean shutdown under load.
+
+    A per-connection socket timeout stops a slow client from pinning a request thread open.
+    Request threads are non-daemon with ``block_on_close``, so ``server_close()`` joins any
+    in-flight handler instead of abandoning it — abandoned daemon handlers racing a closing
+    listen socket are what surface as ``ConnectionAborted`` / "I/O on closed file" errors.
+    The socket timeout bounds that join so it can never hang."""
+
+    daemon_threads = False
+    block_on_close = True
+    request_timeout_s: float = REQUEST_TIMEOUT_S
+
+    def finish_request(self, request: Any, client_address: Any) -> None:
+        try:
+            request.settimeout(self.request_timeout_s)
+        except OSError:  # pragma: no cover - platform without settable timeout
+            pass
+        super().finish_request(request, client_address)
