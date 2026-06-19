@@ -124,6 +124,11 @@ class RunLimits:
     max_tool_calls: int = 100
     max_bytes_read: int = 1_000_000
     max_duration_s: int | None = 900
+    # Bounds on the by-value conversation log so a long multi-turn run cannot grow it
+    # without limit (it is resent every turn and persisted in every checkpoint). Defaults
+    # are generous backstops; exceeding either settles the run as ``limited``.
+    max_messages: int = 100_000
+    max_message_log_bytes: int = 8_000_000
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> RunLimits:
@@ -136,6 +141,8 @@ class RunLimits:
             max_tool_calls=int(payload.get("max_tool_calls", defaults.max_tool_calls)),
             max_bytes_read=int(payload.get("max_bytes_read", defaults.max_bytes_read)),
             max_duration_s=None if max_duration_raw is None else int(max_duration_raw),
+            max_messages=int(payload.get("max_messages", defaults.max_messages)),
+            max_message_log_bytes=int(payload.get("max_message_log_bytes", defaults.max_message_log_bytes)),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -144,6 +151,8 @@ class RunLimits:
             "max_tool_calls": self.max_tool_calls,
             "max_bytes_read": self.max_bytes_read,
             "max_duration_s": self.max_duration_s,
+            "max_messages": self.max_messages,
+            "max_message_log_bytes": self.max_message_log_bytes,
         }
 
 

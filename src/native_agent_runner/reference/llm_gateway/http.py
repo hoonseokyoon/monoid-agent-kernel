@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import json
+import logging
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any
 from urllib.parse import urlparse
 
 from native_agent_runner.errors import ModelAdapterError, NativeAgentError, PermissionDenied
+from native_agent_runner.reference._shared.http_util import (
+    HardenedThreadingHTTPServer,
+    HttpRequestTooLarge,
+    log_http_request,
+    read_json_limited,
+    redact_internal_error,
+)
 from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
 from native_agent_runner.providers.gateway import (
     GATEWAY_AUTH_ERROR,
@@ -14,6 +22,8 @@ from native_agent_runner.providers.gateway import (
     GATEWAY_BAD_RESPONSE,
     GATEWAY_SERVER_ERROR,
 )
+
+_LOGGER = logging.getLogger("native_agent_runner.llm_gateway.http")
 
 
 def make_llm_gateway_handler(
@@ -49,20 +59,14 @@ def make_llm_gateway_handler(
             except Exception as exc:
                 self._write_exception(exc)
 
+        def log_request(self, code: Any = "-", size: Any = "-") -> None:  # noqa: ARG002
+            log_http_request(_LOGGER, self, code)
+
         def log_message(self, _format: str, *_args: Any) -> None:
             return None
 
         def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length") or "0")
-            if length <= 0:
-                return {}
-            try:
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            except json.JSONDecodeError as exc:
-                raise ValueError("invalid JSON request body") from exc
-            if not isinstance(payload, dict):
-                raise ValueError("JSON request body must be an object")
-            return payload
+            return read_json_limited(self)
 
         def _bearer_token(self) -> str:
             header = self.headers.get("Authorization") or ""
@@ -93,6 +97,13 @@ def make_llm_gateway_handler(
                     error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
                     retryable=exc.retryable,
                 )
+            elif isinstance(exc, HttpRequestTooLarge):
+                self._write_error(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    str(exc),
+                    error_code=GATEWAY_BAD_REQUEST,
+                    retryable=False,
+                )
             elif isinstance(exc, ValueError):
                 self._write_error(
                     HTTPStatus.BAD_REQUEST,
@@ -110,7 +121,7 @@ def make_llm_gateway_handler(
             else:
                 self._write_error(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
-                    str(exc),
+                    redact_internal_error(_LOGGER, self, exc),
                     error_code=GATEWAY_SERVER_ERROR,
                     retryable=True,
                 )
@@ -159,5 +170,5 @@ def create_llm_gateway_server(
     host: str,
     port: int,
     admin_token: str,
-) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_llm_gateway_handler(gateway, admin_token=admin_token))
+) -> HardenedThreadingHTTPServer:
+    return HardenedThreadingHTTPServer((host, port), make_llm_gateway_handler(gateway, admin_token=admin_token))

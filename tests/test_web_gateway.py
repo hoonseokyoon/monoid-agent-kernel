@@ -3,17 +3,17 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
-from urllib.request import Request, urlopen
+
+from native_agent_runner.reference._shared.http_util import HardenedThreadingHTTPServer
 
 import pytest
 
-from conftest import runtime_config, runtime_provider, tool_binding
+from conftest import http_json, runtime_config, runtime_provider, tool_binding, wait_http_ready
 
 from native_agent_runner.core.schemas import validate_run_dir
 from native_agent_runner.core.spec import AgentRunSpec
@@ -79,6 +79,39 @@ def test_web_gateway_enforces_binding_constraints_usage_and_domains() -> None:
         )
     with pytest.raises(TokenError):
         manager.verify(token, kind="llm_gateway", audience="csp.llm-gateway")
+
+
+def test_web_gateway_client_retries_transient_connection_error(monkeypatch) -> None:
+    # A bare connection-level error (OSError, neither HTTPError nor a real response) is
+    # transient and must be retried, not surfaced as a failed web call.
+    calls = 0
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return None
+
+        def read(self):
+            return b'{"result_count": 0, "results": []}'
+
+    def fake_urlopen(_request, timeout):
+        del timeout
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionResetError("connection reset by peer")
+        return _Resp()
+
+    monkeypatch.setattr("native_agent_runner.web.urlopen", fake_urlopen)
+    monkeypatch.setattr("native_agent_runner.web.time.sleep", lambda _d: None)
+    client = WebGatewayClient("http://gateway.local", token="t")
+
+    result = client.search({"binding_id": "b", "query": "q"})
+
+    assert calls == 2
+    assert result["result_count"] == 0
 
 
 def test_web_gateway_http_client_and_usage() -> None:
@@ -242,31 +275,15 @@ def test_brave_search_provider_live_smoke() -> None:
 
 
 def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-    with urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return http_json(url, payload, token=token)
 
 
 def _json_get(url: str, *, token: str) -> dict:
-    request = Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
-    with urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return http_json(url, token=token, method="GET")
 
 
-def _wait_http_ready(base_url: str, *, timeout_s: float = 5.0) -> None:
-    deadline = time.time() + timeout_s
-    last_error: Exception | None = None
-    while time.time() < deadline:
-        try:
-            _json_get(f"{base_url}/healthz", token="unused")
-            return
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.02)
-    raise TimeoutError(f"server did not become ready: {last_error}")
+def _wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
+    wait_http_ready(base_url, timeout_s=timeout_s)
 
 
 class _FakeUpstreamServer:
@@ -344,8 +361,8 @@ class _FakeUpstreamServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server = HardenedThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever)
 
     @property
     def port(self) -> int:

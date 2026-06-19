@@ -6,12 +6,11 @@ import tarfile
 import threading
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 
 import pytest
 from click.testing import CliRunner
 
-from conftest import runtime_config, runtime_provider
+from conftest import http_json, runtime_config, runtime_provider
 
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
@@ -504,19 +503,11 @@ def test_backend_package_apply_endpoint_handles_deletion_package(tmp_path: Path)
 
 
 def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
-    body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = Request(url, data=body, headers=headers, method="POST")
-    with urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return http_json(url, payload, token=token)
 
 
 def _json_get(url: str, *, token: str) -> dict:
-    request = Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
-    with urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return http_json(url, token=token, method="GET")
 
 
 class _BytesReader:

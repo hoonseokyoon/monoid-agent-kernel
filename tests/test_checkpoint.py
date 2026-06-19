@@ -160,6 +160,29 @@ def test_local_fs_store_latest_ignores_uncommitted_seq(tmp_path: Path) -> None:
     assert record is not None and record.seq == 1 and record.checkpoint.final_text == "good"
 
 
+def test_local_fs_store_put_flip_is_monotonic(tmp_path: Path) -> None:
+    # A late writer with a lower seq (e.g. a reclaim racing a slow original worker) must
+    # never regress LATEST and unpublish a newer committed checkpoint.
+    store = LocalFsCheckpointStore(tmp_path)
+    store.put(RunCheckpoint(run_id="run_1", seq=2, final_text="new"))
+    store.put(RunCheckpoint(run_id="run_1", seq=1, final_text="stale"))
+    record = store.latest("run_1")
+    assert record is not None and record.seq == 2 and record.checkpoint.final_text == "new"
+
+
+def test_local_fs_store_put_gcs_orphan_blob_tmp(tmp_path: Path) -> None:
+    # A blob temp file left by a crashed prior write is dead weight (no LATEST flip ever
+    # referenced it); the next put garbage-collects it.
+    store = LocalFsCheckpointStore(tmp_path)
+    blobs_dir = tmp_path / "run_1" / "checkpoints" / "blobs"
+    blobs_dir.mkdir(parents=True)
+    orphan = blobs_dir / ("a" * 64 + ".tmp")
+    orphan.write_bytes(b"partial")
+    store.put(RunCheckpoint(run_id="run_1", seq=1), blobs={"b" * 64: b"data"})
+    assert not orphan.exists()
+    assert (blobs_dir / ("b" * 64)).read_bytes() == b"data"
+
+
 def test_snapshot_writes_checkpoint_at_hosted_park(tmp_path: Path) -> None:
     spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
     loop, _task_id, _run_dir, _artifacts = _hitl_parked_loop(spec)

@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from native_agent_runner.core._util import write_json_atomic
+from native_agent_runner.core._util import file_lock, write_json_atomic
 
 SCHEMA_VERSION = "native-agent-runner.checkpoint.v1"
 
@@ -167,37 +168,84 @@ class LocalFsCheckpointStore:
     object-store/DB store is a drop-in replacement (same protocol)."""
 
     run_root: Path
+    # Cross-process put serialization. A writer steals a lock left by a crashed peer once
+    # it is older than ``lock_stale_s``; ``lock_timeout_s`` bounds how long it waits for a
+    # live peer before stealing anyway (so a stuck holder can never deadlock a put).
+    lock_timeout_s: float = 10.0
+    lock_stale_s: float = 30.0
 
     def _dir(self, run_id: str) -> Path:
         return self.run_root / run_id / "checkpoints"
 
     def put(self, checkpoint: RunCheckpoint, blobs: Mapping[str, bytes] = {}) -> None:
         cdir = self._dir(checkpoint.run_id)
-        # 1) Content blobs first — content-addressed and write-once, so a crash here
-        #    only leaves harmless orphans (no LATEST flip yet).
-        if blobs:
-            blobs_dir = cdir / "blobs"
-            blobs_dir.mkdir(parents=True, exist_ok=True)
-            for sha256, data in blobs.items():
-                target = blobs_dir / sha256
-                if not target.exists():
-                    tmp = target.with_suffix(".tmp")
-                    tmp.write_bytes(data)
-                    tmp.replace(target)
-        # 2) Manifest (atomic file write into the seq dir).
-        seq_dir = cdir / str(checkpoint.seq)
-        seq_dir.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(seq_dir / "manifest.json", checkpoint.to_json())
-        # 3) Flip the latest pointer last — only now is this seq considered committed.
-        write_json_atomic(cdir / "LATEST", {"seq": checkpoint.seq})
+        # Serialize puts for this run across processes (e.g. a watchdog reclaim racing the
+        # original worker): without it, two writers could interleave blob writes and LATEST
+        # flips and tear a checkpoint.
+        cdir.mkdir(parents=True, exist_ok=True)
+        with file_lock(cdir / ".put.lock", timeout_s=self.lock_timeout_s, stale_s=self.lock_stale_s):
+            # 0) GC orphaned blob temp files left by a crashed prior write (no LATEST was
+            #    flipped for them, so they are pure dead weight).
+            self._gc_blob_tmp(cdir)
+            # 1) Content blobs first — content-addressed and write-once, so a crash here
+            #    only leaves harmless orphans (no LATEST flip yet).
+            if blobs:
+                blobs_dir = cdir / "blobs"
+                blobs_dir.mkdir(parents=True, exist_ok=True)
+                for sha256, data in blobs.items():
+                    target = blobs_dir / sha256
+                    if not target.exists():
+                        tmp = target.with_suffix(".tmp")
+                        tmp.write_bytes(data)
+                        tmp.replace(target)
+            # 2) Manifest (atomic file write into the seq dir).
+            seq_dir = cdir / str(checkpoint.seq)
+            seq_dir.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(seq_dir / "manifest.json", checkpoint.to_json())
+            # 3) Flip the latest pointer last — only now is this seq considered committed.
+            #    Monotonic: never regress LATEST to an older seq, so a late/lower-seq writer
+            #    cannot unpublish a newer committed checkpoint (re-putting the same seq, as
+            #    the backend does to fold in the message queue, is a no-op flip).
+            if checkpoint.seq > self._read_latest_seq(cdir):
+                write_json_atomic(cdir / "LATEST", {"seq": checkpoint.seq})
+
+    def _read_latest_seq(self, cdir: Path) -> int:
+        try:
+            return int(json.loads((cdir / "LATEST").read_text(encoding="utf-8"))["seq"])
+        except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+            return -1
+
+    def _gc_blob_tmp(self, cdir: Path) -> None:
+        blobs_dir = cdir / "blobs"
+        if not blobs_dir.is_dir():
+            return
+        for tmp in blobs_dir.glob("*.tmp"):
+            try:
+                tmp.unlink()
+            except OSError:  # pragma: no cover - best-effort cleanup
+                pass
 
     def latest(self, run_id: str) -> CheckpointRecord | None:
         cdir = self._dir(run_id)
-        try:
-            pointer = json.loads((cdir / "LATEST").read_text(encoding="utf-8"))
-            seq = int(pointer["seq"])
-            manifest = json.loads((cdir / str(seq) / "manifest.json").read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+        if not cdir.is_dir():
+            return None  # never checkpointed — fast path, no retry
+        # A reader can race a concurrent put()'s atomic LATEST/manifest replace (especially
+        # cross-process, e.g. a watchdog reclaim reading while the original worker commits).
+        # Retry a few times so a transient read failure mid-commit is not mistaken for
+        # "no checkpoint" — returning None here would wrongly skip a recoverable run.
+        seq = -1
+        manifest: dict[str, Any] | None = None
+        for attempt in range(4):
+            try:
+                pointer = json.loads((cdir / "LATEST").read_text(encoding="utf-8"))
+                seq = int(pointer["seq"])
+                manifest = json.loads((cdir / str(seq) / "manifest.json").read_text(encoding="utf-8"))
+                break
+            except (ValueError, OSError, KeyError, TypeError):
+                manifest = None
+                if attempt < 3:
+                    time.sleep(0.01)
+        if manifest is None:
             return None
         checkpoint = RunCheckpoint.from_json(manifest)
         if checkpoint is None:
