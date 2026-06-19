@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import queue
 import threading
 import time
@@ -25,7 +27,7 @@ from native_agent_runner.core.packages import (
     write_apply_result,
     write_approval,
 )
-from native_agent_runner.core._util import write_json_atomic
+from native_agent_runner.core._util import file_lock, write_json_atomic
 from native_agent_runner.core.checkpoint import (
     CheckpointRecord,
     CheckpointStore,
@@ -66,6 +68,8 @@ ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
 
 # Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
 _RUN_META_SCHEMA_VERSION = "native-agent-runner.backend-run.v1"
+
+_LOGGER = logging.getLogger("native_agent_runner.backend")
 
 
 def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
@@ -247,14 +251,38 @@ class RunnerBackend:
     max_session_lifetime_s: float = 1800.0
     max_turns: int = 50
     task_wait_poll_s: float = 5.0
+    # A run whose checkpoint cannot be resumed is retried at most this many times across
+    # restarts before being marked unrecoverable (a durable failure.json), so a poison
+    # checkpoint never drives an unbounded restart/crash loop.
+    max_recover_attempts: int = 3
+    # Active watchdog (opt-in via start_watchdog). A worker heartbeats a lease.json for each
+    # of its live runs; the watchdog reclaims runs whose lease has gone stale (the owning
+    # worker crashed). lease_ttl_s must comfortably exceed watchdog_interval_s so a healthy
+    # worker's own lease never looks stale between ticks.
+    lease_ttl_s: float = 30.0
+    watchdog_interval_s: float = 5.0
+    # Resource bounds. A follow-up message larger than max_message_bytes is rejected, and a
+    # run's pending-message queue is capped at max_message_queue_depth. max_concurrent_runs
+    # caps how many runs do real work at once (0 = unbounded); excess runs stay ``queued``
+    # until a slot frees, bounding CPU / memory / gateway load under a submission burst.
+    max_message_bytes: int = 1_000_000
+    max_message_queue_depth: int = 100
+    max_concurrent_runs: int = 0
     # How checkpoints are durably stored (backend owns HOW). Defaults to a local-fs
     # store under run_root; swap for a mounted-volume path or an object-store/DB store.
     checkpoint_store: CheckpointStore | None = None
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
     _usage: dict[str, TenantUsage] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _worker_id: str = field(default="", init=False, repr=False)
+    _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
+    _watchdog_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _run_semaphore: threading.BoundedSemaphore | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._worker_id = uuid.uuid4().hex
+        if self.max_concurrent_runs > 0:
+            self._run_semaphore = threading.BoundedSemaphore(self.max_concurrent_runs)
         self.run_root = self.run_root.resolve()
         self.run_root.mkdir(parents=True, exist_ok=True)
         roots = tuple(root.resolve() for root in self.allowed_workspace_roots)
@@ -480,9 +508,13 @@ class RunnerBackend:
         queued and consumed as the next user turn once the current turn settles."""
         self._authorize_run(run_id, token)
         record = self._record(run_id)
+        if len(content.encode("utf-8")) > self.max_message_bytes:
+            raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
                 raise ValueError("cannot send a message to a terminal run")
+            if record.message_queue.qsize() >= self.max_message_queue_depth:
+                raise ValueError("message queue is full; retry once the run drains it")
         record.message_queue.put(str(content))
         return {"run_id": run_id, "status": "queued"}
 
@@ -943,34 +975,42 @@ class RunnerBackend:
         llm_gateway_token: str,
         web_gateway_token: str,
     ) -> None:
-        spec = self._run_spec_for_request(run_id, request, workspace_root)
+        # Bound concurrent active runs: at capacity this blocks, so the run stays ``queued``
+        # until a slot frees rather than piling work onto a saturated process.
+        if self._run_semaphore is not None:
+            self._run_semaphore.acquire()
         try:
-            runtime_config = self.current_runtime_config(run_id)
-            adapter = self._build_model_adapter(
-                spec,
-                llm_gateway_token,
-                runtime_config.model if runtime_config is not None else None,
-            )
-            loop = AgentLoop(
-                spec=spec,
-                model_adapter=adapter,
-                event_sinks=(BackendRunStateSink(self, run_id),),
-                permission_policy=request.permission_policy,
-                cancellation_token=self._record(run_id).cancellation_token,
-                shell_approval_provider=None,
-                web_gateway_client=self._web_gateway_client(web_gateway_token),
-                runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
-                checkpoint_store=self.checkpoint_store,
-            )
-            with self._lock:
-                self._records[run_id].loop = loop
-            # Persist the recovery metadata before the first turn so a crash at any park
-            # point can be resumed (the checkpoint itself is written by the driver).
-            self._write_run_meta(self._record(run_id), request)
-            result = self._drive_session(run_id, request, loop)
-            self._record_run_result(run_id, result)
-        except Exception as exc:
-            self._record_run_failure(run_id, exc)
+            spec = self._run_spec_for_request(run_id, request, workspace_root)
+            try:
+                runtime_config = self.current_runtime_config(run_id)
+                adapter = self._build_model_adapter(
+                    spec,
+                    llm_gateway_token,
+                    runtime_config.model if runtime_config is not None else None,
+                )
+                loop = AgentLoop(
+                    spec=spec,
+                    model_adapter=adapter,
+                    event_sinks=(BackendRunStateSink(self, run_id),),
+                    permission_policy=request.permission_policy,
+                    cancellation_token=self._record(run_id).cancellation_token,
+                    shell_approval_provider=None,
+                    web_gateway_client=self._web_gateway_client(web_gateway_token),
+                    runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
+                    checkpoint_store=self.checkpoint_store,
+                )
+                with self._lock:
+                    self._records[run_id].loop = loop
+                # Persist the recovery metadata before the first turn so a crash at any park
+                # point can be resumed (the checkpoint itself is written by the driver).
+                self._write_run_meta(self._record(run_id), request)
+                result = self._drive_session(run_id, request, loop)
+                self._record_run_result(run_id, result)
+            except Exception as exc:
+                self._record_run_failure(run_id, exc)
+        finally:
+            if self._run_semaphore is not None:
+                self._run_semaphore.release()
 
     def _record_run_result(self, run_id: str, result: AgentRunResult) -> None:
         with self._lock:
@@ -985,12 +1025,87 @@ class RunnerBackend:
             )
 
     def _record_run_failure(self, run_id: str, exc: Exception) -> None:
+        # Durable failure mark FIRST — before the in-memory status flips to a terminal
+        # value. A worker-level crash that bypassed the loop's own bundle would otherwise
+        # leave no failure.json, and the restart scanner would treat the run as merely
+        # parked and resume it into a crash loop. Writing the bundle before the terminal
+        # status also closes the race where an observer sees ``failed`` but no bundle yet.
+        # ``overwrite=False`` preserves the loop's richer bundle when it already wrote one.
+        # There is still no auto-recovery: the bundle is purely an operator restore aid.
+        self._write_failure_bundle(
+            run_id,
+            self.run_root / run_id,
+            error=str(exc),
+            error_code=getattr(exc, "error_code", "internal_error"),
+            exc_type=type(exc).__name__,
+            overwrite=False,
+        )
         with self._lock:
             record = self._records[run_id]
             record.status = "failed"
             record.error = str(exc)
             record.error_code = getattr(exc, "error_code", "internal_error")
             record.finished_at = time.time()
+
+    def _write_failure_bundle(
+        self,
+        run_id: str,
+        run_dir: Path,
+        *,
+        error: str,
+        error_code: str,
+        exc_type: str,
+        overwrite: bool,
+    ) -> None:
+        """Write ``run_dir/failure.json`` (the operator-facing failure bundle, same schema
+        as the core's). ``overwrite=False`` preserves a bundle the loop already wrote
+        (which carries richer, in-run context)."""
+        failure_path = run_dir / "failure.json"
+        if failure_path.exists() and not overwrite:
+            return
+        last_good_seq = 0
+        if self.checkpoint_store is not None:
+            try:
+                stored = self.checkpoint_store.latest(run_id)
+                last_good_seq = stored.seq if stored is not None else 0
+            except Exception:  # pragma: no cover - last-good lookup must never mask the failure
+                last_good_seq = 0
+        bundle = {
+            "schema_version": "native-agent-runner.failure.v1",
+            "run_id": run_id,
+            "error": error,
+            "error_code": error_code,
+            "type": exc_type,
+            "last_good_seq": last_good_seq,
+            "restore_hint": (
+                f"restore checkpoint seq {last_good_seq} for run {run_id} via CheckpointStore, "
+                "then resume via recover_runs"
+                if last_good_seq > 0
+                else "no recoverable checkpoint; inspect run logs and run.json"
+            ),
+            "failed_at": time.time(),
+        }
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(failure_path, bundle)
+
+    def _recover_attempts_path(self, run_dir: Path) -> Path:
+        return run_dir / "recover_attempts.json"
+
+    def _read_recover_attempts(self, run_dir: Path) -> int:
+        try:
+            payload = json.loads(self._recover_attempts_path(run_dir).read_text(encoding="utf-8"))
+            return int(payload["count"])
+        except (FileNotFoundError, ValueError, KeyError, OSError, TypeError):
+            return 0
+
+    def _bump_recover_attempts(self, run_dir: Path) -> int:
+        count = self._read_recover_attempts(run_dir) + 1
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(self._recover_attempts_path(run_dir), {"count": count})
+        return count
+
+    def _clear_recover_attempts(self, run_dir: Path) -> None:
+        self._recover_attempts_path(run_dir).unlink(missing_ok=True)
 
     def _write_run_meta(self, record: BackendRunRecord, request: BackendRunRequest) -> None:
         """Write run.json — the durable recovery descriptor. Holds everything
@@ -1039,15 +1154,159 @@ class RunnerBackend:
             stored = self.checkpoint_store.latest(run_id)
             if stored is None or stored.checkpoint.terminal:
                 continue
-            meta = _read_run_meta(run_dir)
-            if meta is None:
+            if self._attempt_resume(run_dir, run_id):
+                recovered.append(run_id)
+        return recovered
+
+    def _attempt_resume(self, run_dir: Path, run_id: str) -> bool:
+        """Resume one run from its latest checkpoint. Returns True on success. Skips runs
+        with no resumable checkpoint or missing run.json. On a resume exception, bumps the
+        durable attempt counter and, once ``max_recover_attempts`` is reached, marks the run
+        unrecoverable (durable failure.json) so it is never retried into a crash loop."""
+        assert self.checkpoint_store is not None
+        stored = self.checkpoint_store.latest(run_id)
+        if stored is None or stored.checkpoint.terminal:
+            return False
+        meta = _read_run_meta(run_dir)
+        if meta is None:
+            return False
+        try:
+            self._resume_from_checkpoint(stored, meta)
+        except Exception as exc:
+            attempts = self._bump_recover_attempts(run_dir)
+            _LOGGER.error(
+                "resume of run %s failed (attempt %d/%d): %s",
+                run_id,
+                attempts,
+                self.max_recover_attempts,
+                exc,
+            )
+            if attempts >= self.max_recover_attempts:
+                self._write_failure_bundle(
+                    run_id,
+                    run_dir,
+                    error=f"recovery failed after {attempts} attempts: {exc}",
+                    error_code="unrecoverable",
+                    exc_type=type(exc).__name__,
+                    overwrite=True,
+                )
+                _LOGGER.error("run %s marked unrecoverable", run_id)
+            return False
+        self._clear_recover_attempts(run_dir)
+        return True
+
+    # --- Active watchdog / lease (operational layer; the core never auto-recovers) -------
+
+    def start_watchdog(self) -> None:
+        """Begin the operational watchdog thread: heartbeat this backend's own runs and
+        reclaim runs orphaned by a crashed peer (a stale lease). Opt-in and idempotent."""
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_stop.clear()
+        thread = threading.Thread(
+            target=self._watchdog_loop,
+            name=f"native-agent-watchdog-{self._worker_id[:8]}",
+            daemon=True,
+        )
+        self._watchdog_thread = thread
+        thread.start()
+
+    def stop_watchdog(self) -> None:
+        self._watchdog_stop.set()
+        thread = self._watchdog_thread
+        if thread is not None:
+            thread.join(timeout=5)
+        self._watchdog_thread = None
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(self.watchdog_interval_s):
+            try:
+                self._heartbeat_own_runs()
+                self._reclaim_stale_runs()
+            except Exception:  # pragma: no cover - the watchdog must never die on a tick
+                _LOGGER.exception("watchdog tick failed")
+
+    def _heartbeat_own_runs(self) -> None:
+        with self._lock:
+            items = list(self._records.items())
+        for run_id, record in items:
+            if record.status in {"completed", "failed", "limited"}:
+                # Terminal: drop the lease so no watchdog ever reclaims a finished run.
+                try:
+                    self._lease_path(record.run_dir).unlink(missing_ok=True)
+                except OSError:  # pragma: no cover - best effort
+                    pass
                 continue
             try:
-                self._resume_from_checkpoint(stored, meta)
-            except Exception:
+                self._write_lease(record.run_dir, run_id)
+            except OSError:  # pragma: no cover - best effort
+                pass
+
+    def _reclaim_stale_runs(self) -> list[str]:
+        """Reclaim runs whose owning worker crashed (lease stale or absent). A live peer's
+        run carries a fresh lease and is left untouched; the claim is a cross-process CAS so
+        two watchdogs racing the same run produce exactly one winner."""
+        reclaimed: list[str] = []
+        if not self.run_root.is_dir():
+            return reclaimed
+        for run_dir in sorted(path for path in self.run_root.iterdir() if path.is_dir()):
+            run_id = run_dir.name
+            with self._lock:
+                if run_id in self._records:
+                    continue
+            if (run_dir / "failure.json").exists():
                 continue
-            recovered.append(run_id)
-        return recovered
+            if not self._lease_is_stale(run_dir):
+                continue  # a live peer owns it
+            if not self._claim_lease(run_dir, run_id):
+                continue  # lost the CAS to another watchdog
+            if self._attempt_resume(run_dir, run_id):
+                _LOGGER.info("watchdog: reclaimed orphaned run %s", run_id)
+                reclaimed.append(run_id)
+            elif not (run_dir / "failure.json").exists():
+                # Resume failed but the attempt cap has not yet marked it unrecoverable.
+                # Release our just-claimed lease so the run is retried next tick (or by a
+                # peer) instead of being stranded behind a fresh lease that never resumes.
+                self._lease_path(run_dir).unlink(missing_ok=True)
+        return reclaimed
+
+    def _lease_path(self, run_dir: Path) -> Path:
+        return run_dir / "lease.json"
+
+    def _read_lease(self, run_dir: Path) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(self._lease_path(run_dir).read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _write_lease(self, run_dir: Path, run_id: str) -> None:
+        write_json_atomic(
+            self._lease_path(run_dir),
+            {
+                "run_id": run_id,
+                "worker_id": self._worker_id,
+                "pid": os.getpid(),
+                "heartbeat_at": time.time(),
+                "lease_ttl_s": self.lease_ttl_s,
+            },
+        )
+
+    def _lease_is_stale(self, run_dir: Path) -> bool:
+        lease = self._read_lease(run_dir)
+        if lease is None:
+            return True  # no lease (crashed before writing, or a legacy run) -> reclaimable
+        ttl = float(lease.get("lease_ttl_s", self.lease_ttl_s))
+        return (time.time() - float(lease.get("heartbeat_at", 0.0))) > ttl
+
+    def _claim_lease(self, run_dir: Path, run_id: str) -> bool:
+        """CAS the lease under a cross-process lock: win only if it is still stale when the
+        lock is held (a peer that reclaimed first leaves a fresh lease, so we back off)."""
+        with file_lock(run_dir / ".reclaim.lock", timeout_s=5.0, stale_s=self.lease_ttl_s * 2 + 5.0):
+            if not self._lease_is_stale(run_dir):
+                return False
+            self._write_lease(run_dir, run_id)
+            return True
 
     def _resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> None:
         checkpoint = stored.checkpoint
@@ -1140,6 +1399,8 @@ class RunnerBackend:
 
     def _run_recovered_worker(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> None:
         record = self._record(run_id)
+        if self._run_semaphore is not None:
+            self._run_semaphore.acquire()
         try:
             # Derive the starting park from the restored loop: tasks still pending -> a
             # hosted-task wait; otherwise a settled park awaiting the next user message.
@@ -1153,6 +1414,9 @@ class RunnerBackend:
             self._record_run_result(run_id, result)
         except Exception as exc:
             self._record_run_failure(run_id, exc)
+        finally:
+            if self._run_semaphore is not None:
+                self._run_semaphore.release()
 
     def _build_model_adapter(
         self,

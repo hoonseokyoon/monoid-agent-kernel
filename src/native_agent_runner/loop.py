@@ -1187,6 +1187,22 @@ class AgentLoop:
                 state.messages.append({"role": "user", "content": instruction})
             for observation in state.pending_observations:
                 state.messages.append(_observation_message(observation))
+            # Bound the by-value conversation log: a runaway multi-turn run must settle
+            # safely (status ``limited``, last-good checkpoint intact) rather than grow the
+            # resent-every-turn log without limit. Checked before the call so an over-limit
+            # log is never sent or re-persisted.
+            log_limit_code = self._message_log_limit_exceeded(state)
+            if log_limit_code is not None:
+                state.status = "limited"
+                state.final_text = "Stopped after reaching the conversation size limit."
+                state.error_code = log_limit_code
+                state.pending_observations = ()
+                return Suspension(
+                    reason="limited",
+                    status="limited",
+                    final_text=state.final_text,
+                    error_code=log_limit_code,
+                )
             request = ModelRequest(
                 instruction=instruction,
                 system_prompt=turn_system_prompt,
@@ -1349,6 +1365,17 @@ class AgentLoop:
             final_text=state.final_text,
             error_code=state.error_code,
         )
+
+    def _message_log_limit_exceeded(self, state: RunState) -> str | None:
+        """Return the limit error_code if the by-value conversation log has outgrown its
+        bounds (count or approximate serialized bytes), else ``None``."""
+        limits = self.spec.limits
+        if len(state.messages) > limits.max_messages:
+            return "message_count_exceeded"
+        size = sum(len(json.dumps(message, ensure_ascii=False)) for message in state.messages)
+        if size > limits.max_message_log_bytes:
+            return "message_log_bytes_exceeded"
+        return None
 
     def _build_metrics(self, state: RunState, res: _RunResources) -> dict[str, Any]:
         context = res.context
