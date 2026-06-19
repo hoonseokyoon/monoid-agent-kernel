@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any, Protocol
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -224,21 +225,35 @@ class HttpFetchProvider:
             },
             method="GET",
         )
-        try:
-            with urlopen(request, timeout=self.timeout_s) as response:
-                final_url = response.geturl()
-                content_type = response.headers.get("Content-Type", "")
-                raw = response.read(self.max_raw_bytes + 1)
-        except HTTPError as exc:
-            raise WebGatewayError(
-                f"fetch failed with HTTP {exc.code}: {url}",
-                error_code="web_fetch_http_error",
-                http_status=int(exc.code),
-            ) from exc
-        except URLError as exc:
-            raise WebGatewayError(f"fetch failed: {exc.reason}", error_code="web_fetch_network_error") from exc
-        except TimeoutError as exc:
-            raise WebGatewayError("fetch timed out", error_code="web_fetch_timeout") from exc
+        # Retry transient connection-level failures (an HTTPError is a real response and
+        # propagates immediately); the final error keeps the original message/code.
+        attempts = 3
+        final_url = url
+        content_type = ""
+        raw = b""
+        for attempt in range(attempts):
+            try:
+                with urlopen(request, timeout=self.timeout_s) as response:
+                    final_url = response.geturl()
+                    content_type = response.headers.get("Content-Type", "")
+                    raw = response.read(self.max_raw_bytes + 1)
+                break
+            except HTTPError as exc:
+                raise WebGatewayError(
+                    f"fetch failed with HTTP {exc.code}: {url}",
+                    error_code="web_fetch_http_error",
+                    http_status=int(exc.code),
+                ) from exc
+            except OSError as exc:  # URLError/TimeoutError + raw connection resets
+                if attempt < attempts - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                if isinstance(exc, TimeoutError):
+                    raise WebGatewayError("fetch timed out", error_code="web_fetch_timeout") from exc
+                reason = getattr(exc, "reason", exc)
+                raise WebGatewayError(
+                    f"fetch failed: {reason}", error_code="web_fetch_network_error"
+                ) from exc
 
         if len(raw) > self.max_raw_bytes:
             raw = raw[: self.max_raw_bytes]
@@ -362,6 +377,43 @@ class SearchFetchContextProvider:
         )
 
 
+def _urlopen_read_with_retry(
+    request: Request,
+    *,
+    timeout_s: int,
+    error_prefix: str,
+    error_code_prefix: str,
+) -> bytes:
+    """Open ``request`` and read the body, retrying transient connection-level failures
+    (reset / aborted / refused / timeout) with a short backoff. An ``HTTPError`` is a real
+    response and propagates immediately; the final connection error keeps the original
+    ``*_network_error`` / ``*_timeout`` code so callers and tests see unchanged behavior."""
+    attempts = 3
+    for attempt in range(attempts):
+        try:
+            with urlopen(request, timeout=timeout_s) as response:
+                return response.read()
+        except HTTPError as exc:
+            raise WebGatewayError(
+                f"{error_prefix} failed with HTTP {exc.code}",
+                error_code=f"{error_code_prefix}_http_error",
+                http_status=int(exc.code),
+            ) from exc
+        except OSError as exc:  # URLError/TimeoutError (OSError subclasses) + raw resets
+            if attempt < attempts - 1:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            if isinstance(exc, TimeoutError):
+                raise WebGatewayError(
+                    f"{error_prefix} timed out", error_code=f"{error_code_prefix}_timeout"
+                ) from exc
+            reason = getattr(exc, "reason", exc)
+            raise WebGatewayError(
+                f"{error_prefix} failed: {reason}", error_code=f"{error_code_prefix}_network_error"
+            ) from exc
+    raise AssertionError("unreachable: retry loop exited without returning or raising")
+
+
 def _request_json(
     url: str,
     *,
@@ -373,20 +425,12 @@ def _request_json(
     error_code_prefix: str = "web_search",
 ) -> dict[str, Any]:
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-    request = Request(url, data=data, headers=headers, method=method)
-    try:
-        with urlopen(request, timeout=timeout_s) as response:
-            body = response.read()
-    except HTTPError as exc:
-        raise WebGatewayError(
-            f"{error_prefix} failed with HTTP {exc.code}",
-            error_code=f"{error_code_prefix}_http_error",
-            http_status=int(exc.code),
-        ) from exc
-    except URLError as exc:
-        raise WebGatewayError(f"{error_prefix} failed: {exc.reason}", error_code=f"{error_code_prefix}_network_error") from exc
-    except TimeoutError as exc:
-        raise WebGatewayError(f"{error_prefix} timed out", error_code=f"{error_code_prefix}_timeout") from exc
+    body = _urlopen_read_with_retry(
+        Request(url, data=data, headers=headers, method=method),
+        timeout_s=timeout_s,
+        error_prefix=error_prefix,
+        error_code_prefix=error_code_prefix,
+    )
     try:
         payload = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError as exc:
