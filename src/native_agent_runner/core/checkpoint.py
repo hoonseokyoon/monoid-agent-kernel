@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -133,17 +133,19 @@ def read_checkpoint(run_dir: Path) -> RunCheckpoint | None:
 @dataclass
 class CheckpointRecord:
     """A fully-committed checkpoint read back from a store: the manifest plus lazy
-    access to its content blobs (changed-file bytes, keyed by sha256)."""
+    access to its content blobs (changed-file bytes, keyed by sha256). The blob accessor
+    is a callable, not a directory, so a store can back it with files, a DB, or an object
+    store — the loop only ever needs ``blob(sha)``."""
 
     seq: int
     checkpoint: RunCheckpoint
-    _blobs_dir: Path | None = None
+    _blob_reader: Callable[[str], bytes] | None = None
 
     def blob(self, sha256: str) -> bytes:
         """Read a content blob by its sha256 key (workspace delta files, Phase L)."""
-        if self._blobs_dir is None:
+        if self._blob_reader is None:
             raise KeyError(sha256)
-        return (self._blobs_dir / sha256).read_bytes()
+        return self._blob_reader(sha256)
 
 
 class CheckpointStore(Protocol):
@@ -250,7 +252,12 @@ class LocalFsCheckpointStore:
         checkpoint = RunCheckpoint.from_json(manifest)
         if checkpoint is None:
             return None
-        return CheckpointRecord(seq=seq, checkpoint=checkpoint, _blobs_dir=cdir / "blobs")
+        blobs_dir = cdir / "blobs"
+        return CheckpointRecord(
+            seq=seq,
+            checkpoint=checkpoint,
+            _blob_reader=lambda sha256: (blobs_dir / sha256).read_bytes(),
+        )
 
     def delete(self, run_id: str) -> None:
         shutil.rmtree(self._dir(run_id), ignore_errors=True)

@@ -129,24 +129,6 @@ def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
     assert read_checkpoint(tmp_path) is None
 
 
-def test_local_fs_store_put_latest_seq(tmp_path: Path) -> None:
-    store = LocalFsCheckpointStore(tmp_path)
-    assert store.latest("run_1") is None
-
-    store.put(RunCheckpoint(run_id="run_1", seq=1, previous_turn_handle="a"))
-    store.put(RunCheckpoint(run_id="run_1", seq=2, previous_turn_handle="b"))
-    record = store.latest("run_1")
-    assert record is not None
-    assert record.seq == 2
-    assert record.checkpoint.previous_turn_handle == "b"
-
-    # A second run is isolated; deleting run_1 leaves nothing to recover.
-    store.put(RunCheckpoint(run_id="run_2", seq=1))
-    store.delete("run_1")
-    assert store.latest("run_1") is None
-    assert store.latest("run_2") is not None
-
-
 def test_local_fs_store_latest_ignores_uncommitted_seq(tmp_path: Path) -> None:
     # A manifest written for a higher seq WITHOUT flipping LATEST (a crash mid-commit)
     # must be ignored — latest() returns the last fully-committed checkpoint.
@@ -160,16 +142,6 @@ def test_local_fs_store_latest_ignores_uncommitted_seq(tmp_path: Path) -> None:
     )
     record = store.latest("run_1")
     assert record is not None and record.seq == 1 and record.checkpoint.final_text == "good"
-
-
-def test_local_fs_store_put_flip_is_monotonic(tmp_path: Path) -> None:
-    # A late writer with a lower seq (e.g. a reclaim racing a slow original worker) must
-    # never regress LATEST and unpublish a newer committed checkpoint.
-    store = LocalFsCheckpointStore(tmp_path)
-    store.put(RunCheckpoint(run_id="run_1", seq=2, final_text="new"))
-    store.put(RunCheckpoint(run_id="run_1", seq=1, final_text="stale"))
-    record = store.latest("run_1")
-    assert record is not None and record.seq == 2 and record.checkpoint.final_text == "new"
 
 
 def test_local_fs_store_put_gcs_orphan_blob_tmp(tmp_path: Path) -> None:

@@ -25,6 +25,7 @@ from native_agent_runner.reference.backend.service import (
     BackendRunRequest,
     RunnerBackend,
 )
+from native_agent_runner.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 
 
 def _token_manager() -> TokenManager:
@@ -507,9 +508,70 @@ def test_watchdog_concurrent_claim_has_single_winner(tmp_path: Path) -> None:
 
     def claim(backend) -> None:
         barrier.wait()
-        results.append(backend._claim_lease(run_dir, "run_x"))
+        results.append(backend.lease_store.try_claim("run_x", backend._worker_id, backend.lease_ttl_s))
 
     threads = [threading.Thread(target=claim, args=(b,)) for b in (b1, b2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results.count(True) == 1
+
+
+def test_multinode_reclaim_over_shared_sqlite(tmp_path: Path, monkeypatch) -> None:
+    # Two backends share ONLY a SQLite db (separate run_roots, no shared files). Backend A
+    # "crashes" leaving an orphan run in the shared db (checkpoint + stale lease); backend B,
+    # which never hosted it, discovers and reclaims it across the instance boundary. This is
+    # what a per-host lease.json cannot do. Resume internals (run.json, restore) are covered
+    # elsewhere, so the resume is stubbed — the point here is cross-instance discovery + CAS.
+    workspace = _workspace(tmp_path)
+    db = tmp_path / "shared.db"
+    shared_checkpoints = SqliteCheckpointStore(db)
+
+    run_id = "run_orphan"
+    shared_checkpoints.put(RunCheckpoint(run_id=run_id, seq=1, terminal=False))
+    SqliteLeaseStore(db).heartbeat(run_id, "worker_a", ttl_s=0.0)  # A crashed -> lease is stale
+    time.sleep(0.02)
+
+    backend_b = RunnerBackend(
+        run_root=tmp_path / "b_runs",  # B's own run_root — it never saw run_orphan's files
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda spec, token: FakeModelAdapter(turns=[ModelTurn(final_text="x")]),
+        checkpoint_store=shared_checkpoints,
+        lease_store=SqliteLeaseStore(db),
+    )
+    resumed: list = []
+    monkeypatch.setattr(
+        backend_b, "_attempt_resume", lambda run_dir, rid: (resumed.append(rid) or True)
+    )
+
+    reclaimed = backend_b._reclaim_stale_runs()
+
+    assert reclaimed == [run_id]  # B found A's orphan through the shared db
+    assert resumed == [run_id]  # and invoked resume across the instance boundary
+    assert backend_b.lease_store.owner(run_id) == backend_b._worker_id  # CAS flipped ownership to B
+
+
+def test_sqlite_lease_concurrent_claim_across_instances(tmp_path: Path) -> None:
+    # The cross-instance guarantee: two SqliteLeaseStore instances on the same db (standing
+    # in for two hosts) race to claim the same absent/stale run; the transactional CAS lets
+    # exactly one win.
+    db = tmp_path / "shared.db"
+    results: list[bool] = []
+    results_lock = threading.Lock()
+    barrier = threading.Barrier(2)
+
+    def claim(worker_id: str) -> None:
+        store = SqliteLeaseStore(db)
+        barrier.wait()
+        won = store.try_claim("run_x", worker_id, ttl_s=30.0)
+        with results_lock:
+            results.append(won)
+
+    threads = [threading.Thread(target=claim, args=(f"w{i}",)) for i in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:

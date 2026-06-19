@@ -476,9 +476,11 @@ the active watchdog lives only in the reference backend (the operational layer).
   `run_dir/lease.json` (`worker_id`, `pid`, `heartbeat_at`, `lease_ttl_s`; default
   `lease_ttl_s=30`), and deletes the lease on terminal.
 - It reclaims a run whose lease has gone stale (`heartbeat_at + lease_ttl_s < now`) and a
-  crashed worker left behind: reclaim takes the lease via a cross-process compare-and-swap
-  under `file_lock(run_dir/.reclaim.lock)`, so two backends racing the same run produce
-  exactly one winner, then resumes via the `recover_runs()` path.
+  crashed worker left behind: reclaim takes the lease via a compare-and-swap, so two
+  backends racing the same run produce exactly one winner, then resumes via the
+  `recover_runs()` path.
+- Lease storage + the CAS are a pluggable **`LeaseStore`** (default `LocalFsLeaseStore`:
+  `lease.json` + `file_lock(run_dir/.reclaim.lock)`); see *Pluggable durable stores*.
 
 ### CheckpointStore robustness invariants
 
@@ -492,6 +494,46 @@ the active watchdog lives only in the reference backend (the operational layer).
   (`core/_util.file_lock`, O_EXCL with stale-steal); `latest()` retries a read that races a
   concurrent commit's atomic replace, so a reader never mistakes mid-commit for "no
   checkpoint."
+
+### Pluggable durable stores
+
+Two seams make durability and multi-node recovery pluggable without touching the loop:
+
+- **`CheckpointStore`** (core) — `put(checkpoint, blobs)` / `latest` / `delete`.
+  `CheckpointRecord.blob(sha)` is a callable, not a directory, so a store can back blobs with
+  files, a DB, or an object store.
+- **`LeaseStore`** (reference) — `candidate_run_ids` / `heartbeat` / `is_stale` / `try_claim`
+  (atomic CAS) / `owner` / `release`. The watchdog policy stays in `RunnerBackend`; only the
+  lease's storage and its claim atomicity live here.
+
+Every store must pass the parametrized contract suites (`tests/test_checkpoint_store_contract.py`,
+`tests/test_lease_store_contract.py`): atomic last-good commit, monotonic `latest`, write-once
+blob dedup, and a single-winner `try_claim`. Passing them makes a backend a drop-in.
+
+**SQLite reference stores** (`reference/stores/`, stdlib `sqlite3`, zero dependencies):
+`SqliteCheckpointStore` and `SqliteLeaseStore`. A DB transaction supplies the invariants —
+`put` commits atomically (a crash rolls back, so `latest` never sees a torn checkpoint), the
+latest pointer advances monotonically via a conditional UPSERT, blobs are write-once, and
+`try_claim` is a transactional CAS under `BEGIN IMMEDIATE`. One shared db can host **both**
+stores, which is the "shared board" that lets a worker on another process/host reclaim a
+crashed peer's run across the instance boundary (a per-host `lease.json` cannot):
+
+```python
+db = "/shared/runner.db"
+backend = RunnerBackend(
+    ...,
+    checkpoint_store=SqliteCheckpointStore(db),
+    lease_store=SqliteLeaseStore(db),
+)
+```
+
+**Limitation / follow-up:** SQLite is single-host (it proves the seams + the transactional
+commit/CAS pattern + crossing the *instance* boundary with zero deps). A true cross-*host*
+deployment swaps in a networked backend behind the same seams — an object store
+(S3 `put` + `If-Match`/ETag CAS on the latest pointer) or a networked DB (Postgres
+`UPDATE ... WHERE seq < :new` / `WHERE lease stale`) — as an optional dependency. The
+run-recovery descriptor (`run.json`) would also move into the shared store for a fully
+host-independent resume.
 
 ### HTTP hardening & request bounds
 

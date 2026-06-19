@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import queue
 import threading
 import time
@@ -27,12 +26,13 @@ from native_agent_runner.core.packages import (
     write_apply_result,
     write_approval,
 )
-from native_agent_runner.core._util import file_lock, write_json_atomic
+from native_agent_runner.core._util import write_json_atomic
 from native_agent_runner.core.checkpoint import (
     CheckpointRecord,
     CheckpointStore,
     LocalFsCheckpointStore,
 )
+from native_agent_runner.reference.stores.lease import LeaseStore, LocalFsLeaseStore
 from native_agent_runner.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from native_agent_runner.core.result import AgentRunResult, Suspension
 from native_agent_runner.core.spec import (
@@ -271,6 +271,10 @@ class RunnerBackend:
     # How checkpoints are durably stored (backend owns HOW). Defaults to a local-fs
     # store under run_root; swap for a mounted-volume path or an object-store/DB store.
     checkpoint_store: CheckpointStore | None = None
+    # How run-ownership leases are stored/claimed. Defaults to local lease.json files; a
+    # shared store (SqliteLeaseStore over the same db as the checkpoint store) lets a worker
+    # on another process/host reclaim a crashed peer's run.
+    lease_store: LeaseStore | None = None
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
     _usage: dict[str, TenantUsage] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -292,6 +296,8 @@ class RunnerBackend:
         self.allowed_apply_roots = tuple(root.resolve() for root in self.allowed_apply_roots)
         if self.checkpoint_store is None:
             self.checkpoint_store = LocalFsCheckpointStore(self.run_root)
+        if self.lease_store is None:
+            self.lease_store = LocalFsLeaseStore(self.run_root)
 
     def submit_run(self, request: BackendRunRequest) -> BackendRunSubmission:
         self._validate_request(request)
@@ -1227,38 +1233,36 @@ class RunnerBackend:
                 _LOGGER.exception("watchdog tick failed")
 
     def _heartbeat_own_runs(self) -> None:
+        assert self.lease_store is not None
         with self._lock:
             items = list(self._records.items())
         for run_id, record in items:
-            if record.status in {"completed", "failed", "limited"}:
-                # Terminal: drop the lease so no watchdog ever reclaims a finished run.
-                try:
-                    self._lease_path(record.run_dir).unlink(missing_ok=True)
-                except OSError:  # pragma: no cover - best effort
-                    pass
-                continue
             try:
-                self._write_lease(record.run_dir, run_id)
-            except OSError:  # pragma: no cover - best effort
+                if record.status in {"completed", "failed", "limited"}:
+                    # Terminal: drop the lease so no watchdog ever reclaims a finished run.
+                    self.lease_store.release(run_id)
+                else:
+                    self.lease_store.heartbeat(run_id, self._worker_id, self.lease_ttl_s)
+            except Exception:  # pragma: no cover - one bad run must not stop heartbeating others
                 pass
 
     def _reclaim_stale_runs(self) -> list[str]:
         """Reclaim runs whose owning worker crashed (lease stale or absent). A live peer's
         run carries a fresh lease and is left untouched; the claim is a cross-process CAS so
-        two watchdogs racing the same run produce exactly one winner."""
+        two watchdogs racing the same run produce exactly one winner. Candidate runs come
+        from the lease store, so a shared store surfaces a peer's runs we never hosted."""
+        assert self.lease_store is not None
         reclaimed: list[str] = []
-        if not self.run_root.is_dir():
-            return reclaimed
-        for run_dir in sorted(path for path in self.run_root.iterdir() if path.is_dir()):
-            run_id = run_dir.name
+        for run_id in sorted(self.lease_store.candidate_run_ids()):
             with self._lock:
                 if run_id in self._records:
                     continue
+            run_dir = self.run_root / run_id
             if (run_dir / "failure.json").exists():
                 continue
-            if not self._lease_is_stale(run_dir):
+            if not self.lease_store.is_stale(run_id):
                 continue  # a live peer owns it
-            if not self._claim_lease(run_dir, run_id):
+            if not self.lease_store.try_claim(run_id, self._worker_id, self.lease_ttl_s):
                 continue  # lost the CAS to another watchdog
             if self._attempt_resume(run_dir, run_id):
                 _LOGGER.info("watchdog: reclaimed orphaned run %s", run_id)
@@ -1267,46 +1271,8 @@ class RunnerBackend:
                 # Resume failed but the attempt cap has not yet marked it unrecoverable.
                 # Release our just-claimed lease so the run is retried next tick (or by a
                 # peer) instead of being stranded behind a fresh lease that never resumes.
-                self._lease_path(run_dir).unlink(missing_ok=True)
+                self.lease_store.release(run_id)
         return reclaimed
-
-    def _lease_path(self, run_dir: Path) -> Path:
-        return run_dir / "lease.json"
-
-    def _read_lease(self, run_dir: Path) -> dict[str, Any] | None:
-        try:
-            payload = json.loads(self._lease_path(run_dir).read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError, OSError):
-            return None
-        return payload if isinstance(payload, dict) else None
-
-    def _write_lease(self, run_dir: Path, run_id: str) -> None:
-        write_json_atomic(
-            self._lease_path(run_dir),
-            {
-                "run_id": run_id,
-                "worker_id": self._worker_id,
-                "pid": os.getpid(),
-                "heartbeat_at": time.time(),
-                "lease_ttl_s": self.lease_ttl_s,
-            },
-        )
-
-    def _lease_is_stale(self, run_dir: Path) -> bool:
-        lease = self._read_lease(run_dir)
-        if lease is None:
-            return True  # no lease (crashed before writing, or a legacy run) -> reclaimable
-        ttl = float(lease.get("lease_ttl_s", self.lease_ttl_s))
-        return (time.time() - float(lease.get("heartbeat_at", 0.0))) > ttl
-
-    def _claim_lease(self, run_dir: Path, run_id: str) -> bool:
-        """CAS the lease under a cross-process lock: win only if it is still stale when the
-        lock is held (a peer that reclaimed first leaves a fresh lease, so we back off)."""
-        with file_lock(run_dir / ".reclaim.lock", timeout_s=5.0, stale_s=self.lease_ttl_s * 2 + 5.0):
-            if not self._lease_is_stale(run_dir):
-                return False
-            self._write_lease(run_dir, run_id)
-            return True
 
     def _resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> None:
         checkpoint = stored.checkpoint
