@@ -172,12 +172,13 @@ def test_snapshot_writes_checkpoint_at_hosted_park(tmp_path: Path) -> None:
     assert cp.previous_turn_handle == "r1"
     assert len(cp.hosted_tasks) == 1
     # snapshot() is a pure read: calling it again yields an equal payload, save the
-    # wall-clock remaining_duration_s (a derived countdown, not run state).
-    again = loop.snapshot().to_json()  # type: ignore[union-attr]
-    again.pop("remaining_duration_s")
-    expected = cp.to_json()
-    expected.pop("remaining_duration_s")
-    assert again == expected
+    # wall-clock fields (remaining_duration_s countdown, workspace_base.created_at).
+    def _strip(payload: dict) -> dict:
+        payload.pop("remaining_duration_s")
+        payload.pop("workspace_base")
+        return payload
+
+    assert _strip(loop.snapshot().to_json()) == _strip(cp.to_json())  # type: ignore[union-attr]
 
 
 def test_restore_resumes_parked_hitl_in_fresh_loop(tmp_path: Path) -> None:
@@ -272,6 +273,48 @@ def test_snapshot_refuses_while_in_process_shell_job_runs(tmp_path: Path) -> Non
     # Once only a finished (hosted-free) park remains, a snapshot is allowed.
     assert loop.snapshot() is not None
     loop.close()
+
+
+def test_workspace_delta_round_trips_through_restore(tmp_path: Path) -> None:
+    # Agent edits files; the checkpoint carries the delta; a fresh loop (over a
+    # re-provisioned base) restores the exact same workspace state.
+    base = _mk(tmp_path / "ws")
+    (base / "keep.txt").write_text("original\n", encoding="utf-8")  # base file the agent deletes
+    spec = AgentRunSpec(workspace_root=base, run_root=tmp_path / "runs")
+    provider = runtime_provider(runtime_config("fs.write"))
+    loop1 = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")]),
+        runtime_config_provider=provider,
+    )
+    loop1.open()
+    ws1 = loop1._session.res.workspace  # type: ignore[union-attr]
+    ws1.write_bytes("new.txt", b"created\n", create_dirs=True)
+    ws1.delete_path("keep.txt")
+    expected = sorted(ws1.changed_paths())
+
+    cp = loop1.snapshot()
+    assert cp is not None
+    blobs = loop1.collect_checkpoint_blobs()
+    assert {entry["change_kind"] for entry in cp.workspace_delta} == {"created", "deleted"}
+    del loop1
+
+    # Fresh "process": re-provision the base (the deleted file is back), then restore.
+    base2 = _mk(tmp_path / "ws2")
+    (base2 / "keep.txt").write_text("original\n", encoding="utf-8")
+    spec2 = AgentRunSpec(workspace_root=base2, run_root=tmp_path / "runs", run_id=spec.run_id)
+    loop2 = AgentLoop(
+        spec=spec2,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="ok")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop2.restore(cp, blobs=blobs)
+    ws2 = loop2._session.res.workspace  # type: ignore[union-attr]
+
+    assert sorted(ws2.changed_paths()) == expected
+    assert ws2.read_bytes("new.txt")[0] == b"created\n"
+    assert not ws2.exists("keep.txt")
+    loop2.close()
 
 
 def test_restore_carries_remaining_deadline(tmp_path: Path) -> None:

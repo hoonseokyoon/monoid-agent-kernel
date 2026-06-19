@@ -72,6 +72,14 @@ class RunCheckpoint:
     reentry_queue: list[str] = field(default_factory=list)
     delivered_reentry_jobs: list[str] = field(default_factory=list)
 
+    # --- workspace delta (agent's created/modified/deleted files since the base) ---
+    # Each entry: {path, kind, change_kind, base_sha256, proposed_sha256, content_sha256}.
+    # File content lives in the store's content-addressed blobs (keyed by content_sha256),
+    # not inline. ``workspace_base`` records which base the delta applies on top of, since
+    # the agent workspace is not durable and the base is re-provisioned on restore.
+    workspace_delta: list[dict[str, Any]] = field(default_factory=list)
+    workspace_base: dict[str, Any] | None = None
+
     # --- run-level bookkeeping ---
     remaining_duration_s: float | None = None
     cancellation_requested: bool = False

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any
 
+from native_agent_runner.core._util import sha256_bytes
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.checkpoint import (
     CheckpointStore,
@@ -231,6 +232,22 @@ class AgentToolContext(ToolContext):
         requested = tuple(self._requested_tool_loads)
         self._requested_tool_loads.clear()
         return requested
+
+
+def _as_blob_reader(
+    blobs: Mapping[str, bytes] | Callable[[str], bytes] | None,
+) -> Callable[[str], bytes]:
+    """Normalize a blob source (mapping, reader callable, or None) into a reader. A
+    ``None`` source has no content — used when restoring a checkpoint with no workspace
+    delta; reading any sha then raises (a delta entry without its blob is a bug)."""
+    if blobs is None:
+        def _empty(sha256: str) -> bytes:
+            raise KeyError(sha256)
+
+        return _empty
+    if callable(blobs):
+        return blobs
+    return lambda sha256: blobs[sha256]
 
 
 @dataclass
@@ -564,6 +581,8 @@ class AgentLoop:
             hosted_tasks=tasks_payload["hosted_tasks"],
             reentry_queue=tasks_payload["reentry_queue"],
             delivered_reentry_jobs=tasks_payload["delivered_reentry_jobs"],
+            workspace_delta=self._workspace_delta_entries(res.workspace),
+            workspace_base=res.workspace.workspace_base_payload(self.spec.run_id),
             remaining_duration_s=(res.deadline - time.time()) if res.deadline is not None else None,
             cancellation_requested=bool(
                 self.cancellation_token is not None and self.cancellation_token.requested
@@ -586,14 +605,56 @@ class AgentLoop:
             return
         session.checkpoint_seq += 1
         checkpoint.seq = session.checkpoint_seq
-        self._checkpoint_store().put(checkpoint)
+        self._checkpoint_store().put(checkpoint, self.collect_checkpoint_blobs())
 
-    def restore(self, checkpoint: RunCheckpoint) -> None:
+    @staticmethod
+    def _workspace_delta_entries(workspace: Workspace) -> list[dict[str, Any]]:
+        """Serialize the agent's created/modified/deleted files since the base. File
+        content is NOT inline — it travels as a content-addressed blob keyed by
+        ``content_sha256`` (see ``collect_checkpoint_blobs``)."""
+        entries: list[dict[str, Any]] = []
+        for entry in workspace.changed_entries():
+            content_sha256 = sha256_bytes(entry.content) if entry.content is not None else None
+            entries.append(
+                {
+                    "path": entry.path,
+                    "kind": entry.kind,
+                    "change_kind": entry.change_kind,
+                    "base_sha256": entry.base_sha256,
+                    "proposed_sha256": entry.proposed_sha256,
+                    "content_sha256": content_sha256,
+                }
+            )
+        return entries
+
+    def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+        """Content-addressed blobs for the current park's workspace delta: the bytes of
+        each created/modified file, keyed by sha256. Read at the same quiescent park as
+        ``snapshot()`` so the keys match the manifest's ``content_sha256`` refs."""
+        session = self._require_open()
+        blobs: dict[str, bytes] = {}
+        for entry in session.res.workspace.changed_entries():
+            if entry.content is not None:
+                blobs[sha256_bytes(entry.content)] = entry.content
+        return blobs
+
+    def restore(
+        self,
+        checkpoint: RunCheckpoint,
+        *,
+        blobs: Mapping[str, bytes] | Callable[[str], bytes] | None = None,
+    ) -> None:
         """Reopen a previously-checkpointed run, rehydrating its session from
         ``checkpoint`` instead of starting fresh. Like ``open()`` but: no second
-        ``run.started``/manifest, ``workspace.base.json`` left untouched, parked hosted
-        tasks re-registered, and any in-process shell job that died on the crash folded
-        in as a failed observation so the model re-decides on the next pump."""
+        ``run.started``/manifest, parked hosted tasks re-registered, the workspace delta
+        re-applied (created/modified files restored from ``blobs``, deletions replayed),
+        and any in-process shell job that died on the crash folded in as a failed
+        observation so the model re-decides on the next pump.
+
+        ``blobs`` supplies the content for the workspace delta — a mapping or a reader
+        ``sha256 -> bytes`` (e.g. ``CheckpointStore.latest().blob``). The caller is
+        expected to have re-provisioned the base workspace first; this only re-applies
+        the agent's delta on top."""
         if self._session is not None:
             raise NativeAgentError("run is already open", error_code="run_already_open")
         self._restoring = True
@@ -601,9 +662,9 @@ class AgentLoop:
             res = self._bootstrap()
         finally:
             self._restoring = False
-        self._rehydrate(checkpoint, res)
+        self._rehydrate(checkpoint, res, _as_blob_reader(blobs))
 
-    def _rehydrate(self, cp: RunCheckpoint, res: _RunResources) -> None:
+    def _rehydrate(self, cp: RunCheckpoint, res: _RunResources, blob_reader: Callable[[str], bytes]) -> None:
         # Deadline carry-over: downtime while parked does not count against
         # max_duration_s (a run parked overnight on a human should not time out). Keep
         # the elapsed-so-far consistent so _build_metrics duration stays sane.
@@ -641,6 +702,10 @@ class AgentLoop:
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
         )
+        # Re-apply the agent's workspace delta on top of the (backend-re-provisioned)
+        # base, so the restored workspace matches the checkpoint instant and
+        # changed_entries() reports the same delta again.
+        self._apply_workspace_delta(res.workspace, cp.workspace_delta, blob_reader)
         manager = res.context.job_manager
         manager.restore_state(
             [HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir) for payload in cp.hosted_tasks],
@@ -661,6 +726,30 @@ class AgentLoop:
             # Continue the sequence so the next park commits cp.seq + 1.
             checkpoint_seq=cp.seq,
         )
+
+    @staticmethod
+    def _apply_workspace_delta(
+        workspace: Workspace,
+        entries: list[dict[str, Any]],
+        blob_reader: Callable[[str], bytes],
+    ) -> None:
+        """Replay a captured workspace delta into a freshly-bootstrapped workspace via
+        its normal write surface, so the workspace tracks the same changes-vs-base. Writes
+        go through ``write_bytes``/``mkdir``/``delete_path`` (not raw disk) so overlay and
+        staging backends both report the delta. Deletions assume the base file was
+        re-provisioned; a missing target is skipped rather than fatal."""
+        for entry in entries:
+            change_kind = entry.get("change_kind")
+            path = entry.get("path")
+            if change_kind in {"created", "modified"}:
+                content_sha256 = entry.get("content_sha256")
+                content = blob_reader(content_sha256) if content_sha256 else b""
+                workspace.write_bytes(path, content, create_dirs=True)
+            elif change_kind == "directory":
+                workspace.mkdir(path)
+            elif change_kind == "deleted":
+                if workspace.exists(path):
+                    workspace.delete_path(path, recursive=entry.get("kind") == "dir")
 
     def _crashed_shell_observations(self, res: _RunResources) -> tuple[ToolObservation, ...]:
         """A shell ``BackgroundJob`` left ``running`` in ``artifacts/jobs/*/job.json``

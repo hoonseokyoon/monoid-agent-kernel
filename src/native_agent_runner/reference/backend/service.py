@@ -27,9 +27,9 @@ from native_agent_runner.core.packages import (
 )
 from native_agent_runner.core._util import write_json_atomic
 from native_agent_runner.core.checkpoint import (
+    CheckpointRecord,
     CheckpointStore,
     LocalFsCheckpointStore,
-    RunCheckpoint,
 )
 from native_agent_runner.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from native_agent_runner.core.result import AgentRunResult, Suspension
@@ -926,7 +926,7 @@ class RunnerBackend:
         checkpoint.queued_messages = residual
         # Overwrites the same seq the loop just committed, now with the queue included.
         assert self.checkpoint_store is not None
-        self.checkpoint_store.put(checkpoint)
+        self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
 
     def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
         return (
@@ -1033,21 +1033,22 @@ class RunnerBackend:
                     continue
             assert self.checkpoint_store is not None
             stored = self.checkpoint_store.latest(run_id)
-            checkpoint = stored.checkpoint if stored is not None else None
-            if checkpoint is None or checkpoint.terminal:
+            if stored is None or stored.checkpoint.terminal:
                 continue
             meta = _read_run_meta(run_dir)
             if meta is None:
                 continue
             try:
-                self._resume_from_checkpoint(run_dir, checkpoint, meta)
+                self._resume_from_checkpoint(stored, meta)
             except Exception:
                 continue
             recovered.append(run_id)
         return recovered
 
-    def _resume_from_checkpoint(self, run_dir: Path, checkpoint: RunCheckpoint, meta: dict[str, Any]) -> None:
+    def _resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> None:
+        checkpoint = stored.checkpoint
         run_id = checkpoint.run_id
+        run_dir = self.run_root / run_id
         runtime_config = AgentRuntimeConfig.from_json(meta["runtime_config"])
         limits = meta.get("limits") or {}
         request = BackendRunRequest(
@@ -1118,7 +1119,9 @@ class RunnerBackend:
             runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
             checkpoint_store=self.checkpoint_store,
         )
-        loop.restore(checkpoint)
+        # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
+        # restore re-applies the agent's delta from the checkpoint's content blobs.
+        loop.restore(checkpoint, blobs=stored.blob)
         with self._lock:
             record.loop = loop
         for message in checkpoint.queued_messages:
