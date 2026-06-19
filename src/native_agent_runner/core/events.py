@@ -114,6 +114,7 @@ class EventBus:
     run_id: str
     sinks: tuple[EventSink, ...]
     _seq: int = 0
+    _closed: bool = field(default=False, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def emit(
@@ -136,13 +137,21 @@ class EventBus:
                 turn_id=turn_id,
                 parent_id=parent_id,
             )
+            # A background job (e.g. a shell monitor thread) can deliver its terminal event
+            # after the run has closed the recorder. That late emit is a benign race, not an
+            # error: drop it to the closed sinks rather than writing to a closed file handle.
+            # emit/close serialize on the same lock, so this check is race-free.
+            if self._closed:
+                return event
             for sink in self.sinks:
                 sink.emit(event)
             return event
 
     def close(self) -> None:
-        for sink in self.sinks:
-            sink.close()
+        with self._lock:
+            for sink in self.sinks:
+                sink.close()
+            self._closed = True
 
 
 def make_agent_event(
