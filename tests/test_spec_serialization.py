@@ -13,7 +13,6 @@ from native_agent_runner.permissions import PermissionPolicy
 
 def test_agent_run_spec_round_trip_is_run_specific() -> None:
     spec = AgentRunSpec(
-        instruction="Inspect.",
         workspace_root=Path("/workspace"),
         run_root=Path("runs"),
         run_id="run_123",
@@ -59,7 +58,6 @@ def test_runtime_config_round_trip_hash_and_model() -> None:
 
 def test_content_parts_json_round_trip() -> None:
     spec = AgentRunSpec(
-        instruction="fallback",
         workspace_root=Path("/workspace"),
         run_root=Path("runs"),
         input=(

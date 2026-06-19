@@ -132,7 +132,10 @@ class GatewayModelAdapter:
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
 
-        if request.previous_turn_handle:
+        if request.messages is not None:
+            # By-value: the full conversation travels as messages; no continuation handle.
+            payload["messages"] = list(request.messages)
+        elif request.previous_turn_handle:
             payload["previous_turn_handle"] = request.previous_turn_handle
             payload["observations"] = [
                 {
@@ -143,8 +146,12 @@ class GatewayModelAdapter:
                 }
                 for observation in request.observations
             ]
+            # Third shape: a new user message delivered on top of an existing
+            # continuation handle (user follow-up). observations is typically empty here.
+            if request.instruction:
+                payload["instruction"] = request.instruction
         else:
-            payload["instruction"] = request.instruction
+            payload["instruction"] = request.instruction or ""
         return payload
 
 

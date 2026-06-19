@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any
 
+from native_agent_runner.core._util import sha256_bytes
 from native_agent_runner.core.cancellation import CancellationToken
+from native_agent_runner.core.checkpoint import (
+    CheckpointStore,
+    LocalFsCheckpointStore,
+    RunCheckpoint,
+)
 from native_agent_runner.core.events import AgentEvent, EventSink
-from native_agent_runner.core.content import non_text_part_types
+from native_agent_runner.core.content import (
+    ContentPart,
+    content_part_from_json,
+    content_part_to_json,
+    non_text_part_types,
+)
 from native_agent_runner.core.context import (
     ContextProvider,
     TurnContext,
@@ -25,8 +37,8 @@ from native_agent_runner.core.agents import (
 )
 from native_agent_runner.core.manifest import build_run_manifest
 from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
-from native_agent_runner.core.result import AgentRunResult
-from native_agent_runner.core.spec import AgentRunSpec, ModelConfig
+from native_agent_runner.core.result import AgentRunResult, AgentTurnResult, Suspension
+from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, input_to_parts, text_from_parts
 from native_agent_runner.core.tool_surface import (
     DefaultToolSurfaceResolver,
     ToolAuthorization,
@@ -46,9 +58,15 @@ from native_agent_runner.errors import (
     ToolExecutionError,
     error_code_for_exception,
 )
-from native_agent_runner.jobs import BackgroundJobManager
+from native_agent_runner.tasks import HostedTask, TaskManager
 from native_agent_runner.permissions import PermissionPolicy, matches_path_patterns
-from native_agent_runner.providers.base import ModelAdapter, ModelRequest, ModelTurn, ToolObservation
+from native_agent_runner.providers.base import (
+    ModelAdapter,
+    ModelRequest,
+    ModelTurn,
+    ToolObservation,
+    format_async_result_text,
+)
 from native_agent_runner.public_view import (
     args_preview,
     public_error_message,
@@ -101,7 +119,7 @@ class AgentToolContext(ToolContext):
     run_id: str
     workspace: Workspace
     recorder: AgentRecorder
-    job_manager: BackgroundJobManager
+    job_manager: TaskManager
     shell_service: ShellService
     web_service: WebService
     jobs_service: JobsService
@@ -177,6 +195,17 @@ class AgentToolContext(ToolContext):
     def job_wait(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.jobs_service.wait(args)
 
+    def request_human_input(self, args: dict[str, Any]) -> dict[str, Any]:
+        task = self.job_manager.start_task(
+            "hitl",
+            {
+                "prompt": str(args.get("prompt") or ""),
+                "choices": tuple(str(choice) for choice in (args.get("choices") or ())),
+                "created_by": "model",
+            },
+        )
+        return task.started_content(self.recorder.run_dir)
+
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.web_service.search(args, self._current_call)
 
@@ -211,6 +240,31 @@ class AgentToolContext(ToolContext):
         return requested
 
 
+def _observation_message(observation: ToolObservation) -> dict[str, Any]:
+    """Provider-neutral by-value message for a tool/async observation. Preserves the
+    ``is_background`` → role semantics the adapters use: a background/hosted result is a
+    new user message; a tool result is a ``tool`` message keyed by ``call_id``."""
+    if observation.is_background:
+        return {"role": "user", "content": format_async_result_text(observation.output)}
+    return {"role": "tool", "call_id": observation.call_id, "content": observation.output}
+
+
+def _as_blob_reader(
+    blobs: Mapping[str, bytes] | Callable[[str], bytes] | None,
+) -> Callable[[str], bytes]:
+    """Normalize a blob source (mapping, reader callable, or None) into a reader. A
+    ``None`` source has no content — used when restoring a checkpoint with no workspace
+    delta; reading any sha then raises (a delta entry without its blob is a bug)."""
+    if blobs is None:
+        def _empty(sha256: str) -> bytes:
+            raise KeyError(sha256)
+
+        return _empty
+    if callable(blobs):
+        return blobs
+    return lambda sha256: blobs[sha256]
+
+
 @dataclass
 class RunState:
     """Mutable state threaded through a run's steps and teardown."""
@@ -222,6 +276,7 @@ class RunState:
     provider_http_status: int | None = None
     final_text: str = ""
     previous_turn_handle: str | None = None
+    pending_user_input: tuple[ContentPart, ...] | None = None
     pending_observations: tuple[ToolObservation, ...] = ()
     pending_binding_loads: tuple[str, ...] = ()
     tool_call_counts: dict[str, int] = field(default_factory=dict)
@@ -231,6 +286,10 @@ class RunState:
     total_usage: dict[str, int] = field(
         default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     )
+    # By-value conversation log: provider-neutral user/assistant/tool messages the core
+    # owns and resends each turn (vendor-independent continuation). The system prompt is
+    # NOT here — it is regenerated per turn and applied via ModelRequest.system_prompt.
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -244,6 +303,19 @@ class _RunResources:
     started: float
     deadline: float | None
     static_segments: tuple[str, ...]
+
+
+@dataclass
+class _Session:
+    """Live state for an open run, threaded across multiple submit() calls."""
+
+    state: RunState
+    res: _RunResources
+    session_step: int = 0
+    submit_local_step: int = 0
+    terminal: bool = False
+    # Monotonic checkpoint sequence for this open run; advanced once per park.
+    checkpoint_seq: int = 0
 
 
 @dataclass
@@ -264,14 +336,80 @@ class AgentLoop:
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
     context_providers: tuple[ContextProvider, ...] = ()
     inject_workspace_index: bool = False
+    # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
+    # Defaults to a local-fs store under the run root; a backend injects a durable one.
+    checkpoint_store: CheckpointStore | None = None
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
+    _session: _Session | None = field(default=None, init=False, repr=False)
+    _restoring: bool = field(default=False, init=False, repr=False)
 
-    def run(self) -> AgentRunResult:
-        state = RunState()
-        res: _RunResources | None = None
+    def open(self) -> None:
+        """Bootstrap the run and leave it idle, ready to accept submit().
+
+        No model turn happens here. The workspace, recorder, tool registry, and
+        manifest are created and ``run.started`` is emitted. A recordable bootstrap
+        failure (e.g. invalid runtime config) is captured as a terminal failed
+        session so close() still returns a failed result rather than raising."""
+        if self._session is not None:
+            raise NativeAgentError("run is already open", error_code="run_already_open")
         try:
             res = self._bootstrap()
-            self._run_steps(state, res)
+        except Exception as exc:  # controlled recording boundary for standalone CLI
+            res = self._bootstrap_resources
+            if res is None:
+                raise
+            state = RunState()
+            self._record_failure(state, res, exc)
+            self._session = _Session(state=state, res=res, terminal=True)
+            return
+        self._session = _Session(state=RunState(), res=res)
+
+    def submit(self, user_input: str | tuple[ContentPart, ...]) -> AgentTurnResult:
+        """Run one user turn: inject ``user_input`` and step until the model settles
+        (no tool calls + final text) or a per-submit limit is hit. The run stays
+        open afterwards; call submit() again to continue or close() to finalize.
+
+        Blocking wrapper over ``run_until_suspended``: when the run parks on tasks it
+        waits in-process (shell monitor completes them, or an external thread reports
+        a hosted-task result) and resumes, returning only once the turn settles."""
+        session = self._require_open()
+        suspension = self.run_until_suspended(user_input)
+        while suspension.reason == "awaiting_tasks":
+            self._wait_for_background_jobs(session.res.context, session.res.recorder, session.res.deadline)
+            suspension = self.run_until_suspended(None)
+        assert suspension.turn is not None  # non-awaiting reasons always checkpoint
+        return suspension.turn
+
+    def run_until_suspended(
+        self, user_input: str | tuple[ContentPart, ...] | None = None
+    ) -> Suspension:
+        """Non-blocking pump. With ``user_input`` it starts a new user turn; with
+        ``None`` it resumes a run parked on a task (whose result was already injected
+        via report_task_result). Returns why the run suspended without blocking on
+        tasks — the caller decides how to wait. Every non-``awaiting_tasks`` reason
+        runs a settle checkpoint and attaches the ``AgentTurnResult`` as ``turn``."""
+        session = self._require_open()
+        if session.terminal:
+            raise NativeAgentError(
+                "run reached a terminal state and cannot accept more input",
+                error_code="run_terminal",
+            )
+        state, res = session.state, session.res
+        if user_input is not None:
+            # Per-submit outcome fields describe this turn; reset before running.
+            state.status = "completed"
+            state.error = ""
+            state.error_code = ""
+            state.provider_error_code = ""
+            state.provider_http_status = None
+            state.final_text = ""
+            # A run.finish in a prior submit must not short-circuit this one.
+            res.context.finished = False
+            state.pending_user_input = input_to_parts(user_input)
+            self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
+            session.submit_local_step = 0
+        try:
+            suspension = self._pump_turn(state, res, session)
         except (RunCancelled, RunTimeout) as exc:
             state.status = "limited"
             state.error = str(exc)
@@ -281,31 +419,427 @@ class AgentLoop:
                 if state.error_code == "cancelled"
                 else "Stopped after reaching max duration."
             )
-        except Exception as exc:  # controlled recording boundary for standalone CLI
-            res = res or self._bootstrap_resources
-            if res is None:
-                raise
-            state.status = "failed"
-            state.error = str(exc)
-            state.error_code = error_code_for_exception(exc)
-            if isinstance(exc, ModelAdapterError):
-                state.provider_error_code = exc.provider_error_code
-                state.provider_http_status = exc.http_status
-            state.final_text = ""
-            res.recorder.emit(
-                "run.failed",
-                data={
-                    "error": public_error_message(state.error),
-                    "error_code": state.error_code,
-                    "type": type(exc).__name__,
-                },
-                level="error",
+            session.terminal = True
+            result = replace(
+                Suspension(reason="terminal", status="limited"),
+                final_text=state.final_text,
+                error=state.error,
+                error_code=state.error_code,
+                turn=self._checkpoint_on_settle(state, res),
             )
-        finally:
-            if res is None:
-                raise RuntimeError("run failed before recorder initialization")
-            result = self._finalize(state, res)
+            self._persist_checkpoint(session)
+            return result
+        except Exception as exc:  # controlled recording boundary for standalone CLI
+            self._record_failure(state, res, exc)
+            session.terminal = True
+            result = replace(
+                Suspension(reason="terminal", status="failed"),
+                error=state.error,
+                error_code=state.error_code,
+                turn=self._checkpoint_on_settle(state, res),
+            )
+            self._persist_checkpoint(session)
+            return result
+        if suspension.reason == "awaiting_tasks":
+            if suspension.has_external:
+                # Parked on a hosted task awaiting an external report (hitl/automation).
+                res.recorder.emit(
+                    "run.awaiting_input",
+                    data={"reason": "task", "task_ids": list(suspension.awaiting_task_ids)},
+                )
+            self._persist_checkpoint(session)
+            return suspension
+        if state.error_code == "max_tool_calls_exceeded":
+            # Tool-call budget is session-cumulative; once spent the run is done.
+            session.terminal = True
+        result = replace(suspension, turn=self._checkpoint_on_settle(state, res))
+        self._persist_checkpoint(session)
         return result
+
+    def await_user_input(self) -> None:
+        """Signal that the run is parked awaiting the next user message. A
+        multi-turn driver calls this before blocking on its message channel."""
+        session = self._require_open()
+        session.res.recorder.emit("run.awaiting_input", data={"reason": "user"})
+
+    def has_pending_tasks(self) -> bool:
+        """Whether the run has resume-tasks still outstanding (not yet drained)."""
+        session = self._require_open()
+        return session.res.context.job_manager.has_resume_jobs()
+
+    def wait_for_pending_tasks(self, timeout_s: float) -> bool:
+        """Block up to ``timeout_s`` for a pending task to become ready (in-process
+        completion or external report). Returns True if one is ready to drain, so
+        the caller can ``run_until_suspended(None)`` to resume."""
+        session = self._require_open()
+        manager = session.res.context.job_manager
+        deadline = time.time() + max(0.0, timeout_s)
+        while manager.has_resume_jobs():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            if manager.wait_for_reentry(min(0.25, remaining)):
+                return True
+        return False
+
+    def close(self) -> AgentRunResult:
+        """Finalize the run: cancel jobs, write the terminal proposal, emit
+        run.finished, close the recorder, and return the cumulative result."""
+        session = self._require_open()
+        result = self._finalize(session.state, session.res)
+        # A successfully completed run has nothing to recover: drop its checkpoints. A
+        # failed/limited run KEEPS its checkpoints so the last-good one (named in
+        # failure.json) is available for an operator-driven restore.
+        if session.state.status == "completed":
+            self._checkpoint_store().delete(self.spec.run_id)
+        self._session = None
+        return result
+
+    def run_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
+        """One-shot convenience: open() + submit(user_input) + close()."""
+        self.open()
+        try:
+            session = self._require_open()
+            if not session.terminal:
+                self.submit(user_input)
+        finally:
+            result = self.close()
+        return result
+
+    def _record_failure(self, state: RunState, res: _RunResources, exc: Exception) -> None:
+        state.status = "failed"
+        state.error = str(exc)
+        state.error_code = error_code_for_exception(exc)
+        if isinstance(exc, ModelAdapterError):
+            state.provider_error_code = exc.provider_error_code
+            state.provider_http_status = exc.http_status
+        state.final_text = ""
+        res.recorder.emit(
+            "run.failed",
+            data={
+                "error": public_error_message(state.error),
+                "error_code": state.error_code,
+                "type": type(exc).__name__,
+            },
+            level="error",
+        )
+        # Failure bundle: what broke + which checkpoint to restore from. The last good
+        # (non-terminal) checkpoint is the current sequence; the terminal checkpoint the
+        # failure path writes next is seq+1 and is skipped by the restart scanner. No
+        # auto-recovery — this is purely the operator's restore aid.
+        last_good_seq = self._session.checkpoint_seq if self._session is not None else 0
+        res.recorder.write_failure(
+            {
+                "schema_version": "native-agent-runner.failure.v1",
+                "run_id": self.spec.run_id,
+                "error": public_error_message(state.error),
+                "error_code": state.error_code,
+                "provider_error_code": state.provider_error_code,
+                "type": type(exc).__name__,
+                "last_good_seq": last_good_seq,
+                "restore_hint": (
+                    f"restore checkpoint seq {last_good_seq} for run {self.spec.run_id} "
+                    "via CheckpointStore, then run_until_suspended(None)"
+                )
+                if last_good_seq > 0
+                else "no committed checkpoint to restore from (failed before first park)",
+            }
+        )
+
+    def commit_checkpoint(self) -> None:
+        """Adopt the current proposed workspace state as the new diff baseline.
+
+        Opt-in and never called automatically (at-close approval is the default).
+        After this, subsequent proposals/diffs report only changes made after this
+        point — the building block for incremental apply across a multi-turn run."""
+        session = self._require_open()
+        res = session.res
+        res.workspace.snapshot_current_as_new_baseline()
+        res.recorder.write_workspace_base(res.workspace.workspace_base_payload(self.spec.run_id))
+        res.recorder.emit(
+            "checkpoint.committed",
+            data={"workspace_backend": res.workspace.backend_kind, "changed_paths": []},
+        )
+
+    def report_task_result(
+        self, task_id: str, result: dict[str, Any], *, status: str = "answered"
+    ) -> dict[str, Any]:
+        """Complete a hosted task (e.g. a hitl request) from outside the loop —
+        the backend or another thread calls this to deliver a result, waking a
+        parked run. The result is injected per the task kind's ResultInjector."""
+        session = self._require_open()
+        return session.res.context.job_manager.report_result(task_id, result, status=status)
+
+    # --- durable persistence (state-snapshot at park points) ---
+
+    def snapshot(self) -> RunCheckpoint | None:
+        """Capture the run's park-point state as a ``RunCheckpoint``, or ``None`` when
+        a durable snapshot is unsafe right now. Pure read — never mutates state or jobs.
+
+        Refuses (returns ``None``) while a live in-process (shell) resume-task is still
+        running: its subprocess can't cross a process boundary, so the park only becomes
+        durable once just hosted (hitl/automation) tasks remain. The conversation itself
+        is held by the provider via ``previous_turn_handle``, so the LLM transcript is
+        never serialized here."""
+        session = self._require_open()
+        state = session.state
+        res = session.res
+        manager = res.context.job_manager
+        if manager.has_resume_jobs():
+            hosted = set(manager.external_pending_task_ids())
+            if not manager.outstanding_resume_task_ids().issubset(hosted):
+                return None
+        tasks_payload = manager.checkpoint_payload()
+        pending_input = (
+            [content_part_to_json(part) for part in state.pending_user_input]
+            if state.pending_user_input is not None
+            else None
+        )
+        return RunCheckpoint(
+            run_id=self.spec.run_id,
+            seq=session.checkpoint_seq,
+            status=state.status,
+            error=state.error,
+            error_code=state.error_code,
+            provider_error_code=state.provider_error_code,
+            provider_http_status=state.provider_http_status,
+            final_text=state.final_text,
+            previous_turn_handle=state.previous_turn_handle,
+            pending_user_input=pending_input,
+            pending_observations=[obs.to_json() for obs in state.pending_observations],
+            pending_binding_loads=list(state.pending_binding_loads),
+            tool_call_counts=dict(state.tool_call_counts),
+            # Latest runtime config travels in every park snapshot, so a mid-run config
+            # change is re-persisted (recovery does not fall back to start-of-run config).
+            previous_runtime_config=(
+                state.previous_runtime_config.to_json()
+                if state.previous_runtime_config is not None
+                else None
+            ),
+            total_tool_calls=state.total_tool_calls,
+            total_usage=dict(state.total_usage),
+            messages=list(state.messages),
+            session_step=session.session_step,
+            submit_local_step=session.submit_local_step,
+            terminal=session.terminal,
+            hosted_tasks=tasks_payload["hosted_tasks"],
+            reentry_queue=tasks_payload["reentry_queue"],
+            delivered_reentry_jobs=tasks_payload["delivered_reentry_jobs"],
+            workspace_delta=self._workspace_delta_entries(res.workspace),
+            workspace_base=res.workspace.workspace_base_payload(self.spec.run_id),
+            remaining_duration_s=(res.deadline - time.time()) if res.deadline is not None else None,
+            cancellation_requested=bool(
+                self.cancellation_token is not None and self.cancellation_token.requested
+            ),
+        )
+
+    def _checkpoint_store(self) -> CheckpointStore:
+        """The injected store, or a default local-fs store under the run root. The core
+        only ever talks to this protocol — it never decides where bytes physically land."""
+        if self.checkpoint_store is None:
+            self.checkpoint_store = LocalFsCheckpointStore(self.spec.run_root)
+        return self.checkpoint_store
+
+    def _persist_checkpoint(self, session: _Session) -> None:
+        """Best-effort durable checkpoint at a park point. No-op when ``snapshot()``
+        refuses (a live shell job is parked-on) — that park is simply not durable yet.
+        Advances the per-run sequence so the store commits a new last-good checkpoint."""
+        checkpoint = self.snapshot()
+        if checkpoint is None:
+            return
+        session.checkpoint_seq += 1
+        checkpoint.seq = session.checkpoint_seq
+        self._checkpoint_store().put(checkpoint, self.collect_checkpoint_blobs())
+
+    @staticmethod
+    def _workspace_delta_entries(workspace: Workspace) -> list[dict[str, Any]]:
+        """Serialize the agent's created/modified/deleted files since the base. File
+        content is NOT inline — it travels as a content-addressed blob keyed by
+        ``content_sha256`` (see ``collect_checkpoint_blobs``)."""
+        entries: list[dict[str, Any]] = []
+        for entry in workspace.changed_entries():
+            content_sha256 = sha256_bytes(entry.content) if entry.content is not None else None
+            entries.append(
+                {
+                    "path": entry.path,
+                    "kind": entry.kind,
+                    "change_kind": entry.change_kind,
+                    "base_sha256": entry.base_sha256,
+                    "proposed_sha256": entry.proposed_sha256,
+                    "content_sha256": content_sha256,
+                }
+            )
+        return entries
+
+    def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+        """Content-addressed blobs for the current park's workspace delta: the bytes of
+        each created/modified file, keyed by sha256. Read at the same quiescent park as
+        ``snapshot()`` so the keys match the manifest's ``content_sha256`` refs."""
+        session = self._require_open()
+        blobs: dict[str, bytes] = {}
+        for entry in session.res.workspace.changed_entries():
+            if entry.content is not None:
+                blobs[sha256_bytes(entry.content)] = entry.content
+        return blobs
+
+    def restore(
+        self,
+        checkpoint: RunCheckpoint,
+        *,
+        blobs: Mapping[str, bytes] | Callable[[str], bytes] | None = None,
+    ) -> None:
+        """Reopen a previously-checkpointed run, rehydrating its session from
+        ``checkpoint`` instead of starting fresh. Like ``open()`` but: no second
+        ``run.started``/manifest, parked hosted tasks re-registered, the workspace delta
+        re-applied (created/modified files restored from ``blobs``, deletions replayed),
+        and any in-process shell job that died on the crash folded in as a failed
+        observation so the model re-decides on the next pump.
+
+        ``blobs`` supplies the content for the workspace delta — a mapping or a reader
+        ``sha256 -> bytes`` (e.g. ``CheckpointStore.latest().blob``). The caller is
+        expected to have re-provisioned the base workspace first; this only re-applies
+        the agent's delta on top."""
+        if self._session is not None:
+            raise NativeAgentError("run is already open", error_code="run_already_open")
+        self._restoring = True
+        try:
+            res = self._bootstrap()
+        finally:
+            self._restoring = False
+        self._rehydrate(checkpoint, res, _as_blob_reader(blobs))
+
+    def _rehydrate(self, cp: RunCheckpoint, res: _RunResources, blob_reader: Callable[[str], bytes]) -> None:
+        # Deadline carry-over: downtime while parked does not count against
+        # max_duration_s (a run parked overnight on a human should not time out). Keep
+        # the elapsed-so-far consistent so _build_metrics duration stays sane.
+        if cp.remaining_duration_s is not None:
+            now = time.time()
+            max_duration_s = self.spec.limits.max_duration_s
+            started = (
+                now - (max_duration_s - cp.remaining_duration_s)
+                if max_duration_s is not None
+                else res.started
+            )
+            res = replace(res, deadline=now + cp.remaining_duration_s, started=started)
+        state = RunState(
+            status=cp.status,
+            error=cp.error,
+            error_code=cp.error_code,
+            provider_error_code=cp.provider_error_code,
+            provider_http_status=cp.provider_http_status,
+            final_text=cp.final_text,
+            previous_turn_handle=cp.previous_turn_handle,
+            pending_user_input=(
+                tuple(content_part_from_json(part) for part in cp.pending_user_input)
+                if cp.pending_user_input is not None
+                else None
+            ),
+            pending_observations=tuple(ToolObservation.from_json(obs) for obs in cp.pending_observations),
+            pending_binding_loads=tuple(cp.pending_binding_loads),
+            tool_call_counts=dict(cp.tool_call_counts),
+            previous_runtime_config=(
+                AgentRuntimeConfig.from_json(cp.previous_runtime_config)
+                if cp.previous_runtime_config is not None
+                else None
+            ),
+            total_tool_calls=cp.total_tool_calls,
+            total_usage=dict(cp.total_usage)
+            or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            messages=list(cp.messages),
+        )
+        # Re-apply the agent's workspace delta on top of the (backend-re-provisioned)
+        # base, so the restored workspace matches the checkpoint instant and
+        # changed_entries() reports the same delta again.
+        self._apply_workspace_delta(res.workspace, cp.workspace_delta, blob_reader)
+        manager = res.context.job_manager
+        manager.restore_state(
+            [HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir) for payload in cp.hosted_tasks],
+            reentry_queue=cp.reentry_queue,
+            delivered_reentry_jobs=cp.delivered_reentry_jobs,
+        )
+        crashed = self._crashed_shell_observations(res)
+        if crashed:
+            state.pending_observations = state.pending_observations + crashed
+        if cp.cancellation_requested and self.cancellation_token is not None:
+            self.cancellation_token.cancel()
+        self._session = _Session(
+            state=state,
+            res=res,
+            session_step=cp.session_step,
+            submit_local_step=cp.submit_local_step,
+            terminal=cp.terminal,
+            # Continue the sequence so the next park commits cp.seq + 1.
+            checkpoint_seq=cp.seq,
+        )
+
+    @staticmethod
+    def _apply_workspace_delta(
+        workspace: Workspace,
+        entries: list[dict[str, Any]],
+        blob_reader: Callable[[str], bytes],
+    ) -> None:
+        """Replay a captured workspace delta into a freshly-bootstrapped workspace via
+        its normal write surface, so the workspace tracks the same changes-vs-base. Writes
+        go through ``write_bytes``/``mkdir``/``delete_path`` (not raw disk) so overlay and
+        staging backends both report the delta. Deletions assume the base file was
+        re-provisioned; a missing target is skipped rather than fatal."""
+        for entry in entries:
+            change_kind = entry.get("change_kind")
+            path = entry.get("path")
+            if change_kind in {"created", "modified"}:
+                content_sha256 = entry.get("content_sha256")
+                content = blob_reader(content_sha256) if content_sha256 else b""
+                workspace.write_bytes(path, content, create_dirs=True)
+            elif change_kind == "directory":
+                workspace.mkdir(path)
+            elif change_kind == "deleted":
+                if workspace.exists(path):
+                    workspace.delete_path(path, recursive=entry.get("kind") == "dir")
+
+    def _crashed_shell_observations(self, res: _RunResources) -> tuple[ToolObservation, ...]:
+        """A shell ``BackgroundJob`` left ``running`` in ``artifacts/jobs/*/job.json``
+        means its subprocess was lost on the crash (it cannot be restored). Surface
+        each as a failed background-job observation so the model re-decides; the
+        original logs stay on disk untouched."""
+        jobs_dir = res.recorder.artifacts_dir / "jobs"
+        if not jobs_dir.is_dir():
+            return ()
+        observations: list[ToolObservation] = []
+        for job_file in sorted(jobs_dir.glob("*/job.json")):
+            try:
+                payload = json.loads(job_file.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            if payload.get("status") != "running":
+                continue
+            job_id = str(payload.get("job_id") or job_file.parent.name)
+            observations.append(
+                ToolObservation(
+                    call_id=f"background:{job_id}",
+                    tool_name="background_job",
+                    output={
+                        "type": "background_job_result",
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error": "process lost on restart",
+                        "command_preview": str(payload.get("command_preview") or ""),
+                    },
+                    is_background=True,
+                )
+            )
+        return tuple(observations)
+
+    def create_task(self, kind: str, request: dict[str, Any]) -> str:
+        """Create a task in the running run from outside the loop (backend-initiated
+        automation/hitl). Returns the task id; its result is delivered later via
+        report_task_result."""
+        session = self._require_open()
+        return session.res.context.job_manager.create_task(kind, request)
+
+    def _require_open(self) -> _Session:
+        if self._session is None:
+            raise NativeAgentError("run is not open; call open() first", error_code="run_not_open")
+        return self._session
 
     def _bootstrap(self) -> _RunResources:
         if self.permission_policy == PermissionPolicy() and self.spec.permission_policy != PermissionPolicy():
@@ -317,8 +851,9 @@ class AgentLoop:
             self.spec.run_id,
             extra_event_sinks=self.event_sinks,
             status_file=self.status_file,
+            reopen=self._restoring,
         )
-        job_manager = BackgroundJobManager(
+        job_manager = TaskManager(
             run_id=self.spec.run_id,
             workspace=workspace,
             recorder=recorder,
@@ -393,46 +928,50 @@ class AgentLoop:
             segment = provider.static_segment()
             if segment and segment.strip():
                 static_segments.append(segment)
-        workspace_base_path = recorder.write_workspace_base(
-            workspace.workspace_base_payload(self.spec.run_id)
-        )
-        manifest = build_run_manifest(
-            self.spec,
-            model_config=initial_runtime_config.model or ModelConfig(),
-            tool_specs=initial_visible_tool_specs,
-            permission_policy=self.permission_policy,
-            tool_surface=tool_surface_manifest(
-                resolver=self.tool_surface_resolver,
-                tool_search=initial_runtime_config.tool_search,
-                dynamic_enabled=bool(self._dynamic_providers()),
-                initial_catalog_count=len(initial_bound_catalog.tools),
-            ),
-            agent_config={
-                "definition_id": initial_runtime_config.definition_id,
-                "config_version": initial_runtime_config.config_version,
-                "config_hash": initial_runtime_config.config_hash,
-            },
-            workspace_index_path=str(workspace_index_path.relative_to(recorder.run_dir).as_posix()),
-            workspace_base_path=str(workspace_base_path.relative_to(recorder.run_dir).as_posix()),
-        )
-        recorder.write_manifest(manifest)
-        recorder.emit(
-            "run.started",
-            data={
-                "workspace": str(self.spec.workspace_root),
-                "run_dir": str(recorder.run_dir),
-                "manifest_path": "manifest.json",
-                "mode": self.spec.mode,
-                "workspace_backend": self.spec.workspace_backend,
-                "workspace_base_path": "workspace.base.json",
-                "model_provider": (initial_runtime_config.model or ModelConfig()).provider,
-                "model": (initial_runtime_config.model or ModelConfig()).model,
-                "reasoning_effort": (initial_runtime_config.model or ModelConfig()).reasoning.effort,
-                "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
-                "agent_config_hash": initial_runtime_config.config_hash,
-            },
-        )
-        self._warn_on_unforwarded_multimodal(recorder)
+        # On restore (_rehydrate) the run dir already holds workspace.base.json,
+        # manifest.json, and a recorded run.started. Re-writing the base would reset
+        # the diff baseline; re-emitting run.started would double the lifecycle. Skip
+        # all bootstrap side-effects and reuse what is already on disk.
+        if not self._restoring:
+            workspace_base_path = recorder.write_workspace_base(
+                workspace.workspace_base_payload(self.spec.run_id)
+            )
+            manifest = build_run_manifest(
+                self.spec,
+                model_config=initial_runtime_config.model or ModelConfig(),
+                tool_specs=initial_visible_tool_specs,
+                permission_policy=self.permission_policy,
+                tool_surface=tool_surface_manifest(
+                    resolver=self.tool_surface_resolver,
+                    tool_search=initial_runtime_config.tool_search,
+                    dynamic_enabled=bool(self._dynamic_providers()),
+                    initial_catalog_count=len(initial_bound_catalog.tools),
+                ),
+                agent_config={
+                    "definition_id": initial_runtime_config.definition_id,
+                    "config_version": initial_runtime_config.config_version,
+                    "config_hash": initial_runtime_config.config_hash,
+                },
+                workspace_index_path=str(workspace_index_path.relative_to(recorder.run_dir).as_posix()),
+                workspace_base_path=str(workspace_base_path.relative_to(recorder.run_dir).as_posix()),
+            )
+            recorder.write_manifest(manifest)
+            recorder.emit(
+                "run.started",
+                data={
+                    "workspace": str(self.spec.workspace_root),
+                    "run_dir": str(recorder.run_dir),
+                    "manifest_path": "manifest.json",
+                    "mode": self.spec.mode,
+                    "workspace_backend": self.spec.workspace_backend,
+                    "workspace_base_path": "workspace.base.json",
+                    "model_provider": (initial_runtime_config.model or ModelConfig()).provider,
+                    "model": (initial_runtime_config.model or ModelConfig()).model,
+                    "reasoning_effort": (initial_runtime_config.model or ModelConfig()).reasoning.effort,
+                    "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
+                    "agent_config_hash": initial_runtime_config.config_hash,
+                },
+            )
         return _RunResources(
             workspace=workspace,
             recorder=recorder,
@@ -443,11 +982,13 @@ class AgentLoop:
             static_segments=tuple(static_segments),
         )
 
-    def _warn_on_unforwarded_multimodal(self, recorder: AgentRecorder) -> None:
+    def _warn_on_unforwarded_multimodal(
+        self, parts: tuple[ContentPart, ...], recorder: AgentRecorder
+    ) -> None:
         """Multimodal input is a contract-only surface for now: non-text parts are
-        accepted on the spec but not yet threaded to any provider. Emit a warning
+        accepted on submit() but not yet threaded to any provider. Emit a warning
         naming the dropped part types and why, so the degradation is observable."""
-        dropped = non_text_part_types(self.spec.effective_input)
+        dropped = non_text_part_types(parts)
         if not dropped:
             return
         reason = "not_yet_forwarded" if getattr(self.model_adapter, "supports_multimodal", False) else "adapter_lacks_multimodal"
@@ -457,24 +998,26 @@ class AgentLoop:
             level="warning",
         )
 
-    def _dynamic_context_segment(self, state: RunState, res: _RunResources, step: int) -> str:
+    def _dynamic_context_segment(self, res: _RunResources, turn_context: TurnContext) -> str:
         """Join each context provider's per-turn segment. Empty when no providers
         contribute, so the turn prompt stays byte-identical to the static prompt."""
+        del res
         if not self.context_providers:
             return ""
-        turn = self._turn_context(state, res, step)
         segments = []
         for provider in self.context_providers:
-            segment = provider.dynamic_segment(turn)
+            segment = provider.dynamic_segment(turn_context)
             if segment and segment.strip():
                 segments.append(segment.strip())
         return "\n\n".join(segments)
 
-    def _turn_context(self, state: RunState, res: _RunResources, step: int) -> TurnContext:
+    def _turn_context(
+        self, state: RunState, res: _RunResources, step: int, remaining_steps: int
+    ) -> TurnContext:
         limits = self.spec.limits
         return TurnContext(
             step=step,
-            remaining_steps=max(0, limits.max_steps - step),
+            remaining_steps=remaining_steps,
             remaining_tool_calls=max(0, limits.max_tool_calls - state.total_tool_calls),
             deadline_s=(res.deadline - time.time()) if res.deadline is not None else None,
             plan=tuple(res.context.plan),
@@ -554,12 +1097,19 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
-    def _run_steps(self, state: RunState, res: _RunResources) -> None:
+    def _pump_turn(self, state: RunState, res: _RunResources, session: _Session) -> Suspension:
         context = res.context
         recorder = res.recorder
         deadline = res.deadline
-        for step in range(1, self.spec.limits.max_steps + 1):
+        # The per-submit step budget continues across task-wait suspensions within one
+        # submit; session_step is the global, monotonic turn counter for turn ids.
+        max_steps = self.spec.limits.max_steps
+        while session.submit_local_step < max_steps:
             self._check_run_boundary(deadline)
+            session.submit_local_step += 1
+            local_step = session.submit_local_step
+            session.session_step += 1
+            step = session.session_step
             background_observations = self._pop_background_observations(context, recorder, step)
             if background_observations:
                 state.pending_observations = (*state.pending_observations, *background_observations)
@@ -569,7 +1119,7 @@ class AgentLoop:
                 turn_id=turn_id,
                 data={"step": step, "previous_turn_handle": state.previous_turn_handle},
             )
-            turn_context = self._turn_context(state, res, step)
+            turn_context = self._turn_context(state, res, step, max(0, max_steps - local_step))
             turn_registry = self._registry_for_turn(context, turn_context, res)
             runtime_config = self._current_runtime_config(turn_registry)
             bound_catalog = compile_bound_tool_catalog(runtime_config, turn_registry)
@@ -609,7 +1159,7 @@ class AgentLoop:
             )
             state.previous_surface_snapshot = surface_snapshot
             state.pending_binding_loads = ()
-            dynamic_segment = self._dynamic_context_segment(state, res, step)
+            dynamic_segment = self._dynamic_context_segment(res, turn_context)
             if surface_snapshot.delta_notice:
                 dynamic_segment = (
                     surface_snapshot.delta_notice
@@ -622,13 +1172,29 @@ class AgentLoop:
                 if not dynamic_segment
                 else f"{static_system_prompt}\n\n{dynamic_segment}"
             )
+            # The new user message is sent only on the first turn that consumes it
+            # (the first turn of this submit); later turns of the same submit carry
+            # observations against the continuation handle.
+            instruction: str | None = None
+            if state.pending_user_input is not None:
+                instruction = text_from_parts(state.pending_user_input) or None
+                state.pending_user_input = None
+            # Accumulate the by-value conversation log BEFORE the call: the new user
+            # message (if any) and the tool/async observations being sent this turn. The
+            # assistant reply is appended after the call. The system prompt is NOT logged
+            # here — it is regenerated per turn and travels via ``system_prompt``.
+            if instruction is not None:
+                state.messages.append({"role": "user", "content": instruction})
+            for observation in state.pending_observations:
+                state.messages.append(_observation_message(observation))
             request = ModelRequest(
-                instruction=self.spec.effective_text_instruction,
+                instruction=instruction,
                 system_prompt=turn_system_prompt,
                 tools=surface_snapshot.immediate_tools,
                 previous_turn_handle=state.previous_turn_handle,
                 observations=state.pending_observations,
                 model=runtime_config.model or ModelConfig(),
+                messages=tuple(state.messages),
             )
             recorder.transcript(
                 {
@@ -667,6 +1233,14 @@ class AgentLoop:
             self._check_run_boundary(deadline)
             _accumulate_usage(state.total_usage, turn)
             state.previous_turn_handle = turn.response_id or state.previous_turn_handle
+            # Append the assistant reply to the by-value log (text + any tool calls).
+            state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": turn.final_text or "",
+                    "tool_calls": [call.__dict__ for call in turn.tool_calls],
+                }
+            )
             recorder.transcript(
                 {
                     "kind": "model_turn",
@@ -708,12 +1282,23 @@ class AgentLoop:
 
             if not turn.tool_calls:
                 if context.job_manager.has_resume_jobs():
-                    self._wait_for_background_jobs(context, recorder, deadline)
+                    # Park without blocking: clear the consumed observations and hand
+                    # control back. The caller waits (in-process monitor completes, or
+                    # an external reporter delivers) and resumes via run_until_suspended.
                     state.pending_observations = ()
-                    continue
+                    external = context.job_manager.external_pending_task_ids()
+                    return Suspension(
+                        reason="awaiting_tasks",
+                        status=state.status,  # type: ignore[arg-type]
+                        awaiting_task_ids=tuple(external),
+                        has_external=bool(external),
+                    )
                 if turn.final_text:
                     state.final_text = turn.final_text
-                    break
+                    # The model has consumed the pending observations and settled;
+                    # the next submit must not resend them alongside a new message.
+                    state.pending_observations = ()
+                    return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
                 raise ModelAdapterError("model returned neither final text nor tool calls")
 
             observations: list[ToolObservation] = []
@@ -747,13 +1332,23 @@ class AgentLoop:
 
             if context.finished:
                 state.final_text = context.final_text
-                break
+                return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
             if state.status == "limited":
-                break
-        else:
-            state.status = "limited"
-            state.final_text = "Stopped after reaching max steps."
-            state.error_code = "max_steps_exceeded"
+                return Suspension(
+                    reason="limited",
+                    status=state.status,  # type: ignore[arg-type]
+                    final_text=state.final_text,
+                    error_code=state.error_code,
+                )
+        state.status = "limited"
+        state.final_text = "Stopped after reaching max steps."
+        state.error_code = "max_steps_exceeded"
+        return Suspension(
+            reason="limited",
+            status=state.status,  # type: ignore[arg-type]
+            final_text=state.final_text,
+            error_code=state.error_code,
+        )
 
     def _build_metrics(self, state: RunState, res: _RunResources) -> dict[str, Any]:
         context = res.context
@@ -839,6 +1434,47 @@ class AgentLoop:
             metrics=metrics,
             error=state.error,
             error_code=state.error_code,
+            final_turn_handle=state.previous_turn_handle,
+        )
+
+    def _checkpoint_on_settle(self, state: RunState, res: _RunResources) -> AgentTurnResult:
+        """Preview-only checkpoint at a settle point: flush the accumulated proposal
+        and metrics, emit ``turn.settled``, and keep the run open. Repeatable — it
+        does not cancel jobs, emit ``proposal.ready``/``run.finished``, or close the
+        recorder. Those happen once in close()/``_finalize``."""
+        recorder = res.recorder
+        workspace = res.workspace
+        diff_path = recorder.write_diff(workspace.diff_patch())
+        proposal_payload = recorder.write_proposal_snapshot(workspace, diff_path)
+        metrics = self._build_metrics(state, res)
+        recorder.write_metrics(metrics)
+        recorder.emit(
+            "workspace.proposal.updated",
+            data=public_proposal_payload(proposal_payload, self.permission_policy),
+        )
+        public_changed = [
+            public_path(str(path), self.permission_policy)
+            for path in proposal_payload.get("changed_paths", [])
+        ]
+        recorder.emit(
+            "turn.settled",
+            data={
+                "status": state.status,
+                "final_text": state.final_text,
+                "error_code": state.error_code,
+                "changed_paths": public_changed,
+            },
+        )
+        return AgentTurnResult(
+            status=state.status,  # type: ignore[arg-type]
+            final_text=state.final_text,
+            proposal_path=recorder.run_dir / "proposal.json",
+            proposal_hash=str(proposal_payload.get("proposal_hash") or ""),
+            changed_paths=tuple(workspace.changed_paths()),
+            turn_handle=state.previous_turn_handle,
+            error=state.error,
+            error_code=state.error_code,
+            metrics=metrics,
         )
 
     def _pop_background_observations(
@@ -847,26 +1483,18 @@ class AgentLoop:
         recorder: AgentRecorder,
         step: int,
     ) -> tuple[ToolObservation, ...]:
-        payloads = context.job_manager.pop_reentry_observations()
-        if not payloads:
+        observations = context.job_manager.pop_reentry_observations()
+        if not observations:
             return ()
         recorder.emit(
             "run.resumed",
             data={
                 "reason": "background_job_result",
-                "job_ids": [str(payload.get("job_id") or "") for payload in payloads],
-                "count": len(payloads),
+                "job_ids": [str(obs.output.get("job_id") or "") for obs in observations],
+                "count": len(observations),
             },
         )
-        observations: list[ToolObservation] = []
-        for payload in payloads:
-            job_id = str(payload.get("job_id") or "")
-            observation = ToolObservation(
-                call_id=f"background:{job_id}",
-                tool_name="background_job",
-                output=payload,
-                is_background=True,
-            )
+        for observation in observations:
             recorder.transcript(
                 {
                     "kind": "tool_observation",
@@ -876,8 +1504,10 @@ class AgentLoop:
                     "output": observation.output,
                 }
             )
-            self._emit_background_workspace_events(payload, context, recorder)
-            observations.append(observation)
+            # Workspace diffs are shell-specific; gate on the shell result payload
+            # so hitl/automation results don't emit phantom workspace events.
+            if observation.output.get("type") == "background_job_result":
+                self._emit_background_workspace_events(observation.output, context, recorder)
         return tuple(observations)
 
     def _wait_for_background_jobs(

@@ -55,9 +55,11 @@ def test_default_system_prompt_is_composed_base(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     adapter = _finish_only_adapter()
-    spec = AgentRunSpec(instruction="Inspect.", workspace_root=workspace, run_root=tmp_path / "runs")
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
 
-    AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider("run.finish")).run()
+    AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider("run.finish")).run_once(
+        "Inspect."
+    )
 
     assert adapter.requests[0].system_prompt == compose_system_prompt()
 
@@ -86,10 +88,10 @@ def test_run_finish_surfaces_outputs_and_notes(tmp_path: Path) -> None:
     )
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Review.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=_provider("run.finish"),
-    ).run()
+    ).run_once("Review.")
 
     assert result.status == "completed"
     assert result.final_text == "Reviewed the notes"
@@ -122,10 +124,10 @@ def test_loop_read_write_finish_happy_path(tmp_path: Path) -> None:
     )
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Clean.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=_provider(),
-    ).run()
+    ).run_once("Clean.")
 
     assert result.status == "completed"
     assert not workspace.joinpath("SUMMARY.md").exists()
@@ -159,14 +161,13 @@ def test_loop_staging_backend_records_base_hash(tmp_path: Path) -> None:
     )
     result = AgentLoop(
         spec=AgentRunSpec(
-            instruction="Update.",
             workspace_root=workspace,
             run_root=tmp_path / "runs",
             workspace_backend="staging",
         ),
         model_adapter=adapter,
         runtime_config_provider=_provider("fs.write", "run.finish"),
-    ).run()
+    ).run_once("Update.")
 
     assert result.status == "completed"
     assert workspace.joinpath("notes.md").read_text(encoding="utf-8") == "new\n"
@@ -177,7 +178,7 @@ def test_loop_staging_backend_records_base_hash(tmp_path: Path) -> None:
 def test_loop_uses_injected_workspace_factory(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    spec = AgentRunSpec(instruction="noop", workspace_root=workspace, run_root=tmp_path / "runs")
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
     seen: list[AgentRunSpec] = []
 
     def factory(run_spec: AgentRunSpec):
@@ -189,7 +190,7 @@ def test_loop_uses_injected_workspace_factory(tmp_path: Path) -> None:
         model_adapter=_finish_only_adapter(),
         workspace_factory=factory,
         runtime_config_provider=_provider("run.finish"),
-    ).run()
+    ).run_once("noop")
 
     assert result.status == "completed"
     assert seen == [spec]
@@ -206,10 +207,10 @@ def test_unknown_tool_is_recorded_as_observation(tmp_path: Path) -> None:
     )
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Do it.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=_provider("run.finish"),
-    ).run()
+    ).run_once("Do it.")
 
     assert result.status == "completed"
     assert "unknown tool" in result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
@@ -229,10 +230,10 @@ def test_absent_binding_means_tool_unavailable(tmp_path: Path) -> None:
     )
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Write.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=_provider("fs.read", "run.finish"),
-    ).run()
+    ).run_once("Write.")
 
     assert result.status == "completed"
     assert "fs.write" not in {tool.id for tool in adapter.requests[0].tools}
@@ -265,10 +266,10 @@ def test_binding_authorization_and_quota_are_enforced(tmp_path: Path) -> None:
     )
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Try tools.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=runtime_provider(config),
-    ).run()
+    ).run_once("Try tools.")
 
     transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
     assert "tool_quota_exceeded" in transcript
@@ -309,10 +310,10 @@ def test_shell_binding_auto_approve_updates_proposal(tmp_path: Path) -> None:
     )
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Use shell.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=runtime_provider(config),
-    ).run()
+    ).run_once("Use shell.")
 
     assert result.status == "completed"
     assert not workspace.joinpath("SHELL.md").exists()
@@ -327,7 +328,6 @@ def test_loop_limits_and_cancellation(tmp_path: Path) -> None:
     workspace.mkdir()
     limited = AgentLoop(
         spec=AgentRunSpec(
-            instruction="Loop.",
             workspace_root=workspace,
             run_root=tmp_path / "limited",
             limits=RunLimits(max_steps=1),
@@ -339,17 +339,17 @@ def test_loop_limits_and_cancellation(tmp_path: Path) -> None:
             ]
         ),
         runtime_config_provider=_provider("fs.list", "run.finish"),
-    ).run()
+    ).run_once("Loop.")
     assert limited.status == "limited"
     assert limited.error_code == "max_steps_exceeded"
 
     token = CancellationToken()
     token.cancel()
     cancelled = AgentLoop(
-        spec=AgentRunSpec(instruction="Finish.", workspace_root=workspace, run_root=tmp_path / "cancelled"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "cancelled"),
         model_adapter=FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
         runtime_config_provider=_provider("run.finish"),
         cancellation_token=token,
-    ).run()
+    ).run_once("Finish.")
     assert cancelled.status == "limited"
     assert cancelled.error_code == "cancelled"

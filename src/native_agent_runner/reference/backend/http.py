@@ -112,6 +112,7 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                             if payload.get("runtime_config") is not None
                             else None
                         ),
+                        multi_turn=bool(payload.get("multi_turn", False)),
                         metadata=dict(payload.get("metadata") or {}),
                     )
                     self._write_json(backend.submit_run(request).to_json(), status=HTTPStatus.ACCEPTED)
@@ -136,6 +137,44 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                             issuer=str(payload.get("issuer") or ""),
                             reason=str(payload.get("reason") or ""),
                             config=AgentRuntimeConfig.from_json(payload["config"]),
+                        )
+                    )
+                    return
+                if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "messages":
+                    run_id = parts[2]
+                    payload = self._read_json()
+                    self._write_json(
+                        backend.send_message(run_id, self._bearer_token(), content=str(payload.get("content") or ""))
+                    )
+                    return
+                if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "tasks":
+                    run_id = parts[2]
+                    payload = self._read_json()
+                    self._write_json(
+                        backend.create_task(
+                            run_id,
+                            self._bearer_token(),
+                            kind=str(payload.get("kind") or ""),
+                            request=dict(payload.get("request") or {}),
+                        )
+                    )
+                    return
+                if (
+                    len(parts) == 6
+                    and parts[:2] == ["v1", "runs"]
+                    and parts[3] == "tasks"
+                    and parts[5] == "result"
+                ):
+                    run_id = parts[2]
+                    task_id = parts[4]
+                    payload = self._read_json()
+                    self._write_json(
+                        backend.report_task_result(
+                            run_id,
+                            self._bearer_token(),
+                            task_id=task_id,
+                            result=dict(payload.get("result") or {}),
+                            status=str(payload.get("status") or "answered"),
                         )
                     )
                     return

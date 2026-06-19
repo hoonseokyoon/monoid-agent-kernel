@@ -27,6 +27,9 @@ class LlmGatewayTurnRequest:
     instruction: str = ""
     previous_turn_handle: str | None = None
     observations: tuple[ToolObservation, ...] = ()
+    # By-value conversation: the full message log, forwarded to the upstream provider
+    # statelessly. When set, no previous_turn_handle lookup is needed.
+    messages: tuple[dict[str, Any], ...] | None = None
 
 
 @dataclass
@@ -76,7 +79,11 @@ class LlmGatewayBackend:
         claims = self._authorize(token)
         request = _parse_turn_request(payload)
         self._validate_request_against_claims(request, claims)
-        provider_previous_response_id = self._provider_previous_response_id(request, claims)
+        # By-value carries the full conversation as messages → forward statelessly, no
+        # handle lookup. The legacy by-reference path still translates handle → response id.
+        provider_previous_response_id = (
+            None if request.messages is not None else self._provider_previous_response_id(request, claims)
+        )
         adapter = self._build_adapter(claims, request)
         turn = adapter.next_turn(
             ModelRequest(
@@ -86,6 +93,7 @@ class LlmGatewayBackend:
                 previous_turn_handle=provider_previous_response_id,
                 observations=request.observations,
                 model=ModelConfig(provider="openai", model=request.model, reasoning=request.reasoning),
+                messages=request.messages,
             )
         )
         turn_handle = self._record_turn(claims, request, turn)
@@ -180,7 +188,9 @@ def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
     previous_turn_handle = payload.get("previous_turn_handle")
     observations = tuple(_parse_observation(item) for item in payload.get("observations") or ())
     instruction = str(payload.get("instruction") or "")
-    if previous_turn_handle is None and not instruction.strip():
+    raw_messages = payload.get("messages")
+    messages = tuple(dict(item) for item in raw_messages) if raw_messages is not None else None
+    if messages is None and previous_turn_handle is None and not instruction.strip():
         raise ValueError("instruction is required for the first LLM turn")
     return LlmGatewayTurnRequest(
         protocol="native-agent-runner.llm-turn.v1",
@@ -194,6 +204,7 @@ def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
         instruction=instruction,
         previous_turn_handle=str(previous_turn_handle) if previous_turn_handle else None,
         observations=observations,
+        messages=messages,
     )
 
 

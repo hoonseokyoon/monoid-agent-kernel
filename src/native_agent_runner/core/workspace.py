@@ -137,5 +137,15 @@ class Workspace(Protocol):
     def changed_entries(self) -> list[ChangedEntry]:
         ...
 
+    def snapshot_current_as_new_baseline(self) -> None:
+        """Adopt the current proposed state as the new diff baseline.
+
+        After this call, ``diff_patch()`` / ``changed_entries()`` report only the
+        changes made *after* this point. Used by ``AgentLoop.commit_checkpoint()``
+        to support incremental apply across a multi-turn run. Mutating workspaces
+        only; a read-only workspace raises.
+        """
+        ...
+
     def workspace_base_payload(self, run_id: str) -> dict[str, Any]:
         ...

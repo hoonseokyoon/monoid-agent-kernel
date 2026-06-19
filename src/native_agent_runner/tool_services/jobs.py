@@ -3,14 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from native_agent_runner.jobs import BackgroundJobManager
+from native_agent_runner.tasks import TaskManager
 
 
 @dataclass
 class JobsService:
-    """Tool-facing view over the background job manager (list/status/logs/cancel/wait)."""
+    """Tool-facing view over the task manager (list/status/logs/cancel/wait)."""
 
-    job_manager: BackgroundJobManager
+    job_manager: TaskManager
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self.job_manager.list_jobs()

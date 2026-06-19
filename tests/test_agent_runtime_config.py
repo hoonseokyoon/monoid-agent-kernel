@@ -104,10 +104,10 @@ def test_runtime_config_guidance_updates_model_request(tmp_path: Path) -> None:
     )
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Finish.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=_RuntimeProvider((config,)),
-    ).run()
+    ).run_once("Finish.")
 
     assert result.status == "completed"
     read_tool = next(tool for tool in adapter.requests[0].tools if tool.id == "fs.read")
@@ -130,10 +130,10 @@ def test_runtime_config_changes_apply_on_next_turn(tmp_path: Path) -> None:
     second = _config(_binding("run.finish"), version=2)
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Read.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=_RuntimeProvider((first, first, second)),
-    ).run()
+    ).run_once("Read.")
 
     assert result.status == "completed"
     assert "fs.read" in {tool.id for tool in adapter.requests[0].tools}
@@ -151,10 +151,10 @@ def test_unknown_runtime_tool_ref_fails_run(tmp_path: Path) -> None:
     config = _config(_binding("missing.tool"))
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Finish.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=_RuntimeProvider((config,)),
-    ).run()
+    ).run_once("Finish.")
 
     assert result.status == "failed"
     assert result.error_code == "agent_config_invalid"
@@ -167,7 +167,7 @@ def test_agent_loop_requires_runtime_config_provider(tmp_path: Path) -> None:
 
     try:
         AgentLoop(
-            AgentRunSpec(instruction="Finish.", workspace_root=workspace, run_root=tmp_path / "runs"),
+            AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
             adapter,
         )
     except TypeError as exc:

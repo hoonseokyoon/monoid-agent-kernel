@@ -8,7 +8,12 @@ from typing import Any
 from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.errors import ModelAdapterError
 from native_agent_runner.providers._common import build_reasoning_payload, normalize_usage
-from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolCall
+from native_agent_runner.providers.base import (
+    ModelRequest,
+    ModelTurn,
+    ToolCall,
+    format_async_result_text,
+)
 
 
 @dataclass
@@ -58,11 +63,22 @@ class OpenAIModelAdapter:
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
 
-        if request.previous_turn_handle:
+        if request.messages is not None:
+            # By-value: the full conversation travels as input; no server-side handle.
+            input_items: list[dict[str, Any]] = []
+            for message in request.messages:
+                input_items.extend(_message_to_input_items(message))
+            payload["input"] = input_items
+        elif request.previous_turn_handle:
             payload["previous_response_id"] = request.previous_turn_handle
-            payload["input"] = [_observation_input_item(observation) for observation in request.observations]
+            input_items = []
+            # Third shape: a new user message on top of an existing continuation handle.
+            if request.instruction:
+                input_items.append({"role": "user", "content": request.instruction})
+            input_items.extend(_observation_input_item(observation) for observation in request.observations)
+            payload["input"] = input_items
         else:
-            payload["input"] = [{"role": "user", "content": request.instruction}]
+            payload["input"] = [{"role": "user", "content": request.instruction or ""}]
         return payload
 
 
@@ -77,18 +93,46 @@ def _openai_tool_schema(tool: Any) -> dict[str, Any]:
 
 def _observation_input_item(observation: Any) -> dict[str, Any]:
     if observation.is_background:
-        return {
-            "role": "user",
-            "content": (
-                "Background shell job completed. Treat this as the result of the previously "
-                f"started job:\n{json.dumps(observation.output, ensure_ascii=False)}"
-            ),
-        }
+        # A background/hosted task result delivered as a new user message.
+        return {"role": "user", "content": format_async_result_text(observation.output)}
     return {
         "type": "function_call_output",
         "call_id": observation.call_id,
         "output": json.dumps(observation.output, ensure_ascii=False),
     }
+
+
+def _message_to_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Translate one provider-neutral by-value message into OpenAI Responses input items.
+    An assistant turn with tool calls expands to an assistant text item (if any) plus a
+    ``function_call`` item per call; a tool message is a ``function_call_output``."""
+    role = message.get("role")
+    if role == "user":
+        return [{"role": "user", "content": message.get("content") or ""}]
+    if role == "tool":
+        return [
+            {
+                "type": "function_call_output",
+                "call_id": message.get("call_id") or "",
+                "output": json.dumps(message.get("content"), ensure_ascii=False),
+            }
+        ]
+    if role == "assistant":
+        items: list[dict[str, Any]] = []
+        content = message.get("content") or ""
+        if content:
+            items.append({"role": "assistant", "content": content})
+        for call in message.get("tool_calls") or []:
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call.get("id") or "",
+                    "name": call.get("name") or "",
+                    "arguments": json.dumps(call.get("arguments") or {}, ensure_ascii=False),
+                }
+            )
+        return items
+    return []
 
 
 def _parse_response(data: dict[str, Any]) -> ModelTurn:

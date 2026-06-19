@@ -22,7 +22,15 @@ from native_agent_runner.core.spec import (
     ReasoningConfig,
     RunLimits,
 )
-from native_agent_runner.core.result import AgentArtifact, AgentRunResult
+from native_agent_runner.core.result import AgentArtifact, AgentRunResult, AgentTurnResult, Suspension
+from native_agent_runner.core.checkpoint import (
+    CheckpointRecord,
+    CheckpointStore,
+    LocalFsCheckpointStore,
+    RunCheckpoint,
+    read_checkpoint,
+    write_checkpoint,
+)
 
 # Context providers (pluggable static + per-turn system context)
 from native_agent_runner.core.context import ContextProvider, TurnContext
@@ -94,6 +102,13 @@ from native_agent_runner.permissions import PermissionPolicy
 # Gateway client seam (the contract the core calls across for web tools)
 from native_agent_runner.web import WebGatewayClient
 
+# Async task seams (executor/injector/reporter the backend plugs in)
+from native_agent_runner.tasks import (
+    ResultInjector,
+    TaskExecutor,
+    TaskReporter,
+)
+
 __all__ = [
     # engine entry / result
     "AgentLoop",
@@ -104,6 +119,14 @@ __all__ = [
     "RunLimits",
     "AgentArtifact",
     "AgentRunResult",
+    "AgentTurnResult",
+    "Suspension",
+    "RunCheckpoint",
+    "CheckpointStore",
+    "CheckpointRecord",
+    "LocalFsCheckpointStore",
+    "read_checkpoint",
+    "write_checkpoint",
     # context providers
     "AgentDefinition",
     "AgentRuntimeConfig",
@@ -156,4 +179,8 @@ __all__ = [
     "PermissionPolicy",
     # gateway client seam
     "WebGatewayClient",
+    # async task seams
+    "TaskExecutor",
+    "ResultInjector",
+    "TaskReporter",
 ]

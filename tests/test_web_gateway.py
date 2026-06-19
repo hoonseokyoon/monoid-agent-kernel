@@ -147,7 +147,6 @@ def test_agent_loop_web_bindings_events_metrics_and_private_transcript(tmp_path:
         )
 
         spec = AgentRunSpec(
-            instruction="Use web.",
             workspace_root=workspace,
             run_root=tmp_path / "runs",
             run_id="web_loop",
@@ -157,7 +156,7 @@ def test_agent_loop_web_bindings_events_metrics_and_private_transcript(tmp_path:
             model_adapter=adapter,
             runtime_config_provider=runtime_provider(config),
             web_gateway_client=WebGatewayClient(base_url, token=_web_token(manager, run_id=spec.run_id)),
-        ).run()
+        ).run_once("Use web.")
 
         assert result.status == "completed"
         metrics = json.loads(result.run_dir.joinpath("metrics.json").read_text(encoding="utf-8"))

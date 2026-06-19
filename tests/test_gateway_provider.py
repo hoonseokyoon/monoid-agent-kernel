@@ -62,9 +62,10 @@ def test_gateway_payload_is_provider_keyless_and_uses_opaque_turn_handle(tmp_pat
     assert "api_key" not in str(payload).lower()
     assert headers["Authorization"] == "Bearer run-token"
 
+    # Tool continuation: handle + observations, no new user message.
     followup = adapter._payload(
         ModelRequest(
-            instruction="ignored on followup",
+            instruction=None,
             system_prompt="sys",
             tools=(_tool(),),
             previous_turn_handle="opaque-turn-handle",
@@ -74,6 +75,20 @@ def test_gateway_payload_is_provider_keyless_and_uses_opaque_turn_handle(tmp_pat
     assert followup["previous_turn_handle"] == "opaque-turn-handle"
     assert "previous_response_id" not in followup
     assert "instruction" not in followup
+    assert followup["observations"][0]["call_id"] == "call_1"
+
+    # Third shape: a new user message on top of an existing continuation handle.
+    user_followup = adapter._payload(
+        ModelRequest(
+            instruction="Now also summarize.",
+            system_prompt="sys",
+            tools=(_tool(),),
+            previous_turn_handle="opaque-turn-handle",
+        )
+    )
+    assert user_followup["previous_turn_handle"] == "opaque-turn-handle"
+    assert user_followup["instruction"] == "Now also summarize."
+    assert user_followup["observations"] == []
 
 
 def test_gateway_response_parser_returns_model_turn() -> None:
@@ -210,3 +225,43 @@ def test_cli_openai_provider_requires_explicit_direct_allow(tmp_path: Path) -> N
 
     assert result.exit_code != 0
     assert "OpenAI runtime configs require --allow-direct-provider-api" in result.output
+
+
+def test_adapters_send_full_messages_by_value(tmp_path: Path) -> None:
+    # When ModelRequest.messages is set, both adapters send the whole conversation and
+    # drop the by-reference handle (vendor-independent continuation).
+    messages = (
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "ok",
+            "tool_calls": [{"id": "c1", "name": "fs_read", "arguments": {"path": "a"}}],
+        },
+        {"role": "tool", "call_id": "c1", "content": {"ok": True}},
+    )
+    request = ModelRequest(
+        instruction=None,
+        system_prompt="sys",
+        tools=(_tool(),),
+        previous_turn_handle="stale-handle",
+        messages=messages,
+    )
+
+    token_file = tmp_path / "token"
+    token_file.write_text("run-token", encoding="utf-8")
+    gateway = GatewayModelAdapter(
+        ModelConfig(model="gpt-5.5", gateway_url="https://llm-gateway.internal/v1/turns"),
+        token_file=token_file,
+    )
+    gw_payload = gateway._payload(request)
+    assert gw_payload["messages"] == [dict(m) for m in messages]
+    assert "previous_turn_handle" not in gw_payload
+    assert "instruction" not in gw_payload
+
+    openai = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"), allow_direct_provider_api=True)
+    oa_payload = openai._payload(request)
+    items = oa_payload["input"]
+    assert {"role": "user", "content": "hi"} in items
+    assert any(it.get("type") == "function_call" and it.get("call_id") == "c1" for it in items)
+    assert any(it.get("type") == "function_call_output" and it.get("call_id") == "c1" for it in items)
+    assert "previous_response_id" not in oa_payload

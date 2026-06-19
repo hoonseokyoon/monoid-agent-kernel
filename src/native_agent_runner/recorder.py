@@ -92,6 +92,13 @@ class StatusJsonSink:
             self.state["status"] = "running"
             self.state["waiting_for_background_jobs"] = False
             self.state["resumed_jobs"] = data.get("job_ids", [])
+        elif event.type == "run.awaiting_input":
+            self.state["status"] = "awaiting_input"
+            self.state["awaiting_input"] = {
+                "reason": data.get("reason"),
+                "task_ids": data.get("task_ids", []),
+                "prompt": data.get("prompt"),
+            }
         elif event.type == "agent.config.updated":
             self.state["agent_config"] = {
                 "definition_id": data.get("definition_id"),
@@ -101,6 +108,9 @@ class StatusJsonSink:
         elif event.type == "model.turn.started":
             self.state["current_turn_id"] = event.turn_id
             self.state["current_step"] = data.get("step")
+            if self.state.get("status") == "awaiting_input":
+                self.state["status"] = "running"
+                self.state.pop("awaiting_input", None)
         elif event.type == "tool.call.started":
             self.state["current_tool"] = data.get("tool")
             self.state["current_tool_call_id"] = data.get("call_id")
@@ -153,6 +163,10 @@ class AgentRecorder:
     run_id: str
     extra_event_sinks: tuple[EventSink, ...] = ()
     status_file: bool = True
+    # Durable restore: reopen an existing run dir instead of requiring a fresh one.
+    # Transcript/events sinks already append, so reopening just tolerates the existing
+    # artifacts dir rather than failing the run-id-collision guard.
+    reopen: bool = False
     run_dir: Path = field(init=False)
     artifacts_dir: Path = field(init=False)
     event_bus: EventBus = field(init=False)
@@ -163,7 +177,7 @@ class AgentRecorder:
     def __post_init__(self) -> None:
         self.run_dir = self.run_root / self.run_id
         self.artifacts_dir = self.run_dir / "artifacts"
-        self.artifacts_dir.mkdir(parents=True, exist_ok=False)
+        self.artifacts_dir.mkdir(parents=True, exist_ok=self.reopen)
         self._transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
         sinks: list[EventSink] = [JsonlEventSink(self.run_dir / "events.jsonl")]
         if self.status_file:
@@ -252,7 +266,10 @@ class AgentRecorder:
             "changed_paths": [entry["path"] for entry in files],
             "files": files,
         }
-        payload["proposal_hash"] = canonical_sha256(payload, drop=("proposal_hash",))
+        # updated_at is wall-clock metadata, not content; excluding it makes the
+        # proposal_hash a stable content identifier so repeated settle checkpoints
+        # with no workspace change produce the same hash.
+        payload["proposal_hash"] = canonical_sha256(payload, drop=("proposal_hash", "updated_at"))
         write_json_atomic(proposal_path, payload)
         return payload
 
@@ -265,6 +282,14 @@ class AgentRecorder:
             **metrics,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def write_failure(self, payload: dict[str, Any]) -> Path:
+        """Write ``run_dir/failure.json`` — the operator-facing failure bundle: what
+        broke plus which checkpoint to restore from. The core surfaces this; recovery
+        (if any) is the integrator's call (no auto-recovery in the core)."""
+        path = self.run_dir / "failure.json"
+        write_json_atomic(path, payload)
         return path
 
     def close(self) -> None:

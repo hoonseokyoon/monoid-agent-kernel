@@ -441,6 +441,41 @@ class LocalWorkspaceBackend:
                 )
         return entries
 
+    def snapshot_current_as_new_baseline(self) -> None:
+        if self.mode == "read-only":
+            raise WorkspaceError("cannot re-baseline a read-only workspace")
+        if self.backend_kind == "staging":
+            # Staging writes land on disk, so the current disk tree is the new base.
+            files, dirs = self._scan_staging_current()
+            self._base_files = dict(files)
+            self._base_dirs = set(dirs)
+        else:
+            # Overlay reads resolve against _overlay/_deleted_* (not _base_files),
+            # so we fold the proposed state into _base_files for base.json accuracy
+            # while deliberately keeping the overlay/delete markers live.
+            proposed_files = dict(self._base_files)
+            for rel in self._deleted_files:
+                proposed_files.pop(rel, None)
+            proposed_files.update(self._overlay)
+            self._base_files = proposed_files
+            self._base_dirs = (set(self._base_dirs) | set(self._overlay_dirs)) - set(self._deleted_dirs)
+        # changed_entries()/diff_patch() iterate _originals; clearing it resets the
+        # reported delta to empty. Later writes re-record originals from the current
+        # (re-baselined) proposed state, so only post-commit changes are reported.
+        self._originals.clear()
+        self._rebuild_base_entries()
+
+    def _rebuild_base_entries(self) -> None:
+        entries: list[dict[str, Any]] = []
+        for rel in sorted(self._base_dirs):
+            entries.append({"path": rel, "kind": "dir", "size": 0, "sha256": None})
+        for rel in sorted(self._base_files):
+            data = self._base_files[rel]
+            entries.append(
+                {"path": rel, "kind": "file", "size": len(data), "sha256": sha256_bytes(data)}
+            )
+        self._base_entries = entries
+
     def workspace_base_payload(self, run_id: str) -> dict[str, Any]:
         return {
             "schema_version": WORKSPACE_BASE_SCHEMA_VERSION,

@@ -147,9 +147,36 @@ class RunLimits:
         }
 
 
+def text_from_parts(parts: tuple[ContentPart, ...]) -> str:
+    """Join the text of the text parts in ``parts`` for text-only model adapters.
+
+    Non-text parts (images, documents) are not forwarded yet (see core/content.py),
+    so only ``TextPart`` content is extracted.
+    """
+    text_segments = [
+        part.text.strip()
+        for part in parts
+        if isinstance(part, TextPart) and part.text.strip()
+    ]
+    return "\n\n".join(text_segments)
+
+
+def input_to_parts(user_input: str | tuple[ContentPart, ...]) -> tuple[ContentPart, ...]:
+    """Normalize a ``submit()`` argument into content parts."""
+    if isinstance(user_input, str):
+        return (TextPart(user_input),)
+    return tuple(user_input)
+
+
 @dataclass(frozen=True)
 class AgentRunSpec:
-    instruction: str
+    """Session descriptor: where and under what constraints a run executes.
+
+    It carries no user input — the instruction(s) flow in through
+    ``AgentLoop.submit()`` / ``run_once()``. ``input`` remains as the (contract-only)
+    multimodal surface; see core/content.py.
+    """
+
     workspace_root: Path
     run_root: Path
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -157,48 +184,22 @@ class AgentRunSpec:
     workspace_backend: WorkspaceBackendKind = "overlay"
     limits: RunLimits = field(default_factory=RunLimits)
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
-    # Richer multimodal input superset of `instruction` (contract-only for now;
-    # see core/content.py). Empty => the run uses `instruction` as a single text part.
     input: tuple[ContentPart, ...] = ()
     metadata: dict[str, object] = field(default_factory=dict)
 
     @property
     def effective_input(self) -> tuple[ContentPart, ...]:
-        """The canonical input parts: explicit `input` if given, else a single
-        text part synthesized from `instruction`."""
-        return self.input or (TextPart(self.instruction),)
-
-    @property
-    def effective_text_instruction(self) -> str:
-        """Text forwarded to current text-only model adapters.
-
-        Explicit text parts take precedence. If an explicit multimodal input has
-        no text parts, fall back to the legacy instruction string so first-turn
-        gateway requests remain valid while non-text forwarding is deferred.
-        """
-        text_segments = [
-            part.text.strip()
-            for part in self.effective_input
-            if isinstance(part, TextPart) and part.text.strip()
-        ]
-        return "\n\n".join(text_segments) or self.instruction
-
-    @classmethod
-    def from_instruction(cls, instruction: str, **kwargs: Any) -> AgentRunSpec:
-        """Convenience constructor for the common text-only case."""
-        return cls(instruction=instruction, **kwargs)
+        """The explicit input parts, if any."""
+        return self.input
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> AgentRunSpec:
         if not isinstance(payload, dict):
             raise ValueError("spec must be an object")
-        if not payload.get("instruction"):
-            raise ValueError("spec.instruction is required")
         if not payload.get("workspace_root"):
             raise ValueError("spec.workspace_root is required")
         metadata = dict(payload.get("metadata") or {})
         kwargs: dict[str, Any] = {
-            "instruction": str(payload["instruction"]),
             "workspace_root": Path(str(payload["workspace_root"])),
             "run_root": Path(str(payload.get("run_root") or "runs")),
             "mode": payload.get("mode", "propose"),
@@ -223,7 +224,6 @@ class AgentRunSpec:
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "instruction": self.instruction,
             "workspace_root": str(self.workspace_root),
             "run_root": str(self.run_root),
             "run_id": self.run_id,

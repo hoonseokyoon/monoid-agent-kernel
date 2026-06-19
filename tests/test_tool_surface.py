@@ -68,10 +68,10 @@ def test_tool_surface_searchable_binding_loads_next_turn(tmp_path: Path) -> None
     )
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Read notes.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=runtime_provider(config),
-    ).run()
+    ).run_once("Read notes.")
 
     assert result.status == "completed"
     assert "fs.read" not in {tool.id for tool in adapter.requests[0].tools}
@@ -102,10 +102,10 @@ def test_search_result_is_not_callable_in_same_turn(tmp_path: Path) -> None:
     config = runtime_config(bindings=(tool_binding("fs.read", exposure="searchable"), tool_binding("run.finish")))
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Read notes.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=runtime_provider(config),
-    ).run()
+    ).run_once("Read notes.")
 
     assert result.status == "completed"
     assert "tool_not_in_surface" in result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
@@ -137,10 +137,10 @@ def test_quota_and_hidden_bindings_are_enforced(tmp_path: Path) -> None:
     )
 
     result = AgentLoop(
-        spec=AgentRunSpec(instruction="Read notes.", workspace_root=workspace, run_root=tmp_path / "runs"),
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
         model_adapter=adapter,
         runtime_config_provider=runtime_provider(config),
-    ).run()
+    ).run_once("Read notes.")
 
     transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
     assert "tool_quota_exceeded" in transcript

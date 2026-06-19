@@ -105,6 +105,17 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     "run.resumed": _data_schema(
         {"reason": _STR, "job_ids": _STR_ARRAY, "count": _INT},
     ),
+    "run.awaiting_input": _data_schema(
+        {"reason": _STR, "task_ids": _STR_ARRAY, "prompt": _STR_NULL},
+        required=("reason",),
+    ),
+    "turn.settled": _data_schema(
+        {"status": _STR, "final_text": _STR, "error_code": _STR, "changed_paths": _STR_ARRAY},
+        required=("status",),
+    ),
+    "checkpoint.committed": _data_schema(
+        {"workspace_backend": _STR, "changed_paths": _STR_ARRAY},
+    ),
     "agent.config.updated": _data_schema(
         {
             "definition_id": _STR,
@@ -189,6 +200,11 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     "job.cancelled": _data_schema({"job_id": _STR_NULL}, additional=True),
     "job.output_limited": _data_schema({"job_id": _STR_NULL}, additional=True),
     "job.failed": _data_schema({"job_id": _STR_NULL}, additional=True),
+    "task.started": _data_schema({"task_id": _STR_NULL, "kind": _STR}, additional=True),
+    "task.finished": _data_schema({"task_id": _STR_NULL, "kind": _STR}, additional=True),
+    "task.cancelled": _data_schema({"task_id": _STR_NULL, "kind": _STR}, additional=True),
+    "task.timed_out": _data_schema({"task_id": _STR_NULL, "kind": _STR}, additional=True),
+    "task.failed": _data_schema({"task_id": _STR_NULL, "kind": _STR}, additional=True),
     "web.search.started": _data_schema({}, additional=True),
     "web.search.finished": _data_schema({}, additional=True),
     "web.search.failed": _data_schema({}, additional=True),
@@ -905,7 +921,7 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
     if not isinstance(proposal, dict):
         return
     expected_proposal_hash = proposal.get("proposal_hash")
-    actual_proposal_hash = canonical_sha256(proposal, drop=("proposal_hash",))
+    actual_proposal_hash = canonical_sha256(proposal, drop=("proposal_hash", "updated_at"))
     if expected_proposal_hash != actual_proposal_hash:
         issues.append(ValidationIssue("proposal.json.proposal_hash", "proposal hash mismatch"))
     diff_rel = proposal.get("diff_path")
