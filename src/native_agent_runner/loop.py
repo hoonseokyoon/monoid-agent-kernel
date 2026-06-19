@@ -38,7 +38,13 @@ from native_agent_runner.core.agents import (
 from native_agent_runner.core.manifest import build_run_manifest
 from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
 from native_agent_runner.core.result import AgentRunResult, AgentTurnResult, Suspension
-from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, input_to_parts, text_from_parts
+from native_agent_runner.core.spec import (
+    AgentRunSpec,
+    ModelConfig,
+    RunLimits,
+    input_to_parts,
+    text_from_parts,
+)
 from native_agent_runner.core.tool_surface import (
     DefaultToolSurfaceResolver,
     ToolAuthorization,
@@ -750,7 +756,7 @@ class AgentLoop:
         # Re-apply the agent's workspace delta on top of the (backend-re-provisioned)
         # base, so the restored workspace matches the checkpoint instant and
         # changed_entries() reports the same delta again.
-        self._apply_workspace_delta(res.workspace, cp.workspace_delta, blob_reader)
+        self._apply_workspace_delta(res.workspace, cp.workspace_delta, blob_reader, self.spec.limits)
         manager = res.context.job_manager
         manager.restore_state(
             [HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir) for payload in cp.hosted_tasks],
@@ -777,18 +783,34 @@ class AgentLoop:
         workspace: Workspace,
         entries: list[dict[str, Any]],
         blob_reader: Callable[[str], bytes],
+        limits: RunLimits,
     ) -> None:
         """Replay a captured workspace delta into a freshly-bootstrapped workspace via
         its normal write surface, so the workspace tracks the same changes-vs-base. Writes
         go through ``write_bytes``/``mkdir``/``delete_path`` (not raw disk) so overlay and
         staging backends both report the delta. Deletions assume the base file was
-        re-provisioned; a missing target is skipped rather than fatal."""
+        re-provisioned; a missing target is skipped rather than fatal. The same size caps
+        as capture are enforced here as bytes are read, so a tampered/huge checkpoint cannot
+        fill the disk on restore — over-cap refuses the restore (surfaced to the caller)."""
+        total = 0
         for entry in entries:
             change_kind = entry.get("change_kind")
             path = entry.get("path")
             if change_kind in {"created", "modified"}:
                 content_sha256 = entry.get("content_sha256")
                 content = blob_reader(content_sha256) if content_sha256 else b""
+                size = len(content)
+                if size > limits.max_delta_file_bytes:
+                    raise NativeAgentError(
+                        f"workspace delta file exceeds size cap on restore: {path}",
+                        error_code="workspace_delta_file_bytes_exceeded",
+                    )
+                total += size
+                if total > limits.max_workspace_delta_bytes:
+                    raise NativeAgentError(
+                        "workspace delta exceeds total size cap on restore",
+                        error_code="workspace_delta_bytes_exceeded",
+                    )
                 workspace.write_bytes(path, content, create_dirs=True)
             elif change_kind == "directory":
                 workspace.mkdir(path)
@@ -1203,6 +1225,18 @@ class AgentLoop:
                     final_text=state.final_text,
                     error_code=log_limit_code,
                 )
+            delta_limit_code = self._workspace_delta_limit_exceeded(res.workspace)
+            if delta_limit_code is not None:
+                state.status = "limited"
+                state.final_text = "Stopped after reaching the workspace change size limit."
+                state.error_code = delta_limit_code
+                state.pending_observations = ()
+                return Suspension(
+                    reason="limited",
+                    status="limited",
+                    final_text=state.final_text,
+                    error_code=delta_limit_code,
+                )
             request = ModelRequest(
                 instruction=instruction,
                 system_prompt=turn_system_prompt,
@@ -1375,6 +1409,24 @@ class AgentLoop:
         size = sum(len(json.dumps(message, ensure_ascii=False)) for message in state.messages)
         if size > limits.max_message_log_bytes:
             return "message_log_bytes_exceeded"
+        return None
+
+    def _workspace_delta_limit_exceeded(self, workspace: Workspace) -> str | None:
+        """Return the limit error_code if the workspace delta a checkpoint would carry has
+        outgrown its bounds (any single file, or the total), else ``None``. Mirrors the
+        by-value message-log cap: an over-cap delta settles the run ``limited`` rather than
+        being persisted into a checkpoint that would bloat the store."""
+        limits = self.spec.limits
+        total = 0
+        for entry in workspace.changed_entries():
+            if entry.content is None:
+                continue
+            size = len(entry.content)
+            if size > limits.max_delta_file_bytes:
+                return "workspace_delta_file_bytes_exceeded"
+            total += size
+            if total > limits.max_workspace_delta_bytes:
+                return "workspace_delta_bytes_exceeded"
         return None
 
     def _build_metrics(self, state: RunState, res: _RunResources) -> dict[str, Any]:
