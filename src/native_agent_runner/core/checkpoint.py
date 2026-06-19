@@ -21,9 +21,11 @@ observations, content parts, runtime config and hosted tasks live in the loop's
 from __future__ import annotations
 
 import json
+import shutil
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from native_agent_runner.core._util import write_json_atomic
 
@@ -40,6 +42,9 @@ class RunCheckpoint:
 
     run_id: str
     schema_version: str = SCHEMA_VERSION
+    # Monotonic per-run checkpoint sequence; the store flips its "latest" pointer to
+    # this only after the checkpoint is fully written (atomic commit / last-good).
+    seq: int = 0
 
     # --- RunState (minus previous_surface_snapshot) ---
     status: str = "completed"
@@ -98,10 +103,95 @@ def write_checkpoint(run_dir: Path, checkpoint: RunCheckpoint) -> Path:
 
 def read_checkpoint(run_dir: Path) -> RunCheckpoint | None:
     """Read ``run_dir/checkpoint.json`` if present and schema-compatible. Returns
-    ``None`` for a missing, unparseable, or schema-mismatched checkpoint — never raises."""
+    ``None`` for a missing, unparseable, or schema-mismatched checkpoint — never raises.
+
+    Single-file helper retained for simple round-trips and tests; production code goes
+    through a ``CheckpointStore`` (which adds seq, atomic commit, and content blobs)."""
     path = run_dir / CHECKPOINT_FILENAME
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return None
     return RunCheckpoint.from_json(payload)
+
+
+# --- CheckpointStore seam: core defines WHAT (RunCheckpoint), the store defines HOW ---
+
+
+@dataclass
+class CheckpointRecord:
+    """A fully-committed checkpoint read back from a store: the manifest plus lazy
+    access to its content blobs (changed-file bytes, keyed by sha256)."""
+
+    seq: int
+    checkpoint: RunCheckpoint
+    _blobs_dir: Path | None = None
+
+    def blob(self, sha256: str) -> bytes:
+        """Read a content blob by its sha256 key (workspace delta files, Phase L)."""
+        if self._blobs_dir is None:
+            raise KeyError(sha256)
+        return (self._blobs_dir / sha256).read_bytes()
+
+
+class CheckpointStore(Protocol):
+    """How a checkpoint is durably stored. The core produces a ``RunCheckpoint`` (the
+    WHAT) and hands it here; the integrator implements the HOW (local fs / mounted
+    volume / object store / DB). ``put`` MUST commit atomically — a partially-written
+    checkpoint must never be returned by ``latest``."""
+
+    def put(self, checkpoint: RunCheckpoint, blobs: Mapping[str, bytes] = ...) -> None: ...
+
+    def latest(self, run_id: str) -> CheckpointRecord | None: ...
+
+    def delete(self, run_id: str) -> None: ...
+
+
+@dataclass
+class LocalFsCheckpointStore:
+    """Default local-filesystem store. Layout under ``run_root/<run_id>/checkpoints/``:
+    ``blobs/<sha>`` (content-addressed, write-once, shared across seqs) and
+    ``<seq>/manifest.json``; a ``LATEST`` pointer is flipped only after the manifest is
+    committed. In a container this is durable iff ``run_root`` is a durable mount; an
+    object-store/DB store is a drop-in replacement (same protocol)."""
+
+    run_root: Path
+
+    def _dir(self, run_id: str) -> Path:
+        return self.run_root / run_id / "checkpoints"
+
+    def put(self, checkpoint: RunCheckpoint, blobs: Mapping[str, bytes] = {}) -> None:
+        cdir = self._dir(checkpoint.run_id)
+        # 1) Content blobs first — content-addressed and write-once, so a crash here
+        #    only leaves harmless orphans (no LATEST flip yet).
+        if blobs:
+            blobs_dir = cdir / "blobs"
+            blobs_dir.mkdir(parents=True, exist_ok=True)
+            for sha256, data in blobs.items():
+                target = blobs_dir / sha256
+                if not target.exists():
+                    tmp = target.with_suffix(".tmp")
+                    tmp.write_bytes(data)
+                    tmp.replace(target)
+        # 2) Manifest (atomic file write into the seq dir).
+        seq_dir = cdir / str(checkpoint.seq)
+        seq_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(seq_dir / "manifest.json", checkpoint.to_json())
+        # 3) Flip the latest pointer last — only now is this seq considered committed.
+        write_json_atomic(cdir / "LATEST", {"seq": checkpoint.seq})
+
+    def latest(self, run_id: str) -> CheckpointRecord | None:
+        cdir = self._dir(run_id)
+        try:
+            pointer = json.loads((cdir / "LATEST").read_text(encoding="utf-8"))
+            seq = int(pointer["seq"])
+            manifest = json.loads((cdir / str(seq) / "manifest.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+            return None
+        checkpoint = RunCheckpoint.from_json(manifest)
+        if checkpoint is None:
+            return None
+        return CheckpointRecord(seq=seq, checkpoint=checkpoint, _blobs_dir=cdir / "blobs")
+
+    def delete(self, run_id: str) -> None:
+        shutil.rmtree(self._dir(run_id), ignore_errors=True)

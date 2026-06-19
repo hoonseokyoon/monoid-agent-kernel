@@ -11,7 +11,7 @@ import pytest
 
 from conftest import runtime_config, tool_binding
 
-from native_agent_runner.core.checkpoint import RunCheckpoint, write_checkpoint
+from native_agent_runner.core.checkpoint import RunCheckpoint
 from native_agent_runner.core.tool_surface import ToolScope
 from native_agent_runner.errors import PermissionDenied
 from native_agent_runner.permissions import PermissionPolicy
@@ -294,7 +294,7 @@ def test_backend_recovers_parked_hitl_run_from_checkpoint(tmp_path: Path) -> Non
     )
     run_id, token = submission.run_id, submission.run_token
     run_dir = run_root / run_id
-    assert _wait(lambda: (run_dir / "checkpoint.json").exists())
+    assert _wait(lambda: backend1.checkpoint_store.latest(run_id) is not None)
     assert (run_dir / "run.json").exists()
 
     # Process 2: a brand-new backend recovers the parked run from disk. Its adapter
@@ -347,14 +347,10 @@ def test_recover_runs_skips_terminal_and_metaless_checkpoints(tmp_path: Path) ->
     backend = _recoverable_backend(run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")])
 
     # A terminal checkpoint is a finished run -> never resumed.
-    terminal_dir = run_root / "run_terminal"
-    terminal_dir.mkdir(parents=True)
-    write_checkpoint(terminal_dir, RunCheckpoint(run_id="run_terminal", terminal=True))
+    backend.checkpoint_store.put(RunCheckpoint(run_id="run_terminal", seq=1, terminal=True))
 
     # A non-terminal checkpoint with no run.json descriptor cannot be rebuilt -> skipped.
-    orphan_dir = run_root / "run_orphan"
-    orphan_dir.mkdir(parents=True)
-    write_checkpoint(orphan_dir, RunCheckpoint(run_id="run_orphan", terminal=False))
+    backend.checkpoint_store.put(RunCheckpoint(run_id="run_orphan", seq=1, terminal=False))
 
     assert backend.recover_runs() == []
 

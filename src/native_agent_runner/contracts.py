@@ -23,7 +23,14 @@ from native_agent_runner.core.spec import (
     RunLimits,
 )
 from native_agent_runner.core.result import AgentArtifact, AgentRunResult, AgentTurnResult, Suspension
-from native_agent_runner.core.checkpoint import RunCheckpoint, read_checkpoint, write_checkpoint
+from native_agent_runner.core.checkpoint import (
+    CheckpointRecord,
+    CheckpointStore,
+    LocalFsCheckpointStore,
+    RunCheckpoint,
+    read_checkpoint,
+    write_checkpoint,
+)
 
 # Context providers (pluggable static + per-turn system context)
 from native_agent_runner.core.context import ContextProvider, TurnContext
@@ -115,6 +122,9 @@ __all__ = [
     "AgentTurnResult",
     "Suspension",
     "RunCheckpoint",
+    "CheckpointStore",
+    "CheckpointRecord",
+    "LocalFsCheckpointStore",
     "read_checkpoint",
     "write_checkpoint",
     # context providers

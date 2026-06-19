@@ -8,9 +8,9 @@ from typing import Any
 
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.checkpoint import (
-    CHECKPOINT_FILENAME,
+    CheckpointStore,
+    LocalFsCheckpointStore,
     RunCheckpoint,
-    write_checkpoint,
 )
 from native_agent_runner.core.events import AgentEvent, EventSink
 from native_agent_runner.core.content import (
@@ -278,6 +278,8 @@ class _Session:
     session_step: int = 0
     submit_local_step: int = 0
     terminal: bool = False
+    # Monotonic checkpoint sequence for this open run; advanced once per park.
+    checkpoint_seq: int = 0
 
 
 @dataclass
@@ -298,6 +300,9 @@ class AgentLoop:
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
     context_providers: tuple[ContextProvider, ...] = ()
     inject_workspace_index: bool = False
+    # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
+    # Defaults to a local-fs store under the run root; a backend injects a durable one.
+    checkpoint_store: CheckpointStore | None = None
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
@@ -446,9 +451,9 @@ class AgentLoop:
         run.finished, close the recorder, and return the cumulative result."""
         session = self._require_open()
         result = self._finalize(session.state, session.res)
-        # A finalized run has nothing to recover: drop any park-point checkpoint so the
-        # backend's restart scanner does not try to resume a completed run.
-        (session.res.recorder.run_dir / CHECKPOINT_FILENAME).unlink(missing_ok=True)
+        # A finalized run has nothing to recover: drop its checkpoints so the backend's
+        # restart scanner does not try to resume a completed run.
+        self._checkpoint_store().delete(self.spec.run_id)
         self._session = None
         return result
 
@@ -532,6 +537,7 @@ class AgentLoop:
         )
         return RunCheckpoint(
             run_id=self.spec.run_id,
+            seq=session.checkpoint_seq,
             status=state.status,
             error=state.error,
             error_code=state.error_code,
@@ -543,6 +549,13 @@ class AgentLoop:
             pending_observations=[obs.to_json() for obs in state.pending_observations],
             pending_binding_loads=list(state.pending_binding_loads),
             tool_call_counts=dict(state.tool_call_counts),
+            # Latest runtime config travels in every park snapshot, so a mid-run config
+            # change is re-persisted (recovery does not fall back to start-of-run config).
+            previous_runtime_config=(
+                state.previous_runtime_config.to_json()
+                if state.previous_runtime_config is not None
+                else None
+            ),
             total_tool_calls=state.total_tool_calls,
             total_usage=dict(state.total_usage),
             session_step=session.session_step,
@@ -557,12 +570,23 @@ class AgentLoop:
             ),
         )
 
+    def _checkpoint_store(self) -> CheckpointStore:
+        """The injected store, or a default local-fs store under the run root. The core
+        only ever talks to this protocol — it never decides where bytes physically land."""
+        if self.checkpoint_store is None:
+            self.checkpoint_store = LocalFsCheckpointStore(self.spec.run_root)
+        return self.checkpoint_store
+
     def _persist_checkpoint(self, session: _Session) -> None:
         """Best-effort durable checkpoint at a park point. No-op when ``snapshot()``
-        refuses (a live shell job is parked-on) — that park is simply not durable yet."""
+        refuses (a live shell job is parked-on) — that park is simply not durable yet.
+        Advances the per-run sequence so the store commits a new last-good checkpoint."""
         checkpoint = self.snapshot()
-        if checkpoint is not None:
-            write_checkpoint(session.res.recorder.run_dir, checkpoint)
+        if checkpoint is None:
+            return
+        session.checkpoint_seq += 1
+        checkpoint.seq = session.checkpoint_seq
+        self._checkpoint_store().put(checkpoint)
 
     def restore(self, checkpoint: RunCheckpoint) -> None:
         """Reopen a previously-checkpointed run, rehydrating its session from
@@ -608,6 +632,11 @@ class AgentLoop:
             pending_observations=tuple(ToolObservation.from_json(obs) for obs in cp.pending_observations),
             pending_binding_loads=tuple(cp.pending_binding_loads),
             tool_call_counts=dict(cp.tool_call_counts),
+            previous_runtime_config=(
+                AgentRuntimeConfig.from_json(cp.previous_runtime_config)
+                if cp.previous_runtime_config is not None
+                else None
+            ),
             total_tool_calls=cp.total_tool_calls,
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
@@ -629,6 +658,8 @@ class AgentLoop:
             session_step=cp.session_step,
             submit_local_step=cp.submit_local_step,
             terminal=cp.terminal,
+            # Continue the sequence so the next park commits cp.seq + 1.
+            checkpoint_seq=cp.seq,
         )
 
     def _crashed_shell_observations(self, res: _RunResources) -> tuple[ToolObservation, ...]:

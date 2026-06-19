@@ -10,6 +10,7 @@ from conftest import runtime_config, runtime_provider
 
 from native_agent_runner.core.checkpoint import (
     SCHEMA_VERSION,
+    LocalFsCheckpointStore,
     RunCheckpoint,
     read_checkpoint,
     write_checkpoint,
@@ -20,6 +21,12 @@ from native_agent_runner.providers.base import ModelTurn, ToolObservation
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.shell import ShellExecutionOptions
 from native_agent_runner.tasks import HostedTask
+
+
+def _latest_checkpoint(spec: AgentRunSpec) -> RunCheckpoint | None:
+    """Read the loop's last durably-committed checkpoint via the default store."""
+    record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    return record.checkpoint if record is not None else None
 
 
 def _python_command(code: str) -> str:
@@ -120,13 +127,47 @@ def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
     assert read_checkpoint(tmp_path) is None
 
 
+def test_local_fs_store_put_latest_seq(tmp_path: Path) -> None:
+    store = LocalFsCheckpointStore(tmp_path)
+    assert store.latest("run_1") is None
+
+    store.put(RunCheckpoint(run_id="run_1", seq=1, previous_turn_handle="a"))
+    store.put(RunCheckpoint(run_id="run_1", seq=2, previous_turn_handle="b"))
+    record = store.latest("run_1")
+    assert record is not None
+    assert record.seq == 2
+    assert record.checkpoint.previous_turn_handle == "b"
+
+    # A second run is isolated; deleting run_1 leaves nothing to recover.
+    store.put(RunCheckpoint(run_id="run_2", seq=1))
+    store.delete("run_1")
+    assert store.latest("run_1") is None
+    assert store.latest("run_2") is not None
+
+
+def test_local_fs_store_latest_ignores_uncommitted_seq(tmp_path: Path) -> None:
+    # A manifest written for a higher seq WITHOUT flipping LATEST (a crash mid-commit)
+    # must be ignored — latest() returns the last fully-committed checkpoint.
+    store = LocalFsCheckpointStore(tmp_path)
+    store.put(RunCheckpoint(run_id="run_1", seq=1, final_text="good"))
+    seq2_dir = tmp_path / "run_1" / "checkpoints" / "2"
+    seq2_dir.mkdir(parents=True)
+    (seq2_dir / "manifest.json").write_text(
+        json.dumps(RunCheckpoint(run_id="run_1", seq=2, final_text="half").to_json()),
+        encoding="utf-8",
+    )
+    record = store.latest("run_1")
+    assert record is not None and record.seq == 1 and record.checkpoint.final_text == "good"
+
+
 def test_snapshot_writes_checkpoint_at_hosted_park(tmp_path: Path) -> None:
     spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
-    loop, _task_id, run_dir, _artifacts = _hitl_parked_loop(spec)
+    loop, _task_id, _run_dir, _artifacts = _hitl_parked_loop(spec)
 
-    # The persist hook wrote a non-terminal checkpoint at the awaiting_tasks park.
-    cp = read_checkpoint(run_dir)
+    # The persist hook committed a non-terminal checkpoint at the awaiting_tasks park.
+    cp = _latest_checkpoint(spec)
     assert cp is not None
+    assert cp.seq == 1
     assert cp.terminal is False
     assert cp.previous_turn_handle == "r1"
     assert len(cp.hosted_tasks) == 1
@@ -141,8 +182,8 @@ def test_snapshot_writes_checkpoint_at_hosted_park(tmp_path: Path) -> None:
 
 def test_restore_resumes_parked_hitl_in_fresh_loop(tmp_path: Path) -> None:
     spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
-    loop1, task_id, run_dir, _artifacts = _hitl_parked_loop(spec)
-    cp = read_checkpoint(run_dir)
+    loop1, task_id, _run_dir, _artifacts = _hitl_parked_loop(spec)
+    cp = _latest_checkpoint(spec)
     assert cp is not None
     del loop1  # simulate process death WITHOUT close()
 
@@ -167,13 +208,13 @@ def test_restore_resumes_parked_hitl_in_fresh_loop(tmp_path: Path) -> None:
     assert hitl_obs and hitl_obs[0].output["answer"] == "Ada"
     assert adapter2.requests[0].previous_turn_handle == "r1"
     # A finalized run leaves no checkpoint behind.
-    assert read_checkpoint(run_dir) is None
+    assert _latest_checkpoint(spec) is None
 
 
 def test_restore_folds_crashed_shell_job_as_failed_observation(tmp_path: Path) -> None:
     spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
-    loop1, _task_id, run_dir, artifacts = _hitl_parked_loop(spec)
-    cp = read_checkpoint(run_dir)
+    loop1, _task_id, _run_dir, artifacts = _hitl_parked_loop(spec)
+    cp = _latest_checkpoint(spec)
     assert cp is not None
     del loop1
 

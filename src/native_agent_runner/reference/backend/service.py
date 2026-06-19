@@ -26,7 +26,11 @@ from native_agent_runner.core.packages import (
     write_approval,
 )
 from native_agent_runner.core._util import write_json_atomic
-from native_agent_runner.core.checkpoint import RunCheckpoint, read_checkpoint, write_checkpoint
+from native_agent_runner.core.checkpoint import (
+    CheckpointStore,
+    LocalFsCheckpointStore,
+    RunCheckpoint,
+)
 from native_agent_runner.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from native_agent_runner.core.result import AgentRunResult, Suspension
 from native_agent_runner.core.spec import (
@@ -243,6 +247,9 @@ class RunnerBackend:
     max_session_lifetime_s: float = 1800.0
     max_turns: int = 50
     task_wait_poll_s: float = 5.0
+    # How checkpoints are durably stored (backend owns HOW). Defaults to a local-fs
+    # store under run_root; swap for a mounted-volume path or an object-store/DB store.
+    checkpoint_store: CheckpointStore | None = None
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
     _usage: dict[str, TenantUsage] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -255,6 +262,8 @@ class RunnerBackend:
             raise ValueError("at least one allowed workspace root is required")
         self.allowed_workspace_roots = roots
         self.allowed_apply_roots = tuple(root.resolve() for root in self.allowed_apply_roots)
+        if self.checkpoint_store is None:
+            self.checkpoint_store = LocalFsCheckpointStore(self.run_root)
 
     def submit_run(self, request: BackendRunRequest) -> BackendRunSubmission:
         self._validate_request(request)
@@ -915,7 +924,9 @@ class RunnerBackend:
                 if isinstance(message, str)
             ]
         checkpoint.queued_messages = residual
-        write_checkpoint(record.run_dir, checkpoint)
+        # Overwrites the same seq the loop just committed, now with the queue included.
+        assert self.checkpoint_store is not None
+        self.checkpoint_store.put(checkpoint)
 
     def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
         return (
@@ -949,6 +960,7 @@ class RunnerBackend:
                 shell_approval_provider=None,
                 web_gateway_client=self._web_gateway_client(web_gateway_token),
                 runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
+                checkpoint_store=self.checkpoint_store,
             )
             with self._lock:
                 self._records[run_id].loop = loop
@@ -1019,7 +1031,9 @@ class RunnerBackend:
             with self._lock:
                 if run_id in self._records:
                     continue
-            checkpoint = read_checkpoint(run_dir)
+            assert self.checkpoint_store is not None
+            stored = self.checkpoint_store.latest(run_id)
+            checkpoint = stored.checkpoint if stored is not None else None
             if checkpoint is None or checkpoint.terminal:
                 continue
             meta = _read_run_meta(run_dir)
@@ -1102,6 +1116,7 @@ class RunnerBackend:
             shell_approval_provider=None,
             web_gateway_client=self._web_gateway_client(web_gateway_token),
             runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
+            checkpoint_store=self.checkpoint_store,
         )
         loop.restore(checkpoint)
         with self._lock:
