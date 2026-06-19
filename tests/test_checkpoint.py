@@ -378,6 +378,46 @@ def test_failed_run_writes_failure_bundle_and_keeps_checkpoint(tmp_path: Path) -
     assert record is not None and record.checkpoint.terminal is True
 
 
+def test_time_machine_restores_workspace_conversation_and_task_together(tmp_path: Path) -> None:
+    # The capstone: one checkpoint, one restore — workspace edit, by-value conversation,
+    # and a parked hosted task all return to the same instant in a fresh process over a
+    # re-provisioned (empty) base, then the run resumes and settles vendor-independently.
+    base = _mk(tmp_path / "ws")
+    spec = AgentRunSpec(workspace_root=base, run_root=tmp_path / "runs")
+    provider = runtime_provider(runtime_config("hitl.request"))
+    adapter1 = FakeModelAdapter(
+        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "ok?"}, "c1"),))]
+    )
+    loop1 = AgentLoop(spec=spec, model_adapter=adapter1, runtime_config_provider=provider)
+    loop1.open()
+    loop1._session.res.workspace.write_bytes("draft.md", b"v1\n", create_dirs=True)  # agent's file edit
+    suspension = loop1.run_until_suspended("write a draft")
+    assert suspension.reason == "awaiting_tasks"
+    task_id = suspension.awaiting_task_ids[0]
+    cp = loop1.snapshot()
+    assert cp is not None
+    blobs = loop1.collect_checkpoint_blobs()
+    del loop1  # crash, no close
+
+    # Fresh process over a re-provisioned base (empty — draft.md is only in the delta).
+    base2 = _mk(tmp_path / "ws2")
+    spec2 = AgentRunSpec(workspace_root=base2, run_root=tmp_path / "runs", run_id=spec.run_id)
+    adapter2 = FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="done")])
+    loop2 = AgentLoop(spec=spec2, model_adapter=adapter2, runtime_config_provider=provider)
+    loop2.restore(cp, blobs=blobs)
+
+    # Workspace + conversation are both back at the checkpoint instant.
+    assert loop2._session.res.workspace.read_bytes("draft.md")[0] == b"v1\n"
+    assert any(m["role"] == "user" and m.get("content") == "write a draft" for m in loop2._session.state.messages)
+
+    # The parked task resumes and the run settles, sending full by-value history.
+    loop2.report_task_result(task_id, {"answer": "yes"})
+    resumed = loop2.run_until_suspended(None)
+    loop2.close()
+    assert resumed.reason == "settled" and resumed.turn is not None and resumed.turn.final_text == "done"
+    assert adapter2.requests[-1].messages is not None
+
+
 def test_restore_carries_remaining_deadline(tmp_path: Path) -> None:
     spec = AgentRunSpec(
         workspace_root=_mk(tmp_path / "ws"),

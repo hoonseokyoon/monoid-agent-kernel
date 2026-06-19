@@ -395,38 +395,61 @@ length is bounded by idle timeout, max lifetime, and max turns.
 
 ### Durable Persistence
 
-A parked run survives a process restart via a **state-snapshot at the suspend
-points** (the same pattern as LangGraph checkpointers — not an event-sourcing
-replay). Because the conversation is held by reference (`turn_handle`), restore
-never replays the model, so there is no determinism constraint and no
-double-side-effect risk; snapshots are only taken at clean park points.
+A checkpoint is a **complete, self-contained "save file."** A parked run survives a
+process restart even when the agent's workspace is *not* durable: workspace, the
+conversation, and run state all roll back to one aligned instant (a time machine).
+This is a **state-snapshot at the suspend points** (the LangGraph-checkpointer
+pattern, not event-sourcing replay); snapshots are only taken at clean park points,
+so there is no determinism constraint and no double-side-effect risk.
 
-- `AgentLoop.snapshot() -> RunCheckpoint | None` captures the small mutable run
-  state (turn handle, counters, pending observations, parked hosted tasks) at a
-  park point. It returns `None` — refusing to snapshot — while a live in-process
-  shell job is still running, because a subprocess cannot cross a process boundary.
-- The loop writes `run_dir/checkpoint.json` at each park and deletes it on
-  `close()` (a finalized run has nothing to recover).
-- `AgentLoop.restore(checkpoint)` reopens the run from the checkpoint: it does not
-  re-emit `run.started`, leaves `workspace.base.json` untouched, re-registers
-  parked hosted tasks (so `report_task_result` still wakes the run), carries the
-  remaining duration forward (downtime does not count against `max_duration_s`),
-  and folds any shell job left `running` on disk in as a failed observation so the
-  model re-decides.
-- The reference backend writes `run_dir/run.json` (a recovery descriptor:
-  identity, workspace, limits, policy, resolved runtime config) and exposes
-  `recover_runs()`, which scans `run_root` for non-terminal checkpoints, rebuilds
-  the run (re-issuing gateway tokens from the signing key), `restore()`s the loop,
-  re-enqueues any durably-saved follow-up messages, and resumes the session.
+**Division of responsibility:** the core defines *what* a checkpoint contains
+(`RunCheckpoint`) and how to `restore()` it; the integrator decides *how* it is
+stored by implementing `CheckpointStore`. The core never does storage I/O or
+auto-recovery — on failure it surfaces a bundle and the last-good checkpoint, and
+recovery is the integrator's call.
 
-Limitations (v1): workspace *content* changes are not part of the checkpoint —
-overlay writes are in-memory and a hard crash loses in-flight edits (the
-conversation and parked tasks resume; the model re-derives file changes if
-needed). The reference `llm_gateway` keeps turn records in memory, so a gateway
-restart invalidates `turn_handle`; a production gateway (or OpenAI Responses,
-which retains `previous_response_id` server-side) does not have this limit. A
-mid-run runtime-config change is not re-persisted, so recovery uses the config as
-of run start.
+- `AgentLoop.snapshot() -> RunCheckpoint | None` captures, at one quiescent park:
+  run state + counters + parked hosted tasks, the **workspace delta** (created/
+  modified/deleted files; content travels as content-addressed blobs), the **by-value
+  conversation** (`messages` — provider-neutral user/assistant/tool log, vendor-
+  independent), and the **latest `runtime_config`**. It returns `None` — refusing —
+  while a live in-process shell job is still running (a subprocess cannot cross a
+  process boundary).
+- `CheckpointStore` (protocol): `put(checkpoint, blobs)` commits **atomically** and
+  flips a `LATEST` pointer last (a half-written checkpoint is never returned);
+  `latest(run_id)`; `delete(run_id)`. `LocalFsCheckpointStore` is the default
+  (`run_root/<id>/checkpoints/<seq>/manifest.json` + content-addressed `blobs/<sha>`);
+  swap it for a mounted-volume path or an object-store/DB store. The loop advances a
+  monotonic `seq` per park and deletes checkpoints only on a *completed* run — a
+  failed/limited run keeps its last-good checkpoint.
+- `AgentLoop.restore(checkpoint, *, blobs=...)` reopens the run: no second
+  `run.started`/manifest, parked hosted tasks re-registered (so `report_task_result`
+  still wakes it), the **workspace delta re-applied** on top of a re-provisioned base
+  (`blobs` is a `sha256 -> bytes` reader, e.g. the store's), the conversation and
+  `runtime_config` restored, remaining duration carried forward (downtime does not
+  count against `max_duration_s`), and any shell job left `running` on disk folded in
+  as a failed observation.
+- **Failure bundle:** on failure the core writes `run_dir/failure.json`
+  (`{error, error_code, type, last_good_seq, restore_hint}`) — fail loud, name the
+  checkpoint to restore from. No auto-recovery.
+- The reference backend writes `run_dir/run.json` (recovery descriptor: identity,
+  workspace, limits, policy, resolved runtime config) and exposes `recover_runs()`,
+  which scans `run_root`, skips terminal checkpoints and failed runs, rebuilds each
+  run (re-issuing gateway tokens from the signing key, **re-provisioning the base
+  workspace** is the deployment's job), `restore()`s the loop with the store's blobs,
+  re-enqueues durably-saved follow-up messages, and resumes.
+
+**Assumption (workspace):** the agent workspace is not durable; on restore the
+deployment re-provisions the base (re-clone/re-mount) and the checkpoint re-applies
+only the agent's delta (the delta always contains the agent's created/modified
+files). For container durability, `run_root` (or the `CheckpointStore`) must point at
+durable storage — a mounted volume needs no code change.
+
+**Limitations (v2):** a mid-run `commit_checkpoint` re-baseline combined with delta-
+restore is a documented follow-up (the common no-re-baseline case is covered).
+Multimodal message parts are text-only for now. `transcript.jsonl` is a debug
+artifact (the by-value `messages` in the checkpoint are the load-bearing
+conversation record).
 
 ## Run Artifacts
 
