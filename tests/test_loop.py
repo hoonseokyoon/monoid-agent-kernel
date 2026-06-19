@@ -70,6 +70,38 @@ def test_message_log_cap_settles_run_as_limited(tmp_path: Path) -> None:
     assert adapter.requests == []  # the over-limit log is never sent to the model
 
 
+def test_workspace_delta_cap_settles_run_as_limited(tmp_path: Path) -> None:
+    # A workspace delta that outgrows the cap settles the run ``limited`` at the next
+    # turn's start, before the over-cap delta is persisted into a checkpoint.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_write", {"path": "big.txt", "content": "x" * 50}, "c1"),),
+            ),
+            ModelTurn(
+                response_id="r2",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "done"}, "c2"),),
+            ),
+        ]
+    )
+    spec = AgentRunSpec(
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+        limits=RunLimits(max_delta_file_bytes=10),
+    )
+
+    result = AgentLoop(
+        spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.write", "run.finish")
+    ).run_once("write a big file")
+
+    assert result.status == "limited"
+    assert result.error_code == "workspace_delta_file_bytes_exceeded"
+    assert len(adapter.requests) == 1  # turn 2 is never sent (settled at its start)
+
+
 def test_default_system_prompt_is_composed_base(tmp_path: Path) -> None:
     from native_agent_runner.core.prompt import compose_system_prompt
 

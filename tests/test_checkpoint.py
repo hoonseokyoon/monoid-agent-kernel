@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from conftest import runtime_config, runtime_provider
 
 from native_agent_runner.core.checkpoint import (
@@ -16,6 +17,7 @@ from native_agent_runner.core.checkpoint import (
     write_checkpoint,
 )
 from native_agent_runner.core.spec import AgentRunSpec, RunLimits
+from native_agent_runner.errors import NativeAgentError
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelTurn, ToolObservation
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
@@ -341,6 +343,41 @@ def test_workspace_delta_round_trips_through_restore(tmp_path: Path) -> None:
     assert ws2.read_bytes("new.txt")[0] == b"created\n"
     assert not ws2.exists("keep.txt")
     loop2.close()
+
+
+def test_workspace_delta_cap_refuses_oversized_restore(tmp_path: Path) -> None:
+    # A checkpoint whose delta exceeds the restoring run's size cap (tampered / huge /
+    # cap lowered since capture) is refused rather than filling the disk; the error
+    # surfaces to the caller (where recover_runs marks the run unrecoverable).
+    base = _mk(tmp_path / "ws")
+    spec = AgentRunSpec(workspace_root=base, run_root=tmp_path / "runs")
+    loop1 = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop1.open()
+    loop1._session.res.workspace.write_bytes("big.txt", b"x" * 50, create_dirs=True)  # type: ignore[union-attr]
+    cp = loop1.snapshot()
+    assert cp is not None
+    blobs = loop1.collect_checkpoint_blobs()
+    del loop1
+
+    base2 = _mk(tmp_path / "ws2")
+    spec2 = AgentRunSpec(
+        workspace_root=base2,
+        run_root=tmp_path / "runs",
+        run_id=spec.run_id,
+        limits=RunLimits(max_delta_file_bytes=10),
+    )
+    loop2 = AgentLoop(
+        spec=spec2,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="ok")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    with pytest.raises(NativeAgentError) as exc_info:
+        loop2.restore(cp, blobs=blobs)
+    assert exc_info.value.error_code == "workspace_delta_file_bytes_exceeded"
 
 
 def test_by_value_conversation_accumulates_and_survives_restore(tmp_path: Path) -> None:

@@ -89,6 +89,22 @@ def test_jsonl_and_status_sinks_flush_and_update(tmp_path: Path) -> None:
     assert status["last_event_type"] == "run.finished"
 
 
+def test_emit_after_close_is_a_noop(tmp_path: Path) -> None:
+    # A background job thread can deliver a terminal event after the run closed the
+    # recorder. That late emit must be a benign no-op, not a write to a closed file
+    # handle (which surfaced as a flaky PytestUnhandledThreadExceptionWarning).
+    events_path = tmp_path / "events.jsonl"
+    bus = EventBus("run_late", (JsonlEventSink(events_path),))
+    bus.emit("run.started", data={"workspace": "w", "mode": "propose", "model": "gpt-5.5"})
+    bus.close()
+    bytes_before = events_path.read_bytes()
+
+    event = bus.emit("task.completed", data={"job_id": "late"})  # must not raise
+
+    assert event.type == "task.completed"  # return contract preserved
+    assert events_path.read_bytes() == bytes_before  # the closed sink is not written
+
+
 def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

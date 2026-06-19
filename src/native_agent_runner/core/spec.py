@@ -129,6 +129,12 @@ class RunLimits:
     # are generous backstops; exceeding either settles the run as ``limited``.
     max_messages: int = 100_000
     max_message_log_bytes: int = 8_000_000
+    # Bounds on the workspace delta a checkpoint may carry, so a runaway/huge/malicious
+    # delta cannot bloat the checkpoint store (capture) or fill the disk (restore). Generous
+    # backstops; exceeding either on capture settles the run ``limited`` (the prior good
+    # checkpoint stays the recovery point), and exceeding on restore refuses the checkpoint.
+    max_workspace_delta_bytes: int = 100_000_000
+    max_delta_file_bytes: int = 50_000_000
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> RunLimits:
@@ -143,6 +149,10 @@ class RunLimits:
             max_duration_s=None if max_duration_raw is None else int(max_duration_raw),
             max_messages=int(payload.get("max_messages", defaults.max_messages)),
             max_message_log_bytes=int(payload.get("max_message_log_bytes", defaults.max_message_log_bytes)),
+            max_workspace_delta_bytes=int(
+                payload.get("max_workspace_delta_bytes", defaults.max_workspace_delta_bytes)
+            ),
+            max_delta_file_bytes=int(payload.get("max_delta_file_bytes", defaults.max_delta_file_bytes)),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -153,6 +163,8 @@ class RunLimits:
             "max_duration_s": self.max_duration_s,
             "max_messages": self.max_messages,
             "max_message_log_bytes": self.max_message_log_bytes,
+            "max_workspace_delta_bytes": self.max_workspace_delta_bytes,
+            "max_delta_file_bytes": self.max_delta_file_bytes,
         }
 
 
