@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.tools.base import ToolSpec
+
+
+def format_async_result_text(output: dict[str, Any]) -> str:
+    """Render a background/hosted (``is_background``) observation as user-message text.
+    The injector may pre-format a ``message``; otherwise a generic async-result preamble
+    is used (covers shell background jobs). Shared by the loop's by-value message log and
+    the OpenAI adapter's by-reference fallback so the wording stays identical."""
+    message = output.get("message") if isinstance(output, dict) else None
+    if message:
+        return str(message)
+    return (
+        "An asynchronous task completed. Treat this as the result of the previously "
+        f"started task:\n{json.dumps(output, ensure_ascii=False)}"
+    )
 
 
 @dataclass(frozen=True)
@@ -62,6 +77,12 @@ class ModelRequest:
     previous_turn_handle: str | None = None
     observations: tuple[ToolObservation, ...] = ()
     model: ModelConfig | None = None
+    # By-value conversation (vendor-independent): the full provider-neutral message log
+    # the core owns and resends each turn. When set, an adapter sends these as the whole
+    # conversation and ignores ``previous_turn_handle``; when ``None`` it falls back to the
+    # by-reference handle + ``instruction``/``observations`` delta. ``system_prompt`` is
+    # NOT part of ``messages`` — it is regenerated each turn and applied separately.
+    messages: tuple[dict[str, Any], ...] | None = None
 
 
 class ModelAdapter(Protocol):

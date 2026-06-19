@@ -61,6 +61,9 @@ class RunCheckpoint:
     previous_runtime_config: dict[str, Any] | None = None
     total_tool_calls: int = 0
     total_usage: dict[str, int] = field(default_factory=dict)
+    # By-value conversation log (vendor-independent continuation). Provider-neutral
+    # user/assistant/tool messages; the system prompt is NOT here (regenerated each turn).
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
     # --- _Session counters ---
     session_step: int = 0

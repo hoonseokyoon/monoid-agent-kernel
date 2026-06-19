@@ -132,7 +132,10 @@ class GatewayModelAdapter:
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
 
-        if request.previous_turn_handle:
+        if request.messages is not None:
+            # By-value: the full conversation travels as messages; no continuation handle.
+            payload["messages"] = list(request.messages)
+        elif request.previous_turn_handle:
             payload["previous_turn_handle"] = request.previous_turn_handle
             payload["observations"] = [
                 {

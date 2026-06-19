@@ -60,7 +60,13 @@ from native_agent_runner.errors import (
 )
 from native_agent_runner.tasks import HostedTask, TaskManager
 from native_agent_runner.permissions import PermissionPolicy, matches_path_patterns
-from native_agent_runner.providers.base import ModelAdapter, ModelRequest, ModelTurn, ToolObservation
+from native_agent_runner.providers.base import (
+    ModelAdapter,
+    ModelRequest,
+    ModelTurn,
+    ToolObservation,
+    format_async_result_text,
+)
 from native_agent_runner.public_view import (
     args_preview,
     public_error_message,
@@ -234,6 +240,15 @@ class AgentToolContext(ToolContext):
         return requested
 
 
+def _observation_message(observation: ToolObservation) -> dict[str, Any]:
+    """Provider-neutral by-value message for a tool/async observation. Preserves the
+    ``is_background`` → role semantics the adapters use: a background/hosted result is a
+    new user message; a tool result is a ``tool`` message keyed by ``call_id``."""
+    if observation.is_background:
+        return {"role": "user", "content": format_async_result_text(observation.output)}
+    return {"role": "tool", "call_id": observation.call_id, "content": observation.output}
+
+
 def _as_blob_reader(
     blobs: Mapping[str, bytes] | Callable[[str], bytes] | None,
 ) -> Callable[[str], bytes]:
@@ -271,6 +286,10 @@ class RunState:
     total_usage: dict[str, int] = field(
         default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     )
+    # By-value conversation log: provider-neutral user/assistant/tool messages the core
+    # owns and resends each turn (vendor-independent continuation). The system prompt is
+    # NOT here — it is regenerated per turn and applied via ModelRequest.system_prompt.
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -575,6 +594,7 @@ class AgentLoop:
             ),
             total_tool_calls=state.total_tool_calls,
             total_usage=dict(state.total_usage),
+            messages=list(state.messages),
             session_step=session.session_step,
             submit_local_step=session.submit_local_step,
             terminal=session.terminal,
@@ -701,6 +721,7 @@ class AgentLoop:
             total_tool_calls=cp.total_tool_calls,
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            messages=list(cp.messages),
         )
         # Re-apply the agent's workspace delta on top of the (backend-re-provisioned)
         # base, so the restored workspace matches the checkpoint instant and
@@ -1134,6 +1155,14 @@ class AgentLoop:
             if state.pending_user_input is not None:
                 instruction = text_from_parts(state.pending_user_input) or None
                 state.pending_user_input = None
+            # Accumulate the by-value conversation log BEFORE the call: the new user
+            # message (if any) and the tool/async observations being sent this turn. The
+            # assistant reply is appended after the call. The system prompt is NOT logged
+            # here — it is regenerated per turn and travels via ``system_prompt``.
+            if instruction is not None:
+                state.messages.append({"role": "user", "content": instruction})
+            for observation in state.pending_observations:
+                state.messages.append(_observation_message(observation))
             request = ModelRequest(
                 instruction=instruction,
                 system_prompt=turn_system_prompt,
@@ -1141,6 +1170,7 @@ class AgentLoop:
                 previous_turn_handle=state.previous_turn_handle,
                 observations=state.pending_observations,
                 model=runtime_config.model or ModelConfig(),
+                messages=tuple(state.messages),
             )
             recorder.transcript(
                 {
@@ -1179,6 +1209,14 @@ class AgentLoop:
             self._check_run_boundary(deadline)
             _accumulate_usage(state.total_usage, turn)
             state.previous_turn_handle = turn.response_id or state.previous_turn_handle
+            # Append the assistant reply to the by-value log (text + any tool calls).
+            state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": turn.final_text or "",
+                    "tool_calls": [call.__dict__ for call in turn.tool_calls],
+                }
+            )
             recorder.transcript(
                 {
                     "kind": "model_turn",

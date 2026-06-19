@@ -253,13 +253,15 @@ def test_snapshot_refuses_while_in_process_shell_job_runs(tmp_path: Path) -> Non
     )
     loop.open()
     manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    # startup_wait_s=0 returns immediately with the job still running (no race against a
+    # job that finishes during the startup wait); the long sleep outlives the snapshot check.
     job = manager.start_shell_job(
         shell_options=ShellExecutionOptions(enabled=True, approval_mode="auto-approve"),
-        command=_python_command("import time; time.sleep(0.6)"),
+        command=_python_command("import time; time.sleep(30)"),
         cwd=".",
-        timeout_s=10,
+        timeout_s=60,
         max_output_bytes=100_000,
-        startup_wait_s=1,
+        startup_wait_s=0,
         env={},
         requested_timeout_s=None,
         requested_max_output_bytes=None,
@@ -269,7 +271,8 @@ def test_snapshot_refuses_while_in_process_shell_job_runs(tmp_path: Path) -> Non
     )
     # A live shell subprocess can't be restored, so the park is not durable yet.
     assert loop.snapshot() is None
-    manager.wait(job.job_id)  # let the job finish
+    manager.cancel(job.job_id)  # stop the long-running job
+    manager.wait(job.job_id)  # let the cancellation settle
     # Once only a finished (hosted-free) park remains, a snapshot is allowed.
     assert loop.snapshot() is not None
     loop.close()
@@ -314,6 +317,38 @@ def test_workspace_delta_round_trips_through_restore(tmp_path: Path) -> None:
     assert sorted(ws2.changed_paths()) == expected
     assert ws2.read_bytes("new.txt")[0] == b"created\n"
     assert not ws2.exists("keep.txt")
+    loop2.close()
+
+
+def test_by_value_conversation_accumulates_and_survives_restore(tmp_path: Path) -> None:
+    # The core owns the conversation by value: each turn appends user/assistant messages,
+    # the request carries the full log, and a restore continues it vendor-independently.
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    provider = runtime_provider(runtime_config("fs.write"))
+    adapter1 = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi there")])
+    loop1 = AgentLoop(spec=spec, model_adapter=adapter1, runtime_config_provider=provider)
+    loop1.open()
+    loop1.submit("hello")
+
+    cp = loop1.snapshot()
+    assert cp is not None
+    logged = [(m["role"], m.get("content")) for m in cp.messages]
+    assert ("user", "hello") in logged and ("assistant", "hi there") in logged
+    # The request was by-value (full messages), not handle-only.
+    assert adapter1.requests[0].messages is not None
+    assert adapter1.requests[0].messages[0]["role"] == "user"
+
+    # Fresh "process": restore and continue — the follow-up request carries the FULL
+    # prior history plus the new user message, with no reliance on a vendor handle.
+    adapter2 = FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="bye")])
+    loop2 = AgentLoop(spec=spec, model_adapter=adapter2, runtime_config_provider=provider)
+    loop2.restore(cp)
+    loop2.submit("more")
+
+    sent = [(m["role"], m.get("content")) for m in adapter2.requests[0].messages]
+    assert ("user", "hello") in sent
+    assert ("assistant", "hi there") in sent
+    assert ("user", "more") in sent
     loop2.close()
 
 
