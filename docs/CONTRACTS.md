@@ -451,6 +451,85 @@ Multimodal message parts are text-only for now. `transcript.jsonl` is a debug
 artifact (the by-value `messages` in the checkpoint are the load-bearing
 conversation record).
 
+## Production Hardening
+
+Operational safety net layered on durable persistence. The core still never auto-recovers;
+the active watchdog lives only in the reference backend (the operational layer).
+
+### Failure surfacing & bounded recovery
+
+- **Failure bundle on every failure.** Beyond the core's own `failure.json`, the reference
+  backend's `_record_run_failure` also writes `run_dir/failure.json`
+  (`native-agent-runner.failure.v1`: `error, error_code, type, last_good_seq, restore_hint,
+  failed_at`) — the durable mark is written *before* the in-memory terminal status, so a
+  worker crash that bypassed the loop's own bundle still leaves a mark and a restart never
+  resumes a crashed run into a loop.
+- **Bounded recovery.** `recover_runs()` logs (not swallows) a resume failure and tracks
+  attempts in `run_dir/recover_attempts.json` (`{count}`); after the cap it writes a
+  `failure.json` with `error_code="unrecoverable"`, so a poison checkpoint is permanently
+  skipped instead of retried forever.
+
+### Active watchdog / lease (backend only)
+
+- `RunnerBackend.start_watchdog()` / `stop_watchdog()` run an opt-in heartbeat thread (tick
+  `watchdog_interval_s`, default 5s). For each owned live run it refreshes
+  `run_dir/lease.json` (`worker_id`, `pid`, `heartbeat_at`, `lease_ttl_s`; default
+  `lease_ttl_s=30`), and deletes the lease on terminal.
+- It reclaims a run whose lease has gone stale (`heartbeat_at + lease_ttl_s < now`) and a
+  crashed worker left behind: reclaim takes the lease via a cross-process compare-and-swap
+  under `file_lock(run_dir/.reclaim.lock)`, so two backends racing the same run produce
+  exactly one winner, then resumes via the `recover_runs()` path.
+
+### CheckpointStore robustness invariants
+
+`LocalFsCheckpointStore` (and any conforming store):
+
+- **Monotonic `LATEST`:** the pointer is only advanced when `checkpoint.seq` exceeds the
+  current `LATEST` seq — a late or lower-seq writer can never unpublish a newer committed
+  checkpoint.
+- **Orphan blob GC:** crash-leftover `blobs/*.tmp` files are cleaned on `put()`/`latest()`.
+- **Cross-process serialization:** `put()` holds `file_lock(checkpoints/.put.lock)`
+  (`core/_util.file_lock`, O_EXCL with stale-steal); `latest()` retries a read that races a
+  concurrent commit's atomic replace, so a reader never mistakes mid-commit for "no
+  checkpoint."
+
+### HTTP hardening & request bounds
+
+Shared in `reference/_shared/http_util.py`, applied to the backend / llm-gateway /
+web-gateway HTTP layers:
+
+- `read_json_limited(handler)` rejects a body whose `Content-Length` exceeds
+  `MAX_REQUEST_BYTES` (10 MB) with **413** before reading — a DoS/OOM guard.
+- `HardenedThreadingHTTPServer` sets a per-connection `REQUEST_TIMEOUT_S` (30s) socket
+  timeout and shuts down cleanly (`daemon_threads=False`, `block_on_close=True`) so a slow
+  client cannot pin a thread and in-flight handlers are not abandoned.
+- `redact_internal_error(...)` logs an unmapped 5xx in full server-side under a
+  `correlation_id` and returns only that id to the client (never a stack trace / path);
+  intentional client-facing errors (`ValueError`/`PermissionDenied`/`KeyError`) keep their
+  message. `log_http_request(...)` emits a structured access line.
+
+### Resource & DoS bounds
+
+- **`RunLimits`** (core): `max_messages` / `max_message_log_bytes` bound the by-value
+  conversation; `max_workspace_delta_bytes` / `max_delta_file_bytes` bound a checkpoint's
+  workspace delta. Exceeding a cap on **capture** settles the run `limited` (a safe stop,
+  not a drop — the prior good checkpoint stays the recovery point); exceeding on **restore**
+  refuses the checkpoint (`workspace_delta_bytes_exceeded` /
+  `workspace_delta_file_bytes_exceeded`). Defaults are generous backstops.
+- **Backend:** `max_message_bytes` (reject over-large follow-up message),
+  `max_message_queue_depth` (cap pending-message queue), `max_concurrent_runs` (a bounded
+  semaphore; excess submissions stay `queued`, `0` = unbounded).
+
+### Client connection retry
+
+The gateway model adapter (`providers/gateway.py`), the web gateway client (`web.py`), and
+the web upstream providers (`reference/web_gateway/providers.py`) retry transient
+connection-level failures (`URLError` / `TimeoutError` / a bare `OSError` such as a
+connection reset mid-read) with backoff. An `HTTPError` is a real response and is **never**
+retried as a connection error. The model adapter's retry is policy-driven by
+`ModelRetryConfig.retry_on` (default codes: `gateway_timeout`, `gateway_network_error`,
+`gateway_rate_limited`, `gateway_server_error`).
+
 ## Run Artifacts
 
 Manifest and transcript are binding-aware:
