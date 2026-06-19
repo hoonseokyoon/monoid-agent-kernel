@@ -49,6 +49,27 @@ def _finish_only_adapter() -> FakeModelAdapter:
     )
 
 
+def test_message_log_cap_settles_run_as_limited(tmp_path: Path) -> None:
+    # A by-value conversation log that outgrows max_message_log_bytes settles the run as
+    # ``limited`` (a safe stop, not a drop) before the over-limit log is ever sent.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = _finish_only_adapter()
+    spec = AgentRunSpec(
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+        limits=RunLimits(max_message_log_bytes=10),
+    )
+
+    result = AgentLoop(
+        spec=spec, model_adapter=adapter, runtime_config_provider=_provider("run.finish")
+    ).run_once("This instruction is clearly longer than ten bytes.")
+
+    assert result.status == "limited"
+    assert result.error_code == "message_log_bytes_exceeded"
+    assert adapter.requests == []  # the over-limit log is never sent to the model
+
+
 def test_default_system_prompt_is_composed_base(tmp_path: Path) -> None:
     from native_agent_runner.core.prompt import compose_system_prompt
 

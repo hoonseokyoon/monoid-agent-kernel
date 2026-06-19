@@ -152,6 +152,45 @@ def test_gateway_retries_retryable_http_error_then_succeeds(monkeypatch) -> None
     assert turn.final_text == "done"
 
 
+def test_gateway_retries_transient_connection_error_then_succeeds(monkeypatch) -> None:
+    # A bare connection-level error (here ConnectionResetError, an OSError that is neither
+    # URLError nor TimeoutError) is transient and must be retried, not surfaced as a failed run.
+    calls = 0
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"turn_handle":"turn_ok","final_text":"done","usage":{"total_tokens":1}}'
+
+    def fake_urlopen(request, timeout):
+        del request, timeout
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionResetError("connection reset by peer")
+        return Response()
+
+    monkeypatch.setattr("native_agent_runner.providers.gateway.urlopen", fake_urlopen)
+    monkeypatch.setattr("native_agent_runner.providers.gateway.time.sleep", lambda _delay: None)
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=3, initial_delay_s=0, jitter_s=0),
+        ),
+        token="run-token",
+    )
+
+    turn = adapter.next_turn(ModelRequest("finish", "sys", (), None))
+
+    assert calls == 2
+    assert turn.final_text == "done"
+
+
 def test_gateway_does_not_retry_auth_error(monkeypatch) -> None:
     calls = 0
 

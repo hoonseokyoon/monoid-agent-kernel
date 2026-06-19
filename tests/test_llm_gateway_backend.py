@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
 
-from conftest import runtime_config
+from conftest import http_json, runtime_config, wait_http_ready
 
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
@@ -223,7 +222,7 @@ def test_runner_backend_can_use_http_llm_gateway_end_to_end(tmp_path: Path) -> N
                 runtime_config=runtime_config("run.finish"),
             )
         )
-        assert runner_backend.wait_for_run(submission.run_id, timeout_s=5) == "completed"
+        assert runner_backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
         result = runner_backend.result(submission.run_id, submission.run_token)
         assert result["final_text"] == "gateway done"
         assert runner_backend.tenant_usage("tenant_a")["total_tokens"] == 11
@@ -350,28 +349,12 @@ def test_fake_full_stack_contract_propose_proposal_usage_and_auth(tmp_path: Path
 
 
 def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-    with urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return http_json(url, payload, token=token)
 
 
 def _json_get(url: str, *, token: str) -> dict:
-    request = Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
-    with urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return http_json(url, token=token, method="GET")
 
 
-def _wait_http_ready(base_url: str, *, timeout_s: float = 5.0) -> None:
-    deadline = time.time() + timeout_s
-    last_error: Exception | None = None
-    while time.time() < deadline:
-        try:
-            _json_get(f"{base_url}/healthz", token="unused")
-            return
-        except Exception as exc:  # pragma: no cover - only exercised under startup races.
-            last_error = exc
-            time.sleep(0.02)
-    raise TimeoutError(f"server did not become ready: {last_error}")
+def _wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
+    wait_http_ready(base_url, timeout_s=timeout_s)

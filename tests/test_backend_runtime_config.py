@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from conftest import http_json
 
 from native_agent_runner.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
 from native_agent_runner.core.tool_surface import ToolGuidance
@@ -193,9 +197,7 @@ def test_backend_http_runtime_config_get_post_and_version_mismatch(tmp_path: Pat
 
 
 def _json_get(url: str, *, token: str) -> dict:
-    request = Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
-    with urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return http_json(url, token=token, method="GET")
 
 
 def _json_post(url: str, payload: dict, *, token: str) -> dict:
@@ -205,18 +207,19 @@ def _json_post(url: str, payload: dict, *, token: str) -> dict:
 
 
 def _json_post_raw(url: str, payload: dict, *, token: str) -> dict:
+    # Captures the HTTP response (including 4xx error bodies) rather than raising, while
+    # retrying transient connection-level errors under load (never an HTTPError, which is a
+    # real response).
     body = json.dumps(payload).encode("utf-8")
-    request = Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=5) as response:
-            return {"status": response.status, "body": json.loads(response.read().decode("utf-8"))}
-    except Exception as exc:
-        response = getattr(exc, "fp", None)
-        status = int(getattr(exc, "code", 500))
-        payload = json.loads(response.read().decode("utf-8")) if response is not None else {"error": str(exc)}
-        return {"status": status, "body": payload}
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            with urlopen(Request(url, data=body, headers=headers, method="POST"), timeout=5) as response:
+                return {"status": response.status, "body": json.loads(response.read().decode("utf-8"))}
+        except HTTPError as exc:
+            return {"status": exc.code, "body": json.loads(exc.read().decode("utf-8"))}
+        except (URLError, ConnectionError, OSError) as exc:
+            last_error = exc
+            time.sleep(0.05 * (attempt + 1))
+    raise last_error if last_error is not None else RuntimeError("request failed without an error")
