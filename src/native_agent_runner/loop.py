@@ -487,9 +487,11 @@ class AgentLoop:
         run.finished, close the recorder, and return the cumulative result."""
         session = self._require_open()
         result = self._finalize(session.state, session.res)
-        # A finalized run has nothing to recover: drop its checkpoints so the backend's
-        # restart scanner does not try to resume a completed run.
-        self._checkpoint_store().delete(self.spec.run_id)
+        # A successfully completed run has nothing to recover: drop its checkpoints. A
+        # failed/limited run KEEPS its checkpoints so the last-good one (named in
+        # failure.json) is available for an operator-driven restore.
+        if session.state.status == "completed":
+            self._checkpoint_store().delete(self.spec.run_id)
         self._session = None
         return result
 
@@ -520,6 +522,28 @@ class AgentLoop:
                 "type": type(exc).__name__,
             },
             level="error",
+        )
+        # Failure bundle: what broke + which checkpoint to restore from. The last good
+        # (non-terminal) checkpoint is the current sequence; the terminal checkpoint the
+        # failure path writes next is seq+1 and is skipped by the restart scanner. No
+        # auto-recovery — this is purely the operator's restore aid.
+        last_good_seq = self._session.checkpoint_seq if self._session is not None else 0
+        res.recorder.write_failure(
+            {
+                "schema_version": "native-agent-runner.failure.v1",
+                "run_id": self.spec.run_id,
+                "error": public_error_message(state.error),
+                "error_code": state.error_code,
+                "provider_error_code": state.provider_error_code,
+                "type": type(exc).__name__,
+                "last_good_seq": last_good_seq,
+                "restore_hint": (
+                    f"restore checkpoint seq {last_good_seq} for run {self.spec.run_id} "
+                    "via CheckpointStore, then run_until_suspended(None)"
+                )
+                if last_good_seq > 0
+                else "no committed checkpoint to restore from (failed before first park)",
+            }
         )
 
     def commit_checkpoint(self) -> None:

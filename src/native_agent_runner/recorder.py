@@ -284,6 +284,14 @@ class AgentRecorder:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
 
+    def write_failure(self, payload: dict[str, Any]) -> Path:
+        """Write ``run_dir/failure.json`` — the operator-facing failure bundle: what
+        broke plus which checkpoint to restore from. The core surfaces this; recovery
+        (if any) is the integrator's call (no auto-recovery in the core)."""
+        path = self.run_dir / "failure.json"
+        write_json_atomic(path, payload)
+        return path
+
     def close(self) -> None:
         self.event_bus.close()
         self._transcript_file.close()

@@ -1031,6 +1031,10 @@ class RunnerBackend:
             with self._lock:
                 if run_id in self._records:
                     continue
+            # A failed run is never auto-resumed: its failure.json is the operator's
+            # restore aid (covers the edge where a failure could not write a terminal mark).
+            if (run_dir / "failure.json").exists():
+                continue
             assert self.checkpoint_store is not None
             stored = self.checkpoint_store.latest(run_id)
             if stored is None or stored.checkpoint.terminal:

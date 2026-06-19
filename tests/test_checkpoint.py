@@ -352,6 +352,32 @@ def test_by_value_conversation_accumulates_and_survives_restore(tmp_path: Path) 
     loop2.close()
 
 
+def test_failed_run_writes_failure_bundle_and_keeps_checkpoint(tmp_path: Path) -> None:
+    class _RaisingAdapter:
+        def next_turn(self, request):  # noqa: ANN001, ANN201
+            from native_agent_runner.errors import ModelAdapterError
+
+            raise ModelAdapterError("boom", error_code="provider_unavailable")
+
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=_RaisingAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    result = loop.run_once("do it")
+
+    assert result.status == "failed"
+    # The operator-facing failure bundle names the error and the restore handle.
+    failure = json.loads((spec.run_root / spec.run_id / "failure.json").read_text(encoding="utf-8"))
+    assert failure["type"] == "ModelAdapterError"
+    assert failure["error_code"] and "restore" in failure["restore_hint"].lower()
+    assert "last_good_seq" in failure
+    # A failed run KEEPS its checkpoints (terminal -> the restart scanner still skips it).
+    record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert record is not None and record.checkpoint.terminal is True
+
+
 def test_restore_carries_remaining_deadline(tmp_path: Path) -> None:
     spec = AgentRunSpec(
         workspace_root=_mk(tmp_path / "ws"),
