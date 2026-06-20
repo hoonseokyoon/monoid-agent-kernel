@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import time
 from collections.abc import Callable, Mapping
@@ -405,12 +407,24 @@ class AgentLoop:
 
         Blocking wrapper over ``run_until_suspended``: when the run parks on tasks it
         waits in-process (shell monitor completes them, or an external thread reports
-        a hosted-task result) and resumes, returning only once the turn settles."""
+        a hosted-task result) and resumes, returning only once the turn settles.
+
+        Sync facade over :meth:`asubmit`; from an async context call ``asubmit``."""
+        return self._run_sync(self.asubmit(user_input))
+
+    async def asubmit(self, user_input: str | tuple[ContentPart, ...]) -> AgentTurnResult:
+        """Async form of :meth:`submit`. Awaits the model natively (or offloads a sync
+        adapter to a thread) and parks on tasks without blocking the event loop."""
         session = self._require_open()
-        suspension = self.run_until_suspended(user_input)
+        suspension = await self.arun_until_suspended(user_input)
         while suspension.reason == "awaiting_tasks":
-            self._wait_for_background_jobs(session.res.context, session.res.recorder, session.res.deadline)
-            suspension = self.run_until_suspended(None)
+            await asyncio.to_thread(
+                self._wait_for_background_jobs,
+                session.res.context,
+                session.res.recorder,
+                session.res.deadline,
+            )
+            suspension = await self.arun_until_suspended(None)
         assert suspension.turn is not None  # non-awaiting reasons always checkpoint
         return suspension.turn
 
@@ -421,7 +435,15 @@ class AgentLoop:
         ``None`` it resumes a run parked on a task (whose result was already injected
         via report_task_result). Returns why the run suspended without blocking on
         tasks — the caller decides how to wait. Every non-``awaiting_tasks`` reason
-        runs a settle checkpoint and attaches the ``AgentTurnResult`` as ``turn``."""
+        runs a settle checkpoint and attaches the ``AgentTurnResult`` as ``turn``.
+
+        Sync facade over :meth:`arun_until_suspended`."""
+        return self._run_sync(self.arun_until_suspended(user_input))
+
+    async def arun_until_suspended(
+        self, user_input: str | tuple[ContentPart, ...] | None = None
+    ) -> Suspension:
+        """Async form of :meth:`run_until_suspended` — the engine's source of truth."""
         session = self._require_open()
         if session.terminal:
             raise NativeAgentError(
@@ -443,7 +465,7 @@ class AgentLoop:
             self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
             session.submit_local_step = 0
         try:
-            suspension = self._pump_turn(state, res, session)
+            suspension = await self._apump_turn(state, res, session)
         except (RunCancelled, RunTimeout) as exc:
             state.status = "limited"
             state.error = str(exc)
@@ -530,15 +552,61 @@ class AgentLoop:
         return result
 
     def run_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
-        """One-shot convenience: open() + submit(user_input) + close()."""
+        """One-shot convenience: open() + submit(user_input) + close().
+
+        Sync facade over :meth:`arun_once`; from an async context call ``arun_once``."""
+        return self._run_sync(self.arun_once(user_input))
+
+    async def arun_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
+        """Async form of :meth:`run_once`."""
         self.open()
         try:
             session = self._require_open()
             if not session.terminal:
-                self.submit(user_input)
+                await self.asubmit(user_input)
         finally:
             result = self.close()
         return result
+
+    async def aopen(self) -> None:
+        """Async form of :meth:`open` — offloads the (sync) bootstrap I/O to a thread so
+        an event loop is not blocked during workspace/manifest setup."""
+        await asyncio.to_thread(self.open)
+
+    async def aclose(self) -> AgentRunResult:
+        """Async form of :meth:`close` — offloads the (sync) finalize I/O to a thread."""
+        return await asyncio.to_thread(self.close)
+
+    def _run_sync(self, coro: Any) -> Any:
+        """Drive an async core method to completion from a synchronous caller.
+
+        Raises a clear error (rather than asyncio's generic one) when invoked inside a
+        running event loop, pointing the caller at the async API."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        coro.close()
+        raise NativeAgentError(
+            "sync API called inside a running event loop; await the async API "
+            "(arun_once / asubmit / arun_until_suspended) instead",
+            error_code="sync_in_async_loop",
+        )
+
+    async def _acall_model(self, request: ModelRequest) -> ModelTurn:
+        """Invoke the model adapter, awaiting an async adapter natively or offloading a
+        sync ``next_turn`` to a thread so the event loop is never blocked on the LLM call.
+
+        Backward compatible: an adapter exposing ``async def anext_turn`` is awaited; a
+        coroutine ``next_turn`` is awaited; a plain sync ``next_turn`` runs in a thread."""
+        adapter = self.model_adapter
+        anext = getattr(adapter, "anext_turn", None)
+        if anext is not None:
+            return await anext(request)
+        next_turn = adapter.next_turn
+        if inspect.iscoroutinefunction(next_turn):
+            return await next_turn(request)
+        return await asyncio.to_thread(next_turn, request)
 
     def _record_failure(self, state: RunState, res: _RunResources, exc: Exception) -> None:
         state.status = "failed"
@@ -1147,7 +1215,7 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
-    def _pump_turn(self, state: RunState, res: _RunResources, session: _Session) -> Suspension:
+    async def _apump_turn(self, state: RunState, res: _RunResources, session: _Session) -> Suspension:
         context = res.context
         recorder = res.recorder
         deadline = res.deadline
@@ -1284,7 +1352,7 @@ class AgentLoop:
                 }
             )
             try:
-                turn = self.model_adapter.next_turn(request)
+                turn = await self._acall_model(request)
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
@@ -1388,7 +1456,11 @@ class AgentLoop:
                     state.final_text = "Stopped after reaching max tool calls."
                     state.error_code = "max_tool_calls_exceeded"
                     break
-                observation = self._execute_tool_call(
+                # Offload the (sync) tool handler — which may block on shell/web/fs — to a
+                # thread so the event loop stays free. Awaited sequentially, so there is no
+                # concurrent access to the shared context/state it mutates.
+                observation = await asyncio.to_thread(
+                    self._execute_tool_call,
                     call_name=call.name,
                     call_id=call.id,
                     arguments=call.arguments,

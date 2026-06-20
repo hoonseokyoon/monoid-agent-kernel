@@ -111,6 +111,11 @@ class ModelAdapter(Protocol):
     adapter (the core never sees them). See ``examples/custom_model_adapter.py`` for a
     minimal implementation, and ``GatewayModelAdapter`` / ``FakeModelAdapter`` for shipped
     ones.
+
+    Async: the engine runs an async core. A sync ``next_turn`` is offloaded to a thread
+    automatically, so existing sync adapters keep working. To be awaited natively (no
+    thread), an adapter may instead define ``async def anext_turn(request) -> ModelTurn``;
+    the engine prefers it when present. A coroutine ``next_turn`` is also awaited directly.
     """
 
     # Optional capability flag. The loop reads it via
