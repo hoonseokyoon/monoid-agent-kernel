@@ -42,10 +42,14 @@ from native_agent_runner.core.agents import (
     PromptSpec,
     RegistryToolRef,
     RuntimeConfigProvider,
+    RuntimeConfigSource,
+    StaticRuntimeConfigProvider,
     ToolBinding,
     ToolSearchConfig,
+    coerce_runtime_config_provider,
     compile_bound_tool_catalog,
     generated_tool_bindings,
+    static_runtime_config,
 )
 from native_agent_runner.core.tool_surface import (
     DefaultToolSurfaceResolver,
@@ -86,6 +90,7 @@ from native_agent_runner.tools.base import (
     ToolSideEffect,
     ToolSpec,
 )
+from native_agent_runner.tools.decorator import tool
 
 # Event contract
 from native_agent_runner.core.events import (
@@ -135,6 +140,10 @@ __all__ = [
     "PromptSpec",
     "RegistryToolRef",
     "RuntimeConfigProvider",
+    "RuntimeConfigSource",
+    "StaticRuntimeConfigProvider",
+    "static_runtime_config",
+    "coerce_runtime_config_provider",
     "ToolBinding",
     "ToolSearchConfig",
     "compile_bound_tool_catalog",
@@ -169,6 +178,7 @@ __all__ = [
     "ToolResult",
     "ToolSideEffect",
     "ToolSpec",
+    "tool",
     # event contract
     "EVENT_SCHEMA_VERSION",
     "AgentEvent",

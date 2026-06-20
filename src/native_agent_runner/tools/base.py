@@ -89,6 +89,15 @@ ToolHandler = Callable[[ToolContext, dict[str, Any]], ToolResult]
 
 @dataclass(frozen=True)
 class ToolSpec:
+    """A registered tool: its identity, JSON-Schema input, and handler.
+
+    ``input_schema`` is a JSON Schema (Draft 2020-12) the registry validates calls against;
+    ``handler`` is a ``(ToolContext, args) -> ToolResult`` callable. ``side_effect`` and the
+    declarative hint fields let the engine drive previews/diffs without branching on tool
+    identity. Author one by hand, or generate it from a typed Python function with the
+    :func:`~native_agent_runner.tool` decorator (``tools/decorator.py``).
+    """
+
     id: str
     description: str
     input_schema: dict[str, Any]

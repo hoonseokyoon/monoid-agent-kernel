@@ -56,6 +56,15 @@ class ToolObservation:
 
 @dataclass(frozen=True)
 class ModelTurn:
+    """One parsed model response — what a :class:`ModelAdapter` returns per turn.
+
+    Either ``tool_calls`` (the model wants tools run; the engine executes them and calls
+    back with observations) or ``final_text`` (the turn settles) should be set — returning
+    neither fails the turn. ``response_id`` is the provider handle the engine may pass back
+    as ``ModelRequest.previous_turn_handle``; ``usage`` carries token counts; ``raw`` keeps
+    the unparsed provider payload for debugging.
+    """
+
     response_id: str | None = None
     final_text: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
@@ -65,6 +74,14 @@ class ModelTurn:
 
 @dataclass(frozen=True)
 class ModelRequest:
+    """One turn's input handed to :meth:`ModelAdapter.next_turn`.
+
+    The engine builds this each step from the current instruction, system prompt, visible
+    tools, and any pending tool observations. See the field comments below for the three
+    wire shapes selected by ``instruction`` + ``previous_turn_handle``, and how the
+    vendor-neutral ``messages`` log (by-value) overrides the by-reference handle path.
+    """
+
     # The new user message for this turn, or None when the turn only carries tool
     # observations. Combined with ``previous_turn_handle`` this selects one of three
     # wire shapes:
@@ -86,6 +103,16 @@ class ModelRequest:
 
 
 class ModelAdapter(Protocol):
+    """The LLM seam: turn a :class:`ModelRequest` into a :class:`ModelTurn`.
+
+    Implement this to target any backend — your own gateway, a provider SDK, or a test
+    double. The single required method is :meth:`next_turn`; it must return a ``ModelTurn``
+    with either ``tool_calls`` or ``final_text``. Keep provider credentials inside the
+    adapter (the core never sees them). See ``examples/custom_model_adapter.py`` for a
+    minimal implementation, and ``GatewayModelAdapter`` / ``FakeModelAdapter`` for shipped
+    ones.
+    """
+
     # Optional capability flag. The loop reads it via
     # ``getattr(adapter, "supports_multimodal", False)``; an adapter that can
     # accept non-text content parts sets it True. Defaulting off keeps existing

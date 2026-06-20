@@ -29,7 +29,8 @@ from native_agent_runner.core.agents import (
     AgentRuntimeConfig,
     BoundTool,
     BoundToolCatalog,
-    RuntimeConfigProvider,
+    RuntimeConfigSource,
+    coerce_runtime_config_provider,
     compile_bound_tool_catalog,
     runtime_config_diff,
     transcript_config_snapshot,
@@ -329,7 +330,9 @@ class AgentLoop:
     spec: AgentRunSpec
     model_adapter: ModelAdapter
     _: KW_ONLY
-    runtime_config_provider: RuntimeConfigProvider
+    # Accepts a RuntimeConfigProvider, a bare AgentRuntimeConfig, or a
+    # callable(run_id) -> AgentRuntimeConfig; __post_init__ coerces to a provider.
+    runtime_config_provider: RuntimeConfigSource
     tool_providers: tuple[ToolProvider, ...] = ()
     dynamic_tool_providers: tuple[DynamicToolProvider, ...] = ()
     tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
@@ -348,6 +351,31 @@ class AgentLoop:
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
+        # can pass any of the three forms without hand-wrapping a StaticRuntimeConfigProvider.
+        self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
+
+    @classmethod
+    def from_config(
+        cls,
+        spec: AgentRunSpec,
+        model_adapter: ModelAdapter,
+        runtime_config: RuntimeConfigSource,
+        **kwargs: Any,
+    ) -> AgentLoop:
+        """Build a loop from a fixed config without hand-wrapping a provider.
+
+        ``runtime_config`` may be an :class:`AgentRuntimeConfig`, a
+        :class:`~native_agent_runner.RuntimeConfigProvider`, or a
+        ``callable(run_id) -> AgentRuntimeConfig``. Remaining optional seams
+        (``tool_providers``, ``event_sinks``, ``checkpoint_store``, …) pass through as
+        keyword arguments. Collapses the full constructor to one call::
+
+            AgentLoop.from_config(spec, adapter, config).run_once("do the thing")
+        """
+        return cls(spec, model_adapter, runtime_config_provider=runtime_config, **kwargs)
 
     def open(self) -> None:
         """Bootstrap the run and leave it idle, ready to accept submit().

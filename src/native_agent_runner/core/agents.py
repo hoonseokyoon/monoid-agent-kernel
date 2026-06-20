@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import difflib
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, Union
 
 from native_agent_runner.core._util import canonical_sha256
 from native_agent_runner.core.spec import ModelConfig
@@ -251,6 +252,17 @@ class AgentDefinition:
 
 @dataclass(frozen=True)
 class AgentRuntimeConfig:
+    """Effective configuration for a single run turn: *what* the agent is right now.
+
+    This is what a :class:`RuntimeConfigProvider` returns and the engine reads at
+    bootstrap and at every turn boundary — the model, system prompt, and tool bindings
+    that decide which registry tools are visible/searchable/executable this turn. It is
+    deliberately separate from :class:`AgentRunSpec` (the immutable session descriptor:
+    workspace, limits, permissions), so returning a different config between turns hot-
+    reloads the agent. ``config_hash`` drives change detection; build one quickly from a
+    reusable blueprint with :meth:`from_definition`.
+    """
+
     definition_id: str
     config_version: int = 1
     model: ModelConfig | None = None
@@ -358,8 +370,75 @@ class BoundToolCatalog:
 
 
 class RuntimeConfigProvider(Protocol):
+    """Supplies the per-run :class:`AgentRuntimeConfig` to the engine.
+
+    The engine calls :meth:`current_config` at bootstrap and at each turn boundary, so a
+    dynamic implementation can hot-reload the model/prompt/tools mid-run (multi-tenant
+    routing, live tool toggles, A/B rollout). Returning ``None`` fails the run with
+    ``agent_config_missing``. For a fixed config use :class:`StaticRuntimeConfigProvider`
+    or pass a bare :class:`AgentRuntimeConfig` / a ``lambda run_id: config`` wherever a
+    provider is expected — :class:`~native_agent_runner.AgentLoop` coerces all three.
+    """
+
     def current_config(self, run_id: str) -> AgentRuntimeConfig | None:
         ...
+
+
+@dataclass(frozen=True)
+class StaticRuntimeConfigProvider(RuntimeConfigProvider):
+    """A :class:`RuntimeConfigProvider` that always returns the same config.
+
+    The simplest provider: ignores ``run_id`` and serves a fixed
+    :class:`AgentRuntimeConfig`. Enough for a one-shot run or a single fixed agent.
+    """
+
+    config: AgentRuntimeConfig
+
+    def current_config(self, run_id: str) -> AgentRuntimeConfig | None:
+        del run_id
+        return self.config
+
+
+@dataclass(frozen=True)
+class _CallableRuntimeConfigProvider(RuntimeConfigProvider):
+    """Adapts a ``Callable[[str], AgentRuntimeConfig | None]`` to the provider protocol."""
+
+    func: Callable[[str], AgentRuntimeConfig | None]
+
+    def current_config(self, run_id: str) -> AgentRuntimeConfig | None:
+        return self.func(run_id)
+
+
+# What callers may pass anywhere a RuntimeConfigProvider is expected. AgentLoop coerces
+# all of these to a RuntimeConfigProvider via coerce_runtime_config_provider().
+RuntimeConfigSource = Union[
+    RuntimeConfigProvider,
+    AgentRuntimeConfig,
+    Callable[[str], "AgentRuntimeConfig | None"],
+]
+
+
+def static_runtime_config(config: AgentRuntimeConfig) -> StaticRuntimeConfigProvider:
+    """Wrap a fixed :class:`AgentRuntimeConfig` in a :class:`StaticRuntimeConfigProvider`."""
+    return StaticRuntimeConfigProvider(config)
+
+
+def coerce_runtime_config_provider(source: RuntimeConfigSource) -> RuntimeConfigProvider:
+    """Normalize a config source to a :class:`RuntimeConfigProvider`.
+
+    Accepts a provider (anything with ``current_config``), a bare
+    :class:`AgentRuntimeConfig` (wrapped static), or a ``callable(run_id) -> config``.
+    """
+    if hasattr(source, "current_config"):
+        return source  # type: ignore[return-value]
+    if isinstance(source, AgentRuntimeConfig):
+        return StaticRuntimeConfigProvider(source)
+    if callable(source):
+        return _CallableRuntimeConfigProvider(source)
+    raise TypeError(
+        "runtime_config_provider must be a RuntimeConfigProvider, an AgentRuntimeConfig, "
+        f"or a callable(run_id) -> AgentRuntimeConfig; got {type(source).__name__}"
+    )
 
 
 def generated_tool_bindings(
@@ -382,6 +461,21 @@ def generated_tool_bindings(
         )
         for tool in tool_specs
         if tool.id != "tool.search"
+    )
+
+
+def _suggest(name: str, candidates: Iterable[str]) -> str:
+    """Return a ' Did you mean 'x'?' hint for the closest candidate, or '' if none close."""
+    matches = difflib.get_close_matches(name, list(candidates), n=1, cutoff=0.6)
+    return f" Did you mean '{matches[0]}'?" if matches else ""
+
+
+def _unknown_tool_message(tool_id: str, available: Iterable[str]) -> str:
+    ids = sorted(available)
+    listed = ", ".join(ids) if ids else "(none registered)"
+    return (
+        f"runtime config references unknown registry tool: {tool_id}."
+        f"{_suggest(tool_id, ids)} Available tools: {listed}"
     )
 
 
@@ -412,7 +506,7 @@ def compile_bound_tool_catalog(config: AgentRuntimeConfig, registry: ToolRegistr
         reserve_call_name(binding.binding_id, binding.binding_id)
         spec = specs.get(binding.ref.tool_id)
         if spec is None:
-            raise AgentConfigError(f"runtime config references unknown registry tool: {binding.ref.tool_id}")
+            raise AgentConfigError(_unknown_tool_message(binding.ref.tool_id, specs.keys()))
         model_name = _resolved_model_name(binding, spec)
         if model_name in seen_model_names:
             raise AgentConfigError(f"duplicate tool model_name: {model_name}")
