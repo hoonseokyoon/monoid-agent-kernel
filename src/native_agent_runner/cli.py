@@ -791,6 +791,7 @@ def backend_serve(
         click.echo("runner backend stopped")
     finally:
         server.server_close()
+        runner_backend.shutdown()  # stop the shared run loop + watchdog
 
 
 @main.group("llm-gateway")
