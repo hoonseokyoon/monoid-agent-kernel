@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -21,6 +23,24 @@ from native_agent_runner.errors import NativeAgentError, PermissionDenied
 from native_agent_runner.permissions import PermissionPolicy
 
 _LOGGER = logging.getLogger("native_agent_runner.backend.http")
+
+# Bridge sentinel: the pump coroutine pushes this once (in finally) to mark end-of-stream.
+_STREAM_SENTINEL = object()
+# Frames buffered before a slow/disconnected client is deemed too slow and the run cancelled.
+_STREAM_HIGH_WATER = 2000
+
+
+def _drain_to_sentinel(q: queue.Queue, *, deadline_s: float = 15.0) -> None:
+    """Discard queued frames until the sentinel (bounded), so a disconnect can't pin the
+    handler thread forever waiting on the pump to finalize."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        try:
+            item = q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if item is _STREAM_SENTINEL:
+            return
 
 
 def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> type[BaseHTTPRequestHandler]:
@@ -98,34 +118,13 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
             try:
                 if parsed.path == "/v1/runs":
                     self._require_admin()
-                    payload = self._read_json()
-                    max_duration_raw = payload.get("max_duration_s", 900)
-                    request = BackendRunRequest(
-                        tenant_id=str(payload["tenant_id"]),
-                        user_id=str(payload["user_id"]),
-                        workspace_root=Path(str(payload["workspace_root"])),
-                        instruction=str(payload["instruction"]),
-                        mode=str(payload.get("mode") or "propose"),  # type: ignore[arg-type]
-                        workspace_backend=str(payload.get("workspace_backend") or "overlay"),  # type: ignore[arg-type]
-                        max_steps=int(payload.get("max_steps") or 30),
-                        max_tool_calls=int(payload.get("max_tool_calls") or 100),
-                        max_bytes_read=int(payload.get("max_bytes_read") or 1_000_000),
-                        max_duration_s=None if max_duration_raw is None else int(max_duration_raw),
-                        permission_policy=PermissionPolicy.from_json(payload.get("permission_policy")),
-                        agent_definition=(
-                            AgentDefinition.from_json(payload["agent_definition"])
-                            if payload.get("agent_definition") is not None
-                            else None
-                        ),
-                        runtime_config=(
-                            AgentRuntimeConfig.from_json(payload["runtime_config"])
-                            if payload.get("runtime_config") is not None
-                            else None
-                        ),
-                        multi_turn=bool(payload.get("multi_turn", False)),
-                        metadata=dict(payload.get("metadata") or {}),
-                    )
+                    request = self._parse_run_request(self._read_json())
                     self._write_json(backend.submit_run(request).to_json(), status=HTTPStatus.ACCEPTED)
+                    return
+                if parsed.path == "/v1/runs/stream":
+                    self._require_admin()
+                    request = self._parse_run_request(self._read_json())
+                    self._stream_run_sse(request)
                     return
                 parts = [part for part in parsed.path.split("/") if part]
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "cancel":
@@ -240,6 +239,94 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
 
         def _read_json(self) -> dict[str, Any]:
             return read_json_limited(self)
+
+        def _parse_run_request(self, payload: dict[str, Any]) -> BackendRunRequest:
+            max_duration_raw = payload.get("max_duration_s", 900)
+            return BackendRunRequest(
+                tenant_id=str(payload["tenant_id"]),
+                user_id=str(payload["user_id"]),
+                workspace_root=Path(str(payload["workspace_root"])),
+                instruction=str(payload["instruction"]),
+                mode=str(payload.get("mode") or "propose"),  # type: ignore[arg-type]
+                workspace_backend=str(payload.get("workspace_backend") or "overlay"),  # type: ignore[arg-type]
+                max_steps=int(payload.get("max_steps") or 30),
+                max_tool_calls=int(payload.get("max_tool_calls") or 100),
+                max_bytes_read=int(payload.get("max_bytes_read") or 1_000_000),
+                max_duration_s=None if max_duration_raw is None else int(max_duration_raw),
+                permission_policy=PermissionPolicy.from_json(payload.get("permission_policy")),
+                agent_definition=(
+                    AgentDefinition.from_json(payload["agent_definition"])
+                    if payload.get("agent_definition") is not None
+                    else None
+                ),
+                runtime_config=(
+                    AgentRuntimeConfig.from_json(payload["runtime_config"])
+                    if payload.get("runtime_config") is not None
+                    else None
+                ),
+                multi_turn=bool(payload.get("multi_turn", False)),
+                metadata=dict(payload.get("metadata") or {}),
+            )
+
+        def _stream_run_sse(self, request: BackendRunRequest) -> None:
+            """Drive a stream-run over SSE: bridge the async ``astream_run`` (shared loop) to
+            this sync handler thread via a thread-safe queue, writing one ``data:`` frame each.
+
+            The pump only ever ``put_nowait``s (a blocking put would freeze the shared loop and
+            every run on it); a slow/disconnected client is bounded by a high-water-mark that
+            cooperatively cancels the run. SSE headers are sent only once the first frame is in
+            hand, so a pre-stream failure (validation/tokens, before any frame) surfaces as a
+            normal HTTP error rather than a 200 empty stream."""
+            q: queue.Queue = queue.Queue()
+            state: dict[str, Any] = {"run_id": None}
+
+            async def _pump() -> None:
+                try:
+                    async for frame in backend.astream_run(request):
+                        if frame.get("kind") == "meta":
+                            state["run_id"] = frame.get("run_id")
+                        q.put_nowait(frame)
+                        if q.qsize() > _STREAM_HIGH_WATER and state["run_id"]:
+                            backend.request_stream_cancel(str(state["run_id"]))
+                finally:
+                    q.put_nowait(_STREAM_SENTINEL)
+
+            future = backend.spawn_coroutine(_pump())
+            first = q.get()
+            if first is _STREAM_SENTINEL:
+                # No frame was produced -> a pre-stream failure; re-raise it as a normal error
+                # response (SSE headers were never sent). future is done once the sentinel lands.
+                exc = future.exception()
+                raise exc if exc is not None else NativeAgentError(
+                    "stream produced no output", error_code="internal_error"
+                )
+            # Commit to the SSE body. This route is long-lived, so clear the 30s socket timeout.
+            self.connection.settimeout(None)
+            self.send_response(int(HTTPStatus.OK))
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            frame = first
+            while True:
+                try:
+                    self.wfile.write(
+                        b"data: "
+                        + json.dumps(frame, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                        + b"\n\n"
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # Client disconnected: cancel cooperatively, drain to the sentinel (bounded),
+                    # then cancel the pump future as a last resort.
+                    if state["run_id"]:
+                        backend.request_stream_cancel(str(state["run_id"]))
+                    _drain_to_sentinel(q)
+                    future.cancel()
+                    return
+                frame = q.get()
+                if frame is _STREAM_SENTINEL:
+                    return
 
         def _bearer_token(self) -> str:
             header = self.headers.get("Authorization") or ""

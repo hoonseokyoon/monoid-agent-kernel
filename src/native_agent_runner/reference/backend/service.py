@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
 from dataclasses import dataclass, field
@@ -129,6 +129,19 @@ class BackendRunSubmission:
             "events_url": self.events_url,
             "proposal_url": self.proposal_url,
         }
+
+
+@dataclass(frozen=True)
+class _PreparedRun:
+    """The shared output of run setup (validate + tokens + stored record), before the run is
+    driven. Consumed by ``submit_run`` (autonomous) and ``astream_run`` (stream-driven)."""
+
+    run_id: str
+    record: BackendRunRecord
+    workspace_root: Path
+    run_token: str
+    llm_gateway_token: str
+    web_gateway_token: str
 
 
 @dataclass
@@ -383,6 +396,21 @@ class RunnerBackend:
         """Run a thread-safe callback on the process-shared run loop (fire-and-forget)."""
         _get_shared_loop().call_soon_threadsafe(fn, *args)
 
+    def spawn_coroutine(self, coro: Any) -> Any:
+        """Schedule a coroutine on the process-shared run loop; returns a
+        ``concurrent.futures.Future``. The transport seam the SSE bridge uses to drive
+        ``astream_run`` on the shared loop from a sync handler thread."""
+        return self._spawn(coro)
+
+    def request_stream_cancel(self, run_id: str) -> None:
+        """Cooperatively cancel a stream-driven run (internal; the SSE handler calls this on
+        client disconnect or backpressure). No auth — the caller created the run via
+        ``astream_run``. A missing record (already drained) is a no-op."""
+        with self._lock:
+            record = self._records.get(run_id)
+        if record is not None:
+            record.cancellation_token.cancel()
+
     def shutdown(self) -> None:
         """Stop this backend's watchdog. The run loop is process-shared (one per process,
         cleaned up at exit via atexit), so there is nothing per-backend to tear down — and
@@ -390,6 +418,24 @@ class RunnerBackend:
         self.stop_watchdog()
 
     def submit_run(self, request: BackendRunRequest) -> BackendRunSubmission:
+        prepared = self._prepare_run_record(request)
+        # Run executes as a coroutine on the shared loop (coroutine-per-run), not a thread.
+        self._spawn(
+            self._run_run(
+                prepared.run_id,
+                request,
+                prepared.workspace_root,
+                prepared.llm_gateway_token,
+                prepared.web_gateway_token,
+            )
+        )
+        return self._submission_for(prepared)
+
+    def _prepare_run_record(self, request: BackendRunRequest) -> _PreparedRun:
+        """Validate the request, mint the three run tokens, and store a queued run record.
+
+        Shared by ``submit_run`` (autonomous drive) and ``astream_run`` (stream-driven). Stops
+        at "record stored under lock" — the caller owns how the run is then driven."""
         self._validate_request(request)
         workspace_root = request.workspace_root.resolve()
         self._check_workspace_allowed(workspace_root)
@@ -452,13 +498,22 @@ class RunnerBackend:
         )
         with self._lock:
             self._records[run_id] = record
-        # Run executes as a coroutine on the shared loop (coroutine-per-run), not a thread.
-        self._spawn(self._run_run(run_id, request, workspace_root, llm_gateway_token, web_gateway_token))
+        return _PreparedRun(
+            run_id=run_id,
+            record=record,
+            workspace_root=workspace_root,
+            run_token=run_token,
+            llm_gateway_token=llm_gateway_token,
+            web_gateway_token=web_gateway_token,
+        )
+
+    def _submission_for(self, prepared: _PreparedRun) -> BackendRunSubmission:
+        run_id = prepared.run_id
         return BackendRunSubmission(
             run_id=run_id,
-            run_token=run_token,
+            run_token=prepared.run_token,
             status="queued",
-            run_dir=run_dir,
+            run_dir=prepared.record.run_dir,
             status_url=f"/v1/runs/{run_id}/status",
             result_url=f"/v1/runs/{run_id}/result",
             events_url=f"/v1/runs/{run_id}/events",
@@ -1084,25 +1139,8 @@ class RunnerBackend:
         if self._run_semaphore is not None:
             await self._run_semaphore.acquire()
         try:
-            spec = self._run_spec_for_request(run_id, request, workspace_root)
             try:
-                runtime_config = self.current_runtime_config(run_id)
-                adapter = self._build_model_adapter(
-                    spec,
-                    llm_gateway_token,
-                    runtime_config.model if runtime_config is not None else None,
-                )
-                loop = AgentLoop(
-                    spec=spec,
-                    model_adapter=adapter,
-                    event_sinks=(BackendRunStateSink(self, run_id),),
-                    permission_policy=request.permission_policy,
-                    cancellation_token=self._record(run_id).cancellation_token,
-                    shell_approval_provider=None,
-                    web_gateway_client=self._web_gateway_client(web_gateway_token),
-                    runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
-                    checkpoint_store=self.checkpoint_store,
-                )
+                loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
                 with self._lock:
                     self._records[run_id].loop = loop
                 # Persist the recovery metadata before the first turn so a crash at any park
@@ -1115,6 +1153,105 @@ class RunnerBackend:
         finally:
             if self._run_semaphore is not None:
                 self._run_semaphore.release()
+
+    def _build_loop(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        workspace_root: Path,
+        llm_gateway_token: str,
+        web_gateway_token: str,
+    ) -> AgentLoop:
+        """Construct the run's AgentLoop (shared by autonomous and stream-driven paths)."""
+        spec = self._run_spec_for_request(run_id, request, workspace_root)
+        runtime_config = self.current_runtime_config(run_id)
+        adapter = self._build_model_adapter(
+            spec,
+            llm_gateway_token,
+            runtime_config.model if runtime_config is not None else None,
+        )
+        return AgentLoop(
+            spec=spec,
+            model_adapter=adapter,
+            event_sinks=(BackendRunStateSink(self, run_id),),
+            permission_policy=request.permission_policy,
+            cancellation_token=self._record(run_id).cancellation_token,
+            shell_approval_provider=None,
+            web_gateway_client=self._web_gateway_client(web_gateway_token),
+            runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
+            checkpoint_store=self.checkpoint_store,
+        )
+
+    async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
+        """Stream-driven run: the transport-neutral programmatic seam behind the SSE endpoint.
+
+        Drives ONE submit via ``loop.astream`` and yields wire-frame dicts: a leading
+        ``{"kind":"meta",...}`` (run id/token/urls — mirrors ``BackendRunSubmission`` so the
+        consumer can poll artifacts later), then ``{"kind":"event",...}`` (orchestration) and
+        ``{"kind":"delta",...}`` (token deltas) per stream item, then exactly one terminal
+        ``{"kind":"result",...}``. Must be driven on the shared loop (astream binds the loop it
+        runs on). An in-process async consumer can ``async for`` this directly, no HTTP.
+
+        Single-submit scope: the run is closed when the stream drains. A mid-stream external
+        hosted-task park is surfaced in the result frame and then closed (HITL-over-stream is
+        deferred), so this never leaves a resumable run dangling.
+        """
+        prepared = self._prepare_run_record(request)
+        run_id = prepared.run_id
+        if self._run_semaphore is not None:
+            await self._run_semaphore.acquire()
+        loop: AgentLoop | None = None
+        closed = False
+        try:
+            yield {"kind": "meta", **self._submission_for(prepared).to_json()}
+            loop = self._build_loop(
+                run_id, request, prepared.workspace_root, prepared.llm_gateway_token, prepared.web_gateway_token
+            )
+            with self._lock:
+                self._records[run_id].loop = loop
+            self._write_run_meta(prepared.record, request)
+            await loop.aopen()
+            suspension: Suspension | None = None
+            async with loop.astream(request.instruction) as stream:
+                async for item in stream:
+                    yield self._frame(item)
+                suspension = stream.suspension
+            result = await loop.aclose()
+            closed = True
+            self._record_run_result(run_id, result)
+            frame: dict[str, Any] = {
+                "kind": "result",
+                "status": result.status,
+                "final_text": result.final_text,
+                "error": result.error,
+                "error_code": result.error_code,
+            }
+            if suspension is not None and suspension.has_external:
+                frame["awaiting_task_ids"] = list(suspension.awaiting_task_ids)
+                frame["note"] = "run closed; hosted task cancelled (HITL streaming deferred)"
+            yield frame
+        except Exception as exc:
+            if loop is not None and not closed:
+                try:
+                    await loop.aclose()
+                except Exception:  # noqa: BLE001 - finalization best-effort; the failure is recorded below
+                    pass
+            self._record_run_failure(run_id, exc)
+            yield {
+                "kind": "result",
+                "status": "failed",
+                "error": str(exc),
+                "error_code": getattr(exc, "error_code", "internal_error"),
+            }
+        finally:
+            if self._run_semaphore is not None:
+                self._run_semaphore.release()
+
+    def _frame(self, item: Any) -> dict[str, Any]:
+        """Wrap one astream item as a neutral wire frame (reference framing on core to_json)."""
+        if isinstance(item, AgentEvent):
+            return {"kind": "event", **item.to_json()}
+        return {"kind": "delta", **item.to_json()}  # ModelStreamChunk
 
     def _record_run_result(self, run_id: str, result: AgentRunResult) -> None:
         with self._lock:

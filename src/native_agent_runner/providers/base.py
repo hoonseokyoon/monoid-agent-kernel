@@ -154,6 +154,9 @@ class TextDelta:
 
     text: str
 
+    def to_json(self) -> dict[str, Any]:
+        return {"type": "text_delta", "text": self.text}
+
 
 @dataclass(frozen=True)
 class ToolCallDelta:
@@ -166,6 +169,15 @@ class ToolCallDelta:
     id: str | None = None
     name: str | None = None
 
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "type": "tool_call_delta",
+            "index": self.index,
+            "arguments_fragment": self.arguments_fragment,
+            "id": self.id,
+            "name": self.name,
+        }
+
 
 @dataclass(frozen=True)
 class TurnComplete:
@@ -173,6 +185,9 @@ class TurnComplete:
 
     response_id: str | None = None
     usage: dict[str, int] = field(default_factory=dict)
+
+    def to_json(self) -> dict[str, Any]:
+        return {"type": "turn_complete", "response_id": self.response_id, "usage": dict(self.usage)}
 
 
 ModelStreamChunk = TextDelta | ToolCallDelta | TurnComplete
