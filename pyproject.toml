@@ -41,6 +41,12 @@ http-async = [
 otel = [
     "opentelemetry-api>=1.20",
 ]
+# MCP (Model Context Protocol) client. JSON-RPC over Streamable HTTP, hand-rolled on httpx
+# (the official `mcp` SDK is async-only and pulls a full server ASGI stack). The import is
+# lazy, so the package imports without it; only McpToolProvider/McpHttpClient need it.
+mcp = [
+    "httpx>=0.27",
+]
 
 [project.scripts]
 native-agent = "native_agent_runner.cli:main"
