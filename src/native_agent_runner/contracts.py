@@ -74,10 +74,16 @@ from native_agent_runner.core.content import (
 from native_agent_runner.providers.base import (
     ModelAdapter,
     ModelRequest,
+    ModelStreamChunk,
     ModelTurn,
+    TextDelta,
     ToolCall,
+    ToolCallDelta,
     ToolObservation,
+    TurnComplete,
+    assemble_streamed_turn,
 )
+from native_agent_runner.core.streaming import RunStream
 
 # Tool contract
 from native_agent_runner.tools.base import (
@@ -169,6 +175,13 @@ __all__ = [
     "ModelTurn",
     "ToolCall",
     "ToolObservation",
+    # streaming (astream) contract
+    "RunStream",
+    "ModelStreamChunk",
+    "TextDelta",
+    "ToolCallDelta",
+    "TurnComplete",
+    "assemble_streamed_turn",
     # tool contract
     "DynamicToolProvider",
     "ToolContext",

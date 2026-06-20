@@ -8,15 +8,29 @@ async-core path transitively.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from conftest import runtime_config, runtime_provider, tool_binding
 
+from native_agent_runner.core.events import AgentEvent
 from native_agent_runner.core.spec import AgentRunSpec, RunLimits
 from native_agent_runner.errors import NativeAgentError
 from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelRequest, ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from native_agent_runner.providers.base import (
+    ModelRequest,
+    ModelTurn,
+    TextDelta,
+    ToolCall,
+    ToolCallDelta,
+    TurnComplete,
+    assemble_streamed_turn,
+)
+from native_agent_runner.providers.fake import (
+    FakeModelAdapter,
+    FakeStreamingModelAdapter,
+    fake_tool_call,
+)
 
 
 def _spec(tmp_path: Path, *, mode: str = "apply", limits: RunLimits | None = None) -> AgentRunSpec:
@@ -187,3 +201,153 @@ def test_concurrent_runs_interleave_on_one_loop(tmp_path: Path) -> None:
         return [r.status for r in results]
 
     assert asyncio.run(run_both()) == ["completed", "completed"]
+
+
+# --- P4a: astream live streaming -------------------------------------------------------
+
+
+async def _drain_stream(loop: AgentLoop, user_input: str) -> tuple[list[object], object, object]:
+    """Open the run, drain one astream turn, then close — returning (items, result, suspension)."""
+    await loop.aopen()
+    items: list[object] = []
+    async with loop.astream(user_input) as stream:
+        async for item in stream:
+            items.append(item)
+        result = stream.result
+        suspension = stream.suspension
+    await loop.aclose()
+    return items, result, suspension
+
+
+def _event_types(items: list[object]) -> list[str]:
+    return [it.type for it in items if isinstance(it, AgentEvent)]
+
+
+def test_assemble_streamed_turn_folds_text_and_tool_args() -> None:
+    turn = assemble_streamed_turn(
+        [
+            TextDelta("Hel"),
+            TextDelta("lo"),
+            ToolCallDelta(index=0, arguments_fragment='{"path":"A', id="c1", name="fs_write"),
+            ToolCallDelta(index=0, arguments_fragment='.md"}'),
+            TurnComplete(response_id="r1", usage={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}),
+        ]
+    )
+    assert turn.final_text == "Hello"
+    assert turn.response_id == "r1"
+    assert turn.tool_calls == (ToolCall(id="c1", name="fs_write", arguments={"path": "A.md"}),)
+    assert turn.usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+
+
+def test_astream_streams_text_deltas_then_settles(tmp_path: Path) -> None:
+    adapter = FakeStreamingModelAdapter(
+        chunk_turns=[[TextDelta("Hel"), TextDelta("lo"), TurnComplete(response_id="r1")]]
+    )
+    loop = _loop(tmp_path, adapter)
+    items, result, suspension = asyncio.run(_drain_stream(loop, "hi"))
+
+    assert suspension is None
+    assert result.status == "completed"
+    assert result.final_text == "Hello"
+    # Token deltas concatenate to the settled text.
+    assert "".join(it.text for it in items if isinstance(it, TextDelta)) == "Hello"
+    # Orchestration events stream too, bracketing the deltas in order.
+    started = next(i for i, it in enumerate(items) if isinstance(it, AgentEvent) and it.type == "model.turn.started")
+    finished = next(i for i, it in enumerate(items) if isinstance(it, AgentEvent) and it.type == "model.turn.finished")
+    delta_idxs = [i for i, it in enumerate(items) if isinstance(it, TextDelta)]
+    assert started < min(delta_idxs) <= max(delta_idxs) < finished
+
+
+def test_astream_accumulates_streamed_tool_call(tmp_path: Path) -> None:
+    adapter = FakeStreamingModelAdapter(
+        chunk_turns=[
+            [
+                ToolCallDelta(index=0, arguments_fragment='{"path":"A', id="c1", name="fs_write"),
+                ToolCallDelta(index=0, arguments_fragment='.md","content":"x"}'),
+                TurnComplete(response_id="r1"),
+            ],
+            [TextDelta("done"), TurnComplete(response_id="r2")],
+        ]
+    )
+    loop = _loop(tmp_path, adapter, "fs.write", "run.finish", limits=RunLimits(max_steps=4))
+    items, result, _ = asyncio.run(_drain_stream(loop, "go"))
+
+    assert result.status == "completed"
+    assert result.final_text == "done"
+    assert (tmp_path / "workspace" / "A.md").read_text() == "x"
+    assert any(isinstance(it, ToolCallDelta) for it in items)
+    types = _event_types(items)
+    assert "tool.call.started" in types and "tool.call.finished" in types
+
+
+def test_astream_nonstreaming_adapter_yields_orchestration_only(tmp_path: Path) -> None:
+    # An adapter without astream_turn falls back to the one-shot path: orchestration events
+    # still stream, but no token deltas are produced.
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")])
+    loop = _loop(tmp_path, adapter)
+    items, result, _ = asyncio.run(_drain_stream(loop, "go"))
+
+    assert result.final_text == "done"
+    assert not any(isinstance(it, (TextDelta, ToolCallDelta)) for it in items)
+    assert "model.turn.started" in _event_types(items)
+    assert "model.turn.finished" in _event_types(items)
+
+
+def test_astream_early_break_cancels_cooperatively(tmp_path: Path) -> None:
+    class InfiniteStreamAdapter:
+        supports_multimodal = False
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:  # pragma: no cover
+            raise AssertionError("astream_turn should be preferred")
+
+        async def astream_turn(self, request: ModelRequest):
+            self.calls += 1
+            await asyncio.sleep(0)
+            yield ToolCallDelta(
+                index=0,
+                arguments_fragment=json.dumps({"path": "A.md", "content": str(self.calls)}),
+                id=f"c{self.calls}",
+                name="fs_write",
+            )
+            yield TurnComplete(response_id=f"r{self.calls}")
+
+    adapter = InfiniteStreamAdapter()
+    # The script never settles; only cooperative cancel (on break) stops it well short of the
+    # huge step budget — proving early break tears the run down, not the limit.
+    loop = _loop(tmp_path, adapter, "fs.write", limits=RunLimits(max_steps=100_000, max_tool_calls=100_000))
+
+    async def go() -> tuple[object, int, bool]:
+        await loop.aopen()
+        async with loop.astream("go") as stream:
+            async for _item in stream:
+                break
+        active_after = loop._stream_sink.active if loop._stream_sink else True  # type: ignore[union-attr]
+        result = await loop.aclose()
+        return result, adapter.calls, active_after
+
+    result, calls, active_after = asyncio.run(go())
+    assert active_after is False
+    assert calls < 1_000  # cut short by cooperative cancel, not the 100k budget
+    assert result.status == "limited"
+
+
+def test_astream_parks_on_external_task(tmp_path: Path) -> None:
+    adapter = FakeStreamingModelAdapter(
+        chunk_turns=[
+            [
+                ToolCallDelta(index=0, arguments_fragment=json.dumps({"prompt": "Pick"}), id="c1", name="hitl_request"),
+                TurnComplete(response_id="r1"),
+            ]
+        ]
+    )
+    loop = _loop(tmp_path, adapter, "hitl.request")
+    items, result, suspension = asyncio.run(_drain_stream(loop, "ask the human"))
+
+    assert result is None  # parked, not settled
+    assert suspension is not None
+    assert suspension.has_external is True
+    assert len(suspension.awaiting_task_ids) == 1
+    assert "run.awaiting_input" in _event_types(items)

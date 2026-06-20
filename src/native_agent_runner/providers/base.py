@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from native_agent_runner.core.spec import ModelConfig
+from native_agent_runner.errors import ModelAdapterError
+from native_agent_runner.providers._common import normalize_usage
 from native_agent_runner.tools.base import ToolSpec
 
 
@@ -116,6 +118,14 @@ class ModelAdapter(Protocol):
     automatically, so existing sync adapters keep working. To be awaited natively (no
     thread), an adapter may instead define ``async def anext_turn(request) -> ModelTurn``;
     the engine prefers it when present. A coroutine ``next_turn`` is also awaited directly.
+
+    Streaming: to feed ``AgentLoop.astream`` token-by-token, an adapter may define
+    ``async def astream_turn(request) -> AsyncIterator[ModelStreamChunk]`` yielding
+    :class:`TextDelta` / :class:`ToolCallDelta` / :class:`TurnComplete` chunks. The engine
+    prefers it only while a stream is active and folds the chunks back into a ``ModelTurn``
+    (see :func:`assemble_streamed_turn`) so a streamed turn produces the same orchestration
+    events and checkpoints as a non-streamed one. When absent, ``astream`` falls back to the
+    one-shot path above and simply emits no token deltas.
     """
 
     # Optional capability flag. The loop reads it via
@@ -127,4 +137,97 @@ class ModelAdapter(Protocol):
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         ...
+
+
+# --- Streaming chunks ------------------------------------------------------------------
+# The vendor-neutral units an ``astream_turn`` adapter yields. Designed to losslessly carry
+# both Anthropic (content-block deltas + ``input_json_delta``) and OpenAI (Chat/Responses
+# ``arguments`` fragments) streams: tool-call arguments arrive as raw string fragments that
+# are NOT individually valid JSON and must be concatenated per ``index`` and parsed once at
+# the end — which :func:`assemble_streamed_turn` does. Real provider→chunk mapping is P4b;
+# P4a exercises these via ``FakeStreamingModelAdapter``.
+
+
+@dataclass(frozen=True)
+class TextDelta:
+    """A fragment of assistant output text."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class ToolCallDelta:
+    """A fragment of one tool call, keyed by ``index`` (its slot in the response). ``id`` and
+    ``name`` typically arrive once (first fragment); ``arguments_fragment`` is a raw,
+    individually-invalid JSON string piece to be concatenated, not parsed, on arrival."""
+
+    index: int
+    arguments_fragment: str = ""
+    id: str | None = None
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class TurnComplete:
+    """Terminal chunk carrying the provider handle and final usage for the turn."""
+
+    response_id: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+ModelStreamChunk = TextDelta | ToolCallDelta | TurnComplete
+
+
+def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
+    """Fold a streamed chunk sequence into the same :class:`ModelTurn` a one-shot turn
+    would produce: concatenate text; group tool-call argument fragments by ``index`` and
+    ``json.loads`` each once at the end; take ``response_id``/``usage`` from ``TurnComplete``.
+    """
+    text_parts: list[str] = []
+    slots: dict[int, dict[str, Any]] = {}
+    order: list[int] = []
+    response_id: str | None = None
+    usage: dict[str, int] = {}
+    for chunk in chunks:
+        if isinstance(chunk, TextDelta):
+            text_parts.append(chunk.text)
+        elif isinstance(chunk, ToolCallDelta):
+            slot = slots.get(chunk.index)
+            if slot is None:
+                slot = {"id": None, "name": None, "args": ""}
+                slots[chunk.index] = slot
+                order.append(chunk.index)
+            if chunk.id is not None:
+                slot["id"] = chunk.id
+            if chunk.name is not None:
+                slot["name"] = chunk.name
+            slot["args"] += chunk.arguments_fragment
+        elif isinstance(chunk, TurnComplete):
+            if chunk.response_id is not None:
+                response_id = chunk.response_id
+            if chunk.usage:
+                usage = chunk.usage
+    tool_calls: list[ToolCall] = []
+    for index in order:
+        slot = slots[index]
+        raw = str(slot["args"]).strip()
+        try:
+            arguments = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise ModelAdapterError(
+                f"invalid streamed tool-call arguments for {slot['name']}",
+                provider_error_code="stream_bad_tool_args",
+            ) from exc
+        if not isinstance(arguments, dict):
+            raise ModelAdapterError(
+                f"streamed tool-call arguments for {slot['name']} are not an object",
+                provider_error_code="stream_bad_tool_args",
+            )
+        tool_calls.append(ToolCall(id=str(slot["id"] or ""), name=str(slot["name"] or ""), arguments=arguments))
+    return ModelTurn(
+        response_id=response_id,
+        final_text="".join(text_parts) if text_parts else None,
+        tool_calls=tuple(tool_calls),
+        usage=normalize_usage(usage) if usage else {},
+    )
 

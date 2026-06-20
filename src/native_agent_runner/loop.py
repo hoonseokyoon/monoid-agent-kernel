@@ -42,6 +42,7 @@ from native_agent_runner.core.agents import (
 from native_agent_runner.core.manifest import build_run_manifest
 from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
 from native_agent_runner.core.result import AgentRunResult, AgentTurnResult, Suspension
+from native_agent_runner.core.streaming import QueueEventSink, RunStream
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
@@ -73,8 +74,10 @@ from native_agent_runner.permissions import PermissionPolicy, matches_path_patte
 from native_agent_runner.providers.base import (
     ModelAdapter,
     ModelRequest,
+    ModelStreamChunk,
     ModelTurn,
     ToolObservation,
+    assemble_streamed_turn,
     format_async_result_text,
 )
 from native_agent_runner.public_view import (
@@ -362,6 +365,9 @@ class AgentLoop:
     # async caller drives the run on its own loop. Torn down by _maybe_close_loop.
     _owned_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False)
     _owned_loop_thread: threading.Thread | None = field(default=None, init=False, repr=False)
+    # Dormant sink installed on the run's EventBus at bootstrap; astream activates it to tap
+    # orchestration events and relay token deltas onto a stream queue. None until bootstrap.
+    _stream_sink: QueueEventSink | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
@@ -427,6 +433,56 @@ class AgentLoop:
         session = self._require_open()
         suspension = await self.arun_until_suspended(user_input)
         while suspension.reason == "awaiting_tasks":
+            await asyncio.to_thread(
+                self._wait_for_background_jobs,
+                session.res.context,
+                session.res.recorder,
+                session.res.deadline,
+            )
+            suspension = await self.arun_until_suspended(None)
+        assert suspension.turn is not None  # non-awaiting reasons always checkpoint
+        return suspension.turn
+
+    def astream(self, user_input: str | tuple[ContentPart, ...]) -> RunStream:
+        """Stream one user turn live: the async-CM analog of :meth:`asubmit`.
+
+        Requires an open run (call :meth:`aopen`) and must be driven on the caller's running
+        event loop. Yields ``AgentEvent`` (orchestration) interleaved with ``ModelStreamChunk``
+        (token deltas, when the adapter exposes ``astream_turn``); read ``stream.result`` after
+        the stream drains. Auto-waits in-process background jobs like ``asubmit`` and ends the
+        stream when the run parks on an external hosted task (surfaced as ``stream.suspension``,
+        alongside a ``run.awaiting_input`` event)::
+
+            await loop.aopen()
+            async with loop.astream("go") as stream:
+                async for item in stream:
+                    ...
+            result = stream.result
+        """
+        self._require_open()
+        sink = self._stream_sink
+        if sink is None:  # pragma: no cover — _require_open guarantees a bootstrapped sink
+            raise NativeAgentError("run is not open; call aopen() first", error_code="run_not_open")
+        if self.cancellation_token is None:
+            # Cooperative cancel (on early break) needs a token the boundary checks observe.
+            self.cancellation_token = CancellationToken()
+        token = self.cancellation_token
+        return RunStream(
+            sink=sink,
+            drive_factory=lambda: self._astream_drive(user_input),
+            request_cancel=token.cancel,
+        )
+
+    async def _astream_drive(
+        self, user_input: str | tuple[ContentPart, ...]
+    ) -> AgentTurnResult | Suspension:
+        """``asubmit``'s body, but yields (instead of blocking) when the run parks on an
+        external hosted task — the caller resumes via a fresh stream after reporting it."""
+        session = self._require_open()
+        suspension = await self.arun_until_suspended(user_input)
+        while suspension.reason == "awaiting_tasks":
+            if suspension.has_external:
+                return suspension
             await asyncio.to_thread(
                 self._wait_for_background_jobs,
                 session.res.context,
@@ -656,8 +712,17 @@ class AgentLoop:
         sync ``next_turn`` to a thread so the event loop is never blocked on the LLM call.
 
         Backward compatible: an adapter exposing ``async def anext_turn`` is awaited; a
-        coroutine ``next_turn`` is awaited; a plain sync ``next_turn`` runs in a thread."""
+        coroutine ``next_turn`` is awaited; a plain sync ``next_turn`` runs in a thread.
+
+        While a stream is active and the adapter supports ``astream_turn``, the streaming
+        path is preferred: token chunks are relayed to the stream queue and folded into a
+        ``ModelTurn`` so the rest of the turn is identical to the non-streamed path."""
         adapter = self.model_adapter
+        sink = self._stream_sink
+        if sink is not None and sink.active:
+            astream_turn = getattr(adapter, "astream_turn", None)
+            if astream_turn is not None:
+                return await self._acall_model_streaming(astream_turn, request, sink)
         anext = getattr(adapter, "anext_turn", None)
         if anext is not None:
             return await anext(request)
@@ -665,6 +730,20 @@ class AgentLoop:
         if inspect.iscoroutinefunction(next_turn):
             return await next_turn(request)
         return await asyncio.to_thread(next_turn, request)
+
+    async def _acall_model_streaming(
+        self,
+        astream_turn: Callable[[ModelRequest], Any],
+        request: ModelRequest,
+        sink: QueueEventSink,
+    ) -> ModelTurn:
+        """Drive an adapter's ``astream_turn``: relay each chunk to the live stream and
+        accumulate them into the turn's ``ModelTurn`` (see ``assemble_streamed_turn``)."""
+        chunks: list[ModelStreamChunk] = []
+        async for chunk in astream_turn(request):
+            sink.push_delta(chunk)
+            chunks.append(chunk)
+        return assemble_streamed_turn(chunks)
 
     def _record_failure(self, state: RunState, res: _RunResources, exc: Exception) -> None:
         state.status = "failed"
@@ -1022,10 +1101,13 @@ class AgentLoop:
             self.permission_policy = self.spec.permission_policy
         workspace_factory = self.workspace_factory or default_local_workspace_factory
         workspace = workspace_factory(self.spec)
+        # A dormant stream sink rides on the EventBus for the whole run; astream activates it
+        # per stream (no EventBus mutation, supports sequential streams). Inert otherwise.
+        self._stream_sink = QueueEventSink()
         recorder = AgentRecorder(
             self.spec.run_root,
             self.spec.run_id,
-            extra_event_sinks=self.event_sinks,
+            extra_event_sinks=(*self.event_sinks, self._stream_sink),
             status_file=self.status_file,
             reopen=self._restoring,
         )
