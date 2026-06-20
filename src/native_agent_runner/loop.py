@@ -1277,6 +1277,10 @@ class AgentLoop:
         context = res.context
         recorder = res.recorder
         deadline = res.deadline
+        # Bind the run's (always-on) loop so background shell jobs schedule their asyncio
+        # subprocess monitors onto it — they then progress while the run is parked between
+        # turns, on the same single loop that drives the run.
+        context.job_manager.bind_loop(asyncio.get_running_loop())
         # The per-submit step budget continues across task-wait suspensions within one
         # submit; session_step is the global, monotonic turn counter for turn ids.
         max_steps = self.spec.limits.max_steps

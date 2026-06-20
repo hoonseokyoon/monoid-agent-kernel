@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from conftest import runtime_config, runtime_provider
+from conftest import runtime_config, runtime_provider, tool_binding
 
 from native_agent_runner.core.spec import AgentRunSpec, RunLimits
 from native_agent_runner.errors import NativeAgentError
@@ -106,6 +106,67 @@ def test_async_and_sync_paths_agree(tmp_path: Path) -> None:
 
     assert sync_result.status == async_result.status == "completed"
     assert sync_result.final_text == async_result.final_text == "settled"
+
+
+def _python_command(code: str) -> str:
+    escaped = code.replace('"', '\\"')
+    return f'python -c "{escaped}"'
+
+
+def test_background_shell_job_completes_on_run_loop_and_reenters(tmp_path: Path) -> None:
+    # B2: a background (resume_on_exit) shell job runs its asyncio subprocess monitor on the
+    # run's always-on loop. The run parks, the monitor completes the subprocess on that loop
+    # (no per-job thread, no 20ms poll), and the result reenters as an observation so the
+    # next turn settles.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(
+                    fake_tool_call(
+                        "shell_exec",
+                        {"command": _python_command("print('bg-done')"), "background": True},
+                        "c1",
+                    ),
+                ),
+            ),
+            # The job is still running here, so this turn parks (awaiting_tasks) rather than
+            # settling; its final_text is discarded.
+            ModelTurn(response_id="r2", final_text="still running"),
+            # Reentry turn: the job result has been delivered, so this settles.
+            ModelTurn(response_id="r3", final_text="done"),
+        ]
+    )
+    config = runtime_config(
+        bindings=(
+            tool_binding(
+                "shell.exec",
+                runtime={"shell": {"approval_mode": "auto-approve", "default_timeout_s": 30}},
+            ),
+            tool_binding("run.finish"),
+        )
+    )
+    result = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+    ).run_once("Run a background job.")
+
+    assert result.status == "completed"
+    assert result.final_text == "done"
+    # The run parked and resumed: the model saw a later turn carrying the job result.
+    assert len(adapter.requests) >= 3
+    job_results = [
+        obs
+        for request in adapter.requests
+        for obs in request.observations
+        if obs.output.get("type") == "background_job_result"
+    ]
+    assert job_results and job_results[0].output["status"] == "exited"
+    events = result.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8")
+    assert "job.started" in events and "job.finished" in events
 
 
 def test_concurrent_runs_interleave_on_one_loop(tmp_path: Path) -> None:
