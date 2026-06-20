@@ -161,6 +161,22 @@ def test_unknown_runtime_tool_ref_fails_run(tmp_path: Path) -> None:
     assert "missing.tool" in result.error
 
 
+def test_unknown_tool_message_lists_tools_and_suggests(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register_many(builtin_tools(LocalWorkspaceBackend(_workspace(tmp_path))))
+    config = _config(_binding("fs.writ"))  # typo of fs.write
+
+    try:
+        validate_runtime_config(config, registry)
+    except Exception as exc:
+        message = str(exc)
+        assert "fs.writ" in message
+        assert "Did you mean 'fs.write'?" in message
+        assert "Available tools:" in message and "fs.read" in message
+    else:  # pragma: no cover
+        raise AssertionError("accepted unknown tool ref")
+
+
 def test_agent_loop_requires_runtime_config_provider(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])

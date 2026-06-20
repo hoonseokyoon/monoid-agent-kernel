@@ -18,18 +18,16 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from native_agent_runner.core.agents import AgentRuntimeConfig, RegistryToolRef, RuntimeConfigProvider, ToolBinding
+from native_agent_runner.core.agents import (
+    AgentRuntimeConfig,
+    RegistryToolRef,
+    StaticRuntimeConfigProvider,
+    ToolBinding,
+)
 from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.core.tool_surface import ToolAuthorizationDecision, ToolExposure, ToolGuidance, ToolQuota, ToolScope
 
-
-class StaticRuntimeConfigProvider(RuntimeConfigProvider):
-    def __init__(self, config: AgentRuntimeConfig) -> None:
-        self.config = config
-
-    def current_config(self, run_id: str) -> AgentRuntimeConfig | None:
-        del run_id
-        return self.config
+__all__ = ["StaticRuntimeConfigProvider"]
 
 
 def tool_binding(

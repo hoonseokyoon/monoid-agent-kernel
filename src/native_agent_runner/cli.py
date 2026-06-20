@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import click
 
-from native_agent_runner.core.agents import AgentDefinition, AgentRuntimeConfig, RuntimeConfigProvider
+from native_agent_runner.core.agents import (
+    AgentDefinition,
+    AgentRuntimeConfig,
+    StaticRuntimeConfigProvider,
+)
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import RunnerBackend
 from native_agent_runner.reference._shared.tokens import TokenManager
@@ -57,15 +61,6 @@ from native_agent_runner.reference.web_gateway.providers import (
     SearchFetchContextProvider,
 )
 from native_agent_runner.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
-
-
-@dataclass(frozen=True)
-class StaticRuntimeConfigProvider(RuntimeConfigProvider):
-    config: AgentRuntimeConfig
-
-    def current_config(self, run_id: str) -> AgentRuntimeConfig | None:
-        del run_id
-        return self.config
 
 
 @click.group()

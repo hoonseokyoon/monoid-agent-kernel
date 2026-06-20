@@ -15,6 +15,18 @@ and web gateway integration.
   tool/shell/web policy inputs have left the core, backend, and CLI execution
   paths.
 
+### Stability
+
+Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
+
+- **Stable**: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig` /
+  `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `tool`, `EventSink`,
+  `CheckpointStore`, `PermissionPolicy`, and the rest of `contracts`.
+- **Experimental**: async-task seams (`TaskExecutor`, `ResultInjector`,
+  `TaskReporter`); multimodal content parts (`ImagePart` / `DocumentPart`
+  round-trip but are not yet forwarded to models).
+- **Not a contract**: `native_agent_runner.reference.*` (example services).
+
 ## Python Contracts
 
 ### AgentLoop
@@ -24,7 +36,13 @@ event_sinks=(), status_file=True, permission_policy=PermissionPolicy(),
 cancellation_token=None, shell_approval_provider=None, web_gateway_client=None)`
 runs a single agent against one workspace.
 
-`runtime_config_provider` is required. The loop reads the current config at
+`runtime_config_provider` is required, but accepts any of three forms — a
+`RuntimeConfigProvider`, a bare `AgentRuntimeConfig`, or a
+`callable(run_id) -> AgentRuntimeConfig | None` — which the loop coerces to a
+provider. `AgentLoop.from_config(spec, model_adapter, runtime_config, **kwargs)`
+wraps a fixed config and forwards the remaining optional seams in one call.
+`StaticRuntimeConfigProvider` / `static_runtime_config(config)` are the explicit
+fixed-config provider. The loop reads the current config at
 bootstrap and at each turn boundary. A config change applies to the next turn.
 The `ToolSurfaceSnapshot` and `BoundToolCatalog` used by a turn stay fixed for
 that turn.

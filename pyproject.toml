@@ -12,7 +12,6 @@ license = { text = "Proprietary" }
 dependencies = [
     "click>=8.1",
     "jsonschema>=4.21",
-    "openai>=1.80",
     "pydantic>=2.6",
 ]
 
@@ -20,12 +19,20 @@ dependencies = [
 dev = [
     "pytest>=8.2",
 ]
+# Direct OpenAI provider adapter (local smoke tests only). Container / CSP-integrated
+# runs use GatewayModelAdapter and do not need this. The import is lazy, so the package
+# imports and OpenAIModelAdapter instantiates without it; only next_turn() requires it.
+openai = [
+    "openai>=1.80",
+]
 
 [project.scripts]
 native-agent = "native_agent_runner.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/native_agent_runner"]
+# Ship the PEP 561 marker so downstream type-checkers honor our inline type hints.
+force-include = { "src/native_agent_runner/py.typed" = "native_agent_runner/py.typed" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

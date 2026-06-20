@@ -13,6 +13,9 @@ from native_agent_runner.contracts import *  # noqa: F401,F403
 
 # Core conveniences (not contract types, but part of the core runner surface).
 from native_agent_runner.providers.gateway import GatewayModelAdapter
+from native_agent_runner.providers.fake import FakeModelAdapter
+from native_agent_runner.providers.openai import OpenAIModelAdapter
+from native_agent_runner.workspace.local import default_local_workspace_factory
 from native_agent_runner.core.packages import (
     apply_package,
     create_approval,
@@ -39,6 +42,9 @@ __all__ = [
     *contracts.__all__,
     # core conveniences
     "GatewayModelAdapter",
+    "FakeModelAdapter",
+    "OpenAIModelAdapter",
+    "default_local_workspace_factory",
     "apply_package",
     "create_approval",
     "export_package",

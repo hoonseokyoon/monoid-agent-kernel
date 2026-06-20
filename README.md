@@ -16,6 +16,63 @@ Python and HTTP wire contracts.
 For the dynamic binding-based tool surface, see
 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md).
 
+## Install
+
+```bash
+pip install native-agent-runner
+```
+
+Core has no provider SDK dependency. The direct OpenAI adapter (local smoke tests only;
+container/CSP runs use `GatewayModelAdapter`) is an optional extra:
+
+```bash
+pip install "native-agent-runner[openai]"
+```
+
+## Quickstart (no servers)
+
+The smallest run needs three of your objects — a spec, a model adapter, and a runtime
+config — and `from_config` wires them in one call. `FakeModelAdapter` (a scripted model)
+makes the first turn run offline, with no gateway or API key:
+
+```python
+from native_agent_runner import AgentLoop, AgentRunSpec, AgentRuntimeConfig, FakeModelAdapter
+from native_agent_runner import RegistryToolRef, ToolBinding
+from native_agent_runner.providers.base import ModelTurn
+
+spec = AgentRunSpec(workspace_root="./workspace", mode="apply")
+config = AgentRuntimeConfig(
+    definition_id="quickstart",
+    tools=(ToolBinding(binding_id="fs.write", ref=RegistryToolRef("fs.write")),),
+)
+adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+
+result = AgentLoop.from_config(spec, adapter, config).run_once("Summarize notes.md")
+```
+
+`from_config`'s `runtime_config` accepts a bare `AgentRuntimeConfig`, a
+`RuntimeConfigProvider`, or a `callable(run_id) -> AgentRuntimeConfig` (hot-reload). See
+[`examples/minimal_quickstart.py`](examples/minimal_quickstart.py) for a complete file and
+[`examples/custom_model_adapter.py`](examples/custom_model_adapter.py) for implementing
+your own `ModelAdapter`. Author tools from typed functions with the `@tool` decorator
+(see [`examples/custom_tools/word_count_tool.py`](examples/custom_tools/word_count_tool.py));
+`generated_tool_bindings(...)` then turns a set of `ToolSpec`s into bindings.
+
+## Stability
+
+This package is pre-1.0 (`0.x`): the public surface may change between minor versions, but
+breaking changes are called out in commit messages and this README.
+
+- **Stable** — the engine and core contracts: `AgentLoop`, `AgentRunSpec`,
+  `AgentRuntimeConfig` / `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `@tool`,
+  `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest of
+  `native_agent_runner.contracts`.
+- **Experimental** — surfaces still settling: the async-task seams (`TaskExecutor`,
+  `ResultInjector`, `TaskReporter`) and the multimodal content parts (`ImagePart` /
+  `DocumentPart` round-trip but are not yet forwarded to models).
+- **Not a contract** — everything under `native_agent_runner.reference.*` is an example
+  implementation; build your own services against the contracts instead.
+
 Agent configuration is centered on `AgentDefinition` and mutable
 `AgentRuntimeConfig`. A definition describes the reusable agent blueprint, while
 runtime config carries the current prompt and `ToolBinding` set for a run.
