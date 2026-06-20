@@ -353,6 +353,11 @@ class AgentLoop:
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
+    # Core-owned per-run event loop for sync callers (the facade reuses ONE loop across
+    # turns instead of asyncio.run-per-call, so background asyncio tasks can span turns —
+    # see _run_sync). None when never driven synchronously or when an async caller drives
+    # the run on its own loop. Torn down by _maybe_close_loop (from the caller thread).
+    _owned_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
@@ -549,13 +554,20 @@ class AgentLoop:
         if session.state.status == "completed":
             self._checkpoint_store().delete(self.spec.run_id)
         self._session = None
+        # Multi-turn sync usage (open/submit*/close) ends here, in the caller thread, so the
+        # owned loop is torn down now. The run_once path calls close() from within the loop;
+        # there _maybe_close_loop is a no-op and run_once's finally does the teardown.
+        self._maybe_close_loop()
         return result
 
     def run_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
         """One-shot convenience: open() + submit(user_input) + close().
 
         Sync facade over :meth:`arun_once`; from an async context call ``arun_once``."""
-        return self._run_sync(self.arun_once(user_input))
+        try:
+            return self._run_sync(self.arun_once(user_input))
+        finally:
+            self._maybe_close_loop()
 
     async def arun_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
         """Async form of :meth:`run_once`."""
@@ -580,18 +592,42 @@ class AgentLoop:
     def _run_sync(self, coro: Any) -> Any:
         """Drive an async core method to completion from a synchronous caller.
 
-        Raises a clear error (rather than asyncio's generic one) when invoked inside a
-        running event loop, pointing the caller at the async API."""
+        Reuses ONE core-owned event loop across the run's turns (not asyncio.run per call),
+        so background asyncio tasks created in one turn can span to the next — every wait
+        path re-enters this loop, letting those tasks make progress and cross-thread
+        ``call_soon_threadsafe`` wakeups land. Raises a clear error (rather than asyncio's
+        generic one) when invoked inside a running event loop, pointing at the async API."""
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(coro)
-        coro.close()
-        raise NativeAgentError(
-            "sync API called inside a running event loop; await the async API "
-            "(arun_once / asubmit / arun_until_suspended) instead",
-            error_code="sync_in_async_loop",
-        )
+            pass
+        else:
+            coro.close()
+            raise NativeAgentError(
+                "sync API called inside a running event loop; await the async API "
+                "(arun_once / asubmit / arun_until_suspended) instead",
+                error_code="sync_in_async_loop",
+            )
+        if self._owned_loop is None:
+            self._owned_loop = asyncio.new_event_loop()
+        return self._owned_loop.run_until_complete(coro)
+
+    def _maybe_close_loop(self) -> None:
+        """Tear down the core-owned loop, but only from outside it. ``run_once`` calls
+        ``close()`` from within ``arun_once`` (i.e. on the owned loop), so close() must not
+        drop the loop it is running on — the run_once facade closes it afterward, from the
+        caller thread."""
+        loop = self._owned_loop
+        if loop is None:
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            return
+        loop.close()
+        self._owned_loop = None
 
     async def _acall_model(self, request: ModelRequest) -> ModelTurn:
         """Invoke the model adapter, awaiting an async adapter natively or offloading a
