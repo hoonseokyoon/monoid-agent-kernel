@@ -24,6 +24,7 @@ from native_agent_runner.core.packages import (
     verify_package,
 )
 from native_agent_runner.core.projections import project_run_status
+from native_agent_runner.observability import OtelEventSink
 from native_agent_runner.tasks import (
     TaskManager,
     get_job_artifact,
@@ -52,6 +53,7 @@ __all__ = [
     "import_package",
     "verify_package",
     "project_run_status",
+    "OtelEventSink",
     "TaskManager",
     "get_job_artifact",
     "list_job_artifacts",

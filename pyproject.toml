@@ -19,6 +19,8 @@ dependencies = [
 dev = [
     "pytest>=8.2",
     "httpx>=0.27",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
 ]
 # Direct OpenAI provider adapter (local smoke tests only). Container / CSP-integrated
 # runs use GatewayModelAdapter and do not need this. The import is lazy, so the package
@@ -32,6 +34,12 @@ openai = [
 # unaffected.
 http-async = [
     "httpx>=0.27",
+]
+# OpenTelemetry tracing (OtelEventSink). Only opentelemetry-api is needed (a no-op without
+# an SDK/exporter); the import is lazy, so the package imports without it. The application
+# installs opentelemetry-sdk + an exporter to actually emit spans.
+otel = [
+    "opentelemetry-api>=1.20",
 ]
 
 [project.scripts]
