@@ -22,6 +22,15 @@ def file_size(path: Path) -> int:
         return 0
 
 
+def proc_group_kwargs() -> dict[str, object]:
+    """Platform kwargs that put a child in its own process group so the whole tree can
+    be terminated together by :func:`terminate_process`. Shared by the sync ``Popen`` and
+    the asyncio (``create_subprocess_exec``) spawn paths so they behave identically."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"preexec_fn": os.setsid}
+
+
 def spawn_process(
     argv: list[str],
     *,
@@ -36,12 +45,6 @@ def spawn_process(
     ``setsid``) lets the whole child tree be terminated together by
     :func:`terminate_process`.
     """
-    creationflags = 0
-    preexec_fn = None
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        preexec_fn = os.setsid
     return subprocess.Popen(
         argv,
         cwd=cwd,
@@ -49,8 +52,7 @@ def spawn_process(
         stdin=subprocess.DEVNULL,
         stdout=stdout,
         stderr=stderr,
-        creationflags=creationflags,
-        preexec_fn=preexec_fn,
+        **proc_group_kwargs(),  # type: ignore[arg-type]
     )
 
 

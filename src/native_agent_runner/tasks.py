@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import subprocess
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from native_agent_runner._proc import file_size, spawn_process, terminate_process
+from native_agent_runner._proc import file_size, proc_group_kwargs, terminate_process
 from native_agent_runner.core._util import write_json_atomic
 from native_agent_runner.errors import ToolExecutionError, WorkspaceError
 from native_agent_runner.permissions import PermissionPolicy
@@ -284,8 +285,13 @@ class ShellTaskExecutor:
             tmp_root=tmp_root,
             before_snapshot=before_snapshot,
         )
+        # Spawn the subprocess on the always-on job loop and wait (in this offloaded worker
+        # thread) for it to start, so a spawn failure still surfaces synchronously as a
+        # ToolExecutionError. The monitor then runs as a background coroutine on that loop.
         try:
-            job.process = _spawn_process(argv, cwd=cwd_abs, env=safe_env, stdout_path=stdout_path, stderr_path=stderr_path)
+            job.process = manager.schedule_job_coroutine(
+                self._aspawn(argv, cwd_abs, safe_env, stdout_path, stderr_path)
+            ).result()
         except Exception as exc:
             job.status = "failed"
             job.error = str(exc)
@@ -296,13 +302,8 @@ class ShellTaskExecutor:
 
         manager._register(job)
         manager.recorder.emit("job.started", data=manager._public_job_payload(job))
-        thread = threading.Thread(
-            target=self._monitor_job,
-            args=(manager, job_id),
-            name=f"native-agent-job-{job_id}",
-            daemon=True,
-        )
-        thread.start()
+        # Monitor the subprocess on the same always-on loop — no per-job thread, no poll.
+        manager.schedule_job_coroutine(self._amonitor(manager, job_id))
         if startup_wait_s > 0:
             manager._wait_startup(job_id, startup_wait_s)
         return job
@@ -336,16 +337,47 @@ class ShellTaskExecutor:
             raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
         return cwd_abs, tmp_root, before
 
-    def _monitor_job(self, manager: TaskManager, job_id: str) -> None:
+    async def _aspawn(
+        self,
+        argv: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        stdout_path: Path,
+        stderr_path: Path,
+    ) -> asyncio.subprocess.Process:
+        """Create the subprocess on the job loop, redirecting output to the job's log files
+        (the child keeps its own fds, so the handles are closed once it has started)."""
+        stdout_handle = stdout_path.open("ab")
+        stderr_handle = stderr_path.open("ab")
+        try:
+            return await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd),
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                **proc_group_kwargs(),  # type: ignore[arg-type]
+            )
+        finally:
+            stdout_handle.close()
+            stderr_handle.close()
+
+    async def _amonitor(self, manager: TaskManager, job_id: str) -> None:
         job = manager.get_job(job_id)
         try:
-            self._monitor_process(manager, job)
-            if job.execution_workspace == "isolated-copy" and job.status == "exited":
-                after = shell_runtime.scan_materialized_workspace(job.tmp_root, manager.permission_policy)
-                changed = shell_runtime.sync_workspace_changes(manager.workspace, job.before_snapshot, after)
-                job.changed_paths = tuple(changed)
-            elif job.execution_workspace == "direct":
-                job.changed_paths = tuple(manager.workspace.changed_paths())
+            proc = job.process
+            if proc is None:
+                job.status = "failed"
+                job.error = "process was not started"
+            else:
+                await self._await_completion(manager, job, proc)
+                if job.execution_workspace == "isolated-copy" and job.status == "exited":
+                    after = shell_runtime.scan_materialized_workspace(job.tmp_root, manager.permission_policy)
+                    changed = shell_runtime.sync_workspace_changes(manager.workspace, job.before_snapshot, after)
+                    job.changed_paths = tuple(changed)
+                elif job.execution_workspace == "direct":
+                    job.changed_paths = tuple(manager.workspace.changed_paths())
         except Exception as exc:
             job.status = "failed"
             job.error = str(exc)
@@ -358,30 +390,38 @@ class ShellTaskExecutor:
             self._cleanup_tmp(job)
             manager.mark_ready(job)
 
-    def _monitor_process(self, manager: TaskManager, job: BackgroundJob) -> None:
-        process = job.process
-        if process is None:
-            job.status = "failed"
-            job.error = "process was not started"
-            return
-        while process.poll() is None:
+    async def _await_completion(
+        self, manager: TaskManager, job: BackgroundJob, proc: asyncio.subprocess.Process
+    ) -> None:
+        # Await exit, waking every 0.25s only to check cancel/timeout/output (event-driven on
+        # exit — no 20ms busy poll). terminate_process is offloaded so taskkill/killpg never
+        # blocks the shared job loop.
+        while True:
+            try:
+                job.exit_code = await asyncio.wait_for(proc.wait(), timeout=0.25)
+                break
+            except asyncio.TimeoutError:
+                pass
             now = time.time()
             stdout_bytes = file_size(job.stdout_path)
             stderr_bytes = file_size(job.stderr_path)
             total_bytes = stdout_bytes + stderr_bytes
             if job.cancel_path.exists():
                 job.status = "cancelled"
-                terminate_process(process)
+                await asyncio.to_thread(terminate_process, proc)
+                job.exit_code = await proc.wait()
                 break
             if now - job.started_at >= job.timeout_s:
                 job.status = "timed_out"
                 job.timed_out = True
-                terminate_process(process)
+                await asyncio.to_thread(terminate_process, proc)
+                job.exit_code = await proc.wait()
                 break
             if total_bytes > job.max_output_bytes:
                 job.status = "output_limited"
                 job.output_truncated = True
-                terminate_process(process)
+                await asyncio.to_thread(terminate_process, proc)
+                job.exit_code = await proc.wait()
                 break
             if total_bytes != job._last_output_event_bytes and now - job._last_output_event_at >= 0.25:
                 job.stdout_bytes = stdout_bytes
@@ -390,12 +430,6 @@ class ShellTaskExecutor:
                 job._last_output_event_bytes = total_bytes
                 manager.recorder.emit("job.output.updated", data=manager._public_job_payload(job))
                 manager._write_job(job)
-            time.sleep(0.02)
-        try:
-            job.exit_code = process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            job.exit_code = process.wait(timeout=2)
         if job.status == "running":
             job.status = "exited"
         job.stdout_bytes = file_size(job.stdout_path)
@@ -654,6 +688,14 @@ class TaskManager:
     _condition: threading.Condition = field(init=False, repr=False)
     _reentry_queue: list[str] = field(default_factory=list, init=False, repr=False)
     _delivered_reentry_jobs: set[str] = field(default_factory=set, init=False, repr=False)
+    # The always-on event loop background shell jobs run their asyncio subprocess monitors
+    # on. In production it is the run's own loop, bound by AgentLoop._apump_turn via
+    # bind_loop(); when TaskManager is used standalone (unit tests) a private daemon-thread
+    # loop is started lazily as a fallback. Either way one loop, always running, hosts the
+    # subprocess coroutines so they progress while the run is parked between turns.
+    _run_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False)
+    _task_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False)
+    _task_loop_thread: threading.Thread | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._condition = threading.Condition(self._lock)
@@ -674,6 +716,46 @@ class TaskManager:
         with self._condition:
             self.jobs[job.job_id] = job
             self._write_job(job)
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Bind the run's event loop (called by AgentLoop._apump_turn while running on it).
+        Background shell jobs schedule their subprocess monitors onto this loop so they
+        progress on the same always-on loop that drives the run."""
+        self._run_loop = loop
+
+    def _job_loop(self) -> asyncio.AbstractEventLoop:
+        """The loop to run subprocess monitors on: the bound run loop in production, else a
+        lazily-started private daemon-thread loop (standalone/unit-test fallback)."""
+        if self._run_loop is not None:
+            return self._run_loop
+        if self._task_loop is None:
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever, name=f"nar-tasks-{self.run_id}", daemon=True
+            )
+            thread.start()
+            self._task_loop = loop
+            self._task_loop_thread = thread
+        return self._task_loop
+
+    def schedule_job_coroutine(self, coro: Any) -> Any:
+        """Schedule a job coroutine on the job loop from any thread; returns a
+        concurrent.futures.Future. Used by ShellTaskExecutor (which runs in an offloaded
+        worker thread) to spawn/monitor a subprocess on the always-on loop."""
+        return asyncio.run_coroutine_threadsafe(coro, self._job_loop())
+
+    def _shutdown_task_loop(self) -> None:
+        """Stop the private fallback loop if one was started. The bound run loop is owned by
+        AgentLoop and is never stopped here."""
+        loop, thread = self._task_loop, self._task_loop_thread
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(timeout=5)
+        loop.close()
+        self._task_loop = None
+        self._task_loop_thread = None
 
     def checkpoint_payload(self) -> dict[str, Any]:
         """Read-only durable snapshot of the hosted tasks and reentry bookkeeping for
@@ -913,12 +995,25 @@ class TaskManager:
             job = self.get_job(job_id)
             if job.status == "running":
                 self.cancel(job_id)
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            with self._condition:
-                if all(job.status != "running" for job in self.jobs.values()):
-                    return
-            time.sleep(0.05)
+        # cancel() above synchronously terminates each subprocess, so the children are
+        # already dying. The wait below only lets the monitor coroutines observe the deaths
+        # and settle status. If we are ON the job loop thread (run_once's close() runs there),
+        # we must NOT block it — the monitors need this very loop to run — so skip the wait;
+        # the processes are already terminated.
+        try:
+            on_job_loop = asyncio.get_running_loop() is self._run_loop and self._run_loop is not None
+        except RuntimeError:
+            on_job_loop = False
+        try:
+            if not on_job_loop:
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    with self._condition:
+                        if all(job.status != "running" for job in self.jobs.values()):
+                            return
+                    time.sleep(0.05)
+        finally:
+            self._shutdown_task_loop()
 
     def _wait_startup(self, job_id: str, startup_wait_s: int) -> None:
         deadline = time.time() + startup_wait_s
@@ -1017,20 +1112,3 @@ def _job_dir(run_dir: Path, job_id: str) -> Path:
     return path
 
 
-def _spawn_process(
-    argv: list[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    stdout_path: Path,
-    stderr_path: Path,
-) -> subprocess.Popen[bytes]:
-    stdout_handle = stdout_path.open("ab")
-    stderr_handle = stderr_path.open("ab")
-    try:
-        return spawn_process(
-            argv, cwd=cwd, env=env, stdout=stdout_handle, stderr=stderr_handle
-        )
-    finally:
-        stdout_handle.close()
-        stderr_handle.close()

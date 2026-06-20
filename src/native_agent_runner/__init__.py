@@ -13,7 +13,7 @@ from native_agent_runner.contracts import *  # noqa: F401,F403
 
 # Core conveniences (not contract types, but part of the core runner surface).
 from native_agent_runner.providers.gateway import GatewayModelAdapter
-from native_agent_runner.providers.fake import FakeModelAdapter
+from native_agent_runner.providers.fake import FakeModelAdapter, FakeStreamingModelAdapter
 from native_agent_runner.providers.openai import OpenAIModelAdapter
 from native_agent_runner.workspace.local import default_local_workspace_factory
 from native_agent_runner.core.packages import (
@@ -24,6 +24,8 @@ from native_agent_runner.core.packages import (
     verify_package,
 )
 from native_agent_runner.core.projections import project_run_status
+from native_agent_runner.observability import OtelEventSink
+from native_agent_runner.mcp import McpError, McpToolProvider
 from native_agent_runner.tasks import (
     TaskManager,
     get_job_artifact,
@@ -43,6 +45,7 @@ __all__ = [
     # core conveniences
     "GatewayModelAdapter",
     "FakeModelAdapter",
+    "FakeStreamingModelAdapter",
     "OpenAIModelAdapter",
     "default_local_workspace_factory",
     "apply_package",
@@ -51,6 +54,9 @@ __all__ = [
     "import_package",
     "verify_package",
     "project_run_status",
+    "OtelEventSink",
+    "McpToolProvider",
+    "McpError",
     "TaskManager",
     "get_job_artifact",
     "list_job_artifacts",

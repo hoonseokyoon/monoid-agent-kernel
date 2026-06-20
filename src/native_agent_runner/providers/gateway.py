@@ -4,6 +4,7 @@ import json
 import os
 import random
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,15 @@ from urllib.request import Request, urlopen
 from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.errors import ModelAdapterError
 from native_agent_runner.providers._common import build_reasoning_payload, normalize_usage
-from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolCall
+from native_agent_runner.providers.base import (
+    ModelRequest,
+    ModelStreamChunk,
+    ModelTurn,
+    TextDelta,
+    ToolCall,
+    ToolCallDelta,
+    TurnComplete,
+)
 from native_agent_runner.tools.base import ToolSpec
 
 DEFAULT_GATEWAY_URL_ENV = "NAR_LLM_GATEWAY_URL"
@@ -106,6 +115,68 @@ class GatewayModelAdapter:
         if last_error is not None:
             raise last_error
         raise ModelAdapterError("LLM gateway request failed", provider_error_code=GATEWAY_NETWORK_ERROR)
+
+    async def astream_turn(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
+        """Stream a turn from the gateway's SSE endpoint, yielding ``ModelStreamChunk``.
+
+        Opt-in: requires ``httpx`` (the ``[http-async]`` extra); the sync ``next_turn`` stays
+        on stdlib ``urllib``. Retries only the initial connect/non-200 status (before the
+        stream is committed) using the same ``ModelConfig.retry`` policy as ``next_turn``;
+        once the 200 stream is flowing, any error is terminal (no partial-stream replay).
+        """
+        try:
+            import httpx
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise ModelAdapterError(
+                "httpx is required for gateway streaming; install native-agent-runner[http-async]",
+                provider_error_code=GATEWAY_NETWORK_ERROR,
+            ) from exc
+
+        config = request.model or self.config
+        url = self._resolve_gateway_url(config).rstrip("/") + "/stream"
+        body = json.dumps(self._payload(request), ensure_ascii=False).encode("utf-8")
+        headers = self._headers()
+        retry = config.retry
+        max_attempts = max(1, retry.max_attempts)
+        last_error: ModelAdapterError | None = None
+        for attempt in range(1, max_attempts + 1):
+            committed = False
+            try:
+                async with httpx.AsyncClient(timeout=config.timeout_s) as client:
+                    async with client.stream("POST", url, headers=headers, content=body) as response:
+                        if response.status_code != 200:
+                            detail = (await response.aread()).decode("utf-8", errors="replace")
+                            error = _error_from_status_body(response.status_code, detail)
+                            if _should_retry(error, attempt, max_attempts, retry.retry_on):
+                                raise _StreamRetry(error)
+                            raise error
+                        committed = True
+                        async for chunk in _aiter_sse_chunks(response):
+                            yield chunk
+                return
+            except _StreamRetry as retry_signal:
+                last_error = retry_signal.error
+                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+            except httpx.HTTPError as exc:
+                if committed:
+                    # The stream already started; replaying would duplicate deltas. Terminal.
+                    raise ModelAdapterError(
+                        f"LLM gateway stream interrupted: {exc}",
+                        provider_error_code=GATEWAY_NETWORK_ERROR,
+                        retryable=False,
+                    ) from exc
+                error = ModelAdapterError(
+                    f"LLM gateway stream connection error: {exc}",
+                    provider_error_code=GATEWAY_NETWORK_ERROR,
+                    retryable=True,
+                )
+                if not _should_retry(error, attempt, max_attempts, retry.retry_on):
+                    raise error from exc
+                last_error = error
+                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+        if last_error is not None:
+            raise last_error
+        raise ModelAdapterError("LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR)
 
     def _resolve_gateway_url(self, config: ModelConfig) -> str:
         url = self.gateway_url or config.gateway_url or self.config.gateway_url or os.environ.get(DEFAULT_GATEWAY_URL_ENV)
@@ -223,6 +294,87 @@ def _parse_gateway_response(data: dict[str, Any]) -> ModelTurn:
         tool_calls=tuple(tool_calls),
         usage=normalize_usage(data.get("usage")),
         raw=data,
+    )
+
+
+class _StreamRetry(Exception):
+    """Internal signal: a pre-stream (non-200) failure that the retry loop should retry."""
+
+    def __init__(self, error: ModelAdapterError) -> None:
+        self.error = error
+
+
+async def _aiter_sse_chunks(response: Any) -> AsyncIterator[ModelStreamChunk]:
+    """Parse the gateway's ``text/event-stream`` body into ``ModelStreamChunk``s.
+
+    Minimal SSE: ``data:`` lines accumulate, a blank line dispatches one JSON frame, ``:``
+    comment lines (keepalives) are ignored, and a trailing frame without a terminating blank
+    line is still dispatched. An ``error`` frame raises ``ModelAdapterError``.
+    """
+    data_lines: list[str] = []
+    async for line in response.aiter_lines():
+        if line == "":
+            if data_lines:
+                chunk = _chunk_from_event(json.loads("\n".join(data_lines)))
+                data_lines = []
+                if chunk is not None:
+                    yield chunk
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip(" "))
+    if data_lines:
+        chunk = _chunk_from_event(json.loads("\n".join(data_lines)))
+        if chunk is not None:
+            yield chunk
+
+
+def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
+    event_type = event.get("type")
+    if event_type == "text_delta":
+        return TextDelta(text=str(event.get("text") or ""))
+    if event_type == "tool_call_delta":
+        return ToolCallDelta(
+            index=int(event.get("index") or 0),
+            arguments_fragment=str(event.get("arguments_fragment") or ""),
+            id=event.get("id"),
+            name=event.get("name"),
+        )
+    if event_type == "turn_complete":
+        # The gateway's opaque turn_handle is the continuation handle the core stores.
+        return TurnComplete(
+            response_id=event.get("turn_handle") or event.get("response_id"),
+            usage=normalize_usage(event.get("usage")),
+        )
+    if event_type == "error":
+        raise ModelAdapterError(
+            str(event.get("error") or "LLM gateway stream error"),
+            provider_error_code=str(event.get("error_code") or GATEWAY_BAD_RESPONSE),
+            retryable=bool(event.get("retryable", False)),
+            http_status=int(event["http_status"]) if event.get("http_status") is not None else None,
+        )
+    return None  # unknown frame type: forward-compatible, ignore
+
+
+def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
+    """Build a ModelAdapterError from a non-200 streaming response body (mirrors
+    ``_error_from_http_error`` for the streaming path)."""
+    error_payload: dict[str, Any] = {}
+    try:
+        parsed = json.loads(detail)
+        if isinstance(parsed, dict):
+            error_payload = parsed
+    except json.JSONDecodeError:
+        pass
+    provider_error_code = str(error_payload.get("error_code") or _error_code_for_http_status(status))
+    retryable = bool(error_payload.get("retryable", _retryable_for_http_status(status)))
+    message = str(error_payload.get("error") or detail or f"HTTP {status}")
+    return ModelAdapterError(
+        f"LLM gateway returned HTTP {status}: {message}",
+        provider_error_code=provider_error_code,
+        retryable=retryable,
+        http_status=status,
     )
 
 

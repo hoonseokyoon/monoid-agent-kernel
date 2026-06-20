@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import atexit
 import json
 import logging
-import queue
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import thread as _cf_thread
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -128,6 +131,19 @@ class BackendRunSubmission:
         }
 
 
+@dataclass(frozen=True)
+class _PreparedRun:
+    """The shared output of run setup (validate + tokens + stored record), before the run is
+    driven. Consumed by ``submit_run`` (autonomous) and ``astream_run`` (stream-driven)."""
+
+    run_id: str
+    record: BackendRunRecord
+    workspace_root: Path
+    run_token: str
+    llm_gateway_token: str
+    web_gateway_token: str
+
+
 @dataclass
 class BackendRunRecord:
     run_id: str
@@ -152,7 +168,13 @@ class BackendRunRecord:
     runtime_config_issuer: str = ""
     runtime_config_reason: str = ""
     loop: AgentLoop | None = None
-    message_queue: queue.Queue[Any] = field(default_factory=queue.Queue, repr=False)
+    # Pending user messages for a multi-turn session. asyncio.Queue (not queue.Queue) so the
+    # run coroutine awaits the next message WITHOUT holding a thread — a parked multi-turn
+    # session is just a suspended coroutine, not a blocked worker (which would exhaust the
+    # shared executor). Producers (send_message/cancel from other threads) enqueue via the
+    # backend's _call_soon so the put runs on the loop. Created without a running loop (3.10+
+    # binds lazily); all gets/puts happen on the shared loop.
+    message_queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue, repr=False)
 
 
 @dataclass
@@ -233,6 +255,68 @@ def _runtime_config_uses_web(config: AgentRuntimeConfig) -> bool:
     return any(binding.ref.tool_id.startswith("web.") for binding in config.tools)
 
 
+class _DaemonDetachedExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor whose worker threads are excluded from CPython's
+    interpreter-shutdown forced join.
+
+    ``concurrent.futures`` registers an ``atexit`` hook (run inside
+    ``threading._shutdown()``, BEFORE our ``atexit`` handlers) that joins EVERY
+    executor worker unconditionally — daemon flag notwithstanding. A worker stuck in
+    a long offloaded call (here, ``asyncio.to_thread(loop.wait_for_pending_tasks)``
+    for a multi-turn/recovered run that is parked awaiting a hosted-task result that
+    never arrives) therefore stalls process exit for up to ``task_wait_poll_s`` per
+    such worker — the "tests pass fast but the process takes minutes to exit" hang.
+
+    Spawned from the daemon run-loop thread, these workers are already daemon (they
+    inherit it), so the OS reclaims them at exit. We only drop them from the global
+    join registry so a blocked offload can never gate shutdown. New work is still
+    refused after ``shutdown()``; this changes nothing about in-process behavior."""
+
+    def _adjust_thread_count(self) -> None:  # type: ignore[override]
+        before = set(self._threads)
+        super()._adjust_thread_count()
+        for worker in self._threads - before:
+            _cf_thread._threads_queues.pop(worker, None)
+
+
+def _teardown_loop(
+    loop: asyncio.AbstractEventLoop,
+    thread: threading.Thread,
+    executor: ThreadPoolExecutor,
+) -> None:
+    """Stop the shared run loop, join its thread, and shut down its executor. Idempotent.
+    Idle executor workers exit promptly; a worker blocked in a long offloaded wait (e.g. an
+    idle multi-turn message-get) exits when that call returns."""
+    if loop.is_closed():
+        return
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    executor.shutdown(wait=False)
+    loop.close()
+
+
+# Process-wide shared run loop. One loop + one executor for the whole process, shared by
+# every RunnerBackend, so creating many short-lived backends (e.g. tests) never leaks
+# loop/executor threads — the previous per-backend loop accumulated threads and starved the
+# scheduler. Started lazily on a daemon thread; cleaned up at process exit via atexit.
+_shared_loop_lock = threading.Lock()
+_shared_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_shared_loop() -> asyncio.AbstractEventLoop:
+    global _shared_loop
+    with _shared_loop_lock:
+        if _shared_loop is None or _shared_loop.is_closed():
+            loop = asyncio.new_event_loop()
+            executor = _DaemonDetachedExecutor(max_workers=32, thread_name_prefix="nar-backend-io")
+            loop.set_default_executor(executor)
+            thread = threading.Thread(target=loop.run_forever, name="nar-backend-loop", daemon=True)
+            thread.start()
+            atexit.register(_teardown_loop, loop, thread, executor)
+            _shared_loop = loop
+        return _shared_loop
+
+
 @dataclass
 class RunnerBackend:
     run_root: Path
@@ -281,12 +365,14 @@ class RunnerBackend:
     _worker_id: str = field(default="", init=False, repr=False)
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _watchdog_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
-    _run_semaphore: threading.BoundedSemaphore | None = field(default=None, init=False, repr=False)
+    _run_semaphore: asyncio.BoundedSemaphore | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._worker_id = uuid.uuid4().hex
         if self.max_concurrent_runs > 0:
-            self._run_semaphore = threading.BoundedSemaphore(self.max_concurrent_runs)
+            # Bound on the shared run loop; constructed without a running loop (3.10+ binds
+            # lazily) and acquired/released inside the run coroutines.
+            self._run_semaphore = asyncio.BoundedSemaphore(self.max_concurrent_runs)
         self.run_root = self.run_root.resolve()
         self.run_root.mkdir(parents=True, exist_ok=True)
         roots = tuple(root.resolve() for root in self.allowed_workspace_roots)
@@ -299,7 +385,57 @@ class RunnerBackend:
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
 
+    # --- Shared event loop (coroutine-per-run) ------------------------------------------
+
+    def _spawn(self, coro: Any) -> Any:
+        """Schedule a coroutine on the process-shared run loop from any (sync) thread;
+        returns a concurrent.futures.Future."""
+        return asyncio.run_coroutine_threadsafe(coro, _get_shared_loop())
+
+    def _call_soon(self, fn: Callable[..., Any], *args: Any) -> None:
+        """Run a thread-safe callback on the process-shared run loop (fire-and-forget)."""
+        _get_shared_loop().call_soon_threadsafe(fn, *args)
+
+    def spawn_coroutine(self, coro: Any) -> Any:
+        """Schedule a coroutine on the process-shared run loop; returns a
+        ``concurrent.futures.Future``. The transport seam the SSE bridge uses to drive
+        ``astream_run`` on the shared loop from a sync handler thread."""
+        return self._spawn(coro)
+
+    def request_stream_cancel(self, run_id: str) -> None:
+        """Cooperatively cancel a stream-driven run (internal; the SSE handler calls this on
+        client disconnect or backpressure). No auth — the caller created the run via
+        ``astream_run``. A missing record (already drained) is a no-op."""
+        with self._lock:
+            record = self._records.get(run_id)
+        if record is not None:
+            record.cancellation_token.cancel()
+
+    def shutdown(self) -> None:
+        """Stop this backend's watchdog. The run loop is process-shared (one per process,
+        cleaned up at exit via atexit), so there is nothing per-backend to tear down — and
+        stopping it here would break other backends in the process. Idempotent."""
+        self.stop_watchdog()
+
     def submit_run(self, request: BackendRunRequest) -> BackendRunSubmission:
+        prepared = self._prepare_run_record(request)
+        # Run executes as a coroutine on the shared loop (coroutine-per-run), not a thread.
+        self._spawn(
+            self._run_run(
+                prepared.run_id,
+                request,
+                prepared.workspace_root,
+                prepared.llm_gateway_token,
+                prepared.web_gateway_token,
+            )
+        )
+        return self._submission_for(prepared)
+
+    def _prepare_run_record(self, request: BackendRunRequest) -> _PreparedRun:
+        """Validate the request, mint the three run tokens, and store a queued run record.
+
+        Shared by ``submit_run`` (autonomous drive) and ``astream_run`` (stream-driven). Stops
+        at "record stored under lock" — the caller owns how the run is then driven."""
         self._validate_request(request)
         workspace_root = request.workspace_root.resolve()
         self._check_workspace_allowed(workspace_root)
@@ -362,18 +498,22 @@ class RunnerBackend:
         )
         with self._lock:
             self._records[run_id] = record
-        thread = threading.Thread(
-            target=self._run_worker,
-            args=(run_id, request, workspace_root, llm_gateway_token, web_gateway_token),
-            name=f"native-agent-run-{run_id[:8]}",
-            daemon=True,
+        return _PreparedRun(
+            run_id=run_id,
+            record=record,
+            workspace_root=workspace_root,
+            run_token=run_token,
+            llm_gateway_token=llm_gateway_token,
+            web_gateway_token=web_gateway_token,
         )
-        thread.start()
+
+    def _submission_for(self, prepared: _PreparedRun) -> BackendRunSubmission:
+        run_id = prepared.run_id
         return BackendRunSubmission(
             run_id=run_id,
-            run_token=run_token,
+            run_token=prepared.run_token,
             status="queued",
-            run_dir=run_dir,
+            run_dir=prepared.record.run_dir,
             status_url=f"/v1/runs/{run_id}/status",
             result_url=f"/v1/runs/{run_id}/result",
             events_url=f"/v1/runs/{run_id}/events",
@@ -498,8 +638,9 @@ class RunnerBackend:
             record.cancellation_token.cancel()
             record.error = "run cancellation requested"
             record.error_code = "cancelled"
-        # Wake a worker blocked on its message queue so it stops promptly.
-        record.message_queue.put(_CLOSE_SESSION)
+        # Wake a run parked on its message queue so it stops promptly. The put runs on the
+        # shared loop (asyncio.Queue is not thread-safe), scheduled from this thread.
+        self._call_soon(record.message_queue.put_nowait, _CLOSE_SESSION)
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
@@ -521,7 +662,8 @@ class RunnerBackend:
                 raise ValueError("cannot send a message to a terminal run")
             if record.message_queue.qsize() >= self.max_message_queue_depth:
                 raise ValueError("message queue is full; retry once the run drains it")
-        record.message_queue.put(str(content))
+        # Enqueue on the shared loop (asyncio.Queue is not thread-safe across threads).
+        self._call_soon(record.message_queue.put_nowait, str(content))
         return {"run_id": run_id, "status": "queued"}
 
     def current_runtime_config(self, run_id: str) -> AgentRuntimeConfig | None:
@@ -867,9 +1009,13 @@ class RunnerBackend:
                 if record.status == "awaiting_input":
                     record.status = "running"
             elif event.type == "run.finished":
-                status = str(event.data.get("status") or "completed")
-                if status in {"completed", "failed", "limited"}:
-                    record.status = status  # type: ignore[assignment]
+                # Record terminal metadata, but DO NOT flip the gating status here. The
+                # run.finished event fires inside loop.close() (on the loop's thread), while
+                # record.result is only set afterward by _record_run_result on the worker
+                # thread. Setting status="completed" here would let wait_for_run/result()
+                # observe a terminal status before the result is recorded (result() would
+                # KeyError on final_text). _record_run_result owns the terminal status so it
+                # flips together with record.result, under the same lock.
                 record.finished_at = time.time()
                 record.error = str(event.data.get("error") or "")
                 record.error_code = str(event.data.get("error_code") or "")
@@ -887,19 +1033,19 @@ class RunnerBackend:
             time.sleep(0.05)
         raise TimeoutError(f"run did not finish before timeout: {run_id}")
 
-    def _drive_session(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> AgentRunResult:
+    async def _drive_session(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> AgentRunResult:
         """Cold-start driver: open the run, take the first turn, then hand off to the
         shared open-session loop (also used by checkpoint recovery)."""
         record = self._record(run_id)
-        loop.open()
+        await loop.aopen()
         try:
-            suspension = loop.run_until_suspended(request.instruction)
+            suspension = await loop.arun_until_suspended(request.instruction)
         except NativeAgentError:
             # Bootstrap failed (terminal session already recorded); just finalize.
-            return loop.close()
-        return self._drive_open_session(record, request, loop, suspension, started=time.time(), turns=1)
+            return await loop.aclose()
+        return await self._drive_open_session(record, request, loop, suspension, started=time.time(), turns=1)
 
-    def _drive_open_session(
+    async def _drive_open_session(
         self,
         record: BackendRunRecord,
         request: BackendRunRequest,
@@ -910,20 +1056,26 @@ class RunnerBackend:
         turns: int,
     ) -> AgentRunResult:
         """Drive an already-open run as a multi-turn session: wait for a parked task to
-        complete or block on the message queue for the next user turn — until idle/
-        lifetime/turn limits, cancel, or close. Shared by cold start and recovery; each
-        park point durably checkpoints (loop state + backend message queue)."""
+        complete or await the message queue for the next user turn — until idle/lifetime/
+        turn limits, cancel, or close. Shared by cold start and recovery; each park point
+        durably checkpoints (loop state + backend message queue).
+
+        Runs as a coroutine on the shared loop. The next-message wait is a pure
+        ``await asyncio.Queue.get()`` (a parked session holds no thread). The hosted/in-proc
+        task-wait is offloaded with asyncio.to_thread (bounded by task_wait_poll_s and
+        retried) since it blocks on the job manager's cross-thread condition (P2);
+        report_task_result wakes it from another thread."""
         while True:
             if suspension.reason in {"terminal", "limited"}:
                 break
             if suspension.reason == "awaiting_tasks":
                 self._persist_run_checkpoint(record)
-                ready = loop.wait_for_pending_tasks(self.task_wait_poll_s)
+                ready = await asyncio.to_thread(loop.wait_for_pending_tasks, self.task_wait_poll_s)
                 if self._session_should_stop(record, started, turns):
                     break
                 if ready or not loop.has_pending_tasks():
                     # A task was delivered (or none remain): resume the pump.
-                    suspension = loop.run_until_suspended(None)
+                    suspension = await loop.arun_until_suspended(None)
                 # else: tasks still pending after the poll window -> keep waiting.
                 continue
             # settled. One-shot runs close here; multi-turn awaits the next message.
@@ -934,14 +1086,15 @@ class RunnerBackend:
             loop.await_user_input()
             self._persist_run_checkpoint(record)
             try:
-                message = record.message_queue.get(timeout=self.idle_timeout_s)
-            except queue.Empty:
+                # Pure async await — a parked multi-turn session holds no thread.
+                message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+            except asyncio.TimeoutError:
                 break  # idle timeout
             if message is _CLOSE_SESSION:
                 break
             turns += 1
-            suspension = loop.run_until_suspended(message)
-        return loop.close()
+            suspension = await loop.arun_until_suspended(message)
+        return await loop.aclose()
 
     def _persist_run_checkpoint(self, record: BackendRunRecord) -> None:
         """Augment the loop's own park-point checkpoint with the backend-owned message
@@ -953,14 +1106,13 @@ class RunnerBackend:
         checkpoint = loop.snapshot()
         if checkpoint is None:
             return
-        # Peek (don't drain) the residual queue; consumed messages are already reflected
-        # in the loop's turn handle / pending input.
-        with record.message_queue.mutex:
-            residual = [
-                message
-                for message in list(record.message_queue.queue)
-                if isinstance(message, str)
-            ]
+        # Peek (don't drain) the residual queue; consumed messages are already reflected in
+        # the loop's turn handle / pending input. Runs in the driver coroutine on the shared
+        # loop, so reading the asyncio.Queue's backing deque needs no lock (single-threaded
+        # loop; producers enqueue via _call_soon on this same loop).
+        residual = [
+            message for message in list(record.message_queue._queue) if isinstance(message, str)
+        ]
         checkpoint.queued_messages = residual
         # Overwrites the same seq the loop just committed, now with the queue included.
         assert self.checkpoint_store is not None
@@ -973,7 +1125,7 @@ class RunnerBackend:
             or turns >= self.max_turns
         )
 
-    def _run_worker(
+    async def _run_run(
         self,
         run_id: str,
         request: BackendRunRequest,
@@ -981,42 +1133,125 @@ class RunnerBackend:
         llm_gateway_token: str,
         web_gateway_token: str,
     ) -> None:
-        # Bound concurrent active runs: at capacity this blocks, so the run stays ``queued``
-        # until a slot frees rather than piling work onto a saturated process.
+        # Bound concurrent active runs: at capacity this awaits (without holding a thread),
+        # so the run stays ``queued`` until a slot frees rather than piling work onto a
+        # saturated process.
         if self._run_semaphore is not None:
-            self._run_semaphore.acquire()
+            await self._run_semaphore.acquire()
         try:
-            spec = self._run_spec_for_request(run_id, request, workspace_root)
             try:
-                runtime_config = self.current_runtime_config(run_id)
-                adapter = self._build_model_adapter(
-                    spec,
-                    llm_gateway_token,
-                    runtime_config.model if runtime_config is not None else None,
-                )
-                loop = AgentLoop(
-                    spec=spec,
-                    model_adapter=adapter,
-                    event_sinks=(BackendRunStateSink(self, run_id),),
-                    permission_policy=request.permission_policy,
-                    cancellation_token=self._record(run_id).cancellation_token,
-                    shell_approval_provider=None,
-                    web_gateway_client=self._web_gateway_client(web_gateway_token),
-                    runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
-                    checkpoint_store=self.checkpoint_store,
-                )
+                loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
                 with self._lock:
                     self._records[run_id].loop = loop
                 # Persist the recovery metadata before the first turn so a crash at any park
                 # point can be resumed (the checkpoint itself is written by the driver).
                 self._write_run_meta(self._record(run_id), request)
-                result = self._drive_session(run_id, request, loop)
+                result = await self._drive_session(run_id, request, loop)
                 self._record_run_result(run_id, result)
             except Exception as exc:
                 self._record_run_failure(run_id, exc)
         finally:
             if self._run_semaphore is not None:
                 self._run_semaphore.release()
+
+    def _build_loop(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        workspace_root: Path,
+        llm_gateway_token: str,
+        web_gateway_token: str,
+    ) -> AgentLoop:
+        """Construct the run's AgentLoop (shared by autonomous and stream-driven paths)."""
+        spec = self._run_spec_for_request(run_id, request, workspace_root)
+        runtime_config = self.current_runtime_config(run_id)
+        adapter = self._build_model_adapter(
+            spec,
+            llm_gateway_token,
+            runtime_config.model if runtime_config is not None else None,
+        )
+        return AgentLoop(
+            spec=spec,
+            model_adapter=adapter,
+            event_sinks=(BackendRunStateSink(self, run_id),),
+            permission_policy=request.permission_policy,
+            cancellation_token=self._record(run_id).cancellation_token,
+            shell_approval_provider=None,
+            web_gateway_client=self._web_gateway_client(web_gateway_token),
+            runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
+            checkpoint_store=self.checkpoint_store,
+        )
+
+    async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
+        """Stream-driven run: the transport-neutral programmatic seam behind the SSE endpoint.
+
+        Drives ONE submit via ``loop.astream`` and yields wire-frame dicts: a leading
+        ``{"kind":"meta",...}`` (run id/token/urls — mirrors ``BackendRunSubmission`` so the
+        consumer can poll artifacts later), then ``{"kind":"event",...}`` (orchestration) and
+        ``{"kind":"delta",...}`` (token deltas) per stream item, then exactly one terminal
+        ``{"kind":"result",...}``. Must be driven on the shared loop (astream binds the loop it
+        runs on). An in-process async consumer can ``async for`` this directly, no HTTP.
+
+        Single-submit scope: the run is closed when the stream drains. A mid-stream external
+        hosted-task park is surfaced in the result frame and then closed (HITL-over-stream is
+        deferred), so this never leaves a resumable run dangling.
+        """
+        prepared = self._prepare_run_record(request)
+        run_id = prepared.run_id
+        if self._run_semaphore is not None:
+            await self._run_semaphore.acquire()
+        loop: AgentLoop | None = None
+        closed = False
+        try:
+            yield {"kind": "meta", **self._submission_for(prepared).to_json()}
+            loop = self._build_loop(
+                run_id, request, prepared.workspace_root, prepared.llm_gateway_token, prepared.web_gateway_token
+            )
+            with self._lock:
+                self._records[run_id].loop = loop
+            self._write_run_meta(prepared.record, request)
+            await loop.aopen()
+            suspension: Suspension | None = None
+            async with loop.astream(request.instruction) as stream:
+                async for item in stream:
+                    yield self._frame(item)
+                suspension = stream.suspension
+            result = await loop.aclose()
+            closed = True
+            self._record_run_result(run_id, result)
+            frame: dict[str, Any] = {
+                "kind": "result",
+                "status": result.status,
+                "final_text": result.final_text,
+                "error": result.error,
+                "error_code": result.error_code,
+            }
+            if suspension is not None and suspension.has_external:
+                frame["awaiting_task_ids"] = list(suspension.awaiting_task_ids)
+                frame["note"] = "run closed; hosted task cancelled (HITL streaming deferred)"
+            yield frame
+        except Exception as exc:
+            if loop is not None and not closed:
+                try:
+                    await loop.aclose()
+                except Exception:  # noqa: BLE001 - finalization best-effort; the failure is recorded below
+                    pass
+            self._record_run_failure(run_id, exc)
+            yield {
+                "kind": "result",
+                "status": "failed",
+                "error": str(exc),
+                "error_code": getattr(exc, "error_code", "internal_error"),
+            }
+        finally:
+            if self._run_semaphore is not None:
+                self._run_semaphore.release()
+
+    def _frame(self, item: Any) -> dict[str, Any]:
+        """Wrap one astream item as a neutral wire frame (reference framing on core to_json)."""
+        if isinstance(item, AgentEvent):
+            return {"kind": "event", **item.to_json()}
+        return {"kind": "delta", **item.to_json()}  # ModelStreamChunk
 
     def _record_run_result(self, run_id: str, result: AgentRunResult) -> None:
         with self._lock:
@@ -1353,20 +1588,17 @@ class RunnerBackend:
         loop.restore(checkpoint, blobs=stored.blob)
         with self._lock:
             record.loop = loop
+        # Re-enqueue durable pending messages on the shared loop (before the resume coroutine
+        # drains them); asyncio.Queue puts must run on the loop, not this thread.
         for message in checkpoint.queued_messages:
-            record.message_queue.put(message)
-        thread = threading.Thread(
-            target=self._run_recovered_worker,
-            args=(run_id, request, loop),
-            name=f"native-agent-recover-{run_id[:8]}",
-            daemon=True,
-        )
-        thread.start()
+            self._call_soon(record.message_queue.put_nowait, message)
+        # Resume executes as a coroutine on the shared loop (coroutine-per-run).
+        self._spawn(self._run_recovered(run_id, request, loop))
 
-    def _run_recovered_worker(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> None:
+    async def _run_recovered(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> None:
         record = self._record(run_id)
         if self._run_semaphore is not None:
-            self._run_semaphore.acquire()
+            await self._run_semaphore.acquire()
         try:
             # Derive the starting park from the restored loop: tasks still pending -> a
             # hosted-task wait; otherwise a settled park awaiting the next user message.
@@ -1374,7 +1606,7 @@ class RunnerBackend:
                 suspension = Suspension(reason="awaiting_tasks", status="running", has_external=True)
             else:
                 suspension = Suspension(reason="settled", status="completed")
-            result = self._drive_open_session(
+            result = await self._drive_open_session(
                 record, request, loop, suspension, started=time.time(), turns=1
             )
             self._record_run_result(run_id, result)

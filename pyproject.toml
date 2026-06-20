@@ -18,12 +18,34 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2",
+    "httpx>=0.27",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
 ]
 # Direct OpenAI provider adapter (local smoke tests only). Container / CSP-integrated
 # runs use GatewayModelAdapter and do not need this. The import is lazy, so the package
 # imports and OpenAIModelAdapter instantiates without it; only next_turn() requires it.
 openai = [
     "openai>=1.80",
+]
+# Async HTTP for token streaming (GatewayModelAdapter.astream_turn). The import is lazy,
+# so the package imports and the adapter instantiates without it; only astream_turn()
+# requires it. The sync next_turn() stays on stdlib urllib, so the default install is
+# unaffected.
+http-async = [
+    "httpx>=0.27",
+]
+# OpenTelemetry tracing (OtelEventSink). Only opentelemetry-api is needed (a no-op without
+# an SDK/exporter); the import is lazy, so the package imports without it. The application
+# installs opentelemetry-sdk + an exporter to actually emit spans.
+otel = [
+    "opentelemetry-api>=1.20",
+]
+# MCP (Model Context Protocol) client. JSON-RPC over Streamable HTTP, hand-rolled on httpx
+# (the official `mcp` SDK is async-only and pulls a full server ASGI stack). The import is
+# lazy, so the package imports without it; only McpToolProvider/McpHttpClient need it.
+mcp = [
+    "httpx>=0.27",
 ]
 
 [project.scripts]
