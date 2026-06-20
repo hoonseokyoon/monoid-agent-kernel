@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
@@ -353,11 +354,14 @@ class AgentLoop:
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
-    # Core-owned per-run event loop for sync callers (the facade reuses ONE loop across
-    # turns instead of asyncio.run-per-call, so background asyncio tasks can span turns —
-    # see _run_sync). None when never driven synchronously or when an async caller drives
-    # the run on its own loop. Torn down by _maybe_close_loop (from the caller thread).
+    # Core-owned per-run event loop for sync callers. Runs continuously on a dedicated
+    # daemon thread for the whole run (not just during a call), so background asyncio tasks
+    # (subprocess monitors) keep progressing between turns even when a turn-by-turn driver
+    # like the backend is parked between calls. The sync facade marshals coroutines onto it
+    # via run_coroutine_threadsafe (see _run_sync). None until first sync use, or when an
+    # async caller drives the run on its own loop. Torn down by _maybe_close_loop.
     _owned_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False)
+    _owned_loop_thread: threading.Thread | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
@@ -608,15 +612,29 @@ class AgentLoop:
                 "(arun_once / asubmit / arun_until_suspended) instead",
                 error_code="sync_in_async_loop",
             )
+        loop = self._ensure_owned_loop()
+        return asyncio.run_coroutine_threadsafe(coro, loop).result()
+
+    def _ensure_owned_loop(self) -> asyncio.AbstractEventLoop:
+        """Lazily start the core-owned event loop on a dedicated daemon thread and keep it
+        running (run_forever) for the run's lifetime."""
         if self._owned_loop is None:
-            self._owned_loop = asyncio.new_event_loop()
-        return self._owned_loop.run_until_complete(coro)
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever,
+                name=f"nar-loop-{self.spec.run_id}",
+                daemon=True,
+            )
+            thread.start()
+            self._owned_loop = loop
+            self._owned_loop_thread = thread
+        return self._owned_loop
 
     def _maybe_close_loop(self) -> None:
-        """Tear down the core-owned loop, but only from outside it. ``run_once`` calls
-        ``close()`` from within ``arun_once`` (i.e. on the owned loop), so close() must not
-        drop the loop it is running on — the run_once facade closes it afterward, from the
-        caller thread."""
+        """Stop and tear down the core-owned loop thread, but only from outside it.
+        ``run_once`` calls ``close()`` from within ``arun_once`` (i.e. on the owned loop),
+        so close() must not drop the loop it is running on — the run_once facade tears it
+        down afterward, from the caller thread."""
         loop = self._owned_loop
         if loop is None:
             return
@@ -626,8 +644,12 @@ class AgentLoop:
             running = None
         if running is loop:
             return
+        loop.call_soon_threadsafe(loop.stop)
+        if self._owned_loop_thread is not None:
+            self._owned_loop_thread.join(timeout=5)
         loop.close()
         self._owned_loop = None
+        self._owned_loop_thread = None
 
     async def _acall_model(self, request: ModelRequest) -> ModelTurn:
         """Invoke the model adapter, awaiting an async adapter natively or offloading a

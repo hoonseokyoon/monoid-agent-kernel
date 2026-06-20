@@ -867,9 +867,13 @@ class RunnerBackend:
                 if record.status == "awaiting_input":
                     record.status = "running"
             elif event.type == "run.finished":
-                status = str(event.data.get("status") or "completed")
-                if status in {"completed", "failed", "limited"}:
-                    record.status = status  # type: ignore[assignment]
+                # Record terminal metadata, but DO NOT flip the gating status here. The
+                # run.finished event fires inside loop.close() (on the loop's thread), while
+                # record.result is only set afterward by _record_run_result on the worker
+                # thread. Setting status="completed" here would let wait_for_run/result()
+                # observe a terminal status before the result is recorded (result() would
+                # KeyError on final_text). _record_run_result owns the terminal status so it
+                # flips together with record.result, under the same lock.
                 record.finished_at = time.time()
                 record.error = str(event.data.get("error") or "")
                 record.error_code = str(event.data.get("error_code") or "")
