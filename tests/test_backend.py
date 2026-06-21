@@ -598,6 +598,36 @@ def test_backend_single_turn_run_closes_after_first_settle(tmp_path: Path) -> No
     assert status == "completed"
 
 
+def test_backend_proposal_diff_returns_unified_diff(tmp_path: Path) -> None:
+    # DX-4: the diff is available via a token-scoped API (not only via result() at run end,
+    # and without reading run artifacts off disk).
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_write", {"path": "NEW.md", "content": "hi\n"}, "c1"),)),
+            ModelTurn(response_id="r2", final_text="wrote NEW.md"),
+        ],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="write NEW.md",
+            runtime_config=_default_config(),
+        )
+    )
+    backend.wait_for_run(submission.run_id, timeout_s=20)
+    out = backend.proposal_diff(submission.run_id, submission.run_token)
+    assert out["ready"] is True
+    assert "NEW.md" in out["diff"]
+    assert "hi" in out["diff"]
+
+
 def test_backend_drain_ends_parked_multi_turn_sessions(tmp_path: Path) -> None:
     # DX-2: drain() cooperatively ends owned runs in one call, so a parked multi-turn session
     # reaches a terminal state (no dangling coroutine on the shared loop).

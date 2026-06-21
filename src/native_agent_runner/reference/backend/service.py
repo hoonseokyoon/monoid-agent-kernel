@@ -659,6 +659,16 @@ class RunnerBackend:
             **payload,
         }
 
+    def proposal_diff(self, run_id: str, token: str) -> dict[str, Any]:
+        """The unified diff of the current proposal, on demand (works mid-run, not only at the
+        end like ``result()``). Token-scoped so an embedder never reads the run dir off disk.
+        Binary files appear as a ``<binary sha256=… size=…>`` marker line in the patch."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        diff_path = record.run_dir / "diff.patch"
+        diff = diff_path.read_text(encoding="utf-8") if diff_path.exists() else ""
+        return {"run_id": run_id, "ready": diff_path.exists(), "diff": diff}
+
     def cancel_run(self, run_id: str, token: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)
         record = self._record(run_id)

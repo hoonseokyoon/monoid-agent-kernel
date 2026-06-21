@@ -52,7 +52,26 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
+    _atomic_replace(tmp_path, path)
+
+
+def _atomic_replace(src: Path, dst: Path, *, attempts: int = 10, backoff_s: float = 0.01) -> None:
+    """``os.replace`` with a bounded retry for Windows.
+
+    On POSIX, replacing a destination that a reader currently has open is atomic and succeeds
+    immediately. On Windows the same replace fails with ``PermissionError`` (ERROR_ACCESS_DENIED /
+    sharing violation) while another handle holds the destination open — which happens whenever a
+    status/checkpoint reader polls the file the run is updating. Readers open-read-close in
+    microseconds, so a few short retries close the race; POSIX never reaches the retry path.
+    """
+    for attempt in range(attempts):
+        try:
+            src.replace(dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(backoff_s)
 
 
 @contextmanager

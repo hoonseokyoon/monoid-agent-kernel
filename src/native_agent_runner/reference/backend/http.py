@@ -100,6 +100,10 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     run_id = parts[2]
                     self._write_json(backend.proposal(run_id, self._bearer_token()))
                     return
+                if len(parts) == 5 and parts[:2] == ["v1", "runs"] and parts[3:5] == ["proposal", "diff"]:
+                    run_id = parts[2]
+                    self._write_json(backend.proposal_diff(run_id, self._bearer_token()))
+                    return
                 if len(parts) >= 6 and parts[:2] == ["v1", "runs"] and parts[3:5] == ["proposal", "files"]:
                     run_id = parts[2]
                     proposal_path = unquote("/".join(parts[5:]))

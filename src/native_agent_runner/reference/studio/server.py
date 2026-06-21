@@ -98,8 +98,6 @@ class StudioServer:
         self._backend: RunnerBackend | None = None
         # run_id -> run access token (held server-side, never sent to the browser).
         self._run_tokens: dict[str, str] = {}
-        # run_id -> run directory (for reading diff.patch behind the BFF).
-        self._run_dirs: dict[str, Path] = {}
         self._lock = threading.RLock()
         self._base_url = ""
 
@@ -188,7 +186,6 @@ class StudioServer:
         submission = self._backend.submit_run(request)
         with self._lock:
             self._run_tokens[submission.run_id] = submission.run_token
-            self._run_dirs[submission.run_id] = submission.run_dir
         return {"run_id": submission.run_id, "status": submission.status}
 
     def continue_chat(self, run_id: str, message: str) -> dict[str, Any]:
@@ -212,18 +209,12 @@ class StudioServer:
         return self._backend.status(run_id, token)
 
     def proposal(self, run_id: str) -> dict[str, Any]:
-        """The current proposed changes for the run: changed files + the unified diff. The
-        diff.patch is read behind the BFF (the backend only returns it via result() at run end)."""
+        """The current proposed changes for the run: changed files + the unified diff, both via
+        token-scoped backend APIs (no reading run artifacts off disk)."""
         assert self._backend is not None
         token = self._token_for(run_id)
         payload = self._backend.proposal(run_id, token)
-        diff = ""
-        run_dir = self._run_dirs.get(run_id)
-        if run_dir is not None:
-            diff_path = run_dir / "diff.patch"
-            if diff_path.exists():
-                diff = diff_path.read_text(encoding="utf-8")
-        payload["diff"] = diff
+        payload["diff"] = self._backend.proposal_diff(run_id, token).get("diff", "")
         return payload
 
     def apply(self, run_id: str) -> dict[str, Any]:

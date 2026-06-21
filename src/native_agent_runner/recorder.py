@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 from dataclasses import dataclass, field
@@ -14,6 +15,8 @@ from native_agent_runner.core.result import AgentArtifact
 
 if TYPE_CHECKING:
     from native_agent_runner.core.workspace import ChangedEntry, Workspace
+
+_LOGGER = logging.getLogger("native_agent_runner.recorder")
 
 
 @dataclass
@@ -137,10 +140,13 @@ class StatusJsonSink:
                 "updated_at": event.timestamp,
             }
         )
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp_path.replace(self.path)
+        # status.json is a best-effort observability projection: a transient write failure must
+        # never fail the run. write_json_atomic retries the Windows replace-vs-concurrent-reader
+        # race; if it still can't be written, skip — a later event rewrites the full state.
+        try:
+            write_json_atomic(self.path, self.state)
+        except OSError:
+            _LOGGER.debug("status.json write skipped (transient fs error)", exc_info=True)
 
     def close(self) -> None:
         return None

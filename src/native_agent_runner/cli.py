@@ -17,6 +17,7 @@ from native_agent_runner.core.agents import (
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import RunnerBackend
 from native_agent_runner.reference._shared.tokens import TokenManager
+from native_agent_runner.narration import narrate_event
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
@@ -1189,18 +1190,26 @@ def _compact_event_line(line: str) -> str:
         event = json.loads(line)
     except json.JSONDecodeError:
         return line.rstrip("\n")
-    data = event.get("data") or {}
-    suffix = ""
-    if "status" in data:
-        suffix = f" status={data['status']}"
-    elif "job_id" in data:
-        suffix = f" job={data['job_id']}"
-    elif "tool" in data:
-        suffix = f" tool={data['tool']}"
-    elif "paths" in data:
-        suffix = f" paths={','.join(map(str, data['paths']))}"
-    elif "error" in data and data["error"]:
-        suffix = f" error={data['error']}"
+    # Tool activity goes through the shared narration projection (the same one the Studio feed
+    # uses), so the verb/target extraction lives in one place. Other events keep a generic dump.
+    narration = narrate_event(event)
+    if narration is not None:
+        suffix = f" {narration.action}"
+        if narration.target:
+            suffix += f" {narration.target}"
+        if narration.status == "error":
+            suffix += f" [error: {narration.detail}]" if narration.detail else " [error]"
+    else:
+        data = event.get("data") or {}
+        suffix = ""
+        if "status" in data:
+            suffix = f" status={data['status']}"
+        elif "job_id" in data:
+            suffix = f" job={data['job_id']}"
+        elif "paths" in data:
+            suffix = f" paths={','.join(map(str, data['paths']))}"
+        elif "error" in data and data["error"]:
+            suffix = f" error={data['error']}"
     return f"{event.get('seq', '?'):>4} {event.get('type', '?')}{suffix}"
 
 

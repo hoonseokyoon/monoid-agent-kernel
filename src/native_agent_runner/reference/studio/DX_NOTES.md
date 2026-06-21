@@ -57,7 +57,17 @@ each (which enqueues the close sentinel), then sleeps briefly to let the loop dr
 that cancels owned runs and awaits their teardown, so embedders get clean shutdown without
 reaching for `cancel_run` + `sleep`.
 
-### DX-3 🟡 Events carry no presentation-ready summary for a UI activity feed
+### DX-3 🟢 Events carry no presentation-ready summary for a UI activity feed
+**Fixed (by sharing a projection, not by changing the event schema):** added
+`native_agent_runner.narration` — `narrate_event(event) -> EventNarration` maps an event to a
+*neutral* `(category, action, target, status, level, detail)` descriptor. The `watch` CLI
+(`_compact_event_line`) and the Studio feed (`activity.describe_event`) now both format that one
+projection instead of each re-deriving the verb/target. This matches the prior art (AG-UI / Vercel
+AI SDK / OTel keep events typed and render at the edge; baking a localized string into the event
+was the wrong move). Covered by `tests/test_narration.py`.
+
+(superseded — original finding kept for history:)
+
 **Where:** the public event stream (`tool.call.started` / `tool.call.finished` / `workspace.*`).
 Found while building the R1 activity feed.
 
@@ -74,7 +84,16 @@ attached to each SSE frame as `studio_activity`. Covered by `test_describe_event
 `tool_activity` shape) to tool/workspace events, derived once at the source where the verb and
 args are already known — so every UI gets a feed for free and it can't drift.
 
-### DX-4 🟡 No mid-run API for the proposal diff text
+### DX-4 🟢 No mid-run API for the proposal diff text
+**Fixed:** added `RunnerBackend.proposal_diff(run_id, token)` and `GET
+/v1/runs/{id}/proposal/diff` — the unified diff on demand, mid-run, token-scoped (GitHub serves
+PR diffs the same way: an on-demand representation of the resource). Studio now calls it instead
+of reading `run_dir/diff.patch`. Binary files (images/docs) appear in the patch as a
+`<binary sha256=… size=…>` marker; the actual bytes are fetched via `proposal_file` (base64) for
+preview/download. Covered by `test_backend_proposal_diff_returns_unified_diff`.
+
+(superseded — original finding kept for history:)
+
 **Where:** `RunnerBackend.proposal()` returns the proposal payload (changed paths + per-file
 snapshot refs) but **not** the unified diff. The diff text is only returned by `result()`, which
 is populated at run end — so a parked multi-turn session has a proposal but no API-served diff.
@@ -89,5 +108,21 @@ read from the run dir. Covered by `test_agent_write_is_staged_then_applied`.
 
 **Proposed core fix:** include the unified diff in `proposal()` (or add a `proposal_diff()` /
 `/proposal/diff` endpoint), so integrators never read run artifacts off disk.
+
+### DX-5 🟢 status.json write race fails the run on Windows (real bug)
+**Where:** `recorder.py::StatusJsonSink` wrote `status.json` with an inline `tmp.replace(dst)`,
+and a sink raising propagates out of `EventBus.emit` and **fails the run**. Found when the Studio
+multi-turn test flaked: polling `status()` while the run rewrote `status.json` hit
+`[WinError 5] Access is denied` — on Windows `os.replace` fails while another handle holds the
+destination open (a concurrent reader). So any UI polling status on Windows could intermittently
+kill a run.
+
+**Fixed (core, not a workaround):**
+1. `core/_util.py::write_json_atomic` now retries the replace on `PermissionError` (Windows
+   reader race; POSIX never hits the retry). 
+2. `StatusJsonSink` uses `write_json_atomic` and treats the status projection as **best-effort** —
+   a transient write failure is logged and skipped, never failing the run (a later event rewrites
+   the full state). Verified by hammering the Studio multi-turn path (0 failures where it
+   previously flaked ~1 in 4).
 
 <!-- Add new entries below as later rungs (R3+) surface them. -->
