@@ -115,23 +115,39 @@ Instead the parent emits two summary events on its own stream:
 spawn tool span (foreground) or under the run span (background, whose tool span has
 already closed). `child_run_id` ties the summary back to the child's own trace/log.
 
-## Tool exposure
+## Tool permissions (Claude-parity, P2.5)
 
-Tools are exposed only through explicit `ToolBinding`s in the runtime config
-(`compile_bound_tool_catalog`). The `Agent` tool spec is registered in the base
-registry **only when `subagent_definitions` is non-empty**, and the runtime config
-author adds a binding (`ref.tool_id = "agent.spawn"`) to expose it. Depth is
-enforced at call time. Additionally, when building a child that would sit **at** the
-depth cap, `_run_subagent_child` strips the `agent.spawn` binding from the child's
-config and gives it no definitions, so the tool is simply absent from that child
-(no wasted turn on a call-time error). The call-time check remains as defense in
-depth.
+A subagent's tools are **derived from the parent's**, never declared independently —
+so a subagent can never exceed the parent (hard ceiling). `_resolve_child_config`:
+
+1. Start from the parent's current bindings.
+2. `definition.tools is None` → inherit all of them; a tuple → keep only parent
+   bindings matching the allowlist.
+3. Remove any binding matching `definition.disallowed_tools` (deny wins).
+4. At the depth cap, also drop the `agent.spawn` binding (tool absent, not a
+   call-time error — the call-time check in the executor remains as defense in depth).
+
+Matching is fnmatch against each binding's tool id / binding id / model name, so
+`fs.read`, `mcp.*`, `mcp.github.*`, and `*` all work. Because the inherited binding
+objects are reused, their `scope`/`quota`/`guidance` carry over too — a subagent's
+path/command scopes are inherited, not widened.
+
+`model`/`mode`/`limits`/`tool_search` inherit the parent's unless the definition
+overrides them. The parent's `tool_providers`/`dynamic_tool_providers` (MCP/custom)
+are passed to the child so the inherited bindings resolve against the same registry.
+
+The `agent.spawn` tool spec is registered in the base registry **only when
+`subagent_definitions` is non-empty**; the runtime config author still adds a binding
+(`ref.tool_id = "agent.spawn"`). The tool advertises the available subagent ids +
+descriptions so the model selects the right one (Claude selects by description).
 
 ## Definitions source (decided: inline)
 
-P1: `AgentLoop.subagent_definitions: Mapping[str, AgentRuntimeConfig]` — inline,
-passed by the embedder. Directory discovery (`--agents-directory`, Claude
-`.claude/agents` style) is P3 and will share machinery with Skills.
+`AgentLoop.subagent_definitions: Mapping[str, SubagentDefinition]` — inline, passed by
+the embedder. `SubagentDefinition.from_runtime_config()` adapts an explicit config
+(its tool ids become a ceiling-bound allowlist). Directory discovery
+(`--agents-directory`, Claude `.claude/agents` style) is P3 and will share machinery
+with Skills.
 
 ## Files
 
@@ -151,6 +167,11 @@ passed by the embedder. Directory discovery (`--agents-directory`, Claude
   (OTel `execute_subagent` spans) + child usage in the event/span + hide the Agent
   tool at max depth + stop sharing stateful sinks with children + `CONTRACTS.md` +
   `contracts.py` exports (`SubagentTaskExecutor`, `agent_spawn_tool`).
+- **P2.5** (done): Claude-parity tool permissions — `SubagentDefinition` (inherit
+  tools/model/mode/limits by default; `tools` allowlist + `disallowed_tools` denylist
+  with fnmatch incl `mcp.*`), hard ceiling (allowlist resolved against parent bindings),
+  parent tool-provider inheritance (MCP/custom), description-based selection in the
+  `agent.spawn` tool.
 - **P3** (deferred): directory discovery (`--agents-directory`), Skills
   `context: fork` integration, optional ADK-style state copy-in/delta-back, parent
   token-budget integration (counting child tokens against the parent's RunLimits).

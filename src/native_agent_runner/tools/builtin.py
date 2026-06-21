@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+from collections.abc import Mapping
 from typing import Any
 
 from native_agent_runner.core.content import DocumentPart, ImagePart
@@ -700,27 +701,41 @@ def _hitl_request() -> ToolSpec:
     )
 
 
-def agent_spawn_tool() -> ToolSpec:
+def agent_spawn_tool(subagents: Mapping[str, str] | None = None) -> ToolSpec:
     """The agent-as-tool delegation tool. Registered in the base registry only when
     the run has ``subagent_definitions`` (see ``AgentLoop`` bootstrap); a runtime
-    config still needs an explicit binding to ``agent.spawn`` to expose it."""
+    config still needs an explicit binding to ``agent.spawn`` to expose it.
+
+    ``subagents`` maps available subagent id -> description; when present the tool
+    advertises them (so the model picks the right one, the way Claude selects a
+    subagent by its description) and constrains ``subagent_type`` to those ids."""
 
     def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
         return ToolResult(ok=True, content=context.spawn_subagent(args))
 
+    description = (
+        "Delegate a focused task to a subagent that works in an isolated context "
+        "and returns only its final message. Choose 'subagent_type' from the "
+        "available subagents and give a self-contained 'prompt' (the subagent does "
+        "not see this conversation). Set 'background': true to spawn without "
+        "waiting — its result is delivered to you later; otherwise the call blocks "
+        "and returns the subagent's final message directly."
+    )
+    subagent_type_schema: dict[str, Any] = {"type": "string"}
+    if subagents:
+        subagent_type_schema = {"type": "string", "enum": sorted(subagents)}
+        catalog = "\n".join(
+            f"- {sub_id}: {desc}" if desc else f"- {sub_id}"
+            for sub_id, desc in sorted(subagents.items())
+        )
+        description = f"{description}\n\nAvailable subagents:\n{catalog}"
+
     return ToolSpec(
         id="agent.spawn",
-        description=(
-            "Delegate a focused task to a subagent that works in an isolated context "
-            "and returns only its final message. Choose 'subagent_type' from the "
-            "available subagents and give a self-contained 'prompt' (the subagent does "
-            "not see this conversation). Set 'background': true to spawn without "
-            "waiting — its result is delivered to you later; otherwise the call blocks "
-            "and returns the subagent's final message directly."
-        ),
+        description=description,
         input_schema=_object_schema(
             {
-                "subagent_type": {"type": "string"},
+                "subagent_type": subagent_type_schema,
                 "prompt": {"type": "string"},
                 "background": {"type": "boolean", "default": False},
             },

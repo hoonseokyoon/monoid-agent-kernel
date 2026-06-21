@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import inspect
 import json
 import threading
@@ -45,6 +46,9 @@ from native_agent_runner.core.agents import (
     BoundTool,
     BoundToolCatalog,
     RuntimeConfigSource,
+    SubagentDefinition,
+    ToolBinding,
+    ToolSearchConfig,
     coerce_runtime_config_provider,
     compile_bound_tool_catalog,
     runtime_config_diff,
@@ -122,6 +126,14 @@ from native_agent_runner.tools.builtin import agent_spawn_tool, builtin_tools
 from native_agent_runner.web import WebGatewayClient, domain_allowed, domain_from_url
 from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.workspace.local import default_local_workspace_factory
+
+
+def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
+    """True if a tool binding matches any fnmatch pattern. Matched against the binding's
+    tool id, binding id, and model name, so subagent allow/deny lists accept ids
+    (``fs.read``), patterns (``mcp.*``, ``mcp.github.*``), or ``*`` for all."""
+    candidates = (binding.ref.tool_id, binding.binding_id, binding.model_name or "")
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name)
 
 
 def _failure_result(exc: Exception, *, error_code: str | None = None) -> ToolResult:
@@ -407,12 +419,13 @@ class AgentLoop:
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
     context_providers: tuple[ContextProvider, ...] = ()
     inject_workspace_index: bool = False
-    # Agent-as-tool delegation: a map of subagent id -> the child run's runtime
-    # config. When non-empty the bootstrap registers the ``agent.spawn`` tool and the
-    # ``subagent`` task executor; a runtime config still needs an explicit binding to
-    # ``agent.spawn`` to expose the tool. Inherited by spawned children so they can
-    # delegate further (bounded by RunLimits.max_subagent_depth).
-    subagent_definitions: Mapping[str, AgentRuntimeConfig] = field(default_factory=dict)
+    # Agent-as-tool delegation: a map of subagent id -> SubagentDefinition. When non-empty
+    # the bootstrap registers the ``agent.spawn`` tool and the ``subagent`` task executor; a
+    # runtime config still needs an explicit binding to ``agent.spawn`` to expose the tool.
+    # A child inherits the parent's tools/model/mode/limits by default (the definition can
+    # narrow them); inherited by spawned children so they can delegate further (bounded by
+    # RunLimits.max_subagent_depth).
+    subagent_definitions: Mapping[str, SubagentDefinition] = field(default_factory=dict)
     # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
     # Defaults to a local-fs store under the run root; a backend injects a durable one.
     checkpoint_store: CheckpointStore | None = None
@@ -1168,7 +1181,11 @@ class AgentLoop:
         for a run that carries ``subagent_definitions``. Called from bootstrap only when
         definitions are present; the runtime config still needs an explicit binding to
         ``agent.spawn`` for the tool to reach the model."""
-        registry.register(agent_spawn_tool())
+        catalog = {
+            sub_id: definition.description
+            for sub_id, definition in self.subagent_definitions.items()
+        }
+        registry.register(agent_spawn_tool(catalog))
         context.subagent_depth = int(self.spec.metadata.get("subagent_depth", 0) or 0)
         job_manager.executors["subagent"] = SubagentTaskExecutor(
             run_child=self._run_subagent_child,
@@ -1194,21 +1211,23 @@ class AgentLoop:
         background = bool(task.request.get("background", False))
         parent_event_id = task.request.get("parent_event_id")
         turn_id = task.request.get("turn_id")
-        config = self.subagent_definitions[definition_id]
+        definition = self.subagent_definitions[definition_id]
+        parent_config = self.runtime_config_provider.current_config(self.spec.run_id)
         child_run_id = f"{self.spec.run_id}.sub.{task.job_id}"
         child_depth = depth + 1
-        # At the depth cap the child must not be able to delegate further: drop any
-        # agent.spawn binding from its config and give it no definitions, so the tool is
-        # simply absent rather than erroring at call time.
+        # At the depth cap the child must not delegate further: the resolver drops any
+        # agent.spawn binding and we give it no definitions, so the tool is simply absent
+        # rather than erroring at call time.
         at_max_depth = child_depth >= self.spec.limits.max_subagent_depth
-        child_config = config
-        child_definitions: Mapping[str, AgentRuntimeConfig] = self.subagent_definitions
-        if at_max_depth:
-            child_config = replace(
-                config,
-                tools=tuple(b for b in config.tools if b.ref.tool_id != "agent.spawn"),
-            )
-            child_definitions = {}
+        child_config = self._resolve_child_config(
+            definition,
+            parent_config,
+            definition_id=definition_id,
+            at_max_depth=at_max_depth,
+        )
+        child_definitions: Mapping[str, SubagentDefinition] = (
+            {} if at_max_depth else self.subagent_definitions
+        )
         # Correlate the delegation on the PARENT's event stream (the child records to its
         # own run dir; stateful sinks like OTel/StatusJson are NOT shared to avoid clobber).
         started = recorder.emit(
@@ -1226,9 +1245,10 @@ class AgentLoop:
             workspace_root=self.spec.workspace_root,
             run_root=self.spec.run_root,
             run_id=child_run_id,
-            mode=self.spec.mode,
+            # mode/limits inherit the parent's unless the definition narrows them.
+            mode=definition.mode or self.spec.mode,
             workspace_backend="overlay",
-            limits=self.spec.limits,
+            limits=definition.limits or self.spec.limits,
             permission_policy=self.spec.permission_policy,
             metadata={
                 "parent_run_id": self.spec.run_id,
@@ -1241,6 +1261,10 @@ class AgentLoop:
             spec=child_spec,
             model_adapter=self.model_adapter,
             runtime_config_provider=child_config,
+            # Inherit the parent's tool providers so MCP/custom tools are in the child's
+            # registry (the inherited bindings reference them).
+            tool_providers=self.tool_providers,
+            dynamic_tool_providers=self.dynamic_tool_providers,
             permission_policy=self.spec.permission_policy,
             cancellation_token=self.cancellation_token,
             shell_approval_provider=self.shell_approval_provider,
@@ -1283,6 +1307,39 @@ class AgentLoop:
                 "error": result.error,
                 "error_code": result.error_code,
             },
+        )
+
+    def _resolve_child_config(
+        self,
+        definition: SubagentDefinition,
+        parent_config: AgentRuntimeConfig | None,
+        *,
+        definition_id: str,
+        at_max_depth: bool,
+    ) -> AgentRuntimeConfig:
+        """Derive a child's runtime config from the parent's, Claude-style: the child
+        inherits the parent's tool bindings (so it can never exceed the parent), then the
+        definition's ``tools`` allowlist and ``disallowed_tools`` denylist filter them
+        (deny wins). ``model``/``tool_search`` inherit unless the definition overrides. At
+        the depth cap the ``agent.spawn`` binding is dropped so the child cannot delegate."""
+        parent_bindings: tuple[ToolBinding, ...] = parent_config.tools if parent_config else ()
+        if definition.tools is None:
+            bindings = list(parent_bindings)
+        else:
+            bindings = [b for b in parent_bindings if _binding_matches(b, definition.tools)]
+        if definition.disallowed_tools:
+            bindings = [b for b in bindings if not _binding_matches(b, definition.disallowed_tools)]
+        if at_max_depth:
+            bindings = [b for b in bindings if b.ref.tool_id != "agent.spawn"]
+        parent_model = parent_config.model if parent_config else None
+        parent_search = parent_config.tool_search if parent_config else ToolSearchConfig()
+        return AgentRuntimeConfig(
+            definition_id=definition_id,
+            model=definition.model or parent_model,
+            prompt=definition.prompt,
+            tools=tuple(bindings),
+            tool_search=definition.tool_search or parent_search,
+            metadata=dict(definition.metadata),
         )
 
     def _bootstrap(self) -> _RunResources:

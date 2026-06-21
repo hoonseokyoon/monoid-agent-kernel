@@ -44,6 +44,7 @@ from native_agent_runner.core.agents import (
     RuntimeConfigProvider,
     RuntimeConfigSource,
     StaticRuntimeConfigProvider,
+    SubagentDefinition,
     ToolBinding,
     ToolSearchConfig,
     coerce_runtime_config_provider,
@@ -211,6 +212,7 @@ __all__ = [
     "ResultInjector",
     "TaskReporter",
     # subagent (agent-as-tool) delegation
+    "SubagentDefinition",
     "SubagentTaskExecutor",
     "agent_spawn_tool",
 ]

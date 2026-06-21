@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, Union
 
 from native_agent_runner.core._util import canonical_sha256
-from native_agent_runner.core.spec import ModelConfig
+from native_agent_runner.core.spec import ModelConfig, RunLimits, RunMode
 from native_agent_runner.core.tool_surface import (
     ToolAuthorization,
     ToolAuthorizationDecision,
@@ -324,6 +324,50 @@ class AgentRuntimeConfig:
             "tool_search": self.tool_search.to_json(),
             "metadata": dict(self.metadata),
         }
+
+
+@dataclass(frozen=True)
+class SubagentDefinition:
+    """How a parent run delegates to a subagent (agent-as-tool). Mirrors the Claude
+    Code subagent model: tools/model/mode/limits default to *inheriting* the parent's,
+    and ``tools``/``disallowed_tools`` filter the parent's tool set — a subagent can
+    never exceed the parent (the allowlist is resolved against the parent's bindings; see
+    ``AgentLoop._resolve_child_config``).
+
+    - ``tools=None`` inherits ALL of the parent's tool bindings; a tuple is an allowlist
+      matched (fnmatch) against each parent binding's tool id / binding id / model name,
+      so patterns like ``"mcp.*"`` or ``"fs.read"`` work.
+    - ``disallowed_tools`` is a denylist applied after the allowlist (deny wins).
+    - ``model``/``mode``/``limits``/``tool_search`` are ``None`` to inherit the parent's.
+    - ``description`` is surfaced to the model in the ``agent.spawn`` tool so it can pick
+      the right subagent (Claude selects subagents by their description).
+    """
+
+    description: str = ""
+    prompt: PromptSpec = field(default_factory=PromptSpec)
+    model: ModelConfig | None = None
+    tools: tuple[str, ...] | None = None
+    disallowed_tools: tuple[str, ...] = ()
+    mode: RunMode | None = None
+    limits: RunLimits | None = None
+    tool_search: ToolSearchConfig | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    @classmethod
+    def from_runtime_config(
+        cls, config: AgentRuntimeConfig, *, description: str = ""
+    ) -> SubagentDefinition:
+        """Adapt an explicit runtime config into a definition: its bindings' tool ids
+        become a fixed allowlist and its prompt/model/tool_search carry over. The
+        allowlist is still ceiling-bound — the parent must also expose those tools."""
+        return cls(
+            description=description,
+            prompt=config.prompt,
+            model=config.model,
+            tools=tuple(binding.ref.tool_id for binding in config.tools),
+            tool_search=config.tool_search,
+            metadata=dict(config.metadata),
+        )
 
 
 @dataclass(frozen=True)

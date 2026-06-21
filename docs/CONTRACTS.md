@@ -240,18 +240,30 @@ A run can delegate a focused task to an isolated child run. This reuses the Asyn
 Task seams above via a `subagent` task kind (`SubagentTaskExecutor`); see
 `docs/SUBAGENT_DESIGN.md` for the full design.
 
-- **Enable**: pass `AgentLoop(subagent_definitions={<id>: AgentRuntimeConfig})`.
+- **Enable**: pass `AgentLoop(subagent_definitions={<id>: SubagentDefinition})`.
   When non-empty, the bootstrap registers the `agent.spawn` tool. The runtime config
   still needs an explicit binding to `agent.spawn` (e.g. `model_name: "agent_spawn"`)
   for the tool to reach the model.
-- **Tool**: `agent.spawn(subagent_type, prompt, background=false)`. The child runs
-  in an isolated overlay workspace and sees only `prompt` (not the parent's
-  conversation). Foreground (`background=false`) blocks and returns the child's final
-  message as the tool result; background returns a `{spawned, background, task_id}`
-  ack and the child's final message is delivered later as a user message.
+- **Definition** (`SubagentDefinition`, Claude-style — everything inherits the parent
+  by default): `description` (surfaced to the model for selection), `prompt`,
+  `model` (None → inherit), `tools` (None → inherit ALL parent tools; a tuple is an
+  allowlist), `disallowed_tools` (denylist, applied after the allowlist — deny wins),
+  `mode`/`limits` (None → inherit), `tool_search` (None → inherit). `tools`/
+  `disallowed_tools` entries are fnmatch patterns matched against each parent binding's
+  tool id / binding id / model name (so `fs.read`, `mcp.*`, `mcp.github.*`, `*` all
+  work). The allowlist is resolved **against the parent's bindings**, so a subagent can
+  never exceed the parent (hard ceiling); the parent's MCP/custom tool providers are
+  inherited by the child so inherited bindings resolve.
+- **Tool**: `agent.spawn(subagent_type, prompt, background=false)`. `subagent_type` is
+  constrained to the configured ids. The child runs in an isolated overlay workspace and
+  sees only `prompt` (not the parent's conversation). Foreground (`background=false`)
+  blocks and returns the child's final message as the tool result; background returns a
+  `{spawned, background, task_id}` ack and the child's final message is delivered later
+  as a user message.
 - **Bounds** (`RunLimits`): `max_subagents` (fan-out per run, default 8) and
   `max_subagent_depth` (nesting, default 5). Enforced in the executor; a child at the
-  depth cap has the `agent.spawn` tool stripped from its config.
+  depth cap has the `agent.spawn` binding stripped (the tool is absent, not just an
+  error at call time).
 - **Result shape** (`subagent_result`): `{status, final_text, message, child_run_id,
   subagent_type, usage, error}`.
 - **Events**: the parent stream carries `subagent.started` (`parent_id` = the spawn
