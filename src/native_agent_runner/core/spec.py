@@ -119,6 +119,14 @@ class ModelConfig:
         }
 
 
+def _optional_int(payload: dict[str, Any], key: str, default: int | None) -> int | None:
+    """Parse an optional int field: missing → ``default``; explicit ``null`` → ``None``."""
+    if key not in payload:
+        return default
+    value = payload[key]
+    return None if value is None else int(value)
+
+
 @dataclass(frozen=True)
 class RunLimits:
     max_steps: int = 30
@@ -141,6 +149,14 @@ class RunLimits:
     # Default off: under gateway-side prompt caching, evicting images is uneconomical
     # (cache reads are ~0.1x), so enable only when not caching image-bearing turns.
     keep_recent_tool_images: int | None = None
+    # Token budget on the run's accumulated API-reported usage (the authoritative actuals,
+    # not an estimate). Checked before each turn against the running totals: once a prior
+    # turn pushes a count past its cap the run settles ``limited`` instead of starting
+    # another turn. ``None`` = unbounded. These bound the cost dimension that bytes/steps
+    # can't (a single turn can be cheap in bytes yet huge in tokens).
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    max_total_tokens: int | None = None
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> RunLimits:
@@ -164,6 +180,9 @@ class RunLimits:
                 if payload.get("keep_recent_tool_images", defaults.keep_recent_tool_images) is None
                 else int(payload["keep_recent_tool_images"])
             ),
+            max_input_tokens=_optional_int(payload, "max_input_tokens", defaults.max_input_tokens),
+            max_output_tokens=_optional_int(payload, "max_output_tokens", defaults.max_output_tokens),
+            max_total_tokens=_optional_int(payload, "max_total_tokens", defaults.max_total_tokens),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -177,6 +196,9 @@ class RunLimits:
             "max_workspace_delta_bytes": self.max_workspace_delta_bytes,
             "max_delta_file_bytes": self.max_delta_file_bytes,
             "keep_recent_tool_images": self.keep_recent_tool_images,
+            "max_input_tokens": self.max_input_tokens,
+            "max_output_tokens": self.max_output_tokens,
+            "max_total_tokens": self.max_total_tokens,
         }
 
 
