@@ -15,6 +15,7 @@ from native_agent_runner.reference.backend.service import BackendRunRequest, Run
 from native_agent_runner.reference._shared.tokens import TokenManager
 from native_agent_runner.errors import ModelAdapterError, PermissionDenied
 from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
+from native_agent_runner.reference.llm_gateway.providers import offline_provider_factory
 from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
 from native_agent_runner.providers.base import ModelTurn, ToolCall
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
@@ -358,3 +359,16 @@ def _json_get(url: str, *, token: str) -> dict:
 
 def _wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
     wait_http_ready(base_url, timeout_s=timeout_s)
+
+
+def test_llm_gateway_offline_provider_answers_without_a_key() -> None:
+    # DX-1: the gateway can serve turns with zero credentials via the offline provider,
+    # the LLM-side counterpart of the WebGateway's fake provider.
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager, provider_adapter_factory=offline_provider_factory
+    )
+    result = gateway.handle_turn(_llm_token(manager), _payload())
+    assert "echo model" in result["final_text"].lower()
+    assert result["tool_calls"] == []
+    assert result["usage"]["total_tokens"] > 0

@@ -411,11 +411,48 @@ class RunnerBackend:
         if record is not None:
             record.cancellation_token.cancel()
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, drain: bool = False, drain_timeout_s: float = 5.0) -> None:
         """Stop this backend's watchdog. The run loop is process-shared (one per process,
         cleaned up at exit via atexit), so there is nothing per-backend to tear down — and
-        stopping it here would break other backends in the process. Idempotent."""
+        stopping it here would break other backends in the process. Idempotent.
+
+        Pass ``drain=True`` to first cooperatively end this backend's own runs (see
+        :meth:`drain`), so an embedder that stops a backend mid-session leaves no parked
+        session coroutines on the shared loop (otherwise teardown logs "Task was destroyed
+        but it is pending")."""
+        if drain:
+            self.drain(timeout_s=drain_timeout_s)
         self.stop_watchdog()
+
+    def drain(self, *, timeout_s: float = 5.0) -> list[str]:
+        """Cooperatively end every non-terminal run this backend owns: cancel it and wake any
+        session parked on its message queue, then wait (bounded by ``timeout_s``) for each to
+        reach a terminal state.
+
+        Returns the run ids still non-terminal when the timeout elapsed (empty on a clean
+        drain). Idempotent; safe to call before :meth:`shutdown`. This is the one-call
+        counterpart to issuing a ``cancel_run`` per run and sleeping."""
+        terminal = {"completed", "failed", "limited"}
+        with self._lock:
+            records = [record for record in self._records.values() if record.status not in terminal]
+        for record in records:
+            with self._lock:
+                record.cancellation_token.cancel()
+                if not record.error_code:
+                    record.error = "run drained on shutdown"
+                    record.error_code = "cancelled"
+            # Wake a session parked on its message queue (put runs on the shared loop).
+            self._call_soon(record.message_queue.put_nowait, _CLOSE_SESSION)
+        deadline = time.time() + timeout_s
+        pending: list[str] = []
+        for record in records:
+            while time.time() < deadline:
+                if record.status in terminal:
+                    break
+                time.sleep(0.02)
+            else:
+                pending.append(record.run_id)
+        return pending
 
     def submit_run(self, request: BackendRunRequest) -> BackendRunSubmission:
         prepared = self._prepare_run_record(request)

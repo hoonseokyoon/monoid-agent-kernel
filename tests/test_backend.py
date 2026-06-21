@@ -598,6 +598,38 @@ def test_backend_single_turn_run_closes_after_first_settle(tmp_path: Path) -> No
     assert status == "completed"
 
 
+def test_backend_drain_ends_parked_multi_turn_sessions(tmp_path: Path) -> None:
+    # DX-2: drain() cooperatively ends owned runs in one call, so a parked multi-turn session
+    # reaches a terminal state (no dangling coroutine on the shared loop).
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")])
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    run_id = submission.run_id
+
+    def _wait(predicate, tries: int = 1000) -> bool:
+        for _ in range(tries):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+    pending = backend.drain(timeout_s=20)
+    assert pending == []
+    assert backend._record(run_id).status in {"completed", "failed", "limited"}
+
+
 def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
     manager = _token_manager()
     token = manager.issue(
