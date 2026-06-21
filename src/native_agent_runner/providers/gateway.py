@@ -7,13 +7,17 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.errors import ModelAdapterError
-from native_agent_runner.providers._common import build_reasoning_payload, normalize_usage
+from native_agent_runner.providers._common import (
+    build_reasoning_payload,
+    normalize_usage,
+    project_message_to_text,
+)
 from native_agent_runner.providers.base import (
     ModelRequest,
     ModelStreamChunk,
@@ -44,6 +48,9 @@ class GatewayModelAdapter:
     token: str | None = None
     token_env: str = DEFAULT_GATEWAY_TOKEN_ENV
     token_file: Path | None = None
+
+    # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
+    supports_multimodal: ClassVar[bool] = True
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         config = request.model or self.config
@@ -218,7 +225,13 @@ class GatewayModelAdapter:
 
         if request.messages is not None:
             # By-value: the full conversation travels as messages; no continuation handle.
-            payload["messages"] = list(request.messages)
+            # A text-only adapter projects any multimodal (list) content down to text so the
+            # gateway never receives parts it cannot forward; a multimodal adapter passes the
+            # resolved blocks through verbatim.
+            if getattr(self, "supports_multimodal", False):
+                payload["messages"] = list(request.messages)
+            else:
+                payload["messages"] = [project_message_to_text(m) for m in request.messages]
         elif request.previous_turn_handle:
             payload["previous_turn_handle"] = request.previous_turn_handle
             payload["observations"] = [

@@ -1,12 +1,44 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from native_agent_runner import _proc
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.shell import ShellExecutionOptions, execute_shell
 from native_agent_runner.workspace.local import LocalWorkspaceBackend
+
+
+def test_terminate_process_falls_back_to_kill_when_group_kill_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled group-killer (Windows ``taskkill`` timing out / POSIX ``killpg`` failing)
+    must escalate to a direct ``process.kill()`` rather than block — the reap-race hardening."""
+    killed: list[bool] = []
+
+    class _FakeProcess:
+        pid = 4321
+
+        def kill(self) -> None:
+            killed.append(True)
+
+    if os.name == "nt":
+        def _stall(*args: object, **kwargs: object) -> None:
+            raise subprocess.TimeoutExpired(cmd="taskkill", timeout=_proc._TERMINATE_TIMEOUT_S)
+
+        monkeypatch.setattr(_proc.subprocess, "run", _stall)
+    else:
+        def _fail(*args: object, **kwargs: object) -> None:
+            raise ProcessLookupError()
+
+        monkeypatch.setattr(_proc.os, "killpg", _fail)
+
+    _proc.terminate_process(_FakeProcess())  # type: ignore[arg-type]
+
+    assert killed == [True]
 
 
 def _python_command(code: str) -> str:

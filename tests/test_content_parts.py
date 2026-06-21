@@ -15,6 +15,7 @@ from native_agent_runner.core.content import (
     content_part_to_json,
     non_text_part_types,
 )
+from native_agent_runner.core.checkpoint import LocalFsCheckpointStore
 from native_agent_runner.core.spec import AgentRunSpec, text_from_parts
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelTurn
@@ -148,6 +149,86 @@ def test_explicit_text_input_is_sent_to_model(tmp_path: Path) -> None:
     )
 
     assert adapter.requests[0].instruction == "explicit text"
+
+
+def test_image_survives_in_message_log(tmp_path: Path) -> None:
+    """P0: a non-text input part lands in the by-value log as a by-reference parts list,
+    instead of being collapsed to text and dropped."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "done"}, "c"),),
+            )
+        ]
+    )
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run_once(
+        (TextPart("describe the image"), ImagePart(source_ref="i.png", mime_type="image/png"))
+    )
+
+    user_messages = [m for m in adapter.requests[0].messages if m["role"] == "user"]
+    assert user_messages, "expected a user message in the by-value log"
+    content = user_messages[0]["content"]
+    assert isinstance(content, list)
+    assert {"type": "image", "source_ref": "i.png", "mime_type": "image/png"} in content
+    assert {"type": "text", "text": "describe the image"} in content
+
+
+def test_image_survives_resume(tmp_path: Path) -> None:
+    """P0: an image in the durable log persists into the checkpoint and is restored
+    verbatim in a fresh loop, so resume re-sends it by value (not lost)."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    image = {"type": "image", "source_ref": "i.png", "mime_type": "image/png"}
+
+    # Drive one multimodal turn that parks on a hosted (hitl) task.
+    provider = runtime_provider(runtime_config("hitl.request"))
+    adapter1 = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick"}, "c1"),),
+            )
+        ]
+    )
+    loop1 = AgentLoop(spec=spec, model_adapter=adapter1, runtime_config_provider=provider)
+    loop1.open()
+    suspension = loop1.run_until_suspended(
+        (TextPart("describe this"), ImagePart(source_ref="i.png", mime_type="image/png"))
+    )
+    assert suspension.reason == "awaiting_tasks"
+    task_id = suspension.awaiting_task_ids[0]
+
+    cp = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert cp is not None
+    # The image is in the durably-committed checkpoint as a by-reference parts list.
+    assert any(
+        m["role"] == "user" and isinstance(m["content"], list) and image in m["content"]
+        for m in cp.checkpoint.messages
+    )
+    del loop1  # simulate process death without close()
+
+    # Fresh "process": restore and continue; the restored log still carries the image.
+    adapter2 = FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="thanks")])
+    loop2 = AgentLoop(
+        spec=spec,
+        model_adapter=adapter2,
+        runtime_config_provider=runtime_provider(runtime_config("hitl.request")),
+    )
+    loop2.restore(cp.checkpoint)
+    loop2.report_task_result(task_id, {"answer": "ok"})
+    loop2.run_until_suspended(None)
+    loop2.close()
+
+    assert any(
+        m["role"] == "user" and isinstance(m["content"], list) and image in m["content"]
+        for m in adapter2.requests[-1].messages
+    )
 
 
 def test_text_only_input_emits_no_degraded_warning(tmp_path: Path) -> None:

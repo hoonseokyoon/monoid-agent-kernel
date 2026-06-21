@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.errors import ModelAdapterError
-from native_agent_runner.providers._common import build_reasoning_payload, normalize_usage
+from native_agent_runner.providers._common import (
+    build_reasoning_payload,
+    normalize_usage,
+)
 from native_agent_runner.providers.base import (
     ModelRequest,
     ModelTurn,
@@ -27,6 +30,9 @@ class OpenAIModelAdapter:
     config: ModelConfig
     api_key: str | None = None
     allow_direct_provider_api: bool = False
+
+    # Maps resolved base64 image blocks to Responses ``input_image`` items.
+    supports_multimodal: ClassVar[bool] = True
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         if not self.allow_direct_provider_api and os.environ.get("NAR_ALLOW_DIRECT_PROVIDER_API") != "1":
@@ -102,21 +108,54 @@ def _observation_input_item(observation: Any) -> dict[str, Any]:
     }
 
 
+def _user_content_items(content: list[Any]) -> list[dict[str, Any]]:
+    """Map resolved by-value user parts to OpenAI Responses content items.
+
+    ``content`` holds text part-dicts and neutral base64 media blocks (produced by the
+    loop's wire-build). A base64 image becomes an ``input_image`` data-URL.
+    """
+    items: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            items.append({"type": "input_text", "text": str(part.get("text", ""))})
+        elif part.get("type") == "image":
+            source = part.get("source") or {}
+            if source.get("type") == "base64":
+                data_url = f"data:{source.get('media_type')};base64,{source.get('data')}"
+                items.append({"type": "input_image", "image_url": data_url})
+    return items
+
+
 def _message_to_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
     """Translate one provider-neutral by-value message into OpenAI Responses input items.
     An assistant turn with tool calls expands to an assistant text item (if any) plus a
     ``function_call`` item per call; a tool message is a ``function_call_output``."""
     role = message.get("role")
     if role == "user":
-        return [{"role": "user", "content": message.get("content") or ""}]
+        content = message.get("content")
+        if isinstance(content, list):
+            # Multimodal: the loop resolved media to neutral base64 blocks. Map each part to
+            # an OpenAI Responses content item (input_text / input_image data-URL).
+            return [{"role": "user", "content": _user_content_items(content)}]
+        return [{"role": "user", "content": content or ""}]
     if role == "tool":
-        return [
+        items = [
             {
                 "type": "function_call_output",
                 "call_id": message.get("call_id") or "",
                 "output": json.dumps(message.get("content"), ensure_ascii=False),
             }
         ]
+        # Images a tool returned cannot ride the tool/function output on OpenAI — deliver
+        # them as a follow-up user message right after the tool result (the portable split).
+        images = message.get("images")
+        if isinstance(images, list):
+            image_items = _user_content_items(images)
+            if image_items:
+                items.append({"role": "user", "content": image_items})
+        return items
     if role == "assistant":
         items: list[dict[str, Any]] = []
         content = message.get("content") or ""

@@ -3,9 +3,11 @@ from __future__ import annotations
 import fnmatch
 from typing import Any
 
+from native_agent_runner.core.content import ImagePart
+from native_agent_runner.core.media import MEDIA_INPUT_CAPABILITY
+from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.errors import WorkspaceError
 from native_agent_runner.tools.base import ToolContext, ToolResult, ToolSpec
-from native_agent_runner.core.workspace import Workspace
 
 
 def builtin_tools(workspace: Workspace) -> list[ToolSpec]:
@@ -14,6 +16,7 @@ def builtin_tools(workspace: Workspace) -> list[ToolSpec]:
         _fs_tree(workspace),
         _fs_stat(workspace),
         _fs_read(workspace),
+        _fs_read_media(workspace),
         _fs_glob(workspace),
         _text_search(workspace),
         _tool_search(),
@@ -213,6 +216,53 @@ def _fs_read(workspace: Workspace) -> ToolSpec:
             required=["path"],
         ),
         capability="fs.read",
+        side_effect="read",
+        handler=handler,
+        path_args=("path",),
+    )
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """Identify an image by magic bytes (not extension — avoids mislabel-driven 400s)."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _fs_read_media(workspace: Workspace) -> ToolSpec:
+    def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
+        path = str(args["path"])
+        max_bytes = int(args.get("max_bytes", workspace.max_bytes_read))
+        data, digest = workspace.read_bytes(path, max_bytes=max_bytes)
+        mime = _sniff_image_mime(data)
+        if mime is None:
+            raise WorkspaceError(f"not a supported image file: {path}")
+        normalized = workspace.normalize(path)
+        # Image travels by reference (source_ref); the runner resolves + forwards it so the
+        # model can view it. The text content carries metadata only.
+        return ToolResult(
+            ok=True,
+            content={"path": normalized, "mime_type": mime, "sha256": digest, "size": len(data)},
+            images=(ImagePart(source_ref=normalized, mime_type=mime),),
+        )
+
+    return ToolSpec(
+        id="fs.read_media",
+        description="Read an image file (PNG/JPEG/GIF/WebP) from the workspace so the model can view it.",
+        input_schema=_object_schema(
+            {
+                "path": {"type": "string"},
+                "max_bytes": {"type": "integer", "minimum": 1, "maximum": 10_000_000, "default": 1_000_000},
+            },
+            required=["path"],
+        ),
+        capability=MEDIA_INPUT_CAPABILITY,
         side_effect="read",
         handler=handler,
         path_args=("path",),

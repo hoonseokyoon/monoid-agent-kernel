@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import shutil
 import subprocess
@@ -27,6 +28,10 @@ from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.workspace.paths import is_within, normalize_workspace_path
 
 import native_agent_runner.shell as shell_runtime
+
+# Upper bound on awaiting a process exit after termination, so a Windows reap race can never
+# block the shared job loop indefinitely (see ``ShellTaskExecutor._terminate_and_reap``).
+_REAP_TIMEOUT_S = 10.0
 
 BackgroundJobStatus = Literal[
     "running",
@@ -408,20 +413,17 @@ class ShellTaskExecutor:
             total_bytes = stdout_bytes + stderr_bytes
             if job.cancel_path.exists():
                 job.status = "cancelled"
-                await asyncio.to_thread(terminate_process, proc)
-                job.exit_code = await proc.wait()
+                job.exit_code = await self._terminate_and_reap(proc)
                 break
             if now - job.started_at >= job.timeout_s:
                 job.status = "timed_out"
                 job.timed_out = True
-                await asyncio.to_thread(terminate_process, proc)
-                job.exit_code = await proc.wait()
+                job.exit_code = await self._terminate_and_reap(proc)
                 break
             if total_bytes > job.max_output_bytes:
                 job.status = "output_limited"
                 job.output_truncated = True
-                await asyncio.to_thread(terminate_process, proc)
-                job.exit_code = await proc.wait()
+                job.exit_code = await self._terminate_and_reap(proc)
                 break
             if total_bytes != job._last_output_event_bytes and now - job._last_output_event_at >= 0.25:
                 job.stdout_bytes = stdout_bytes
@@ -438,6 +440,21 @@ class ShellTaskExecutor:
             job.output_truncated = True
             if job.status == "exited":
                 job.status = "output_limited"
+
+    async def _terminate_and_reap(self, proc: asyncio.subprocess.Process) -> int | None:
+        """Terminate the process group and wait for it, bounded. ``terminate_process`` is
+        offloaded so a stalled killer never blocks the shared job loop; the reap itself is
+        capped, escalating to a direct ``kill`` and finally giving up (returns the last-known
+        ``returncode``) rather than awaiting ``proc.wait()`` forever — a Windows reap race that
+        otherwise leaves this monitor pending indefinitely."""
+        await asyncio.to_thread(terminate_process, proc)
+        for _ in range(2):
+            try:
+                return await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+        return proc.returncode
 
     def _cleanup_tmp(self, job: BackgroundJob) -> None:
         if job.tmp_root is not None:
@@ -746,10 +763,25 @@ class TaskManager:
 
     def _shutdown_task_loop(self) -> None:
         """Stop the private fallback loop if one was started. The bound run loop is owned by
-        AgentLoop and is never stopped here."""
+        AgentLoop and is never stopped here.
+
+        Cancel and await any still-pending monitor coroutines first: ``cancel_all`` sets a
+        job's terminal status from *inside* ``_amonitor`` before that coroutine returns, so
+        without draining we could close the loop while a monitor is in its tail — the
+        "Task was destroyed but it is pending" warning. Draining makes teardown deterministic."""
         loop, thread = self._task_loop, self._task_loop_thread
         if loop is None:
             return
+
+        async def _drain() -> None:
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(_drain(), loop).result(timeout=_REAP_TIMEOUT_S + 2)
         loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
             thread.join(timeout=5)

@@ -10,6 +10,7 @@ from native_agent_runner.core.content import (
     TextPart,
     content_part_from_json,
     content_part_to_json,
+    non_text_part_types,
 )
 from native_agent_runner.permissions import PermissionPolicy
 
@@ -135,6 +136,11 @@ class RunLimits:
     # checkpoint stays the recovery point), and exceeding on restore refuses the checkpoint.
     max_workspace_delta_bytes: int = 100_000_000
     max_delta_file_bytes: int = 50_000_000
+    # Keep only the N most-recent tool-result images on the wire (older ones evicted,
+    # cache-aligned) to bound replay growth in screenshot-heavy loops. ``None`` = keep all.
+    # Default off: under gateway-side prompt caching, evicting images is uneconomical
+    # (cache reads are ~0.1x), so enable only when not caching image-bearing turns.
+    keep_recent_tool_images: int | None = None
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> RunLimits:
@@ -153,6 +159,11 @@ class RunLimits:
                 payload.get("max_workspace_delta_bytes", defaults.max_workspace_delta_bytes)
             ),
             max_delta_file_bytes=int(payload.get("max_delta_file_bytes", defaults.max_delta_file_bytes)),
+            keep_recent_tool_images=(
+                None
+                if payload.get("keep_recent_tool_images", defaults.keep_recent_tool_images) is None
+                else int(payload["keep_recent_tool_images"])
+            ),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -165,6 +176,7 @@ class RunLimits:
             "max_message_log_bytes": self.max_message_log_bytes,
             "max_workspace_delta_bytes": self.max_workspace_delta_bytes,
             "max_delta_file_bytes": self.max_delta_file_bytes,
+            "keep_recent_tool_images": self.keep_recent_tool_images,
         }
 
 
@@ -187,6 +199,23 @@ def input_to_parts(user_input: str | tuple[ContentPart, ...]) -> tuple[ContentPa
     if isinstance(user_input, str):
         return (TextPart(user_input),)
     return tuple(user_input)
+
+
+def user_message_from_parts(parts: tuple[ContentPart, ...]) -> dict[str, Any] | None:
+    """Build the durable by-value user message for ``parts``.
+
+    All-text input keeps the legacy ``{"role": "user", "content": <str>}`` shape (and
+    returns ``None`` when the text is empty, so an empty turn is not logged). When any
+    non-text part is present, the message carries the parts **by reference** as a list of
+    ``content_part_to_json`` dicts — lossless and JSON-round-trippable, so it survives
+    checkpoint/resume. Resolution to bytes happens later, at wire-build time.
+    """
+    if non_text_part_types(parts):
+        return {"role": "user", "content": [content_part_to_json(part) for part in parts]}
+    text = text_from_parts(parts)
+    if not text:
+        return None
+    return {"role": "user", "content": text}
 
 
 @dataclass(frozen=True)

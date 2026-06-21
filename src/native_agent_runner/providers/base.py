@@ -37,6 +37,9 @@ class ToolObservation:
     tool_name: str
     output: dict[str, Any]
     is_background: bool = False
+    # Non-text media the tool returned, by reference (``content_part_to_json`` dicts).
+    # Round-tripped through the checkpoint so a resumed run still forwards the image.
+    images: tuple[dict[str, Any], ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -44,6 +47,7 @@ class ToolObservation:
             "tool_name": self.tool_name,
             "output": self.output,
             "is_background": self.is_background,
+            "images": [dict(image) for image in self.images],
         }
 
     @classmethod
@@ -53,6 +57,7 @@ class ToolObservation:
             tool_name=str(payload.get("tool_name") or ""),
             output=dict(payload.get("output") or {}),
             is_background=bool(payload.get("is_background", False)),
+            images=tuple(dict(image) for image in payload.get("images") or ()),
         )
 
 
@@ -131,9 +136,13 @@ class ModelAdapter(Protocol):
     # Optional capability flag. The loop reads it via
     # ``getattr(adapter, "supports_multimodal", False)``; an adapter that can
     # accept non-text content parts sets it True. Defaulting off keeps existing
-    # adapters valid without declaring it. Multimodal forwarding itself is not
-    # yet implemented (see core/content.py) — this is the negotiation seam.
+    # adapters valid without declaring it. When True, the loop resolves by-reference
+    # media in the by-value ``messages`` log to wire blocks before the call.
     supports_multimodal: bool = False
+    # The wire encoding a multimodal adapter expects for resolved media. The loop reads
+    # it via ``getattr(adapter, "wire_image_encoding", "base64")``. Only ``"base64"``
+    # is implemented today; ``"url"`` / ``"file_id"`` are reserved for later phases.
+    wire_image_encoding: str = "base64"
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         ...

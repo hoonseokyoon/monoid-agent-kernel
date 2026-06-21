@@ -56,8 +56,16 @@ def spawn_process(
     )
 
 
+# The external group-killer (``taskkill``) is itself a spawned process; under load/AV its
+# spawn can stall. Bound it so a stalled kill can never block the caller — the foreground
+# shell loop or the background job monitor thread — indefinitely.
+_TERMINATE_TIMEOUT_S = 10.0
+
+
 def terminate_process(process: subprocess.Popen[bytes]) -> None:
-    """Terminate ``process`` and its group, falling back to ``kill`` on error."""
+    """Terminate ``process`` and its group, falling back to a direct ``kill`` on error or if
+    the group kill does not return promptly. The group kill (Windows ``taskkill``) is bounded
+    by a timeout so a stalled killer escalates to ``process.kill()`` instead of hanging."""
     try:
         if os.name == "nt":
             subprocess.run(
@@ -66,8 +74,13 @@ def terminate_process(process: subprocess.Popen[bytes]) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                timeout=_TERMINATE_TIMEOUT_S,
             )
         else:
             os.killpg(process.pid, signal.SIGTERM)
     except Exception:
-        process.kill()
+        # taskkill timed out / failed, or killpg failed: terminate the child handle directly.
+        try:
+            process.kill()
+        except Exception:
+            pass
