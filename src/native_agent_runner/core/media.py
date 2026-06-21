@@ -27,9 +27,9 @@ from native_agent_runner.errors import NativeAgentError
 # here (and referenced) so it is a live constant rather than a dead one.
 MEDIA_INPUT_CAPABILITY = "media.input"
 
-# Non-text part ``type`` values the wire-build resolves and forwards today. Image only
-# for now; ``document``/``audio``/``video`` join as their provider mapping lands.
-WIRE_FORWARDABLE_PART_TYPES = frozenset({"image"})
+# Non-text part ``type`` values the wire-build resolves and forwards today. ``audio``/``video``
+# join as their provider mapping lands.
+WIRE_FORWARDABLE_PART_TYPES = frozenset({"image", "document"})
 
 # Image token accounting (Anthropic patch model: tokens ≈ ⌈w/28⌉·⌈h/28⌉, clamped to a
 # per-model native cap). The legacy (w·h)/750 approximation is deprecated.
@@ -152,12 +152,16 @@ class WorkspaceMediaResolver:
         return stripped
 
 
-def media_block_base64(part_type: str, resolved: ResolvedMedia) -> dict[str, Any]:
+def media_block_base64(
+    part_type: str, resolved: ResolvedMedia, *, filename: str | None = None
+) -> dict[str, Any]:
     """Neutral resolved media block (the Anthropic image/document shape).
 
-    Adapters map this further to their provider envelope (e.g. OpenAI ``input_image``).
+    Adapters map this further to their provider envelope (e.g. OpenAI ``input_image`` /
+    ``input_file``). ``filename`` is carried on document blocks because OpenAI ``input_file``
+    requires it; the Anthropic shape ignores the extra key.
     """
-    return {
+    block: dict[str, Any] = {
         "type": part_type,
         "source": {
             "type": "base64",
@@ -165,6 +169,15 @@ def media_block_base64(part_type: str, resolved: ResolvedMedia) -> dict[str, Any
             "data": base64.b64encode(resolved.data).decode("ascii"),
         },
     }
+    if filename:
+        block["filename"] = filename
+    return block
+
+
+def _document_filename(source_ref: str) -> str:
+    """Basename of a document ``source_ref`` (workspace prefix stripped) for OpenAI input_file."""
+    path = _WORKSPACE_PREFIX_RE.sub("", source_ref, count=1)
+    return path.rsplit("/", 1)[-1] or "document.pdf"
 
 
 def count_tool_result_images(messages: tuple[dict[str, Any], ...]) -> int:
@@ -263,5 +276,6 @@ def _resolve_part_list(parts: list[Any], resolver: MediaResolver) -> list[dict[s
             resolved.append(part)
         elif part_type in WIRE_FORWARDABLE_PART_TYPES:
             media = resolver.resolve(str(part["source_ref"]), str(part["mime_type"]))
-            resolved.append(media_block_base64(str(part_type), media))
+            filename = _document_filename(str(part["source_ref"])) if part_type == "document" else None
+            resolved.append(media_block_base64(str(part_type), media, filename=filename))
     return resolved
