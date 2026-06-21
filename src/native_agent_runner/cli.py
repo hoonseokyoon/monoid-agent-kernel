@@ -50,6 +50,7 @@ from native_agent_runner.providers.base import ModelAdapter
 from native_agent_runner.providers.gateway import GatewayModelAdapter
 from native_agent_runner.providers.openai import OpenAIModelAdapter
 from native_agent_runner.recorder import StdoutJsonlSink, append_event_to_run
+from native_agent_runner.skills import SkillProvider, load_skill_definitions
 from native_agent_runner.subagent_loader import load_subagent_definitions
 from native_agent_runner.tool_loader import load_tool_provider
 from native_agent_runner.web import WebGatewayClient
@@ -131,6 +132,12 @@ def main() -> None:
     default=None,
     help="Load subagent definitions (*.md with frontmatter) from a directory, enabling agent.spawn.",
 )
+@click.option(
+    "--skills-directory",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Load Agent Skills (SKILL.md with frontmatter) from a directory, enabling the skill tools.",
+)
 @click.option("--deny-path", multiple=True, help="Deny workspace paths matching a backend-provided glob.")
 @click.option("--redact-path", multiple=True, help="Redact matching paths from public events and projections.")
 @click.option("--permission-policy-file", type=click.Path(path_type=Path), default=None)
@@ -175,6 +182,7 @@ def run(
     max_duration_s: int,
     tool_module: tuple[str, ...],
     agents_directory: Path | None,
+    skills_directory: Path | None,
     deny_path: tuple[str, ...],
     redact_path: tuple[str, ...],
     permission_policy_file: Path | None,
@@ -248,6 +256,16 @@ def run(
         subagent_definitions = (
             load_subagent_definitions(agents_directory) if agents_directory is not None else {}
         )
+        skill_provider: SkillProvider | None = None
+        if skills_directory is not None:
+            skill_definitions = load_skill_definitions(skills_directory)
+            if skill_definitions:
+                skill_provider = SkillProvider(skill_definitions)
+                # Provider tools are not auto-bound; expose them by merging their bindings
+                # into the runtime config (mirrors the MCP provider).
+                runtime_config = replace(
+                    runtime_config, tools=runtime_config.tools + skill_provider.tool_bindings()
+                )
         extra_sinks = []
         if stream_json:
             extra_sinks.append(StdoutJsonlSink())
@@ -266,7 +284,8 @@ def run(
             llm_gateway_token_file=llm_gateway_token_file,
             allow_direct_provider_api=allow_direct_provider_api,
         ),
-        tool_providers=providers,
+        tool_providers=providers + ((skill_provider,) if skill_provider is not None else ()),
+        context_providers=(skill_provider,) if skill_provider is not None else (),
         event_sinks=tuple(extra_sinks),
         status_file=not no_status_file,
         permission_policy=spec.permission_policy,

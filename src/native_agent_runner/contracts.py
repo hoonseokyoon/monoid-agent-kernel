@@ -127,6 +127,9 @@ from native_agent_runner.core.frontmatter import parse_frontmatter
 from native_agent_runner.subagent_loader import load_subagent_definitions
 from native_agent_runner.tools.builtin import agent_spawn_tool
 
+# Agent Skills (progressive disclosure) — context + tool provider, plus file discovery
+from native_agent_runner.skills import SkillDefinition, SkillProvider, load_skill_definitions
+
 __all__ = [
     # engine entry / result
     "AgentLoop",
@@ -219,4 +222,8 @@ __all__ = [
     "agent_spawn_tool",
     "load_subagent_definitions",
     "parse_frontmatter",
+    # agent skills (progressive disclosure)
+    "SkillDefinition",
+    "SkillProvider",
+    "load_skill_definitions",
 ]

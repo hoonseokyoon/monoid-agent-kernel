@@ -288,6 +288,41 @@ Task seams above via a `subagent` task kind (`SubagentTaskExecutor`); see
   (fresh subagents only). Parsed by `parse_frontmatter` — a zero-dependency YAML subset
   (scalars, inline/block lists, quotes), shared with Skills' `SKILL.md`.
 
+### Skills (progressive disclosure)
+
+A run can be equipped with **Agent Skills** — procedural how-to knowledge (Anthropic's
+`SKILL.md` model) delivered to the model by *progressive disclosure*, so a large library
+costs almost nothing until a skill is actually used. Skills are a knowledge layer,
+complementary to subagents (execution) and MCP (integration). The whole feature attaches
+through the existing `ContextProvider` + `ToolProvider` seams with **no core-loop change**
+(`SkillProvider` implements both); see `docs/SKILLS_DESIGN.md`.
+
+- **Enable**: build a `SkillProvider(definitions)` and register the one instance in both
+  `AgentLoop(context_providers=(provider,), tool_providers=(provider,))`. Provider tools
+  are not auto-bound — merge `provider.tool_bindings()` into the runtime config so the
+  `skill` tools reach the model (mirrors the MCP provider). The CLI `--skills-directory`
+  does all of this.
+- **Definition** (`SkillDefinition`): `name`, `description` (both advertised at L1),
+  `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (**advisory** only,
+  Claude parity — a hint, not an enforced restriction), `directory` (bundle root for L3),
+  `metadata`.
+- **Three levels of disclosure**:
+  - **L1 — catalog** (~100 tokens/skill, always resident): `SkillProvider.static_segment()`
+    lists each `name: description` in the system prompt plus how to load one.
+  - **L2 — instructions** (on trigger): the model calls the `skill(name)` tool; the result
+    carries `{name, instructions, allowed_tools?, resources?}`. Model-native triggering —
+    the model picks a skill by its description, no router.
+  - **L3 — resources** (on demand): the model calls `skill.read_file(name, path)` to read a
+    bundled file (`path` relative to the skill directory, as listed in `resources`). Path
+    traversal outside the skill directory is rejected (`skill_path_invalid`); `SKILL.md`
+    itself is not readable this way (it is the L2 payload).
+- **Directory discovery**: `load_skill_definitions(dir)` (CLI `--skills-directory`) scans
+  recursively for `SKILL.md` files (the `<skills>/<skill-name>/SKILL.md` convention); the
+  skill name is the frontmatter `name` (falling back to the directory name) and the
+  SKILL.md's parent directory is the bundle root. Frontmatter fields: `name`, `description`,
+  `allowed-tools` (space-separated per the spec, or an inline list), `metadata`. Parsed by
+  the same zero-dependency `parse_frontmatter` used for subagents.
+
 ### Permission Boundary
 
 `PermissionPolicy` remains the workspace/public-output boundary:
