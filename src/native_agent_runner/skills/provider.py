@@ -132,6 +132,12 @@ class SkillProvider:
             resources = _list_resources(definition.directory)
             if resources:
                 content["resources"] = resources
+            # Best-effort observability: record the activation if the context exposes the
+            # hook (the engine's AgentToolContext does; bare test stubs do not). Duck-typed
+            # so skills stay decoupled from the core ToolContext contract.
+            record = getattr(_context, "record_skill_activation", None)
+            if callable(record):
+                record(definition.name, resource_count=len(resources))
             return ToolResult(ok=True, content=content)
 
         return handler

@@ -119,6 +119,17 @@ class OtelEventSink:
                 finish=_subagent_finish_attrs(event.data),
                 error=(kind == "subagent.failed" or event.data.get("status") == "failed"),
             )
+        elif kind == "skill.activated":
+            # A point-in-time event (no started/finished pair): enrich the still-open
+            # ``execute_tool`` span of the skill tool call (its event_id is this event's
+            # parent_id) rather than opening an orphan span.
+            self._enrich(
+                event.parent_id,
+                {
+                    "skill.name": event.data.get("name"),
+                    "skill.resource_count": event.data.get("resource_count"),
+                },
+            )
 
     def close(self) -> None:
         # Leak guard: end any spans still open (abnormal termination, missing finish events).
@@ -146,6 +157,17 @@ class OtelEventSink:
         self._spans[event.event_id] = self._tracer.start_span(
             name, context=context, kind=kind, attributes=_clean(attrs)
         )
+
+    def _enrich(self, span_event_id: str | None, attrs: dict[str, Any]) -> None:
+        """Set attributes on a still-open child span (keyed by the event_id that opened it).
+        No-op if that span is not open. Used for point-in-time events that annotate an
+        existing span rather than opening their own."""
+        span = self._spans.get(span_event_id or "")
+        if span is None or not span.is_recording():
+            return
+        for key, value in attrs.items():
+            if value is not None:
+                span.set_attribute(key, value)
 
     def _close_child(self, event: AgentEvent, *, finish: dict[str, Any] | None = None, error: bool = False) -> None:
         span = self._spans.pop(event.parent_id or "", None)

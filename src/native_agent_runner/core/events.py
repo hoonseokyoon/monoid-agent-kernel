@@ -47,6 +47,7 @@ AgentEventType = Literal[
     "subagent.started",
     "subagent.finished",
     "subagent.failed",
+    "skill.activated",
     "web.search.started",
     "web.search.finished",
     "web.search.failed",

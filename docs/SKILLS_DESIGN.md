@@ -1,6 +1,6 @@
 # Agent Skills (progressive disclosure) design
 
-Status: P1 implemented (branch `feat/skills-progressive-disclosure`).
+Status: P1 + P2 implemented (branch `feat/skills-progressive-disclosure`).
 
 ## Goal
 
@@ -99,11 +99,33 @@ out of scope here.
 both `context_providers` and `tool_providers`, with `provider.tool_bindings()` merged
 into the runtime config (provider tools are not auto-bound, same as MCP).
 
+## Observability (P2)
+
+Activating a skill is a normal `skill` tool call, so it is already covered by the
+`tool.call.started`/`finished` events and their `execute_tool` span. P2 adds a typed
+semantic signal on top of that, *without* changing the core ToolContext contract:
+
+- The `skill` tool handler **duck-types** an optional `record_skill_activation` hook on
+  the tool context (`getattr(context, "record_skill_activation", None)`). The engine's
+  `AgentToolContext` implements it; bare test stubs simply don't, so the handler degrades
+  to a no-op. This keeps skills decoupled from the core — the loop never imports skills.
+- `record_skill_activation` emits a `skill.activated` event whose `parent_id` is the
+  current skill tool-call event, and bumps a report-only counter.
+- The OTel sink treats `skill.activated` as a point-in-time event and **enriches the
+  already-open skill tool span** (looked up by `parent_id`) with `skill.name` /
+  `skill.resource_count`, rather than opening an orphan span.
+- Run metrics gain `skill_activation_count` + `skills_activated`, mirroring the subagent
+  roll-up (report-only; skills don't consume the parent's context budget the way an
+  inlined tool result does, so they are surfaced for visibility, not summed elsewhere).
+
+`allowed_tools` is echoed in the `skill` tool result as an advisory hint (it is not added
+to the L1 catalog, which stays at the ~100-token name+description budget).
+
 ## Scope
 
-- **P1 (this doc)**: L1 + L2 + L3, directory discovery, CLI, exports, tests, docs.
-- **P2**: `skill.activated` event + OTel span; advisory allowed-tools surfaced in the
-  catalog; lightweight activation metrics.
-- **P3**: `context: fork` — run a skill's body as a *subagent* (reuse the just-merged
-  subagent machine); optional `skill.run_script` (execute a bundled script, output-only,
-  code never enters context); optional enforced allowed-tools gating.
+- **P1**: L1 + L2 + L3, directory discovery, CLI, exports, tests, docs.
+- **P2** (this revision): `skill.activated` event + OTel span enrichment + activation
+  metrics; advisory allowed-tools echoed in the tool result.
+- **P3**: `context: fork` — run a skill's body as a *subagent* (reuse the merged subagent
+  machine); optional `skill.run_script` (execute a bundled script, output-only, code never
+  enters context); optional enforced allowed-tools gating.

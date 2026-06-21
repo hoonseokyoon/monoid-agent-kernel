@@ -184,6 +184,11 @@ class AgentToolContext(ToolContext):
     # inflate. Surfaced in the run metrics for cost visibility.
     subagent_count: int = 0
     subagent_usage: dict[str, int] = field(default_factory=dict)
+    # Report-only roll-up of skill activations (a skill's L2 instructions being loaded via
+    # the ``skill`` tool). Surfaced in run metrics for usage visibility. Skills attach via
+    # the ContextProvider/ToolProvider seams, so this is the only run-state they touch.
+    skill_activation_count: int = 0
+    skills_activated: list[str] = field(default_factory=list)
     _requested_tool_loads: list[str] = field(default_factory=list)
     _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
 
@@ -284,6 +289,22 @@ class AgentToolContext(ToolContext):
             content = task.started_content(self.recorder.run_dir)
             return {"spawned": True, "background": True, **content}
         return self.job_manager.wait(task.job_id)
+
+    def record_skill_activation(self, name: str, *, resource_count: int = 0) -> None:
+        """Observability hook called (best-effort) by the ``skill`` tool when a skill's
+        instructions are loaded. Emits a ``skill.activated`` event correlated to the skill
+        tool call (so an OTel sink can enrich that tool span) and bumps the run-metrics
+        counter. The skill tool duck-types this method, so skills stay decoupled from the
+        core contract; this is the only place run-state learns about skills."""
+        call = self._current_call
+        self.skill_activation_count += 1
+        self.skills_activated.append(name)
+        self.recorder.emit(
+            "skill.activated",
+            turn_id=call.turn_id,
+            parent_id=call.tool_event_id,
+            data={"name": name, "resource_count": int(resource_count)},
+        )
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.web_service.search(args, self._current_call)
@@ -2123,6 +2144,9 @@ class AgentLoop:
         if context.subagent_count:
             metrics["subagent_count"] = context.subagent_count
             metrics["subagent_usage"] = dict(context.subagent_usage)
+        if context.skill_activation_count:
+            metrics["skill_activation_count"] = context.skill_activation_count
+            metrics["skills_activated"] = list(context.skills_activated)
         if state.provider_error_code:
             metrics["provider_error_code"] = state.provider_error_code
         if state.provider_http_status is not None:

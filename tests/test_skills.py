@@ -10,6 +10,7 @@ from native_agent_runner.core.spec import AgentRunSpec
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from native_agent_runner.recorder import MemoryEventSink
 from native_agent_runner.skills import SkillDefinition, SkillProvider, load_skill_definitions
 from native_agent_runner.skills.definition import SKILL_FILENAME
 
@@ -270,3 +271,91 @@ def test_e2e_model_loads_skill_then_reads_resource(tmp_path: Path) -> None:
     outputs = json.dumps([obs.output for req in adapter.requests for obs in req.observations])
     assert "INSTRUCTIONS_BODY" in outputs
     assert "FORMS_CONTENT" in outputs
+
+
+# --- P2: observability -------------------------------------------------------------
+
+
+def _run_skill_activation(tmp_path: Path, *, event_sinks: tuple = ()):
+    skills_root = tmp_path / "skills"
+    _write_skill(
+        skills_root,
+        "pdf-fill",
+        description="Fill PDF forms",
+        body="BODY",
+        resources={"references/FORMS.md": "X"},
+    )
+    provider = SkillProvider(load_skill_definitions(skills_root))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("skill", {"name": "pdf-fill"}, "c1"),)),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    return AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        context_providers=(provider,),
+        tool_providers=(provider,),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=provider.tool_bindings())),
+        event_sinks=event_sinks,
+    ).run_once("go")
+
+
+def test_skill_activation_emits_correlated_event_and_metrics(tmp_path: Path) -> None:
+    sink = MemoryEventSink()
+    result = _run_skill_activation(tmp_path, event_sinks=(sink,))
+
+    by_type = {e.type: e for e in sink.events}
+    assert "skill.activated" in by_type
+    activated = by_type["skill.activated"]
+    assert activated.data["name"] == "pdf-fill"
+    assert activated.data["resource_count"] == 1
+
+    # Correlated to the skill tool call (so an OTel sink can enrich that tool span).
+    tool_starts = {e.event_id: e for e in sink.events if e.type == "tool.call.started"}
+    assert activated.parent_id in tool_starts
+    assert tool_starts[activated.parent_id].data.get("tool") == "skill"
+
+    # Report-only run metrics.
+    assert result.metrics["skill_activation_count"] == 1
+    assert result.metrics["skills_activated"] == ["pdf-fill"]
+
+
+def test_no_skill_metrics_when_none_activated(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "pdf-fill", description="d")
+    provider = SkillProvider(load_skill_definitions(tmp_path / "skills"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+    result = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        context_providers=(provider,),
+        tool_providers=(provider,),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=provider.tool_bindings())),
+    ).run_once("go")
+    assert "skill_activation_count" not in result.metrics
+
+
+def test_otel_skill_tool_span_enriched(tmp_path: Path) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from native_agent_runner.observability.otel import OtelEventSink
+
+    exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    _run_skill_activation(tmp_path, event_sinks=(OtelEventSink(tracer_provider=tracer_provider),))
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    assert "execute_tool skill" in spans
+    tool_span = spans["execute_tool skill"]
+    assert tool_span.attributes["skill.name"] == "pdf-fill"
+    assert tool_span.attributes["skill.resource_count"] == 1

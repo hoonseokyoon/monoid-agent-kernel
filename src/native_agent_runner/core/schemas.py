@@ -217,6 +217,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         {"subagent_type": _STR, "child_run_id": _STR, "status": _STR, "usage": _OBJ},
         additional=True,
     ),
+    "skill.activated": _data_schema(
+        {"name": _STR, "resource_count": _INT},
+        additional=True,
+    ),
     "web.search.started": _data_schema({}, additional=True),
     "web.search.finished": _data_schema({}, additional=True),
     "web.search.failed": _data_schema({}, additional=True),

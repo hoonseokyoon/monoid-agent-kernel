@@ -316,6 +316,12 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
     bundled file (`path` relative to the skill directory, as listed in `resources`). Path
     traversal outside the skill directory is rejected (`skill_path_invalid`); `SKILL.md`
     itself is not readable this way (it is the L2 payload).
+- **Observability**: activating a skill (L2) emits a `skill.activated` event whose
+  `parent_id` is the `skill` tool call (so it is correlated to, and an OTel sink enriches,
+  that tool's `execute_tool` span with `skill.name` / `skill.resource_count`); data is
+  `{name, resource_count}`. The run metrics carry `skill_activation_count` and
+  `skills_activated` (the list of activated skill names) — report-only, like the subagent
+  roll-up. `allowed_tools` is echoed in the `skill` tool result as an advisory hint.
 - **Directory discovery**: `load_skill_definitions(dir)` (CLI `--skills-directory`) scans
   recursively for `SKILL.md` files (the `<skills>/<skill-name>/SKILL.md` convention); the
   skill name is the frontmatter `name` (falling back to the directory name) and the
