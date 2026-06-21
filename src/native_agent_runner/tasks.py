@@ -763,10 +763,25 @@ class TaskManager:
 
     def _shutdown_task_loop(self) -> None:
         """Stop the private fallback loop if one was started. The bound run loop is owned by
-        AgentLoop and is never stopped here."""
+        AgentLoop and is never stopped here.
+
+        Cancel and await any still-pending monitor coroutines first: ``cancel_all`` sets a
+        job's terminal status from *inside* ``_amonitor`` before that coroutine returns, so
+        without draining we could close the loop while a monitor is in its tail — the
+        "Task was destroyed but it is pending" warning. Draining makes teardown deterministic."""
         loop, thread = self._task_loop, self._task_loop_thread
         if loop is None:
             return
+
+        async def _drain() -> None:
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(_drain(), loop).result(timeout=_REAP_TIMEOUT_S + 2)
         loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
             thread.join(timeout=5)
