@@ -1502,6 +1502,21 @@ class AgentLoop:
                     final_text=state.final_text,
                     error_code=log_limit_code,
                 )
+            # Token budget: checked before the turn against the accumulated API-reported
+            # usage of prior turns, so once a cap is crossed the run settles rather than
+            # starting (and paying for) another turn.
+            token_limit_code = self._token_budget_exceeded(state)
+            if token_limit_code is not None:
+                state.status = "limited"
+                state.final_text = "Stopped after reaching the token budget."
+                state.error_code = token_limit_code
+                state.pending_observations = ()
+                return Suspension(
+                    reason="limited",
+                    status="limited",
+                    final_text=state.final_text,
+                    error_code=token_limit_code,
+                )
             delta_limit_code = self._workspace_delta_limit_exceeded(res.workspace)
             if delta_limit_code is not None:
                 state.status = "limited"
@@ -1729,6 +1744,20 @@ class AgentLoop:
         size = sum(len(json.dumps(message, ensure_ascii=False)) for message in state.messages)
         if size > limits.max_message_log_bytes:
             return "message_log_bytes_exceeded"
+        return None
+
+    def _token_budget_exceeded(self, state: RunState) -> str | None:
+        """Return the limit error_code if the run's accumulated API-reported usage has
+        crossed a configured token budget, else ``None``. Reads ``state.total_usage`` —
+        the authoritative provider actuals summed across turns, not an estimate."""
+        limits = self.spec.limits
+        usage = state.total_usage
+        if limits.max_input_tokens is not None and usage.get("input_tokens", 0) > limits.max_input_tokens:
+            return "input_tokens_exceeded"
+        if limits.max_output_tokens is not None and usage.get("output_tokens", 0) > limits.max_output_tokens:
+            return "output_tokens_exceeded"
+        if limits.max_total_tokens is not None and usage.get("total_tokens", 0) > limits.max_total_tokens:
+            return "total_tokens_exceeded"
         return None
 
     def _wire_bytes_exceeded(self, wire_messages: tuple[dict[str, Any], ...]) -> str | None:
@@ -2461,8 +2490,13 @@ class AgentLoop:
 
 
 def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
-    for key in ("input_tokens", "output_tokens", "total_tokens"):
-        total_usage[key] += int(turn.usage.get(key, 0))
+    """Sum every integer usage field across turns. The core three always exist; optional
+    priced sub-counts (cache_read/cache_creation/reasoning/audio) accumulate too when the
+    adapter reports them, so they reach metrics and the token-budget check."""
+    for key, value in turn.usage.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        total_usage[key] = total_usage.get(key, 0) + value
 
 
 def _dedupe(items: tuple[str, ...]) -> tuple[str, ...]:

@@ -295,6 +295,12 @@ Successful response:
 }
 ```
 
+`usage` always carries `input_tokens` / `output_tokens` / `total_tokens`. It MAY
+additionally carry optional priced sub-counts when the provider reports them —
+`cache_read_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `audio_tokens` —
+which the runner sums into per-run totals and checks against the token budget. These
+fields are additive; a consumer that ignores them stays correct.
+
 The reference LLM gateway token authenticates run identity. The request model
 selects the turn model.
 
