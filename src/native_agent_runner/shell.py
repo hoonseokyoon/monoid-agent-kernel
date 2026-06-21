@@ -373,6 +373,7 @@ def execute_shell(
     requested_timeout_s: int | None = None,
     requested_max_output_bytes: int | None = None,
     execution_workspace: ResolvedShellExecutionWorkspace | None = None,
+    argv_override: list[str] | None = None,
 ) -> ShellExecutionResult:
     if not policy.enabled:
         raise ToolExecutionError("shell is disabled", error_code="shell_disabled")
@@ -381,7 +382,10 @@ def execute_shell(
     policy.check_command(command)
     cwd_rel = validate_cwd(workspace, cwd, permission_policy)
     safe_env = build_env(policy, env)
-    argv = shell_argv(policy.effective_shell(), command)
+    # ``argv_override`` runs a pre-built argv directly (no shell interpretation), so
+    # model-supplied arguments can never be re-parsed by bash/powershell. ``command`` is
+    # then only the human-readable label used for the scope check, approval, and preview.
+    argv = list(argv_override) if argv_override is not None else shell_argv(policy.effective_shell(), command)
     resolved_execution_workspace = execution_workspace or policy.effective_execution_workspace(workspace.backend_kind)
 
     if resolved_execution_workspace == "direct":

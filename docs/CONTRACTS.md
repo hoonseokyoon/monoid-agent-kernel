@@ -288,6 +288,68 @@ Task seams above via a `subagent` task kind (`SubagentTaskExecutor`); see
   (fresh subagents only). Parsed by `parse_frontmatter` — a zero-dependency YAML subset
   (scalars, inline/block lists, quotes), shared with Skills' `SKILL.md`.
 
+### Skills (progressive disclosure)
+
+A run can be equipped with **Agent Skills** — procedural how-to knowledge (Anthropic's
+`SKILL.md` model) delivered to the model by *progressive disclosure*, so a large library
+costs almost nothing until a skill is actually used. Skills are a knowledge layer,
+complementary to subagents (execution) and MCP (integration). The whole feature attaches
+through the existing `ContextProvider` + `ToolProvider` seams with **no core-loop change**
+(`SkillProvider` implements both); see `docs/SKILLS_DESIGN.md`.
+
+- **Enable**: build a `SkillProvider(definitions)` and register the one instance in both
+  `AgentLoop(context_providers=(provider,), tool_providers=(provider,))`. Provider tools
+  are not auto-bound — merge `provider.tool_bindings()` into the runtime config so the
+  `skill` tools reach the model (mirrors the MCP provider). The CLI `--skills-directory`
+  does all of this.
+- **Definition** (`SkillDefinition`): `name`, `description` (both advertised at L1),
+  `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (**advisory** for
+  inline skills — a hint, not enforced; **enforced** for fork skills, see below), `context`
+  (`"inline"` default | `"fork"`), `directory` (bundle root for L3), `metadata`.
+- **Fork skills** (`context: fork`): instead of loading instructions inline, the skill runs
+  as an isolated **subagent** (reusing the subagent machine) and only its final message
+  returns — heavy skills keep their working noise out of the main context. The model calls
+  `skill(name, task)` with `task` describing the goal; the subagent's persona is the skill's
+  instructions and `task` is its first user message. The skill's `allowed_tools` become the
+  subagent's tool **allowlist** — resolved against the parent's bindings, so it is a hard
+  ceiling (here `allowed-tools` is genuinely *enforced*, unlike inline skills). Enable by
+  merging `SkillProvider.subagent_definitions()` (namespaced `skill:<name>` ids) into
+  `AgentLoop(subagent_definitions=...)`; the CLI does this automatically. The delegated run
+  is reported in the usual `subagent_count`/`subagent.*` events and metrics.
+- **Three levels of disclosure**:
+  - **L1 — catalog** (~100 tokens/skill, always resident): `SkillProvider.static_segment()`
+    lists each `name: description` in the system prompt plus how to load one.
+  - **L2 — instructions** (on trigger): the model calls the `skill(name)` tool; the result
+    carries `{name, instructions, allowed_tools?, resources?}`. Model-native triggering —
+    the model picks a skill by its description, no router.
+  - **L3 — resources** (on demand): the model calls `skill.read_file(name, path)` to read a
+    bundled file (`path` relative to the skill directory, as listed in `resources`), or
+    `skill.run_script(name, path, args?)` to **execute** a bundled script and get back only
+    its `{exit_code, stdout, stderr, ...}` — the script source never enters context. The
+    interpreter is chosen by extension (`.py` → the runner's Python, `.sh` → bash, `.js` →
+    node, `.rb` → ruby, `.ps1` → powershell); `args` are passed to the script **verbatim as
+    argv, never through a shell**, so they cannot be re-parsed/injected. The script runs in
+    the workspace through the same machinery as `shell.exec` (`side_effect: "shell"`):
+    approval, env scrubbing, timeout, and output limits all apply, and it is blocked in
+    read-only mode. Path traversal outside the skill directory is rejected
+    (`skill_path_invalid`); `SKILL.md` itself is never a readable/runnable resource (it is
+    the L2 payload). **Security**: a skill script is arbitrary code — skills are
+    operator-provisioned (`--skills-directory`), the same trust boundary as `--tool-module`;
+    there is no extra sandbox beyond the shell machinery's defenses, so only load skills from
+    trusted sources.
+- **Observability**: activating a skill (L2) emits a `skill.activated` event whose
+  `parent_id` is the `skill` tool call (so it is correlated to, and an OTel sink enriches,
+  that tool's `execute_tool` span with `skill.name` / `skill.resource_count`); data is
+  `{name, resource_count}`. The run metrics carry `skill_activation_count` and
+  `skills_activated` (the list of activated skill names) — report-only, like the subagent
+  roll-up. `allowed_tools` is echoed in the `skill` tool result as an advisory hint.
+- **Directory discovery**: `load_skill_definitions(dir)` (CLI `--skills-directory`) scans
+  recursively for `SKILL.md` files (the `<skills>/<skill-name>/SKILL.md` convention); the
+  skill name is the frontmatter `name` (falling back to the directory name) and the
+  SKILL.md's parent directory is the bundle root. Frontmatter fields: `name`, `description`,
+  `allowed-tools` (space-separated per the spec, or an inline list), `metadata`. Parsed by
+  the same zero-dependency `parse_frontmatter` used for subagents.
+
 ### Permission Boundary
 
 `PermissionPolicy` remains the workspace/public-output boundary:

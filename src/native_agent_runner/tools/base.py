@@ -60,6 +60,9 @@ class ToolContext(Protocol):
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def run_script(self, args: dict[str, Any]) -> dict[str, Any]:
+        ...
+
     def list_jobs(self) -> list[dict[str, Any]]:
         ...
 

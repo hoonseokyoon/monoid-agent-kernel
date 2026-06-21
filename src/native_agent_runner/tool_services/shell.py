@@ -48,7 +48,9 @@ class ShellService:
             "total_shell_duration_s": self.total_shell_duration_s,
         }
 
-    def execute(self, args: dict[str, Any], call: CallContext) -> dict[str, Any]:
+    def execute(
+        self, args: dict[str, Any], call: CallContext, *, argv_override: list[str] | None = None
+    ) -> dict[str, Any]:
         command = str(args["command"])
         cwd = str(args.get("cwd") or ".")
         shell_options = _shell_options_from_call(call)
@@ -59,7 +61,9 @@ class ShellService:
         max_output_bytes = shell_options.effective_output_limit(requested_max_output_bytes)
         startup_wait_s = shell_options.effective_startup_wait(requested_startup_wait_s)
         execution_workspace = shell_options.effective_execution_workspace(self.workspace.backend_kind)
-        background = bool(args.get("background", False))
+        # A pre-built argv (skill.run_script) runs foreground-only: the background job path
+        # builds its own argv from the command string and has no argv-override seam.
+        background = bool(args.get("background", False)) and argv_override is None
         resume_on_exit = bool(args.get("resume_on_exit", True))
         env = args.get("env") or {}
         if not isinstance(env, dict):
@@ -171,6 +175,7 @@ class ShellService:
                 requested_timeout_s=request.requested_timeout_s,
                 requested_max_output_bytes=request.requested_max_output_bytes,
                 execution_workspace=execution_workspace,
+                argv_override=argv_override,
             )
         except Exception as exc:
             self.failed_shell_calls += 1
