@@ -29,13 +29,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from native_agent_runner.core.agents import AgentRuntimeConfig
+from native_agent_runner.core.agents import (
+    AgentRuntimeConfig,
+    RegistryToolRef,
+    ToolBinding,
+)
 from native_agent_runner.errors import NativeAgentError
 from native_agent_runner.reference._shared.tokens import TokenManager
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
 from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
 from native_agent_runner.reference.llm_gateway.providers import offline_provider_factory
 from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
+from native_agent_runner.reference.studio.activity import describe_event
 
 _LOGGER = logging.getLogger("native_agent_runner.studio")
 
@@ -44,6 +49,20 @@ _MAX_BODY_BYTES = 1_000_000
 # Studio is a single-user local app; the tenant/user are fixed placeholders.
 _TENANT = "studio"
 _USER = "local"
+
+# Directories never shown in the file tree (and not worth walking).
+_TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".ruff_cache", ".pytest_cache"}
+_TREE_MAX_ENTRIES = 2000
+
+
+def _read_runtime_config() -> AgentRuntimeConfig:
+    """R1 capability set: read-only filesystem access (chat + read, no mutation yet)."""
+    return AgentRuntimeConfig(
+        definition_id="studio-agent",
+        tools=(
+            ToolBinding(binding_id="fs.read", model_name="fs_read", ref=RegistryToolRef("fs.read")),
+        ),
+    )
 
 
 @dataclass
@@ -59,9 +78,12 @@ class StudioConfig:
 class StudioServer:
     """Boots the bundled stack and serves the UI + BFF. Use :meth:`start` / :meth:`shutdown`."""
 
-    def __init__(self, config: StudioConfig) -> None:
+    def __init__(self, config: StudioConfig, *, provider_factory: Any = None) -> None:
         self.config = config
         self.workspace = config.workspace.resolve()
+        # Optional override for the gateway's model provider (an embedder seam; tests inject a
+        # tool-calling fake here). Defaults to the offline/openai choice in config.provider.
+        self._provider_factory_override = provider_factory
         self._token_manager = TokenManager.ephemeral()
         self._admin_token = secrets.token_hex(16)
         self._gateway_server: ThreadingHTTPServer | None = None
@@ -89,7 +111,9 @@ class StudioServer:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.config.run_root.mkdir(parents=True, exist_ok=True)
 
-        provider_factory = offline_provider_factory if self.offline else None
+        provider_factory = self._provider_factory_override or (
+            offline_provider_factory if self.offline else None
+        )
         gateway = LlmGatewayBackend(
             token_manager=self._token_manager,
             provider_adapter_factory=provider_factory,
@@ -142,7 +166,7 @@ class StudioServer:
     def start_chat(self, message: str) -> dict[str, Any]:
         """Open a new multi-turn session in the workspace and deliver the first message."""
         assert self._backend is not None
-        runtime_config = AgentRuntimeConfig(definition_id="studio-chat")  # R0: chat only, no tools
+        runtime_config = _read_runtime_config()  # R1: chat + read-only filesystem
         request = BackendRunRequest(
             tenant_id=_TENANT,
             user_id=_USER,
@@ -176,6 +200,22 @@ class StudioServer:
         assert self._backend is not None
         token = self._token_for(run_id)
         return self._backend.status(run_id, token)
+
+    def list_files(self) -> list[dict[str, Any]]:
+        """A flat, sorted listing of the workspace for the file-tree panel (read-only;
+        skips VCS/cache dirs and is bounded so a huge tree can't stall the UI)."""
+        root = self.workspace
+        entries: list[dict[str, Any]] = []
+        if not root.exists():
+            return entries
+        for path in sorted(root.rglob("*")):
+            rel = path.relative_to(root)
+            if any(part in _TREE_SKIP for part in rel.parts):
+                continue
+            entries.append({"path": rel.as_posix(), "is_dir": path.is_dir()})
+            if len(entries) >= _TREE_MAX_ENTRIES:
+                break
+        return entries
 
     def _token_for(self, run_id: str) -> str:
         with self._lock:
@@ -213,6 +253,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                         "offline": studio.offline,
                     }
                 )
+                return
+            if parsed.path == "/api/files":
+                self._write_json({"workspace": str(studio.workspace), "files": studio.list_files()})
                 return
             if parsed.path == "/api/events":
                 self._stream_events(parse_qs(parsed.query))
@@ -296,6 +339,10 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 return
 
         def _sse_send(self, event: dict[str, Any]) -> None:
+            # Annotate tool activity with a human-readable line for the UI feed (DX-3).
+            summary = describe_event(event)
+            if summary:
+                event = {**event, "studio_activity": summary}
             self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
             self.wfile.flush()
 

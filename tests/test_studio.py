@@ -13,9 +13,15 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.providers.base import ModelRequest
+from native_agent_runner.providers.base import ModelRequest, ModelTurn
+from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.reference.llm_gateway.providers import EchoModelAdapter
-from native_agent_runner.reference.studio.server import StudioConfig, StudioServer
+from native_agent_runner.reference.studio.activity import describe_event
+from native_agent_runner.reference.studio.server import (
+    StudioConfig,
+    StudioServer,
+    _read_runtime_config,
+)
 
 
 def _settled(server: StudioServer, run_id: str) -> list[dict]:
@@ -90,3 +96,74 @@ def test_run_tokens_are_not_exposed_to_callers(studio: StudioServer) -> None:
     result = studio.start_chat("hello")
     assert set(result) == {"run_id", "status"}
     assert "run_token" not in result
+
+
+# --- R1: read tools, file tree, activity feed -------------------------------------------
+
+
+def test_read_runtime_config_binds_fs_read() -> None:
+    config = _read_runtime_config()
+    refs = {binding.ref.tool_id for binding in config.tools}
+    assert "fs.read" in refs
+    # The model-facing name is the dotted id sanitized to underscores.
+    read = next(b for b in config.tools if b.ref.tool_id == "fs.read")
+    assert read.model_name == "fs_read"
+
+
+def test_describe_event_maps_tool_activity_to_human_text() -> None:
+    started = {
+        "type": "tool.call.started",
+        "data": {"tool": "fs_read", "args_preview": {"path": "notes.md"}, "paths": ["notes.md"]},
+    }
+    assert describe_event(started) == "Reading notes.md"
+    # A successful finish is implied by the next step — not shown.
+    assert describe_event({"type": "tool.call.finished", "data": {"tool": "fs_read", "ok": True}}) is None
+    # A failure surfaces with its error.
+    failed = describe_event(
+        {"type": "tool.call.finished", "data": {"tool": "fs_read", "ok": False, "error": "boom"}}
+    )
+    assert failed is not None and "boom" in failed
+    # Chat / lifecycle events do not appear in the activity feed.
+    assert describe_event({"type": "turn.settled", "data": {"final_text": "hi"}}) is None
+    assert describe_event({"type": "run.started", "data": {}}) is None
+
+
+def test_list_files_returns_workspace_tree(studio: StudioServer) -> None:
+    (studio.workspace / "notes.md").write_text("hello\n", encoding="utf-8")
+    (studio.workspace / "sub").mkdir(exist_ok=True)
+    (studio.workspace / "sub" / "inner.txt").write_text("x\n", encoding="utf-8")
+    paths = {entry["path"] for entry in studio.list_files()}
+    assert "notes.md" in paths
+    assert "sub/inner.txt" in paths
+
+
+def test_agent_reads_a_file_and_emits_activity(tmp_path: Path) -> None:
+    # End-to-end with a tool-calling fake model injected via the provider seam: the agent calls
+    # fs.read, the read flows through as events, and describe_event renders an activity line.
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("the secret is 42\n", encoding="utf-8")
+
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "c1"),)),
+            ModelTurn(final_text="I read notes.md for you."),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("read notes.md")["run_id"]
+        _wait_settled(server, run_id, 1)
+        events = server.poll_events(run_id, 0).get("events", [])
+        started = [e for e in events if e.get("type") == "tool.call.started"]
+        assert any(e["data"].get("tool") == "fs_read" for e in started)
+        assert any("notes.md" in (describe_event(e) or "") for e in started)
+        # The model's final text settles the turn.
+        settled = [e for e in events if e.get("type") == "turn.settled"]
+        assert settled and "notes.md" in settled[0]["data"]["final_text"]
+    finally:
+        server.shutdown()

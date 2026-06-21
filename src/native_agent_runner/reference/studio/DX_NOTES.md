@@ -57,4 +57,21 @@ each (which enqueues the close sentinel), then sleeps briefly to let the loop dr
 that cancels owned runs and awaits their teardown, so embedders get clean shutdown without
 reaching for `cancel_run` + `sleep`.
 
-<!-- Add new entries below as later rungs (R1+) surface them. -->
+### DX-3 🟡 Events carry no presentation-ready summary for a UI activity feed
+**Where:** the public event stream (`tool.call.started` / `tool.call.finished` / `workspace.*`).
+Found while building the R1 activity feed.
+
+**Hurt:** To show "what is the agent doing right now" you must hand-maintain a verb table keyed
+by the *wire* tool name (`fs_read`, `shell_exec`, …) and heuristically dig the action target out
+of `args_preview` / `paths`. Every integrator who wants a feed reinvents this, and it silently
+drifts when tools are added/renamed. There is no human `summary` and no typed `(verb, target,
+status)` on the event.
+
+**Worked around:** `reference/studio/activity.py::describe_event` maps events → a line server-side,
+attached to each SSE frame as `studio_activity`. Covered by `test_describe_event_*`.
+
+**Proposed core fix:** have the engine attach an optional `summary` (and/or a structured
+`tool_activity` shape) to tool/workspace events, derived once at the source where the verb and
+args are already known — so every UI gets a feed for free and it can't drift.
+
+<!-- Add new entries below as later rungs (R2+) surface them. -->
