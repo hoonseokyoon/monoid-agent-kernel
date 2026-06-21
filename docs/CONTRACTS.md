@@ -313,9 +313,20 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
     carries `{name, instructions, allowed_tools?, resources?}`. Model-native triggering —
     the model picks a skill by its description, no router.
   - **L3 — resources** (on demand): the model calls `skill.read_file(name, path)` to read a
-    bundled file (`path` relative to the skill directory, as listed in `resources`). Path
-    traversal outside the skill directory is rejected (`skill_path_invalid`); `SKILL.md`
-    itself is not readable this way (it is the L2 payload).
+    bundled file (`path` relative to the skill directory, as listed in `resources`), or
+    `skill.run_script(name, path, args?)` to **execute** a bundled script and get back only
+    its `{exit_code, stdout, stderr, ...}` — the script source never enters context. The
+    interpreter is chosen by extension (`.py` → the runner's Python, `.sh` → bash, `.js` →
+    node, `.rb` → ruby, `.ps1` → powershell); `args` are passed to the script **verbatim as
+    argv, never through a shell**, so they cannot be re-parsed/injected. The script runs in
+    the workspace through the same machinery as `shell.exec` (`side_effect: "shell"`):
+    approval, env scrubbing, timeout, and output limits all apply, and it is blocked in
+    read-only mode. Path traversal outside the skill directory is rejected
+    (`skill_path_invalid`); `SKILL.md` itself is never a readable/runnable resource (it is
+    the L2 payload). **Security**: a skill script is arbitrary code — skills are
+    operator-provisioned (`--skills-directory`), the same trust boundary as `--tool-module`;
+    there is no extra sandbox beyond the shell machinery's defenses, so only load skills from
+    trusted sources.
 - **Observability**: activating a skill (L2) emits a `skill.activated` event whose
   `parent_id` is the `skill` tool call (so it is correlated to, and an OTel sink enriches,
   that tool's `execute_tool` span with `skill.name` / `skill.resource_count`); data is

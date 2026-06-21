@@ -15,6 +15,7 @@ to merge bindings into the runtime config (mirrors ``McpToolProvider.tool_bindin
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -26,9 +27,24 @@ from native_agent_runner.tools.base import ToolResult, ToolSpec
 
 SKILL_TOOL_ID = "skill"
 SKILL_READ_FILE_TOOL_ID = "skill.read_file"
+SKILL_RUN_SCRIPT_TOOL_ID = "skill.run_script"
 
 _MAX_RESOURCE_FILES = 100
 _MAX_RESOURCE_BYTES = 1_000_000
+
+# Map a bundled script's extension to the argv prefix that runs it. ``sys.executable`` (the
+# runner's own Python) backs ``.py`` so a Python script always has an interpreter on hand;
+# the rest rely on the interpreter being on PATH. Scripts are run by argv — never through a
+# shell — so the source never enters context and the args are never re-parsed by a shell.
+_INTERPRETERS: dict[str, list[str]] = {
+    ".py": [sys.executable],
+    ".sh": ["bash"],
+    ".bash": ["bash"],
+    ".js": ["node"],
+    ".mjs": ["node"],
+    ".rb": ["ruby"],
+    ".ps1": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"],
+}
 
 
 class SkillProvider:
@@ -101,6 +117,29 @@ class SkillProvider:
             side_effect="read",
             handler=self._make_read_file_handler(),
         )
+        yield ToolSpec(
+            id=SKILL_RUN_SCRIPT_TOOL_ID,
+            description=(
+                "Run a bundled executable script from a skill's directory (Level 3) and "
+                "get back only its stdout/stderr/exit code — the script's source never "
+                "enters context. Provide the skill 'name', the script 'path' relative to "
+                "the skill directory, and optional 'args' (passed to the script verbatim, "
+                "never through a shell). The interpreter is chosen by file extension "
+                "(.py/.sh/.js/.rb/.ps1). The script runs in the workspace under the same "
+                "approval and permission rules as a shell command."
+            ),
+            input_schema=_object_schema(
+                {
+                    "name": {"type": "string", "enum": names},
+                    "path": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}, "default": []},
+                },
+                required=["name", "path"],
+            ),
+            capability="skill",
+            side_effect="shell",  # executes code → gated like shell.exec (mode + approval)
+            handler=self._make_run_script_handler(),
+        )
 
     def tool_bindings(self) -> tuple[ToolBinding, ...]:
         """Bindings for the skill tools, to merge into the runtime config so the run can
@@ -161,6 +200,56 @@ class SkillProvider:
 
         return handler
 
+    def _make_run_script_handler(self):
+        def handler(context: Any, args: dict[str, Any]) -> ToolResult:
+            name = str(args.get("name") or "")
+            rel = str(args.get("path") or "")
+            script_args = [str(a) for a in (args.get("args") or ())]
+            definition = self._definitions.get(name)
+            if definition is None:
+                return ToolResult(ok=False, error=f"unknown skill: {name}", error_code="skill_unknown")
+            if definition.directory is None:
+                return ToolResult(
+                    ok=False, error=f"skill has no bundled resources: {name}", error_code="skill_no_resources"
+                )
+            try:
+                script = _resolve_resource(definition.directory, rel)
+            except _ResourceError as exc:
+                return ToolResult(ok=False, error=str(exc), error_code=exc.code)
+            interpreter = _INTERPRETERS.get(script.suffix.lower())
+            if interpreter is None:
+                return ToolResult(
+                    ok=False,
+                    error=f"no interpreter for script extension '{script.suffix}': {rel}",
+                    error_code="skill_script_unsupported",
+                )
+            # argv is executed directly (no shell); ``command`` is only a readable label for
+            # the approval preview and scope check. The script source is never read.
+            argv = [*interpreter, str(script), *script_args]
+            label = " ".join([Path(interpreter[0]).name, rel, *script_args]).strip()
+            run = getattr(context, "run_script", None)
+            if not callable(run):
+                return ToolResult(
+                    ok=False,
+                    error="this context cannot run scripts",
+                    error_code="skill_run_unsupported",
+                )
+            result = run({"command": label, "argv": argv, "cwd": "."})
+            if result.get("timed_out"):
+                return ToolResult(
+                    ok=False, content=result, error="script timed out", error_code="skill_script_timeout"
+                )
+            if result.get("output_truncated"):
+                return ToolResult(
+                    ok=False,
+                    content=result,
+                    error="script exceeded output limit",
+                    error_code="skill_script_output_limit",
+                )
+            return ToolResult(ok=True, content=result)
+
+        return handler
+
 
 def _object_schema(properties: dict[str, Any], *, required: list[str] | None = None) -> dict[str, Any]:
     return {
@@ -193,9 +282,10 @@ class _ResourceError(Exception):
         self.code = code
 
 
-def _read_resource(directory: Path, rel: str) -> str:
-    """Read a bundled resource, guarding against path traversal (the resolved path must
-    stay within the skill directory) and non-text content."""
+def _resolve_resource(directory: Path, rel: str) -> Path:
+    """Resolve ``rel`` against the skill directory and return the absolute path, guarding
+    against traversal (the resolved path must stay within the skill dir) and refusing the
+    skill's own ``SKILL.md`` (it is the L2 payload, not a resource). Raises ``_ResourceError``."""
     root = directory.resolve()
     candidate = (root / rel).resolve()
     if root != candidate and root not in candidate.parents:
@@ -204,6 +294,12 @@ def _read_resource(directory: Path, rel: str) -> str:
         raise _ResourceError("SKILL.md is loaded via the skill tool, not as a resource", "skill_path_invalid")
     if not candidate.is_file():
         raise _ResourceError(f"resource not found: {rel}", "skill_resource_missing")
+    return candidate
+
+
+def _read_resource(directory: Path, rel: str) -> str:
+    """Read a bundled resource as utf-8 text (traversal-guarded, non-text rejected)."""
+    candidate = _resolve_resource(directory, rel)
     data = candidate.read_bytes()
     if len(data) > _MAX_RESOURCE_BYTES:
         raise _ResourceError(f"resource too large: {rel}", "skill_resource_too_large")

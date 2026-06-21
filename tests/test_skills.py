@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import runtime_config, runtime_provider
+from conftest import runtime_config, runtime_provider, tool_binding
 
 from native_agent_runner.core.spec import AgentRunSpec
 from native_agent_runner.loop import AgentLoop
@@ -219,11 +219,11 @@ def test_read_file_missing_resource(tmp_path: Path) -> None:
 # --- bindings ----------------------------------------------------------------------
 
 
-def test_tool_bindings_cover_both_tools(tmp_path: Path) -> None:
+def test_tool_bindings_cover_all_tools(tmp_path: Path) -> None:
     _write_skill(tmp_path, "pdf-fill")
     provider = SkillProvider(load_skill_definitions(tmp_path))
     bound = {b.ref.tool_id for b in provider.tool_bindings()}
-    assert bound == {"skill", "skill.read_file"}
+    assert bound == {"skill", "skill.read_file", "skill.run_script"}
 
 
 # --- E2E: progressive disclosure through a real run --------------------------------
@@ -338,6 +338,101 @@ def test_no_skill_metrics_when_none_activated(tmp_path: Path) -> None:
         runtime_config_provider=runtime_provider(runtime_config(bindings=provider.tool_bindings())),
     ).run_once("go")
     assert "skill_activation_count" not in result.metrics
+
+
+# --- P3①: skill.run_script (execute a bundled script, output-only) -----------------
+
+
+def _make_script_skill(tmp_path: Path, script_rel: str, source: str) -> SkillProvider:
+    skills_root = tmp_path / "skills"
+    _write_skill(skills_root, "pdf-fill", description="d", body="BODY", resources={script_rel: source})
+    return SkillProvider(load_skill_definitions(skills_root))
+
+
+def _run_script_via_loop(tmp_path: Path, provider: SkillProvider, call_args: dict):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("skill_run_script", call_args, "c1"),)),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    bindings = (
+        tool_binding("skill"),
+        tool_binding("skill.read_file"),
+        tool_binding("skill.run_script", runtime={"shell": {"approval_mode": "auto-approve"}}),
+    )
+    AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        context_providers=(provider,),
+        tool_providers=(provider,),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=bindings)),
+    ).run_once("go")
+    return [obs.output for req in adapter.requests for obs in req.observations]
+
+
+def test_run_script_executes_and_returns_output_only(tmp_path: Path) -> None:
+    # The source carries a marker that must NOT reach context; only stdout should.
+    source = "# SECRET_SOURCE_MARKER\nprint('HELLO_FROM_SCRIPT')\n"
+    provider = _make_script_skill(tmp_path, "scripts/hello.py", source)
+
+    outputs = _run_script_via_loop(tmp_path, provider, {"name": "pdf-fill", "path": "scripts/hello.py"})
+    dumped = json.dumps(outputs)
+
+    assert "HELLO_FROM_SCRIPT" in dumped  # stdout reached the model
+    assert "SECRET_SOURCE_MARKER" not in dumped  # source never entered context
+    # exit_code surfaced in the tool result content.
+    run_obs = [o for o in outputs if isinstance(o, dict) and "result" in o and "exit_code" in o.get("result", {})]
+    assert run_obs and run_obs[0]["result"]["exit_code"] == 0
+
+
+def test_run_script_passes_args_literally_without_a_shell(tmp_path: Path) -> None:
+    # Echo argv; a shell would interpret '; touch pwned' — argv execution keeps it literal.
+    source = "import sys\nprint(sys.argv[1:])\n"
+    provider = _make_script_skill(tmp_path, "scripts/echo.py", source)
+    injection = "; touch pwned"
+
+    outputs = _run_script_via_loop(
+        tmp_path, provider, {"name": "pdf-fill", "path": "scripts/echo.py", "args": [injection, "two words"]}
+    )
+    dumped = json.dumps(outputs)
+
+    # The injection string survives verbatim as a single argv element (never shell-parsed).
+    assert injection in dumped
+    assert "two words" in dumped
+    assert not (tmp_path / "workspace" / "pwned").exists()
+
+
+def test_run_script_unsupported_extension(tmp_path: Path) -> None:
+    provider = _make_script_skill(tmp_path, "data/notes.txt", "just text")
+    run = _specs(provider)["skill.run_script"]
+    result = run.handler(_FakeRunContext(), {"name": "pdf-fill", "path": "data/notes.txt"})
+    assert not result.ok
+    assert result.error_code == "skill_script_unsupported"
+
+
+def test_run_script_rejects_traversal(tmp_path: Path) -> None:
+    (tmp_path / "outside.py").write_text("print('x')", encoding="utf-8")
+    provider = _make_script_skill(tmp_path, "scripts/hello.py", "print('x')")
+    run = _specs(provider)["skill.run_script"]
+    result = run.handler(_FakeRunContext(), {"name": "pdf-fill", "path": "../../outside.py"})
+    assert not result.ok
+    assert result.error_code == "skill_path_invalid"
+
+
+class _FakeRunContext:
+    """Minimal context: enough for the run_script handler's pre-flight checks (it never
+    reaches run_script for the unsupported/traversal cases, so run_script is unused)."""
+
+    def run_script(self, args: dict) -> dict:  # pragma: no cover - not reached in these tests
+        raise AssertionError("run_script should not be called for rejected inputs")
+
+
+def test_run_script_side_effect_is_shell(tmp_path: Path) -> None:
+    provider = _make_script_skill(tmp_path, "scripts/hello.py", "print('x')")
+    assert _specs(provider)["skill.run_script"].side_effect == "shell"
 
 
 def test_otel_skill_tool_span_enriched(tmp_path: Path) -> None:

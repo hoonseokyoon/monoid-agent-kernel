@@ -238,6 +238,15 @@ class AgentToolContext(ToolContext):
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.shell_service.execute(args, self._current_call)
 
+    def run_script(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Run a pre-resolved ``argv`` (skill.run_script) through the shell machinery —
+        approval, env scrubbing, timeout, output limits, events — but WITHOUT a shell, so
+        the bundled script's own args are never re-parsed by bash/powershell. ``args``
+        carries ``argv`` (the real command) plus a ``command`` label for the preview."""
+        argv = [str(part) for part in args.get("argv") or ()]
+        rest = {key: value for key, value in args.items() if key != "argv"}
+        return self.shell_service.execute(rest, self._current_call, argv_override=argv)
+
     def list_jobs(self) -> list[dict[str, Any]]:
         return self.jobs_service.list_jobs()
 

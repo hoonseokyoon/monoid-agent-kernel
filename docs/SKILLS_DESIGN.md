@@ -1,6 +1,6 @@
 # Agent Skills (progressive disclosure) design
 
-Status: P1 + P2 implemented (branch `feat/skills-progressive-disclosure`).
+Status: P1 + P2 + P3① (`skill.run_script`) implemented (branch `feat/skills-progressive-disclosure`).
 
 ## Goal
 
@@ -121,11 +121,47 @@ semantic signal on top of that, *without* changing the core ToolContext contract
 `allowed_tools` is echoed in the `skill` tool result as an advisory hint (it is not added
 to the L1 catalog, which stays at the ~100-token name+description budget).
 
+## Running bundled scripts (P3①: `skill.run_script`)
+
+L3 has two shapes: `skill.read_file` pulls a reference file's text *into* context, while
+`skill.run_script` **executes** a bundled script and returns only its output — the source
+never enters context (Anthropic's "code never loads, only output" property, realized at the
+execution boundary).
+
+Design, reusing the shell machinery rather than re-implementing process handling:
+
+- **argv, never a shell.** `shell.exec` runs `bash -lc <command>` / `powershell -Command`,
+  so a command string is shell-interpreted (injection surface). `skill.run_script` instead
+  builds an **argv** (`[interpreter, abs_script, *args]`) and runs it directly. The low-level
+  `execute_shell` gained an `argv_override` seam (skip `shell_argv`); the `command` string is
+  then only the human-readable label for the approval preview and scope check. Model-supplied
+  `args` are literal argv elements — they can never be re-parsed by a shell.
+- **Reuse, not re-implement.** The handler resolves the script (the same traversal guard as
+  `read_file`), picks the interpreter by extension, and calls a new `ToolContext.run_script`,
+  which routes through `ShellService.execute(..., argv_override=...)`. So approval gating,
+  env scrubbing (secrets stripped), timeout, output-byte limits, `changed_paths`, and the
+  `shell.exec.*`/approval events are all inherited. `side_effect: "shell"` classifies it as
+  a side-effecting tool (`_risk_for`), so run-mode gating (blocked in read-only) and approval
+  match `shell.exec` by construction. Foreground-only (no background argv seam).
+- **cwd = workspace root** (chosen), like `shell.exec`, so script side effects land in the
+  workspace and are tracked; the script reaches its own bundle via the absolute path / `__file__`.
+- **Interpreter by extension** (chosen): `.py` → the runner's own `sys.executable` (always
+  present), `.sh`/`.bash` → bash, `.js`/`.mjs` → node, `.rb` → ruby, `.ps1` → powershell;
+  unknown extension → `skill_script_unsupported`.
+- **Security stance.** A skill script is arbitrary code, but skills are operator-provisioned
+  via `--skills-directory` — the *same* trust boundary as `--tool-module`, which already
+  imports arbitrary operator Python. So no new sandbox is introduced; the defense is operator
+  trust + the shell machinery's existing controls (approval, mode, timeout, output cap, env
+  scrub) + the model being able to choose only a script *path within the skill dir* and
+  literal args (not an arbitrary command). Documented: only load skills from trusted sources.
+
 ## Scope
 
-- **P1**: L1 + L2 + L3, directory discovery, CLI, exports, tests, docs.
-- **P2** (this revision): `skill.activated` event + OTel span enrichment + activation
-  metrics; advisory allowed-tools echoed in the tool result.
-- **P3**: `context: fork` — run a skill's body as a *subagent* (reuse the merged subagent
-  machine); optional `skill.run_script` (execute a bundled script, output-only, code never
-  enters context); optional enforced allowed-tools gating.
+- **P1**: L1 + L2 + L3 (`read_file`), directory discovery, CLI, exports, tests, docs.
+- **P2**: `skill.activated` event + OTel span enrichment + activation metrics; advisory
+  allowed-tools echoed in the tool result.
+- **P3① (this revision)**: `skill.run_script` — execute a bundled script, output-only,
+  argv (no shell), reusing the shell approval/limits machinery.
+- **P3 remaining**: `context: fork` — run a skill's body as a *subagent* (reuse the merged
+  subagent machine); optional enforced allowed-tools gating (largely subsumed by fork, whose
+  subagent tool-ceiling enforces restriction for free).
