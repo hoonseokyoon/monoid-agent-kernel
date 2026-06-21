@@ -28,7 +28,9 @@ from native_agent_runner.core.media import (
     MAX_FORWARDABLE_BLOCKS,
     WIRE_FORWARDABLE_PART_TYPES,
     WorkspaceMediaResolver,
+    count_tool_result_images,
     estimate_image_tokens,
+    evict_tool_result_images,
     image_dimensions,
     native_image_token_cap,
     resolve_wire_messages,
@@ -270,7 +272,16 @@ def _observation_message(observation: ToolObservation) -> dict[str, Any]:
     new user message; a tool result is a ``tool`` message keyed by ``call_id``."""
     if observation.is_background:
         return {"role": "user", "content": format_async_result_text(observation.output)}
-    return {"role": "tool", "call_id": observation.call_id, "content": observation.output}
+    message: dict[str, Any] = {
+        "role": "tool",
+        "call_id": observation.call_id,
+        "content": observation.output,
+    }
+    if observation.images:
+        # By reference; resolved to wire blocks at send time and delivered per provider
+        # (a follow-up user image message for OpenAI/gateway).
+        message["images"] = list(observation.images)
+    return message
 
 
 def _as_blob_reader(
@@ -1508,13 +1519,24 @@ class AgentLoop:
             # text-only adapter receives the by-reference log and projects it to text.
             wire_messages = tuple(state.messages)
             if getattr(self.model_adapter, "supports_multimodal", False):
+                # Tool-result image eviction runs on the by-reference copy BEFORE resolution,
+                # so dropped images are never read/encoded. Off unless a keep-N is configured.
+                evicted = 0
+                keep_n = self.spec.limits.keep_recent_tool_images
+                if keep_n is not None:
+                    before = count_tool_result_images(wire_messages)
+                    wire_messages = evict_tool_result_images(wire_messages, keep_n)
+                    evicted = before - count_tool_result_images(wire_messages)
                 wire_messages = resolve_wire_messages(
                     wire_messages,
                     WorkspaceMediaResolver(res.workspace),
                     encoding=getattr(self.model_adapter, "wire_image_encoding", "base64"),
                 )
                 self._emit_media_accounting(
-                    wire_messages, (runtime_config.model or ModelConfig()).model, recorder
+                    wire_messages,
+                    (runtime_config.model or ModelConfig()).model,
+                    recorder,
+                    evicted_image_count=evicted,
                 )
                 # The resolved payload (inline base64) is the real size risk — the durable
                 # by-reference log stays tiny. Guard it separately so an oversized media turn
@@ -1723,6 +1745,8 @@ class AgentLoop:
         wire_messages: tuple[dict[str, Any], ...],
         model: str | None,
         recorder: AgentRecorder,
+        *,
+        evicted_image_count: int = 0,
     ) -> None:
         """Emit per-turn media accounting: count resolved image blocks, estimate their input
         tokens (28×28 patch formula, clamped to the model's native cap), and warn past the
@@ -1731,10 +1755,13 @@ class AgentLoop:
         blocks = 0
         estimated_tokens = 0
         for message in wire_messages:
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
+            # Resolved image blocks live in a user ``content`` list and/or a tool ``images`` list.
+            parts = []
+            if isinstance(message.get("content"), list):
+                parts.extend(message["content"])
+            if isinstance(message.get("images"), list):
+                parts.extend(message["images"])
+            for part in parts:
                 if not (isinstance(part, dict) and part.get("type") in WIRE_FORWARDABLE_PART_TYPES):
                     continue
                 blocks += 1
@@ -1748,7 +1775,7 @@ class AgentLoop:
                 dims = image_dimensions(raw, str(source.get("media_type") or ""))
                 if dims is not None:
                     estimated_tokens += estimate_image_tokens(*dims, cap=cap)
-        if blocks == 0:
+        if blocks == 0 and evicted_image_count == 0:
             return
         if blocks > MAX_FORWARDABLE_BLOCKS:
             recorder.emit(
@@ -1756,10 +1783,10 @@ class AgentLoop:
                 data={"reason": "image_block_count_cliff", "block_count": blocks},
                 level="warning",
             )
-        recorder.emit(
-            "model.input.media",
-            data={"block_count": blocks, "estimated_image_tokens": estimated_tokens},
-        )
+        data: dict[str, Any] = {"block_count": blocks, "estimated_image_tokens": estimated_tokens}
+        if evicted_image_count:
+            data["evicted_image_count"] = evicted_image_count
+        recorder.emit("model.input.media", data=data)
 
     def _workspace_delta_limit_exceeded(self, workspace: Workspace) -> str | None:
         """Return the limit error_code if the workspace delta a checkpoint would carry has
@@ -2176,6 +2203,7 @@ class AgentLoop:
             call_id=call_id,
             tool_name=call_name,
             output=result.to_observation(),
+            images=tuple(content_part_to_json(image) for image in result.images),
         )
         recorder.transcript(
             {

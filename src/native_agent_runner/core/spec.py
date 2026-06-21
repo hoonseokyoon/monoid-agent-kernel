@@ -136,6 +136,11 @@ class RunLimits:
     # checkpoint stays the recovery point), and exceeding on restore refuses the checkpoint.
     max_workspace_delta_bytes: int = 100_000_000
     max_delta_file_bytes: int = 50_000_000
+    # Keep only the N most-recent tool-result images on the wire (older ones evicted,
+    # cache-aligned) to bound replay growth in screenshot-heavy loops. ``None`` = keep all.
+    # Default off: under gateway-side prompt caching, evicting images is uneconomical
+    # (cache reads are ~0.1x), so enable only when not caching image-bearing turns.
+    keep_recent_tool_images: int | None = None
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> RunLimits:
@@ -154,6 +159,11 @@ class RunLimits:
                 payload.get("max_workspace_delta_bytes", defaults.max_workspace_delta_bytes)
             ),
             max_delta_file_bytes=int(payload.get("max_delta_file_bytes", defaults.max_delta_file_bytes)),
+            keep_recent_tool_images=(
+                None
+                if payload.get("keep_recent_tool_images", defaults.keep_recent_tool_images) is None
+                else int(payload["keep_recent_tool_images"])
+            ),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -166,6 +176,7 @@ class RunLimits:
             "max_message_log_bytes": self.max_message_log_bytes,
             "max_workspace_delta_bytes": self.max_workspace_delta_bytes,
             "max_delta_file_bytes": self.max_delta_file_bytes,
+            "keep_recent_tool_images": self.keep_recent_tool_images,
         }
 
 

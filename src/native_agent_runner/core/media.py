@@ -167,6 +167,58 @@ def media_block_base64(part_type: str, resolved: ResolvedMedia) -> dict[str, Any
     }
 
 
+def count_tool_result_images(messages: tuple[dict[str, Any], ...]) -> int:
+    """Count forwardable image parts carried on ``tool``-role messages' ``images`` lists."""
+    return sum(
+        1
+        for message in messages
+        if message.get("role") == "tool" and isinstance(message.get("images"), list)
+        for part in message["images"]
+        if isinstance(part, dict) and part.get("type") in WIRE_FORWARDABLE_PART_TYPES
+    )
+
+
+def evict_tool_result_images(
+    messages: tuple[dict[str, Any], ...],
+    keep_n: int | None,
+    *,
+    chunk: int | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Keep only the most-recent ``keep_n`` tool-result images, dropping older ones.
+
+    Operates on the by-reference message list (cheap — runs before resolution). Targets
+    ONLY ``images`` on ``role == "tool"`` messages; user-content images are never touched
+    (mirrors the Anthropic computer-use nesting rule). Removal is **cache-aligned**: the
+    count is rounded down to a multiple of ``chunk`` (default ``keep_n``) so the wire prefix
+    stays byte-stable between turns until a whole chunk ages out. ``keep_n=None`` is a no-op.
+    """
+    if keep_n is None:
+        return messages
+    chunk = chunk or keep_n or 1
+    total = count_tool_result_images(messages)
+    to_remove = total - keep_n
+    if to_remove <= 0:
+        return messages
+    to_remove -= to_remove % chunk
+    if to_remove <= 0:
+        return messages
+    removed = 0
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") != "tool" or not isinstance(message.get("images"), list):
+            result.append(message)
+            continue
+        kept_images: list[Any] = []
+        for part in message["images"]:
+            is_image = isinstance(part, dict) and part.get("type") in WIRE_FORWARDABLE_PART_TYPES
+            if is_image and removed < to_remove:
+                removed += 1
+                continue
+            kept_images.append(part)
+        result.append({**message, "images": kept_images})
+    return tuple(result)
+
+
 def resolve_wire_messages(
     messages: tuple[dict[str, Any], ...],
     resolver: MediaResolver,
@@ -184,18 +236,28 @@ def resolve_wire_messages(
         raise MediaResolveError(f"unsupported wire image encoding: {encoding!r}")
     resolved_messages: list[dict[str, Any]] = []
     for message in messages:
+        new_message = message
+        # User multimodal turns carry parts in a ``content`` list.
         content = message.get("content")
-        if not isinstance(content, list):
-            resolved_messages.append(message)
-            continue
-        new_content: list[dict[str, Any]] = []
-        for part in content:
-            part_type = part.get("type") if isinstance(part, dict) else None
-            if part_type == "text":
-                new_content.append(part)
-            elif part_type in WIRE_FORWARDABLE_PART_TYPES:
-                resolved = resolver.resolve(str(part["source_ref"]), str(part["mime_type"]))
-                new_content.append(media_block_base64(str(part_type), resolved))
-            # else: non-forwardable media — dropped from the wire (already degraded-warned).
-        resolved_messages.append({**message, "content": new_content})
+        if isinstance(content, list):
+            new_message = {**new_message, "content": _resolve_part_list(content, resolver)}
+        # Tool messages carry returned media in a top-level ``images`` list.
+        images = message.get("images")
+        if isinstance(images, list):
+            new_message = {**new_message, "images": _resolve_part_list(images, resolver)}
+        resolved_messages.append(new_message)
     return tuple(resolved_messages)
+
+
+def _resolve_part_list(parts: list[Any], resolver: MediaResolver) -> list[dict[str, Any]]:
+    """Resolve forwardable by-reference media parts to neutral base64 blocks; text passes
+    through; non-forwardable media is dropped (already degraded-warned)."""
+    resolved: list[dict[str, Any]] = []
+    for part in parts:
+        part_type = part.get("type") if isinstance(part, dict) else None
+        if part_type == "text":
+            resolved.append(part)
+        elif part_type in WIRE_FORWARDABLE_PART_TYPES:
+            media = resolver.resolve(str(part["source_ref"]), str(part["mime_type"]))
+            resolved.append(media_block_base64(str(part_type), media))
+    return resolved

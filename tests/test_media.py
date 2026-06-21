@@ -13,7 +13,9 @@ from native_agent_runner.core.media import (
     MediaResolveError,
     ResolvedMedia,
     WorkspaceMediaResolver,
+    count_tool_result_images,
     estimate_image_tokens,
+    evict_tool_result_images,
     image_dimensions,
     native_image_token_cap,
 )
@@ -79,6 +81,45 @@ def test_native_image_token_cap_is_higher_for_opus() -> None:
     assert native_image_token_cap("claude-opus-4-8") == NATIVE_IMAGE_TOKEN_CAP_HIGH_RES
     assert native_image_token_cap("gpt-5.5") == NATIVE_IMAGE_TOKEN_CAP_DEFAULT
     assert native_image_token_cap(None) == NATIVE_IMAGE_TOKEN_CAP_DEFAULT
+
+
+def _tool_image_msg(ref: str) -> dict:
+    return {
+        "role": "tool",
+        "call_id": ref,
+        "content": {"ok": True, "result": {}},
+        "images": [{"type": "image", "source_ref": ref, "mime_type": "image/png"}],
+    }
+
+
+def _refs(messages) -> list[str]:
+    return [p["source_ref"] for m in messages for p in m.get("images", [])]
+
+
+def test_evict_keeps_chunk_aligned_recent() -> None:
+    messages = tuple(_tool_image_msg(f"img{i}.png") for i in range(5))
+
+    evicted = evict_tool_result_images(messages, keep_n=2)
+
+    # Chunk-aligned (chunk=keep_n=2): remove 3 → round down to 2; keeps the 3 most recent.
+    assert _refs(evicted) == ["img2.png", "img3.png", "img4.png"]
+    assert count_tool_result_images(evicted) == 3
+
+
+def test_evict_targets_only_tool_images() -> None:
+    user_msg = {"role": "user", "content": [{"type": "image", "source_ref": "user.png", "mime_type": "image/png"}]}
+    messages = (user_msg, _tool_image_msg("t0.png"), _tool_image_msg("t1.png"), _tool_image_msg("t2.png"))
+
+    evicted = evict_tool_result_images(messages, keep_n=1)
+
+    # User-content image untouched; only the most-recent tool image survives.
+    assert evicted[0]["content"][0]["source_ref"] == "user.png"
+    assert _refs([m for m in evicted if m["role"] == "tool"]) == ["t2.png"]
+
+
+def test_evict_off_by_default() -> None:
+    messages = tuple(_tool_image_msg(f"img{i}.png") for i in range(5))
+    assert evict_tool_result_images(messages, None) == messages
 
 
 def test_image_dimensions_png_and_jpeg() -> None:
