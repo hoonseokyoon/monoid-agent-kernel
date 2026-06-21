@@ -55,12 +55,17 @@ _TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".r
 _TREE_MAX_ENTRIES = 2000
 
 
-def _read_runtime_config() -> AgentRuntimeConfig:
-    """R1 capability set: read-only filesystem access (chat + read, no mutation yet)."""
+def _agent_runtime_config() -> AgentRuntimeConfig:
+    """Studio capability set so far: chat + read + write (R1 read, R2 write/propose).
+
+    In propose mode writes are staged into an overlay and surfaced as a diff/proposal; nothing
+    touches the real workspace until the user applies it.
+    """
     return AgentRuntimeConfig(
         definition_id="studio-agent",
         tools=(
             ToolBinding(binding_id="fs.read", model_name="fs_read", ref=RegistryToolRef("fs.read")),
+            ToolBinding(binding_id="fs.write", model_name="fs_write", ref=RegistryToolRef("fs.write")),
         ),
     )
 
@@ -93,6 +98,8 @@ class StudioServer:
         self._backend: RunnerBackend | None = None
         # run_id -> run access token (held server-side, never sent to the browser).
         self._run_tokens: dict[str, str] = {}
+        # run_id -> run directory (for reading diff.patch behind the BFF).
+        self._run_dirs: dict[str, Path] = {}
         self._lock = threading.RLock()
         self._base_url = ""
 
@@ -132,6 +139,8 @@ class StudioServer:
             run_root=self.config.run_root,
             token_manager=self._token_manager,
             allowed_workspace_roots=(self.workspace,),
+            # Allow applying an approved proposal back into the workspace (R2).
+            allowed_apply_roots=(self.workspace,),
             llm_gateway_url=f"http://127.0.0.1:{gateway_port}/internal/llm/turns",
         )
 
@@ -166,7 +175,7 @@ class StudioServer:
     def start_chat(self, message: str) -> dict[str, Any]:
         """Open a new multi-turn session in the workspace and deliver the first message."""
         assert self._backend is not None
-        runtime_config = _read_runtime_config()  # R1: chat + read-only filesystem
+        runtime_config = _agent_runtime_config()  # chat + read + write (staged in propose mode)
         request = BackendRunRequest(
             tenant_id=_TENANT,
             user_id=_USER,
@@ -179,6 +188,7 @@ class StudioServer:
         submission = self._backend.submit_run(request)
         with self._lock:
             self._run_tokens[submission.run_id] = submission.run_token
+            self._run_dirs[submission.run_id] = submission.run_dir
         return {"run_id": submission.run_id, "status": submission.status}
 
     def continue_chat(self, run_id: str, message: str) -> dict[str, Any]:
@@ -200,6 +210,29 @@ class StudioServer:
         assert self._backend is not None
         token = self._token_for(run_id)
         return self._backend.status(run_id, token)
+
+    def proposal(self, run_id: str) -> dict[str, Any]:
+        """The current proposed changes for the run: changed files + the unified diff. The
+        diff.patch is read behind the BFF (the backend only returns it via result() at run end)."""
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        payload = self._backend.proposal(run_id, token)
+        diff = ""
+        run_dir = self._run_dirs.get(run_id)
+        if run_dir is not None:
+            diff_path = run_dir / "diff.patch"
+            if diff_path.exists():
+                diff = diff_path.read_text(encoding="utf-8")
+        payload["diff"] = diff
+        return payload
+
+    def apply(self, run_id: str) -> dict[str, Any]:
+        """Approve and apply the current proposal into the workspace (the propose→apply step)."""
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        self._backend.approve_proposal(run_id, token, approver_id=_USER)
+        result = self._backend.apply_proposal(run_id, token, target=self.workspace)
+        return result
 
     def list_files(self) -> list[dict[str, Any]]:
         """A flat, sorted listing of the workspace for the file-tree panel (read-only;
@@ -257,6 +290,13 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/files":
                 self._write_json({"workspace": str(studio.workspace), "files": studio.list_files()})
                 return
+            if parsed.path == "/api/proposal":
+                run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
+                try:
+                    self._write_json(studio.proposal(run_id))
+                except NativeAgentError as exc:
+                    self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
             if parsed.path == "/api/events":
                 self._stream_events(parse_qs(parsed.query))
                 return
@@ -283,6 +323,11 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     body = self._read_json()
                     run_id = str(body.get("run_id") or "")
                     self._write_json(studio.cancel_chat(run_id))
+                    return
+                if parsed.path == "/api/apply":
+                    body = self._read_json()
+                    run_id = str(body.get("run_id") or "")
+                    self._write_json(studio.apply(run_id))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
             except NativeAgentError as exc:

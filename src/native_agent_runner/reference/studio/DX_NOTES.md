@@ -74,4 +74,20 @@ attached to each SSE frame as `studio_activity`. Covered by `test_describe_event
 `tool_activity` shape) to tool/workspace events, derived once at the source where the verb and
 args are already known — so every UI gets a feed for free and it can't drift.
 
-<!-- Add new entries below as later rungs (R2+) surface them. -->
+### DX-4 🟡 No mid-run API for the proposal diff text
+**Where:** `RunnerBackend.proposal()` returns the proposal payload (changed paths + per-file
+snapshot refs) but **not** the unified diff. The diff text is only returned by `result()`, which
+is populated at run end — so a parked multi-turn session has a proposal but no API-served diff.
+Found while building the R2 diff panel.
+
+**Hurt:** To show a live diff while the session is still open, Studio reads
+`run_dir / "diff.patch"` directly, coupling the app to the run-directory layout instead of going
+through a token-scoped API.
+
+**Worked around:** `StudioServer.proposal()` merges `backend.proposal(...)` with the diff text
+read from the run dir. Covered by `test_agent_write_is_staged_then_applied`.
+
+**Proposed core fix:** include the unified diff in `proposal()` (or add a `proposal_diff()` /
+`/proposal/diff` endpoint), so integrators never read run artifacts off disk.
+
+<!-- Add new entries below as later rungs (R3+) surface them. -->

@@ -36,6 +36,22 @@
   #tree li.file:hover { background: var(--assistant); }
   #log { flex: 1; overflow-y: auto; padding: 18px 16px; display: flex;
     flex-direction: column; gap: 12px; }
+  #proposal { width: 380px; min-width: 320px; border-left: 1px solid var(--border);
+    background: var(--panel); padding: 12px 14px; overflow: auto; display: flex;
+    flex-direction: column; gap: 10px; }
+  #proposal[hidden] { display: none; }
+  #proposal-files { font-size: 12.5px; color: var(--muted); }
+  #proposal-files .f { color: var(--text); }
+  #diff { flex: 1; margin: 0; overflow: auto; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre; }
+  #diff .add { color: #7fd18b; }
+  #diff .del { color: #f08a8a; }
+  #diff .meta { color: var(--muted); }
+  #apply { background: #7fd18b; color: #06210c; border: 0; border-radius: 8px; padding: 9px 14px;
+    font-weight: 600; cursor: pointer; }
+  #apply:disabled { opacity: .5; cursor: default; }
+  #apply-status { font-size: 12.5px; color: var(--muted); }
   .msg { max-width: 760px; padding: 10px 14px; border-radius: 12px; white-space: pre-wrap;
     word-wrap: break-word; }
   .msg.user { align-self: flex-end; background: var(--user); }
@@ -70,6 +86,13 @@
       <ul id="tree"></ul>
     </aside>
     <div id="log"></div>
+    <aside id="proposal" hidden>
+      <div class="side-title">Proposed changes</div>
+      <div id="proposal-files"></div>
+      <pre id="diff"></pre>
+      <button id="apply" type="button">Approve &amp; apply</button>
+      <div id="apply-status"></div>
+    </aside>
   </div>
   <footer>
     <form id="form">
@@ -131,6 +154,10 @@ function handleEvent(ev) {
   const type = ev.type || "";
   const data = ev.data || {};
   if (ev.studio_activity) { hideTyping(); activity(ev.studio_activity); return; }
+  if (type === "proposal.ready" || type === "workspace.diff.updated" || type === "workspace.proposal.updated") {
+    refreshProposal();
+    return;
+  }
   if (type === "model.turn.started") { showTyping(); return; }
   if (type === "model.turn.finished") { hideTyping(); return; }
   if (type === "turn.settled" || type === "run.finished") {
@@ -145,6 +172,67 @@ function handleEvent(ev) {
   }
   if (type === "studio.stream.end") { hideTyping(); return; }
 }
+
+const proposalEl = document.getElementById("proposal");
+const proposalFilesEl = document.getElementById("proposal-files");
+const diffEl = document.getElementById("diff");
+const applyBtn = document.getElementById("apply");
+const applyStatus = document.getElementById("apply-status");
+let applied = false;
+
+function renderDiff(text) {
+  diffEl.innerHTML = "";
+  for (const line of text.split("\n")) {
+    const span = document.createElement("span");
+    if (line.startsWith("+") && !line.startsWith("+++")) span.className = "add";
+    else if (line.startsWith("-") && !line.startsWith("---")) span.className = "del";
+    else if (line.startsWith("@@") || line.startsWith("diff ") || line.startsWith("index ")) span.className = "meta";
+    span.textContent = line + "\n";
+    diffEl.appendChild(span);
+  }
+}
+
+async function refreshProposal() {
+  if (!runId || applied) return;
+  try {
+    const p = await (await fetch(`/api/proposal?run_id=${encodeURIComponent(runId)}`)).json();
+    if (!p.ready || !p.diff) return;
+    const files = (p.changed_paths || (p.files || []).map(f => f.path) || []);
+    proposalFilesEl.innerHTML = files.length
+      ? "Changed: " + files.map(f => `<span class="f">${f}</span>`).join(", ")
+      : "";
+    renderDiff(p.diff);
+    proposalEl.hidden = false;
+    applyBtn.disabled = false;
+    applyStatus.textContent = "";
+  } catch (_) {}
+}
+
+async function applyProposal() {
+  if (!runId) return;
+  applyBtn.disabled = true;
+  applyStatus.textContent = "Applying…";
+  try {
+    const res = await (await fetch("/api/apply", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId }),
+    })).json();
+    if (res.error) { applyStatus.textContent = "Error: " + res.error; applyBtn.disabled = false; return; }
+    if (res.status === "conflict") {
+      applyStatus.textContent = "Conflict — workspace changed since the proposal.";
+      applyBtn.disabled = false;
+      return;
+    }
+    applied = true;
+    applyStatus.textContent = "Applied " + ((res.applied_paths || []).length) + " file(s).";
+    activity("Applied proposed changes to the workspace");
+    loadTree();
+  } catch (err) {
+    applyStatus.textContent = "Error: " + err;
+    applyBtn.disabled = false;
+  }
+}
+applyBtn.addEventListener("click", applyProposal);
 
 function openStream() {
   if (evtSource) evtSource.close();

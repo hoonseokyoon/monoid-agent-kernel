@@ -20,7 +20,7 @@ from native_agent_runner.reference.studio.activity import describe_event
 from native_agent_runner.reference.studio.server import (
     StudioConfig,
     StudioServer,
-    _read_runtime_config,
+    _agent_runtime_config,
 )
 
 
@@ -101,10 +101,10 @@ def test_run_tokens_are_not_exposed_to_callers(studio: StudioServer) -> None:
 # --- R1: read tools, file tree, activity feed -------------------------------------------
 
 
-def test_read_runtime_config_binds_fs_read() -> None:
-    config = _read_runtime_config()
+def test_runtime_config_binds_read_and_write() -> None:
+    config = _agent_runtime_config()
     refs = {binding.ref.tool_id for binding in config.tools}
-    assert "fs.read" in refs
+    assert {"fs.read", "fs.write"} <= refs
     # The model-facing name is the dotted id sanitized to underscores.
     read = next(b for b in config.tools if b.ref.tool_id == "fs.read")
     assert read.model_name == "fs_read"
@@ -165,5 +165,57 @@ def test_agent_reads_a_file_and_emits_activity(tmp_path: Path) -> None:
         # The model's final text settles the turn.
         settled = [e for e in events if e.get("type") == "turn.settled"]
         assert settled and "notes.md" in settled[0]["data"]["final_text"]
+    finally:
+        server.shutdown()
+
+
+# --- R2: write, proposal/diff, approve & apply ------------------------------------------
+
+
+def _wait_proposal(server: StudioServer, run_id: str, timeout: float = 10.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        proposal = server.proposal(run_id)
+        if proposal.get("ready") and proposal.get("diff"):
+            return proposal
+        time.sleep(0.1)
+    return server.proposal(run_id)
+
+
+def test_agent_write_is_staged_then_applied(tmp_path: Path) -> None:
+    # The propose->apply loop: the agent writes a file (staged in the overlay, not on disk),
+    # Studio surfaces it as a diff, and apply materializes it into the workspace.
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    target = workspace / "OUT.md"
+
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("fs_write", {"path": "OUT.md", "content": "hello\n"}, "c1"),)),
+            ModelTurn(final_text="Wrote OUT.md."),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("create OUT.md")["run_id"]
+        _wait_settled(server, run_id, 1)
+
+        # Staged, not yet on disk.
+        assert not target.exists()
+        proposal = _wait_proposal(server, run_id)
+        assert proposal["ready"]
+        assert "OUT.md" in proposal["diff"]
+        assert "hello" in proposal["diff"]
+
+        # Approve & apply -> the file lands in the workspace.
+        result = server.apply(run_id)
+        assert result["status"] != "conflict"
+        assert "OUT.md" in str(result.get("applied_paths"))
+        assert target.exists()
+        assert target.read_text(encoding="utf-8") == "hello\n"
     finally:
         server.shutdown()
