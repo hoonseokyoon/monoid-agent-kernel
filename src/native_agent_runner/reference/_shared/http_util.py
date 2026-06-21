@@ -32,6 +32,11 @@ def read_json_limited(handler: BaseHTTPRequestHandler, *, max_bytes: int = MAX_R
     or ``ValueError`` (-> 400) on a malformed body."""
     length = int(handler.headers.get("Content-Length") or "0")
     if length > max_bytes:
+        # The declared body is rejected WITHOUT reading it (the OOM guard). That leaves the
+        # client's already-sent bytes unconsumed, so the connection cannot be safely reused —
+        # close it after the 413 rather than attempting keep-alive (an unconsumed body would
+        # also otherwise be misread as the next request, and the close races a TCP reset).
+        handler.close_connection = True
         raise HttpRequestTooLarge(f"request body exceeds the {max_bytes}-byte limit")
     if length <= 0:
         return {}
