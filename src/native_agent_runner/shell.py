@@ -612,7 +612,12 @@ def _run_subprocess(
             exit_code = process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             process.kill()
-            exit_code = process.wait(timeout=2)
+            try:
+                exit_code = process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                # The child outlived both terminate and a direct kill; do not block the
+                # foreground caller — report the last-known code (or a sentinel) and move on.
+                exit_code = process.returncode if process.returncode is not None else -1
 
     stdout_bytes = file_size(stdout_path)
     stderr_bytes = file_size(stderr_path)
