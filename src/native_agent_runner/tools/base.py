@@ -6,7 +6,7 @@ from typing import Any, Literal, Protocol
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from native_agent_runner.core.content import ImagePart
+from native_agent_runner.core.content import ContentPart
 from native_agent_runner.errors import ToolExecutionError
 
 ToolSideEffect = Literal["read", "write", "artifact", "run", "shell"]
@@ -23,15 +23,16 @@ class ToolResult:
     error_code: str = ""
     retryable: bool = False
     category: str = "tool"
-    # Non-text media the tool produced (chart/screenshot/read image). Carried by
-    # reference (source_ref), not bytes; resolved at wire-build time and delivered to
-    # the model per provider (a follow-up user image message for OpenAI/gateway).
-    images: tuple[ImagePart, ...] = ()
+    # Non-text media the tool produced (chart/screenshot/read image/document). Carried by
+    # reference (source_ref), not bytes; resolved at wire-build time and delivered to the
+    # model per provider (a follow-up user message for OpenAI/gateway). Typed ``ContentPart``
+    # so a tool can return an image OR a document (PDF), not images only.
+    media: tuple[ContentPart, ...] = ()
 
     def to_observation(self) -> dict[str, Any]:
         """Model-facing payload. The handler's ``content`` lives under ``result`` so
-        domain keys can never collide with the ``ok``/``error`` envelope. Images travel
-        separately (see ``ToolObservation.images``), not inside this dict."""
+        domain keys can never collide with the ``ok``/``error`` envelope. Media travel
+        separately (see ``ToolObservation.media``), not inside this dict."""
         obs: dict[str, Any] = {"ok": self.ok, "result": self.content}
         if not self.ok:
             obs["error"] = {

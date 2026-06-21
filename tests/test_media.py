@@ -88,12 +88,12 @@ def _tool_image_msg(ref: str) -> dict:
         "role": "tool",
         "call_id": ref,
         "content": {"ok": True, "result": {}},
-        "images": [{"type": "image", "source_ref": ref, "mime_type": "image/png"}],
+        "media": [{"type": "image", "source_ref": ref, "mime_type": "image/png"}],
     }
 
 
 def _refs(messages) -> list[str]:
-    return [p["source_ref"] for m in messages for p in m.get("images", [])]
+    return [p["source_ref"] for m in messages for p in m.get("media", [])]
 
 
 def test_evict_keeps_chunk_aligned_recent() -> None:
