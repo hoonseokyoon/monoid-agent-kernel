@@ -700,6 +700,38 @@ def _hitl_request() -> ToolSpec:
     )
 
 
+def agent_spawn_tool() -> ToolSpec:
+    """The agent-as-tool delegation tool. Registered in the base registry only when
+    the run has ``subagent_definitions`` (see ``AgentLoop`` bootstrap); a runtime
+    config still needs an explicit binding to ``agent.spawn`` to expose it."""
+
+    def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(ok=True, content=context.spawn_subagent(args))
+
+    return ToolSpec(
+        id="agent.spawn",
+        description=(
+            "Delegate a focused task to a subagent that works in an isolated context "
+            "and returns only its final message. Choose 'subagent_type' from the "
+            "available subagents and give a self-contained 'prompt' (the subagent does "
+            "not see this conversation). Set 'background': true to spawn without "
+            "waiting — its result is delivered to you later; otherwise the call blocks "
+            "and returns the subagent's final message directly."
+        ),
+        input_schema=_object_schema(
+            {
+                "subagent_type": {"type": "string"},
+                "prompt": {"type": "string"},
+                "background": {"type": "boolean", "default": False},
+            },
+            required=["subagent_type", "prompt"],
+        ),
+        capability="agent.spawn",
+        side_effect="run",
+        handler=handler,
+    )
+
+
 def _web_search() -> ToolSpec:
     def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
         return ToolResult(ok=True, content=context.execute_web_search(args))
