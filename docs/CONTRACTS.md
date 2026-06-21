@@ -303,9 +303,19 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
   `skill` tools reach the model (mirrors the MCP provider). The CLI `--skills-directory`
   does all of this.
 - **Definition** (`SkillDefinition`): `name`, `description` (both advertised at L1),
-  `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (**advisory** only,
-  Claude parity — a hint, not an enforced restriction), `directory` (bundle root for L3),
-  `metadata`.
+  `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (**advisory** for
+  inline skills — a hint, not enforced; **enforced** for fork skills, see below), `context`
+  (`"inline"` default | `"fork"`), `directory` (bundle root for L3), `metadata`.
+- **Fork skills** (`context: fork`): instead of loading instructions inline, the skill runs
+  as an isolated **subagent** (reusing the subagent machine) and only its final message
+  returns — heavy skills keep their working noise out of the main context. The model calls
+  `skill(name, task)` with `task` describing the goal; the subagent's persona is the skill's
+  instructions and `task` is its first user message. The skill's `allowed_tools` become the
+  subagent's tool **allowlist** — resolved against the parent's bindings, so it is a hard
+  ceiling (here `allowed-tools` is genuinely *enforced*, unlike inline skills). Enable by
+  merging `SkillProvider.subagent_definitions()` (namespaced `skill:<name>` ids) into
+  `AgentLoop(subagent_definitions=...)`; the CLI does this automatically. The delegated run
+  is reported in the usual `subagent_count`/`subagent.*` events and metrics.
 - **Three levels of disclosure**:
   - **L1 — catalog** (~100 tokens/skill, always resident): `SkillProvider.static_segment()`
     lists each `name: description` in the system prompt plus how to load one.

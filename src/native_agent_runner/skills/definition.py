@@ -10,9 +10,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 SKILL_FILENAME = "SKILL.md"
+
+# How a skill's L2 payload is delivered when activated:
+# - "inline": the SKILL.md body is returned by the ``skill`` tool into the conversation.
+# - "fork":   the body runs as an isolated *subagent* (reusing the subagent machine); only
+#             its final message returns. Heavy skills keep their working noise out of context.
+SkillContext = Literal["inline", "fork"]
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,7 @@ class SkillDefinition:
     description: str = ""
     instructions: str = ""
     allowed_tools: tuple[str, ...] = ()
+    context: SkillContext = "inline"
     directory: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -62,11 +69,14 @@ class SkillDefinition:
         metadata_raw = meta.get("metadata")
         metadata = dict(metadata_raw) if isinstance(metadata_raw, Mapping) else {}
 
+        context: SkillContext = "fork" if str(meta.get("context") or "inline") == "fork" else "inline"
+
         return cls(
             name=name,
             description=str(meta.get("description") or ""),
             instructions=body.strip(),
             allowed_tools=allowed,
+            context=context,
             directory=directory,
             metadata=metadata,
         )

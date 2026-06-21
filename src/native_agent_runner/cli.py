@@ -266,6 +266,9 @@ def run(
                 runtime_config = replace(
                     runtime_config, tools=runtime_config.tools + skill_provider.tool_bindings()
                 )
+                # Fork skills (context: fork) run as subagents; register their synthesized
+                # definitions (namespaced ids, so no collision with --agents-directory).
+                subagent_definitions = {**subagent_definitions, **skill_provider.subagent_definitions()}
         extra_sinks = []
         if stream_json:
             extra_sinks.append(StdoutJsonlSink())

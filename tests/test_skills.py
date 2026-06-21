@@ -24,6 +24,7 @@ def _write_skill(
     *,
     description: str = "",
     allowed_tools: str = "",
+    context: str = "",
     body: str = "Do the thing.",
     resources: dict[str, str] | None = None,
 ) -> Path:
@@ -34,6 +35,8 @@ def _write_skill(
         lines.append(f"description: {description}")
     if allowed_tools:
         lines.append(f"allowed-tools: {allowed_tools}")
+    if context:
+        lines.append(f"context: {context}")
     lines += ["---", "", body, ""]
     (skill_dir / SKILL_FILENAME).write_text("\n".join(lines), encoding="utf-8")
     for rel, content in (resources or {}).items():
@@ -433,6 +436,80 @@ class _FakeRunContext:
 def test_run_script_side_effect_is_shell(tmp_path: Path) -> None:
     provider = _make_script_skill(tmp_path, "scripts/hello.py", "print('x')")
     assert _specs(provider)["skill.run_script"].side_effect == "shell"
+
+
+# --- P3 fork: a skill that runs as a subagent -------------------------------------
+
+
+def test_from_frontmatter_context_fork_vs_inline() -> None:
+    assert SkillDefinition.from_frontmatter({"name": "x", "context": "fork"}, "b").context == "fork"
+    assert SkillDefinition.from_frontmatter({"name": "y"}, "b").context == "inline"
+
+
+def test_inline_skill_has_no_subagent_definition(tmp_path: Path) -> None:
+    _write_skill(tmp_path, "pdf-fill", description="d")
+    provider = SkillProvider(load_skill_definitions(tmp_path))
+    assert provider.subagent_definitions() == {}
+
+
+def test_fork_skill_synthesizes_fresh_subagent_with_allowlist(tmp_path: Path) -> None:
+    _write_skill(
+        tmp_path, "researcher", description="Research", context="fork",
+        allowed_tools="fs.read shell.exec", body="You are a researcher.",
+    )
+    provider = SkillProvider(load_skill_definitions(tmp_path))
+
+    defs = provider.subagent_definitions()
+    assert set(defs) == {"skill:researcher"}
+    sub = defs["skill:researcher"]
+    assert sub.context == "fresh"  # fresh subagent whose persona is the skill body
+    assert sub.tools == ("fs.read", "shell.exec")  # allowed_tools -> hard ceiling
+    assert sub.prompt.persona_segments == ("You are a researcher.",)
+
+
+def test_fork_skill_activation_runs_as_subagent(tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    _write_skill(
+        skills_root, "researcher", description="Research things", context="fork",
+        body="CHILD_PERSONA — research the topic and report.",
+    )
+    provider = SkillProvider(load_skill_definitions(skills_root))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class _ForkAdapter:
+        def __init__(self) -> None:
+            self.parent = [
+                ModelTurn(tool_calls=(fake_tool_call("skill", {"name": "researcher", "task": "find X"}, "c1"),)),
+                ModelTurn(final_text="parent done"),
+            ]
+            self.requests: list = []
+
+        def next_turn(self, request):
+            self.requests.append(request)
+            if "CHILD_PERSONA" in request.system_prompt:  # the fork subagent's persona
+                return ModelTurn(final_text="RESEARCH_RESULT")
+            return self.parent.pop(0) if self.parent else ModelTurn(final_text="parent idle")
+
+    adapter = _ForkAdapter()
+    result = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        context_providers=(provider,),
+        tool_providers=(provider,),
+        subagent_definitions=provider.subagent_definitions(),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=provider.tool_bindings())),
+    ).run_once("go")
+
+    assert result.status == "completed"
+    # The skill ran as an isolated subagent; only its final message came back to the parent.
+    outputs = json.dumps([obs.output for req in adapter.requests for obs in req.observations])
+    assert "RESEARCH_RESULT" in outputs
+    # The child's persona was the skill instructions; the task was its user message.
+    child_reqs = [r for r in adapter.requests if "CHILD_PERSONA" in r.system_prompt]
+    assert child_reqs  # the fork subagent actually ran
+    # Report-only subagent metrics reflect the delegated run.
+    assert result.metrics.get("subagent_count") == 1
 
 
 def test_otel_skill_tool_span_enriched(tmp_path: Path) -> None:

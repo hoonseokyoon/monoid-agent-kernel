@@ -1,6 +1,6 @@
 # Agent Skills (progressive disclosure) design
 
-Status: P1 + P2 + P3① (`skill.run_script`) implemented (branch `feat/skills-progressive-disclosure`).
+Status: P1 + P2 + P3 implemented (branch `feat/skills-progressive-disclosure`).
 
 ## Goal
 
@@ -155,13 +155,45 @@ Design, reusing the shell machinery rather than re-implementing process handling
   scrub) + the model being able to choose only a script *path within the skill dir* and
   literal args (not an arbitrary command). Documented: only load skills from trusted sources.
 
+## Fork skills (P3: `context: fork`)
+
+A skill can declare `context: fork` (a Claude Code SKILL.md extension). Instead of loading
+its instructions inline (L2), the skill runs as an isolated **subagent** and only its final
+message returns — heavy skills (long instructions + lots of intermediate tool calls) keep
+their working noise out of the main context. This is the original reason the subagent feature
+was built first: a fork skill is just a `SubagentDefinition` driven through the existing
+agent-as-tool machine, so there is almost no new plumbing.
+
+- **A fork skill is a fresh subagent whose persona is the skill body.** `SkillProvider.
+  subagent_definitions()` synthesizes, for each `context: fork` skill, a
+  `SubagentDefinition(prompt=<instructions>, tools=<allowed_tools> or None, context="fresh")`.
+  Note "fork" in skill-land (runs in a separate context) maps to a subagent in **`"fresh"`**
+  mode (isolated, persona = skill body) — *not* the subagent's own `"fork"` mode, which would
+  inherit the parent's prompt and ignore the skill body.
+- **Namespaced ids.** The definitions are keyed `skill:<name>` so they never collide with
+  operator subagents (`--agents-directory`). The CLI merges them into
+  `AgentLoop(subagent_definitions=...)`; programmatic users do the same.
+- **Activation routes to `spawn_subagent`.** The `skill` tool gains an optional `task` arg.
+  When the chosen skill is `context: fork`, the handler calls `context.spawn_subagent(
+  {"subagent_type": "skill:<name>", "prompt": task})` (foreground) and returns the child's
+  final message; otherwise it loads instructions inline as before. The subagent machine
+  supplies depth/fan-out caps, re-entrancy safety, cancellation, usage roll-up, and the
+  `subagent.*` events/metrics for free.
+- **allowed-tools is *enforced* here.** For inline skills `allowed_tools` is advisory; for a
+  fork skill it becomes the subagent's tool allowlist, resolved against the parent's bindings
+  — a hard ceiling. So "I want this skill restricted to certain tools" is answered by making
+  it a fork skill, which is why a separate enforced-gating mechanism for inline skills is not
+  worth building. (For a fork skill, write `allowed-tools` in the runner's tool-id namespace,
+  e.g. `fs.read shell.exec`, since it is matched by fnmatch against tool ids.)
+
 ## Scope
 
 - **P1**: L1 + L2 + L3 (`read_file`), directory discovery, CLI, exports, tests, docs.
 - **P2**: `skill.activated` event + OTel span enrichment + activation metrics; advisory
   allowed-tools echoed in the tool result.
-- **P3① (this revision)**: `skill.run_script` — execute a bundled script, output-only,
-  argv (no shell), reusing the shell approval/limits machinery.
-- **P3 remaining**: `context: fork` — run a skill's body as a *subagent* (reuse the merged
-  subagent machine); optional enforced allowed-tools gating (largely subsumed by fork, whose
-  subagent tool-ceiling enforces restriction for free).
+- **P3①**: `skill.run_script` — execute a bundled script, output-only, argv (no shell),
+  reusing the shell approval/limits machinery.
+- **P3 fork (this revision)**: `context: fork` — run a skill's body as a fresh subagent,
+  reusing the merged subagent machine; `allowed_tools` enforced via the subagent ceiling.
+- **Deferred**: enforced allowed-tools gating for *inline* skills (subsumed by fork);
+  ADK-style state copy-in/delta-back; token-budget enforcement across the tree.

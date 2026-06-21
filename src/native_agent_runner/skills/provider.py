@@ -20,7 +20,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from native_agent_runner.core.agents import RegistryToolRef, ToolBinding
+from native_agent_runner.core.agents import PromptSpec, RegistryToolRef, SubagentDefinition, ToolBinding
 from native_agent_runner.core.context import TurnContext
 from native_agent_runner.skills.definition import SKILL_FILENAME, SkillDefinition
 from native_agent_runner.tools.base import ToolResult, ToolSpec
@@ -28,6 +28,10 @@ from native_agent_runner.tools.base import ToolResult, ToolSpec
 SKILL_TOOL_ID = "skill"
 SKILL_READ_FILE_TOOL_ID = "skill.read_file"
 SKILL_RUN_SCRIPT_TOOL_ID = "skill.run_script"
+
+# Fork skills are exposed to the subagent machine under this namespace so their synthesized
+# SubagentDefinitions never collide with operator-defined subagents (``--agents-directory``).
+SKILL_SUBAGENT_PREFIX = "skill:"
 
 _MAX_RESOURCE_FILES = 100
 _MAX_RESOURCE_BYTES = 1_000_000
@@ -85,14 +89,19 @@ class SkillProvider:
         yield ToolSpec(
             id=SKILL_TOOL_ID,
             description=(
-                "Load an Agent Skill's full instructions into context. Choose 'name' from "
-                "the available skills; the tool returns the skill's instructions plus a "
-                "manifest of bundled resource files (read those on demand with "
-                f"'{SKILL_READ_FILE_TOOL_ID}'). Only load a skill when it is relevant.\n\n"
+                "Activate an Agent Skill. For most skills this loads the skill's full "
+                "instructions into context (plus a manifest of bundled resource files, read "
+                f"on demand with '{SKILL_READ_FILE_TOOL_ID}'). Some skills run in a separate "
+                "context instead: for those, provide 'task' describing what to accomplish and "
+                "the tool returns only the skill's final result. Choose 'name' from the "
+                "available skills; only activate a skill when it is relevant.\n\n"
                 f"Available skills:\n{catalog}"
             ),
             input_schema=_object_schema(
-                {"name": {"type": "string", "enum": names}},
+                {
+                    "name": {"type": "string", "enum": names},
+                    "task": {"type": "string"},
+                },
                 required=["name"],
             ),
             capability="skill",
@@ -149,6 +158,30 @@ class SkillProvider:
             for spec in self.get_tools()
         )
 
+    def subagent_definitions(self) -> dict[str, SubagentDefinition]:
+        """SubagentDefinitions for fork skills (``context: fork``), keyed by a namespaced id.
+        Merge these into ``AgentLoop(subagent_definitions=...)`` so the ``skill`` tool can
+        spawn them. A fork skill runs as a FRESH subagent whose persona is the skill's
+        instructions and whose tool allowlist is the skill's ``allowed_tools`` — resolved
+        against the parent's bindings, so it is a hard ceiling (the subagent can never exceed
+        the parent). Empty ``allowed_tools`` inherits all of the parent's tools."""
+        out: dict[str, SubagentDefinition] = {}
+        for name, definition in self._definitions.items():
+            if definition.context != "fork":
+                continue
+            prompt = (
+                PromptSpec(persona_segments=(definition.instructions,))
+                if definition.instructions
+                else PromptSpec()
+            )
+            out[SKILL_SUBAGENT_PREFIX + name] = SubagentDefinition(
+                description=definition.description,
+                prompt=prompt,
+                tools=definition.allowed_tools or None,
+                context="fresh",
+            )
+        return out
+
     # -- internals ---------------------------------------------------------------------
 
     def _catalog_lines(self) -> list[str]:
@@ -164,6 +197,8 @@ class SkillProvider:
             definition = self._definitions.get(name)
             if definition is None:
                 return ToolResult(ok=False, error=f"unknown skill: {name}", error_code="skill_unknown")
+            if definition.context == "fork":
+                return _activate_fork(_context, definition, str(args.get("task") or ""))
             content: dict[str, Any] = {"name": definition.name, "instructions": definition.instructions}
             if definition.allowed_tools:
                 # Advisory (Claude parity): a hint, not an enforced restriction.
@@ -249,6 +284,27 @@ class SkillProvider:
             return ToolResult(ok=True, content=result)
 
         return handler
+
+
+def _activate_fork(context: Any, definition: SkillDefinition, task: str) -> ToolResult:
+    """Run a fork skill as a subagent and return its final message. Delegates to the tool
+    context's ``spawn_subagent`` (the engine registered the skill's SubagentDefinition under
+    the namespaced id); the subagent's persona is the skill instructions and ``task`` is its
+    first user message."""
+    spawn = getattr(context, "spawn_subagent", None)
+    if not callable(spawn):
+        return ToolResult(
+            ok=False, error="this context cannot run fork skills", error_code="skill_fork_unsupported"
+        )
+    prompt = task.strip() or definition.description or "Follow your instructions for this task."
+    result = spawn({"subagent_type": SKILL_SUBAGENT_PREFIX + definition.name, "prompt": prompt})
+    failed = str(result.get("status") or "") == "failed"
+    return ToolResult(
+        ok=not failed,
+        content=result,
+        error="" if not failed else str(result.get("error") or "skill subagent failed"),
+        error_code="" if not failed else "skill_fork_failed",
+    )
 
 
 def _object_schema(properties: dict[str, Any], *, required: list[str] | None = None) -> dict[str, Any]:
