@@ -56,16 +56,21 @@ _TREE_MAX_ENTRIES = 2000
 
 
 def _agent_runtime_config() -> AgentRuntimeConfig:
-    """Studio capability set so far: chat + read + write (R1 read, R2 write/propose).
+    """Studio capability set so far: chat + read + write + ask-the-human (R1 read, R2
+    write/propose, R3 HITL).
 
     In propose mode writes are staged into an overlay and surfaced as a diff/proposal; nothing
-    touches the real workspace until the user applies it.
+    touches the real workspace until the user applies it. ``hitl.request`` lets the agent pause
+    and ask the human to approve/answer before proceeding.
     """
     return AgentRuntimeConfig(
         definition_id="studio-agent",
         tools=(
             ToolBinding(binding_id="fs.read", model_name="fs_read", ref=RegistryToolRef("fs.read")),
             ToolBinding(binding_id="fs.write", model_name="fs_write", ref=RegistryToolRef("fs.write")),
+            ToolBinding(
+                binding_id="hitl.request", model_name="hitl_request", ref=RegistryToolRef("hitl.request")
+            ),
         ),
     )
 
@@ -225,6 +230,15 @@ class StudioServer:
         result = self._backend.apply_proposal(run_id, token, target=self.workspace)
         return result
 
+    def answer_hitl(self, run_id: str, task_id: str, answer: str) -> dict[str, Any]:
+        """Deliver the human's decision for a parked ``hitl.request`` (the approval gate). The
+        answer is handed back to the agent as the tool's result and the run resumes."""
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        return self._backend.report_task_result(
+            run_id, token, task_id=task_id, result={"answer": answer}, status="answered"
+        )
+
     def list_files(self) -> list[dict[str, Any]]:
         """A flat, sorted listing of the workspace for the file-tree panel (read-only;
         skips VCS/cache dirs and is bounded so a huge tree can't stall the UI)."""
@@ -319,6 +333,13 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     body = self._read_json()
                     run_id = str(body.get("run_id") or "")
                     self._write_json(studio.apply(run_id))
+                    return
+                if parsed.path == "/api/hitl":
+                    body = self._read_json()
+                    run_id = str(body.get("run_id") or "")
+                    task_id = str(body.get("task_id") or "")
+                    answer = str(body.get("answer") or "")
+                    self._write_json(studio.answer_hitl(run_id, task_id, answer))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
             except NativeAgentError as exc:

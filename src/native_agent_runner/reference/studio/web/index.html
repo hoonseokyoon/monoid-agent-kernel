@@ -64,6 +64,17 @@
     color: var(--muted); }
   .activity { align-self: center; color: var(--muted); font-size: 12px; font-style: italic; }
   .typing { align-self: flex-start; color: var(--muted); font-size: 13px; }
+  .hitl { align-self: stretch; max-width: 760px; background: #2a2410; border: 1px solid var(--warn);
+    border-radius: 12px; padding: 12px 14px; }
+  .hitl .q { margin-bottom: 10px; white-space: pre-wrap; }
+  .hitl .q b { color: var(--warn); }
+  .hitl .opts { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hitl button { background: var(--warn); color: #1c1606; border: 0; border-radius: 8px;
+    padding: 7px 14px; font-weight: 600; cursor: pointer; }
+  .hitl button.deny { background: transparent; color: var(--warn); border: 1px solid var(--warn); }
+  .hitl button:disabled { opacity: .5; cursor: default; }
+  .hitl.answered { opacity: .65; }
+  .hitl .answered-note { color: var(--muted); font-size: 12px; margin-top: 8px; }
   footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
   form { display: flex; gap: 10px; max-width: 900px; margin: 0 auto; }
   textarea { flex: 1; resize: none; background: var(--bg); color: var(--text);
@@ -158,6 +169,7 @@ function handleEvent(ev) {
     refreshProposal();
     return;
   }
+  if (type === "task.started" && data.kind === "hitl") { hideTyping(); renderHitl(data); return; }
   if (type === "model.turn.started") { showTyping(); return; }
   if (type === "model.turn.finished") { hideTyping(); return; }
   if (type === "turn.settled" || type === "run.finished") {
@@ -233,6 +245,51 @@ async function applyProposal() {
   }
 }
 applyBtn.addEventListener("click", applyProposal);
+
+function renderHitl(data) {
+  const taskId = data.task_id;
+  const choices = (Array.isArray(data.choices) && data.choices.length) ? data.choices : ["Approve", "Deny"];
+  const card = document.createElement("div");
+  card.className = "hitl";
+  const q = document.createElement("div");
+  q.className = "q";
+  const prompt = (data.prompt || "Approve this action?")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  q.innerHTML = "<b>The agent needs your approval</b>\n" + prompt;
+  card.appendChild(q);
+  const opts = document.createElement("div");
+  opts.className = "opts";
+  choices.forEach((choice, idx) => {
+    const b = document.createElement("button");
+    if (choices.length === 2 && idx === 1) b.className = "deny";
+    b.textContent = choice;
+    b.addEventListener("click", () => answerHitl(taskId, choice, card));
+    opts.appendChild(b);
+  });
+  card.appendChild(opts);
+  log.appendChild(card);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function answerHitl(taskId, answer, card) {
+  card.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  try {
+    const res = await fetch("/api/hitl", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId, task_id: taskId, answer }),
+    });
+    const body = await res.json();
+    if (body.error) throw new Error(body.error);
+    card.classList.add("answered");
+    const note = document.createElement("div");
+    note.className = "answered-note";
+    note.textContent = "You answered: " + answer;
+    card.appendChild(note);
+  } catch (err) {
+    card.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    activity("Failed to send approval: " + err);
+  }
+}
 
 function openStream() {
   if (evtSource) evtSource.close();

@@ -29,6 +29,7 @@ _TOOL_ACTIONS = {
     "fs_copy": "copy",
     "fs_mkdir": "mkdir",
     "shell_exec": "run",
+    "hitl_request": "ask",
     "web_search": "search",
     "web_fetch": "fetch",
     "web_context": "research",

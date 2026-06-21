@@ -101,10 +101,10 @@ def test_run_tokens_are_not_exposed_to_callers(studio: StudioServer) -> None:
 # --- R1: read tools, file tree, activity feed -------------------------------------------
 
 
-def test_runtime_config_binds_read_and_write() -> None:
+def test_runtime_config_binds_read_write_and_hitl() -> None:
     config = _agent_runtime_config()
     refs = {binding.ref.tool_id for binding in config.tools}
-    assert {"fs.read", "fs.write"} <= refs
+    assert {"fs.read", "fs.write", "hitl.request"} <= refs
     # The model-facing name is the dotted id sanitized to underscores.
     read = next(b for b in config.tools if b.ref.tool_id == "fs.read")
     assert read.model_name == "fs_read"
@@ -217,5 +217,59 @@ def test_agent_write_is_staged_then_applied(tmp_path: Path) -> None:
         assert "OUT.md" in str(result.get("applied_paths"))
         assert target.exists()
         assert target.read_text(encoding="utf-8") == "hello\n"
+    finally:
+        server.shutdown()
+
+
+# --- R3: human-in-the-loop approval gate ------------------------------------------------
+
+
+def _wait_event(server: StudioServer, run_id: str, etype: str, timeout: float = 10.0) -> dict | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for event in server.poll_events(run_id, 0).get("events", []):
+            if event.get("type") == etype:
+                return event
+        time.sleep(0.1)
+    return None
+
+
+def test_hitl_gate_parks_the_run_then_resumes_on_answer(tmp_path: Path) -> None:
+    # The agent calls hitl.request; the run parks awaiting a human decision; answering it
+    # resumes the run. This is the danger-op approval gate.
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "hitl_request",
+                        {"prompt": "Delete all files in the workspace?", "choices": ["Approve", "Deny"]},
+                        "c1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="Thanks — proceeding per your choice."),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("clean up the workspace")["run_id"]
+        started = _wait_event(server, run_id, "task.started")
+        assert started is not None
+        assert started["data"]["kind"] == "hitl"
+        assert "Delete all files" in started["data"]["prompt"]
+        # Parked: the turn has not settled while it waits for the human.
+        assert not _settled(server, run_id)
+        # Answer the gate -> the run resumes and settles (a final assistant turn appears).
+        task_id = started["data"]["task_id"]
+        server.answer_hitl(run_id, task_id, "Approve")
+        settled = _wait_settled(server, run_id, 1)
+        assert settled and settled[0]["data"]["final_text"]
     finally:
         server.shutdown()

@@ -125,4 +125,11 @@ kill a run.
    the full state). Verified by hammering the Studio multi-turn path (0 failures where it
    previously flaked ~1 in 4).
 
-<!-- Add new entries below as later rungs (R3+) surface them. -->
+### R3 (HITL) — no new core gap
+The `hitl.request` tool + hosted-task surface (`task.started` carrying `task_id`/`prompt`/
+`choices`, `report_task_result` to resume) was sufficient to build the approval gate end to end.
+Studio binds `hitl.request`, renders a gate card from `task.started`, and answers via
+`POST /api/hitl` → `report_task_result`. One minor naming snag: hosted tasks key their id as
+`task_id` while background **jobs** use `job_id` — worth knowing but not worth a change.
+
+<!-- Add new entries below as later rungs (R4+) surface them. -->

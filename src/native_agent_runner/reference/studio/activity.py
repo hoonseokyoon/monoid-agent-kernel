@@ -23,6 +23,7 @@ _PRESENT = {
     "mkdir": "Creating directory",
     "list": "Listing",
     "run": "Running",
+    "ask": "Asking the human",
     "search": "Searching the web for",
     "fetch": "Fetching",
     "research": "Researching",
