@@ -101,10 +101,14 @@ def test_run_tokens_are_not_exposed_to_callers(studio: StudioServer) -> None:
 # --- R1: read tools, file tree, activity feed -------------------------------------------
 
 
-def test_runtime_config_binds_read_write_and_hitl() -> None:
+def test_runtime_config_binds_read_write_hitl_and_shell() -> None:
     config = _agent_runtime_config()
     refs = {binding.ref.tool_id for binding in config.tools}
-    assert {"fs.read", "fs.write", "hitl.request"} <= refs
+    assert {"fs.read", "fs.write", "hitl.request", "shell.exec"} <= refs
+    # The shell binding refuses obviously destructive commands and auto-approves the rest.
+    shell = next(b for b in config.tools if b.ref.tool_id == "shell.exec")
+    assert any(p.startswith("rm") for p in shell.scope.command_deny_prefixes)
+    assert shell.runtime["shell"]["approval_mode"] == "auto-approve"
     # The model-facing name is the dotted id sanitized to underscores.
     read = next(b for b in config.tools if b.ref.tool_id == "fs.read")
     assert read.model_name == "fs_read"
@@ -271,5 +275,86 @@ def test_hitl_gate_parks_the_run_then_resumes_on_answer(tmp_path: Path) -> None:
         server.answer_hitl(run_id, task_id, "Approve")
         settled = _wait_settled(server, run_id, 1)
         assert settled and settled[0]["data"]["final_text"]
+    finally:
+        server.shutdown()
+
+
+# --- R4: shell + background jobs --------------------------------------------------------
+
+
+def _python_command(code: str) -> str:
+    return 'python -c "' + code.replace('"', '\\"') + '"'
+
+
+def _shell_studio(tmp_path: Path, turns: list) -> StudioServer:
+    fake = FakeModelAdapter(turns=turns)
+    server = StudioServer(
+        StudioConfig(workspace=tmp_path / "ws", host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    (tmp_path / "ws").mkdir(parents=True, exist_ok=True)
+    server.start()
+    return server
+
+
+def test_shell_foreground_command_runs(tmp_path: Path) -> None:
+    server = _shell_studio(
+        tmp_path,
+        [
+            ModelTurn(tool_calls=(fake_tool_call("shell_exec", {"command": _python_command("print('hi')")}, "c1"),)),
+            ModelTurn(final_text="ran it"),
+        ],
+    )
+    try:
+        run_id = server.start_chat("run a command")["run_id"]
+        _wait_settled(server, run_id, 1)
+        events = server.poll_events(run_id, 0).get("events", [])
+        finished = [e for e in events if e.get("type") == "shell.exec.finished"]
+        assert finished and finished[0]["data"]["exit_code"] == 0
+        # The shell call narrates into the activity feed.
+        started = [e for e in events if e.get("type") == "tool.call.started" and e["data"].get("tool") == "shell_exec"]
+        assert started and (describe_event(started[0]) or "").startswith("Running")
+    finally:
+        server.shutdown()
+
+
+def test_shell_destructive_command_is_denied(tmp_path: Path) -> None:
+    server = _shell_studio(
+        tmp_path,
+        [
+            ModelTurn(tool_calls=(fake_tool_call("shell_exec", {"command": "rm -rf ."}, "c1"),)),
+            ModelTurn(final_text="couldn't do that"),
+        ],
+    )
+    try:
+        run_id = server.start_chat("delete everything")["run_id"]
+        _wait_settled(server, run_id, 1)
+        events = server.poll_events(run_id, 0).get("events", [])
+        # The destructive command is blocked by the binding's deny scope (before it can run).
+        denied = {"tool_scope_denied", "shell_binding_denied"}
+        failed = [e for e in events if (e.get("data") or {}).get("error_code") in denied]
+        assert failed, "destructive command should be denied by the binding gate"
+    finally:
+        server.shutdown()
+
+
+def test_shell_background_job_is_listed(tmp_path: Path) -> None:
+    server = _shell_studio(
+        tmp_path,
+        [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call("shell_exec", {"command": _python_command("print('bg')"), "background": True}, "c1"),
+                )
+            ),
+            ModelTurn(final_text="started a background job"),
+        ],
+    )
+    try:
+        run_id = server.start_chat("run something in the background")["run_id"]
+        _wait_settled(server, run_id, 1)
+        jobs = server.jobs(run_id).get("jobs", [])
+        assert jobs, "the background job should be listed"
+        assert jobs[0].get("job_id")
     finally:
         server.shutdown()

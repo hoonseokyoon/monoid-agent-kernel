@@ -34,6 +34,7 @@ from native_agent_runner.core.agents import (
     RegistryToolRef,
     ToolBinding,
 )
+from native_agent_runner.core.tool_surface import ToolScope
 from native_agent_runner.errors import NativeAgentError
 from native_agent_runner.reference._shared.tokens import TokenManager
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
@@ -55,13 +56,22 @@ _TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".r
 _TREE_MAX_ENTRIES = 2000
 
 
+# Obvious destructive command prefixes the shell binding refuses outright (a binding-level
+# safety gate, enforced regardless of approval mode). Matched as command.strip().startswith.
+_SHELL_DENY_PREFIXES = (
+    "rm ", "rmdir", "del ", "rd ", "format", "mkfs", "dd ", "sudo ", "shutdown", "reboot",
+)
+
+
 def _agent_runtime_config() -> AgentRuntimeConfig:
-    """Studio capability set so far: chat + read + write + ask-the-human (R1 read, R2
-    write/propose, R3 HITL).
+    """Studio capability set so far: chat + read + write + ask-the-human + shell (R1 read, R2
+    write/propose, R3 HITL, R4 shell + background jobs).
 
     In propose mode writes are staged into an overlay and surfaced as a diff/proposal; nothing
     touches the real workspace until the user applies it. ``hitl.request`` lets the agent pause
-    and ask the human to approve/answer before proceeding.
+    and ask the human to approve/answer. ``shell.exec`` runs commands in a sanitized workspace
+    copy: it auto-approves ordinary commands but refuses obviously destructive ones, and supports
+    background jobs.
     """
     return AgentRuntimeConfig(
         definition_id="studio-agent",
@@ -70,6 +80,13 @@ def _agent_runtime_config() -> AgentRuntimeConfig:
             ToolBinding(binding_id="fs.write", model_name="fs_write", ref=RegistryToolRef("fs.write")),
             ToolBinding(
                 binding_id="hitl.request", model_name="hitl_request", ref=RegistryToolRef("hitl.request")
+            ),
+            ToolBinding(
+                binding_id="shell.exec",
+                model_name="shell_exec",
+                ref=RegistryToolRef("shell.exec"),
+                scope=ToolScope(command_deny_prefixes=_SHELL_DENY_PREFIXES),
+                runtime={"shell": {"approval_mode": "auto-approve"}},
             ),
         ),
     )
@@ -230,6 +247,16 @@ class StudioServer:
         result = self._backend.apply_proposal(run_id, token, target=self.workspace)
         return result
 
+    def jobs(self, run_id: str) -> dict[str, Any]:
+        """Background shell jobs for the run (running + finished)."""
+        assert self._backend is not None
+        return self._backend.jobs(run_id, self._token_for(run_id))
+
+    def job_logs(self, run_id: str, job_id: str, *, stream: str = "stdout") -> dict[str, Any]:
+        """Tail of a background job's stdout/stderr log."""
+        assert self._backend is not None
+        return self._backend.job_logs(run_id, self._token_for(run_id), job_id, stream=stream, tail_bytes=20_000)
+
     def answer_hitl(self, run_id: str, task_id: str, answer: str) -> dict[str, Any]:
         """Deliver the human's decision for a parked ``hitl.request`` (the approval gate). The
         answer is handed back to the agent as the tool's result and the run resumes."""
@@ -299,6 +326,23 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
                 try:
                     self._write_json(studio.proposal(run_id))
+                except NativeAgentError as exc:
+                    self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/jobs":
+                run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
+                try:
+                    self._write_json(studio.jobs(run_id))
+                except NativeAgentError as exc:
+                    self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/job-logs":
+                query = parse_qs(parsed.query)
+                run_id = (query.get("run_id") or [""])[0]
+                job_id = (query.get("job_id") or [""])[0]
+                stream = (query.get("stream") or ["stdout"])[0]
+                try:
+                    self._write_json(studio.job_logs(run_id, job_id, stream=stream))
                 except NativeAgentError as exc:
                     self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return

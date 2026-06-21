@@ -132,4 +132,13 @@ Studio binds `hitl.request`, renders a gate card from `task.started`, and answer
 `POST /api/hitl` → `report_task_result`. One minor naming snag: hosted tasks key their id as
 `task_id` while background **jobs** use `job_id` — worth knowing but not worth a change.
 
-<!-- Add new entries below as later rungs (R4+) surface them. -->
+### R4 (shell + background jobs) — no new core gap
+Shell + jobs were buildable from the existing surface: bind `shell.exec` with
+`runtime.shell.approval_mode="auto-approve"` and a `ToolScope(command_deny_prefixes=…)` for the
+destructive-command gate (enforced at the scope layer → `permission.denied` /
+`error_code="tool_scope_denied"` before execution), and the backend's `jobs()` / `job_logs()` for
+the background-jobs panel. Minor narration learning: the shell tool's `args_preview` carries the
+command under `command_preview` (not `command`), so `narration._TARGET_KEYS` includes it — a small
+key inconsistency, not worth a core change.
+
+<!-- Add new entries below as later rungs (R5+) surface them. -->

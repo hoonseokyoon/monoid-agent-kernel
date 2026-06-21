@@ -35,7 +35,7 @@ _TOOL_ACTIONS = {
     "web_context": "research",
 }
 # args_preview keys to surface as the action's primary target, in priority order.
-_TARGET_KEYS = ("path", "url", "query", "command", "cmd", "pattern", "src", "dest")
+_TARGET_KEYS = ("path", "url", "query", "command_preview", "command", "cmd", "pattern", "src", "dest")
 
 
 @dataclass(frozen=True)
