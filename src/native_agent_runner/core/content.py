@@ -14,9 +14,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-# Internal marker for the deferred multimodal-forwarding work.
-MEDIA_INPUT_CAPABILITY = "media.input"
-
 
 @dataclass(frozen=True)
 class TextPart:

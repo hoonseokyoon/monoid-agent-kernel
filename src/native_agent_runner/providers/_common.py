@@ -22,6 +22,40 @@ def build_reasoning_payload(reasoning: ReasoningConfig) -> dict[str, Any]:
     return payload
 
 
+def text_from_message_content(content: Any) -> str:
+    """Project a by-value message ``content`` down to plain text for text-only adapters.
+
+    ``content`` is either a ``str`` (already text) or a list of part-dicts (the multimodal
+    by-reference shape produced by ``content_part_to_json``). Non-text parts (image,
+    document) are dropped here — a text-only wire keeps working even once the durable log
+    carries multimodal parts. Multimodal adapters bypass this and map the parts instead.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        segments = [
+            str(part.get("text", "")).strip()
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and str(part.get("text", "")).strip()
+        ]
+        return "\n\n".join(segments)
+    return ""
+
+
+def project_message_to_text(message: dict[str, Any]) -> dict[str, Any]:
+    """Return ``message`` with list ``content`` collapsed to text; pass ``str`` through.
+
+    Used by text-only adapter send paths so a durable multimodal message (list content)
+    never reaches a provider that cannot read it.
+    """
+    content = message.get("content")
+    if isinstance(content, list):
+        return {**message, "content": text_from_message_content(content)}
+    return message
+
+
 def normalize_usage(usage: dict[str, Any] | None, *, legacy_aliases: bool = False) -> dict[str, int]:
     """Coerce a provider usage dict to ``{input_tokens, output_tokens, total_tokens}``.
 

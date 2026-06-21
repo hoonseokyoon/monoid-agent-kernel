@@ -131,9 +131,13 @@ class ModelAdapter(Protocol):
     # Optional capability flag. The loop reads it via
     # ``getattr(adapter, "supports_multimodal", False)``; an adapter that can
     # accept non-text content parts sets it True. Defaulting off keeps existing
-    # adapters valid without declaring it. Multimodal forwarding itself is not
-    # yet implemented (see core/content.py) — this is the negotiation seam.
+    # adapters valid without declaring it. When True, the loop resolves by-reference
+    # media in the by-value ``messages`` log to wire blocks before the call.
     supports_multimodal: bool = False
+    # The wire encoding a multimodal adapter expects for resolved media. The loop reads
+    # it via ``getattr(adapter, "wire_image_encoding", "base64")``. Only ``"base64"``
+    # is implemented today; ``"url"`` / ``"file_id"`` are reserved for later phases.
+    wire_image_encoding: str = "base64"
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         ...

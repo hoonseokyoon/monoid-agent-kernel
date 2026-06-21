@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from native_agent_runner.providers.base import (
     ModelRequest,
@@ -18,6 +19,23 @@ from native_agent_runner.providers.base import (
 class FakeModelAdapter:
     turns: list[ModelTurn] = field(default_factory=list)
     requests: list[ModelRequest] = field(default_factory=list)
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        self.requests.append(request)
+        if not self.turns:
+            return ModelTurn(final_text="fake model completed")
+        return self.turns.pop(0)
+
+
+@dataclass
+class FakeMultimodalModelAdapter:
+    """A multimodal ``FakeModelAdapter``: declares ``supports_multimodal`` so the loop
+    resolves by-reference media to wire blocks, and records the resolved ``messages`` it
+    receives so a test can assert what was forwarded."""
+
+    turns: list[ModelTurn] = field(default_factory=list)
+    requests: list[ModelRequest] = field(default_factory=list)
+    supports_multimodal: ClassVar[bool] = True
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         self.requests.append(request)

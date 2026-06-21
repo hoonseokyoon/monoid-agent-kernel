@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import threading
@@ -22,6 +23,15 @@ from native_agent_runner.core.content import (
     content_part_from_json,
     content_part_to_json,
     non_text_part_types,
+)
+from native_agent_runner.core.media import (
+    MAX_FORWARDABLE_BLOCKS,
+    WIRE_FORWARDABLE_PART_TYPES,
+    WorkspaceMediaResolver,
+    estimate_image_tokens,
+    image_dimensions,
+    native_image_token_cap,
+    resolve_wire_messages,
 )
 from native_agent_runner.core.context import (
     ContextProvider,
@@ -49,6 +59,7 @@ from native_agent_runner.core.spec import (
     RunLimits,
     input_to_parts,
     text_from_parts,
+    user_message_from_parts,
 )
 from native_agent_runner.core.tool_surface import (
     DefaultToolSurfaceResolver,
@@ -1243,16 +1254,24 @@ class AgentLoop:
     def _warn_on_unforwarded_multimodal(
         self, parts: tuple[ContentPart, ...], recorder: AgentRecorder
     ) -> None:
-        """Multimodal input is a contract-only surface for now: non-text parts are
-        accepted on submit() but not yet threaded to any provider. Emit a warning
-        naming the dropped part types and why, so the degradation is observable."""
+        """Emit a ``model.input.degraded`` warning for any non-text part that will NOT be
+        forwarded this run, so the degradation stays observable. A multimodal adapter
+        forwards the wire-forwardable types (see ``WIRE_FORWARDABLE_PART_TYPES``); a
+        text-only adapter forwards none."""
         dropped = non_text_part_types(parts)
         if not dropped:
             return
-        reason = "not_yet_forwarded" if getattr(self.model_adapter, "supports_multimodal", False) else "adapter_lacks_multimodal"
+        if getattr(self.model_adapter, "supports_multimodal", False):
+            unforwarded = [t for t in dropped if t not in WIRE_FORWARDABLE_PART_TYPES]
+            reason = "type_not_forwarded"
+        else:
+            unforwarded = dropped
+            reason = "adapter_lacks_multimodal"
+        if not unforwarded:
+            return
         recorder.emit(
             "model.input.degraded",
-            data={"dropped_part_types": dropped, "reason": reason},
+            data={"dropped_part_types": unforwarded, "reason": reason},
             level="warning",
         )
 
@@ -1438,15 +1457,22 @@ class AgentLoop:
             # (the first turn of this submit); later turns of the same submit carry
             # observations against the continuation handle.
             instruction: str | None = None
+            user_message: dict[str, Any] | None = None
             if state.pending_user_input is not None:
+                # ``instruction`` is the text projection used only by the by-reference
+                # fallback path (first turn / follow-up on a handle). ``user_message``
+                # is the durable by-value log entry: a plain string for all-text input,
+                # or a by-reference parts list when non-text parts are present, so an
+                # image survives in the log and across checkpoint/resume.
                 instruction = text_from_parts(state.pending_user_input) or None
+                user_message = user_message_from_parts(state.pending_user_input)
                 state.pending_user_input = None
             # Accumulate the by-value conversation log BEFORE the call: the new user
             # message (if any) and the tool/async observations being sent this turn. The
             # assistant reply is appended after the call. The system prompt is NOT logged
             # here — it is regenerated per turn and travels via ``system_prompt``.
-            if instruction is not None:
-                state.messages.append({"role": "user", "content": instruction})
+            if user_message is not None:
+                state.messages.append(user_message)
             for observation in state.pending_observations:
                 state.messages.append(_observation_message(observation))
             # Bound the by-value conversation log: a runaway multi-turn run must settle
@@ -1477,6 +1503,34 @@ class AgentLoop:
                     final_text=state.final_text,
                     error_code=delta_limit_code,
                 )
+            # By-value wire copy: the durable log stays by-reference; a multimodal adapter
+            # gets media resolved to wire blocks here (once per turn, not per retry). A
+            # text-only adapter receives the by-reference log and projects it to text.
+            wire_messages = tuple(state.messages)
+            if getattr(self.model_adapter, "supports_multimodal", False):
+                wire_messages = resolve_wire_messages(
+                    wire_messages,
+                    WorkspaceMediaResolver(res.workspace),
+                    encoding=getattr(self.model_adapter, "wire_image_encoding", "base64"),
+                )
+                self._emit_media_accounting(
+                    wire_messages, (runtime_config.model or ModelConfig()).model, recorder
+                )
+                # The resolved payload (inline base64) is the real size risk — the durable
+                # by-reference log stays tiny. Guard it separately so an oversized media turn
+                # settles ``limited`` instead of being sent.
+                wire_limit_code = self._wire_bytes_exceeded(wire_messages)
+                if wire_limit_code is not None:
+                    state.status = "limited"
+                    state.final_text = "Stopped after reaching the model request size limit."
+                    state.error_code = wire_limit_code
+                    state.pending_observations = ()
+                    return Suspension(
+                        reason="limited",
+                        status="limited",
+                        final_text=state.final_text,
+                        error_code=wire_limit_code,
+                    )
             request = ModelRequest(
                 instruction=instruction,
                 system_prompt=turn_system_prompt,
@@ -1484,7 +1538,7 @@ class AgentLoop:
                 previous_turn_handle=state.previous_turn_handle,
                 observations=state.pending_observations,
                 model=runtime_config.model or ModelConfig(),
-                messages=tuple(state.messages),
+                messages=wire_messages,
             )
             recorder.transcript(
                 {
@@ -1654,6 +1708,58 @@ class AgentLoop:
         if size > limits.max_message_log_bytes:
             return "message_log_bytes_exceeded"
         return None
+
+    def _wire_bytes_exceeded(self, wire_messages: tuple[dict[str, Any], ...]) -> str | None:
+        """Return ``"wire_bytes_exceeded"`` if the resolved per-turn wire payload (inline
+        base64 media included) outgrows ``max_message_log_bytes``, else ``None``. Distinct
+        from the durable by-reference log cap, which never carries bytes."""
+        size = sum(len(json.dumps(message, ensure_ascii=False)) for message in wire_messages)
+        if size > self.spec.limits.max_message_log_bytes:
+            return "wire_bytes_exceeded"
+        return None
+
+    def _emit_media_accounting(
+        self,
+        wire_messages: tuple[dict[str, Any], ...],
+        model: str | None,
+        recorder: AgentRecorder,
+    ) -> None:
+        """Emit per-turn media accounting: count resolved image blocks, estimate their input
+        tokens (28×28 patch formula, clamped to the model's native cap), and warn past the
+        >20-block cliff where providers enforce a stricter per-image dimension limit."""
+        cap = native_image_token_cap(model)
+        blocks = 0
+        estimated_tokens = 0
+        for message in wire_messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not (isinstance(part, dict) and part.get("type") in WIRE_FORWARDABLE_PART_TYPES):
+                    continue
+                blocks += 1
+                source = part.get("source") or {}
+                if source.get("type") != "base64":
+                    continue
+                try:
+                    raw = base64.b64decode(source.get("data") or "")
+                except (ValueError, TypeError):
+                    continue
+                dims = image_dimensions(raw, str(source.get("media_type") or ""))
+                if dims is not None:
+                    estimated_tokens += estimate_image_tokens(*dims, cap=cap)
+        if blocks == 0:
+            return
+        if blocks > MAX_FORWARDABLE_BLOCKS:
+            recorder.emit(
+                "model.input.degraded",
+                data={"reason": "image_block_count_cliff", "block_count": blocks},
+                level="warning",
+            )
+        recorder.emit(
+            "model.input.media",
+            data={"block_count": blocks, "estimated_image_tokens": estimated_tokens},
+        )
 
     def _workspace_delta_limit_exceeded(self, workspace: Workspace) -> str | None:
         """Return the limit error_code if the workspace delta a checkpoint would carry has

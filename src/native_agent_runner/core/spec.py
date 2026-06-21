@@ -10,6 +10,7 @@ from native_agent_runner.core.content import (
     TextPart,
     content_part_from_json,
     content_part_to_json,
+    non_text_part_types,
 )
 from native_agent_runner.permissions import PermissionPolicy
 
@@ -187,6 +188,23 @@ def input_to_parts(user_input: str | tuple[ContentPart, ...]) -> tuple[ContentPa
     if isinstance(user_input, str):
         return (TextPart(user_input),)
     return tuple(user_input)
+
+
+def user_message_from_parts(parts: tuple[ContentPart, ...]) -> dict[str, Any] | None:
+    """Build the durable by-value user message for ``parts``.
+
+    All-text input keeps the legacy ``{"role": "user", "content": <str>}`` shape (and
+    returns ``None`` when the text is empty, so an empty turn is not logged). When any
+    non-text part is present, the message carries the parts **by reference** as a list of
+    ``content_part_to_json`` dicts — lossless and JSON-round-trippable, so it survives
+    checkpoint/resume. Resolution to bytes happens later, at wire-build time.
+    """
+    if non_text_part_types(parts):
+        return {"role": "user", "content": [content_part_to_json(part) for part in parts]}
+    text = text_from_parts(parts)
+    if not text:
+        return None
+    return {"role": "user", "content": text}
 
 
 @dataclass(frozen=True)
