@@ -112,7 +112,8 @@ def _user_content_items(content: list[Any]) -> list[dict[str, Any]]:
     """Map resolved by-value user parts to OpenAI Responses content items.
 
     ``content`` holds text part-dicts and neutral base64 media blocks (produced by the
-    loop's wire-build). A base64 image becomes an ``input_image`` data-URL.
+    loop's wire-build). A base64 image becomes an ``input_image`` data-URL; a base64 document
+    becomes an ``input_file`` with a filename.
     """
     items: list[dict[str, Any]] = []
     for part in content:
@@ -125,6 +126,17 @@ def _user_content_items(content: list[Any]) -> list[dict[str, Any]]:
             if source.get("type") == "base64":
                 data_url = f"data:{source.get('media_type')};base64,{source.get('data')}"
                 items.append({"type": "input_image", "image_url": data_url})
+        elif part.get("type") == "document":
+            source = part.get("source") or {}
+            if source.get("type") == "base64":
+                data_url = f"data:{source.get('media_type')};base64,{source.get('data')}"
+                items.append(
+                    {
+                        "type": "input_file",
+                        "filename": str(part.get("filename") or "document.pdf"),
+                        "file_data": data_url,
+                    }
+                )
     return items
 
 

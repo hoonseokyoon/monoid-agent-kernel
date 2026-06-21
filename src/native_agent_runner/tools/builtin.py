@@ -3,7 +3,7 @@ from __future__ import annotations
 import fnmatch
 from typing import Any
 
-from native_agent_runner.core.content import ImagePart
+from native_agent_runner.core.content import DocumentPart, ImagePart
 from native_agent_runner.core.media import MEDIA_INPUT_CAPABILITY
 from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.errors import WorkspaceError
@@ -222,8 +222,8 @@ def _fs_read(workspace: Workspace) -> ToolSpec:
     )
 
 
-def _sniff_image_mime(data: bytes) -> str | None:
-    """Identify an image by magic bytes (not extension — avoids mislabel-driven 400s)."""
+def _sniff_media_mime(data: bytes) -> str | None:
+    """Identify an image or PDF by magic bytes (not extension — avoids mislabel-driven 400s)."""
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     if data[:3] == b"\xff\xd8\xff":
@@ -232,6 +232,8 @@ def _sniff_image_mime(data: bytes) -> str | None:
         return "image/gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
+    if data[:5] == b"%PDF-":
+        return "application/pdf"
     return None
 
 
@@ -240,21 +242,26 @@ def _fs_read_media(workspace: Workspace) -> ToolSpec:
         path = str(args["path"])
         max_bytes = int(args.get("max_bytes", workspace.max_bytes_read))
         data, digest = workspace.read_bytes(path, max_bytes=max_bytes)
-        mime = _sniff_image_mime(data)
+        mime = _sniff_media_mime(data)
         if mime is None:
-            raise WorkspaceError(f"not a supported image file: {path}")
+            raise WorkspaceError(f"not a supported image or PDF file: {path}")
         normalized = workspace.normalize(path)
-        # Image travels by reference (source_ref); the runner resolves + forwards it so the
+        # Media travels by reference (source_ref); the runner resolves + forwards it so the
         # model can view it. The text content carries metadata only.
+        part: ImagePart | DocumentPart = (
+            DocumentPart(source_ref=normalized, mime_type=mime)
+            if mime == "application/pdf"
+            else ImagePart(source_ref=normalized, mime_type=mime)
+        )
         return ToolResult(
             ok=True,
             content={"path": normalized, "mime_type": mime, "sha256": digest, "size": len(data)},
-            media=(ImagePart(source_ref=normalized, mime_type=mime),),
+            media=(part,),
         )
 
     return ToolSpec(
         id="fs.read_media",
-        description="Read an image file (PNG/JPEG/GIF/WebP) from the workspace so the model can view it.",
+        description="Read an image (PNG/JPEG/GIF/WebP) or PDF file from the workspace so the model can view it.",
         input_schema=_object_schema(
             {
                 "path": {"type": "string"},

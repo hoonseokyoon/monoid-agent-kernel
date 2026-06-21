@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from conftest import runtime_config, runtime_provider
 
-from native_agent_runner.core.content import ImagePart, TextPart
+from native_agent_runner.core.content import AudioPart, DocumentPart, ImagePart, TextPart
 from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from native_agent_runner.errors import WorkspaceError
 from native_agent_runner.loop import AgentLoop
@@ -23,6 +23,9 @@ from native_agent_runner.tools.builtin import builtin_tools
 from native_agent_runner.workspace.local import LocalWorkspaceBackend
 
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+# Includes a NUL byte (as real PDFs do in stream data) so fs.read rejects it as non-text,
+# while the leading "%PDF-" magic still identifies it.
+_PDF_BYTES = b"%PDF-1.4\n1 0 obj<<>>stream\n\x00\x01\x02binary\nendstream\n%%EOF\n"
 
 
 def _workspace_with_image(tmp_path: Path) -> Path:
@@ -30,6 +33,21 @@ def _workspace_with_image(tmp_path: Path) -> Path:
     workspace.mkdir()
     workspace.joinpath("img.png").write_bytes(_PNG_BYTES)
     return workspace
+
+
+def _workspace_with_pdf(tmp_path: Path) -> Path:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace.joinpath("doc.pdf").write_bytes(_PDF_BYTES)
+    return workspace
+
+
+def _events(result) -> list:
+    return [
+        json.loads(line)
+        for line in result.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def _finish_turn() -> ModelTurn:
@@ -299,3 +317,137 @@ def test_gateway_payload_forwards_image_block_verbatim() -> None:
     payload = adapter._payload(request)
 
     assert payload["messages"][0]["content"] == [{"type": "text", "text": "hi"}, block]
+
+
+# ---- P6a/P6c: documents (PDF) ------------------------------------------------------
+
+def test_document_input_forwarded(tmp_path: Path) -> None:
+    """A user-submitted PDF reaches the wire as a base64 document block (+ filename); no degrade."""
+    workspace = _workspace_with_pdf(tmp_path)
+    adapter = FakeMultimodalModelAdapter(turns=[_finish_turn()])
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    ).run_once((TextPart("summarize"), DocumentPart(source_ref="doc.pdf", mime_type="application/pdf")))
+
+    user = [m for m in adapter.requests[0].messages if m["role"] == "user"][0]
+    blocks = [p for p in user["content"] if p.get("type") == "document"]
+    assert len(blocks) == 1
+    source = blocks[0]["source"]
+    assert source["type"] == "base64"
+    assert source["media_type"] == "application/pdf"
+    assert base64.b64decode(source["data"]) == _PDF_BYTES
+    assert blocks[0]["filename"] == "doc.pdf"
+    assert not [e for e in _events(result) if e["type"] == "model.input.degraded"]
+
+
+def test_openai_maps_document_to_input_file() -> None:
+    """A neutral base64 document block becomes a Responses input_file with a filename."""
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "see"},
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "QUJD"},
+                "filename": "report.pdf",
+            },
+        ],
+    }
+
+    items = _message_to_input_items(message)
+
+    content = items[0]["content"]
+    assert {
+        "type": "input_file",
+        "filename": "report.pdf",
+        "file_data": "data:application/pdf;base64,QUJD",
+    } in content
+
+
+def test_fs_read_media_returns_document_part_for_pdf(tmp_path: Path) -> None:
+    workspace = LocalWorkspaceBackend(_workspace_with_pdf(tmp_path))
+    tools = {tool.id: tool for tool in builtin_tools(workspace)}
+
+    result = tools["fs.read_media"].handler(None, {"path": "doc.pdf"})  # type: ignore[arg-type]
+    assert result.ok
+    assert len(result.media) == 1
+    assert isinstance(result.media[0], DocumentPart)
+    assert result.media[0].mime_type == "application/pdf"
+    assert result.content["mime_type"] == "application/pdf"
+
+    with pytest.raises(WorkspaceError):
+        tools["fs.read"].handler(None, {"path": "doc.pdf"})  # type: ignore[arg-type]
+
+
+def test_tool_result_document_forwarded(tmp_path: Path) -> None:
+    """P6c: a tool returning a PDF (fs.read_media) reaches the wire as a resolved document block."""
+    workspace = _workspace_with_pdf(tmp_path)
+    adapter = FakeMultimodalModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_read_media", {"path": "doc.pdf"}, "c1"),),
+            ),
+            _finish_turn(),
+        ]
+    )
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("fs.read_media", "run.finish")),
+    ).run_once("read the pdf")
+
+    tool_messages = [
+        m for req in adapter.requests for m in req.messages if m.get("role") == "tool" and m.get("media")
+    ]
+    assert tool_messages, "expected a tool message carrying resolved media"
+    block = tool_messages[0]["media"][0]
+    assert block["type"] == "document"
+    assert base64.b64decode(block["source"]["data"]) == _PDF_BYTES
+
+
+def test_document_degrades_on_text_only_adapter(tmp_path: Path) -> None:
+    workspace = _workspace_with_pdf(tmp_path)
+    adapter = FakeModelAdapter(turns=[_finish_turn()])
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    ).run_once((TextPart("x"), DocumentPart(source_ref="doc.pdf", mime_type="application/pdf")))
+
+    degraded = [e for e in _events(result) if e["type"] == "model.input.degraded"]
+    assert len(degraded) == 1
+    assert degraded[0]["data"]["reason"] == "adapter_lacks_multimodal"
+    assert degraded[0]["data"]["dropped_part_types"] == ["document"]
+
+
+def test_audio_degrades_even_on_multimodal_adapter(tmp_path: Path) -> None:
+    """P6b: audio/video round-trip but are not forwarded — a multimodal adapter still degrades
+    them (reason ``type_not_forwarded``) and they never reach the wire."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace.joinpath("clip.mp3").write_bytes(b"ID3\x03\x00fake-audio")
+    adapter = FakeMultimodalModelAdapter(turns=[_finish_turn()])
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    ).run_once((TextPart("describe"), AudioPart(source_ref="clip.mp3", mime_type="audio/mpeg")))
+
+    degraded = [e for e in _events(result) if e["type"] == "model.input.degraded"]
+    assert len(degraded) == 1
+    assert degraded[0]["data"]["reason"] == "type_not_forwarded"
+    assert degraded[0]["data"]["dropped_part_types"] == ["audio"]
+    # The audio part is dropped from the wire; only text reaches the model.
+    user = [m for m in adapter.requests[0].messages if m["role"] == "user"][0]
+    assert all(p.get("type") != "audio" for p in user["content"] if isinstance(p, dict))
