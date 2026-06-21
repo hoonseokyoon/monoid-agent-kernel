@@ -1,12 +1,12 @@
 """Provider-neutral content parts for multimodal input.
 
-This module defines the stable input shape for multimodal work. Only
-``TextPart`` is forwarded to a model today. ``ImagePart`` and ``DocumentPart``
-are accepted and round-trip through JSON; when non-text parts are present, the
-loop emits a ``model.input.degraded`` warning and proceeds with text only.
-
-Deferred (explicit follow-up): threading parts into ``ModelRequest``, provider
-multimodal payload mapping, and ``fs.read`` extraction of non-text files.
+This module defines the stable input shape for multimodal work. ``TextPart``,
+``ImagePart`` and ``DocumentPart`` are forwarded to models that support it (the
+loop resolves them to provider blocks). ``AudioPart`` and ``VideoPart`` round-trip
+through JSON and survive checkpoints, but are not yet forwarded — the loop emits a
+``model.input.degraded`` warning for any part type it cannot forward and proceeds
+with the rest. Audio/video forwarding is provider-thin (Gemini-native) and left to a
+later adapter; the contract here keeps them first-class so an integrator can carry them.
 """
 
 from __future__ import annotations
@@ -39,7 +39,25 @@ class DocumentPart:
     type: Literal["document"] = "document"
 
 
-ContentPart = TextPart | ImagePart | DocumentPart
+@dataclass(frozen=True)
+class AudioPart:
+    """Contract-only: a reference to audio input. Round-trips but not yet forwarded."""
+
+    source_ref: str
+    mime_type: str
+    type: Literal["audio"] = "audio"
+
+
+@dataclass(frozen=True)
+class VideoPart:
+    """Contract-only: a reference to video input. Round-trips but not yet forwarded."""
+
+    source_ref: str
+    mime_type: str
+    type: Literal["video"] = "video"
+
+
+ContentPart = TextPart | ImagePart | DocumentPart | AudioPart | VideoPart
 
 
 def non_text_part_types(parts: tuple[ContentPart, ...]) -> list[str]:
@@ -59,6 +77,10 @@ def content_part_to_json(part: ContentPart) -> dict[str, Any]:
         return {"type": "image", "source_ref": part.source_ref, "mime_type": part.mime_type}
     if isinstance(part, DocumentPart):
         return {"type": "document", "source_ref": part.source_ref, "mime_type": part.mime_type}
+    if isinstance(part, AudioPart):
+        return {"type": "audio", "source_ref": part.source_ref, "mime_type": part.mime_type}
+    if isinstance(part, VideoPart):
+        return {"type": "video", "source_ref": part.source_ref, "mime_type": part.mime_type}
     raise ValueError(f"unsupported content part: {part!r}")
 
 
@@ -70,4 +92,8 @@ def content_part_from_json(payload: dict[str, Any]) -> ContentPart:
         return ImagePart(source_ref=str(payload["source_ref"]), mime_type=str(payload["mime_type"]))
     if kind == "document":
         return DocumentPart(source_ref=str(payload["source_ref"]), mime_type=str(payload["mime_type"]))
+    if kind == "audio":
+        return AudioPart(source_ref=str(payload["source_ref"]), mime_type=str(payload["mime_type"]))
+    if kind == "video":
+        return VideoPart(source_ref=str(payload["source_ref"]), mime_type=str(payload["mime_type"]))
     raise ValueError(f"unknown content part type: {kind!r}")

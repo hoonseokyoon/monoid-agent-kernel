@@ -8,9 +8,11 @@ import pytest
 from conftest import runtime_config, runtime_provider
 
 from native_agent_runner.core.content import (
+    AudioPart,
     DocumentPart,
     ImagePart,
     TextPart,
+    VideoPart,
     content_part_from_json,
     content_part_to_json,
     non_text_part_types,
@@ -32,6 +34,8 @@ def _provider():
         TextPart("hello"),
         ImagePart(source_ref="img.png", mime_type="image/png"),
         DocumentPart(source_ref="doc.pdf", mime_type="application/pdf"),
+        AudioPart(source_ref="clip.mp3", mime_type="audio/mpeg"),
+        VideoPart(source_ref="clip.mp4", mime_type="video/mp4"),
     ],
 )
 def test_content_part_codec_round_trip(part) -> None:
@@ -40,7 +44,7 @@ def test_content_part_codec_round_trip(part) -> None:
 
 def test_unknown_part_type_rejected() -> None:
     with pytest.raises(ValueError, match="unknown content part type"):
-        content_part_from_json({"type": "video", "source_ref": "x"})
+        content_part_from_json({"type": "hologram", "source_ref": "x"})
 
 
 def test_effective_input_synthesizes_text_from_instruction() -> None:

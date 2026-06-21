@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from conftest import runtime_config, runtime_provider
 
-from native_agent_runner.core.content import DocumentPart, ImagePart, TextPart
+from native_agent_runner.core.content import AudioPart, DocumentPart, ImagePart, TextPart
 from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from native_agent_runner.errors import WorkspaceError
 from native_agent_runner.loop import AgentLoop
@@ -427,3 +427,27 @@ def test_document_degrades_on_text_only_adapter(tmp_path: Path) -> None:
     assert len(degraded) == 1
     assert degraded[0]["data"]["reason"] == "adapter_lacks_multimodal"
     assert degraded[0]["data"]["dropped_part_types"] == ["document"]
+
+
+def test_audio_degrades_even_on_multimodal_adapter(tmp_path: Path) -> None:
+    """P6b: audio/video round-trip but are not forwarded — a multimodal adapter still degrades
+    them (reason ``type_not_forwarded``) and they never reach the wire."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace.joinpath("clip.mp3").write_bytes(b"ID3\x03\x00fake-audio")
+    adapter = FakeMultimodalModelAdapter(turns=[_finish_turn()])
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    ).run_once((TextPart("describe"), AudioPart(source_ref="clip.mp3", mime_type="audio/mpeg")))
+
+    degraded = [e for e in _events(result) if e["type"] == "model.input.degraded"]
+    assert len(degraded) == 1
+    assert degraded[0]["data"]["reason"] == "type_not_forwarded"
+    assert degraded[0]["data"]["dropped_part_types"] == ["audio"]
+    # The audio part is dropped from the wire; only text reaches the model.
+    user = [m for m in adapter.requests[0].messages if m["role"] == "user"][0]
+    assert all(p.get("type") != "audio" for p in user["content"] if isinstance(p, dict))
