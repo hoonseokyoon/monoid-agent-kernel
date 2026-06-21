@@ -78,6 +78,9 @@ class ToolContext(Protocol):
     def request_human_input(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def spawn_subagent(self, args: dict[str, Any]) -> dict[str, Any]:
+        ...
+
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 

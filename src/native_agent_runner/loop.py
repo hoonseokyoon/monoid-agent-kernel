@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import inspect
 import json
 import threading
@@ -44,7 +45,11 @@ from native_agent_runner.core.agents import (
     AgentRuntimeConfig,
     BoundTool,
     BoundToolCatalog,
+    PromptSpec,
     RuntimeConfigSource,
+    SubagentDefinition,
+    ToolBinding,
+    ToolSearchConfig,
     coerce_runtime_config_provider,
     compile_bound_tool_catalog,
     runtime_config_diff,
@@ -82,7 +87,12 @@ from native_agent_runner.errors import (
     ToolExecutionError,
     error_code_for_exception,
 )
-from native_agent_runner.tasks import HostedTask, TaskManager
+from native_agent_runner.tasks import (
+    HostedResultInjector,
+    HostedTask,
+    SubagentTaskExecutor,
+    TaskManager,
+)
 from native_agent_runner.permissions import PermissionPolicy, matches_path_patterns
 from native_agent_runner.providers.base import (
     ModelAdapter,
@@ -113,10 +123,18 @@ from native_agent_runner.tools.base import (
     ToolResult,
     ToolSpec,
 )
-from native_agent_runner.tools.builtin import builtin_tools
+from native_agent_runner.tools.builtin import agent_spawn_tool, builtin_tools
 from native_agent_runner.web import WebGatewayClient, domain_allowed, domain_from_url
 from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.workspace.local import default_local_workspace_factory
+
+
+def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
+    """True if a tool binding matches any fnmatch pattern. Matched against the binding's
+    tool id, binding id, and model name, so subagent allow/deny lists accept ids
+    (``fs.read``), patterns (``mcp.*``, ``mcp.github.*``), or ``*`` for all."""
+    candidates = (binding.ref.tool_id, binding.binding_id, binding.model_name or "")
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name)
 
 
 def _failure_result(exc: Exception, *, error_code: str | None = None) -> ToolResult:
@@ -157,6 +175,15 @@ class AgentToolContext(ToolContext):
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     tool_search_entries: tuple[ToolSearchEntry, ...] = ()
     tool_search_max_results: int = 5
+    # Depth of this run in the subagent tree (0 = top-level). Threaded into spawned
+    # children as ``depth`` so the executor can enforce the nesting cap.
+    subagent_depth: int = 0
+    # Report-only roll-up of delegated work: how many subagents this run spawned and their
+    # combined token usage. Kept SEPARATE from total_usage on purpose — total_usage also
+    # tracks this run's remaining context budget, which a child's isolated tokens must not
+    # inflate. Surfaced in the run metrics for cost visibility.
+    subagent_count: int = 0
+    subagent_usage: dict[str, int] = field(default_factory=dict)
     _requested_tool_loads: list[str] = field(default_factory=list)
     _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
 
@@ -231,6 +258,32 @@ class AgentToolContext(ToolContext):
             },
         )
         return task.started_content(self.recorder.run_dir)
+
+    def spawn_subagent(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Delegate to a child run via the ``subagent`` task kind. Foreground spawns
+        block here on ``TaskManager.wait`` and return the child's final message;
+        background spawns return ``started`` content and the result is injected later
+        through the reentry queue (see ``SubagentTaskExecutor``)."""
+        background = bool(args.get("background", False))
+        call = self._current_call
+        task = self.job_manager.start_task(
+            "subagent",
+            {
+                "definition_id": str(args.get("subagent_type") or ""),
+                "prompt": str(args.get("prompt") or ""),
+                "depth": self.subagent_depth,
+                "background": background,
+                "resume_on_exit": background,
+                "created_by": "model",
+                # Correlation so subagent.* events nest under this spawn tool call.
+                "parent_event_id": call.tool_event_id,
+                "turn_id": call.turn_id,
+            },
+        )
+        if background:
+            content = task.started_content(self.recorder.run_dir)
+            return {"spawned": True, "background": True, **content}
+        return self.job_manager.wait(task.job_id)
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.web_service.search(args, self._current_call)
@@ -373,6 +426,13 @@ class AgentLoop:
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
     context_providers: tuple[ContextProvider, ...] = ()
     inject_workspace_index: bool = False
+    # Agent-as-tool delegation: a map of subagent id -> SubagentDefinition. When non-empty
+    # the bootstrap registers the ``agent.spawn`` tool and the ``subagent`` task executor; a
+    # runtime config still needs an explicit binding to ``agent.spawn`` to expose the tool.
+    # A child inherits the parent's tools/model/mode/limits by default (the definition can
+    # narrow them); inherited by spawned children so they can delegate further (bounded by
+    # RunLimits.max_subagent_depth).
+    subagent_definitions: Mapping[str, SubagentDefinition] = field(default_factory=dict)
     # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
     # Defaults to a local-fs store under the run root; a backend injects a durable one.
     checkpoint_store: CheckpointStore | None = None
@@ -651,12 +711,22 @@ class AgentLoop:
         finally:
             self._maybe_close_loop()
 
-    async def arun_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
-        """Async form of :meth:`run_once`."""
+    async def arun_once(
+        self,
+        user_input: str | tuple[ContentPart, ...],
+        *,
+        seed_messages: tuple[dict[str, Any], ...] | None = None,
+    ) -> AgentRunResult:
+        """Async form of :meth:`run_once`. ``seed_messages`` pre-loads the by-value
+        conversation log before the first turn — used by a ``context: fork`` subagent to
+        inherit the parent's conversation snapshot (the system prompt is regenerated from
+        this run's own config, so a fork sees the history but applies its own directive)."""
         self.open()
         try:
             session = self._require_open()
             if not session.terminal:
+                if seed_messages:
+                    session.state.messages = [dict(message) for message in seed_messages]
                 await self.asubmit(user_input)
         finally:
             result = self.close()
@@ -1118,6 +1188,197 @@ class AgentLoop:
             raise NativeAgentError("run is not open; call open() first", error_code="run_not_open")
         return self._session
 
+    def _install_subagent_capability(
+        self,
+        registry: ToolRegistry,
+        context: AgentToolContext,
+        job_manager: TaskManager,
+    ) -> None:
+        """Register the ``agent.spawn`` tool and the ``subagent`` task executor/injector
+        for a run that carries ``subagent_definitions``. Called from bootstrap only when
+        definitions are present; the runtime config still needs an explicit binding to
+        ``agent.spawn`` for the tool to reach the model."""
+        catalog = {
+            sub_id: definition.description
+            for sub_id, definition in self.subagent_definitions.items()
+        }
+        registry.register(agent_spawn_tool(catalog))
+        context.subagent_depth = int(self.spec.metadata.get("subagent_depth", 0) or 0)
+        job_manager.executors["subagent"] = SubagentTaskExecutor(
+            run_child=self._run_subagent_child,
+            definition_ids=tuple(self.subagent_definitions.keys()),
+            max_depth=self.spec.limits.max_subagent_depth,
+            max_subagents=self.spec.limits.max_subagents,
+        )
+        job_manager.injectors["subagent"] = HostedResultInjector(
+            kind="subagent",
+            tool_name="agent_spawn",
+            result_type="subagent_result",
+            as_user_message=True,
+        )
+
+    async def _run_subagent_child(self, manager: TaskManager, task: HostedTask) -> None:
+        """Run one isolated child run for a ``subagent`` task and record its result on
+        the task. Builds a fresh child ``AgentLoop`` (isolated overlay workspace, shared
+        adapter/sinks/checkpoint store, depth+1) and stores the child's final message;
+        ``SubagentTaskExecutor._arun`` then publishes it through the reentry pipe."""
+        recorder = manager.recorder
+        definition_id = str(task.request.get("definition_id") or "")
+        depth = int(task.request.get("depth", 0) or 0)
+        background = bool(task.request.get("background", False))
+        parent_event_id = task.request.get("parent_event_id")
+        turn_id = task.request.get("turn_id")
+        definition = self.subagent_definitions[definition_id]
+        parent_config = self.runtime_config_provider.current_config(self.spec.run_id)
+        is_fork = definition.context == "fork"
+        child_run_id = f"{self.spec.run_id}.sub.{task.job_id}"
+        child_depth = depth + 1
+        # At the depth cap the child must not delegate further: the resolver drops any
+        # agent.spawn binding and we give it no definitions, so the tool is simply absent
+        # rather than erroring at call time.
+        at_max_depth = child_depth >= self.spec.limits.max_subagent_depth
+        child_config = self._resolve_child_config(
+            definition,
+            parent_config,
+            definition_id=definition_id,
+            at_max_depth=at_max_depth,
+            fork=is_fork,
+        )
+        child_definitions: Mapping[str, SubagentDefinition] = (
+            {} if at_max_depth else self.subagent_definitions
+        )
+        # A fork inherits the parent's conversation snapshot; a fresh subagent starts empty.
+        # mode/limits: a fork inherits the parent's outright; a fresh subagent may narrow them.
+        seed_messages: tuple[dict[str, Any], ...] | None = None
+        if is_fork and self._session is not None:
+            seed_messages = tuple(dict(message) for message in self._session.state.messages)
+        # Correlate the delegation on the PARENT's event stream (the child records to its
+        # own run dir; stateful sinks like OTel/StatusJson are NOT shared to avoid clobber).
+        started = recorder.emit(
+            "subagent.started",
+            turn_id=turn_id,
+            parent_id=parent_event_id,
+            data={
+                "subagent_type": definition_id,
+                "child_run_id": child_run_id,
+                "depth": child_depth,
+                "background": background,
+            },
+        )
+        child_spec = AgentRunSpec(
+            workspace_root=self.spec.workspace_root,
+            run_root=self.spec.run_root,
+            run_id=child_run_id,
+            # mode/limits inherit the parent's unless the definition narrows them.
+            mode=self.spec.mode if is_fork else (definition.mode or self.spec.mode),
+            workspace_backend="overlay",
+            limits=self.spec.limits if is_fork else (definition.limits or self.spec.limits),
+            permission_policy=self.spec.permission_policy,
+            metadata={
+                "parent_run_id": self.spec.run_id,
+                "parent_task_id": task.job_id,
+                "subagent_definition_id": definition_id,
+                "subagent_depth": child_depth,
+            },
+        )
+        child = AgentLoop(
+            spec=child_spec,
+            model_adapter=self.model_adapter,
+            runtime_config_provider=child_config,
+            # Inherit the parent's tool providers so MCP/custom tools are in the child's
+            # registry (the inherited bindings reference them).
+            tool_providers=self.tool_providers,
+            dynamic_tool_providers=self.dynamic_tool_providers,
+            permission_policy=self.spec.permission_policy,
+            cancellation_token=self.cancellation_token,
+            shell_approval_provider=self.shell_approval_provider,
+            web_gateway_client=self.web_gateway_client,
+            workspace_factory=self.workspace_factory,
+            checkpoint_store=self.checkpoint_store,
+            subagent_definitions=child_definitions,
+            status_file=False,
+        )
+        result = await child.arun_once(task.prompt, seed_messages=seed_messages)
+        usage = {
+            key: result.metrics[key]
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+            if isinstance(result.metrics, dict) and key in result.metrics
+        }
+        # Report-only roll-up onto the parent context (NOT total_usage; see field comment).
+        if self._session is not None:
+            parent_ctx = self._session.res.context
+            parent_ctx.subagent_count += 1
+            for key, value in usage.items():
+                parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + int(value)
+        task.result = {
+            "type": "subagent_result",
+            "task_id": task.job_id,
+            "subagent_type": definition_id,
+            "child_run_id": child_run_id,
+            "status": result.status,
+            "message": result.final_text,
+            "answer": result.final_text,
+            "final_text": result.final_text,
+            "error": result.error,
+            "usage": usage,
+        }
+        if result.status == "failed":
+            task.status = "failed"
+        recorder.emit(
+            "subagent.finished" if result.status != "failed" else "subagent.failed",
+            turn_id=turn_id,
+            parent_id=started.event_id,
+            level="error" if result.status == "failed" else "info",
+            data={
+                "subagent_type": definition_id,
+                "child_run_id": child_run_id,
+                "status": result.status,
+                "usage": usage,
+                "error": result.error,
+                "error_code": result.error_code,
+            },
+        )
+
+    def _resolve_child_config(
+        self,
+        definition: SubagentDefinition,
+        parent_config: AgentRuntimeConfig | None,
+        *,
+        definition_id: str,
+        at_max_depth: bool,
+        fork: bool = False,
+    ) -> AgentRuntimeConfig:
+        """Derive a child's runtime config from the parent's, Claude-style: the child
+        inherits the parent's tool bindings (so it can never exceed the parent), then the
+        definition's ``tools`` allowlist and ``disallowed_tools`` denylist filter them
+        (deny wins). ``model``/``tool_search`` inherit unless the definition overrides. At
+        the depth cap the ``agent.spawn`` binding is dropped so the child cannot delegate.
+
+        A ``fork`` inherits the parent FULLY — prompt, tools, model, tool_search — and the
+        definition's own prompt/tools/model are ignored ("continue as me in a branch")."""
+        parent_bindings: tuple[ToolBinding, ...] = parent_config.tools if parent_config else ()
+        parent_model = parent_config.model if parent_config else None
+        parent_search = parent_config.tool_search if parent_config else ToolSearchConfig()
+        parent_prompt = parent_config.prompt if parent_config else PromptSpec()
+        if fork:
+            bindings = list(parent_bindings)
+        elif definition.tools is None:
+            bindings = list(parent_bindings)
+        else:
+            bindings = [b for b in parent_bindings if _binding_matches(b, definition.tools)]
+        if not fork and definition.disallowed_tools:
+            bindings = [b for b in bindings if not _binding_matches(b, definition.disallowed_tools)]
+        if at_max_depth:
+            bindings = [b for b in bindings if b.ref.tool_id != "agent.spawn"]
+        return AgentRuntimeConfig(
+            definition_id=definition_id,
+            model=parent_model if fork else (definition.model or parent_model),
+            prompt=parent_prompt if fork else definition.prompt,
+            tools=tuple(bindings),
+            tool_search=parent_search if fork else (definition.tool_search or parent_search),
+            metadata=dict(definition.metadata),
+        )
+
     def _bootstrap(self) -> _RunResources:
         if self.permission_policy == PermissionPolicy() and self.spec.permission_policy != PermissionPolicy():
             self.permission_policy = self.spec.permission_policy
@@ -1166,6 +1427,8 @@ class AgentLoop:
         base_registry.register_many(builtin_tools(workspace))
         for provider in self.tool_providers:
             base_registry.register_many(provider.get_tools(context))
+        if self.subagent_definitions:
+            self._install_subagent_capability(base_registry, context, job_manager)
 
         started = time.time()
         deadline = (
@@ -1857,6 +2120,9 @@ class AgentLoop:
             **context.web_service.metrics(),
             **state.total_usage,
         }
+        if context.subagent_count:
+            metrics["subagent_count"] = context.subagent_count
+            metrics["subagent_usage"] = dict(context.subagent_usage)
         if state.provider_error_code:
             metrics["provider_error_code"] = state.provider_error_code
         if state.provider_http_status is not None:

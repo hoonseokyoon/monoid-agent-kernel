@@ -44,6 +44,7 @@ from native_agent_runner.core.agents import (
     RuntimeConfigProvider,
     RuntimeConfigSource,
     StaticRuntimeConfigProvider,
+    SubagentDefinition,
     ToolBinding,
     ToolSearchConfig,
     coerce_runtime_config_provider,
@@ -116,9 +117,15 @@ from native_agent_runner.web import WebGatewayClient
 # Async task seams (executor/injector/reporter the backend plugs in)
 from native_agent_runner.tasks import (
     ResultInjector,
+    SubagentTaskExecutor,
     TaskExecutor,
     TaskReporter,
 )
+
+# Subagent (agent-as-tool) delegation tool + file discovery
+from native_agent_runner.core.frontmatter import parse_frontmatter
+from native_agent_runner.subagent_loader import load_subagent_definitions
+from native_agent_runner.tools.builtin import agent_spawn_tool
 
 __all__ = [
     # engine entry / result
@@ -206,4 +213,10 @@ __all__ = [
     "TaskExecutor",
     "ResultInjector",
     "TaskReporter",
+    # subagent (agent-as-tool) delegation
+    "SubagentDefinition",
+    "SubagentTaskExecutor",
+    "agent_spawn_tool",
+    "load_subagent_definitions",
+    "parse_frontmatter",
 ]

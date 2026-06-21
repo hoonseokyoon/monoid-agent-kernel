@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -687,6 +688,114 @@ class HostedResultInjector:
                 is_background=self.as_user_message,
             )
         ]
+
+
+@dataclass
+class SubagentTaskExecutor:
+    """In-process executor for agent-as-tool delegation. Registers a parked
+    ``HostedTask`` and schedules ``run_child`` (a closure built by the parent
+    ``AgentLoop`` that runs an isolated child run) on the always-on job loop. On
+    completion the coroutine sets the task's status/result and publishes it through
+    ``TaskManager.mark_ready`` — the same reentry pipe shell/hosted tasks use.
+
+    Foreground spawns pass ``resume_on_exit=False`` and the tool handler blocks on
+    ``TaskManager.wait`` to read the child's final message directly; background
+    spawns pass ``resume_on_exit=True`` and the result is injected later as a user
+    message via ``HostedResultInjector`` (the reentry queue drains many at once, so
+    several background subagents run concurrently for free)."""
+
+    run_child: Callable[[TaskManager, HostedTask], Awaitable[None]]
+    definition_ids: tuple[str, ...] = ()
+    max_depth: int = 5
+    max_subagents: int = 8
+    kind: str = "subagent"
+    in_process: bool = True
+
+    def start(
+        self,
+        manager: TaskManager,
+        *,
+        definition_id: str = "",
+        prompt: str = "",
+        depth: int = 0,
+        background: bool = False,
+        resume_on_exit: bool | None = None,
+        created_by: str = "model",
+        **request: Any,
+    ) -> HostedTask:
+        if not definition_id:
+            raise ToolExecutionError(
+                "subagent definition_id is required", error_code="subagent_invalid"
+            )
+        if self.definition_ids and definition_id not in self.definition_ids:
+            raise ToolExecutionError(
+                f"unknown subagent: {definition_id}", error_code="subagent_unknown"
+            )
+        if depth >= self.max_depth:
+            raise ToolExecutionError(
+                f"subagent depth cap reached (max {self.max_depth})",
+                error_code="subagent_depth_exceeded",
+            )
+        active = sum(1 for job in manager.jobs.values() if job.kind == self.kind)
+        if self.max_subagents and active >= self.max_subagents:
+            raise ToolExecutionError(
+                f"subagent fan-out cap reached (max {self.max_subagents})",
+                error_code="subagent_fanout_exceeded",
+            )
+        resume = bool(background) if resume_on_exit is None else bool(resume_on_exit)
+        task_id = f"task_{uuid.uuid4().hex[:12]}"
+        task_dir = manager.recorder.artifacts_dir / "tasks" / task_id
+        task_dir.mkdir(parents=True, exist_ok=False)
+        task = HostedTask(
+            job_id=task_id,
+            kind=self.kind,
+            prompt=str(prompt),
+            status="running",
+            started_at=time.time(),
+            resume_on_exit=resume,
+            request={
+                "definition_id": definition_id,
+                "depth": int(depth),
+                "background": bool(background),
+                **request,
+            },
+            created_by=created_by,
+            job_path=task_dir / "task.json",
+            cancel_path=task_dir / "cancel.requested",
+        )
+        manager._register(task)
+        manager.recorder.emit("task.started", data=manager._public_job_payload(task))
+        # Run the child on the always-on job loop; the worker thread that called
+        # start() (a tool handler offloaded via to_thread) is free to block on
+        # wait() for a foreground spawn without stalling the loop.
+        manager.schedule_job_coroutine(self._arun(manager, task))
+        return task
+
+    async def _arun(self, manager: TaskManager, task: HostedTask) -> None:
+        try:
+            await self.run_child(manager, task)
+            if task.status == "running":
+                task.status = "answered"
+        except Exception as exc:  # noqa: BLE001 - surface as a failed subagent result
+            task.status = "failed"
+            task.error = str(exc)
+            if task.result is None:
+                task.result = {
+                    "type": "subagent_result",
+                    "task_id": task.job_id,
+                    "status": "failed",
+                    "error": str(exc),
+                    "message": f"subagent failed: {exc}",
+                }
+        finally:
+            task.finished_at = time.time()
+            manager.mark_ready(task)
+
+    def cancel(self, manager: TaskManager, job: HostedTask) -> None:
+        del manager
+        if job.status == "running":
+            job.status = "cancelled"
+            job.finished_at = time.time()
 
 
 Task = BackgroundJob | HostedTask

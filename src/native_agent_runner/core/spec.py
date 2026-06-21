@@ -157,6 +157,12 @@ class RunLimits:
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     max_total_tokens: int | None = None
+    # Bounds on agent-as-tool delegation. ``max_subagents`` caps how many subagent
+    # tasks a single run may spawn (fan-out backstop); ``max_subagent_depth`` caps
+    # nesting (a child at this depth cannot spawn further children). Enforced at
+    # spawn time in ``SubagentTaskExecutor``; the depth Claude Code uses is 5.
+    max_subagents: int = 8
+    max_subagent_depth: int = 5
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> RunLimits:
@@ -183,6 +189,8 @@ class RunLimits:
             max_input_tokens=_optional_int(payload, "max_input_tokens", defaults.max_input_tokens),
             max_output_tokens=_optional_int(payload, "max_output_tokens", defaults.max_output_tokens),
             max_total_tokens=_optional_int(payload, "max_total_tokens", defaults.max_total_tokens),
+            max_subagents=int(payload.get("max_subagents", defaults.max_subagents)),
+            max_subagent_depth=int(payload.get("max_subagent_depth", defaults.max_subagent_depth)),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -199,6 +207,8 @@ class RunLimits:
             "max_input_tokens": self.max_input_tokens,
             "max_output_tokens": self.max_output_tokens,
             "max_total_tokens": self.max_total_tokens,
+            "max_subagents": self.max_subagents,
+            "max_subagent_depth": self.max_subagent_depth,
         }
 
 

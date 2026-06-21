@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, Union
 
 from native_agent_runner.core._util import canonical_sha256
-from native_agent_runner.core.spec import ModelConfig
+from native_agent_runner.core.spec import ModelConfig, RunLimits, RunMode
 from native_agent_runner.core.tool_surface import (
     ToolAuthorization,
     ToolAuthorizationDecision,
@@ -19,6 +19,7 @@ from native_agent_runner.errors import AgentConfigError
 from native_agent_runner.tools.base import ToolRegistry, ToolSpec
 
 ToolRefKind = Literal["registry"]
+SubagentContext = Literal["fresh", "fork"]
 
 
 @dataclass(frozen=True)
@@ -324,6 +325,102 @@ class AgentRuntimeConfig:
             "tool_search": self.tool_search.to_json(),
             "metadata": dict(self.metadata),
         }
+
+
+@dataclass(frozen=True)
+class SubagentDefinition:
+    """How a parent run delegates to a subagent (agent-as-tool). Mirrors the Claude
+    Code subagent model: tools/model/mode/limits default to *inheriting* the parent's,
+    and ``tools``/``disallowed_tools`` filter the parent's tool set — a subagent can
+    never exceed the parent (the allowlist is resolved against the parent's bindings; see
+    ``AgentLoop._resolve_child_config``).
+
+    - ``tools=None`` inherits ALL of the parent's tool bindings; a tuple is an allowlist
+      matched (fnmatch) against each parent binding's tool id / binding id / model name,
+      so patterns like ``"mcp.*"`` or ``"fs.read"`` work.
+    - ``disallowed_tools`` is a denylist applied after the allowlist (deny wins).
+    - ``model``/``mode``/``limits``/``tool_search`` are ``None`` to inherit the parent's.
+    - ``description`` is surfaced to the model in the ``agent.spawn`` tool so it can pick
+      the right subagent (Claude selects subagents by their description).
+    - ``context="fork"`` makes the child inherit the parent's conversation snapshot AND
+      the parent's prompt/tools/model (the definition's own prompt/tools/model are
+      ignored) — "continue as me in an isolated branch". ``"fresh"`` (default) is the
+      normal isolated subagent that only sees the task prompt.
+    """
+
+    description: str = ""
+    prompt: PromptSpec = field(default_factory=PromptSpec)
+    model: ModelConfig | None = None
+    tools: tuple[str, ...] | None = None
+    disallowed_tools: tuple[str, ...] = ()
+    mode: RunMode | None = None
+    limits: RunLimits | None = None
+    tool_search: ToolSearchConfig | None = None
+    context: SubagentContext = "fresh"
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    @classmethod
+    def from_frontmatter(cls, meta: Mapping[str, Any], body: str) -> SubagentDefinition:
+        """Build a definition from a parsed ``.claude/agents``-style file: the YAML
+        frontmatter ``meta`` plus the markdown ``body`` (which becomes the system
+        prompt for a fresh subagent; ignored for a fork). Mirrors the Claude field
+        names — ``tools`` omitted means inherit all parent tools."""
+        sentinel = object()
+        model_raw = meta.get("model")
+        if model_raw in (None, "inherit", ""):
+            model = None
+        elif isinstance(model_raw, Mapping):
+            model = ModelConfig.from_json(dict(model_raw))
+        else:
+            model = ModelConfig(model=str(model_raw))
+
+        tools_raw = meta.get("tools", sentinel)
+        if tools_raw is sentinel or tools_raw is None:
+            tools: tuple[str, ...] | None = None
+        elif isinstance(tools_raw, str):
+            tools = (tools_raw,)
+        else:
+            tools = tuple(str(item) for item in tools_raw)
+
+        disallowed_raw = meta.get("disallowed_tools", meta.get("disallowedTools", ()))
+        if isinstance(disallowed_raw, str):
+            disallowed = (disallowed_raw,)
+        else:
+            disallowed = tuple(str(item) for item in disallowed_raw or ())
+
+        mode_raw = meta.get("mode") or meta.get("permissionMode")
+        mode = mode_raw if mode_raw in ("read-only", "propose", "apply") else None
+
+        context_raw = str(meta.get("context") or "fresh")
+        context: SubagentContext = "fork" if context_raw == "fork" else "fresh"
+
+        body_text = body.strip()
+        prompt = PromptSpec(persona_segments=(body_text,)) if body_text else PromptSpec()
+        return cls(
+            description=str(meta.get("description") or ""),
+            prompt=prompt,
+            model=model,
+            tools=tools,
+            disallowed_tools=disallowed,
+            mode=mode,
+            context=context,
+        )
+
+    @classmethod
+    def from_runtime_config(
+        cls, config: AgentRuntimeConfig, *, description: str = ""
+    ) -> SubagentDefinition:
+        """Adapt an explicit runtime config into a definition: its bindings' tool ids
+        become a fixed allowlist and its prompt/model/tool_search carry over. The
+        allowlist is still ceiling-bound — the parent must also expose those tools."""
+        return cls(
+            description=description,
+            prompt=config.prompt,
+            model=config.model,
+            tools=tuple(binding.ref.tool_id for binding in config.tools),
+            tool_search=config.tool_search,
+            metadata=dict(config.metadata),
+        )
 
 
 @dataclass(frozen=True)

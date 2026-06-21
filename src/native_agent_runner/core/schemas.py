@@ -205,6 +205,18 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     "task.cancelled": _data_schema({"task_id": _STR_NULL, "kind": _STR}, additional=True),
     "task.timed_out": _data_schema({"task_id": _STR_NULL, "kind": _STR}, additional=True),
     "task.failed": _data_schema({"task_id": _STR_NULL, "kind": _STR}, additional=True),
+    "subagent.started": _data_schema(
+        {"subagent_type": _STR, "child_run_id": _STR, "depth": _INT, "background": _BOOL},
+        additional=True,
+    ),
+    "subagent.finished": _data_schema(
+        {"subagent_type": _STR, "child_run_id": _STR, "status": _STR, "usage": _OBJ},
+        additional=True,
+    ),
+    "subagent.failed": _data_schema(
+        {"subagent_type": _STR, "child_run_id": _STR, "status": _STR, "usage": _OBJ},
+        additional=True,
+    ),
     "web.search.started": _data_schema({}, additional=True),
     "web.search.finished": _data_schema({}, additional=True),
     "web.search.failed": _data_schema({}, additional=True),
