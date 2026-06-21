@@ -38,8 +38,8 @@ class ToolObservation:
     output: dict[str, Any]
     is_background: bool = False
     # Non-text media the tool returned, by reference (``content_part_to_json`` dicts).
-    # Round-tripped through the checkpoint so a resumed run still forwards the image.
-    images: tuple[dict[str, Any], ...] = ()
+    # Round-tripped through the checkpoint so a resumed run still forwards the media.
+    media: tuple[dict[str, Any], ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -47,17 +47,22 @@ class ToolObservation:
             "tool_name": self.tool_name,
             "output": self.output,
             "is_background": self.is_background,
-            "images": [dict(image) for image in self.images],
+            "media": [dict(part) for part in self.media],
         }
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ToolObservation:
+        # Lenient read: accept the pre-rename ``images`` key so a checkpoint written before
+        # the media rename still restores its tool-returned media.
+        media = payload.get("media")
+        if media is None:
+            media = payload.get("images")
         return cls(
             call_id=str(payload.get("call_id") or ""),
             tool_name=str(payload.get("tool_name") or ""),
             output=dict(payload.get("output") or {}),
             is_background=bool(payload.get("is_background", False)),
-            images=tuple(dict(image) for image in payload.get("images") or ()),
+            media=tuple(dict(part) for part in media or ()),
         )
 
 

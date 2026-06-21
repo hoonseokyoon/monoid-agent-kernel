@@ -148,13 +148,13 @@ def _message_to_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
                 "output": json.dumps(message.get("content"), ensure_ascii=False),
             }
         ]
-        # Images a tool returned cannot ride the tool/function output on OpenAI — deliver
-        # them as a follow-up user message right after the tool result (the portable split).
-        images = message.get("images")
-        if isinstance(images, list):
-            image_items = _user_content_items(images)
-            if image_items:
-                items.append({"role": "user", "content": image_items})
+        # Media a tool returned cannot ride the tool/function output on OpenAI — deliver
+        # it as a follow-up user message right after the tool result (the portable split).
+        media = message.get("media")
+        if isinstance(media, list):
+            media_items = _user_content_items(media)
+            if media_items:
+                items.append({"role": "user", "content": media_items})
         return items
     if role == "assistant":
         items: list[dict[str, Any]] = []

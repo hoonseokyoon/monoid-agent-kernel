@@ -249,7 +249,7 @@ def _fs_read_media(workspace: Workspace) -> ToolSpec:
         return ToolResult(
             ok=True,
             content={"path": normalized, "mime_type": mime, "sha256": digest, "size": len(data)},
-            images=(ImagePart(source_ref=normalized, mime_type=mime),),
+            media=(ImagePart(source_ref=normalized, mime_type=mime),),
         )
 
     return ToolSpec(

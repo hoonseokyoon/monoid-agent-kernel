@@ -277,10 +277,10 @@ def _observation_message(observation: ToolObservation) -> dict[str, Any]:
         "call_id": observation.call_id,
         "content": observation.output,
     }
-    if observation.images:
+    if observation.media:
         # By reference; resolved to wire blocks at send time and delivered per provider
-        # (a follow-up user image message for OpenAI/gateway).
-        message["images"] = list(observation.images)
+        # (a follow-up user message for OpenAI/gateway).
+        message["media"] = list(observation.media)
     return message
 
 
@@ -1784,12 +1784,12 @@ class AgentLoop:
         blocks = 0
         estimated_tokens = 0
         for message in wire_messages:
-            # Resolved image blocks live in a user ``content`` list and/or a tool ``images`` list.
+            # Resolved image blocks live in a user ``content`` list and/or a tool ``media`` list.
             parts = []
             if isinstance(message.get("content"), list):
                 parts.extend(message["content"])
-            if isinstance(message.get("images"), list):
-                parts.extend(message["images"])
+            if isinstance(message.get("media"), list):
+                parts.extend(message["media"])
             for part in parts:
                 if not (isinstance(part, dict) and part.get("type") in WIRE_FORWARDABLE_PART_TYPES):
                     continue
@@ -2232,7 +2232,7 @@ class AgentLoop:
             call_id=call_id,
             tool_name=call_name,
             output=result.to_observation(),
-            images=tuple(content_part_to_json(image) for image in result.images),
+            media=tuple(content_part_to_json(part) for part in result.media),
         )
         recorder.transcript(
             {

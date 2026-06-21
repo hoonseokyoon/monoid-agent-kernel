@@ -168,12 +168,14 @@ def media_block_base64(part_type: str, resolved: ResolvedMedia) -> dict[str, Any
 
 
 def count_tool_result_images(messages: tuple[dict[str, Any], ...]) -> int:
-    """Count forwardable image parts carried on ``tool``-role messages' ``images`` lists."""
+    """Count forwardable image parts on ``tool``-role messages' ``media`` lists. Eviction is
+    image-specific (diminishing-value screenshots), so only image-type parts are counted even
+    though the ``media`` carrier may also hold documents."""
     return sum(
         1
         for message in messages
-        if message.get("role") == "tool" and isinstance(message.get("images"), list)
-        for part in message["images"]
+        if message.get("role") == "tool" and isinstance(message.get("media"), list)
+        for part in message["media"]
         if isinstance(part, dict) and part.get("type") in WIRE_FORWARDABLE_PART_TYPES
     )
 
@@ -186,11 +188,13 @@ def evict_tool_result_images(
 ) -> tuple[dict[str, Any], ...]:
     """Keep only the most-recent ``keep_n`` tool-result images, dropping older ones.
 
-    Operates on the by-reference message list (cheap — runs before resolution). Targets
-    ONLY ``images`` on ``role == "tool"`` messages; user-content images are never touched
-    (mirrors the Anthropic computer-use nesting rule). Removal is **cache-aligned**: the
-    count is rounded down to a multiple of ``chunk`` (default ``keep_n``) so the wire prefix
-    stays byte-stable between turns until a whole chunk ages out. ``keep_n=None`` is a no-op.
+    Operates on the by-reference message list (cheap — runs before resolution). Targets only
+    image parts on ``role == "tool"`` messages' ``media`` lists; user-content images and any
+    non-image media (e.g. documents) are never touched (mirrors the Anthropic computer-use
+    nesting rule, and keeps PDFs from being aged out like stale screenshots). Removal is
+    **cache-aligned**: the count is rounded down to a multiple of ``chunk`` (default
+    ``keep_n``) so the wire prefix stays byte-stable between turns until a whole chunk ages
+    out. ``keep_n=None`` is a no-op.
     """
     if keep_n is None:
         return messages
@@ -205,17 +209,17 @@ def evict_tool_result_images(
     removed = 0
     result: list[dict[str, Any]] = []
     for message in messages:
-        if message.get("role") != "tool" or not isinstance(message.get("images"), list):
+        if message.get("role") != "tool" or not isinstance(message.get("media"), list):
             result.append(message)
             continue
-        kept_images: list[Any] = []
-        for part in message["images"]:
+        kept: list[Any] = []
+        for part in message["media"]:
             is_image = isinstance(part, dict) and part.get("type") in WIRE_FORWARDABLE_PART_TYPES
             if is_image and removed < to_remove:
                 removed += 1
                 continue
-            kept_images.append(part)
-        result.append({**message, "images": kept_images})
+            kept.append(part)
+        result.append({**message, "media": kept})
     return tuple(result)
 
 
@@ -241,10 +245,10 @@ def resolve_wire_messages(
         content = message.get("content")
         if isinstance(content, list):
             new_message = {**new_message, "content": _resolve_part_list(content, resolver)}
-        # Tool messages carry returned media in a top-level ``images`` list.
-        images = message.get("images")
-        if isinstance(images, list):
-            new_message = {**new_message, "images": _resolve_part_list(images, resolver)}
+        # Tool messages carry returned media in a top-level ``media`` list.
+        media = message.get("media")
+        if isinstance(media, list):
+            new_message = {**new_message, "media": _resolve_part_list(media, resolver)}
         resolved_messages.append(new_message)
     return tuple(resolved_messages)
 

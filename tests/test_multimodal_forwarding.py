@@ -175,9 +175,9 @@ def test_fs_read_media_returns_image_part(tmp_path: Path) -> None:
 
     result = tools["fs.read_media"].handler(None, {"path": "img.png"})  # type: ignore[arg-type]
     assert result.ok
-    assert len(result.images) == 1
-    assert result.images[0].source_ref == "img.png"
-    assert result.images[0].mime_type == "image/png"
+    assert len(result.media) == 1
+    assert result.media[0].source_ref == "img.png"
+    assert result.media[0].mime_type == "image/png"
     assert result.content["mime_type"] == "image/png"
 
     # fs.read is unchanged — still rejects the binary as non-text.
@@ -185,15 +185,27 @@ def test_fs_read_media_returns_image_part(tmp_path: Path) -> None:
         tools["fs.read"].handler(None, {"path": "img.png"})  # type: ignore[arg-type]
 
 
-def test_tool_image_observation_round_trips() -> None:
-    """ToolObservation images survive checkpoint serialization (by reference)."""
+def test_tool_media_observation_round_trips() -> None:
+    """ToolObservation media survive checkpoint serialization (by reference)."""
     obs = ToolObservation(
         call_id="c1",
         tool_name="fs.read_media",
         output={"ok": True, "result": {"path": "img.png"}},
-        images=({"type": "image", "source_ref": "img.png", "mime_type": "image/png"},),
+        media=({"type": "image", "source_ref": "img.png", "mime_type": "image/png"},),
     )
     assert ToolObservation.from_json(obs.to_json()) == obs
+
+
+def test_tool_observation_from_json_accepts_legacy_images_key() -> None:
+    """A checkpoint written before the rename (``images`` key) still restores its media."""
+    legacy = {
+        "call_id": "c1",
+        "tool_name": "fs.read_media",
+        "output": {"ok": True},
+        "images": [{"type": "image", "source_ref": "img.png", "mime_type": "image/png"}],
+    }
+    restored = ToolObservation.from_json(legacy)
+    assert restored.media == ({"type": "image", "source_ref": "img.png", "mime_type": "image/png"},)
 
 
 def test_openai_tool_message_splits_to_followup_user() -> None:
@@ -202,7 +214,7 @@ def test_openai_tool_message_splits_to_followup_user() -> None:
         "role": "tool",
         "call_id": "c1",
         "content": {"ok": True, "result": {"path": "img.png"}},
-        "images": [
+        "media": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}
         ],
     }
@@ -236,10 +248,10 @@ def test_tool_image_forwarded_end_to_end(tmp_path: Path) -> None:
     ).run_once("show me the image")
 
     tool_messages = [
-        m for req in adapter.requests for m in req.messages if m.get("role") == "tool" and m.get("images")
+        m for req in adapter.requests for m in req.messages if m.get("role") == "tool" and m.get("media")
     ]
-    assert tool_messages, "expected a tool message carrying resolved images"
-    block = tool_messages[0]["images"][0]
+    assert tool_messages, "expected a tool message carrying resolved media"
+    block = tool_messages[0]["media"][0]
     assert block["source"]["type"] == "base64"
     assert base64.b64decode(block["source"]["data"]) == _PNG_BYTES
 
@@ -268,7 +280,7 @@ def test_tool_images_evicted_on_wire(tmp_path: Path) -> None:
 
     # The final request saw two tool images accumulate; eviction keeps only the most recent.
     last = adapter.requests[-1]
-    total = sum(len(m.get("images", [])) for m in last.messages if m.get("role") == "tool")
+    total = sum(len(m.get("media", [])) for m in last.messages if m.get("role") == "tool")
     assert total == 1
 
 
