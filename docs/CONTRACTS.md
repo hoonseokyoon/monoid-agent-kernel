@@ -271,6 +271,22 @@ Task seams above via a `subagent` task kind (`SubagentTaskExecutor`); see
   `subagent.started` event), the latter carrying the child's `usage`. The child's
   full event stream goes to its own run dir; external `event_sinks` are not shared
   with children (stateful sinks like OTel/StatusJson are per-run).
+- **Usage reporting**: the parent's run metrics carry `subagent_count` and
+  `subagent_usage` (the children's combined token totals). These are kept SEPARATE
+  from the parent's own `total_usage` on purpose — `total_usage` also reflects the
+  parent's remaining context budget, which a child's isolated tokens must not inflate.
+- **Context fork** (`SubagentDefinition.context = "fork"`): instead of a fresh
+  isolated context, the child inherits a snapshot of the parent's conversation AND the
+  parent's prompt / tools / model (the definition's own prompt/tools/model are ignored)
+  — "continue as me in an isolated branch". `"fresh"` (default) is the normal isolated
+  subagent that sees only the task prompt.
+- **Directory discovery**: `load_subagent_definitions(dir)` (CLI `--agents-directory`)
+  scans `*.md` files with YAML frontmatter (`.claude/agents` style) into
+  `SubagentDefinition`s. Frontmatter fields: `name` (id; falls back to filename),
+  `description`, `tools` (omitted → inherit all), `disallowedTools`, `model` (string
+  shorthand or `inherit`), `mode`, `context`; the markdown body is the system prompt
+  (fresh subagents only). Parsed by `parse_frontmatter` — a zero-dependency YAML subset
+  (scalars, inline/block lists, quotes), shared with Skills' `SKILL.md`.
 
 ### Permission Boundary
 

@@ -122,7 +122,9 @@ from native_agent_runner.tasks import (
     TaskReporter,
 )
 
-# Subagent (agent-as-tool) delegation tool
+# Subagent (agent-as-tool) delegation tool + file discovery
+from native_agent_runner.core.frontmatter import parse_frontmatter
+from native_agent_runner.subagent_loader import load_subagent_definitions
 from native_agent_runner.tools.builtin import agent_spawn_tool
 
 __all__ = [
@@ -215,4 +217,6 @@ __all__ = [
     "SubagentDefinition",
     "SubagentTaskExecutor",
     "agent_spawn_tool",
+    "load_subagent_definitions",
+    "parse_frontmatter",
 ]

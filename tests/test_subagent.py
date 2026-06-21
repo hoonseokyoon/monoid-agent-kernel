@@ -55,6 +55,7 @@ def _child_def(
     mode=None,
     limits: RunLimits | None = None,
     description: str = "",
+    context: str = "fresh",
 ) -> SubagentDefinition:
     return SubagentDefinition(
         description=description,
@@ -64,6 +65,7 @@ def _child_def(
         model=model,
         mode=mode,
         limits=limits,
+        context=context,  # type: ignore[arg-type]
     )
 
 
@@ -391,3 +393,116 @@ def test_child_model_inherits_and_overrides(tmp_path: Path) -> None:
     loop2.run_once("go")
     child_models2 = {r.model.model for r in adapter2.requests if CHILD_MARK in r.system_prompt and r.model}
     assert child_models2 == {"M-child"}
+
+
+# --- P3: directory discovery, context fork, usage reporting -------------------------
+
+
+def test_loader_reads_markdown_directory(tmp_path: Path) -> None:
+    from native_agent_runner.subagent_loader import load_subagent_definitions
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "reviewer.md").write_text(
+        "---\n"
+        "name: reviewer\n"
+        "description: Reviews code\n"
+        "tools: [fs.read]\n"
+        "disallowedTools: [shell.exec]\n"
+        "model: M-sub\n"
+        "---\n"
+        "You are a careful reviewer.\n",
+        encoding="utf-8",
+    )
+    (agents / "brancher.md").write_text(
+        "---\ndescription: continue in a branch\ncontext: fork\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    defs = load_subagent_definitions(agents)
+
+    assert set(defs) == {"reviewer", "brancher"}  # brancher id from filename (no name field)
+    rev = defs["reviewer"]
+    assert rev.description == "Reviews code"
+    assert rev.tools == ("fs.read",)  # explicit allowlist
+    assert rev.disallowed_tools == ("shell.exec",)
+    assert rev.model is not None and rev.model.model == "M-sub"
+    assert "careful reviewer" in rev.prompt.persona_segments[0]
+    assert defs["brancher"].context == "fork"
+    assert defs["brancher"].tools is None  # omitted -> inherit
+
+
+class InstructionAdapter:
+    """Routes by ModelRequest.instruction (not by system prompt) — needed for fork, where
+    the child inherits the parent's system prompt and the marker can't distinguish them."""
+
+    def __init__(self, by_instruction: dict[str, ModelTurn], default_final: str) -> None:
+        self.by_instruction = by_instruction
+        self.default_final = default_final
+        self.requests: list[ModelRequest] = []
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        self.requests.append(request)
+        if request.instruction in self.by_instruction:
+            return self.by_instruction[request.instruction]
+        return ModelTurn(final_text=self.default_final)
+
+
+def test_fork_inherits_parent_context_prompt_and_tools(tmp_path: Path) -> None:
+    adapter = InstructionAdapter(
+        by_instruction={
+            "go": _spawn_call("fork directive"),
+            "fork directive": ModelTurn(final_text="FORK_CHILD_DONE"),
+        },
+        default_final="parent done",
+    )
+    loop = _loop(
+        tmp_path,
+        adapter,
+        _parent_config("fs.read", model=ModelConfig(model="M-parent")),
+        child=_child_def(context="fork"),
+    )
+
+    result = loop.run_once("go")
+    assert result.status == "completed"
+
+    fork_reqs = [r for r in adapter.requests if r.instruction == "fork directive"]
+    assert fork_reqs, "the fork child should have run with the directive as its instruction"
+    fr = fork_reqs[0]
+    # Inherits the parent's system prompt (NOT the child definition's persona).
+    assert PARENT_MARK in fr.system_prompt
+    assert CHILD_MARK not in fr.system_prompt
+    # Inherits the parent's conversation snapshot (seeded messages contain the parent's "go").
+    assert "go" in json.dumps(list(fr.messages))
+    # Inherits the parent's tools (fs.read) and model.
+    assert any(getattr(t, "id", "") == "fs.read" for t in fr.tools)
+    assert fr.model is not None and fr.model.model == "M-parent"
+
+
+def test_fresh_subagent_starts_with_empty_context(tmp_path: Path) -> None:
+    adapter = RoutingAdapter(
+        parent=[_spawn_call("do X"), ModelTurn(final_text="parent done")],
+        child=[ModelTurn(final_text="child done")],
+    )
+    loop = _loop(tmp_path, adapter, _parent_config(), child=_child_def(context="fresh"))
+
+    loop.run_once("go")
+
+    child_first = next(r for r in adapter.requests if r.instruction == "do X" and CHILD_MARK in r.system_prompt)
+    # A fresh child sees only its own task prompt — none of the parent's conversation.
+    assert "go" not in json.dumps(list(child_first.messages or ()))
+
+
+def test_metrics_report_subagent_usage_separately(tmp_path: Path) -> None:
+    adapter = RoutingAdapter(
+        parent=[_spawn_call("do X"), ModelTurn(final_text="parent done")],
+        child=[ModelTurn(final_text="child done", usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})],
+    )
+    loop = _loop(tmp_path, adapter, _parent_config())
+
+    result = loop.run_once("go")
+
+    assert result.metrics["subagent_count"] == 1
+    assert result.metrics["subagent_usage"]["total_tokens"] == 10
+    # The child's tokens must NOT inflate the parent's own usage (context accounting).
+    assert result.metrics.get("total_tokens", 0) == 0

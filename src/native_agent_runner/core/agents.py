@@ -19,6 +19,7 @@ from native_agent_runner.errors import AgentConfigError
 from native_agent_runner.tools.base import ToolRegistry, ToolSpec
 
 ToolRefKind = Literal["registry"]
+SubagentContext = Literal["fresh", "fork"]
 
 
 @dataclass(frozen=True)
@@ -341,6 +342,10 @@ class SubagentDefinition:
     - ``model``/``mode``/``limits``/``tool_search`` are ``None`` to inherit the parent's.
     - ``description`` is surfaced to the model in the ``agent.spawn`` tool so it can pick
       the right subagent (Claude selects subagents by their description).
+    - ``context="fork"`` makes the child inherit the parent's conversation snapshot AND
+      the parent's prompt/tools/model (the definition's own prompt/tools/model are
+      ignored) — "continue as me in an isolated branch". ``"fresh"`` (default) is the
+      normal isolated subagent that only sees the task prompt.
     """
 
     description: str = ""
@@ -351,7 +356,55 @@ class SubagentDefinition:
     mode: RunMode | None = None
     limits: RunLimits | None = None
     tool_search: ToolSearchConfig | None = None
+    context: SubagentContext = "fresh"
     metadata: dict[str, object] = field(default_factory=dict)
+
+    @classmethod
+    def from_frontmatter(cls, meta: Mapping[str, Any], body: str) -> SubagentDefinition:
+        """Build a definition from a parsed ``.claude/agents``-style file: the YAML
+        frontmatter ``meta`` plus the markdown ``body`` (which becomes the system
+        prompt for a fresh subagent; ignored for a fork). Mirrors the Claude field
+        names — ``tools`` omitted means inherit all parent tools."""
+        sentinel = object()
+        model_raw = meta.get("model")
+        if model_raw in (None, "inherit", ""):
+            model = None
+        elif isinstance(model_raw, Mapping):
+            model = ModelConfig.from_json(dict(model_raw))
+        else:
+            model = ModelConfig(model=str(model_raw))
+
+        tools_raw = meta.get("tools", sentinel)
+        if tools_raw is sentinel or tools_raw is None:
+            tools: tuple[str, ...] | None = None
+        elif isinstance(tools_raw, str):
+            tools = (tools_raw,)
+        else:
+            tools = tuple(str(item) for item in tools_raw)
+
+        disallowed_raw = meta.get("disallowed_tools", meta.get("disallowedTools", ()))
+        if isinstance(disallowed_raw, str):
+            disallowed = (disallowed_raw,)
+        else:
+            disallowed = tuple(str(item) for item in disallowed_raw or ())
+
+        mode_raw = meta.get("mode") or meta.get("permissionMode")
+        mode = mode_raw if mode_raw in ("read-only", "propose", "apply") else None
+
+        context_raw = str(meta.get("context") or "fresh")
+        context: SubagentContext = "fork" if context_raw == "fork" else "fresh"
+
+        body_text = body.strip()
+        prompt = PromptSpec(persona_segments=(body_text,)) if body_text else PromptSpec()
+        return cls(
+            description=str(meta.get("description") or ""),
+            prompt=prompt,
+            model=model,
+            tools=tools,
+            disallowed_tools=disallowed,
+            mode=mode,
+            context=context,
+        )
 
     @classmethod
     def from_runtime_config(

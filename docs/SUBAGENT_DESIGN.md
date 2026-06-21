@@ -141,13 +141,26 @@ The `agent.spawn` tool spec is registered in the base registry **only when
 (`ref.tool_id = "agent.spawn"`). The tool advertises the available subagent ids +
 descriptions so the model selects the right one (Claude selects by description).
 
-## Definitions source (decided: inline)
+## Definitions source
 
-`AgentLoop.subagent_definitions: Mapping[str, SubagentDefinition]` — inline, passed by
-the embedder. `SubagentDefinition.from_runtime_config()` adapts an explicit config
-(its tool ids become a ceiling-bound allowlist). Directory discovery
-(`--agents-directory`, Claude `.claude/agents` style) is P3 and will share machinery
-with Skills.
+`AgentLoop.subagent_definitions: Mapping[str, SubagentDefinition]` — inline, or loaded
+from a directory. `load_subagent_definitions(dir)` (CLI `--agents-directory`) scans
+`*.md` files with YAML frontmatter (`.claude/agents` style) via the zero-dep
+`core/frontmatter.py` parser (shared with Skills' `SKILL.md`). `name` is the id (falls
+back to filename); frontmatter maps to `SubagentDefinition.from_frontmatter`.
+`SubagentDefinition.from_runtime_config()` also adapts an explicit config.
+
+## Context fork (P3)
+
+`SubagentDefinition.context = "fork"` (default `"fresh"`). A fork inherits a **snapshot
+of the parent's conversation** (the parent's by-value `messages` log, seeded into the
+child via `arun_once(..., seed_messages=...)`) AND the parent's prompt / tools / model
+(`_resolve_child_config(..., fork=True)` ignores the definition's own prompt/tools/model
+and `mode`/`limits` inherit too). The child still runs in an isolated overlay workspace
+and returns only its final message — so a fork is "continue as me in an isolated
+branch", cheaper to reason about than re-explaining context to a fresh subagent. The
+system prompt is regenerated per turn from the (inherited) config, so the fork applies
+the parent's directive over the inherited history.
 
 ## Files
 
@@ -172,6 +185,10 @@ with Skills.
   with fnmatch incl `mcp.*`), hard ceiling (allowlist resolved against parent bindings),
   parent tool-provider inheritance (MCP/custom), description-based selection in the
   `agent.spawn` tool.
-- **P3** (deferred): directory discovery (`--agents-directory`), Skills
-  `context: fork` integration, optional ADK-style state copy-in/delta-back, parent
-  token-budget integration (counting child tokens against the parent's RunLimits).
+- **P3** (done): directory discovery (`--agents-directory` + `core/frontmatter.py`),
+  context fork (`context: "fork"` — inherits parent conversation + prompt/tools/model),
+  report-only usage roll-up (`subagent_count`/`subagent_usage` in metrics, kept out of
+  `total_usage` to preserve context accounting).
+- **Deferred**: Skills `context: fork` wiring (needs the Skills feature), ADK-style
+  state copy-in/delta-back, parent token-budget *enforcement* across the tree (only
+  AutoGen does this; we report rather than enforce to keep context accounting clean).

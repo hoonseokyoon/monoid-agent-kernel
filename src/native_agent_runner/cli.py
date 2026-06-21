@@ -50,6 +50,7 @@ from native_agent_runner.providers.base import ModelAdapter
 from native_agent_runner.providers.gateway import GatewayModelAdapter
 from native_agent_runner.providers.openai import OpenAIModelAdapter
 from native_agent_runner.recorder import StdoutJsonlSink, append_event_to_run
+from native_agent_runner.subagent_loader import load_subagent_definitions
 from native_agent_runner.tool_loader import load_tool_provider
 from native_agent_runner.web import WebGatewayClient
 from native_agent_runner.reference.web_gateway.http import create_web_gateway_server
@@ -124,6 +125,12 @@ def main() -> None:
 @click.option("--max-bytes-read", type=int, default=1_000_000, show_default=True)
 @click.option("--max-duration-s", type=int, default=900, show_default=True)
 @click.option("--tool-module", multiple=True, help="Load custom tools from path.py:function.")
+@click.option(
+    "--agents-directory",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Load subagent definitions (*.md with frontmatter) from a directory, enabling agent.spawn.",
+)
 @click.option("--deny-path", multiple=True, help="Deny workspace paths matching a backend-provided glob.")
 @click.option("--redact-path", multiple=True, help="Redact matching paths from public events and projections.")
 @click.option("--permission-policy-file", type=click.Path(path_type=Path), default=None)
@@ -167,6 +174,7 @@ def run(
     max_bytes_read: int,
     max_duration_s: int,
     tool_module: tuple[str, ...],
+    agents_directory: Path | None,
     deny_path: tuple[str, ...],
     redact_path: tuple[str, ...],
     permission_policy_file: Path | None,
@@ -237,6 +245,9 @@ def run(
 
     try:
         providers = tuple(load_tool_provider(item) for item in tool_module)
+        subagent_definitions = (
+            load_subagent_definitions(agents_directory) if agents_directory is not None else {}
+        )
         extra_sinks = []
         if stream_json:
             extra_sinks.append(StdoutJsonlSink())
@@ -247,6 +258,7 @@ def run(
 
     result = AgentLoop(
         spec=spec,
+        subagent_definitions=subagent_definitions,
         model_adapter=_model_adapter(
             runtime_config.model or ModelConfig(),
             llm_gateway_url=llm_gateway_url or (runtime_config.model.gateway_url if runtime_config.model else None),

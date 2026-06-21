@@ -45,6 +45,7 @@ from native_agent_runner.core.agents import (
     AgentRuntimeConfig,
     BoundTool,
     BoundToolCatalog,
+    PromptSpec,
     RuntimeConfigSource,
     SubagentDefinition,
     ToolBinding,
@@ -177,6 +178,12 @@ class AgentToolContext(ToolContext):
     # Depth of this run in the subagent tree (0 = top-level). Threaded into spawned
     # children as ``depth`` so the executor can enforce the nesting cap.
     subagent_depth: int = 0
+    # Report-only roll-up of delegated work: how many subagents this run spawned and their
+    # combined token usage. Kept SEPARATE from total_usage on purpose — total_usage also
+    # tracks this run's remaining context budget, which a child's isolated tokens must not
+    # inflate. Surfaced in the run metrics for cost visibility.
+    subagent_count: int = 0
+    subagent_usage: dict[str, int] = field(default_factory=dict)
     _requested_tool_loads: list[str] = field(default_factory=list)
     _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
 
@@ -704,12 +711,22 @@ class AgentLoop:
         finally:
             self._maybe_close_loop()
 
-    async def arun_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
-        """Async form of :meth:`run_once`."""
+    async def arun_once(
+        self,
+        user_input: str | tuple[ContentPart, ...],
+        *,
+        seed_messages: tuple[dict[str, Any], ...] | None = None,
+    ) -> AgentRunResult:
+        """Async form of :meth:`run_once`. ``seed_messages`` pre-loads the by-value
+        conversation log before the first turn — used by a ``context: fork`` subagent to
+        inherit the parent's conversation snapshot (the system prompt is regenerated from
+        this run's own config, so a fork sees the history but applies its own directive)."""
         self.open()
         try:
             session = self._require_open()
             if not session.terminal:
+                if seed_messages:
+                    session.state.messages = [dict(message) for message in seed_messages]
                 await self.asubmit(user_input)
         finally:
             result = self.close()
@@ -1213,6 +1230,7 @@ class AgentLoop:
         turn_id = task.request.get("turn_id")
         definition = self.subagent_definitions[definition_id]
         parent_config = self.runtime_config_provider.current_config(self.spec.run_id)
+        is_fork = definition.context == "fork"
         child_run_id = f"{self.spec.run_id}.sub.{task.job_id}"
         child_depth = depth + 1
         # At the depth cap the child must not delegate further: the resolver drops any
@@ -1224,10 +1242,16 @@ class AgentLoop:
             parent_config,
             definition_id=definition_id,
             at_max_depth=at_max_depth,
+            fork=is_fork,
         )
         child_definitions: Mapping[str, SubagentDefinition] = (
             {} if at_max_depth else self.subagent_definitions
         )
+        # A fork inherits the parent's conversation snapshot; a fresh subagent starts empty.
+        # mode/limits: a fork inherits the parent's outright; a fresh subagent may narrow them.
+        seed_messages: tuple[dict[str, Any], ...] | None = None
+        if is_fork and self._session is not None:
+            seed_messages = tuple(dict(message) for message in self._session.state.messages)
         # Correlate the delegation on the PARENT's event stream (the child records to its
         # own run dir; stateful sinks like OTel/StatusJson are NOT shared to avoid clobber).
         started = recorder.emit(
@@ -1246,9 +1270,9 @@ class AgentLoop:
             run_root=self.spec.run_root,
             run_id=child_run_id,
             # mode/limits inherit the parent's unless the definition narrows them.
-            mode=definition.mode or self.spec.mode,
+            mode=self.spec.mode if is_fork else (definition.mode or self.spec.mode),
             workspace_backend="overlay",
-            limits=definition.limits or self.spec.limits,
+            limits=self.spec.limits if is_fork else (definition.limits or self.spec.limits),
             permission_policy=self.spec.permission_policy,
             metadata={
                 "parent_run_id": self.spec.run_id,
@@ -1274,12 +1298,18 @@ class AgentLoop:
             subagent_definitions=child_definitions,
             status_file=False,
         )
-        result = await child.arun_once(task.prompt)
+        result = await child.arun_once(task.prompt, seed_messages=seed_messages)
         usage = {
             key: result.metrics[key]
             for key in ("input_tokens", "output_tokens", "total_tokens")
             if isinstance(result.metrics, dict) and key in result.metrics
         }
+        # Report-only roll-up onto the parent context (NOT total_usage; see field comment).
+        if self._session is not None:
+            parent_ctx = self._session.res.context
+            parent_ctx.subagent_count += 1
+            for key, value in usage.items():
+                parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + int(value)
         task.result = {
             "type": "subagent_result",
             "task_id": task.job_id,
@@ -1316,29 +1346,36 @@ class AgentLoop:
         *,
         definition_id: str,
         at_max_depth: bool,
+        fork: bool = False,
     ) -> AgentRuntimeConfig:
         """Derive a child's runtime config from the parent's, Claude-style: the child
         inherits the parent's tool bindings (so it can never exceed the parent), then the
         definition's ``tools`` allowlist and ``disallowed_tools`` denylist filter them
         (deny wins). ``model``/``tool_search`` inherit unless the definition overrides. At
-        the depth cap the ``agent.spawn`` binding is dropped so the child cannot delegate."""
+        the depth cap the ``agent.spawn`` binding is dropped so the child cannot delegate.
+
+        A ``fork`` inherits the parent FULLY — prompt, tools, model, tool_search — and the
+        definition's own prompt/tools/model are ignored ("continue as me in a branch")."""
         parent_bindings: tuple[ToolBinding, ...] = parent_config.tools if parent_config else ()
-        if definition.tools is None:
+        parent_model = parent_config.model if parent_config else None
+        parent_search = parent_config.tool_search if parent_config else ToolSearchConfig()
+        parent_prompt = parent_config.prompt if parent_config else PromptSpec()
+        if fork:
+            bindings = list(parent_bindings)
+        elif definition.tools is None:
             bindings = list(parent_bindings)
         else:
             bindings = [b for b in parent_bindings if _binding_matches(b, definition.tools)]
-        if definition.disallowed_tools:
+        if not fork and definition.disallowed_tools:
             bindings = [b for b in bindings if not _binding_matches(b, definition.disallowed_tools)]
         if at_max_depth:
             bindings = [b for b in bindings if b.ref.tool_id != "agent.spawn"]
-        parent_model = parent_config.model if parent_config else None
-        parent_search = parent_config.tool_search if parent_config else ToolSearchConfig()
         return AgentRuntimeConfig(
             definition_id=definition_id,
-            model=definition.model or parent_model,
-            prompt=definition.prompt,
+            model=parent_model if fork else (definition.model or parent_model),
+            prompt=parent_prompt if fork else definition.prompt,
             tools=tuple(bindings),
-            tool_search=definition.tool_search or parent_search,
+            tool_search=parent_search if fork else (definition.tool_search or parent_search),
             metadata=dict(definition.metadata),
         )
 
@@ -2083,6 +2120,9 @@ class AgentLoop:
             **context.web_service.metrics(),
             **state.total_usage,
         }
+        if context.subagent_count:
+            metrics["subagent_count"] = context.subagent_count
+            metrics["subagent_usage"] = dict(context.subagent_usage)
         if state.provider_error_code:
             metrics["provider_error_code"] = state.provider_error_code
         if state.provider_http_status is not None:
