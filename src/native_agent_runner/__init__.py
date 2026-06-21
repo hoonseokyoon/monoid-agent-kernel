@@ -1,11 +1,16 @@
-"""Native agent runner — core engine and stable integration contracts.
+"""Native agent runner — the contracts and the core engine that implements them.
 
-Importing this package exposes only the core runner and its integration contracts (see
-``native_agent_runner.contracts`` and ``docs/CONTRACTS.md``).
+The package is layered in three tiers (see ``docs/CONTRACTS.md`` and the README):
 
-The reference example services live under ``native_agent_runner.reference`` and are reached
-explicitly, e.g. ``from native_agent_runner.reference.backend import RunnerBackend``. They are
-examples, not part of the supported public surface.
+- **contracts** — the stable integration surface (``native_agent_runner.contracts``): the specs
+  and protocols you depend on and implement.
+- **core** — the engine that implements those contracts (``AgentLoop`` and friends), the default
+  supported runner.
+- **reference** — example services under ``native_agent_runner.reference``, reached explicitly,
+  e.g. ``from native_agent_runner.reference.backend import RunnerBackend``. They are examples,
+  not part of the supported public surface.
+
+Importing this package exposes the contracts plus the core conveniences.
 """
 
 from native_agent_runner import contracts as contracts

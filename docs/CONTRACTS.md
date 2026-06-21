@@ -7,13 +7,22 @@ and web gateway integration.
 
 ## Boundary
 
-- Core exports the runner, contracts, providers, tools, workspace, permission,
-  shell execution, and web gateway client modules.
-- Reference packages implement example services. Core code has no dependency on
-  `native_agent_runner.reference`.
-- Agent configuration enters the engine through `AgentRuntimeConfig`. Legacy
-  tool/shell/web policy inputs have left the core, backend, and CLI execution
-  paths.
+The package is layered in three tiers:
+
+- **contracts** — the stable integration surface, collected in
+  `native_agent_runner.contracts` (and re-exported from the top-level
+  `native_agent_runner`). These are the specs and protocols you depend on and
+  implement. This document defines them.
+- **core** — the engine that implements those contracts: the default supported
+  runner (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, permission,
+  shell execution, and web gateway client modules).
+- **reference** — example services under `native_agent_runner.reference`
+  (`backend`, `llm_gateway`, `web_gateway`, `stores`). Not part of the supported
+  surface; core has no dependency on `native_agent_runner.reference`.
+
+Agent configuration enters the engine through `AgentRuntimeConfig`. Legacy
+tool/shell/web policy inputs have left the core, backend, and CLI execution
+paths.
 
 ### Stability
 
