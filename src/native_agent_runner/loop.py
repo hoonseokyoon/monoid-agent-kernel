@@ -246,6 +246,7 @@ class AgentToolContext(ToolContext):
         background spawns return ``started`` content and the result is injected later
         through the reentry queue (see ``SubagentTaskExecutor``)."""
         background = bool(args.get("background", False))
+        call = self._current_call
         task = self.job_manager.start_task(
             "subagent",
             {
@@ -255,6 +256,9 @@ class AgentToolContext(ToolContext):
                 "background": background,
                 "resume_on_exit": background,
                 "created_by": "model",
+                # Correlation so subagent.* events nest under this spawn tool call.
+                "parent_event_id": call.tool_event_id,
+                "turn_id": call.turn_id,
             },
         )
         if background:
@@ -1184,11 +1188,40 @@ class AgentLoop:
         the task. Builds a fresh child ``AgentLoop`` (isolated overlay workspace, shared
         adapter/sinks/checkpoint store, depth+1) and stores the child's final message;
         ``SubagentTaskExecutor._arun`` then publishes it through the reentry pipe."""
-        del manager
+        recorder = manager.recorder
         definition_id = str(task.request.get("definition_id") or "")
         depth = int(task.request.get("depth", 0) or 0)
+        background = bool(task.request.get("background", False))
+        parent_event_id = task.request.get("parent_event_id")
+        turn_id = task.request.get("turn_id")
         config = self.subagent_definitions[definition_id]
         child_run_id = f"{self.spec.run_id}.sub.{task.job_id}"
+        child_depth = depth + 1
+        # At the depth cap the child must not be able to delegate further: drop any
+        # agent.spawn binding from its config and give it no definitions, so the tool is
+        # simply absent rather than erroring at call time.
+        at_max_depth = child_depth >= self.spec.limits.max_subagent_depth
+        child_config = config
+        child_definitions: Mapping[str, AgentRuntimeConfig] = self.subagent_definitions
+        if at_max_depth:
+            child_config = replace(
+                config,
+                tools=tuple(b for b in config.tools if b.ref.tool_id != "agent.spawn"),
+            )
+            child_definitions = {}
+        # Correlate the delegation on the PARENT's event stream (the child records to its
+        # own run dir; stateful sinks like OTel/StatusJson are NOT shared to avoid clobber).
+        started = recorder.emit(
+            "subagent.started",
+            turn_id=turn_id,
+            parent_id=parent_event_id,
+            data={
+                "subagent_type": definition_id,
+                "child_run_id": child_run_id,
+                "depth": child_depth,
+                "background": background,
+            },
+        )
         child_spec = AgentRunSpec(
             workspace_root=self.spec.workspace_root,
             run_root=self.spec.run_root,
@@ -1201,21 +1234,20 @@ class AgentLoop:
                 "parent_run_id": self.spec.run_id,
                 "parent_task_id": task.job_id,
                 "subagent_definition_id": definition_id,
-                "subagent_depth": depth + 1,
+                "subagent_depth": child_depth,
             },
         )
         child = AgentLoop(
             spec=child_spec,
             model_adapter=self.model_adapter,
-            runtime_config_provider=config,
-            event_sinks=self.event_sinks,
+            runtime_config_provider=child_config,
             permission_policy=self.spec.permission_policy,
             cancellation_token=self.cancellation_token,
             shell_approval_provider=self.shell_approval_provider,
             web_gateway_client=self.web_gateway_client,
             workspace_factory=self.workspace_factory,
             checkpoint_store=self.checkpoint_store,
-            subagent_definitions=self.subagent_definitions,
+            subagent_definitions=child_definitions,
             status_file=False,
         )
         result = await child.arun_once(task.prompt)
@@ -1238,6 +1270,20 @@ class AgentLoop:
         }
         if result.status == "failed":
             task.status = "failed"
+        recorder.emit(
+            "subagent.finished" if result.status != "failed" else "subagent.failed",
+            turn_id=turn_id,
+            parent_id=started.event_id,
+            level="error" if result.status == "failed" else "info",
+            data={
+                "subagent_type": definition_id,
+                "child_run_id": child_run_id,
+                "status": result.status,
+                "usage": usage,
+                "error": result.error,
+                "error_code": result.error_code,
+            },
+        )
 
     def _bootstrap(self) -> _RunResources:
         if self.permission_policy == PermissionPolicy() and self.spec.permission_policy != PermissionPolicy():

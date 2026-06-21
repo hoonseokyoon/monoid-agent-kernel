@@ -10,6 +10,7 @@ from native_agent_runner.core.spec import AgentRunSpec, RunLimits
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelRequest, ModelTurn
 from native_agent_runner.providers.fake import fake_tool_call
+from native_agent_runner.recorder import MemoryEventSink
 
 # Routing fake adapter: parent and child runs share one adapter (the child inherits
 # ``model_adapter``), so we route by a marker baked into each config's persona segment
@@ -56,7 +57,15 @@ def _spawn_call(prompt: str, *, background: bool = False, call_id: str = "c1") -
     return ModelTurn(tool_calls=(fake_tool_call("agent_spawn", args, call_id),))
 
 
-def _loop(tmp_path: Path, adapter: RoutingAdapter, parent: AgentRuntimeConfig, *, limits: RunLimits | None = None, child: AgentRuntimeConfig | None = None) -> AgentLoop:
+def _loop(
+    tmp_path: Path,
+    adapter: RoutingAdapter,
+    parent: AgentRuntimeConfig,
+    *,
+    limits: RunLimits | None = None,
+    child: AgentRuntimeConfig | None = None,
+    event_sinks: tuple = (),
+) -> AgentLoop:
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     return AgentLoop(
@@ -68,6 +77,7 @@ def _loop(tmp_path: Path, adapter: RoutingAdapter, parent: AgentRuntimeConfig, *
         model_adapter=adapter,
         runtime_config_provider=parent,
         subagent_definitions={"child": child or _child_config()},
+        event_sinks=event_sinks,
     )
 
 
@@ -174,3 +184,57 @@ def test_background_spawn_returns_started_then_delivers_result(tmp_path: Path) -
     # The detached child's result was delivered later and drove the final parent turn.
     assert result.final_text == "got child"
     assert any(CHILD_MARK in r.system_prompt for r in adapter.requests)
+
+
+def test_subagent_events_correlate_to_spawn_call(tmp_path: Path) -> None:
+    sink = MemoryEventSink()
+    adapter = RoutingAdapter(
+        parent=[_spawn_call("do X", call_id="c1"), ModelTurn(final_text="parent done")],
+        child=[ModelTurn(final_text="CHILD_OUTPUT")],
+    )
+    loop = _loop(tmp_path, adapter, _parent_config(), event_sinks=(sink,))
+
+    loop.run_once("go")
+
+    by_type = {e.type: e for e in sink.events}
+    assert "subagent.started" in by_type
+    assert "subagent.finished" in by_type
+    started = by_type["subagent.started"]
+    finished = by_type["subagent.finished"]
+    # started nests under the spawn tool call; finished nests under started (close pairing).
+    tool_starts = {e.event_id: e for e in sink.events if e.type == "tool.call.started"}
+    assert started.parent_id in tool_starts
+    assert tool_starts[started.parent_id].data.get("tool") == "agent_spawn"
+    assert finished.parent_id == started.event_id
+    assert finished.data["status"] == "completed"
+    assert "usage" in finished.data
+    # The child run records to its OWN run dir; the parent's external sink never sees the
+    # child's internal events (only the subagent.* summary on the parent stream).
+    child_run_id = started.data["child_run_id"]
+    assert all(e.run_id != child_run_id for e in sink.events)
+
+
+def test_child_at_max_depth_has_no_spawn_tool(tmp_path: Path) -> None:
+    # max depth 1: the parent (depth 0) may spawn, but the child (depth 1) is at the cap,
+    # so its agent.spawn binding is stripped and the tool is absent from its requests.
+    adapter = RoutingAdapter(
+        parent=[_spawn_call("delegate", call_id="c1"), ModelTurn(final_text="parent done")],
+        child=[ModelTurn(final_text="child done")],
+    )
+    # The child config DOES bind agent.spawn — without depth-hiding it would be exposed.
+    child_cfg = _child_config("agent.spawn")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        _parent_config(),
+        limits=RunLimits(max_subagent_depth=1),
+        child=child_cfg,
+    )
+
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    child_requests = [r for r in adapter.requests if CHILD_MARK in r.system_prompt]
+    assert child_requests, "the child must have run"
+    for req in child_requests:
+        assert all(getattr(t, "id", "") != "agent.spawn" for t in req.tools)

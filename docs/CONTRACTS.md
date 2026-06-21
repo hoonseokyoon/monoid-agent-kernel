@@ -234,6 +234,32 @@ seams are pluggable:
 Both the model (via tools such as `hitl.request`) and the backend can create
 tasks; a completed task wakes a parked run through the shared reentry queue.
 
+### Subagents (agent-as-tool)
+
+A run can delegate a focused task to an isolated child run. This reuses the Async
+Task seams above via a `subagent` task kind (`SubagentTaskExecutor`); see
+`docs/SUBAGENT_DESIGN.md` for the full design.
+
+- **Enable**: pass `AgentLoop(subagent_definitions={<id>: AgentRuntimeConfig})`.
+  When non-empty, the bootstrap registers the `agent.spawn` tool. The runtime config
+  still needs an explicit binding to `agent.spawn` (e.g. `model_name: "agent_spawn"`)
+  for the tool to reach the model.
+- **Tool**: `agent.spawn(subagent_type, prompt, background=false)`. The child runs
+  in an isolated overlay workspace and sees only `prompt` (not the parent's
+  conversation). Foreground (`background=false`) blocks and returns the child's final
+  message as the tool result; background returns a `{spawned, background, task_id}`
+  ack and the child's final message is delivered later as a user message.
+- **Bounds** (`RunLimits`): `max_subagents` (fan-out per run, default 8) and
+  `max_subagent_depth` (nesting, default 5). Enforced in the executor; a child at the
+  depth cap has the `agent.spawn` tool stripped from its config.
+- **Result shape** (`subagent_result`): `{status, final_text, message, child_run_id,
+  subagent_type, usage, error}`.
+- **Events**: the parent stream carries `subagent.started` (`parent_id` = the spawn
+  tool-call event) and `subagent.finished`/`subagent.failed` (`parent_id` = the
+  `subagent.started` event), the latter carrying the child's `usage`. The child's
+  full event stream goes to its own run dir; external `event_sinks` are not shared
+  with children (stateful sinks like OTel/StatusJson are per-run).
+
 ### Permission Boundary
 
 `PermissionPolicy` remains the workspace/public-output boundary:

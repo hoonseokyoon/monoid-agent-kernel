@@ -96,6 +96,29 @@ class OtelEventSink:
             )
         elif kind in ("tool.call.finished", "tool.call.failed"):
             self._close_child(event, error=(kind == "tool.call.failed"))
+        elif kind == "subagent.started":
+            sub = event.data.get("subagent_type")
+            self._open_child(
+                event,
+                name="execute_subagent " + sub if sub else "execute_subagent",
+                kind=self._SpanKind.INTERNAL,
+                attrs={
+                    "gen_ai.operation.name": "execute_subagent",
+                    "subagent.type": sub,
+                    "subagent.run_id": event.data.get("child_run_id"),
+                    "subagent.background": event.data.get("background"),
+                    "turn_id": event.turn_id,
+                },
+                # Nest under the spawn tool span when it is still open (foreground); a
+                # background spawn's tool span has already closed, so fall back to run.
+                parent_event_id=event.parent_id,
+            )
+        elif kind in ("subagent.finished", "subagent.failed"):
+            self._close_child(
+                event,
+                finish=_subagent_finish_attrs(event.data),
+                error=(kind == "subagent.failed" or event.data.get("status") == "failed"),
+            )
 
     def close(self) -> None:
         # Leak guard: end any spans still open (abnormal termination, missing finish events).
@@ -106,10 +129,20 @@ class OtelEventSink:
             self._run_span.end()
             self._run_span = None
 
-    def _open_child(self, event: AgentEvent, *, name: str, kind: Any, attrs: dict[str, Any]) -> None:
-        # Parent is the run span (siblings), reconstructed explicitly so async/thread hops never
-        # matter — the ambient current-span is never read.
-        context = self._trace.set_span_in_context(self._run_span) if self._run_span is not None else None
+    def _open_child(
+        self,
+        event: AgentEvent,
+        *,
+        name: str,
+        kind: Any,
+        attrs: dict[str, Any],
+        parent_event_id: str | None = None,
+    ) -> None:
+        # Default parent is the run span (siblings), reconstructed explicitly so async/thread
+        # hops never matter — the ambient current-span is never read. ``parent_event_id`` nests
+        # under another still-open child span (e.g. a subagent under its spawn tool span).
+        anchor = self._spans.get(parent_event_id or "") or self._run_span
+        context = self._trace.set_span_in_context(anchor) if anchor is not None else None
         self._spans[event.event_id] = self._tracer.start_span(
             name, context=context, kind=kind, attributes=_clean(attrs)
         )
@@ -164,4 +197,18 @@ def _chat_finish_attrs(data: dict[str, Any]) -> dict[str, Any]:
         attrs["gen_ai.response.finish_reasons"] = ("tool_calls",)
     elif data.get("has_final"):
         attrs["gen_ai.response.finish_reasons"] = ("stop",)
+    return attrs
+
+
+def _subagent_finish_attrs(data: dict[str, Any]) -> dict[str, Any]:
+    """GenAI attributes set when an execute_subagent span ends: the child's token usage
+    (so a parent trace shows delegated cost) and its terminal status."""
+    usage = data.get("usage") or {}
+    attrs: dict[str, Any] = {}
+    if usage.get("input_tokens") is not None:
+        attrs["gen_ai.usage.input_tokens"] = int(usage["input_tokens"])
+    if usage.get("output_tokens") is not None:
+        attrs["gen_ai.usage.output_tokens"] = int(usage["output_tokens"])
+    if data.get("status"):
+        attrs["subagent.status"] = data["status"]
     return attrs

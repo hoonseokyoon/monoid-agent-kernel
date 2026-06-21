@@ -43,11 +43,14 @@ parent turn: model calls the Agent tool
          later as a user message via reentry          (mirrors start_shell_job)
 
   run_child (closure in AgentLoop bootstrap):
+    - emit subagent.started on the PARENT recorder (parent_id = spawn tool-call event)
     - build an isolated child AgentRunSpec (overlay workspace, child run_id)
-    - build a child AgentLoop (shared model_adapter, event_sinks, checkpoint_store,
-      cancellation_token; runtime config from the subagent definition; depth+1)
+    - build a child AgentLoop (shared model_adapter, checkpoint_store,
+      cancellation_token; runtime config from the subagent definition; depth+1).
+      External event_sinks are NOT shared — see Observability below.
     - result = await child.arun_once(prompt)
     - task.result = {final_text, status, usage, child_run_id, ...}
+    - emit subagent.finished on the PARENT recorder (parent_id = subagent.started)
     - manager.mark_ready(task)
 ```
 
@@ -92,14 +95,37 @@ final message (the parent does not see intermediate edits). This matches Claude'
 - **Usage**: the child's token usage is returned in `task.result["usage"]` so the
   parent (and accounting) can attribute it.
 
+## Observability (correlation + usage)
+
+The child run records its full event stream to its **own** run dir via its own
+recorder. External `event_sinks` are deliberately **not** shared with the child:
+sinks like `OtelEventSink` and `StatusJsonSink` hold per-run state (one root span,
+one status doc), so a shared instance would be clobbered by the child's
+`run.started`.
+
+Instead the parent emits two summary events on its own stream:
+
+- `subagent.started` — `parent_id` = the spawn tool-call event id, so it nests under
+  that tool call; data carries `subagent_type`, `child_run_id`, `depth`, `background`.
+- `subagent.finished` / `subagent.failed` — `parent_id` = the `subagent.started`
+  event id (close pairing); data carries `status`, `usage` (the child's token
+  totals, for delegated-cost attribution), and `error`/`error_code`.
+
+`OtelEventSink` maps this pair to an `execute_subagent {type}` span nested under the
+spawn tool span (foreground) or under the run span (background, whose tool span has
+already closed). `child_run_id` ties the summary back to the child's own trace/log.
+
 ## Tool exposure
 
 Tools are exposed only through explicit `ToolBinding`s in the runtime config
 (`compile_bound_tool_catalog`). The `Agent` tool spec is registered in the base
 registry **only when `subagent_definitions` is non-empty**, and the runtime config
 author adds a binding (`ref.tool_id = "agent.spawn"`) to expose it. Depth is
-enforced at call time rather than by hiding the tool (a clean error, no wasted
-config rewriting). Hiding the tool at max depth is a P2 refinement.
+enforced at call time. Additionally, when building a child that would sit **at** the
+depth cap, `_run_subagent_child` strips the `agent.spawn` binding from the child's
+config and gives it no definitions, so the tool is simply absent from that child
+(no wasted turn on a call-time error). The call-time check remains as defense in
+depth.
 
 ## Definitions source (decided: inline)
 
@@ -121,8 +147,10 @@ passed by the embedder. Directory discovery (`--agents-directory`, Claude
 
 - **P1** (this branch): executor/injector + Agent tool + isolated overlay +
   foreground & background + depth/fan-out caps + inline definitions.
-- **P2**: `parent_id` event stamping (OTel child spans nested under the spawn
-  tool call) + usage roll-up into the parent summary + cancellation hardening +
-  hide Agent tool at max depth + `docs/CONTRACTS.md` wire contract.
+- **P2** (done): `subagent.started`/`finished` events with `parent_id` correlation
+  (OTel `execute_subagent` spans) + child usage in the event/span + hide the Agent
+  tool at max depth + stop sharing stateful sinks with children + `CONTRACTS.md` +
+  `contracts.py` exports (`SubagentTaskExecutor`, `agent_spawn_tool`).
 - **P3** (deferred): directory discovery (`--agents-directory`), Skills
-  `context: fork` integration, optional ADK-style state copy-in/delta-back.
+  `context: fork` integration, optional ADK-style state copy-in/delta-back, parent
+  token-budget integration (counting child tokens against the parent's RunLimits).

@@ -116,9 +116,13 @@ from native_agent_runner.web import WebGatewayClient
 # Async task seams (executor/injector/reporter the backend plugs in)
 from native_agent_runner.tasks import (
     ResultInjector,
+    SubagentTaskExecutor,
     TaskExecutor,
     TaskReporter,
 )
+
+# Subagent (agent-as-tool) delegation tool
+from native_agent_runner.tools.builtin import agent_spawn_tool
 
 __all__ = [
     # engine entry / result
@@ -206,4 +210,7 @@ __all__ = [
     "TaskExecutor",
     "ResultInjector",
     "TaskReporter",
+    # subagent (agent-as-tool) delegation
+    "SubagentTaskExecutor",
+    "agent_spawn_tool",
 ]
