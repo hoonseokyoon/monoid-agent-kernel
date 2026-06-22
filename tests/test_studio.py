@@ -15,8 +15,12 @@ from pathlib import Path
 import pytest
 
 from native_agent_runner.errors import ModelAdapterError
-from native_agent_runner.providers.base import ModelRequest, ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from native_agent_runner.providers.base import ModelRequest, ModelTurn, TextDelta, TurnComplete
+from native_agent_runner.providers.fake import (
+    FakeModelAdapter,
+    FakeStreamingModelAdapter,
+    fake_tool_call,
+)
 from native_agent_runner.reference.llm_gateway.providers import EchoModelAdapter
 from native_agent_runner.reference.studio.activity import describe_event
 from native_agent_runner.reference.studio.server import (
@@ -559,5 +563,31 @@ def test_studio_interrupt_keeps_session_alive(tmp_path: Path) -> None:
         # The session is alive: a follow-up message settles.
         server.continue_chat(run_id, "continue")
         assert len(_wait_settled(server, run_id, 1)) >= 1
+    finally:
+        server.shutdown()
+
+
+# --- DX-8: live token streaming (model.output.delta over the event stream) --------------
+
+
+def test_studio_streams_output_deltas(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    adapter = FakeStreamingModelAdapter(
+        chunk_turns=[[TextDelta("Hel"), TextDelta("lo"), TurnComplete(response_id="r1", usage={"total_tokens": 3})]]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: adapter,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("hi")["run_id"]
+        _wait_settled(server, run_id, 1)
+        events = server.poll_events(run_id, 0).get("events", [])
+        deltas = [e for e in events if e.get("type") == "model.output.delta"]
+        assert [d["data"]["text"] for d in deltas] == ["Hel", "lo"]
+        settled = [e for e in events if e.get("type") == "turn.settled"]
+        assert settled and settled[0]["data"]["final_text"] == "Hello"
     finally:
         server.shutdown()

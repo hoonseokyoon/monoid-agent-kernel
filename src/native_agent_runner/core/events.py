@@ -20,6 +20,7 @@ AgentEventType = Literal[
     "checkpoint.committed",
     "agent.config.updated",
     "model.turn.started",
+    "model.output.delta",
     "model.turn.finished",
     "turn.failed",
     "turn.interrupted",

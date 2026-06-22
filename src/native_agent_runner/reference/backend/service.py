@@ -354,6 +354,10 @@ class RunnerBackend:
     # Only auto-retries count toward this cap; user-initiated resends are bounded by max_turns.
     max_consecutive_turn_failures: int = 5
     turn_retry: ModelRetryConfig = field(default_factory=ModelRetryConfig)
+    # Opt-in token streaming for the autonomous drive: when set, runs emit model.output.delta
+    # events (for adapters that support astream_turn) so an event-stream consumer renders tokens
+    # live. Off by default; a UI-facing embedder (e.g. studio) turns it on.
+    emit_output_deltas: bool = False
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -1326,6 +1330,7 @@ class RunnerBackend:
             web_gateway_client=self._web_gateway_client(web_gateway_token),
             runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
             checkpoint_store=self.checkpoint_store,
+            emit_output_deltas=self.emit_output_deltas,
         )
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
@@ -1728,6 +1733,7 @@ class RunnerBackend:
             web_gateway_client=self._web_gateway_client(web_gateway_token),
             runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
             checkpoint_store=self.checkpoint_store,
+            emit_output_deltas=self.emit_output_deltas,
         )
         # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
         # restore re-applies the agent's delta from the checkpoint's content blobs.

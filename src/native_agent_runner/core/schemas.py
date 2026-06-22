@@ -155,6 +155,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         {"reason": _STR},
         required=(),
     ),
+    "model.output.delta": _data_schema(
+        {"text": _STR},
+        required=("text",),
+    ),
     "model.input.degraded": _data_schema(
         {"dropped_part_types": _STR_ARRAY, "reason": _STR},
         required=("reason",),

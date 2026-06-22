@@ -156,6 +156,8 @@ let typingEl = null;
 let lastUserMessage = "";
 let pendingConfigFix = false;  // a non-retryable turn.failed is awaiting a model/effort change
 let generating = false;
+let streamingEl = null;        // the assistant bubble currently being streamed into
+let streamingText = "";
 
 function setGenerating(on) {
   generating = on;
@@ -177,20 +179,39 @@ async function stopRun() {
 }
 stopBtn.addEventListener("click", stopRun);
 
-function bubble(cls, text) {
-  const el = document.createElement("div");
-  el.className = "msg " + cls;
+function renderMarkdown(text) {
   // minimal markdown: **bold** and > quote
   let html = text
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  html = html.split("\n").map(line =>
+  return html.split("\n").map(line =>
     line.startsWith("&gt; ") ? "<blockquote>" + line.slice(5) + "</blockquote>" : line
   ).join("\n");
-  el.innerHTML = html;
+}
+
+function bubble(cls, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + cls;
+  el.innerHTML = renderMarkdown(text);
   log.appendChild(el);
   log.scrollTop = log.scrollHeight;
   return el;
+}
+
+// Live token streaming: append model.output.delta fragments into one assistant bubble.
+function appendDelta(text) {
+  hideTyping();
+  if (!streamingEl) { streamingEl = bubble("assistant", ""); streamingText = ""; }
+  streamingText += text;
+  streamingEl.innerHTML = renderMarkdown(streamingText);
+  log.scrollTop = log.scrollHeight;
+}
+function finalizeStream(finalText) {
+  if (!streamingEl) return false;
+  // Prefer the authoritative assembled final_text if the turn settled with one.
+  if (finalText) streamingEl.innerHTML = renderMarkdown(finalText);
+  streamingEl = null; streamingText = "";
+  return true;
 }
 
 function activity(text) {
@@ -243,12 +264,19 @@ function handleEvent(ev) {
     }
     return;
   }
-  if (type === "turn.interrupted") { hideTyping(); setGenerating(false); return; }
-  if (type === "model.turn.started") { pendingConfigFix = false; setGenerating(true); showTyping(); return; }
+  if (type === "turn.interrupted") { hideTyping(); setGenerating(false); finalizeStream(""); return; }
+  if (type === "model.turn.started") {
+    pendingConfigFix = false; setGenerating(true);
+    streamingEl = null; streamingText = "";  // a fresh turn streams into a new bubble
+    showTyping();
+    return;
+  }
+  if (type === "model.output.delta") { appendDelta(data.text || ""); return; }
   if (type === "model.turn.finished") { hideTyping(); return; }
   if (type === "turn.settled" || type === "run.finished") {
     hideTyping();
     setGenerating(false);
+    if (finalizeStream(data.final_text)) return;  // a streamed bubble is already on screen
     if (data.final_text) bubble("assistant", data.final_text);
     return;
   }
@@ -256,6 +284,7 @@ function handleEvent(ev) {
   if (type === "run.failed" || type === "ModelAdapterError") {
     hideTyping();
     setGenerating(false);
+    finalizeStream("");
     bubble("error", data.error || data.message || "the run failed");
     return;
   }

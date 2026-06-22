@@ -229,6 +229,9 @@ class StudioServer:
             allowed_apply_roots=(self.workspace,),
             llm_gateway_url=f"http://127.0.0.1:{gateway_port}/internal/llm/turns",
             web_gateway_url=f"http://127.0.0.1:{web_port}",
+            # Stream tokens live: emit model.output.delta events the UI renders incrementally
+            # (effective for adapters that support astream_turn — the gateway/openai path).
+            emit_output_deltas=True,
         )
 
         self._ui_server = ThreadingHTTPServer(

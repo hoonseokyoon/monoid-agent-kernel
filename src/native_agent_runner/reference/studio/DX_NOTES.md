@@ -11,20 +11,30 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
-### DX-8 🔴 Token streaming isn't reachable from the autonomous (submit_run) path
-**Found** building the Tier-1 "token streaming" item. The loop only streams when a stream sink is
-active: `_acall_model` (loop.py) relays `astream_turn` chunks via `self._stream_sink.push_delta`,
-and that sink is set **only** on the `loop.astream()` / backend `astream_run` path. Studio drives
-chats via `submit_run` → `arun_until_suspended` (autonomous), so no sink is active → it never
-streams. Two further blockers: (a) deltas go to the RunStream **queue**, not the event recorder,
-so they don't appear in `events.jsonl`/SSE that studio's UI consumes; (b) `OpenAIModelAdapter` has
-**no `astream_turn`** (the deferred P4b-③ "OpenAI direct streaming"), so even the gateway path
-yields one assembled chunk — no real per-token from OpenAI.
+### DX-8 🟢 Token streaming isn't reachable from the autonomous (submit_run) path — FIXED
+**Found** building the Tier-1 "token streaming" item. The loop only streamed when a RunStream sink
+was active (`loop.astream()` / backend `astream_run`); studio drives chats via `submit_run` →
+`arun_until_suspended` (autonomous, no sink), deltas went to the RunStream **queue** (not
+`events.jsonl`/SSE), and `OpenAIModelAdapter` had **no `astream_turn`** (deferred P4b-③) so even the
+gateway path yielded one assembled chunk. Three layers, none of which was the core *engine*:
+- **Provider**: added `OpenAIModelAdapter.astream_turn` (async, `AsyncOpenAI`, `responses.create
+  (stream=True)`) mapping Responses stream events → neutral `TextDelta`/`ToolCallDelta`/`TurnComplete`
+  chunks. The gateway's `_stream_turn` already forwards a provider `astream_turn` when present (else
+  synthesizes one chunk), so **no gateway change** was needed.
+- **Core**: opt-in `AgentLoop.emit_output_deltas`. When set and the adapter supports `astream_turn`,
+  the *autonomous* drive streams via a new `_acall_model_emitting_deltas` that emits each text
+  fragment as a `model.output.delta` event (new type + schema) and folds chunks into the identical
+  assembled `ModelTurn`. This keeps studio's existing multi-turn `submit_run`/SSE transport — no
+  switch to `astream_run` (which is single-submit, no HITL-over-stream). Off by default (CLI/others
+  unaffected); adapters without `astream_turn` (offline echo) fall back to `next_turn`.
+- **Backend + studio**: `RunnerBackend.emit_output_deltas` plumbed into `_build_loop`; studio turns
+  it on and the UI renders `model.output.delta` into one assistant bubble live (`finalizeStream`
+  reconciles with the authoritative `final_text` on settle).
 
-Net: token streaming is a multi-layer effort, not a surface-only Tier-1 item. To do it: switch
-studio chat to the backend `astream_run`/SSE-frame path (or emit a new `model.output.delta` event
-from the autonomous path), require the `[http-async]` extra for `GatewayModelAdapter.astream_turn`,
-and implement `OpenAIModelAdapter.astream_turn`. Deferred; Stop + usage shipped instead.
+Verified live with real OpenAI: 10 incremental fragments (`One`, `…`, `Two`, …) that join exactly to
+the settled `final_text`. The DX-9 limit (Stop is step-boundary) is unchanged — a true
+mid-generation Stop now becomes possible on top of this stream (cancel the async iterator), a
+follow-up if wanted.
 
 ### DX-9 🟢 "Stop" is run-level only (no turn-level interrupt) — FIXED
 Cancellation (`RunnerBackend.cancel_run` / `CancellationToken`) terminalizes the **whole run**, so

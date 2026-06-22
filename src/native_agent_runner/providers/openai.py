@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -13,8 +14,12 @@ from native_agent_runner.providers._common import (
 )
 from native_agent_runner.providers.base import (
     ModelRequest,
+    ModelStreamChunk,
     ModelTurn,
+    TextDelta,
     ToolCall,
+    ToolCallDelta,
+    TurnComplete,
     format_async_result_text,
 )
 
@@ -65,6 +70,75 @@ class OpenAIModelAdapter:
             raise _model_error_from_openai(exc) from exc
         data = response.model_dump() if hasattr(response, "model_dump") else _coerce_response(response)
         return _parse_response(data)
+
+    async def astream_turn(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
+        """Stream a turn from the OpenAI Responses API as neutral ``ModelStreamChunk``s (text
+        fragments, tool-call fragments, a terminal usage chunk). Async so the gateway's
+        private-loop pump and the loop's async drive can consume it; the sync ``next_turn``
+        path is unaffected. Provider errors map to a classified ``ModelAdapterError`` (no body
+        leak), exactly like ``next_turn``."""
+        if not self.allow_direct_provider_api and os.environ.get("NAR_ALLOW_DIRECT_PROVIDER_API") != "1":
+            raise ModelAdapterError(
+                "direct provider API access is disabled; use GatewayModelAdapter for container runs"
+            )
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise ModelAdapterError("openai package is not installed") from exc
+
+        key = self.api_key or os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise ModelAdapterError("OPENAI_API_KEY is required for OpenAIModelAdapter")
+
+        client = AsyncOpenAI(api_key=key)
+        payload = self._payload(request)
+        config = request.model or self.config
+        try:
+            try:
+                stream = await client.responses.create(**payload, stream=True, timeout=config.timeout_s)
+            except TypeError:
+                stream = await client.responses.create(**payload, stream=True)
+        except ModelAdapterError:
+            raise
+        except Exception as exc:
+            raise _model_error_from_openai(exc) from exc
+
+        final_data: dict[str, Any] = {}
+        try:
+            async for event in stream:
+                etype = getattr(event, "type", "")
+                if etype == "response.output_text.delta":
+                    text = getattr(event, "delta", "") or ""
+                    if text:
+                        yield TextDelta(text)
+                elif etype == "response.output_item.added":
+                    item = getattr(event, "item", None)
+                    if item is not None and getattr(item, "type", "") == "function_call":
+                        yield ToolCallDelta(
+                            index=int(getattr(event, "output_index", 0) or 0),
+                            id=str(getattr(item, "call_id", "") or getattr(item, "id", "") or "") or None,
+                            name=str(getattr(item, "name", "") or "") or None,
+                        )
+                elif etype == "response.function_call_arguments.delta":
+                    frag = getattr(event, "delta", "") or ""
+                    if frag:
+                        yield ToolCallDelta(
+                            index=int(getattr(event, "output_index", 0) or 0),
+                            arguments_fragment=frag,
+                        )
+                elif etype == "response.completed":
+                    response = getattr(event, "response", None)
+                    if response is not None and hasattr(response, "model_dump"):
+                        final_data = response.model_dump()
+        except ModelAdapterError:
+            raise
+        except Exception as exc:
+            raise _model_error_from_openai(exc) from exc
+
+        yield TurnComplete(
+            response_id=final_data.get("id"),
+            usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
+        )
 
     def _payload(self, request: ModelRequest) -> dict[str, Any]:
         config = request.model or self.config

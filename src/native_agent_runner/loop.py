@@ -100,6 +100,7 @@ from native_agent_runner.providers.base import (
     ModelRequest,
     ModelStreamChunk,
     ModelTurn,
+    TextDelta,
     ToolObservation,
     assemble_streamed_turn,
     format_async_result_text,
@@ -468,6 +469,11 @@ class AgentLoop:
     tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
     event_sinks: tuple[EventSink, ...] = ()
     status_file: bool = True
+    # Opt-in token streaming for the autonomous (non-RunStream) drive: when set and the model
+    # adapter supports ``astream_turn``, each text fragment is emitted as a ``model.output.delta``
+    # event so an event-stream consumer (e.g. the studio app over SSE) can render tokens live.
+    # Falls back to a one-shot ``next_turn`` for adapters that can't stream. Off by default.
+    emit_output_deltas: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
     shell_approval_provider: ShellApprovalProvider | None = None
@@ -945,6 +951,10 @@ class AgentLoop:
             astream_turn = getattr(adapter, "astream_turn", None)
             if astream_turn is not None:
                 return await self._acall_model_streaming(astream_turn, request, sink)
+        if self.emit_output_deltas:
+            astream_turn = getattr(adapter, "astream_turn", None)
+            if astream_turn is not None:
+                return await self._acall_model_emitting_deltas(astream_turn, request)
         anext = getattr(adapter, "anext_turn", None)
         if anext is not None:
             return await anext(request)
@@ -965,6 +975,24 @@ class AgentLoop:
         async for chunk in astream_turn(request):
             sink.push_delta(chunk)
             chunks.append(chunk)
+        return assemble_streamed_turn(chunks)
+
+    async def _acall_model_emitting_deltas(
+        self,
+        astream_turn: Callable[[ModelRequest], Any],
+        request: ModelRequest,
+    ) -> ModelTurn:
+        """Autonomous-drive streaming (no RunStream queue): drive ``astream_turn`` and emit each
+        text fragment as a ``model.output.delta`` event, so an event-stream consumer renders
+        tokens live. Tool-call/usage chunks are folded only — the assembled ``ModelTurn`` is
+        identical to the one-shot path, so the rest of the turn is unchanged."""
+        assert self._session is not None
+        recorder = self._session.res.recorder
+        chunks: list[ModelStreamChunk] = []
+        async for chunk in astream_turn(request):
+            chunks.append(chunk)
+            if isinstance(chunk, TextDelta) and chunk.text:
+                recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
         return assemble_streamed_turn(chunks)
 
     def _record_failure(self, state: RunState, res: _RunResources, exc: Exception) -> None:

@@ -11,8 +11,12 @@ from native_agent_runner.core.spec import AgentRunSpec, RunLimits
 from native_agent_runner.core.tool_surface import ToolQuota
 from native_agent_runner.errors import ModelAdapterError
 from native_agent_runner.loop import AgentLoop, _recoverable_turn_error
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from native_agent_runner.providers.base import ModelTurn, TextDelta, TurnComplete
+from native_agent_runner.providers.fake import (
+    FakeModelAdapter,
+    FakeStreamingModelAdapter,
+    fake_tool_call,
+)
 from native_agent_runner.recorder import MemoryEventSink
 from native_agent_runner.workspace.local import default_local_workspace_factory, sha256_bytes
 
@@ -608,5 +612,51 @@ def test_stale_interrupt_does_not_kill_next_turn(tmp_path: Path) -> None:
         susp = loop.run_until_suspended("hi")
         assert susp.reason == "settled"
         assert susp.final_text == "ok"
+    finally:
+        loop.close()
+
+
+# --- DX-8: autonomous-drive token streaming (model.output.delta) ------------------------
+
+
+def _streaming_loop(tmp_path: Path, adapter, *, emit: bool):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    sink = MemoryEventSink()
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("run.finish"),
+        event_sinks=(sink,),
+        emit_output_deltas=emit,
+    )
+    return loop, sink
+
+
+def test_autonomous_drive_emits_output_deltas(tmp_path: Path) -> None:
+    adapter = FakeStreamingModelAdapter(
+        chunk_turns=[[TextDelta("Hel"), TextDelta("lo"), TurnComplete(response_id="r1", usage={"total_tokens": 3})]]
+    )
+    loop, sink = _streaming_loop(tmp_path, adapter, emit=True)
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("hi")
+        assert susp.reason == "settled"
+        assert susp.final_text == "Hello"  # assembled identically to the one-shot path
+        deltas = [e for e in sink.events if e.type == "model.output.delta"]
+        assert [d.data["text"] for d in deltas] == ["Hel", "lo"]
+    finally:
+        loop.close()
+
+
+def test_no_output_deltas_when_disabled(tmp_path: Path) -> None:
+    # Off by default: the same streaming adapter falls back to next_turn (no delta events).
+    adapter = FakeStreamingModelAdapter(chunk_turns=[[TextDelta("hi"), TurnComplete()]])
+    loop, sink = _streaming_loop(tmp_path, adapter, emit=False)
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("hi")
+        assert susp.final_text == "hi"
+        assert not [e for e in sink.events if e.type == "model.output.delta"]
     finally:
         loop.close()
