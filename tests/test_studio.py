@@ -113,6 +113,9 @@ def test_runtime_config_binds_read_write_hitl_shell_and_web() -> None:
     config = _agent_runtime_config()
     refs = {binding.ref.tool_id for binding in config.tools}
     assert {"fs.read", "fs.write", "hitl.request", "shell.exec", "web.search", "web.context"} <= refs
+    # The plan tool is always bound (observability) and the prompt nudges its use.
+    assert "run.update_plan" in refs
+    assert config.prompt.system_prompt_base and "run_update_plan" in config.prompt.system_prompt_base
     # The shell binding refuses obviously destructive commands and auto-approves the rest.
     shell = next(b for b in config.tools if b.ref.tool_id == "shell.exec")
     assert any(p.startswith("rm") for p in shell.scope.command_deny_prefixes)
@@ -403,9 +406,10 @@ def test_web_search_runs_through_the_gateway(tmp_path: Path) -> None:
 
 
 def test_runtime_config_for_subset() -> None:
+    # run.update_plan is always bound (observability); capability toggles add the rest.
     refs = {b.ref.tool_id for b in _runtime_config_for(["read"]).tools}
-    assert refs == {"fs.read"}
-    assert _runtime_config_for([]).tools == ()
+    assert refs == {"fs.read", "run.update_plan"}
+    assert {b.ref.tool_id for b in _runtime_config_for([]).tools} == {"run.update_plan"}
 
 
 def test_settings_lists_capabilities_and_provider(tmp_path: Path) -> None:
@@ -420,7 +424,7 @@ def test_settings_change_applies_to_new_chats(studio: StudioServer) -> None:
     studio.update_settings(capabilities=["read"])
     run_id = studio.start_chat("hi")["run_id"]
     config = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
-    assert {b.ref.tool_id for b in config.tools} == {"fs.read"}
+    assert {b.ref.tool_id for b in config.tools} == {"fs.read", "run.update_plan"}
 
 
 def test_settings_model_and_effort_apply_to_new_chats(studio: StudioServer) -> None:
@@ -440,7 +444,7 @@ def test_settings_hot_swaps_active_session(studio: StudioServer) -> None:
     result = studio.update_settings(capabilities=["read"])
     assert result["applied_runs"] == 1
     after = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
-    assert {b.ref.tool_id for b in after.tools} == {"fs.read"}
+    assert {b.ref.tool_id for b in after.tools} == {"fs.read", "run.update_plan"}
     assert after.config_version > before.config_version
 
 
@@ -589,5 +593,46 @@ def test_studio_streams_output_deltas(tmp_path: Path) -> None:
         assert [d["data"]["text"] for d in deltas] == ["Hel", "lo"]
         settled = [e for e in events if e.get("type") == "turn.settled"]
         assert settled and settled[0]["data"]["final_text"] == "Hello"
+    finally:
+        server.shutdown()
+
+
+# --- Tier-2: Plan panel (run.update_plan -> plan.updated) -------------------------------
+
+
+def test_studio_renders_plan_updates(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "run_update_plan",
+                        {"items": [
+                            {"step": "Read the files", "status": "completed"},
+                            {"step": "Edit the code", "status": "in_progress"},
+                        ]},
+                        "c1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="on it"),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("do the task")["run_id"]
+        _wait_settled(server, run_id, 1)
+        events = server.poll_events(run_id, 0).get("events", [])
+        plans = [e for e in events if e.get("type") == "plan.updated"]
+        assert plans, "the Plan panel relies on plan.updated events"
+        items = plans[-1]["data"]["items"]
+        assert {i["step"] for i in items} == {"Read the files", "Edit the code"}
+        assert any(i["status"] == "in_progress" for i in items)
     finally:
         server.shutdown()

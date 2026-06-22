@@ -103,6 +103,12 @@
   button:disabled { opacity: .5; cursor: default; }
   #stop { background: var(--err); color: #1c0606; }
   .usage { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #plan { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+  #plan li { padding: 3px 0; color: var(--muted); display: flex; gap: 6px; align-items: baseline; }
+  #plan li .st { flex: none; width: 14px; text-align: center; }
+  #plan li.done { color: var(--text); }
+  #plan li.done .step { text-decoration: line-through; opacity: .7; }
+  #plan li.active { color: var(--accent); }
 </style>
 </head>
 <body>
@@ -117,6 +123,8 @@
     <aside id="sidebar">
       <div class="side-title">Files</div>
       <ul id="tree"></ul>
+      <div class="side-title" id="plan-title" style="margin-top:14px" hidden>Plan</div>
+      <ol id="plan" hidden></ol>
       <div class="side-title" style="margin-top:14px">Jobs</div>
       <ul id="jobs"></ul>
     </aside>
@@ -247,6 +255,7 @@ function handleEvent(ev) {
   }
   if (type === "task.started" && data.kind === "hitl") { hideTyping(); renderHitl(data); return; }
   if (type.indexOf("job.") === 0) { refreshJobs(); return; }
+  if (type === "plan.updated") { renderPlan(data.items); return; }
   if (type === "metrics.updated") { updateUsage(data); return; }
   if (type === "turn.failed") {
     hideTyping();
@@ -295,6 +304,26 @@ function updateUsage(data) {
   const i = data.input_tokens, o = data.output_tokens, t = data.total_tokens;
   if (t === undefined && i === undefined) return;
   usageEl.textContent = "↑" + (i ?? 0) + " ↓" + (o ?? 0) + " · " + (t ?? 0) + " tok";
+}
+
+const planTitle = document.getElementById("plan-title");
+const planEl = document.getElementById("plan");
+function renderPlan(items) {
+  if (!Array.isArray(items) || items.length === 0) { planTitle.hidden = true; planEl.hidden = true; return; }
+  planTitle.hidden = false; planEl.hidden = false;
+  planEl.innerHTML = "";
+  for (const it of items) {
+    const li = document.createElement("li");
+    const status = String((it && it.status) || "").toLowerCase();
+    let icon = "○";
+    if (status === "completed" || status === "done") { icon = "✓"; li.className = "done"; }
+    else if (status === "in_progress" || status === "active" || status === "running") { icon = "▸"; li.className = "active"; }
+    const st = document.createElement("span"); st.className = "st"; st.textContent = icon;
+    const step = document.createElement("span"); step.className = "step";
+    step.textContent = String((it && (it.step || it.title || it.name)) || "");
+    li.appendChild(st); li.appendChild(step);
+    planEl.appendChild(li);
+  }
 }
 
 const proposalEl = document.getElementById("proposal");

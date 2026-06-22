@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 
 from native_agent_runner.core.agents import (
     AgentRuntimeConfig,
+    PromptSpec,
     RegistryToolRef,
     ToolBinding,
 )
@@ -117,6 +118,21 @@ _EFFORT_CHOICES = ("none", "low", "medium", "high", "xhigh")
 _ALL_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh")
 
 
+# System prompt: introduce the agent + nudge it to keep a live plan (Plan panel). The plan is
+# pure observability — the model self-reports via run.update_plan; the engine never enforces it.
+_SYSTEM_PROMPT = (
+    "You are an agent working inside a user's project workspace. For any task that takes more "
+    "than one step, keep a short running plan with the run_update_plan tool: pass items as "
+    "{step, status} where status is one of pending, in_progress, or completed, and update it as "
+    "you make progress (mark a step in_progress when you start it and completed when done). "
+    "Keep the plan concise — a handful of steps, not a transcript."
+)
+# Always available (observability, not a gated capability): the plan tool the Plan panel renders.
+_PLAN_BINDING = ToolBinding(
+    binding_id="run.update_plan", model_name="run_update_plan", ref=RegistryToolRef("run.update_plan")
+)
+
+
 def _runtime_config_for(
     capabilities: list[str], model: str = _DEFAULT_MODEL, effort: str = _DEFAULT_EFFORT
 ) -> AgentRuntimeConfig:
@@ -124,13 +140,14 @@ def _runtime_config_for(
     chosen model + reasoning effort. The model flows to the gateway as the effective model name
     (ignored by the offline echo provider)."""
     enabled = set(capabilities)
-    tools: list[ToolBinding] = []
+    tools: list[ToolBinding] = [_PLAN_BINDING]  # plan tool is always bound (observability)
     for capability in _ALL_CAPABILITIES:
         if capability in enabled:
             tools.extend(_capability_bindings(capability))
     return AgentRuntimeConfig(
         definition_id="studio-agent",
         model=ModelConfig(model=model, reasoning=ReasoningConfig(effort=effort)),  # provider="gateway"
+        prompt=PromptSpec(system_prompt_base=_SYSTEM_PROMPT),
         tools=tuple(tools),
     )
 
