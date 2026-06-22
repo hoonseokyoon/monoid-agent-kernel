@@ -11,6 +11,32 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
+### DX-7 🟢 A recoverable model error killed the whole conversation
+**Where:** `loop.py` terminalized the run on *any* model-turn exception; a 4xx/429/transient
+error (e.g. `reasoning effort=minimal` rejected by gpt-5.5) ended the session, after which
+`RunnerBackend.send_message` refused follow-ups ("cannot send a message to a terminal run").
+Found live in Studio.
+
+**Fixed (core mechanism + backend policy + reference fidelity), prior-art-aligned (OpenAI
+Assistants: thread survives a failed run; LangGraph: state not advanced on failure):**
+- core: `loop.py` classifies recoverable model errors and returns a non-terminal
+  `Suspension(reason="turn_failed", retryable, http_status)` (idempotent re-attempt — only
+  `pending_observations` is cleared), emits `turn.failed`, keeps the session alive; adds
+  `fail_recoverable` for give-up. Suspension.reason / AgentEventType / schemas extended additively.
+- backend: `_drive_open_session` retries transient turn failures with async backoff, parks
+  config-4xx for the user to fix + resend, gives up after `max_consecutive_turn_failures`.
+- reference fidelity: `providers/openai.py` now maps a provider 4xx to a classified
+  `ModelAdapterError(http_status, retryable)` (body-free) instead of leaking the raw SDK error
+  (which the gateway had mistranslated to a retryable 500).
+- studio: `turn.failed` renders inline, the composer stays enabled, and a model/effort change
+  auto-resends (plus a Retry button).
+
+Verified live: `effort=minimal` → `turn.failed (400, retryable=false)`, session parked (not
+terminal), `send_message` accepted, `effort=medium` → resend settles. Covered by
+`test_loop.py` (P1), `test_backend.py` + `test_cli_and_openai.py` (P2), `test_studio.py` (P3).
+
+---
+
 ### DX-1 🟢 LLM gateway has no key-less / fake provider seam
 **Fixed:** added `reference/llm_gateway/providers.py` (`EchoModelAdapter`, `offline_provider_factory`)
 — the LLM-side counterpart of `FakeWebProvider` — and a `native-agent llm-gateway serve

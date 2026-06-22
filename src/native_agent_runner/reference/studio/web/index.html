@@ -66,6 +66,9 @@
     border: 1px solid var(--border); }
   .msg.error { align-self: flex-start; background: #2a1c1c; border: 1px solid var(--err);
     color: var(--err); }
+  .msg.error .retry { margin-top: 8px; background: var(--err); color: #1c0606; border: 0;
+    border-radius: 8px; padding: 6px 14px; font-weight: 600; cursor: pointer; }
+  .msg.error .retry:disabled { opacity: .5; cursor: default; }
   .msg strong { color: var(--accent); }
   .msg blockquote { margin: 6px 0; padding-left: 10px; border-left: 3px solid var(--border);
     color: var(--muted); }
@@ -83,6 +86,14 @@
   .hitl.answered { opacity: .65; }
   .hitl .answered-note { color: var(--muted); font-size: 12px; margin-top: 8px; }
   footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
+  #setup { display: flex; align-items: center; gap: 14px; max-width: 900px; margin: 0 auto 8px;
+    font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  #setup label { display: flex; align-items: center; gap: 6px; }
+  #setup input, #setup select { background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; font: inherit; }
+  #setup input { width: 150px; }
+  #setup input:disabled { opacity: .5; }
+  #setup-status { color: var(--accent); }
   form { display: flex; gap: 10px; max-width: 900px; margin: 0 auto; }
   textarea { flex: 1; resize: none; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font: inherit;
@@ -116,6 +127,11 @@
     </aside>
   </div>
   <footer>
+    <div id="setup">
+      <label>Model <input id="model" type="text" spellcheck="false" autocomplete="off" /></label>
+      <label>Effort <select id="effort"></select></label>
+      <span id="setup-status"></span>
+    </div>
     <form id="form">
       <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)" autofocus></textarea>
       <button id="send" type="submit">Send</button>
@@ -131,6 +147,8 @@ let runId = null;
 let evtSource = null;
 let seenSeq = -1;
 let typingEl = null;
+let lastUserMessage = "";
+let pendingConfigFix = false;  // a non-retryable turn.failed is awaiting a model/effort change
 
 function bubble(cls, text) {
   const el = document.createElement("div");
@@ -181,7 +199,21 @@ function handleEvent(ev) {
   }
   if (type === "task.started" && data.kind === "hitl") { hideTyping(); renderHitl(data); return; }
   if (type.indexOf("job.") === 0) { refreshJobs(); return; }
-  if (type === "model.turn.started") { showTyping(); return; }
+  if (type === "turn.failed") {
+    hideTyping();
+    const msg = data.error || "the model turn failed";
+    if (data.retryable) {
+      activity("⚠ " + msg + " — retrying…");
+    } else {
+      // recoverable but not retryable (e.g. a config 4xx): the session stays alive; the user
+      // fixes model/effort above and resends. Composer stays enabled.
+      pendingConfigFix = true;
+      const card = bubble("error", msg + "\n\nAdjust the model/effort above, then retry.");
+      showRetry(card);
+    }
+    return;
+  }
+  if (type === "model.turn.started") { pendingConfigFix = false; showTyping(); return; }
   if (type === "model.turn.finished") { hideTyping(); return; }
   if (type === "turn.settled" || type === "run.finished") {
     hideTyping();
@@ -346,7 +378,22 @@ function openStream() {
   evtSource.onerror = () => { /* EventSource auto-reconnects */ };
 }
 
+function showRetry(afterCard) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "retry";
+  btn.textContent = "Retry";
+  btn.addEventListener("click", () => {
+    btn.disabled = true;
+    if (lastUserMessage) send(lastUserMessage);
+  });
+  afterCard.appendChild(document.createElement("br"));
+  afterCard.appendChild(btn);
+}
+
 async function send(message) {
+  lastUserMessage = message;
+  pendingConfigFix = false;
   bubble("user", message);
   sendBtn.disabled = true;
   try {
@@ -407,6 +454,43 @@ async function loadTree() {
   } catch (_) {}
 }
 
+async function saveSetting(payload, label) {
+  const st = document.getElementById("setup-status");
+  st.textContent = "saving…";
+  try {
+    const r = await (await fetch("/api/settings", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    })).json();
+    if (r.error) { st.textContent = "error: " + r.error; return; }
+    st.textContent = label + " updated" + (r.applied_runs ? " · hot-swapped " + r.applied_runs : "");
+    setTimeout(() => { st.textContent = ""; }, 2500);
+    // If a turn just failed on a config issue, the fix is in — auto-resend the last message.
+    if (pendingConfigFix && lastUserMessage) {
+      pendingConfigFix = false;
+      send(lastUserMessage);
+    }
+  } catch (_) { st.textContent = "error"; }
+}
+
+async function loadSetup() {
+  try {
+    const s = await (await fetch("/api/settings")).json();
+    const modelEl = document.getElementById("model");
+    const effortEl = document.getElementById("effort");
+    modelEl.value = s.model || "";
+    if (s.offline) { modelEl.disabled = true; modelEl.title = "offline echo model — ignored"; }
+    effortEl.innerHTML = "";
+    for (const e of (s.efforts || [])) {
+      const opt = document.createElement("option");
+      opt.value = e; opt.textContent = e;
+      if (e === s.effort) opt.selected = true;
+      effortEl.appendChild(opt);
+    }
+    modelEl.addEventListener("change", () => saveSetting({ model: modelEl.value }, "Model"));
+    effortEl.addEventListener("change", () => saveSetting({ effort: effortEl.value }, "Effort"));
+  } catch (_) {}
+}
+
 (async function init() {
   try {
     const cfg = await (await fetch("/api/config")).json();
@@ -417,6 +501,7 @@ async function loadTree() {
     if (cfg.offline) badge.classList.add("offline");
   } catch (_) {}
   loadTree();
+  loadSetup();
 })();
 </script>
 </body>

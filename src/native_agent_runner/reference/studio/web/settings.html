@@ -12,7 +12,12 @@
   * { box-sizing: border-box; }
   body { background: var(--bg); color: var(--text); margin: 0; padding: 20px;
     font: 14px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-  h1 { font-size: 16px; margin: 0 0 4px; }
+  h1 { font-size: 16px; margin: 0; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .close { background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 8px; width: 30px; height: 30px; font-size: 15px; line-height: 1; cursor: pointer;
+    padding: 0; }
+  .close:hover { color: var(--text); border-color: var(--muted); }
   .sub { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
   .group { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
     padding: 14px 16px; margin-bottom: 16px; }
@@ -32,7 +37,10 @@
 </style>
 </head>
 <body>
-  <h1>Settings</h1>
+  <div class="topbar">
+    <h1>Settings</h1>
+    <button class="close" id="close" type="button" title="Back to chat" aria-label="Back to chat">✕</button>
+  </div>
   <div class="sub">Changes apply to new chats and hot-swap any active session.</div>
 
   <div class="group">
@@ -55,6 +63,12 @@
 <script>
 const capsEl = document.getElementById("caps");
 const statusEl = document.getElementById("status");
+
+// Back to chat: prefer history (keeps the in-progress chat in this window); otherwise navigate.
+document.getElementById("close").addEventListener("click", () => {
+  if (window.history.length > 1) window.history.back();
+  else window.location.href = "/";
+});
 
 async function load() {
   const s = await (await fetch("/api/settings")).json();

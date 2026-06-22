@@ -34,6 +34,7 @@ from native_agent_runner.core.agents import (
     RegistryToolRef,
     ToolBinding,
 )
+from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
 from native_agent_runner.core.tool_surface import ToolScope
 from native_agent_runner.errors import NativeAgentError
 from native_agent_runner.reference._shared.tokens import TokenManager
@@ -105,14 +106,33 @@ def _capability_bindings(capability: str) -> tuple[ToolBinding, ...]:
     return ()
 
 
-def _runtime_config_for(capabilities: list[str]) -> AgentRuntimeConfig:
-    """Build the runtime config for an enabled-capability set (order-stable, deduped)."""
+# Model + reasoning effort are quick-editable from the chat composer's setup bar.
+_DEFAULT_MODEL = "gpt-5.5"
+_DEFAULT_EFFORT = "medium"
+# Offered in the UI — the reasoning efforts the default model (gpt-5.5) accepts:
+# none/low/medium/high/xhigh (NOT "minimal", which is gpt-5-only and was replaced by "none"
+# in the 5.1+ series). Effort support is model-dependent; a non-default model may differ.
+_EFFORT_CHOICES = ("none", "low", "medium", "high", "xhigh")
+# Validation superset = the engine's full ReasoningEffort literal (some values suit other models).
+_ALL_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh")
+
+
+def _runtime_config_for(
+    capabilities: list[str], model: str = _DEFAULT_MODEL, effort: str = _DEFAULT_EFFORT
+) -> AgentRuntimeConfig:
+    """Build the runtime config for an enabled-capability set (order-stable, deduped) plus the
+    chosen model + reasoning effort. The model flows to the gateway as the effective model name
+    (ignored by the offline echo provider)."""
     enabled = set(capabilities)
     tools: list[ToolBinding] = []
     for capability in _ALL_CAPABILITIES:
         if capability in enabled:
             tools.extend(_capability_bindings(capability))
-    return AgentRuntimeConfig(definition_id="studio-agent", tools=tuple(tools))
+    return AgentRuntimeConfig(
+        definition_id="studio-agent",
+        model=ModelConfig(model=model, reasoning=ReasoningConfig(effort=effort)),  # provider="gateway"
+        tools=tuple(tools),
+    )
 
 
 def _agent_runtime_config() -> AgentRuntimeConfig:
@@ -150,6 +170,9 @@ class StudioServer:
         self._backend: RunnerBackend | None = None
         # The live-editable Agent capability set (Settings window, R6). Defaults to everything.
         self._capabilities: list[str] = list(_ALL_CAPABILITIES)
+        # Live-editable model + reasoning effort (chat composer setup bar).
+        self._model: str = _DEFAULT_MODEL
+        self._effort: str = _DEFAULT_EFFORT
         # run_id -> run access token (held server-side, never sent to the browser).
         self._run_tokens: dict[str, str] = {}
         self._lock = threading.RLock()
@@ -239,7 +262,7 @@ class StudioServer:
     def start_chat(self, message: str) -> dict[str, Any]:
         """Open a new multi-turn session in the workspace and deliver the first message."""
         assert self._backend is not None
-        runtime_config = _runtime_config_for(self._capabilities)  # the currently-enabled capabilities
+        runtime_config = _runtime_config_for(self._capabilities, self._model, self._effort)
         request = BackendRunRequest(
             tenant_id=_TENANT,
             user_id=_USER,
@@ -311,20 +334,35 @@ class StudioServer:
         )
 
     def settings(self) -> dict[str, Any]:
-        """Current Studio settings for the Settings window: provider + the Agent capability set."""
+        """Current Studio settings: provider, capability set, and the model + reasoning effort."""
         return {
             "provider": self.config.provider,
             "offline": self.offline,
             "capabilities": list(self._capabilities),
             "available": [{"key": cap, "label": _CAPABILITY_LABELS[cap]} for cap in _ALL_CAPABILITIES],
+            "model": self._model,
+            "effort": self._effort,
+            "efforts": list(_EFFORT_CHOICES),
         }
 
-    def update_settings(self, capabilities: list[str]) -> dict[str, Any]:
-        """Change the Agent's capability set. New chats use it; active sessions are hot-swapped
-        in place via runtime-config replacement (applied at their next turn)."""
+    def update_settings(
+        self,
+        *,
+        capabilities: list[str] | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> dict[str, Any]:
+        """Change the Agent's capabilities / model / reasoning effort. Only provided fields
+        change. New chats use the result; active sessions are hot-swapped in place via
+        runtime-config replacement (applied at their next turn)."""
         assert self._backend is not None
-        caps = [cap for cap in _ALL_CAPABILITIES if cap in set(capabilities)]
-        self._capabilities = caps
+        if capabilities is not None:
+            self._capabilities = [cap for cap in _ALL_CAPABILITIES if cap in set(capabilities)]
+        if model is not None and model.strip():
+            self._model = model.strip()
+        if effort is not None and effort in _ALL_EFFORTS:
+            self._effort = effort
+        new_config = _runtime_config_for(self._capabilities, self._model, self._effort)
         with self._lock:
             active = list(self._run_tokens.items())
         applied = 0
@@ -338,13 +376,18 @@ class StudioServer:
                     token,
                     expected_version=current.config_version,
                     issuer="studio-settings",
-                    reason="capability change from Settings",
-                    config=_runtime_config_for(caps),
+                    reason="settings change",
+                    config=new_config,
                 )
                 applied += 1
             except (NativeAgentError, ValueError):
                 pass  # terminal or stale run — skip
-        return {"capabilities": caps, "applied_runs": applied}
+        return {
+            "capabilities": list(self._capabilities),
+            "model": self._model,
+            "effort": self._effort,
+            "applied_runs": applied,
+        }
 
     def list_files(self) -> list[dict[str, Any]]:
         """A flat, sorted listing of the workspace for the file-tree panel (read-only;
@@ -473,11 +516,18 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/settings":
                     body = self._read_json()
-                    caps = body.get("capabilities") or []
-                    if not isinstance(caps, list):
-                        self._write_json({"error": "capabilities must be a list"}, HTTPStatus.BAD_REQUEST)
-                        return
-                    self._write_json(studio.update_settings([str(c) for c in caps]))
+                    kwargs: dict[str, Any] = {}
+                    if "capabilities" in body:
+                        caps = body.get("capabilities")
+                        if not isinstance(caps, list):
+                            self._write_json({"error": "capabilities must be a list"}, HTTPStatus.BAD_REQUEST)
+                            return
+                        kwargs["capabilities"] = [str(c) for c in caps]
+                    if "model" in body:
+                        kwargs["model"] = str(body.get("model") or "")
+                    if "effort" in body:
+                        kwargs["effort"] = str(body.get("effort") or "")
+                    self._write_json(studio.update_settings(**kwargs))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
             except NativeAgentError as exc:

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from native_agent_runner.errors import ModelAdapterError
 from native_agent_runner.providers.base import ModelRequest, ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.reference.llm_gateway.providers import EchoModelAdapter
@@ -411,10 +412,19 @@ def test_settings_lists_capabilities_and_provider(tmp_path: Path) -> None:
 
 
 def test_settings_change_applies_to_new_chats(studio: StudioServer) -> None:
-    studio.update_settings(["read"])
+    studio.update_settings(capabilities=["read"])
     run_id = studio.start_chat("hi")["run_id"]
     config = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
     assert {b.ref.tool_id for b in config.tools} == {"fs.read"}
+
+
+def test_settings_model_and_effort_apply_to_new_chats(studio: StudioServer) -> None:
+    studio.update_settings(model="gpt-x-test", effort="high")
+    run_id = studio.start_chat("hi")["run_id"]
+    config = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
+    assert config.model is not None
+    assert config.model.model == "gpt-x-test"
+    assert config.model.reasoning.effort == "high"
 
 
 def test_settings_hot_swaps_active_session(studio: StudioServer) -> None:
@@ -422,8 +432,49 @@ def test_settings_hot_swaps_active_session(studio: StudioServer) -> None:
     _wait_settled(studio, run_id, 1)  # turn settles -> session active (awaiting input), not terminal
     before = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
     assert "fs.write" in {b.ref.tool_id for b in before.tools}
-    result = studio.update_settings(["read"])
+    result = studio.update_settings(capabilities=["read"])
     assert result["applied_runs"] == 1
     after = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
     assert {b.ref.tool_id for b in after.tools} == {"fs.read"}
     assert after.config_version > before.config_version
+
+
+# --- recoverable turn errors (studio surfaces turn.failed; session stays alive) ---------
+
+
+class _RaiseThenAdapter:
+    """A gateway provider that raises scripted exceptions, otherwise returns turns."""
+
+    def __init__(self, script: list) -> None:
+        self.script = list(script)
+
+    def next_turn(self, request):  # noqa: ANN001
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def test_studio_surfaces_turn_failed_without_terminating(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    adapter = _RaiseThenAdapter(
+        [ModelAdapterError("unsupported effort", http_status=400), ModelTurn(final_text="ok now")]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: adapter,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("do the thing")["run_id"]
+        failed = _wait_event(server, run_id, "turn.failed")
+        assert failed is not None
+        assert failed["data"]["http_status"] == 400
+        assert failed["data"]["retryable"] is False
+        # The session is NOT terminal — a follow-up is accepted (this is the whole point).
+        assert server.run_status(run_id)["status"] not in {"completed", "failed", "limited"}
+        server.continue_chat(run_id, "try again")
+        assert _wait_settled(server, run_id, 1)  # the resend settles
+    finally:
+        server.shutdown()
