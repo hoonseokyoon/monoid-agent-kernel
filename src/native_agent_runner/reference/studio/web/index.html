@@ -118,6 +118,23 @@
   .subagent.failed .sa-status { color: var(--err); }
   .subagent .sa-act { font-size: 12px; color: var(--muted); padding: 1px 0; }
   .subagent .sa-out { white-space: pre-wrap; font-size: 13px; margin-top: 4px; }
+  .hlink { color: var(--muted); text-decoration: none; font-size: 12px; margin-left: 10px; cursor: pointer; }
+  .hlink:hover, .hlink.on { color: var(--accent); }
+  #sessions { list-style: none; padding: 0; margin: 0; }
+  #sessions li { font-size: 12px; padding: 4px 6px; border-radius: 6px; cursor: pointer; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #sessions li:hover { background: rgba(255,255,255,.05); }
+  #sessions li.active { background: rgba(255,255,255,.08); color: var(--text); }
+  #sessions li .dot { display: inline-block; width: 6px; height: 6px; border-radius: 999px; margin-right: 6px;
+    background: var(--muted); vertical-align: middle; }
+  #sessions li.live .dot { background: var(--accent); }
+  #trace { overflow: auto; }
+  #trace-tree { font-size: 12px; font-variant-numeric: tabular-nums; }
+  #trace-tree ul { list-style: none; margin: 0; padding-left: 14px; border-left: 1px solid var(--border, #2a2f3a); }
+  #trace-tree > ul { padding-left: 0; border-left: 0; }
+  #trace-tree li { padding: 2px 0; color: var(--muted); }
+  #trace-tree .tt-type { color: var(--text); }
+  #trace-tree li.err .tt-type { color: var(--err); }
 </style>
 </head>
 <body>
@@ -126,11 +143,15 @@
     <span class="ws" id="ws">…</span>
     <span class="badge" id="provider">…</span>
     <span class="usage" id="usage" title="tokens this run"></span>
+    <a href="#" id="newchat" class="hlink" title="Start a new chat">＋ New</a>
+    <a href="#" id="trace-btn" class="hlink" title="Toggle the run trace">Trace</a>
     <a href="/settings" title="Settings" style="color:var(--muted);text-decoration:none;font-size:16px;margin-left:6px">⚙</a>
   </header>
   <div id="body">
     <aside id="sidebar">
-      <div class="side-title">Files</div>
+      <div class="side-title">Chats</div>
+      <ul id="sessions"></ul>
+      <div class="side-title" style="margin-top:14px">Files</div>
       <ul id="tree"></ul>
       <div class="side-title" id="plan-title" style="margin-top:14px" hidden>Plan</div>
       <ol id="plan" hidden></ol>
@@ -144,6 +165,10 @@
       <pre id="diff"></pre>
       <button id="apply" type="button">Approve &amp; apply</button>
       <div id="apply-status"></div>
+    </aside>
+    <aside id="trace" hidden>
+      <div class="side-title">Trace</div>
+      <div id="trace-tree"></div>
     </aside>
   </div>
   <footer>
@@ -257,6 +282,10 @@ function handleEvent(ev) {
   if (seq >= 0) seenSeq = seq;
   const type = ev.type || "";
   const data = ev.data || {};
+  if (ev.event_id && !_TRACE_SKIP.has(type)) {  // collect for the trace tree
+    runEvents.push(ev);
+    if (traceAside && !traceAside.hidden) renderTrace();
+  }
   if (ev.studio_activity) { hideTyping(); activity(ev.studio_activity); return; }
   if (type === "proposal.ready" || type === "workspace.diff.updated" || type === "workspace.proposal.updated") {
     refreshProposal();
@@ -589,7 +618,7 @@ async function send(message) {
     });
     const body = await res.json();
     if (body.error) { bubble("error", body.error); return; }
-    if (!runId && body.run_id) { runId = body.run_id; openStream(); }
+    if (!runId && body.run_id) { runId = body.run_id; openStream(); refreshSessions(); }
     setGenerating(true);  // show Stop until the turn settles/parks
   } catch (err) {
     bubble("error", String(err));
@@ -678,6 +707,109 @@ async function loadSetup() {
   } catch (_) {}
 }
 
+// --- R8: session history + trace tree ---------------------------------------------------
+const sessionsEl = document.getElementById("sessions");
+const newchatBtn = document.getElementById("newchat");
+const traceBtn = document.getElementById("trace-btn");
+const traceAside = document.getElementById("trace");
+const traceTreeEl = document.getElementById("trace-tree");
+let runEvents = [];
+const _TRACE_SKIP = new Set([
+  "model.output.delta", "metrics.updated", "workspace.file.read", "workspace.file.changed",
+  "workspace.diff.updated", "workspace.proposal.updated", "checkpoint.committed",
+]);
+
+function resetChatView() {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  log.innerHTML = "";
+  seenSeq = -1; typingEl = null; streamingEl = null; streamingText = "";
+  runEvents = []; pendingConfigFix = false;
+  for (const cid in subagents) { if (subagents[cid].timer) clearTimeout(subagents[cid].timer); delete subagents[cid]; }
+  renderPlan([]); setGenerating(false);
+  usageEl.textContent = "";
+  if (traceAside && !traceAside.hidden) renderTrace();
+}
+
+function newChat() {
+  runId = null;
+  resetChatView();
+  refreshSessions();
+  input.focus();
+}
+
+function loadSession(id) {
+  if (id === runId) return;
+  runId = id;
+  resetChatView();
+  openStream();       // replays from seq 0, then streams live
+  refreshSessions();  // highlight the active session
+}
+
+async function refreshSessions() {
+  try {
+    const body = await (await fetch("/api/sessions")).json();
+    sessionsEl.innerHTML = "";
+    for (const s of (body.sessions || [])) {
+      const li = document.createElement("li");
+      if (!["completed", "failed", "limited"].includes(s.status)) li.classList.add("live");
+      if (s.run_id === runId) li.classList.add("active");
+      const dot = document.createElement("span"); dot.className = "dot";
+      li.appendChild(dot);
+      li.appendChild(document.createTextNode(s.title || s.run_id));
+      li.title = (s.title || s.run_id) + " — " + s.status;
+      li.addEventListener("click", () => loadSession(s.run_id));
+      sessionsEl.appendChild(li);
+    }
+  } catch (_) {}
+}
+
+function traceLabel(ev) {
+  const d = ev.data || {};
+  if (ev.type === "tool.call.started") return "tool · " + childActivity(d);
+  if (ev.type === "tool.call.finished") return "tool · " + (d.tool || "") + (d.ok === false ? " ✕ " + (d.error || "") : " ✓");
+  if (ev.type === "subagent.started") return "subagent · " + (d.subagent_type || "");
+  if (ev.type === "subagent.finished" || ev.type === "subagent.failed") return "subagent · " + (d.status || "");
+  if (ev.type === "plan.updated") return "plan · " + ((d.items || []).length) + " steps";
+  if (ev.type === "turn.settled") return "turn settled";
+  return ev.type;
+}
+function renderTrace() {
+  if (!traceTreeEl) return;
+  const evs = runEvents.filter((e) => e.event_id);
+  const ids = new Set(evs.map((e) => e.event_id));
+  const children = {};
+  const roots = [];
+  for (const e of evs) {
+    if (e.parent_id && ids.has(e.parent_id)) (children[e.parent_id] = children[e.parent_id] || []).push(e);
+    else roots.push(e);
+  }
+  const build = (list) => {
+    const ul = document.createElement("ul");
+    for (const e of list) {
+      const li = document.createElement("li");
+      if (e.level === "error" || (e.data && e.data.ok === false)) li.classList.add("err");
+      const sp = document.createElement("span"); sp.className = "tt-type"; sp.textContent = traceLabel(e);
+      li.appendChild(sp);
+      const kids = children[e.event_id];
+      if (kids) li.appendChild(build(kids));
+      ul.appendChild(li);
+    }
+    return ul;
+  };
+  traceTreeEl.innerHTML = "";
+  if (!roots.length) { traceTreeEl.textContent = "(no events yet)"; return; }
+  traceTreeEl.appendChild(build(roots));
+}
+
+newchatBtn.addEventListener("click", (e) => { e.preventDefault(); newChat(); });
+traceBtn.addEventListener("click", (e) => {
+  e.preventDefault();
+  const show = traceAside.hidden;
+  traceAside.hidden = !show;
+  traceBtn.classList.toggle("on", show);
+  if (show) renderTrace();
+});
+
 (async function init() {
   try {
     const cfg = await (await fetch("/api/config")).json();
@@ -689,6 +821,7 @@ async function loadSetup() {
   } catch (_) {}
   loadTree();
   loadSetup();
+  refreshSessions();
 })();
 </script>
 </body>

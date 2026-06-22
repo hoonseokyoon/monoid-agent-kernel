@@ -225,6 +225,9 @@ class StudioServer:
         self._effort: str = _DEFAULT_EFFORT
         # run_id -> run access token (held server-side, never sent to the browser).
         self._run_tokens: dict[str, str] = {}
+        # Chat sessions started this server run (newest first): the history list. In-memory only —
+        # see DX note: a cross-restart history would need a backend "list runs" API.
+        self._sessions: list[dict[str, Any]] = []
         self._lock = threading.RLock()
         self._base_url = ""
 
@@ -328,9 +331,28 @@ class StudioServer:
             runtime_config=runtime_config,
         )
         submission = self._backend.submit_run(request)
+        title = " ".join(message.split())[:60] or "(empty)"
         with self._lock:
             self._run_tokens[submission.run_id] = submission.run_token
+            self._sessions.insert(0, {"run_id": submission.run_id, "title": title, "created_at": time.time()})
         return {"run_id": submission.run_id, "status": submission.status}
+
+    def sessions(self) -> dict[str, Any]:
+        """The chat history: sessions started this server run (newest first) with their live
+        status. In-memory only — a session list that survives a restart would need a backend
+        run-listing API (the run dirs persist under run_root, but their access tokens don't)."""
+        assert self._backend is not None
+        with self._lock:
+            entries = list(self._sessions)
+        out: list[dict[str, Any]] = []
+        for entry in entries:
+            status = "unknown"
+            try:
+                status = self._backend.status(entry["run_id"], self._token_for(entry["run_id"])).get("status", "unknown")
+            except NativeAgentError:
+                pass
+            out.append({**entry, "status": status})
+        return {"sessions": out}
 
     def continue_chat(self, run_id: str, message: str) -> dict[str, Any]:
         assert self._backend is not None
@@ -531,6 +553,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/api/files":
                 self._write_json({"workspace": str(studio.workspace), "files": studio.list_files()})
+                return
+            if parsed.path == "/api/sessions":
+                self._write_json(studio.sessions())
                 return
             if parsed.path == "/api/proposal":
                 run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]

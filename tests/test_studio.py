@@ -684,3 +684,46 @@ def test_studio_spawns_subagent_and_exposes_child_events(tmp_path: Path) -> None
         assert server.subagent_events("../secrets")["events"] == []
     finally:
         server.shutdown()
+
+
+# --- R8: session history --------------------------------------------------------------
+
+
+def test_studio_sessions_lists_started_chats_newest_first(studio: StudioServer) -> None:
+    r1 = studio.start_chat("first task")["run_id"]
+    _wait_settled(studio, r1, 1)
+    r2 = studio.start_chat("second task")["run_id"]
+    _wait_settled(studio, r2, 1)
+    sessions = studio.sessions()["sessions"]
+    assert [s["title"] for s in sessions[:2]] == ["second task", "first task"]  # newest first
+    assert {r1, r2} <= {s["run_id"] for s in sessions}
+    # each entry carries a live status (active multi-turn sessions are not terminal)
+    by_id = {s["run_id"]: s for s in sessions}
+    assert by_id[r1]["status"] not in {"completed", "failed", "limited"}
+
+
+def test_run_events_carry_trace_nesting(tmp_path: Path) -> None:
+    # The trace tree nests by event_id/parent_id; verify a tool call nests under its turn.
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("hi\n", encoding="utf-8")
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "c1"),)),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("read it")["run_id"]
+        _wait_settled(server, run_id, 1)
+        events = server.poll_events(run_id, 0).get("events", [])
+        ids = {e["event_id"] for e in events if e.get("event_id")}
+        tool = next(e for e in events if e.get("type") == "tool.call.started")
+        assert tool.get("event_id") and tool.get("parent_id") in ids  # nests under a parent event
+    finally:
+        server.shutdown()

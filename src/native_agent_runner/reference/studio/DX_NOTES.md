@@ -11,6 +11,16 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
+### DX-12 🟡 Session history doesn't survive a restart (no backend run-listing API)
+Building R8 (chat history). Studio lists the chats it started this server run from an in-memory
+map (`_sessions`) — and loading a past chat just re-opens its event stream (`/api/events` replays
+from seq 0), so no new core surface was needed for the in-session case. But a history that survives
+a **restart** can't be rebuilt: the run dirs persist under `run_root`, yet the backend exposes no
+"list my runs" API, and each run's events are gated behind a per-run token that studio held only in
+memory. `recover_runs()` lists *recoverable* (parked) runs, not all of them, and doesn't mint read
+tokens. Clean fix would be a backend `list_runs(tenant, ...)` (+ a way to re-issue a read token for
+an owned run) so an embedder can rebuild history from disk. Deferred — in-session history shipped.
+
 ### DX-11 🟢 Streaming a child subagent's work to the parent UI — FIXED
 Building the subagent feature with live progress. A spawned subagent is an **isolated child run**
 (`AgentLoop` with run id `<parent>.sub.<task>`, its own recorder); the parent's event stream only
