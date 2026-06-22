@@ -14,7 +14,8 @@ from conftest import http_json, runtime_config, tool_binding, wait_http_ready
 from native_agent_runner.core._util import write_json_atomic
 from native_agent_runner.core.checkpoint import RunCheckpoint
 from native_agent_runner.core.tool_surface import ToolScope
-from native_agent_runner.errors import PermissionDenied
+from native_agent_runner.core.spec import ModelRetryConfig
+from native_agent_runner.errors import ModelAdapterError, PermissionDenied
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
@@ -1182,3 +1183,158 @@ def _json_get(url: str, *, token: str) -> dict:
 
 def _wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
     wait_http_ready(base_url, timeout_s=timeout_s)
+
+
+# --- recoverable turn errors: backend retry policy -------------------------------------
+
+
+class _ScriptedTurnAdapter:
+    """Drives a script of turns/exceptions: a ModelTurn is returned, a BaseException raised."""
+
+    def __init__(self, script: list) -> None:
+        self.script = list(script)
+        self.requests: list = []
+
+    def next_turn(self, request):  # noqa: ANN001
+        self.requests.append(request)
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _scripted_backend(tmp_path: Path, workspace: Path, adapters: list, script: list) -> RunnerBackend:
+    token_manager = _token_manager()
+
+    def factory(spec, llm_gateway_token):  # noqa: ANN001
+        del spec, llm_gateway_token
+        adapter = _ScriptedTurnAdapter(script)
+        adapters.append(adapter)
+        return adapter
+
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+    )
+    backend.turn_retry = ModelRetryConfig(initial_delay_s=0.0, jitter_s=0.0, max_delay_s=0.0)
+    return backend
+
+
+def _calls(adapters: list) -> int:
+    return sum(len(a.requests) for a in adapters)
+
+
+def _poll(pred, tries: int = 2000) -> bool:
+    for _ in range(tries):
+        if pred():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _submit_multi_turn(backend: RunnerBackend, workspace: Path):
+    return backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hi",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+
+
+def test_backend_auto_retries_transient_turn_failure(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        [ModelAdapterError("rate limited", http_status=503, retryable=True),
+         ModelTurn(response_id="r2", final_text="recovered")],
+    )
+    submission = _submit_multi_turn(backend, workspace)
+    try:
+        # the transient failure is auto-retried; the run settles + parks awaiting input
+        assert _poll(lambda: backend._record(submission.run_id).status == "awaiting_input")
+        assert backend._record(submission.run_id).status != "failed"
+        assert _calls(adapters) == 2  # initial attempt + one retry
+    finally:
+        backend.cancel_run(submission.run_id, submission.run_token)
+        backend.wait_for_run(submission.run_id, timeout_s=20)
+
+
+def test_backend_parks_on_nonretryable_turn_failure_then_resumes(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        [ModelAdapterError("bad effort", http_status=400, retryable=False),
+         ModelTurn(response_id="r2", final_text="fixed")],
+    )
+    backend.idle_timeout_s = 30.0
+    submission = _submit_multi_turn(backend, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    try:
+        # config 4xx is NOT auto-retried — it parks for the user (status awaiting_input, not failed)
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+        assert _calls(adapters) == 1
+        # send_message succeeds (run is NOT terminal) and the resend settles
+        assert backend.send_message(run_id, token, "try again")["status"] == "queued"
+        assert _poll(lambda: _calls(adapters) >= 2)
+    finally:
+        backend.cancel_run(run_id, token)
+        backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_backend_gives_up_after_max_consecutive_turn_failures(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        [ModelAdapterError("transient", http_status=503, retryable=True) for _ in range(10)],
+    )
+    backend.max_consecutive_turn_failures = 2
+    submission = _submit_multi_turn(backend, workspace)
+    status = backend.wait_for_run(submission.run_id, timeout_s=20)
+    assert status == "failed"
+    assert _calls(adapters) == 2  # initial attempt + one retry, then give up at the cap
+
+
+def test_backend_consecutive_failure_counter_resets_on_settle(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        [
+            ModelAdapterError("t1", http_status=503, retryable=True),
+            ModelTurn(response_id="a", final_text="a"),
+            ModelAdapterError("t2", http_status=503, retryable=True),
+            ModelTurn(response_id="b", final_text="b"),
+        ],
+    )
+    backend.max_consecutive_turn_failures = 2
+    backend.idle_timeout_s = 30.0
+    submission = _submit_multi_turn(backend, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    try:
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")  # retried + settled
+        assert _calls(adapters) == 2
+        backend.send_message(run_id, token, "again")  # drives the 2nd fail+retry+settle
+        assert _poll(lambda: _calls(adapters) >= 4)
+        # streak reset between settles -> cap of 2 never tripped
+        assert backend._record(run_id).status != "failed"
+    finally:
+        backend.cancel_run(run_id, token)
+        backend.wait_for_run(run_id, timeout_s=20)

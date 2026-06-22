@@ -52,9 +52,17 @@ class OpenAIModelAdapter:
         payload = self._payload(request)
         config = request.model or self.config
         try:
-            response = client.responses.create(**payload, timeout=config.timeout_s)
-        except TypeError:
-            response = client.responses.create(**payload)
+            try:
+                response = client.responses.create(**payload, timeout=config.timeout_s)
+            except TypeError:
+                response = client.responses.create(**payload)
+        except ModelAdapterError:
+            raise
+        except Exception as exc:
+            # Map provider API errors (e.g. a 400 for an unsupported reasoning effort) to a
+            # classified ModelAdapterError so the gateway returns the real status (4xx, not a
+            # generic 500) and the runner can treat it as recoverable. Never echo the raw body.
+            raise _model_error_from_openai(exc) from exc
         data = response.model_dump() if hasattr(response, "model_dump") else _coerce_response(response)
         return _parse_response(data)
 
@@ -86,6 +94,32 @@ class OpenAIModelAdapter:
         else:
             payload["input"] = [{"role": "user", "content": request.instruction or ""}]
         return payload
+
+
+def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
+    """Classify an OpenAI SDK exception into a ModelAdapterError carrying the provider HTTP
+    status, so downstream (gateway HTTP mapping, runner classification, core recoverability)
+    can reason about it. Uses a synthetic, body-free message to avoid leaking prompt/PII."""
+    status = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    code = body.get("code") if isinstance(body, dict) else None
+    if isinstance(status, int) and 400 <= status < 500:
+        return ModelAdapterError(
+            f"provider rejected the request (HTTP {status})",
+            error_code="model_error",
+            provider_error_code=str(code or ""),
+            retryable=(status == 429),
+            http_status=status,
+        )
+    if isinstance(status, int) and 500 <= status < 600:
+        return ModelAdapterError(
+            f"provider server error (HTTP {status})",
+            error_code="model_error",
+            provider_error_code=str(code or ""),
+            retryable=True,
+            http_status=status,
+        )
+    return ModelAdapterError("provider call failed", error_code="model_error")
 
 
 def _openai_tool_schema(tool: Any) -> dict[str, Any]:

@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import json
 import logging
+import random
 import threading
 import time
 import uuid
@@ -41,6 +42,7 @@ from native_agent_runner.core.result import AgentRunResult, Suspension
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
+    ModelRetryConfig,
     RunLimits,
     RunMode,
     WorkspaceBackendKind,
@@ -317,6 +319,17 @@ def _get_shared_loop() -> asyncio.AbstractEventLoop:
         return _shared_loop
 
 
+async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> None:
+    """Awaitable, cancellable exponential backoff with jitter — the async counterpart of the
+    gateway's sync ``_sleep_before_retry`` (used between turn-level auto-retries on the shared
+    loop). ``attempt`` is 1-based."""
+    delay = min(retry.max_delay_s, retry.initial_delay_s * (retry.backoff_multiplier ** max(0, attempt - 1)))
+    if retry.jitter_s > 0:
+        delay += random.uniform(0, retry.jitter_s)
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
 @dataclass
 class RunnerBackend:
     run_root: Path
@@ -335,6 +348,12 @@ class RunnerBackend:
     max_session_lifetime_s: float = 1800.0
     max_turns: int = 50
     task_wait_poll_s: float = 5.0
+    # A recoverable model-turn failure (turn_failed) keeps the session alive: a transient one
+    # is auto-retried with backoff; a config/auth 4xx parks for the user to fix + resend. A run
+    # that takes this many CONSECUTIVE failed turns (no settle between) is given up as failed.
+    # Only auto-retries count toward this cap; user-initiated resends are bounded by max_turns.
+    max_consecutive_turn_failures: int = 5
+    turn_retry: ModelRetryConfig = field(default_factory=ModelRetryConfig)
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -1112,6 +1131,7 @@ class RunnerBackend:
         task-wait is offloaded with asyncio.to_thread (bounded by task_wait_poll_s and
         retried) since it blocks on the job manager's cross-thread condition (P2);
         report_task_result wakes it from another thread."""
+        consecutive_turn_failures = 0
         while True:
             if suspension.reason in {"terminal", "limited"}:
                 break
@@ -1125,7 +1145,49 @@ class RunnerBackend:
                     suspension = await loop.arun_until_suspended(None)
                 # else: tasks still pending after the poll window -> keep waiting.
                 continue
+            if suspension.reason == "turn_failed":
+                # Recoverable model-turn failure: the session is alive (core kept it so). Apply
+                # the retry POLICY here. Give up once too many turns fail in a row.
+                consecutive_turn_failures += 1
+                if consecutive_turn_failures >= self.max_consecutive_turn_failures or self._session_should_stop(
+                    record, started, turns
+                ):
+                    loop.fail_recoverable(
+                        suspension.error or "model turn failed repeatedly",
+                        error_code=suspension.error_code or "model_error",
+                    )
+                    break
+                if suspension.retryable:
+                    # Transient (429 / exhausted-5xx / network): bounded auto-retry with backoff,
+                    # then re-issue the SAME turn (no new user message).
+                    self._persist_run_checkpoint(record)
+                    await _async_sleep_before_retry(consecutive_turn_failures, self.turn_retry)
+                    if self._session_should_stop(record, started, turns):
+                        break
+                    suspension = await loop.arun_until_suspended(None)
+                    continue
+                # Non-retryable but recoverable (config/auth 4xx): a blind retry would just fail
+                # again. Park for the user to fix the config (model/effort) and resend. A one-shot
+                # run has nobody to resend, so finalize it as failed.
+                if not request.multi_turn:
+                    loop.fail_recoverable(
+                        suspension.error or "model turn failed",
+                        error_code=suspension.error_code or "model_error",
+                    )
+                    break
+                loop.await_user_input()
+                self._persist_run_checkpoint(record)
+                try:
+                    message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                except asyncio.TimeoutError:
+                    break
+                if message is _CLOSE_SESSION:
+                    break
+                turns += 1
+                suspension = await loop.arun_until_suspended(message)
+                continue
             # settled. One-shot runs close here; multi-turn awaits the next message.
+            consecutive_turn_failures = 0  # a settled turn clears the failure streak
             if not request.multi_turn:
                 break
             if self._session_should_stop(record, started, turns):

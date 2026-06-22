@@ -11,6 +11,7 @@ from conftest import runtime_config
 
 from native_agent_runner.cli import main
 from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
+from native_agent_runner.errors import ModelAdapterError
 from native_agent_runner.providers.base import ModelRequest, ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter
 from native_agent_runner.providers.openai import OpenAIModelAdapter
@@ -177,3 +178,33 @@ def test_openai_smoke_payload_only() -> None:
     payload = adapter._payload(request)
 
     assert payload["input"] == [{"role": "user", "content": "Say ok."}]
+
+
+def test_openai_adapter_maps_provider_400_to_model_adapter_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A provider 400 (e.g. unsupported reasoning effort) must surface as a classified, non-
+    # retryable ModelAdapterError carrying http_status — NOT a raw SDK error (which the gateway
+    # would mistranslate to a retryable 500). The message must not echo the request body.
+    class _FakeBadRequest(Exception):
+        def __init__(self) -> None:
+            super().__init__("Unsupported value: 'minimal' is not supported with 'gpt-5.5'.")
+            self.status_code = 400
+            self.body = {"code": "unsupported_value"}
+
+    class _FakeResponses:
+        def create(self, **kwargs):  # noqa: ANN003
+            raise _FakeBadRequest()
+
+    class _FakeClient:
+        def __init__(self, **kwargs) -> None:  # noqa: ANN003
+            self.responses = _FakeResponses()
+
+    monkeypatch.setattr("openai.OpenAI", _FakeClient)
+    adapter = OpenAIModelAdapter(ModelConfig(), api_key="test", allow_direct_provider_api=True)
+    request = ModelRequest(instruction="my secret prompt", system_prompt="", tools=())
+    with pytest.raises(ModelAdapterError) as excinfo:
+        adapter.next_turn(request)
+    err = excinfo.value
+    assert err.http_status == 400
+    assert err.retryable is False
+    assert err.provider_error_code == "unsupported_value"
+    assert "secret prompt" not in str(err)  # no prompt/body leak
