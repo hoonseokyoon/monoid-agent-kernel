@@ -166,15 +166,14 @@ async function stopRun() {
   if (!runId) return;
   setGenerating(false);
   try {
-    await fetch("/api/cancel", {
+    await fetch("/api/interrupt", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ run_id: runId }),
     });
   } catch (_) {}
-  // Cancel is run-level: the run becomes terminal, so the next message starts a fresh chat.
-  activity("⏹ Stopped — send a message to start a new chat.");
-  if (evtSource) evtSource.close();
-  runId = null;
+  // Interrupt is turn-level: the session stays alive, so the conversation continues with the
+  // next message (the run is NOT terminalized). Takes effect at the next step boundary.
+  activity("⏹ Stopped — the session is still open; send another message to continue.");
 }
 stopBtn.addEventListener("click", stopRun);
 
@@ -244,6 +243,7 @@ function handleEvent(ev) {
     }
     return;
   }
+  if (type === "turn.interrupted") { hideTyping(); setGenerating(false); return; }
   if (type === "model.turn.started") { pendingConfigFix = false; setGenerating(true); showTyping(); return; }
   if (type === "model.turn.finished") { hideTyping(); return; }
   if (type === "turn.settled" || type === "run.finished") {

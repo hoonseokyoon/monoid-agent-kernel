@@ -287,6 +287,13 @@ class StudioServer:
         token = self._token_for(run_id)
         return self._backend.cancel_run(run_id, token)
 
+    def interrupt_chat(self, run_id: str) -> dict[str, Any]:
+        """Turn-level stop: halt the current turn but keep the session alive (the next
+        message continues the chat). Contrast cancel_chat, which ends the run."""
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        return self._backend.interrupt_turn(run_id, token)
+
     def poll_events(self, run_id: str, from_seq: int) -> dict[str, Any]:
         assert self._backend is not None
         token = self._token_for(run_id)
@@ -501,6 +508,11 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     body = self._read_json()
                     run_id = str(body.get("run_id") or "")
                     self._write_json(studio.cancel_chat(run_id))
+                    return
+                if parsed.path == "/api/interrupt":
+                    body = self._read_json()
+                    run_id = str(body.get("run_id") or "")
+                    self._write_json(studio.interrupt_chat(run_id))
                     return
                 if parsed.path == "/api/apply":
                     body = self._read_json()

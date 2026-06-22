@@ -80,6 +80,15 @@ class RunCancelled(NativeAgentError):
     error_code = "cancelled"
 
 
+class TurnInterrupted(NativeAgentError):
+    """Raised at a step boundary when the current turn is interrupted by an external
+    caller (a "stop"). Unlike :class:`RunCancelled`, this does **not** terminalize the
+    run — the loop converts it to a non-terminal ``Suspension(reason="interrupted")`` so
+    the session stays alive and the conversation can continue with the next message."""
+
+    error_code = "interrupted"
+
+
 def error_code_for_exception(exc: Exception) -> str:
     code = getattr(exc, "error_code", None)
     return str(code) if code else "internal_error"

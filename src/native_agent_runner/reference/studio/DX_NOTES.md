@@ -26,12 +26,23 @@ studio chat to the backend `astream_run`/SSE-frame path (or emit a new `model.ou
 from the autonomous path), require the `[http-async]` extra for `GatewayModelAdapter.astream_turn`,
 and implement `OpenAIModelAdapter.astream_turn`. Deferred; Stop + usage shipped instead.
 
-### DX-9 🟡 "Stop" is run-level only (no turn-level interrupt)
-Cancellation (`RunnerBackend.cancel_run` / `CancellationToken`) terminalizes the **whole run**;
-there is no "interrupt the current turn but keep the session alive" primitive. So Studio's Stop
-button ends the conversation (the next message starts a fresh run). A turn-level interrupt that
-parks at `awaiting_input` (like the recoverable-turn path) would be the better chat UX — a future
-core affordance. Worked around in studio by treating Stop as "end this chat".
+### DX-9 🟢 "Stop" is run-level only (no turn-level interrupt) — FIXED
+Cancellation (`RunnerBackend.cancel_run` / `CancellationToken`) terminalizes the **whole run**, so
+the first Stop button ended the conversation. Added a turn-level interrupt that keeps the session
+alive, reusing the recoverable-turn (DX-7) park pattern:
+- **Core**: `AgentLoop.interrupt_turn()` sets a per-turn flag (distinct from the run-level
+  `cancellation_token`); `_check_run_boundary` raises the new `TurnInterrupted` at the next step
+  boundary; `arun_until_suspended` converts it to a non-terminal `Suspension(reason="interrupted")`
+  (no error, session alive) + emits `turn.interrupted`. The flag is cleared on consume and at each
+  new submit (a stale stop can't kill the next turn).
+- **Backend**: `interrupt_turn(run_id, token)` signals the loop; `_drive_open_session` parks the
+  multi-turn session (`await_user_input`) on `reason=="interrupted"` (a one-shot run just closes).
+- **Studio**: Stop button → `POST /api/interrupt` → `interrupt_chat`; the composer stays enabled and
+  the next message continues the same conversation (`/api/cancel` is kept for "end the run").
+
+**Known limit (ties to DX-8):** the interrupt takes effect at a step boundary, so an in-flight model
+call finishes first — it stops a *multi-step* agent from doing more, but cannot abort a single
+in-flight generation. A true mid-generation stop needs streaming (cancel the stream) = DX-8.
 
 ---
 

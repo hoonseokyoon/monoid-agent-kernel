@@ -8,6 +8,7 @@ offline echo model, so they are deterministic and key-less.
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -502,3 +503,61 @@ def test_studio_cancel_terminates_run(studio: StudioServer) -> None:
             break
         time.sleep(0.1)
     assert studio.run_status(run_id)["status"] in {"completed", "failed", "limited"}
+
+
+# --- DX-9: turn-level interrupt (Stop keeps the session alive) --------------------------
+
+
+class _BlockingThenToolAdapter:
+    """Turn 1 calls a tool; turn 2 blocks until released (giving the test a window to call
+    interrupt_chat while a turn is in flight), then calls a tool so the next step boundary
+    trips the interrupt. Turn 3 (after resume) settles."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.reached_block = threading.Event()
+        self.release = threading.Event()
+
+    def next_turn(self, request):  # noqa: ANN001
+        self.calls += 1
+        if self.calls == 1:
+            return ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "c1"),))
+        if self.calls == 2:
+            self.reached_block.set()
+            self.release.wait(5.0)
+            return ModelTurn(response_id="r2", tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "c2"),))
+        return ModelTurn(response_id="r3", final_text="resumed ok")
+
+
+def test_studio_interrupt_keeps_session_alive(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("hello\n", encoding="utf-8")
+    adapter = _BlockingThenToolAdapter()
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: adapter,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("go")["run_id"]
+        assert adapter.reached_block.wait(10.0)  # a turn is now in flight (turn 2 blocking)
+        result = server.interrupt_chat(run_id)  # the Stop button path
+        assert result["interrupt_requested"] is True
+        adapter.release.set()  # let turn 2 finish; the next boundary trips the interrupt
+        # The run parks (awaiting_input) — interrupt must NOT terminalize it.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            status = server.run_status(run_id)["status"]
+            if status == "awaiting_input":
+                break
+            assert status not in {"completed", "failed", "limited"}, "interrupt terminalized the run"
+            time.sleep(0.05)
+        assert server.run_status(run_id)["status"] == "awaiting_input"
+        events = server.poll_events(run_id, 0).get("events", [])
+        assert any(e.get("type") == "turn.interrupted" for e in events)
+        # The session is alive: a follow-up message settles.
+        server.continue_chat(run_id, "continue")
+        assert len(_wait_settled(server, run_id, 1)) >= 1
+    finally:
+        server.shutdown()

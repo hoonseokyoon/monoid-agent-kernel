@@ -716,6 +716,26 @@ class RunnerBackend:
             "error_code": record.error_code,
         }
 
+    def interrupt_turn(self, run_id: str, token: str) -> dict[str, Any]:
+        """Turn-level stop (keeps the session alive): signal the loop to halt the current
+        turn at its next step boundary; the driver then parks for the next message. Unlike
+        :meth:`cancel_run` this does NOT terminalize the run. A no-op on a terminal or
+        not-yet-built run. The flag set is a thread-safe one-way signal (like cancel)."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            loop = record.loop
+            terminal = record.status in {"completed", "failed", "limited"}
+        requested = not terminal and loop is not None
+        if requested:
+            loop.interrupt_turn()
+        return {
+            "run_id": record.run_id,
+            "tenant_id": record.tenant_id,
+            "status": record.status,
+            "interrupt_requested": requested,
+        }
+
     def send_message(self, run_id: str, token: str, content: str) -> dict[str, Any]:
         """Deliver a follow-up user message to a running multi-turn session. It is
         queued and consumed as the next user turn once the current turn settles."""
@@ -1174,6 +1194,23 @@ class RunnerBackend:
                         suspension.error or "model turn failed",
                         error_code=suspension.error_code or "model_error",
                     )
+                    break
+                loop.await_user_input()
+                self._persist_run_checkpoint(record)
+                try:
+                    message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                except asyncio.TimeoutError:
+                    break
+                if message is _CLOSE_SESSION:
+                    break
+                turns += 1
+                suspension = await loop.arun_until_suspended(message)
+                continue
+            if suspension.reason == "interrupted":
+                # Turn-level stop (the user hit "stop"): not a failure, not terminal. Park the
+                # multi-turn session for the next message; a one-shot run just closes. Does not
+                # count against the turn-failure streak.
+                if not request.multi_turn or self._session_should_stop(record, started, turns):
                     break
                 loop.await_user_input()
                 self._persist_run_checkpoint(record)

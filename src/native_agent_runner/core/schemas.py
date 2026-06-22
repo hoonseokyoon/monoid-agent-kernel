@@ -151,6 +151,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         required=("error_code",),
     ),
+    "turn.interrupted": _data_schema(
+        {"reason": _STR},
+        required=(),
+    ),
     "model.input.degraded": _data_schema(
         {"dropped_part_types": _STR_ARRAY, "reason": _STR},
         required=("reason",),

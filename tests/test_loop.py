@@ -553,3 +553,60 @@ def test_fail_recoverable_promotes_to_terminal(tmp_path: Path) -> None:
         assert list(run_root.rglob("failure.json"))
     finally:
         loop.close()
+
+
+# --- DX-9: turn-level interrupt (a "stop" that keeps the session alive) -----------------
+
+
+class _SelfInterruptingAdapter:
+    """First turn calls a tool and flips the loop's interrupt flag, so the next step boundary
+    (before the second model call) trips — simulating a user "stop" mid-turn. A later call
+    settles, proving the session survived the stop."""
+
+    def __init__(self) -> None:
+        self.loop = None
+        self.calls = 0
+
+    def next_turn(self, request):  # noqa: ANN001
+        self.calls += 1
+        if self.calls == 1:
+            self.loop.interrupt_turn()
+            return ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),))
+        return ModelTurn(response_id="r2", final_text="resumed ok")
+
+
+def test_interrupt_parks_turn_without_terminating(tmp_path: Path) -> None:
+    adapter = _SelfInterruptingAdapter()
+    loop, sink, run_root = _loop_with(tmp_path, adapter, "fs.list", "run.finish")
+    adapter.loop = loop
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("go")
+        assert susp.reason == "interrupted"
+        assert loop._session is not None and loop._session.terminal is False
+        assert adapter.calls == 1  # the second model call never ran — the turn was stopped
+        types = [e.type for e in sink.events]
+        assert "turn.interrupted" in types
+        assert "run.failed" not in types
+        assert list(run_root.rglob("failure.json")) == []  # not a terminal failure
+        # The session is alive: re-issuing the turn (the interrupt flag is consumed) settles.
+        again = loop.run_until_suspended(None)
+        assert again.reason == "settled"
+        assert again.final_text == "resumed ok"
+        assert adapter.calls == 2
+    finally:
+        loop.close()
+
+
+def test_stale_interrupt_does_not_kill_next_turn(tmp_path: Path) -> None:
+    # interrupt_turn() with no turn in flight is a no-op: the next submit clears the flag.
+    adapter = _ScriptedAdapter([ModelTurn(response_id="r1", final_text="ok")])
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        loop.interrupt_turn()  # stale stop
+        susp = loop.run_until_suspended("hi")
+        assert susp.reason == "settled"
+        assert susp.final_text == "ok"
+    finally:
+        loop.close()

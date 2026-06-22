@@ -85,6 +85,7 @@ from native_agent_runner.errors import (
     RunCancelled,
     RunTimeout,
     ToolExecutionError,
+    TurnInterrupted,
     error_code_for_exception,
 )
 from native_agent_runner.tasks import (
@@ -498,6 +499,11 @@ class AgentLoop:
     # Dormant sink installed on the run's EventBus at bootstrap; astream activates it to tap
     # orchestration events and relay token deltas onto a stream queue. None until bootstrap.
     _stream_sink: QueueEventSink | None = field(default=None, init=False, repr=False)
+    # Turn-level "stop": set from another thread via :meth:`interrupt_turn`, consumed at the
+    # next step boundary (see ``_check_run_boundary``). Distinct from ``cancellation_token``
+    # (which is run-level/terminal); an interrupt keeps the session alive. Cleared at the start
+    # of each new user submit so a stale stop never kills the next turn.
+    _interrupt_requested: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
@@ -635,6 +641,16 @@ class AgentLoop:
         Sync facade over :meth:`arun_until_suspended`."""
         return self._run_sync(self.arun_until_suspended(user_input))
 
+    def interrupt_turn(self) -> None:
+        """Request a turn-level stop: the running turn halts at its next step boundary and
+        suspends with ``reason="interrupted"`` (the session stays alive — the next message
+        continues the conversation). Thread-safe one-way signal (a bare flag set, mirroring
+        ``cancellation_token.cancel()``). A no-op if no turn is in flight: the flag is cleared
+        when the next submit starts, so it never kills a turn the user did not mean to stop.
+        Takes effect only at a step boundary — an in-flight model call finishes first (a true
+        mid-generation stop requires streaming)."""
+        self._interrupt_requested = True
+
     async def arun_until_suspended(
         self, user_input: str | tuple[ContentPart, ...] | None = None
     ) -> Suspension:
@@ -656,6 +672,8 @@ class AgentLoop:
             state.final_text = ""
             # A run.finish in a prior submit must not short-circuit this one.
             res.context.finished = False
+            # Drop a stale stop so it can't immediately interrupt this fresh turn.
+            self._interrupt_requested = False
             state.pending_user_input = input_to_parts(user_input)
             self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
             session.submit_local_step = 0
@@ -722,6 +740,16 @@ class AgentLoop:
                 retryable=exc.retryable,
                 http_status=exc.http_status,
             )
+        except TurnInterrupted:
+            # Turn-level stop: keep the session alive (no error, not terminal). Same idempotency
+            # as turn_failed — the user message/observations are already committed; only clear
+            # pending_observations so a re-issue doesn't re-append tool outputs. The driver parks
+            # for the next user message. ``status`` is cosmetic here; branch on ``reason``.
+            self._interrupt_requested = False
+            res.recorder.emit("turn.interrupted", data={"reason": "user_stop"}, level="info")
+            state.pending_observations = ()
+            self._persist_checkpoint(session)
+            return Suspension(reason="interrupted", status="completed")
         except Exception as exc:  # controlled recording boundary for standalone CLI
             self._record_failure(state, res, exc)
             session.terminal = True
@@ -2782,6 +2810,9 @@ class AgentLoop:
             raise RunCancelled("run cancelled")
         if deadline is not None and time.time() >= deadline:
             raise RunTimeout("run exceeded max duration")
+        # Run-level cancel (terminal) takes precedence over a turn-level interrupt (non-terminal).
+        if self._interrupt_requested:
+            raise TurnInterrupted("turn interrupted")
 
     def _emit_side_effect_event(
         self,

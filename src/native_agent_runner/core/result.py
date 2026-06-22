@@ -49,14 +49,18 @@ class Suspension:
     conversation up to the user message is preserved, and a caller may re-issue
     the turn via ``arun_until_suspended(None)`` or park for new user input.
     ``retryable``/``http_status`` carry the classification for that decision.
-    The non-terminal-ness is carried by ``reason`` alone — ``status`` mirrors the
-    failure (``"failed"``) since ``RunStatus`` has no non-terminal value, so
-    callers must branch on ``reason``, not ``status``, to detect a live run.
-    For every reason except ``awaiting_tasks`` a settle checkpoint ran and
-    ``turn`` carries its result.
+    ``interrupted`` — an external caller stopped the current turn (a "stop"); like
+    ``turn_failed`` the session is **not** terminal (no error), so a caller parks for
+    the next user message. The non-terminal-ness is carried by ``reason`` alone —
+    ``status`` mirrors the failure (``"failed"``) for ``turn_failed`` since ``RunStatus``
+    has no non-terminal value, so callers must branch on ``reason``, not ``status``, to
+    detect a live run. For every reason except ``awaiting_tasks`` a settle checkpoint ran
+    and ``turn`` carries its result.
     """
 
-    reason: Literal["settled", "awaiting_tasks", "limited", "terminal", "turn_failed"]
+    reason: Literal[
+        "settled", "awaiting_tasks", "limited", "terminal", "turn_failed", "interrupted"
+    ]
     status: RunStatus
     final_text: str = ""
     error: str = ""

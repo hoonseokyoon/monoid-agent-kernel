@@ -1338,3 +1338,67 @@ def test_backend_consecutive_failure_counter_resets_on_settle(tmp_path: Path) ->
     finally:
         backend.cancel_run(run_id, token)
         backend.wait_for_run(run_id, timeout_s=20)
+
+
+# --- DX-9: turn-level interrupt drives a non-terminal park, then resumes ----------------
+
+
+class _InterruptingTurnAdapter:
+    """First model turn calls a tool; the second grabs the loop (handed in via ``loop_box``)
+    and interrupts the turn — simulating a user "stop" mid-turn — then yields another tool
+    call so a step boundary trips. A third call (after the user resumes) settles."""
+
+    def __init__(self) -> None:
+        self.requests: list = []
+        self.loop_box: list = []
+        self.calls = 0
+
+    def next_turn(self, request):  # noqa: ANN001
+        self.requests.append(request)
+        self.calls += 1
+        if self.calls == 1:
+            return ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_read", {"path": "x.md"}, "c1"),))
+        if self.calls == 2:
+            deadline = time.time() + 5.0
+            while not self.loop_box and time.time() < deadline:
+                time.sleep(0.01)
+            self.loop_box[0].interrupt_turn()
+            return ModelTurn(response_id="r2", tool_calls=(fake_tool_call("fs_read", {"path": "x.md"}, "c2"),))
+        return ModelTurn(response_id="r3", final_text="resumed ok")
+
+
+def test_backend_interrupt_parks_turn_then_resumes(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    (workspace / "x.md").write_text("hi\n", encoding="utf-8")
+    captured: dict = {}
+
+    def factory(spec, llm_gateway_token):  # noqa: ANN001
+        del spec, llm_gateway_token
+        adapter = _InterruptingTurnAdapter()
+        captured["adapter"] = adapter
+        return adapter
+
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+    )
+    backend.idle_timeout_s = 30.0
+    submission = _submit_multi_turn(backend, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    try:
+        # Hand the loop to the adapter so it can interrupt itself mid-turn (deterministic).
+        assert _poll(lambda: backend._record(run_id).loop is not None)
+        captured["adapter"].loop_box.append(backend._record(run_id).loop)
+        # The interrupt parks the multi-turn session (awaiting_input) — it is NOT terminal.
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+        assert backend._record(run_id).status not in {"completed", "failed", "limited"}
+        # The session is alive: a follow-up message resumes and settles.
+        backend.send_message(run_id, token, "continue")
+        assert _poll(lambda: captured["adapter"].calls >= 3)
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+    finally:
+        backend.cancel_run(run_id, token)
+        backend.wait_for_run(run_id, timeout_s=20)
