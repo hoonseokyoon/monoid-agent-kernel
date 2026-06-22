@@ -478,3 +478,27 @@ def test_studio_surfaces_turn_failed_without_terminating(tmp_path: Path) -> None
         assert _wait_settled(server, run_id, 1)  # the resend settles
     finally:
         server.shutdown()
+
+
+# --- Tier 1: usage events + cancel (Stop) ----------------------------------------------
+
+
+def test_studio_chat_emits_token_usage(studio: StudioServer) -> None:
+    run_id = studio.start_chat("hello")["run_id"]
+    _wait_settled(studio, run_id, 1)
+    events = studio.poll_events(run_id, 0).get("events", [])
+    metrics = [e for e in events if e.get("type") == "metrics.updated"]
+    assert metrics, "the usage meter relies on metrics.updated events"
+    assert any("total_tokens" in (e.get("data") or {}) for e in metrics)
+
+
+def test_studio_cancel_terminates_run(studio: StudioServer) -> None:
+    run_id = studio.start_chat("hello")["run_id"]
+    _wait_settled(studio, run_id, 1)  # parks awaiting_input
+    studio.cancel_chat(run_id)  # the Stop button path: cancel is run-level
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if studio.run_status(run_id)["status"] in {"completed", "failed", "limited"}:
+            break
+        time.sleep(0.1)
+    assert studio.run_status(run_id)["status"] in {"completed", "failed", "limited"}

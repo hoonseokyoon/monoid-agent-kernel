@@ -11,6 +11,30 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
+### DX-8 🔴 Token streaming isn't reachable from the autonomous (submit_run) path
+**Found** building the Tier-1 "token streaming" item. The loop only streams when a stream sink is
+active: `_acall_model` (loop.py) relays `astream_turn` chunks via `self._stream_sink.push_delta`,
+and that sink is set **only** on the `loop.astream()` / backend `astream_run` path. Studio drives
+chats via `submit_run` → `arun_until_suspended` (autonomous), so no sink is active → it never
+streams. Two further blockers: (a) deltas go to the RunStream **queue**, not the event recorder,
+so they don't appear in `events.jsonl`/SSE that studio's UI consumes; (b) `OpenAIModelAdapter` has
+**no `astream_turn`** (the deferred P4b-③ "OpenAI direct streaming"), so even the gateway path
+yields one assembled chunk — no real per-token from OpenAI.
+
+Net: token streaming is a multi-layer effort, not a surface-only Tier-1 item. To do it: switch
+studio chat to the backend `astream_run`/SSE-frame path (or emit a new `model.output.delta` event
+from the autonomous path), require the `[http-async]` extra for `GatewayModelAdapter.astream_turn`,
+and implement `OpenAIModelAdapter.astream_turn`. Deferred; Stop + usage shipped instead.
+
+### DX-9 🟡 "Stop" is run-level only (no turn-level interrupt)
+Cancellation (`RunnerBackend.cancel_run` / `CancellationToken`) terminalizes the **whole run**;
+there is no "interrupt the current turn but keep the session alive" primitive. So Studio's Stop
+button ends the conversation (the next message starts a fresh run). A turn-level interrupt that
+parks at `awaiting_input` (like the recoverable-turn path) would be the better chat UX — a future
+core affordance. Worked around in studio by treating Stop as "end this chat".
+
+---
+
 ### DX-7 🟢 A recoverable model error killed the whole conversation
 **Where:** `loop.py` terminalized the run on *any* model-turn exception; a 4xx/429/transient
 error (e.g. `reasoning effort=minimal` rejected by gpt-5.5) ended the session, after which
