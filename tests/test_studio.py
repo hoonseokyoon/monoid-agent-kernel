@@ -101,10 +101,10 @@ def test_run_tokens_are_not_exposed_to_callers(studio: StudioServer) -> None:
 # --- R1: read tools, file tree, activity feed -------------------------------------------
 
 
-def test_runtime_config_binds_read_write_hitl_and_shell() -> None:
+def test_runtime_config_binds_read_write_hitl_shell_and_web() -> None:
     config = _agent_runtime_config()
     refs = {binding.ref.tool_id for binding in config.tools}
-    assert {"fs.read", "fs.write", "hitl.request", "shell.exec"} <= refs
+    assert {"fs.read", "fs.write", "hitl.request", "shell.exec", "web.search", "web.context"} <= refs
     # The shell binding refuses obviously destructive commands and auto-approves the rest.
     shell = next(b for b in config.tools if b.ref.tool_id == "shell.exec")
     assert any(p.startswith("rm") for p in shell.scope.command_deny_prefixes)
@@ -356,5 +356,36 @@ def test_shell_background_job_is_listed(tmp_path: Path) -> None:
         jobs = server.jobs(run_id).get("jobs", [])
         assert jobs, "the background job should be listed"
         assert jobs[0].get("job_id")
+    finally:
+        server.shutdown()
+
+
+# --- R5: web tools (through the bundled WebGateway) -------------------------------------
+
+
+def test_web_search_runs_through_the_gateway(tmp_path: Path) -> None:
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("web_search", {"query": "native agent runner"}, "c1"),)),
+            ModelTurn(final_text="searched the web"),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=tmp_path / "ws", host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    (tmp_path / "ws").mkdir(parents=True, exist_ok=True)
+    server.start()
+    try:
+        run_id = server.start_chat("look it up online")["run_id"]
+        _wait_settled(server, run_id, 1)
+        events = server.poll_events(run_id, 0).get("events", [])
+        finished = [e for e in events if e.get("type") == "web.search.finished"]
+        assert finished, "web search should run through the bundled gateway"
+        assert not (finished[0].get("data") or {}).get("error")
+        started = [
+            e for e in events if e.get("type") == "tool.call.started" and e["data"].get("tool") == "web_search"
+        ]
+        assert started and "Searching the web for" in (describe_event(started[0]) or "")
     finally:
         server.shutdown()

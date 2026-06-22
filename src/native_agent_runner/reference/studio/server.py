@@ -41,6 +41,8 @@ from native_agent_runner.reference.backend.service import BackendRunRequest, Run
 from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
 from native_agent_runner.reference.llm_gateway.providers import offline_provider_factory
 from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
+from native_agent_runner.reference.web_gateway.http import create_web_gateway_server
+from native_agent_runner.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from native_agent_runner.reference.studio.activity import describe_event
 
 _LOGGER = logging.getLogger("native_agent_runner.studio")
@@ -88,6 +90,9 @@ def _agent_runtime_config() -> AgentRuntimeConfig:
                 scope=ToolScope(command_deny_prefixes=_SHELL_DENY_PREFIXES),
                 runtime={"shell": {"approval_mode": "auto-approve"}},
             ),
+            ToolBinding(binding_id="web.search", model_name="web_search", ref=RegistryToolRef("web.search")),
+            ToolBinding(binding_id="web.fetch", model_name="web_fetch", ref=RegistryToolRef("web.fetch")),
+            ToolBinding(binding_id="web.context", model_name="web_context", ref=RegistryToolRef("web.context")),
         ),
     )
 
@@ -115,6 +120,8 @@ class StudioServer:
         self._admin_token = secrets.token_hex(16)
         self._gateway_server: ThreadingHTTPServer | None = None
         self._gateway_thread: threading.Thread | None = None
+        self._web_gateway_server: ThreadingHTTPServer | None = None
+        self._web_gateway_thread: threading.Thread | None = None
         self._ui_server: ThreadingHTTPServer | None = None
         self._ui_thread: threading.Thread | None = None
         self._backend: RunnerBackend | None = None
@@ -155,6 +162,17 @@ class StudioServer:
         )
         self._gateway_thread.start()
 
+        # Web gateway (R5): the fake corpus provider, so web tools work with no egress/keys.
+        web_gateway = WebGatewayBackend(token_manager=self._token_manager, provider=FakeWebProvider())
+        self._web_gateway_server = create_web_gateway_server(
+            web_gateway, host="127.0.0.1", port=0, admin_token=self._admin_token
+        )
+        web_port = self._web_gateway_server.server_address[1]
+        self._web_gateway_thread = threading.Thread(
+            target=self._web_gateway_server.serve_forever, name="studio-web-gateway", daemon=True
+        )
+        self._web_gateway_thread.start()
+
         self._backend = RunnerBackend(
             run_root=self.config.run_root,
             token_manager=self._token_manager,
@@ -162,6 +180,7 @@ class StudioServer:
             # Allow applying an approved proposal back into the workspace (R2).
             allowed_apply_roots=(self.workspace,),
             llm_gateway_url=f"http://127.0.0.1:{gateway_port}/internal/llm/turns",
+            web_gateway_url=f"http://127.0.0.1:{web_port}",
         )
 
         self._ui_server = ThreadingHTTPServer(
@@ -182,7 +201,7 @@ class StudioServer:
         # no parked session coroutines at exit (DX-2: drain instead of cancel-each + sleep).
         if self._backend is not None:
             self._backend.shutdown(drain=True)
-        for server in (self._ui_server, self._gateway_server):
+        for server in (self._ui_server, self._gateway_server, self._web_gateway_server):
             if server is not None:
                 try:
                     server.shutdown()

@@ -41,6 +41,18 @@ def test_narrate_target_from_paths_and_url() -> None:
     assert fetch is not None and fetch.action == "fetch" and fetch.target == "http://x"
 
 
+def test_narrate_skips_redacted_target() -> None:
+    # A redacted arg (e.g. a web query) comes through as a dict, not a string — it must not
+    # be surfaced as the target.
+    narration = narrate_event(
+        {
+            "type": "tool.call.started",
+            "data": {"tool": "web_search", "args_preview": {"query_preview": {"redacted": True, "type": "str"}}},
+        }
+    )
+    assert narration is not None and narration.action == "search" and narration.target == ""
+
+
 def test_narrate_non_tool_events_return_none() -> None:
     for event_type in ("run.started", "turn.settled", "model.turn.started", "workspace.file.read"):
         assert narrate_event({"type": event_type, "data": {}}) is None

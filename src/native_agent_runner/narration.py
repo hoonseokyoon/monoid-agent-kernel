@@ -35,7 +35,10 @@ _TOOL_ACTIONS = {
     "web_context": "research",
 }
 # args_preview keys to surface as the action's primary target, in priority order.
-_TARGET_KEYS = ("path", "url", "query", "command_preview", "command", "cmd", "pattern", "src", "dest")
+_TARGET_KEYS = (
+    "path", "url", "url_preview", "query", "query_preview",
+    "command_preview", "command", "cmd", "pattern", "src", "dest",
+)
 
 
 @dataclass(frozen=True)
@@ -55,11 +58,13 @@ def _target(data: Mapping[str, Any]) -> str:
     if isinstance(args, Mapping):
         for key in _TARGET_KEYS:
             value = args.get(key)
-            if value:
-                return str(value)
+            # Only surface plain strings: a redacted/sensitive arg comes through as a
+            # {"redacted": True, ...} dict (e.g. a web query), which must not be shown.
+            if isinstance(value, str) and value:
+                return value
     paths = data.get("paths")
     if isinstance(paths, (list, tuple)) and paths:
-        return ", ".join(str(p) for p in paths)
+        return ", ".join(str(p) for p in paths if isinstance(p, str))
     return ""
 
 

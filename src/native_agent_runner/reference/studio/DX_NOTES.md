@@ -141,4 +141,13 @@ the background-jobs panel. Minor narration learning: the shell tool's `args_prev
 command under `command_preview` (not `command`), so `narration._TARGET_KEYS` includes it — a small
 key inconsistency, not worth a core change.
 
-<!-- Add new entries below as later rungs (R5+) surface them. -->
+### R5 (web tools) — no new core gap
+Web tools dropped in by booting the reference `WebGatewayBackend(FakeWebProvider())` on a loopback
+port (shared signing secret) and pointing `RunnerBackend(web_gateway_url=…)` at it; binding any
+`web.*` tool makes the backend mint the web token automatically. Two narration learnings (both
+correct behavior, no core change): web `args_preview` carries `query_preview` / `url_preview`
+(not `query`/`url`), and the query is **redacted** in the public stream (a `{"redacted": True, …}`
+dict), so `narration._target` now surfaces only plain-string args — a redacted query shows as
+"Searching the web for" with no term, which is the right privacy outcome.
+
+<!-- Add new entries below as later rungs (R6+) surface them. -->
