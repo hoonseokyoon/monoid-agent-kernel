@@ -1469,6 +1469,9 @@ class AgentLoop:
             checkpoint_store=self.checkpoint_store,
             subagent_definitions=child_definitions,
             status_file=False,
+            # Inherit token streaming so a child's work streams into its own events.jsonl too
+            # (an observer can tail run_root/<child_run_id>/events.jsonl for live subagent output).
+            emit_output_deltas=self.emit_output_deltas,
         )
         result = await child.arun_once(task.prompt, seed_messages=seed_messages)
         usage = {

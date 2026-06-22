@@ -33,6 +33,7 @@ from native_agent_runner.core.agents import (
     AgentRuntimeConfig,
     PromptSpec,
     RegistryToolRef,
+    SubagentDefinition,
     ToolBinding,
 )
 from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
@@ -69,13 +70,36 @@ _SHELL_DENY_PREFIXES = (
 
 # The Agent's capabilities, each mapping to the tool bindings it enables. Editable live from the
 # Settings window (R6) — toggling one hot-swaps the running session's runtime config.
-_ALL_CAPABILITIES = ("read", "write", "hitl", "shell", "web")
+_ALL_CAPABILITIES = ("read", "write", "hitl", "shell", "web", "delegate")
 _CAPABILITY_LABELS = {
     "read": "Read files",
     "write": "Write files (staged as a proposal)",
     "hitl": "Ask the human for approval",
     "shell": "Run shell commands + background jobs",
     "web": "Search & fetch the web",
+    "delegate": "Delegate subtasks to a subagent",
+}
+
+# Agent-as-tool: a read-only "researcher" subagent. Its tool allowlist is intersected with the
+# parent's bindings (a subagent can never exceed the parent), so it gets read + web only — no
+# write/shell. The child runs in isolation and returns just its final message; its live work is
+# observable via run_root/<child_run_id>/events.jsonl (see StudioServer.subagent_events).
+_SUBAGENT_DEFINITIONS = {
+    "researcher": SubagentDefinition(
+        description=(
+            "Investigate a focused question read-only — reads files and searches the web, then "
+            "reports findings. Cannot edit files or run shell commands."
+        ),
+        prompt=PromptSpec(
+            system_prompt_base=(
+                "You are a research subagent working in isolation. Investigate the task using the "
+                "read and web tools available to you, then return a concise findings summary as "
+                "your final message. You cannot edit files or run commands."
+            )
+        ),
+        tools=("fs.read", "text.search", "web.search", "web.fetch", "web.context", "run.update_plan"),
+        context="fresh",
+    ),
 }
 
 
@@ -104,6 +128,12 @@ def _capability_bindings(capability: str) -> tuple[ToolBinding, ...]:
             ToolBinding(binding_id="web.fetch", model_name="web_fetch", ref=RegistryToolRef("web.fetch")),
             ToolBinding(binding_id="web.context", model_name="web_context", ref=RegistryToolRef("web.context")),
         )
+    if capability == "delegate":
+        # Only effective when the backend carries subagent_definitions (the loop bootstrap
+        # registers agent.spawn then); studio always does.
+        return (
+            ToolBinding(binding_id="agent.spawn", model_name="agent_spawn", ref=RegistryToolRef("agent.spawn")),
+        )
     return ()
 
 
@@ -125,7 +155,10 @@ _SYSTEM_PROMPT = (
     "than one step, keep a short running plan with the run_update_plan tool: pass items as "
     "{step, status} where status is one of pending, in_progress, or completed, and update it as "
     "you make progress (mark a step in_progress when you start it and completed when done). "
-    "Keep the plan concise — a handful of steps, not a transcript."
+    "Keep the plan concise — a handful of steps, not a transcript. "
+    "For a focused, self-contained subtask (especially read-only research), you may delegate to "
+    "a subagent with the agent_spawn tool; it works in isolation and returns only its final "
+    "message."
 )
 # Always available (observability, not a gated capability): the plan tool the Plan panel renders.
 _PLAN_BINDING = ToolBinding(
@@ -249,6 +282,8 @@ class StudioServer:
             # Stream tokens live: emit model.output.delta events the UI renders incrementally
             # (effective for adapters that support astream_turn — the gateway/openai path).
             emit_output_deltas=True,
+            # Agent-as-tool: makes agent.spawn available (bound via the "delegate" capability).
+            subagent_definitions=_SUBAGENT_DEFINITIONS,
         )
 
         self._ui_server = ThreadingHTTPServer(
@@ -318,6 +353,33 @@ class StudioServer:
         assert self._backend is not None
         token = self._token_for(run_id)
         return self._backend.events(run_id, token, from_seq=from_seq)
+
+    def subagent_events(self, child_run_id: str, from_seq: int = 0) -> dict[str, Any]:
+        """Stream a child subagent run's work by reading its events.jsonl directly.
+
+        A spawned subagent is an isolated AgentLoop under the same run_root (run id
+        ``<parent>.sub.<task>``), NOT a backend record — so backend.events() can't reach it.
+        The parent's stream only carries subagent.started/finished; the child's tool calls and
+        token deltas live in run_root/<child_run_id>/events.jsonl. Studio owns the run_root, so
+        it tails that file. (DX gap: core persists child events but offers no API to stream a
+        descendant run to the parent's UI — a backend "descendant events" endpoint would be the
+        clean fix; logged in DX_NOTES.)"""
+        if not child_run_id or any(c in child_run_id for c in ("/", "\\")) or ".." in child_run_id:
+            return {"events": []}
+        path = self.config.run_root / child_run_id / "events.jsonl"
+        events: list[dict[str, Any]] = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if int(event.get("seq", 0)) >= from_seq:
+                    events.append(event)
+        return {"events": events}
 
     def run_status(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None
@@ -504,6 +566,12 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/api/events":
                 self._stream_events(parse_qs(parsed.query))
+                return
+            if parsed.path == "/api/subagent-events":
+                query = parse_qs(parsed.query)
+                child_run_id = (query.get("run_id") or [""])[0]
+                from_seq = int((query.get("from") or ["0"])[0] or 0)
+                self._write_json(studio.subagent_events(child_run_id, from_seq))
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
 

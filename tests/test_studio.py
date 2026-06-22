@@ -636,3 +636,51 @@ def test_studio_renders_plan_updates(tmp_path: Path) -> None:
         assert any(i["status"] == "in_progress" for i in items)
     finally:
         server.shutdown()
+
+
+# --- Tier-2: subagents (agent.spawn) + streaming child work ----------------------------
+
+
+def test_studio_spawns_subagent_and_exposes_child_events(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "data.md").write_text("the answer is 42\n", encoding="utf-8")
+    # One shared fake drives parent + child turns in sequence (the child reuses the parent's
+    # adapter instance): parent delegates, child answers, parent wraps up.
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "agent_spawn",
+                        {"subagent_type": "researcher", "prompt": "find the answer in data.md"},
+                        "c1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="The answer is 42."),
+            ModelTurn(final_text="My researcher reports: 42."),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("delegate the lookup")["run_id"]
+        _wait_settled(server, run_id, 1)
+        events = server.poll_events(run_id, 0).get("events", [])
+        started = [e for e in events if e.get("type") == "subagent.started"]
+        assert started, "the parent stream should carry subagent.started"
+        child_run_id = started[0]["data"]["child_run_id"]
+        assert ".sub." in child_run_id and run_id in child_run_id
+        assert any(e.get("type") == "subagent.finished" for e in events)
+        # The child's own work is streamable via subagent_events (reads the child's events.jsonl).
+        child = server.subagent_events(child_run_id).get("events", [])
+        settled = [e for e in child if e.get("type") == "turn.settled"]
+        assert settled and "42" in settled[-1]["data"]["final_text"]
+        # path-traversal guard
+        assert server.subagent_events("../secrets")["events"] == []
+    finally:
+        server.shutdown()

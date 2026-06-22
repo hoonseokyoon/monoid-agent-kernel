@@ -11,6 +11,32 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
+### DX-11 🟡 Streaming a child subagent's work to the parent UI
+Building the subagent feature with live progress. A spawned subagent is an **isolated child run**
+(`AgentLoop` with run id `<parent>.sub.<task>`, its own recorder); the parent's event stream only
+carries `subagent.started`/`subagent.finished` (with `child_run_id`) — the child's tool calls and
+token deltas go to **its own** `run_root/<child_run_id>/events.jsonl`. The child loop also did not
+inherit token streaming.
+- **Core fix (clean):** the child `AgentLoop` now inherits `emit_output_deltas`, so the child
+  streams `model.output.delta` into its own events.jsonl too.
+- **Studio workaround:** `subagent_events(child_run_id)` reads that file directly (studio owns the
+  run_root) and the UI polls `/api/subagent-events` to render a nested card — live tool calls +
+  streamed tokens. Verified live: a child streamed 54 token fragments that reassembled to its
+  final text.
+- **Remaining gap:** the backend exposes no API to stream a *descendant* run's events (records are
+  flat; `backend.events` is per-registered-run + token). A "descendant events" endpoint (authorize
+  via the parent's token) would be the clean fix so an embedder need not read the filesystem.
+
+### DX-10 🟢 Backend config validation rejected the dynamically-registered agent.spawn — FIXED
+Binding `agent.spawn` in a runtime config failed `validate_runtime_config` with "unknown registry
+tool: agent.spawn". Cause: `agent.spawn` is registered by the loop bootstrap **only when the run
+carries `subagent_definitions`**, but the backend validates configs (`submit_run`,
+`replace_runtime_config`) against the static `builtin_tools` registry, which never includes it.
+Fix: `_backend_builtin_tool_specs(subagent_definitions)` appends `agent_spawn_tool(catalog)` when
+the backend has subagent definitions, so validation matches what the loop will actually register.
+
+---
+
 ### DX-8 🟢 Token streaming isn't reachable from the autonomous (submit_run) path — FIXED
 **Found** building the Tier-1 "token streaming" item. The loop only streamed when a RunStream sink
 was active (`loop.astream()` / backend `astream_run`); studio drives chats via `submit_run` →

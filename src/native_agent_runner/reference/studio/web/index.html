@@ -109,6 +109,15 @@
   #plan li.done { color: var(--text); }
   #plan li.done .step { text-decoration: line-through; opacity: .7; }
   #plan li.active { color: var(--accent); }
+  .subagent { border-left: 2px solid var(--accent); padding: 4px 0 4px 10px; margin: 8px 0; }
+  .subagent .sa-head { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .subagent .sa-head b { color: var(--text); }
+  .subagent .sa-status { float: right; }
+  .subagent.done .sa-status { color: var(--ok, #4ec9b0); }
+  .subagent.failed { border-left-color: var(--err); }
+  .subagent.failed .sa-status { color: var(--err); }
+  .subagent .sa-act { font-size: 12px; color: var(--muted); padding: 1px 0; }
+  .subagent .sa-out { white-space: pre-wrap; font-size: 13px; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -256,6 +265,8 @@ function handleEvent(ev) {
   if (type === "task.started" && data.kind === "hitl") { hideTyping(); renderHitl(data); return; }
   if (type.indexOf("job.") === 0) { refreshJobs(); return; }
   if (type === "plan.updated") { renderPlan(data.items); return; }
+  if (type === "subagent.started") { startSubagent(data); return; }
+  if (type === "subagent.finished" || type === "subagent.failed") { finishSubagent(data, type === "subagent.failed"); return; }
   if (type === "metrics.updated") { updateUsage(data); return; }
   if (type === "turn.failed") {
     hideTyping();
@@ -324,6 +335,83 @@ function renderPlan(items) {
     li.appendChild(st); li.appendChild(step);
     planEl.appendChild(li);
   }
+}
+
+// Subagents: a spawned subagent is an isolated child run; its work isn't in the parent stream,
+// so we poll its own events.jsonl (via /api/subagent-events) to stream tokens + tool calls into
+// a nested card. child_run_id arrives on subagent.started.
+const subagents = {};
+function startSubagent(data) {
+  const cid = data.child_run_id;
+  if (!cid || subagents[cid]) return;
+  hideTyping();
+  const card = document.createElement("div");
+  card.className = "subagent";
+  const head = document.createElement("div");
+  head.className = "sa-head";
+  head.textContent = "🤖 subagent · " + String(data.subagent_type || "");
+  const status = document.createElement("span");
+  status.className = "sa-status"; status.textContent = "running…";
+  head.appendChild(status);
+  const body = document.createElement("div");
+  body.className = "sa-body";
+  card.appendChild(head); card.appendChild(body);
+  log.appendChild(card); log.scrollTop = log.scrollHeight;
+  const state = { card, status, body, outEl: null, lastSeq: -1, done: false, timer: null };
+  subagents[cid] = state;
+  pollSubagent(cid);
+}
+function drainSubagent(cid) {
+  const state = subagents[cid];
+  if (!state) return Promise.resolve();
+  return fetch("/api/subagent-events?run_id=" + encodeURIComponent(cid) + "&from=" + (state.lastSeq + 1))
+    .then((r) => r.json())
+    .then((body) => {
+      for (const ev of (body.events || [])) {
+        const seq = ev.seq ?? -1;
+        if (seq <= state.lastSeq) continue;
+        state.lastSeq = seq;
+        renderChildEvent(state, ev);
+      }
+    })
+    .catch(() => {});
+}
+function pollSubagent(cid) {
+  const state = subagents[cid];
+  if (!state || state.done) return;
+  drainSubagent(cid).finally(() => {
+    if (!state.done) state.timer = setTimeout(() => pollSubagent(cid), 600);
+  });
+}
+function renderChildEvent(state, ev) {
+  const type = ev.type || "", data = ev.data || {};
+  if (type === "model.output.delta") {
+    if (!state.outEl) { state.outEl = document.createElement("div"); state.outEl.className = "sa-out"; state.body.appendChild(state.outEl); }
+    state.outEl.textContent += (data.text || "");
+    log.scrollTop = log.scrollHeight;
+  } else if (type === "tool.call.started") {
+    const line = document.createElement("div");
+    line.className = "sa-act";
+    line.textContent = "↳ " + childActivity(data);
+    state.body.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  }
+}
+function childActivity(data) {
+  const tool = String(data.tool || "tool").replace(/_/g, ".");
+  const ap = data.args_preview || {};
+  const target = (data.paths && data.paths[0]) || ap.path || ap.query_preview || ap.url_preview || ap.query || "";
+  return target ? (tool + " " + target) : tool;
+}
+function finishSubagent(data, failed) {
+  const cid = data.child_run_id;
+  const state = subagents[cid];
+  if (!state) return;
+  if (state.timer) clearTimeout(state.timer);
+  state.done = true;
+  drainSubagent(cid);  // catch the tail of the child's events
+  state.card.classList.add(failed ? "failed" : "done");
+  state.status.textContent = failed ? "✕ failed" : "✓ done";
 }
 
 const proposalEl = document.getElementById("proposal");

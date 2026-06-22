@@ -8,7 +8,7 @@ import random
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
 from dataclasses import dataclass, field
@@ -19,6 +19,7 @@ from native_agent_runner.core.agents import (
     AgentDefinition,
     AgentRuntimeConfig,
     RuntimeConfigProvider,
+    SubagentDefinition,
     validate_runtime_config,
 )
 from native_agent_runner.core.cancellation import CancellationToken
@@ -61,7 +62,7 @@ from native_agent_runner.providers.base import ModelAdapter
 from native_agent_runner.providers.gateway import GatewayModelAdapter
 from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
 from native_agent_runner.recorder import append_event_to_run
-from native_agent_runner.tools.builtin import builtin_tools
+from native_agent_runner.tools.builtin import agent_spawn_tool, builtin_tools
 from native_agent_runner.web import WebGatewayClient
 from native_agent_runner.workspace.paths import is_within
 
@@ -249,8 +250,17 @@ class BackendRuntimeConfigProvider(RuntimeConfigProvider):
         return self._backend.current_runtime_config(self._run_id)
 
 
-def _backend_builtin_tool_specs() -> tuple[Any, ...]:
-    return tuple(builtin_tools(cast(Workspace, None)))
+def _backend_builtin_tool_specs(
+    subagent_definitions: Mapping[str, SubagentDefinition] | None = None,
+) -> tuple[Any, ...]:
+    specs = list(builtin_tools(cast(Workspace, None)))
+    # agent.spawn is registered dynamically by the loop bootstrap (only when the run carries
+    # subagent_definitions), so config validation must know about it too when they're present —
+    # otherwise a binding to agent.spawn looks like an unknown tool.
+    if subagent_definitions:
+        catalog = {sid: d.description for sid, d in subagent_definitions.items()}
+        specs.append(agent_spawn_tool(catalog))
+    return tuple(specs)
 
 
 def _runtime_config_uses_web(config: AgentRuntimeConfig) -> bool:
@@ -358,6 +368,9 @@ class RunnerBackend:
     # events (for adapters that support astream_turn) so an event-stream consumer renders tokens
     # live. Off by default; a UI-facing embedder (e.g. studio) turns it on.
     emit_output_deltas: bool = False
+    # Agent-as-tool delegation: subagent id -> definition. When non-empty, runs can bind
+    # agent.spawn (the loop bootstrap registers it). Child runs write to run_root/<child_id>/.
+    subagent_definitions: Mapping[str, SubagentDefinition] = field(default_factory=dict)
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -509,7 +522,7 @@ class RunnerBackend:
             user_id=request.user_id,
             ttl_s=self.run_token_ttl_s,
         )
-        tool_specs = _backend_builtin_tool_specs()
+        tool_specs = _backend_builtin_tool_specs(self.subagent_definitions)
         initial_runtime_config = request.runtime_config
         runtime_config_issuer = "submit_run"
         runtime_config_reason = "initial runtime config"
@@ -798,7 +811,7 @@ class RunnerBackend:
         config: AgentRuntimeConfig,
     ) -> dict[str, Any]:
         self._authorize_run(run_id, token)
-        validate_runtime_config(config, _backend_builtin_tool_specs())
+        validate_runtime_config(config, _backend_builtin_tool_specs(self.subagent_definitions))
         record = self._record(run_id)
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
@@ -1331,6 +1344,7 @@ class RunnerBackend:
             runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
             checkpoint_store=self.checkpoint_store,
             emit_output_deltas=self.emit_output_deltas,
+            subagent_definitions=self.subagent_definitions,
         )
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
@@ -1734,6 +1748,7 @@ class RunnerBackend:
             runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
             checkpoint_store=self.checkpoint_store,
             emit_output_deltas=self.emit_output_deltas,
+            subagent_definitions=self.subagent_definitions,
         )
         # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
         # restore re-applies the agent's delta from the checkpoint's content blobs.
