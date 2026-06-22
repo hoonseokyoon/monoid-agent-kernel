@@ -1402,3 +1402,42 @@ def test_backend_interrupt_parks_turn_then_resumes(tmp_path: Path) -> None:
     finally:
         backend.cancel_run(run_id, token)
         backend.wait_for_run(run_id, timeout_s=20)
+
+
+# --- DX-11: descendant (subagent) events API -------------------------------------------
+
+
+def test_backend_descendant_events_reads_child_and_checks_lineage(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(tmp_path, workspace, adapters, [ModelTurn(response_id="r1", final_text="ok")])
+    submission = _submit_multi_turn(backend, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    try:
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+        # Simulate an isolated child subagent run's events.jsonl under the same run_root.
+        child_id = f"{run_id}.sub.task_abc"
+        child_dir = backend.run_root / child_id
+        child_dir.mkdir(parents=True)
+        (child_dir / "events.jsonl").write_text(
+            json.dumps({"seq": 0, "type": "model.output.delta", "data": {"text": "hi"}}) + "\n"
+            + json.dumps({"seq": 1, "type": "turn.settled", "data": {"final_text": "hi"}}) + "\n",
+            encoding="utf-8",
+        )
+        out = backend.descendant_events(run_id, token, child_id)
+        assert [e["type"] for e in out["events"]] == ["model.output.delta", "turn.settled"]
+        # from_seq filters
+        tail = backend.descendant_events(run_id, token, child_id, from_seq=1)
+        assert [e["seq"] for e in tail["events"]] == [1]
+        # a non-descendant id is rejected even with a valid token
+        with pytest.raises(PermissionDenied):
+            backend.descendant_events(run_id, token, "some.other.run")
+        # path traversal is rejected
+        with pytest.raises(PermissionDenied):
+            backend.descendant_events(run_id, token, f"{run_id}.sub.../escape")
+        # a bad token is rejected
+        with pytest.raises(Exception):  # noqa: B017 - TokenError family
+            backend.descendant_events(run_id, "bad-token", child_id)
+    finally:
+        backend.cancel_run(run_id, token)
+        backend.wait_for_run(run_id, timeout_s=20)

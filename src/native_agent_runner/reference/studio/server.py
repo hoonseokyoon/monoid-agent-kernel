@@ -355,31 +355,23 @@ class StudioServer:
         return self._backend.events(run_id, token, from_seq=from_seq)
 
     def subagent_events(self, child_run_id: str, from_seq: int = 0) -> dict[str, Any]:
-        """Stream a child subagent run's work by reading its events.jsonl directly.
+        """Stream a child subagent run's work for the parent UI.
 
-        A spawned subagent is an isolated AgentLoop under the same run_root (run id
-        ``<parent>.sub.<task>``), NOT a backend record — so backend.events() can't reach it.
-        The parent's stream only carries subagent.started/finished; the child's tool calls and
-        token deltas live in run_root/<child_run_id>/events.jsonl. Studio owns the run_root, so
-        it tails that file. (DX gap: core persists child events but offers no API to stream a
-        descendant run to the parent's UI — a backend "descendant events" endpoint would be the
-        clean fix; logged in DX_NOTES.)"""
-        if not child_run_id or any(c in child_run_id for c in ("/", "\\")) or ".." in child_run_id:
+        A spawned subagent is an isolated child run (id ``<parent>.sub.<task>``) the backend
+        doesn't expose via a record. We derive the ancestor run studio submitted from the id and
+        read the descendant's events through ``backend.descendant_events`` (authorized by the
+        ancestor's run token, which the BFF holds server-side) — no filesystem access from the UI
+        path. This is the DX-11 fix: the descendant-events API replaced studio's earlier direct
+        events.jsonl read."""
+        assert self._backend is not None
+        if ".sub." not in child_run_id:
             return {"events": []}
-        path = self.config.run_root / child_run_id / "events.jsonl"
-        events: list[dict[str, Any]] = []
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if int(event.get("seq", 0)) >= from_seq:
-                    events.append(event)
-        return {"events": events}
+        parent_run_id = child_run_id.split(".sub.", 1)[0]
+        try:
+            token = self._token_for(parent_run_id)
+            return self._backend.descendant_events(parent_run_id, token, child_run_id, from_seq=from_seq)
+        except NativeAgentError:
+            return {"events": []}
 
     def run_status(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None

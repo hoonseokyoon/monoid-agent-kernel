@@ -1047,6 +1047,33 @@ class RunnerBackend:
                     events.append(event)
         return {"run_id": run_id, "events": events}
 
+    def descendant_events(
+        self, run_id: str, token: str, descendant_run_id: str, *, from_seq: int = 0
+    ) -> dict[str, Any]:
+        """Stream a descendant (subagent) run's events, authorized via the ancestor's run token.
+
+        A spawned subagent is an isolated child run (id ``<parent>.sub.<task>``) under the same
+        run_root but with NO backend record/token, so :meth:`events` can't reach it. The owner of
+        an ancestor run reads a descendant's events.jsonl here — its tool calls + token deltas —
+        for live subagent observability, without touching the filesystem itself. Authorization is
+        the ancestor's token plus an id-prefix descendant check (a subagent id always extends its
+        parent's with ``.sub.<task>``, at any depth)."""
+        self._authorize_run(run_id, token)
+        if descendant_run_id != run_id and not descendant_run_id.startswith(f"{run_id}.sub."):
+            raise PermissionDenied("run is not a descendant of the authorized run")
+        if any(sep in descendant_run_id for sep in ("/", "\\")) or ".." in descendant_run_id:
+            raise PermissionDenied("invalid descendant run id")
+        events_path = self.run_root / descendant_run_id / "events.jsonl"
+        events: list[dict[str, Any]] = []
+        if events_path.exists():
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                if int(event.get("seq") or 0) >= from_seq:
+                    events.append(event)
+        return {"run_id": descendant_run_id, "events": events}
+
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)
         record = self._record(run_id)

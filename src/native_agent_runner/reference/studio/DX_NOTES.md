@@ -11,21 +11,24 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
-### DX-11 🟡 Streaming a child subagent's work to the parent UI
+### DX-11 🟢 Streaming a child subagent's work to the parent UI — FIXED
 Building the subagent feature with live progress. A spawned subagent is an **isolated child run**
 (`AgentLoop` with run id `<parent>.sub.<task>`, its own recorder); the parent's event stream only
 carries `subagent.started`/`subagent.finished` (with `child_run_id`) — the child's tool calls and
 token deltas go to **its own** `run_root/<child_run_id>/events.jsonl`. The child loop also did not
 inherit token streaming.
-- **Core fix (clean):** the child `AgentLoop` now inherits `emit_output_deltas`, so the child
-  streams `model.output.delta` into its own events.jsonl too.
-- **Studio workaround:** `subagent_events(child_run_id)` reads that file directly (studio owns the
-  run_root) and the UI polls `/api/subagent-events` to render a nested card — live tool calls +
-  streamed tokens. Verified live: a child streamed 54 token fragments that reassembled to its
-  final text.
-- **Remaining gap:** the backend exposes no API to stream a *descendant* run's events (records are
-  flat; `backend.events` is per-registered-run + token). A "descendant events" endpoint (authorize
-  via the parent's token) would be the clean fix so an embedder need not read the filesystem.
+- **Core:** the child `AgentLoop` now inherits `emit_output_deltas`, so the child streams
+  `model.output.delta` into its own events.jsonl too.
+- **Backend (the clean fix):** `RunnerBackend.descendant_events(run_id, token, descendant_run_id)`
+  — authorize via the *ancestor's* run token, verify lineage by id prefix (a subagent id always
+  extends its parent's with `.sub.<task>`, at any depth) + reject path separators, then read the
+  descendant's events.jsonl. A child run has no record/token of its own, so this is how an embedder
+  tails it without filesystem access.
+- **Studio:** `subagent_events(child_run_id)` derives the ancestor run id from the child id, looks
+  up that run's token (held server-side) and calls `descendant_events` — the earlier direct
+  events.jsonl read is gone. The UI polls `/api/subagent-events` to render a nested card with the
+  child's live tool calls + streamed tokens. Verified live: a child streamed 54 token fragments
+  that reassembled to its final text.
 
 ### DX-10 🟢 Backend config validation rejected the dynamically-registered agent.spawn — FIXED
 Binding `agent.spawn` in a runtime config failed `validate_runtime_config` with "unknown registry
