@@ -18,9 +18,11 @@ from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.reference.llm_gateway.providers import EchoModelAdapter
 from native_agent_runner.reference.studio.activity import describe_event
 from native_agent_runner.reference.studio.server import (
+    _ALL_CAPABILITIES,
     StudioConfig,
     StudioServer,
     _agent_runtime_config,
+    _runtime_config_for,
 )
 
 
@@ -389,3 +391,39 @@ def test_web_search_runs_through_the_gateway(tmp_path: Path) -> None:
         assert started and "Searching the web for" in (describe_event(started[0]) or "")
     finally:
         server.shutdown()
+
+
+# --- R6: settings window + live Agent-spec editing --------------------------------------
+
+
+def test_runtime_config_for_subset() -> None:
+    refs = {b.ref.tool_id for b in _runtime_config_for(["read"]).tools}
+    assert refs == {"fs.read"}
+    assert _runtime_config_for([]).tools == ()
+
+
+def test_settings_lists_capabilities_and_provider(tmp_path: Path) -> None:
+    server = StudioServer(StudioConfig(workspace=tmp_path / "ws", provider="offline"))  # not started
+    s = server.settings()
+    assert s["provider"] == "offline" and s["offline"] is True
+    assert set(s["capabilities"]) == set(_ALL_CAPABILITIES)
+    assert {a["key"] for a in s["available"]} == set(_ALL_CAPABILITIES)
+
+
+def test_settings_change_applies_to_new_chats(studio: StudioServer) -> None:
+    studio.update_settings(["read"])
+    run_id = studio.start_chat("hi")["run_id"]
+    config = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
+    assert {b.ref.tool_id for b in config.tools} == {"fs.read"}
+
+
+def test_settings_hot_swaps_active_session(studio: StudioServer) -> None:
+    run_id = studio.start_chat("hello")["run_id"]
+    _wait_settled(studio, run_id, 1)  # turn settles -> session active (awaiting input), not terminal
+    before = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
+    assert "fs.write" in {b.ref.tool_id for b in before.tools}
+    result = studio.update_settings(["read"])
+    assert result["applied_runs"] == 1
+    after = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
+    assert {b.ref.tool_id for b in after.tools} == {"fs.read"}
+    assert after.config_version > before.config_version

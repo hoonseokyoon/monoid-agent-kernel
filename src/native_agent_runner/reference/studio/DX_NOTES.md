@@ -150,4 +150,29 @@ correct behavior, no core change): web `args_preview` carries `query_preview` / 
 dict), so `narration._target` now surfaces only plain-string args — a redacted query shows as
 "Searching the web for" with no term, which is the right privacy outcome.
 
-<!-- Add new entries below as later rungs (R6+) surface them. -->
+### R6 (settings window + live Agent-spec editing) — no new core gap
+The runtime-config hot-swap surface was sufficient: Studio keeps an editable capability set,
+builds the runtime config from it (`_runtime_config_for`), and on a settings change calls
+`backend.replace_runtime_config(expected_version=current.config_version, …)` for each active run
+(version auto-bumps; terminal/stale runs are skipped). The Settings page is a second small
+window (`/settings`, opened via `studio settings`). `current_runtime_config` (no token, internal)
+made reading the live version trivial. Optimistic versioning (expected_version) is the only sharp
+edge — read the current version right before replacing.
+
+### DX-6 🟡 Test suite can intermittently hang (now bounded + diagnosable)
+**Symptom:** a backgrounded full-suite run occasionally appeared to stall forever — no output,
+the pytest process alive but idle (≈6 CPU-seconds over minutes), requiring a manual kill.
+
+**Investigation:** the core teardowns are already bounded (`_teardown_loop` joins the shared
+asyncio-loop thread with `timeout=5`; conftest `serving()` joins HTTP server threads with
+`timeout=10`). Single runs and several back-to-back repros all passed cleanly, so this is a **rare
+timing race** in the threaded-HTTP / shared-loop / subprocess tests, not a deterministic deadlock
+or a shipped-code bug. The "silently forever" part was the harness's block-buffered background
+pipe: a hung pytest never flushes, so the run looks dead.
+
+**Fix (test-infra):** `tests/conftest.py` arms `faulthandler.dump_traceback_later(240, exit=True)`
+(disabled via `NAR_TEST_HANG_TIMEOUT_S=0`, cancelled on normal finish). A wedged run now dumps
+every thread's stack — pinpointing the exact blocked line — and aborts, instead of hanging. So
+the background can never stall indefinitely again, and the next occurrence is self-diagnosing.
+
+<!-- Add new entries below as later rungs surface them. -->

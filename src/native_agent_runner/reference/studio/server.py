@@ -65,24 +65,29 @@ _SHELL_DENY_PREFIXES = (
 )
 
 
-def _agent_runtime_config() -> AgentRuntimeConfig:
-    """Studio capability set so far: chat + read + write + ask-the-human + shell (R1 read, R2
-    write/propose, R3 HITL, R4 shell + background jobs).
+# The Agent's capabilities, each mapping to the tool bindings it enables. Editable live from the
+# Settings window (R6) — toggling one hot-swaps the running session's runtime config.
+_ALL_CAPABILITIES = ("read", "write", "hitl", "shell", "web")
+_CAPABILITY_LABELS = {
+    "read": "Read files",
+    "write": "Write files (staged as a proposal)",
+    "hitl": "Ask the human for approval",
+    "shell": "Run shell commands + background jobs",
+    "web": "Search & fetch the web",
+}
 
-    In propose mode writes are staged into an overlay and surfaced as a diff/proposal; nothing
-    touches the real workspace until the user applies it. ``hitl.request`` lets the agent pause
-    and ask the human to approve/answer. ``shell.exec`` runs commands in a sanitized workspace
-    copy: it auto-approves ordinary commands but refuses obviously destructive ones, and supports
-    background jobs.
-    """
-    return AgentRuntimeConfig(
-        definition_id="studio-agent",
-        tools=(
-            ToolBinding(binding_id="fs.read", model_name="fs_read", ref=RegistryToolRef("fs.read")),
-            ToolBinding(binding_id="fs.write", model_name="fs_write", ref=RegistryToolRef("fs.write")),
-            ToolBinding(
-                binding_id="hitl.request", model_name="hitl_request", ref=RegistryToolRef("hitl.request")
-            ),
+
+def _capability_bindings(capability: str) -> tuple[ToolBinding, ...]:
+    if capability == "read":
+        return (ToolBinding(binding_id="fs.read", model_name="fs_read", ref=RegistryToolRef("fs.read")),)
+    if capability == "write":
+        return (ToolBinding(binding_id="fs.write", model_name="fs_write", ref=RegistryToolRef("fs.write")),)
+    if capability == "hitl":
+        return (
+            ToolBinding(binding_id="hitl.request", model_name="hitl_request", ref=RegistryToolRef("hitl.request")),
+        )
+    if capability == "shell":
+        return (
             ToolBinding(
                 binding_id="shell.exec",
                 model_name="shell_exec",
@@ -90,11 +95,29 @@ def _agent_runtime_config() -> AgentRuntimeConfig:
                 scope=ToolScope(command_deny_prefixes=_SHELL_DENY_PREFIXES),
                 runtime={"shell": {"approval_mode": "auto-approve"}},
             ),
+        )
+    if capability == "web":
+        return (
             ToolBinding(binding_id="web.search", model_name="web_search", ref=RegistryToolRef("web.search")),
             ToolBinding(binding_id="web.fetch", model_name="web_fetch", ref=RegistryToolRef("web.fetch")),
             ToolBinding(binding_id="web.context", model_name="web_context", ref=RegistryToolRef("web.context")),
-        ),
-    )
+        )
+    return ()
+
+
+def _runtime_config_for(capabilities: list[str]) -> AgentRuntimeConfig:
+    """Build the runtime config for an enabled-capability set (order-stable, deduped)."""
+    enabled = set(capabilities)
+    tools: list[ToolBinding] = []
+    for capability in _ALL_CAPABILITIES:
+        if capability in enabled:
+            tools.extend(_capability_bindings(capability))
+    return AgentRuntimeConfig(definition_id="studio-agent", tools=tuple(tools))
+
+
+def _agent_runtime_config() -> AgentRuntimeConfig:
+    """The full capability set (chat + read + write + HITL + shell + web)."""
+    return _runtime_config_for(list(_ALL_CAPABILITIES))
 
 
 @dataclass
@@ -125,6 +148,8 @@ class StudioServer:
         self._ui_server: ThreadingHTTPServer | None = None
         self._ui_thread: threading.Thread | None = None
         self._backend: RunnerBackend | None = None
+        # The live-editable Agent capability set (Settings window, R6). Defaults to everything.
+        self._capabilities: list[str] = list(_ALL_CAPABILITIES)
         # run_id -> run access token (held server-side, never sent to the browser).
         self._run_tokens: dict[str, str] = {}
         self._lock = threading.RLock()
@@ -214,7 +239,7 @@ class StudioServer:
     def start_chat(self, message: str) -> dict[str, Any]:
         """Open a new multi-turn session in the workspace and deliver the first message."""
         assert self._backend is not None
-        runtime_config = _agent_runtime_config()  # chat + read + write (staged in propose mode)
+        runtime_config = _runtime_config_for(self._capabilities)  # the currently-enabled capabilities
         request = BackendRunRequest(
             tenant_id=_TENANT,
             user_id=_USER,
@@ -285,6 +310,42 @@ class StudioServer:
             run_id, token, task_id=task_id, result={"answer": answer}, status="answered"
         )
 
+    def settings(self) -> dict[str, Any]:
+        """Current Studio settings for the Settings window: provider + the Agent capability set."""
+        return {
+            "provider": self.config.provider,
+            "offline": self.offline,
+            "capabilities": list(self._capabilities),
+            "available": [{"key": cap, "label": _CAPABILITY_LABELS[cap]} for cap in _ALL_CAPABILITIES],
+        }
+
+    def update_settings(self, capabilities: list[str]) -> dict[str, Any]:
+        """Change the Agent's capability set. New chats use it; active sessions are hot-swapped
+        in place via runtime-config replacement (applied at their next turn)."""
+        assert self._backend is not None
+        caps = [cap for cap in _ALL_CAPABILITIES if cap in set(capabilities)]
+        self._capabilities = caps
+        with self._lock:
+            active = list(self._run_tokens.items())
+        applied = 0
+        for run_id, token in active:
+            current = self._backend.current_runtime_config(run_id)
+            if current is None:
+                continue
+            try:
+                self._backend.replace_runtime_config(
+                    run_id,
+                    token,
+                    expected_version=current.config_version,
+                    issuer="studio-settings",
+                    reason="capability change from Settings",
+                    config=_runtime_config_for(caps),
+                )
+                applied += 1
+            except (NativeAgentError, ValueError):
+                pass  # terminal or stale run — skip
+        return {"capabilities": caps, "applied_runs": applied}
+
     def list_files(self) -> list[dict[str, Any]]:
         """A flat, sorted listing of the workspace for the file-tree panel (read-only;
         skips VCS/cache dirs and is bounded so a huge tree can't stall the UI)."""
@@ -325,6 +386,12 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             parsed = urlparse(self.path)
             if parsed.path in ("/", "/index.html"):
                 self._serve_file(_WEB_DIR / "index.html", "text/html; charset=utf-8")
+                return
+            if parsed.path == "/settings":
+                self._serve_file(_WEB_DIR / "settings.html", "text/html; charset=utf-8")
+                return
+            if parsed.path == "/api/settings":
+                self._write_json(studio.settings())
                 return
             if parsed.path == "/healthz":
                 self._write_json({"ok": True})
@@ -403,6 +470,14 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     task_id = str(body.get("task_id") or "")
                     answer = str(body.get("answer") or "")
                     self._write_json(studio.answer_hitl(run_id, task_id, answer))
+                    return
+                if parsed.path == "/api/settings":
+                    body = self._read_json()
+                    caps = body.get("capabilities") or []
+                    if not isinstance(caps, list):
+                        self._write_json({"error": "capabilities must be a list"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    self._write_json(studio.update_settings([str(c) for c in caps]))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
             except NativeAgentError as exc:

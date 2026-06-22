@@ -112,3 +112,13 @@ def studio_open(*, url: str) -> None:
     if window is None:
         raise click.ClickException(f"No Chromium browser found; open {url} manually.")
     window.wait()
+
+
+@studio.command("settings")
+@click.option("--url", type=str, default="http://127.0.0.1:8799", show_default=True)
+def studio_settings(*, url: str) -> None:
+    """Open the small Settings window for an already-running Studio server."""
+    window = open_app_window(url.rstrip("/") + "/settings", width=520, height=660)
+    if window is None:
+        raise click.ClickException(f"No Chromium browser found; open {url}/settings manually.")
+    window.wait()
