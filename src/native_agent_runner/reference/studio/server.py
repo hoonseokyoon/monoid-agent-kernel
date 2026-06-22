@@ -338,20 +338,36 @@ class StudioServer:
         return {"run_id": submission.run_id, "status": submission.status}
 
     def sessions(self) -> dict[str, Any]:
-        """The chat history: sessions started this server run (newest first) with their live
-        status. In-memory only — a session list that survives a restart would need a backend
-        run-listing API (the run dirs persist under run_root, but their access tokens don't)."""
+        """The chat history (newest first), restart-surviving via the backend (DX-12).
+
+        Source of truth is ``backend.list_runs`` (scans run_root → titles/status + a read token
+        per run), so the list — and loading a past chat — works after a restart. The per-run read
+        tokens are stored server-side (never sent to the browser). Very-recent runs whose run.json
+        isn't on disk yet are overlaid from the in-memory ``_sessions`` so a new chat appears
+        immediately."""
         assert self._backend is not None
+        listing = self._backend.list_runs(_TENANT, user_id=_USER).get("runs", [])
         with self._lock:
-            entries = list(self._sessions)
-        out: list[dict[str, Any]] = []
-        for entry in entries:
-            status = "unknown"
-            try:
-                status = self._backend.status(entry["run_id"], self._token_for(entry["run_id"])).get("status", "unknown")
-            except NativeAgentError:
-                pass
-            out.append({**entry, "status": status})
+            for run in listing:
+                self._run_tokens.setdefault(run["run_id"], run["read_token"])
+            known = {run["run_id"] for run in listing}
+            recents = [s for s in self._sessions if s["run_id"] not in known]
+        out = [
+            {
+                "run_id": run["run_id"],
+                "title": run["title"] or run["run_id"],
+                "status": run["status"],
+                "created_at": run["created_at"],
+                "recoverable": run["recoverable"],
+            }
+            for run in listing
+        ]
+        out += [
+            {"run_id": s["run_id"], "title": s["title"], "status": "running",
+             "created_at": s["created_at"], "recoverable": False}
+            for s in recents
+        ]
+        out.sort(key=lambda entry: entry["created_at"], reverse=True)
         return {"sessions": out}
 
     def continue_chat(self, run_id: str, message: str) -> dict[str, Any]:

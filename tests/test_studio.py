@@ -727,3 +727,27 @@ def test_run_events_carry_trace_nesting(tmp_path: Path) -> None:
         assert tool.get("event_id") and tool.get("parent_id") in ids  # nests under a parent event
     finally:
         server.shutdown()
+
+
+def test_studio_history_survives_restart(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    run_root = tmp_path / "runs"
+    s1 = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root))
+    s1.start()
+    try:
+        rid = s1.start_chat("remember me")["run_id"]
+        _wait_settled(s1, rid, 1)
+    finally:
+        s1.shutdown()
+    # A fresh studio over the same run_root == a restart (no in-memory records/tokens).
+    s2 = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root))
+    s2.start()
+    try:
+        sessions = s2.sessions()["sessions"]
+        assert any(x["run_id"] == rid and x["title"] == "remember me" for x in sessions)
+        # the past transcript is readable even though s2 has no live record for it
+        events = s2.poll_events(rid, 0)["events"]
+        assert any(e.get("type") == "turn.settled" for e in events)
+    finally:
+        s2.shutdown()

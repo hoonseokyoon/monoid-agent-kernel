@@ -1441,3 +1441,49 @@ def test_backend_descendant_events_reads_child_and_checks_lineage(tmp_path: Path
     finally:
         backend.cancel_run(run_id, token)
         backend.wait_for_run(run_id, timeout_s=20)
+
+
+# --- DX-12: list_runs + historical (no-record) reads survive a restart -----------------
+
+
+def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend1 = _scripted_backend(
+        tmp_path, workspace, adapters, [ModelTurn(response_id="r1", final_text="hello world")]
+    )
+    submission = _submit_multi_turn(backend1, workspace)  # instruction "hi"
+    run_id = submission.run_id
+    try:
+        assert _poll(lambda: backend1._record(run_id).status == "awaiting_input")
+    finally:
+        backend1.cancel_run(run_id, submission.run_token)
+        backend1.wait_for_run(run_id, timeout_s=20)
+
+    # "restart": a brand-new backend over the same run_root, with NO in-memory records.
+    backend2 = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda *_a, **_k: _ScriptedTurnAdapter([]),
+    )
+    listing = backend2.list_runs("tenant_a")["runs"]
+    entry = next(r for r in listing if r["run_id"] == run_id)
+    assert entry["title"] == "hi"
+    token = entry["read_token"]
+    # historical event read with no live record
+    events = backend2.events(run_id, token)["events"]
+    assert any(e.get("type") == "turn.settled" for e in events)
+    assert "status" in backend2.status(run_id, token)
+    # tenant scoping
+    assert backend2.list_runs("nobody")["runs"] == []
+    # auth: a bad token, and a path-traversal run id, are rejected
+    with pytest.raises(PermissionDenied):
+        backend2.events(run_id, "not-a-token")
+    traversal = backend2.token_manager.issue(
+        kind="run_access", audience="native-agent-runner.backend",
+        run_id="../escape", tenant_id="tenant_a", user_id="user_a", ttl_s=60,
+    )
+    with pytest.raises(PermissionDenied):
+        backend2.events("../escape", traversal)

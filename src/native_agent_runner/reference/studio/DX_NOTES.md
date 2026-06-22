@@ -11,15 +11,24 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
-### DX-12 🟡 Session history doesn't survive a restart (no backend run-listing API)
-Building R8 (chat history). Studio lists the chats it started this server run from an in-memory
-map (`_sessions`) — and loading a past chat just re-opens its event stream (`/api/events` replays
-from seq 0), so no new core surface was needed for the in-session case. But a history that survives
-a **restart** can't be rebuilt: the run dirs persist under `run_root`, yet the backend exposes no
-"list my runs" API, and each run's events are gated behind a per-run token that studio held only in
-memory. `recover_runs()` lists *recoverable* (parked) runs, not all of them, and doesn't mint read
-tokens. Clean fix would be a backend `list_runs(tenant, ...)` (+ a way to re-issue a read token for
-an owned run) so an embedder can rebuild history from disk. Deferred — in-session history shipped.
+### DX-12 🟢 Session history doesn't survive a restart (no backend run-listing API) — FIXED
+Building R8 (chat history). Studio first listed only the chats it started this server run (in-memory
+`_sessions`); a history that survived a **restart** couldn't be rebuilt — the run dirs persist under
+`run_root`, but the backend had no "list my runs" API and each run's events were gated behind a
+per-run token held only in memory, plus `events()`/`status()` required an in-memory record.
+- **Backend:** `list_runs(tenant_id, *, user_id, limit)` — a trusted-host scan of run_root (like
+  `recover_runs`) reading each `run.json` (now carrying `created_at` + `title`), taking status from
+  a live record when present else status.json, flagging `recoverable`, and **minting a read token
+  per entry** (mirrors submit_run returning one). `events()`/`status()` gained a **no-record path**
+  via `_authorized_run_dir`: a signed run token authorizes reading `run_root/<run_id>` straight from
+  disk (path-guarded), so a historical run with no record is still readable.
+- **Studio:** `sessions()` now sources `backend.list_runs` (restart-surviving), stores the read
+  tokens server-side (never sent to the browser), and overlays very-recent in-memory runs whose
+  run.json isn't on disk yet. The UI is unchanged.
+- Verified live across a real "restart" (a second studio process over the same run_root): it listed
+  the prior chat (`recoverable=True`) and replayed its transcript with no in-memory record, and no
+  read token leaked to the browser. Resuming a parked historical run (vs read-only replay) rides the
+  existing `recover_runs()` and is left for when needed.
 
 ### DX-11 🟢 Streaming a child subagent's work to the parent UI — FIXED
 Building the subagent feature with live progress. A spawned subagent is an **isolated child run**

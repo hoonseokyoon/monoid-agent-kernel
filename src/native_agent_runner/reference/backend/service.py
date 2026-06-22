@@ -620,12 +620,21 @@ class RunnerBackend:
         )
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        status_file = record.run_dir / "status.json"
+        run_dir = self._authorized_run_dir(run_id, token)
+        status_file = run_dir / "status.json"
         status_payload: dict[str, Any] | None = None
         if status_file.exists():
             status_payload = json.loads(status_file.read_text(encoding="utf-8"))
+        with self._lock:
+            record = self._records.get(run_id)
+        if record is None:
+            # Historical run (no live record, e.g. after a restart): report from status.json.
+            return {
+                "run_id": run_id,
+                "status": (status_payload or {}).get("status", "ended"),
+                "run_dir": str(run_dir),
+                "status_file": status_payload,
+            }
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
@@ -1034,9 +1043,7 @@ class RunnerBackend:
         return result.to_json()
 
     def events(self, run_id: str, token: str, *, from_seq: int = 0) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        events_path = record.run_dir / "events.jsonl"
+        events_path = self._authorized_run_dir(run_id, token) / "events.jsonl"
         events: list[dict[str, Any]] = []
         if events_path.exists():
             for line in events_path.read_text(encoding="utf-8").splitlines():
@@ -1555,6 +1562,9 @@ class RunnerBackend:
             "mode": request.mode,
             "workspace_backend": request.workspace_backend,
             "multi_turn": request.multi_turn,
+            # For history listing (DX-12): a created-at stamp + a short title (first instruction).
+            "created_at": time.time(),
+            "title": " ".join((request.instruction or "").split())[:80],
             "limits": {
                 "max_steps": request.max_steps,
                 "max_tool_calls": request.max_tool_calls,
@@ -1849,18 +1859,104 @@ class RunnerBackend:
             raise PermissionDenied(f"workspace root is outside allowed roots: {workspace_root}")
 
     def _authorize_run(self, run_id: str, token: str) -> None:
-        try:
-            claims = self.token_manager.verify(
-                token,
-                kind="run_access",
-                audience="native-agent-runner.backend",
-                run_id=run_id,
-            )
-        except TokenError as exc:
-            raise PermissionDenied(str(exc)) from exc
+        claims = self._verify_run_token(run_id, token)
         record = self._record(run_id)
         if claims.tenant_id != record.tenant_id or claims.user_id != record.user_id:
             raise PermissionDenied("token subject mismatch")
+
+    def _verify_run_token(self, run_id: str, token: str) -> Any:
+        """Verify a run-access token for ``run_id`` (signature/kind/audience/run id), returning
+        its claims. Does NOT require an in-memory record — the signed token is the capability."""
+        try:
+            return self.token_manager.verify(
+                token, kind="run_access", audience="native-agent-runner.backend", run_id=run_id
+            )
+        except TokenError as exc:
+            raise PermissionDenied(str(exc)) from exc
+
+    def _authorized_run_dir(self, run_id: str, token: str) -> Path:
+        """Resolve a run's directory for a token-authorized READ — live or historical.
+
+        A live run is checked against its in-memory record (as :meth:`_authorize_run` does). A run
+        with no record (e.g. after a restart, surfaced by :meth:`list_runs`) is authorized on the
+        signed run token's own claims and read straight from run_root. Rejects path separators so
+        a crafted run id can't escape run_root."""
+        claims = self._verify_run_token(run_id, token)
+        with self._lock:
+            record = self._records.get(run_id)
+        if record is not None:
+            if claims.tenant_id != record.tenant_id or claims.user_id != record.user_id:
+                raise PermissionDenied("token subject mismatch")
+            return record.run_dir
+        if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
+            raise PermissionDenied("invalid run id")
+        return self.run_root / run_id
+
+    def list_runs(
+        self, tenant_id: str, *, user_id: str | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        """List a tenant's runs from ``run_root`` (newest first) — the durable history.
+
+        A trusted-host call (no token, like :meth:`recover_runs`): the embedder owns the run_root
+        and is responsible for tenant scoping. Reads each run.json (skipping subagent child runs,
+        which have none) for identity + title + created_at, takes the live status from an
+        in-memory record when present else status.json, and mints a fresh read-scoped run token
+        per entry so the caller can fetch events/status afterwards (mirrors submit_run returning a
+        run token). ``recoverable`` flags a parked run a restart can resume via recover_runs."""
+        runs: list[dict[str, Any]] = []
+        if not self.run_root.is_dir():
+            return {"runs": runs}
+        for run_dir in self.run_root.iterdir():
+            meta_path = run_dir / "run.json"
+            if not run_dir.is_dir() or not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            if meta.get("tenant_id") != tenant_id:
+                continue
+            run_user = meta.get("user_id") or ""
+            if user_id is not None and run_user != user_id:
+                continue
+            run_id = meta.get("run_id") or run_dir.name
+            with self._lock:
+                record = self._records.get(run_id)
+            if record is not None:
+                status = record.status
+            else:
+                status = "ended"
+                status_path = run_dir / "status.json"
+                if status_path.exists():
+                    try:
+                        status = json.loads(status_path.read_text(encoding="utf-8")).get("status", "ended")
+                    except (ValueError, OSError):
+                        pass
+            recoverable = False
+            if record is None and not (run_dir / "failure.json").exists() and self.checkpoint_store is not None:
+                stored = self.checkpoint_store.latest(run_id)
+                recoverable = stored is not None and not stored.checkpoint.terminal
+            runs.append(
+                {
+                    "run_id": run_id,
+                    "tenant_id": tenant_id,
+                    "user_id": run_user,
+                    "title": meta.get("title") or "",
+                    "created_at": meta.get("created_at") or 0.0,
+                    "status": status,
+                    "recoverable": recoverable,
+                    "read_token": self.token_manager.issue(
+                        kind="run_access",
+                        audience="native-agent-runner.backend",
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        user_id=run_user,
+                        ttl_s=self.run_token_ttl_s,
+                    ),
+                }
+            )
+        runs.sort(key=lambda entry: entry["created_at"], reverse=True)
+        return {"runs": runs[:limit]}
 
     def _record(self, run_id: str) -> BackendRunRecord:
         with self._lock:
