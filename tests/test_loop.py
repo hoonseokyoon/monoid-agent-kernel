@@ -660,3 +660,37 @@ def test_no_output_deltas_when_disabled(tmp_path: Path) -> None:
         assert not [e for e in sink.events if e.type == "model.output.delta"]
     finally:
         loop.close()
+
+
+class _StreamThenStopAdapter:
+    """Streams text fragments and flips the loop's interrupt flag after the first one, so the
+    next post-yield check aborts the stream mid-generation (immediate stop)."""
+
+    def __init__(self) -> None:
+        self.loop = None
+
+    async def astream_turn(self, request):  # noqa: ANN001
+        yield TextDelta("part1 ")
+        self.loop.interrupt_turn()  # a "stop" arrives mid-stream
+        yield TextDelta("part2 ")
+        yield TextDelta("part3 ")  # must NOT be reached — the stream is aborted first
+        yield TurnComplete(response_id="r1")
+
+    def next_turn(self, request):  # noqa: ANN001
+        return ModelTurn(final_text="unused")
+
+
+def test_interrupt_aborts_stream_mid_generation(tmp_path: Path) -> None:
+    adapter = _StreamThenStopAdapter()
+    loop, sink = _streaming_loop(tmp_path, adapter, emit=True)
+    adapter.loop = loop
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("go")
+        assert susp.reason == "interrupted"
+        assert loop._session is not None and loop._session.terminal is False
+        texts = [e.data["text"] for e in sink.events if e.type == "model.output.delta"]
+        assert texts == ["part1 ", "part2 "]  # part3 never streamed: aborted mid-generation
+        assert "turn.interrupted" in [e.type for e in sink.events]
+    finally:
+        loop.close()

@@ -32,9 +32,8 @@ gateway path yielded one assembled chunk. Three layers, none of which was the co
   reconciles with the authoritative `final_text` on settle).
 
 Verified live with real OpenAI: 10 incremental fragments (`One`, `…`, `Two`, …) that join exactly to
-the settled `final_text`. The DX-9 limit (Stop is step-boundary) is unchanged — a true
-mid-generation Stop now becomes possible on top of this stream (cancel the async iterator), a
-follow-up if wanted.
+the settled `final_text`. This stream also makes the DX-9 Stop *immediate* (abort the async
+iterator mid-token) — implemented; see DX-9's resolution note.
 
 ### DX-9 🟢 "Stop" is run-level only (no turn-level interrupt) — FIXED
 Cancellation (`RunnerBackend.cancel_run` / `CancellationToken`) terminalizes the **whole run**, so
@@ -50,9 +49,13 @@ alive, reusing the recoverable-turn (DX-7) park pattern:
 - **Studio**: Stop button → `POST /api/interrupt` → `interrupt_chat`; the composer stays enabled and
   the next message continues the same conversation (`/api/cancel` is kept for "end the run").
 
-**Known limit (ties to DX-8):** the interrupt takes effect at a step boundary, so an in-flight model
-call finishes first — it stops a *multi-step* agent from doing more, but cannot abort a single
-in-flight generation. A true mid-generation stop needs streaming (cancel the stream) = DX-8.
+**Step-boundary limit → resolved on streaming (DX-8).** Without streaming the interrupt lands at the
+next step boundary (an in-flight non-streamed model call finishes first). With token streaming
+(`emit_output_deltas` + an `astream_turn` adapter), `_acall_model_emitting_deltas` checks the flag
+after every chunk and raises `TurnInterrupted` + `aclose()`s the generator — aborting the in-flight
+generation within one token (the partial text already streamed stays). Verified live with OpenAI:
+Stop mid-essay halted at ~8 fragments, no `turn.settled`, session alive. So studio's Stop is now
+immediate during a streamed turn, step-boundary otherwise.
 
 ---
 

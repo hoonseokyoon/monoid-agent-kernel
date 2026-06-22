@@ -653,8 +653,9 @@ class AgentLoop:
         continues the conversation). Thread-safe one-way signal (a bare flag set, mirroring
         ``cancellation_token.cancel()``). A no-op if no turn is in flight: the flag is cleared
         when the next submit starts, so it never kills a turn the user did not mean to stop.
-        Takes effect only at a step boundary — an in-flight model call finishes first (a true
-        mid-generation stop requires streaming)."""
+        With token streaming (``emit_output_deltas`` + an ``astream_turn`` adapter) it takes
+        effect mid-generation — the in-flight stream is aborted at the next token. Otherwise it
+        lands at the next step boundary (a non-streamed model call finishes first)."""
         self._interrupt_requested = True
 
     async def arun_until_suspended(
@@ -989,10 +990,23 @@ class AgentLoop:
         assert self._session is not None
         recorder = self._session.res.recorder
         chunks: list[ModelStreamChunk] = []
-        async for chunk in astream_turn(request):
-            chunks.append(chunk)
-            if isinstance(chunk, TextDelta) and chunk.text:
-                recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
+        agen = astream_turn(request)
+        try:
+            async for chunk in agen:
+                chunks.append(chunk)
+                if isinstance(chunk, TextDelta) and chunk.text:
+                    recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
+                # Immediate stop: when a turn interrupt arrives mid-stream, abort the in-flight
+                # generation now (don't wait for the next step boundary). The text already
+                # streamed stays; the except in arun_until_suspended parks the live session.
+                if self._interrupt_requested:
+                    raise TurnInterrupted("turn interrupted")
+        finally:
+            # Close the generator so the provider's stream/connection is released promptly
+            # (on a normal drain this is a no-op; on the mid-stream abort it cancels the wire).
+            aclose = getattr(agen, "aclose", None)
+            if aclose is not None:
+                await aclose()
         return assemble_streamed_turn(chunks)
 
     def _record_failure(self, state: RunState, res: _RunResources, exc: Exception) -> None:
