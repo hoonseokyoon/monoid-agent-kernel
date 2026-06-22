@@ -137,6 +137,24 @@ def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name)
 
 
+def _recoverable_turn_error(exc: BaseException) -> bool:
+    """Whether a model-turn exception is *recoverable* — the session should survive and the
+    turn can be re-attempted (after backoff, or after the user fixes config) rather than
+    terminalizing the whole run.
+
+    Recoverable = a ``ModelAdapterError`` that is gateway-flagged ``retryable`` (transient:
+    timeouts, network, 429, exhausted 5xx) OR any 4xx (config/auth/rate-limit the user can fix
+    and resend against). Everything else — a generic exception, or an un-flagged 5xx — stays
+    terminal, matching today's behavior.
+    """
+    if not isinstance(exc, ModelAdapterError):
+        return False
+    if exc.retryable:
+        return True
+    status = exc.http_status
+    return status is not None and 400 <= status < 500
+
+
 def _failure_result(exc: Exception, *, error_code: str | None = None) -> ToolResult:
     """Build a failed ToolResult from an exception, carrying the model-facing
     retry/category signal. Raw ``ValueError``/``TypeError`` are treated as tool
@@ -662,6 +680,48 @@ class AgentLoop:
             )
             self._persist_checkpoint(session)
             return result
+        except ModelAdapterError as exc:
+            if not _recoverable_turn_error(exc):
+                # Non-recoverable model error -> terminal (same bookkeeping as the generic
+                # handler below; a re-raise here would skip that handler, so inline it).
+                self._record_failure(state, res, exc)
+                session.terminal = True
+                result = replace(
+                    Suspension(reason="terminal", status="failed"),
+                    error=state.error,
+                    error_code=state.error_code,
+                    turn=self._checkpoint_on_settle(state, res),
+                )
+                self._persist_checkpoint(session)
+                return result
+            # Recoverable model-turn failure: keep the session alive so the turn can be
+            # re-attempted (driver decides: backoff-retry transient, or park for the user to
+            # fix config + resend). The user message + observations are already committed to
+            # state.messages (appended before the model call); the assistant reply was never
+            # appended (success-only). The ONLY leftover to clear for an idempotent re-attempt
+            # is pending_observations — otherwise a re-issue re-appends the same tool outputs.
+            state.provider_error_code = exc.provider_error_code
+            state.provider_http_status = exc.http_status
+            res.recorder.emit(
+                "turn.failed",
+                data={
+                    "error": public_error_message(str(exc)),
+                    "error_code": exc.error_code,
+                    "provider_error_code": exc.provider_error_code,
+                    "http_status": exc.http_status,
+                    "retryable": exc.retryable,
+                },
+                level="warning",
+            )
+            state.pending_observations = ()
+            self._persist_checkpoint(session)
+            return replace(
+                Suspension(reason="turn_failed", status="failed"),
+                error=public_error_message(str(exc)),
+                error_code=exc.error_code,
+                retryable=exc.retryable,
+                http_status=exc.http_status,
+            )
         except Exception as exc:  # controlled recording boundary for standalone CLI
             self._record_failure(state, res, exc)
             session.terminal = True
@@ -694,6 +754,18 @@ class AgentLoop:
         multi-turn driver calls this before blocking on its message channel."""
         session = self._require_open()
         session.res.recorder.emit("run.awaiting_input", data={"reason": "user"})
+
+    def fail_recoverable(self, message: str, *, error_code: str = "model_error") -> None:
+        """Promote a now-exhausted recoverable turn failure to a terminal run failure.
+
+        A driver that has given up retrying a ``turn_failed`` suspension (e.g. the consecutive
+        failure cap was hit) calls this to record the durable failure (``failure.json`` +
+        ``run.failed``) and mark the session terminal, without having to duplicate the loop's
+        terminal bookkeeping. The driver then closes the run as usual."""
+        session = self._require_open()
+        self._record_failure(session.state, session.res, ModelAdapterError(message, error_code=error_code))
+        session.terminal = True
+        self._persist_checkpoint(session)
 
     def has_pending_tasks(self) -> bool:
         """Whether the run has resume-tasks still outstanding (not yet drained)."""

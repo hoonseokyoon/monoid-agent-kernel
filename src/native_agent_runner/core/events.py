@@ -21,6 +21,7 @@ AgentEventType = Literal[
     "agent.config.updated",
     "model.turn.started",
     "model.turn.finished",
+    "turn.failed",
     "model.input.degraded",
     "tool.call.started",
     "tool.call.finished",

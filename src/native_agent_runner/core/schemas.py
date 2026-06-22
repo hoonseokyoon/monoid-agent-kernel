@@ -141,6 +141,16 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         required=("step",),
     ),
+    "turn.failed": _data_schema(
+        {
+            "error": _STR,
+            "error_code": _STR,
+            "provider_error_code": _STR,
+            "http_status": {"type": ["integer", "null"]},
+            "retryable": _BOOL,
+        },
+        required=("error_code",),
+    ),
     "model.input.degraded": _data_schema(
         {"dropped_part_types": _STR_ARRAY, "reason": _STR},
         required=("reason",),

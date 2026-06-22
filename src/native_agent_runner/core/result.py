@@ -44,11 +44,19 @@ class Suspension:
     pending tasks; ``awaiting_task_ids``/``has_external`` describe the hosted
     (hitl/automation) tasks a caller must wait on. ``limited`` — a per-submit or
     session budget was hit. ``terminal`` — cancelled/timed out/failed.
+    ``turn_failed`` — the model turn raised a *recoverable* error (e.g. a 4xx/429
+    or a gateway-flagged retryable error): the session is **not** terminal, the
+    conversation up to the user message is preserved, and a caller may re-issue
+    the turn via ``arun_until_suspended(None)`` or park for new user input.
+    ``retryable``/``http_status`` carry the classification for that decision.
+    The non-terminal-ness is carried by ``reason`` alone — ``status`` mirrors the
+    failure (``"failed"``) since ``RunStatus`` has no non-terminal value, so
+    callers must branch on ``reason``, not ``status``, to detect a live run.
     For every reason except ``awaiting_tasks`` a settle checkpoint ran and
     ``turn`` carries its result.
     """
 
-    reason: Literal["settled", "awaiting_tasks", "limited", "terminal"]
+    reason: Literal["settled", "awaiting_tasks", "limited", "terminal", "turn_failed"]
     status: RunStatus
     final_text: str = ""
     error: str = ""
@@ -56,6 +64,8 @@ class Suspension:
     awaiting_task_ids: tuple[str, ...] = ()
     has_external: bool = False
     turn: AgentTurnResult | None = None
+    retryable: bool = False
+    http_status: int | None = None
 
 
 @dataclass(frozen=True)

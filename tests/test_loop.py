@@ -9,9 +9,11 @@ from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.schemas import validate_run_dir
 from native_agent_runner.core.spec import AgentRunSpec, RunLimits
 from native_agent_runner.core.tool_surface import ToolQuota
-from native_agent_runner.loop import AgentLoop
+from native_agent_runner.errors import ModelAdapterError
+from native_agent_runner.loop import AgentLoop, _recoverable_turn_error
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from native_agent_runner.recorder import MemoryEventSink
 from native_agent_runner.workspace.local import default_local_workspace_factory, sha256_bytes
 
 
@@ -406,3 +408,148 @@ def test_loop_limits_and_cancellation(tmp_path: Path) -> None:
     ).run_once("Finish.")
     assert cancelled.status == "limited"
     assert cancelled.error_code == "cancelled"
+
+
+# --- recoverable turn errors -----------------------------------------------------------
+
+
+class _ScriptedAdapter:
+    """Drives a script of turns/exceptions: a ModelTurn is returned, a BaseException is raised."""
+
+    def __init__(self, script: list) -> None:
+        self.script = list(script)
+        self.requests: list = []
+
+    def next_turn(self, request):  # noqa: ANN001
+        self.requests.append(request)
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _loop_with(tmp_path: Path, adapter, *tool_ids: str) -> tuple[AgentLoop, MemoryEventSink, Path]:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    run_root = tmp_path / "runs"
+    sink = MemoryEventSink()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=run_root)
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=_provider(*(tool_ids or ("run.finish",))),
+        event_sinks=(sink,),
+    )
+    return loop, sink, run_root
+
+
+def test_recoverable_turn_error_classifier() -> None:
+    assert _recoverable_turn_error(ModelAdapterError("x", http_status=400))
+    assert _recoverable_turn_error(ModelAdapterError("x", http_status=401))
+    assert _recoverable_turn_error(ModelAdapterError("x", http_status=429, retryable=True))
+    assert _recoverable_turn_error(ModelAdapterError("x", retryable=True))  # any status
+    assert not _recoverable_turn_error(ModelAdapterError("x", http_status=500))
+    assert not _recoverable_turn_error(RuntimeError("x"))
+
+
+def test_turn_failed_suspension_is_non_terminal(tmp_path: Path) -> None:
+    adapter = _ScriptedAdapter([ModelAdapterError("bad effort", http_status=400, error_code="model_error")])
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("hello")
+        assert susp.reason == "turn_failed"
+        assert susp.retryable is False
+        assert susp.http_status == 400
+        assert loop._session is not None and loop._session.terminal is False
+        types = [e.type for e in sink.events]
+        assert "turn.failed" in types
+        assert "run.failed" not in types
+        assert list(run_root.rglob("failure.json")) == []  # not a terminal failure
+    finally:
+        loop.close()
+
+
+def test_turn_failed_is_idempotent_on_reentry(tmp_path: Path) -> None:
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError("transient", http_status=503, retryable=True),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        first = loop.run_until_suspended("hi")
+        assert first.reason == "turn_failed"
+        assert loop._session is not None and loop._session.state.pending_observations == ()
+        second = loop.run_until_suspended(None)  # re-issue the same turn
+        assert second.reason == "settled"
+        # The re-attempt sent the identical message log — no duplicated user message.
+        assert adapter.requests[0].messages == adapter.requests[1].messages
+    finally:
+        loop.close()
+
+
+def test_non_recoverable_model_error_is_terminal(tmp_path: Path) -> None:
+    adapter = _ScriptedAdapter([ModelAdapterError("server boom", http_status=500)])
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("hi")
+        assert susp.reason == "terminal"
+        assert susp.status == "failed"
+        assert loop._session is not None and loop._session.terminal is True
+        assert "run.failed" in [e.type for e in sink.events]
+        assert list(run_root.rglob("failure.json"))
+    finally:
+        loop.close()
+
+
+def test_generic_model_error_is_terminal(tmp_path: Path) -> None:
+    # A raw exception is wrapped into a non-retryable ModelAdapterError -> still terminal.
+    adapter = _ScriptedAdapter([RuntimeError("kaboom")])
+    loop, sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("hi")
+        assert susp.reason == "terminal" and susp.status == "failed"
+        assert loop._session is not None and loop._session.terminal is True
+    finally:
+        loop.close()
+
+
+def test_turn_failed_after_tool_round_clears_observations(tmp_path: Path) -> None:
+    adapter = _ScriptedAdapter(
+        [
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_write", {"path": "a.md", "content": "x"}, "c1"),)),
+            ModelAdapterError("transient", http_status=503, retryable=True),
+            ModelTurn(response_id="r3", final_text="done"),
+        ]
+    )
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter, "fs.write", "run.finish")
+    loop.open()
+    try:
+        first = loop.run_until_suspended("write a.md")  # tool runs, then turn 2 model call fails
+        assert first.reason == "turn_failed"
+        assert loop._session is not None and loop._session.state.pending_observations == ()
+        second = loop.run_until_suspended(None)
+        assert second.reason == "settled"
+        # The post-tool message log is re-sent verbatim — the function_call_output isn't duplicated.
+        assert adapter.requests[1].messages == adapter.requests[2].messages
+    finally:
+        loop.close()
+
+
+def test_fail_recoverable_promotes_to_terminal(tmp_path: Path) -> None:
+    adapter = _ScriptedAdapter([ModelAdapterError("bad", http_status=400)])
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hi").reason == "turn_failed"
+        loop.fail_recoverable("gave up after retries", error_code="model_error")
+        assert loop._session is not None and loop._session.terminal is True
+        assert "run.failed" in [e.type for e in sink.events]
+        assert list(run_root.rglob("failure.json"))
+    finally:
+        loop.close()
