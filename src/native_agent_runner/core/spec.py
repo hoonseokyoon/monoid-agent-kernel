@@ -215,8 +215,9 @@ class RunLimits:
 def text_from_parts(parts: tuple[ContentPart, ...]) -> str:
     """Join the text of the text parts in ``parts`` for text-only model adapters.
 
-    Non-text parts (images, documents) are not forwarded yet (see core/content.py),
-    so only ``TextPart`` content is extracted.
+    Used only for adapters without multimodal support: such an adapter cannot carry
+    images/documents, so only ``TextPart`` content is extracted. Multimodal adapters keep the
+    full by-reference parts list (see ``user_message_from_parts`` / core/content.py).
     """
     text_segments = [
         part.text.strip()

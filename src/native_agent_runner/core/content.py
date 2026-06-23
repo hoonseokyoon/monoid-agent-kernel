@@ -23,7 +23,8 @@ class TextPart:
 
 @dataclass(frozen=True)
 class ImagePart:
-    """Contract-only: a reference to image input. Not yet forwarded to providers."""
+    """A by-reference image input. Forwarded to multimodal providers: the loop resolves
+    ``source_ref`` to bytes at wire-build time (``WIRE_FORWARDABLE_PART_TYPES``)."""
 
     source_ref: str  # workspace path or opaque handle; resolution is deferred
     mime_type: str
@@ -32,7 +33,8 @@ class ImagePart:
 
 @dataclass(frozen=True)
 class DocumentPart:
-    """Contract-only: a reference to document input (e.g. PDF). Not yet forwarded."""
+    """A by-reference document input (e.g. PDF). Forwarded to multimodal providers, same as
+    ``ImagePart`` (resolved at wire-build time)."""
 
     source_ref: str
     mime_type: str

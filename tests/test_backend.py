@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -17,8 +18,13 @@ from native_agent_runner.core.tool_surface import ToolScope
 from native_agent_runner.core.spec import ModelRetryConfig
 from native_agent_runner.errors import ModelAdapterError, PermissionDenied
 from native_agent_runner.permissions import PermissionPolicy
+from native_agent_runner.core.content import ImagePart, TextPart
 from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from native_agent_runner.providers.fake import (
+    FakeModelAdapter,
+    FakeMultimodalModelAdapter,
+    fake_tool_call,
+)
 from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import (
@@ -431,6 +437,110 @@ def test_resume_run_rejects_terminal_and_unknown(tmp_path: Path) -> None:
     )
     with pytest.raises(KeyError):
         backend.resume_run("run_missing", bogus)
+
+
+# A 1x1 transparent PNG — small enough to ride the default max_bytes_read.
+_PNG_1x1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+
+def test_send_message_forwards_multimodal_image_by_reference(tmp_path: Path) -> None:
+    # The string-only blocker fix: send_message accepts content parts; the loop resolves the
+    # workspace image reference to a base64 wire block and forwards it to a multimodal adapter.
+    workspace = _workspace(tmp_path)
+    workspace.joinpath("shot.png").write_bytes(_PNG_1x1)
+    run_root = tmp_path / "runs"
+
+    adapters: list = []
+
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        adapter = FakeMultimodalModelAdapter(
+            turns=[ModelTurn(response_id="r1", final_text="first"), ModelTurn(response_id="r2", final_text="an image")]
+        )
+        adapters.append(adapter)
+        return adapter
+
+    backend = RunnerBackend(
+        run_root=run_root,
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+    )
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hi",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+
+    def _wait(predicate, tries: int = 2000) -> bool:
+        for _ in range(tries):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+
+    # Deliver a multimodal follow-up: a workspace image reference + a text part.
+    backend.send_message(
+        run_id,
+        token,
+        [TextPart("describe this"), ImagePart(source_ref="shot.png", mime_type="image/png")],
+    )
+
+    # The resolved request carries a base64 image block (resolution happened at wire-build time).
+    def _image_block_forwarded() -> bool:
+        for adapter in adapters:
+            for req in adapter.requests:
+                for msg in req.messages:
+                    content = msg.get("content")
+                    if isinstance(content, list) and any(
+                        isinstance(b, dict) and b.get("type") == "image" for b in content
+                    ):
+                        return True
+        return False
+
+    assert _wait(_image_block_forwarded)
+
+    backend.cancel_run(run_id, token)
+    assert backend.wait_for_run(run_id, timeout_s=20) in {"completed", "limited", "failed"}
+
+
+def test_queued_multimodal_message_round_trips_through_checkpoint() -> None:
+    # The queue + checkpoint stay JSON-native, so a parked multimodal message survives a restart.
+    from native_agent_runner.core.checkpoint import RunCheckpoint
+    from native_agent_runner.reference.backend.service import (
+        _normalize_inbound_message,
+        _queued_message_to_loop_input,
+    )
+
+    wire = _normalize_inbound_message(
+        [TextPart("describe"), ImagePart(source_ref="shot.png", mime_type="image/png")]
+    )
+    assert isinstance(wire, list)  # JSON-native: a list of content-part dicts
+
+    # Survives the durable checkpoint round-trip with no dataclass (de)serialization.
+    ckpt = RunCheckpoint(run_id="r", queued_messages=["plain text", wire])
+    restored = RunCheckpoint.from_json(ckpt.to_json())
+    assert restored is not None
+    assert restored.queued_messages[0] == "plain text"
+
+    # On dequeue it rebuilds the typed parts for the loop.
+    loop_input = _queued_message_to_loop_input(restored.queued_messages[1])
+    assert isinstance(loop_input, tuple)
+    assert isinstance(loop_input[0], TextPart) and isinstance(loop_input[1], ImagePart)
+    assert loop_input[1].source_ref == "shot.png"
 
 
 def test_recover_runs_skips_terminal_and_metaless_checkpoints(tmp_path: Path) -> None:

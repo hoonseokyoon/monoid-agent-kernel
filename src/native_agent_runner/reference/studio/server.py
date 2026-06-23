@@ -17,12 +17,15 @@ Not part of the supported surface — a reference example you copy and own.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +40,7 @@ from native_agent_runner.core.agents import (
     SubagentDefinition,
     ToolBinding,
 )
+from native_agent_runner.core.content import ContentPart, DocumentPart, ImagePart, TextPart
 from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
 from native_agent_runner.core.tool_surface import ToolScope
 from native_agent_runner.errors import NativeAgentError
@@ -52,13 +56,19 @@ from native_agent_runner.reference.studio.activity import describe_event
 _LOGGER = logging.getLogger("native_agent_runner.studio")
 
 _WEB_DIR = Path(__file__).parent / "web"
-_MAX_BODY_BYTES = 1_000_000
+# Per-attachment cap. Images/PDFs ride a base64 JSON body, so the HTTP body limit and the run's
+# workspace read limit are both sized to clear it (a multimodal message references the workspace
+# file; the bytes are resolved at wire-build time, capped by the run's max_bytes_read).
+_MAX_ATTACH_BYTES = 8 * 1024 * 1024
+_MAX_BODY_BYTES = _MAX_ATTACH_BYTES + 2 * 1024 * 1024  # room for base64 inflation + JSON envelope
+# Uploaded attachments are persisted here under the workspace so a workspace-path source_ref resolves.
+_ATTACH_DIR = ".studio-attachments"
 # Studio is a single-user local app; the tenant/user are fixed placeholders.
 _TENANT = "studio"
 _USER = "local"
 
 # Directories never shown in the file tree (and not worth walking).
-_TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".ruff_cache", ".pytest_cache"}
+_TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".ruff_cache", ".pytest_cache", _ATTACH_DIR}
 _TREE_MAX_ENTRIES = 2000
 _VIEW_MAX_BYTES = 256 * 1024  # file-viewer read cap — keep a huge file from stalling the UI
 
@@ -358,17 +368,57 @@ class StudioServer:
 
     # --- chat operations (called by the handler) ----------------------------------------
 
-    def start_chat(self, message: str) -> dict[str, Any]:
-        """Open a new multi-turn session in the workspace and deliver the first message."""
+    def _parts_from_attachments(
+        self, message: str, attachments: Sequence[dict[str, Any]]
+    ) -> tuple[ContentPart, ...]:
+        """Persist uploaded attachments under the workspace and build the multimodal content parts
+        for a user message. Each attachment is ``{name, mime, data_b64}``; ``image/*`` becomes an
+        ``ImagePart``, anything else (e.g. ``application/pdf``) a ``DocumentPart``. The file is
+        written into the workspace so its by-reference ``source_ref`` resolves at wire-build time.
+        Returns ``()`` when there are no attachments (the caller uses the plain-text path)."""
+        if not attachments:
+            return ()
+        parts: list[ContentPart] = []
+        if message.strip():
+            parts.append(TextPart(message.strip()))
+        attach_root = self.workspace / _ATTACH_DIR
+        attach_root.mkdir(parents=True, exist_ok=True)
+        for att in attachments:
+            name = str(att.get("name") or "file")
+            mime = str(att.get("mime") or "application/octet-stream")
+            try:
+                raw = base64.b64decode(str(att.get("data_b64") or ""), validate=True)
+            except (ValueError, TypeError) as exc:
+                raise NativeAgentError(f"attachment {name!r} is not valid base64") from exc
+            if not raw:
+                raise NativeAgentError(f"attachment {name!r} is empty")
+            if len(raw) > _MAX_ATTACH_BYTES:
+                raise NativeAgentError(f"attachment {name!r} exceeds the {_MAX_ATTACH_BYTES}-byte limit")
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:80] or "file"
+            rel = f"{_ATTACH_DIR}/{secrets.token_hex(4)}-{safe}"
+            (self.workspace / rel).write_bytes(raw)
+            if mime.startswith("image/"):
+                parts.append(ImagePart(source_ref=rel, mime_type=mime))
+            else:
+                parts.append(DocumentPart(source_ref=rel, mime_type=mime))
+        return tuple(parts)
+
+    def start_chat(self, message: str, attachments: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+        """Open a new multi-turn session in the workspace and deliver the first message (with any
+        image/document attachments as multimodal content parts)."""
         assert self._backend is not None
         runtime_config = _runtime_config_for(self._capabilities, self._model, self._effort, self._summary)
+        parts = self._parts_from_attachments(message, attachments)
         request = BackendRunRequest(
             tenant_id=_TENANT,
             user_id=_USER,
             workspace_root=self.workspace,
-            instruction=message,
+            instruction=message or "[attachment]",
+            input_parts=parts,
             mode="propose",
             multi_turn=True,
+            # Sized so a workspace image/PDF reference resolves to bytes at wire-build time.
+            max_bytes_read=_MAX_ATTACH_BYTES,
             runtime_config=runtime_config,
         )
         submission = self._backend.submit_run(request)
@@ -411,18 +461,22 @@ class StudioServer:
         out.sort(key=lambda entry: entry["created_at"], reverse=True)
         return {"sessions": out}
 
-    def continue_chat(self, run_id: str, message: str) -> dict[str, Any]:
-        """Deliver a follow-up message. If the run is no longer live in memory (a parked session
-        surviving a restart), transparently resume it from its checkpoint first, then send — so
-        "continue an old chat" just works. ``send_message`` raises KeyError for a non-in-memory run;
-        we resume on that signal and retry once."""
+    def continue_chat(
+        self, run_id: str, message: str, attachments: Sequence[dict[str, Any]] = ()
+    ) -> dict[str, Any]:
+        """Deliver a follow-up message (optionally with image/document attachments). If the run is
+        no longer live in memory (a parked session surviving a restart), transparently resume it
+        from its checkpoint first, then send — so "continue an old chat" just works. ``send_message``
+        raises KeyError for a non-in-memory run; we resume on that signal and retry once."""
         assert self._backend is not None
         token = self._token_for(run_id)
+        parts = self._parts_from_attachments(message, attachments)
+        payload: str | tuple[ContentPart, ...] = parts if parts else message
         try:
-            return self._backend.send_message(run_id, token, message)
+            return self._backend.send_message(run_id, token, payload)
         except KeyError:
             self._backend.resume_run(run_id, token)
-            return self._backend.send_message(run_id, token, message)
+            return self._backend.send_message(run_id, token, payload)
 
     def cancel_chat(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None
@@ -736,14 +790,20 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/chat":
                     body = self._read_json()
                     message = str(body.get("message") or "").strip()
-                    if not message:
-                        self._write_json({"error": "message is required"}, HTTPStatus.BAD_REQUEST)
+                    raw_attachments = body.get("attachments")
+                    attachments = (
+                        [a for a in raw_attachments if isinstance(a, dict)]
+                        if isinstance(raw_attachments, list)
+                        else []
+                    )
+                    if not message and not attachments:
+                        self._write_json({"error": "message or attachment is required"}, HTTPStatus.BAD_REQUEST)
                         return
                     run_id = body.get("run_id")
                     if run_id:
-                        result = studio.continue_chat(str(run_id), message)
+                        result = studio.continue_chat(str(run_id), message, attachments)
                     else:
-                        result = studio.start_chat(message)
+                        result = studio.start_chat(message, attachments)
                     self._write_json(result)
                     return
                 if parsed.path == "/api/cancel":

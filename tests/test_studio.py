@@ -371,6 +371,54 @@ def test_continue_chat_resumes_a_parked_session_after_restart(tmp_path: Path) ->
         server.shutdown()
 
 
+def test_start_chat_attaches_image_and_forwards_resolved_block(tmp_path: Path) -> None:
+    # R13: an attached image is persisted under the workspace and forwarded to a multimodal
+    # adapter as a resolved base64 block (the loop resolves the by-reference source_ref).
+    import base64
+
+    from native_agent_runner.providers.fake import FakeMultimodalModelAdapter
+
+    png_1x1 = base64.b64encode(
+        base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk"
+            "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        )
+    ).decode("ascii")
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    adapter = FakeMultimodalModelAdapter(turns=[ModelTurn(final_text="I see a 1x1 image.")])
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: adapter,
+    )
+    server.start()
+    try:
+        result = server.start_chat(
+            "what is this?",
+            [{"name": "pic.png", "mime": "image/png", "data_b64": png_1x1}],
+        )
+        run_id = result["run_id"]
+        _wait_settled(server, run_id, 1)
+
+        # The attachment was persisted under the workspace (so its source_ref resolves).
+        attach_dir = workspace / ".studio-attachments"
+        assert attach_dir.is_dir() and any(attach_dir.iterdir())
+
+        # The adapter received a resolved base64 image block on the user turn.
+        def _image_forwarded() -> bool:
+            return any(
+                isinstance(msg.get("content"), list)
+                and any(isinstance(b, dict) and b.get("type") == "image" for b in msg["content"])
+                for req in adapter.requests
+                for msg in req.messages
+            )
+
+        assert _image_forwarded()
+    finally:
+        server.shutdown()
+
+
 # --- R3: human-in-the-loop approval gate ------------------------------------------------
 
 

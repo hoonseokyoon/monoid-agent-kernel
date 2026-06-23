@@ -8,7 +8,7 @@ import random
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
 from dataclasses import dataclass, field
@@ -40,6 +40,11 @@ from native_agent_runner.core.checkpoint import (
 from native_agent_runner.reference.stores.lease import LeaseStore, LocalFsLeaseStore
 from native_agent_runner.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from native_agent_runner.core.result import AgentRunResult, Suspension
+from native_agent_runner.core.content import (
+    ContentPart,
+    content_part_from_json,
+    content_part_to_json,
+)
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
@@ -72,6 +77,34 @@ BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "f
 _CLOSE_SESSION = object()
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
 
+
+# --- multimodal message normalization (the backend message queue stays JSON-native) ---------
+# A backend message is either a ``str`` (text) or a ``list[dict]`` of content-part dicts (a
+# multimodal message carried by-reference). Keeping the queue + checkpoint JSON-native means a
+# parked multimodal message survives a restart with no dataclass (de)serialization in the driver.
+
+
+def _normalize_inbound_message(content: str | Sequence[Any]) -> str | list[dict[str, Any]]:
+    """Normalize a ``send_message`` argument into the queue's JSON-native wire form. Accepts a
+    plain ``str``, a sequence of ``ContentPart`` dataclasses, or a sequence of already-serialized
+    content-part dicts (the HTTP boundary sends the latter)."""
+    if isinstance(content, str):
+        return content
+    parts: list[dict[str, Any]] = []
+    for item in content:
+        parts.append(item if isinstance(item, dict) else content_part_to_json(item))
+    if not parts:
+        raise ValueError("message has no content")
+    return parts
+
+
+def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]:
+    """Convert a dequeued backend message (text ``str`` or ``list[dict]`` of part dicts) into a
+    loop ``submit`` input. ``content_part_from_json`` rebuilds the typed parts at the boundary."""
+    if isinstance(message, list):
+        return tuple(content_part_from_json(part) for part in message)
+    return message  # str
+
 # Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
 _RUN_META_SCHEMA_VERSION = "native-agent-runner.backend-run.v1"
 
@@ -95,6 +128,10 @@ class BackendRunRequest:
     user_id: str
     workspace_root: Path
     instruction: str
+    # Optional multimodal first turn: when non-empty, these content parts (text + image/document
+    # references) drive the opening turn instead of ``instruction``. ``instruction`` is still used
+    # for the run title / metadata, so callers pass the text alongside.
+    input_parts: tuple[ContentPart, ...] = ()
     mode: RunMode = "propose"
     workspace_backend: WorkspaceBackendKind = "overlay"
     max_steps: int = 30
@@ -768,12 +805,23 @@ class RunnerBackend:
             "interrupt_requested": requested,
         }
 
-    def send_message(self, run_id: str, token: str, content: str) -> dict[str, Any]:
-        """Deliver a follow-up user message to a running multi-turn session. It is
-        queued and consumed as the next user turn once the current turn settles."""
+    def send_message(
+        self, run_id: str, token: str, content: str | Sequence[Any]
+    ) -> dict[str, Any]:
+        """Deliver a follow-up user message to a running multi-turn session. It is queued and
+        consumed as the next user turn once the current turn settles.
+
+        ``content`` is either a plain ``str`` or a sequence of content parts (``ContentPart``
+        dataclasses or their JSON dicts) for a multimodal message. Multimodal parts reference
+        workspace files by ``source_ref`` — the bytes are resolved at wire-build time — so the
+        message itself stays small; the size limit applies to the by-reference wire form."""
         self._authorize_run(run_id, token)
         record = self._record(run_id)
-        if len(content.encode("utf-8")) > self.max_message_bytes:
+        message = _normalize_inbound_message(content)
+        wire_bytes = len(
+            (message if isinstance(message, str) else json.dumps(message)).encode("utf-8")
+        )
+        if wire_bytes > self.max_message_bytes:
             raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
@@ -781,7 +829,7 @@ class RunnerBackend:
             if record.message_queue.qsize() >= self.max_message_queue_depth:
                 raise ValueError("message queue is full; retry once the run drains it")
         # Enqueue on the shared loop (asyncio.Queue is not thread-safe across threads).
-        self._call_soon(record.message_queue.put_nowait, str(content))
+        self._call_soon(record.message_queue.put_nowait, message)
         return {"run_id": run_id, "status": "queued"}
 
     def current_runtime_config(self, run_id: str) -> AgentRuntimeConfig | None:
@@ -1181,8 +1229,9 @@ class RunnerBackend:
         shared open-session loop (also used by checkpoint recovery)."""
         record = self._record(run_id)
         await loop.aopen()
+        first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
         try:
-            suspension = await loop.arun_until_suspended(request.instruction)
+            suspension = await loop.arun_until_suspended(first_input)
         except NativeAgentError:
             # Bootstrap failed (terminal session already recorded); just finalize.
             return await loop.aclose()
@@ -1261,7 +1310,7 @@ class RunnerBackend:
                 if message is _CLOSE_SESSION:
                     break
                 turns += 1
-                suspension = await loop.arun_until_suspended(message)
+                suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
                 continue
             if suspension.reason == "interrupted":
                 # Turn-level stop (the user hit "stop"): not a failure, not terminal. Park the
@@ -1278,7 +1327,7 @@ class RunnerBackend:
                 if message is _CLOSE_SESSION:
                     break
                 turns += 1
-                suspension = await loop.arun_until_suspended(message)
+                suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
                 continue
             # settled. One-shot runs close here; multi-turn awaits the next message.
             consecutive_turn_failures = 0  # a settled turn clears the failure streak
@@ -1296,7 +1345,7 @@ class RunnerBackend:
             if message is _CLOSE_SESSION:
                 break
             turns += 1
-            suspension = await loop.arun_until_suspended(message)
+            suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
         return await loop.aclose()
 
     def _persist_run_checkpoint(self, record: BackendRunRecord) -> None:
@@ -1314,7 +1363,9 @@ class RunnerBackend:
         # loop, so reading the asyncio.Queue's backing deque needs no lock (single-threaded
         # loop; producers enqueue via _call_soon on this same loop).
         residual = [
-            message for message in list(record.message_queue._queue) if isinstance(message, str)
+            message
+            for message in list(record.message_queue._queue)
+            if isinstance(message, (str, list))  # str text or list[dict] parts; drop the close sentinel
         ]
         checkpoint.queued_messages = residual
         # Overwrites the same seq the loop just committed, now with the queue included.
@@ -1417,7 +1468,8 @@ class RunnerBackend:
             self._write_run_meta(prepared.record, request)
             await loop.aopen()
             suspension: Suspension | None = None
-            async with loop.astream(request.instruction) as stream:
+            first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
+            async with loop.astream(first_input) as stream:
                 async for item in stream:
                     yield self._frame(item)
                 suspension = stream.suspension
@@ -1888,8 +1940,8 @@ class RunnerBackend:
             raise ValueError("tenant_id is required")
         if not request.user_id.strip():
             raise ValueError("user_id is required")
-        if not request.instruction.strip():
-            raise ValueError("instruction is required")
+        if not request.instruction.strip() and not request.input_parts:
+            raise ValueError("instruction or input_parts is required")
         if request.mode not in {"read-only", "propose", "apply"}:
             raise ValueError(f"unsupported mode: {request.mode}")
         if request.workspace_backend not in {"overlay", "staging"}:

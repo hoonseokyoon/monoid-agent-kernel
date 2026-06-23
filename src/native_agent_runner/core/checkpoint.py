@@ -87,8 +87,11 @@ class RunCheckpoint:
     # --- run-level bookkeeping ---
     remaining_duration_s: float | None = None
     cancellation_requested: bool = False
-    # Filled by the backend driver (the message queue lives outside the loop).
-    queued_messages: list[str] = field(default_factory=list)
+    # Filled by the backend driver (the message queue lives outside the loop). Each entry is
+    # JSON-native: a ``str`` (text message) or a ``list[dict]`` of content-part dicts (a
+    # multimodal message carried by-reference). Kept JSON-native so the checkpoint round-trips
+    # without any dataclass (de)serialization here.
+    queued_messages: list[Any] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

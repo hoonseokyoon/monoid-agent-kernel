@@ -444,4 +444,44 @@ fail-able operation with a hot path); it was to make the *write* surface symmetr
 surface by giving callers a token-scoped resume primitive. The studio orchestrates the two calls,
 keeping the resume observable and `send_message` single-responsibility.
 
+### R13 (multimodal attach) — the core was ready; the backend message path was string-only
+**Symptom (DX blocker):** the core has had multimodal input for a while (`ContentPart`,
+`loop.arun_until_suspended(str | tuple[ContentPart, ...])`, a workspace media resolver that turns
+a `source_ref` into a base64 wire block). But none of it was reachable from an app, because the
+**reference backend's entire message path was typed `str`**: `BackendRunRequest.instruction: str`,
+`send_message(content: str)` (enqueued `str(content)`), and the durable
+`RunCheckpoint.queued_messages: list[str]`. A string is where multimodal goes to die.
+
+**Fix (backend, no core change):**
+- The backend message queue now carries a **JSON-native** wire form: `str` (text) or `list[dict]`
+  (content-part dicts). `_normalize_inbound_message` accepts a `str`, a `tuple[ContentPart, ...]`,
+  or part-dicts (the HTTP boundary sends the last); `_queued_message_to_loop_input` rebuilds the
+  typed parts at the dequeue boundary right before `arun_until_suspended`. Keeping the queue
+  JSON-native means `queued_messages` (now `list[Any]`) round-trips through the checkpoint with **no
+  dataclass (de)serialization** — a parked multimodal message survives a restart for free.
+- `send_message` accepts parts; the size limit applies to the by-reference wire form (small — the
+  bytes live in the workspace, not the message). `BackendRunRequest.input_parts` carries a
+  multimodal **first** turn; `_drive_session` / `astream_run` use it when present.
+
+**Studio wiring + the two real contract constraints it exposed:**
+1. **The media resolver only accepts workspace-path `source_ref`s** — there is *no by-value/inline
+   base64 input path* (every other scheme raises `MediaResolveError`). So an attachment must first
+   land in the workspace. The studio writes uploads under `.studio-attachments/` and references them
+   by path. This works for both the first turn and follow-ups because the overlay workspace **reads
+   through to the live disk root** for files the agent hasn't overwritten (writes are staged
+   in-memory; reads are read-through) — a file written after `open()` is still resolvable.
+2. **Two size ceilings gate an image**: the run's `max_bytes_read` (default 1 MB) caps the
+   wire-build resolve, and the HTTP body limit caps the base64 upload. The studio raises both to
+   8 MB (`_MAX_ATTACH_BYTES`). An integrator who forgets the first gets a `MediaResolveError` only
+   at wire-build time, not at upload — a sharp edge worth a clearer error.
+
+**Drive-by doc fix:** `content.py`'s per-class docstrings still said `ImagePart`/`DocumentPart` were
+"Not yet forwarded" — stale since the P2/P6 forwarding work. Corrected (they ARE forwarded), along
+with `text_from_parts`'s docstring (it's the text-only-adapter path, not a global "not forwarded").
+
+**Verified:** live HTTP — `POST /api/chat` with a base64 PNG attachment → persisted under the
+workspace → resolved to a base64 `image/png` block → forwarded to a multimodal adapter. Backend
+test (image via `send_message` forwarded as a resolved block) + checkpoint round-trip test (a queued
+multimodal message rebuilds its typed parts) + studio test (attach persists + forwards).
+
 <!-- Add new entries below as later rungs surface them. -->
