@@ -424,6 +424,41 @@ def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> No
     backend1.cancel_run(run_id, token)  # stop the defunct first-process worker
 
 
+def test_read_run_artifact_by_digest_with_slicing(tmp_path: Path) -> None:
+    # The R9 data-returning seam: a blob put under a run is fetched back by its sha256 digest,
+    # token-scoped, with offset/limit slicing — and malformed/unknown digests are rejected.
+    import hashlib
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+    backend = _recoverable_backend(run_root, token_manager, workspace, [], turns=[ModelTurn(final_text="x")])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hi",
+            runtime_config=_default_config(),
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    backend.wait_for_run(run_id, timeout_s=20)
+
+    data = b"PK\x03\x04artifact-bytes-0123456789"
+    digest = backend.checkpoint_store.put_blob(run_id, data)
+    assert digest == hashlib.sha256(data).hexdigest()
+
+    assert backend.read_run_artifact(run_id, token, digest) == data
+    assert backend.read_run_artifact(run_id, token, digest, offset=2) == data[2:]
+    assert backend.read_run_artifact(run_id, token, digest, offset=2, limit=4) == data[2:6]
+
+    with pytest.raises(ValueError):
+        backend.read_run_artifact(run_id, token, "ZZZ")  # malformed digest → 400
+    with pytest.raises(KeyError):
+        backend.read_run_artifact(run_id, token, "a" * 64)  # unknown digest → 404
+
+
 def test_resume_run_rejects_terminal_and_unknown(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     run_root = tmp_path / "runs"

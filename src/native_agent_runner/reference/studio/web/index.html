@@ -714,23 +714,32 @@ async function exportPackage() {
   exportBtn.disabled = true;
   applyStatus.textContent = "Exporting…";
   try {
-    const res = await fetch("/api/export-package", {
+    // 1) Build → receipt (digest + name). No bytes, no server path.
+    const buildRes = await fetch("/api/export-package", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ run_id: runId }),
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      applyStatus.textContent = "Error: " + (err.error || res.status);
+    const receipt = await buildRes.json();
+    if (!buildRes.ok || receipt.error) {
+      applyStatus.textContent = "Error: " + (receipt.error || buildRes.status);
       exportBtn.disabled = false;
       return;
     }
-    const blob = await res.blob();
-    const cd = res.headers.get("Content-Disposition") || "";
-    const name = (cd.match(/filename="([^"]+)"/) || [])[1] || "proposal.tar";
-    const url = URL.createObjectURL(blob);
+    // 2) Fetch the bytes by digest (the data-returning seam — works co-located or remote).
+    const url = `/api/artifact?run_id=${encodeURIComponent(runId)}&digest=${encodeURIComponent(receipt.digest)}`;
+    const dlRes = await fetch(url);
+    if (!dlRes.ok) {
+      applyStatus.textContent = "Error: artifact fetch " + dlRes.status;
+      exportBtn.disabled = false;
+      return;
+    }
+    const blob = await dlRes.blob();
+    const cd = dlRes.headers.get("Content-Disposition") || "";
+    const name = (cd.match(/filename="([^"]+)"/) || [])[1] || receipt.name || "proposal.tar";
+    const objUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = name; a.click();
-    URL.revokeObjectURL(url);
+    a.href = objUrl; a.download = name; a.click();
+    URL.revokeObjectURL(objUrl);
     applyStatus.textContent = "Exported " + name;
     exportBtn.disabled = false;
   } catch (err) {

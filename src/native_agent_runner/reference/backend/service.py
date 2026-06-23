@@ -5,6 +5,7 @@ import atexit
 import json
 import logging
 import random
+import re
 import threading
 import time
 import uuid
@@ -76,6 +77,10 @@ BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "f
 # Sentinel enqueued to wake/stop a session worker blocked on its message queue.
 _CLOSE_SESSION = object()
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
+
+# A run-artifact fetch handle is a bare sha256 hex digest — validated before any store lookup so a
+# crafted value can never reach the blob layer as a path.
+_ARTIFACT_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
 # --- multimodal message normalization (the backend message queue stays JSON-native) ---------
@@ -1002,16 +1007,54 @@ class RunnerBackend:
         }
 
     def export_proposal_package(self, run_id: str, token: str) -> dict[str, Any]:
+        """Build the portable proposal package and return a RECEIPT — never a filesystem path.
+
+        The tar is stored as a content-addressed blob; the receipt's ``digest`` (sha256 of the tar
+        bytes) is the retrieval handle for :meth:`read_run_artifact`. This keeps the
+        "embedder never reads run_dir off disk" invariant for binary artifacts too: a remote
+        embedder fetches the bytes back by digest, exactly like Bazel CAS / an OCI blob."""
         self._authorize_run(run_id, token)
         record = self._record(run_id)
         output = record.run_dir / "proposal.tar"
         payload = export_package(record.run_dir, output)
+        tar_bytes = output.read_bytes()
+        assert self.checkpoint_store is not None
+        digest = self.checkpoint_store.put_blob(run_id, tar_bytes)
         append_event_to_run(
             record.run_dir,
             "proposal.package.exported",
-            data={"package_hash": payload["package_hash"], "package_path": str(output)},
+            data={"package_hash": payload["package_hash"], "digest": digest, "size_bytes": len(tar_bytes)},
         )
-        return payload
+        return {
+            "package_hash": payload["package_hash"],
+            "digest": digest,  # the fetch handle (sha256 of the tar bytes)
+            "size_bytes": len(tar_bytes),
+            "media_type": "application/x-tar",
+            "name": "proposal.tar",  # advisory filename for Content-Disposition only
+        }
+
+    def read_run_artifact(
+        self, run_id: str, token: str, digest: str, *, offset: int = 0, limit: int | None = None
+    ) -> bytes:
+        """Fetch a run artifact's bytes by its sha256 ``digest`` — the single token-scoped,
+        data-returning seam for binary artifacts (the export tar today, any blob tomorrow).
+
+        Content-addressed: the digest IS the capability (a sha256 is unguessable, so possessing one
+        is proof of knowledge of the content). ``offset``/``limit`` are accepted now so a future
+        streaming/range fetch is a non-breaking addition; today they slice the in-memory bytes.
+        Raises ``KeyError`` (→ 404) when the digest is unknown for this run, ``ValueError`` (→ 400)
+        for a malformed digest."""
+        self._authorize_run(run_id, token)
+        if not _ARTIFACT_DIGEST_RE.match(digest):
+            raise ValueError("digest must be a 64-char sha256 hex string")
+        assert self.checkpoint_store is not None
+        try:
+            data = self.checkpoint_store.get_blob(run_id, digest)
+        except KeyError as exc:
+            raise KeyError(f"artifact not found: {digest}") from exc
+        if offset or limit is not None:
+            data = data[offset : (None if limit is None else offset + limit)]
+        return data
 
     def approve_proposal(
         self,

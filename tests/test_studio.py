@@ -273,8 +273,10 @@ def test_partial_approval_applies_only_selected_paths(tmp_path: Path) -> None:
         server.shutdown()
 
 
-def test_export_package_builds_self_verifying_tar(tmp_path: Path) -> None:
-    # R9: export hands back a portable, self-verifying package the studio can stream to the user.
+def test_export_package_returns_digest_receipt_fetched_as_bytes(tmp_path: Path) -> None:
+    # R9 (fundamental): export returns a RECEIPT (digest) — never a server path — and the bytes are
+    # fetched back by digest through the data-returning seam (works co-located or remote).
+    import io
     import tarfile
 
     workspace = tmp_path / "ws"
@@ -295,13 +297,29 @@ def test_export_package_builds_self_verifying_tar(tmp_path: Path) -> None:
         _wait_settled(server, run_id, 1)
         _wait_proposal(server, run_id)
 
-        path, payload = server.export_package(run_id)
-        assert path.exists()
-        assert payload.get("package_hash")
-        with tarfile.open(path, "r") as archive:
+        receipt = server.export_package(run_id)
+        # The receipt is a handle, not a path — no run_dir path leaks across the boundary.
+        assert "package_path" not in receipt
+        assert len(receipt["digest"]) == 64
+        assert receipt["size_bytes"] > 0
+
+        data, name = server.read_artifact(run_id, receipt["digest"])
+        # The fetched bytes match the digest (content-addressed self-verification).
+        import hashlib
+
+        assert hashlib.sha256(data).hexdigest() == receipt["digest"]
+        assert name.endswith(".tar")
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
             names = archive.getnames()
         assert "proposal.package.json" in names
-        assert any(name == "proposal.json" for name in names)
+        assert any(n == "proposal.json" for n in names)
+
+        # A malformed digest is rejected (ValueError → 400); an unknown well-formed one is
+        # not-found (KeyError → 404).
+        with pytest.raises(ValueError):
+            server.read_artifact(run_id, "not-a-digest")
+        with pytest.raises(KeyError):
+            server.read_artifact(run_id, "f" * 64)
     finally:
         server.shutdown()
 

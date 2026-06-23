@@ -525,4 +525,44 @@ the durability integration (inline image → checkpoint → restore into a **fre
 still forwarded, resolved from the rehydrated blob). Live HTTP: attach → forwarded with matching
 bytes → **zero workspace files**.
 
+### R9b (digest-addressed run artifacts) — closing the R9 remote-embedder gap at the root
+**Why:** R9 logged a 🟠 contract gap — `export_proposal_package` returned a **server-local path**
+(`run_dir/proposal.tar`), so a remote (non-co-located) embedder had no token-scoped way to fetch the
+package bytes; the studio only worked by reading run_dir off disk, violating the "embedder never
+reads run_dir off disk" invariant. Researched the prior art (Bazel RE CAS + ByteStream, OCI
+Distribution blobs, S3/GCS presigned URLs, GitHub Actions artifacts, OpenAI/Anthropic Files): the
+universal shape is **separate build (returns a handle/receipt) from fetch (returns bytes)**, and the
+systems structurally closest to ours (Bazel/OCI — they already have a content-addressed store)
+**address the fetch by content digest**, which collapses the allowlist, traversal defense, and
+integrity check into one mechanism.
+
+**What shipped:**
+- **`put_blob(run_id, data) -> sha` / `get_blob(run_id, sha) -> bytes`** on the `CheckpointStore`
+  seam (both `LocalFsCheckpointStore` and `SqliteCheckpointStore`): the standalone entry to the same
+  content-addressed, write-once blob namespace `put` already fills for checkpoints. (This is also the
+  primitive R13b edge #1 wanted.)
+- **`export_proposal_package` now returns a RECEIPT** — `{package_hash, digest, size_bytes,
+  media_type, name}` — never a path. The tar is stored via `put_blob`; `digest` (sha256 of the tar
+  bytes) is the fetch handle.
+- **`read_run_artifact(run_id, token, digest, *, offset=0, limit=None) -> bytes`** — the single
+  token-scoped, data-returning seam for binary artifacts. Digest validated against `^[a-f0-9]{64}$`
+  before any store lookup (no value can reach the blob layer as a path). `offset`/`limit` accepted
+  now so a future streaming/range fetch is non-breaking. Unknown digest → `KeyError` (404), malformed
+  → `ValueError` (400).
+- **HTTP:** `POST /api/export-package` → receipt JSON; `GET /api/artifact?run_id=…&digest=…` → streams
+  the bytes with `Content-Disposition`, `ETag: "<digest>"`, `Cache-Control: immutable` (content-
+  addressed bodies are immutable/cacheable). The studio's `export_package` no longer touches run_dir
+  off disk — build-then-fetch-by-digest, identical for co-located and remote.
+
+**Why digest over an allowlisted name:** a name needs both an allowlist *and* a name→blob mapping
+(the exact thing that historically leaks paths); a sha256 digest is self-validating, cannot name an
+arbitrary file, dedups, and is infinitely cacheable. The digest is itself the capability (knowing it
+is proof of knowing the content — the Bazel/OCI security model). Live-verified over HTTP: receipt
+carries no `package_path`; the fetched bytes' sha256 equals the receipt digest; 400 on malformed,
+404 on unknown.
+
+**Deliberately deferred:** presigned-URL redirect (adopt only when a remote object store becomes the
+data path and proxying bytes is the bottleneck — until then it only adds expiry/range-signing/HEAD
+pitfalls); actual range streaming (the `offset`/`limit` seam is in place for it).
+
 <!-- Add new entries below as later rungs surface them. -->

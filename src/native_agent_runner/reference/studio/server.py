@@ -539,16 +539,22 @@ class StudioServer:
         result = self._backend.apply_proposal(run_id, token, target=self.workspace)
         return result
 
-    def export_package(self, run_id: str) -> tuple[Path, dict[str, Any]]:
-        """Build the portable proposal package (a self-verifying tar) and hand back its on-disk path
-        plus the manifest. The studio is co-located with the backend, so it streams the tar straight
-        off ``run_dir``. NOTE (contract gap): ``export_proposal_package`` returns only a server-local
-        path, so a *remote* embedder has no token-scoped way to fetch the package bytes — see
-        DX_NOTES R9."""
+    def export_package(self, run_id: str) -> dict[str, Any]:
+        """Build the portable proposal package and return its RECEIPT (``digest`` + name + size).
+        The bytes are fetched separately by digest via :meth:`read_artifact` — no run_dir path ever
+        crosses the boundary, so this works identically whether the backend is co-located or remote
+        (closes the R9 contract gap)."""
         assert self._backend is not None
         token = self._token_for(run_id)
-        payload = self._backend.export_proposal_package(run_id, token)
-        return Path(str(payload["package_path"])), payload
+        return self._backend.export_proposal_package(run_id, token)
+
+    def read_artifact(self, run_id: str, digest: str) -> tuple[bytes, str]:
+        """Fetch a run artifact's bytes by sha256 digest (the data-returning seam). Returns
+        ``(bytes, download_name)``."""
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        data = self._backend.read_run_artifact(run_id, token, digest)
+        return data, f"proposal-{digest[:12]}.tar"
 
     def jobs(self, run_id: str) -> dict[str, Any]:
         """Background shell jobs for the run (running + finished)."""
@@ -741,6 +747,23 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 except NativeAgentError as exc:
                     self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
+            if parsed.path == "/api/artifact":
+                query = parse_qs(parsed.query)
+                run_id = (query.get("run_id") or [""])[0]
+                digest = (query.get("digest") or [""])[0]
+                try:
+                    data, name = studio.read_artifact(run_id, digest)
+                except KeyError:
+                    self.send_error(HTTPStatus.NOT_FOUND, "artifact not found")
+                except (NativeAgentError, ValueError) as exc:
+                    self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                else:
+                    # Content-addressed → immutable + cacheable (ETag = the digest).
+                    self._serve_bytes(
+                        data, "application/x-tar", download_name=name,
+                        headers={"ETag": f'"{digest}"', "Cache-Control": "immutable, max-age=31536000"},
+                    )
+                return
             if parsed.path == "/api/sessions":
                 self._write_json(studio.sessions())
                 return
@@ -820,11 +843,11 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     self._write_json(studio.apply(run_id, approved_paths=approved))
                     return
                 if parsed.path == "/api/export-package":
+                    # Build → return the RECEIPT (digest + size + name). The bytes are fetched
+                    # separately via GET /api/artifact?digest=… — no run_dir path crosses the wire.
                     body = self._read_json()
                     run_id = str(body.get("run_id") or "")
-                    path, payload = studio.export_package(run_id)
-                    name = f"proposal-{str(payload.get('package_hash') or 'package')[:12]}.tar"
-                    self._serve_file(path, "application/x-tar", download_name=name)
+                    self._write_json(studio.export_package(run_id))
                     return
                 if parsed.path == "/api/hitl":
                     body = self._read_json()
@@ -942,11 +965,23 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             except OSError:
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
                 return
+            self._serve_bytes(body, content_type, download_name=download_name)
+
+        def _serve_bytes(
+            self,
+            body: bytes,
+            content_type: str,
+            *,
+            download_name: str = "",
+            headers: dict[str, str] | None = None,
+        ) -> None:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             if download_name:
                 self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
