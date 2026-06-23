@@ -11,6 +11,25 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
+### R11 🟢 Three low-effort surfacings — file viewer + markdown/code + OTel toggle
+Engine capability that existed but wasn't reachable from the UI. All studio-side (plus one tiny
+backend seam), no core changes.
+- **File viewer:** clicking a workspace file opens its contents in a side panel (Shift/Ctrl-click
+  still inserts the path). New `studio.read_file()` is path-guarded to the workspace root (rejects
+  traversal/absolute), 256 KiB-capped, binary-refusing (NUL byte); served at `GET /api/file?path=`.
+- **Markdown/code:** `renderMarkdown` now does fenced code blocks (language label + copy button,
+  robust to an unclosed trailing fence mid-stream), inline code, headers, lists, blockquotes — all
+  escaped. The copy button uses inline `onclick` so it survives the streaming `innerHTML` re-render.
+  (No syntax *highlighting* — that needs a lib, against the zero-dep/offline ethos.)
+- **OTel tracing toggle:** a settings switch installs a global OTLP/HTTP `TracerProvider`
+  (`_ensure_otel_provider`, actionable error if the `opentelemetry` SDK/exporter extra is missing)
+  and attaches `OtelEventSink` **per run** via a new `RunnerBackend.extra_event_sink_factories`
+  seam — a factory tuple (not a shared instance) so each run gets its own span state, appended at
+  loop-build time. The only core-adjacent change; the embedder seam for observability-without-a-dep.
+  Verified live over the **real OTLP wire** (a local OTLP/HTTP receiver captured the
+  `invoke_agent → chat → execute_tool` span tree); a real Jaeger consumes the same stream (docker
+  was unavailable here to run its UI).
+
 ### R10 🟢 Studio reasoning UX — Thinking disclosure + summary toggle + reasoning-tokens meter
 The studio surface for reasoning. The disclosure (collapsible "🧠 Thinking" panel, auto-collapse on
 the first answer token) and the summary toggle (off/auto/detailed in the composer setup bar) shipped
