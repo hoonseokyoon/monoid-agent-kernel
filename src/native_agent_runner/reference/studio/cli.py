@@ -16,7 +16,7 @@ from pathlib import Path
 
 import click
 
-from native_agent_runner.reference.studio.server import StudioConfig, StudioServer
+from native_agent_runner.reference.studio.server import _SAMPLE_SKILLS_DIR, StudioConfig, StudioServer
 from native_agent_runner.reference.studio.window import open_app_window
 
 
@@ -46,8 +46,43 @@ def _common_server_options(fn):
         default=Path("runs"),
         show_default=True,
     )(fn)
+    fn = click.option(
+        "--skills-directory",
+        type=click.Path(path_type=Path),
+        default=_SAMPLE_SKILLS_DIR,
+        show_default="bundled sample skill",
+        help="Directory of Agent Skills (SKILL.md files). Defaults to a bundled sample.",
+    )(fn)
+    fn = click.option("--no-skills", is_flag=True, help="Disable Agent Skills entirely.")(fn)
+    fn = click.option(
+        "--mcp",
+        is_flag=True,
+        help="Attach the bundled offline reference MCP server and expose its tools.",
+    )(fn)
     fn = _workspace_option(fn)
     return fn
+
+
+def _studio_config(
+    *,
+    workspace: Path,
+    host: str,
+    port: int,
+    provider: str,
+    run_root: Path,
+    skills_directory: Path,
+    no_skills: bool,
+    mcp: bool,
+) -> StudioConfig:
+    return StudioConfig(
+        workspace=workspace,
+        host=host,
+        port=port,
+        provider=provider,
+        run_root=run_root,
+        skills_directory=None if no_skills else skills_directory,
+        mcp=mcp,
+    )
 
 
 @click.group("studio")
@@ -59,11 +94,24 @@ def studio() -> None:
 @_common_server_options
 @click.option("--open", "open_window", is_flag=True, help="Open a window once after starting.")
 def studio_serve(
-    *, workspace: Path, host: str, port: int, provider: str, run_root: Path, open_window: bool
+    *,
+    workspace: Path,
+    host: str,
+    port: int,
+    provider: str,
+    run_root: Path,
+    skills_directory: Path,
+    no_skills: bool,
+    mcp: bool,
+    open_window: bool,
 ) -> None:
     """Start the Studio server and keep it running (window is detachable)."""
-    server = StudioServer(StudioConfig(workspace=workspace, host=host, port=port,
-                                       provider=provider, run_root=run_root))
+    server = StudioServer(
+        _studio_config(
+            workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
+            skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
+        )
+    )
     url = server.start()
     click.echo(f"Agent Studio serving on {url}  (workspace: {server.workspace})")
     click.echo(f"Open a window any time with:  native-agent studio open --url {url}")
@@ -82,11 +130,23 @@ def studio_serve(
 @studio.command("app")
 @_common_server_options
 def studio_app(
-    *, workspace: Path, host: str, port: int, provider: str, run_root: Path
+    *,
+    workspace: Path,
+    host: str,
+    port: int,
+    provider: str,
+    run_root: Path,
+    skills_directory: Path,
+    no_skills: bool,
+    mcp: bool,
 ) -> None:
     """Start the server and a desktop window; closing the window stops the server."""
-    server = StudioServer(StudioConfig(workspace=workspace, host=host, port=port,
-                                       provider=provider, run_root=run_root))
+    server = StudioServer(
+        _studio_config(
+            workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
+            skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
+        )
+    )
     url = server.start()
     click.echo(f"Agent Studio app on {url}  (workspace: {server.workspace})")
     window = open_app_window(url)

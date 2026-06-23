@@ -295,6 +295,7 @@ class BackendRuntimeConfigProvider(RuntimeConfigProvider):
 
 def _backend_builtin_tool_specs(
     subagent_definitions: Mapping[str, SubagentDefinition] | None = None,
+    tool_providers: Sequence[Any] = (),
 ) -> tuple[Any, ...]:
     specs = list(builtin_tools(cast(Workspace, None)))
     # agent.spawn is registered dynamically by the loop bootstrap (only when the run carries
@@ -303,6 +304,12 @@ def _backend_builtin_tool_specs(
     if subagent_definitions:
         catalog = {sid: d.description for sid, d in subagent_definitions.items()}
         specs.append(agent_spawn_tool(catalog))
+    # Provider tools (skill, skill.read_file, mcp.<server>.<tool>, …) are likewise registered by
+    # the loop bootstrap from tool_providers, so validation must know them too or a binding to a
+    # provider tool looks unknown (the DX-10/agent_spawn precedent). get_tools() is cheap here:
+    # SkillProvider does no I/O, and McpToolProvider caches its discovery after the first call.
+    for provider in tool_providers:
+        specs.extend(provider.get_tools())
     return tuple(specs)
 
 
@@ -420,6 +427,17 @@ class RunnerBackend:
     # uses to attach observability without a core dep — e.g. studio sets ``(OtelEventSink,)`` when
     # OTel is toggled on. Read at loop-build time so it can change at runtime. Empty → no deps.
     extra_event_sink_factories: tuple[Any, ...] = ()
+    # Tool/context providers attached to every run the backend builds (Skills, MCP, custom).
+    # The embedder-facing seam for the loop's tool_providers/context_providers (the CLI passes
+    # these to AgentLoop directly; without these fields an out-of-process embedder could not
+    # attach a provider at all). INSTANCES, not factories (unlike extra_event_sink_factories):
+    # a provider holds a shared, reusable resource (MCP's live httpx client + discovery cache)
+    # or is immutable (SkillProvider) — both are safe to share across concurrent runs (the MCP
+    # client is documented thread-safe; SkillProvider is read-only). Read at loop-build time so
+    # a parked run re-attaches them on resume/restart. Their tools must also be declared to
+    # config validation — see _backend_builtin_tool_specs. Empty → no providers.
+    tool_providers: tuple[Any, ...] = ()
+    context_providers: tuple[Any, ...] = ()
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -571,7 +589,7 @@ class RunnerBackend:
             user_id=request.user_id,
             ttl_s=self.run_token_ttl_s,
         )
-        tool_specs = _backend_builtin_tool_specs(self.subagent_definitions)
+        tool_specs = _backend_builtin_tool_specs(self.subagent_definitions, self.tool_providers)
         initial_runtime_config = request.runtime_config
         runtime_config_issuer = "submit_run"
         runtime_config_reason = "initial runtime config"
@@ -888,7 +906,9 @@ class RunnerBackend:
         config: AgentRuntimeConfig,
     ) -> dict[str, Any]:
         self._authorize_run(run_id, token)
-        validate_runtime_config(config, _backend_builtin_tool_specs(self.subagent_definitions))
+        validate_runtime_config(
+            config, _backend_builtin_tool_specs(self.subagent_definitions, self.tool_providers)
+        )
         record = self._record(run_id)
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
@@ -1488,6 +1508,8 @@ class RunnerBackend:
             checkpoint_store=self.checkpoint_store,
             emit_output_deltas=self.emit_output_deltas,
             subagent_definitions=self.subagent_definitions,
+            tool_providers=self.tool_providers,
+            context_providers=self.context_providers,
         )
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
@@ -1935,6 +1957,8 @@ class RunnerBackend:
             checkpoint_store=self.checkpoint_store,
             emit_output_deltas=self.emit_output_deltas,
             subagent_definitions=self.subagent_definitions,
+            tool_providers=self.tool_providers,
+            context_providers=self.context_providers,
         )
         # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
         # restore re-applies the agent's delta from the checkpoint's content blobs.

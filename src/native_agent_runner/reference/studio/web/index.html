@@ -205,6 +205,10 @@
       <ol id="plan" hidden></ol>
       <div class="side-title" style="margin-top:14px">Jobs</div>
       <ul id="jobs"></ul>
+      <div class="side-title" id="skills-title" style="margin-top:14px" hidden>Skills</div>
+      <ul id="skills" hidden></ul>
+      <div class="side-title" id="mcp-title" style="margin-top:14px" hidden>MCP tools</div>
+      <ul id="mcp-tools" hidden></ul>
     </aside>
     <div id="log"></div>
     <aside id="proposal" hidden>
@@ -771,6 +775,29 @@ async function refreshJobs() {
   } catch (_) {}
 }
 
+// One-time catalog of the attached providers (Skills, MCP tools). Hidden sections when empty.
+async function refreshCapabilities() {
+  try {
+    const body = await (await fetch("/api/capabilities-catalog")).json();
+    fillCatalog("skills", body.skills || [], (x) => x.name, (x) => x.description);
+    fillCatalog("mcp-tools", body.mcp_tools || [], (x) => x.id, (x) => x.description);
+  } catch (_) {}
+}
+function fillCatalog(listId, items, nameOf, descOf) {
+  const ul = document.getElementById(listId);
+  const title = document.getElementById((listId === "mcp-tools" ? "mcp" : listId) + "-title");
+  ul.innerHTML = "";
+  for (const it of items) {
+    const li = document.createElement("li");
+    li.textContent = nameOf(it);
+    li.title = descOf(it) || "";
+    ul.appendChild(li);
+  }
+  const show = items.length > 0;
+  ul.hidden = !show;
+  if (title) title.hidden = !show;
+}
+
 async function showJobLogs(jobId) {
   try {
     const body = await (await fetch(
@@ -1114,6 +1141,7 @@ traceBtn.addEventListener("click", (e) => {
   loadTree();
   loadSetup();
   refreshSessions();
+  refreshCapabilities();
 })();
 </script>
 </body>

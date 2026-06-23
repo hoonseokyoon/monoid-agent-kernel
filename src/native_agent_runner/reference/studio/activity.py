@@ -39,5 +39,15 @@ def describe_event(event: Mapping[str, Any]) -> str | None:
         if narration.detail:
             return f"⚠ {narration.target} failed: {narration.detail}"
         return f"⚠ {narration.target} failed"
+    # Provider tools carry no path/query target, so the generic narration is bare ("Running
+    # skill"). Surface the skill name / mark MCP tools for a clearer feed (the R5 narration
+    # lesson: a tool family the narrator doesn't know gets a thin studio-side branch).
+    data = event.get("data") or {}
+    tool = str(data.get("tool") or "")
+    args = data.get("args_preview") or {}
+    if tool == "skill" and args.get("name"):
+        return f"Using skill: {args['name']}"
+    if tool.startswith("mcp_"):
+        return f"Calling MCP tool: {tool}"
     verb = _PRESENT.get(narration.action, narration.action.capitalize())
     return f"{verb} {narration.target}".strip() if narration.target else verb

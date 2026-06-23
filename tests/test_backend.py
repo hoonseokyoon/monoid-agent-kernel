@@ -16,7 +16,7 @@ from native_agent_runner.core._util import write_json_atomic
 from native_agent_runner.core.checkpoint import RunCheckpoint
 from native_agent_runner.core.tool_surface import ToolScope
 from native_agent_runner.core.spec import ModelRetryConfig
-from native_agent_runner.errors import ModelAdapterError, PermissionDenied
+from native_agent_runner.errors import AgentConfigError, ModelAdapterError, PermissionDenied
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.core.content import ImagePart, TextPart
 from native_agent_runner.providers.base import ModelTurn
@@ -26,6 +26,7 @@ from native_agent_runner.providers.fake import (
     fake_tool_call,
 )
 from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
+from native_agent_runner.skills import SkillDefinition, SkillProvider
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import (
     _RUN_META_SCHEMA_VERSION,
@@ -422,6 +423,213 @@ def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> No
     instructions = [r.instruction for a in resumed for r in a.requests if r.instruction]
     assert "again" in instructions
     backend1.cancel_run(run_id, token)  # stop the defunct first-process worker
+
+
+# --- Provider seam (Skills/MCP attach through the backend) --------------------------------
+#
+# RunnerBackend exposes tool_providers/context_providers so an embedder can attach Skills, MCP,
+# or any custom provider (the loop already supports them; the backend was the missing seam).
+# A SkillProvider built from an in-memory definition is the cleanest offline provider to test
+# with — no directory, no network.
+
+
+def _skill_provider() -> SkillProvider:
+    return SkillProvider(
+        {
+            "greeter": SkillDefinition(
+                name="greeter",
+                description="Greet the user warmly.",
+                instructions="Say a warm hello to the user.",
+            )
+        }
+    )
+
+
+def _provider_backend(
+    run_root: Path,
+    token_manager: TokenManager,
+    workspace: Path,
+    *,
+    turns: list,
+    adapters: list | None = None,
+    provider: SkillProvider | None = None,
+) -> RunnerBackend:
+    sink = adapters if adapters is not None else []
+
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        adapter = FakeModelAdapter(turns=list(turns))
+        sink.append(adapter)
+        return adapter
+
+    skill = provider if provider is not None else _skill_provider()
+    return RunnerBackend(
+        run_root=run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+        tool_providers=(skill,),
+        context_providers=(skill,),
+    )
+
+
+def _wait_for(predicate, tries: int = 1000) -> bool:
+    for _ in range(tries):
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_backend_validates_provider_tool_only_when_attached(tmp_path: Path) -> None:
+    # A binding to a provider tool (`skill`) is "unknown" to validation unless the provider is
+    # attached — and accepted once it is. This is the DX-15 / agent_spawn precedent for providers.
+    workspace = _workspace(tmp_path)
+    token_manager = _token_manager()
+    request = BackendRunRequest(
+        tenant_id="tenant_a",
+        user_id="user_a",
+        workspace_root=workspace,
+        instruction="hi",
+        runtime_config=runtime_config("skill", "run.finish"),
+    )
+
+    bare = RunnerBackend(
+        run_root=tmp_path / "runs-bare",
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _s, _t: FakeModelAdapter(turns=[ModelTurn(final_text="x")]),
+    )
+    with pytest.raises(AgentConfigError):
+        bare.submit_run(request)
+
+    attached = _provider_backend(
+        tmp_path / "runs", token_manager, workspace, turns=[ModelTurn(final_text="x")]
+    )
+    submission = attached.submit_run(request)
+    assert attached.wait_for_run(submission.run_id, timeout_s=20) == "completed"
+
+
+def test_backend_replace_runtime_config_accepts_provider_tool(tmp_path: Path) -> None:
+    # The hot-swap path (settings change) re-validates the config; a provider tool added on the
+    # swap must remain valid (covers the replace_runtime_config validation call site).
+    workspace = _workspace(tmp_path)
+    token_manager = _token_manager()
+    backend = _provider_backend(
+        tmp_path / "runs", token_manager, workspace, turns=[ModelTurn(response_id="r1", final_text="first")]
+    )
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_default_config(),  # no skill binding yet
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert _wait_for(lambda: backend._record(run_id).status == "awaiting_input")
+
+    current = backend.current_runtime_config(run_id)
+    result = backend.replace_runtime_config(
+        run_id,
+        token,
+        expected_version=current.config_version,
+        issuer="test",
+        reason="enable skills mid-run",
+        config=runtime_config("fs.read", "fs.write", "run.finish", "skill"),
+    )
+    assert result["config_version"] > current.config_version
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_backend_executes_provider_tool_through_loop(tmp_path: Path) -> None:
+    # End-to-end: a `skill` tool call issued by the model is registered from the backend's
+    # provider, executed, and its result reaches the model — proving the provider is actually
+    # wired into the run's tool registry, not just past validation.
+    workspace = _workspace(tmp_path)
+    token_manager = _token_manager()
+    adapters: list = []
+    backend = _provider_backend(
+        tmp_path / "runs",
+        token_manager,
+        workspace,
+        adapters=adapters,
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("skill", {"name": "greeter"}, "c1"),)),
+            ModelTurn(response_id="r2", final_text="greeted"),
+        ],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="greet the user",
+            runtime_config=runtime_config("skill", "run.finish"),
+        )
+    )
+    assert backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
+    observations = [obs for a in adapters for r in a.requests for obs in r.observations]
+    skill_obs = [obs for obs in observations if obs.tool_name == "skill"]
+    assert skill_obs, "the skill tool result never reached the model"
+    assert "warm hello" in json.dumps(skill_obs[0].output, default=str)
+
+
+def test_backend_resume_carries_providers(tmp_path: Path) -> None:
+    # A parked run resumed by a fresh backend (simulated restart) must re-attach providers —
+    # they are backend-instance fields read at every loop build, including the resume site.
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+
+    backend1 = _provider_backend(
+        run_root, token_manager, workspace, turns=[ModelTurn(response_id="r1", final_text="first")]
+    )
+    backend1.idle_timeout_s = 30.0
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=runtime_config("skill", "run.finish"),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert _wait_for(lambda: backend1.checkpoint_store.latest(run_id) is not None)
+    assert _wait_for(lambda: backend1._record(run_id).status == "awaiting_input")
+
+    # Fresh backend (empty _records) with its own provider instance resumes the run, then a
+    # follow-up triggers a skill call that must resolve against the re-attached provider.
+    resumed: list = []
+    backend2 = _provider_backend(
+        run_root,
+        token_manager,
+        workspace,
+        adapters=resumed,
+        turns=[
+            ModelTurn(response_id="r2", tool_calls=(fake_tool_call("skill", {"name": "greeter"}, "c2"),)),
+            ModelTurn(response_id="r3", final_text="greeted"),
+        ],
+    )
+    backend2.idle_timeout_s = 30.0
+    backend2.max_recover_attempts = 10_000
+    assert backend2.resume_run(run_id, token)["resumed"] is True
+    assert backend2.send_message(run_id, token, "use the greeter skill")["status"] == "queued"
+    assert _wait_for(
+        lambda: any(obs.tool_name == "skill" for a in resumed for r in a.requests for obs in r.observations)
+    ), "the skill tool did not resolve after resume — providers were not re-attached"
+
+    backend2.cancel_run(run_id, token)
+    backend2.wait_for_run(run_id, timeout_s=20)
+    backend1.cancel_run(run_id, token)
 
 
 def test_read_run_artifact_by_digest_with_slicing(tmp_path: Path) -> None:

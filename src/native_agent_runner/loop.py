@@ -1900,6 +1900,12 @@ class AgentLoop:
             turn_registry = self._registry_for_turn(context, turn_context, res)
             runtime_config = self._current_runtime_config(turn_registry)
             bound_catalog = compile_bound_tool_catalog(runtime_config, turn_registry)
+            # Now that the active tool set for this turn is known, expose it on the turn context so
+            # a context provider's dynamic_segment can gate itself on the live config (e.g. the
+            # Skills catalog tracks the skill tool binding across a hot-swap).
+            turn_context = replace(
+                turn_context, bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools)
+            )
             self._emit_runtime_config_if_changed(
                 recorder=recorder,
                 state=state,

@@ -51,6 +51,10 @@ from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
 from native_agent_runner.reference.web_gateway.http import create_web_gateway_server
 from native_agent_runner.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from native_agent_runner.reference.studio.activity import describe_event
+from native_agent_runner.reference._shared.http_util import wait_http_ready
+from native_agent_runner.reference.mcp_gateway import FakeMcpServer, create_mcp_server
+from native_agent_runner.mcp import McpError, McpToolProvider
+from native_agent_runner.skills import SkillProvider, load_skill_definitions
 
 _LOGGER = logging.getLogger("native_agent_runner.studio")
 
@@ -88,6 +92,16 @@ _CAPABILITY_LABELS = {
     "web": "Search & fetch the web",
     "delegate": "Delegate subtasks to a subagent",
 }
+# Provider-backed capabilities (Skills, MCP) — present only when their provider is attached at
+# boot. Unlike the static capabilities above, their bindings come from a provider instance
+# (skill_provider.tool_bindings() / mcp_provider.tool_bindings()), so they are threaded into the
+# runtime config as provider_bindings rather than resolved by _capability_bindings.
+_PROVIDER_CAPABILITY_LABELS = {
+    "skills": "Use Agent Skills (progressive-disclosure playbooks)",
+    "mcp": "Use tools from the connected MCP server",
+}
+# Bundled sample skill, so `studio serve` demonstrates Skills with zero configuration.
+_SAMPLE_SKILLS_DIR = Path(__file__).parent / "sample-skills"
 
 # Agent-as-tool: a read-only "researcher" subagent. Its tool allowlist is intersected with the
 # parent's bindings (a subagent can never exceed the parent), so it gets read + web only — no
@@ -214,15 +228,24 @@ def _runtime_config_for(
     model: str = _DEFAULT_MODEL,
     effort: str = _DEFAULT_EFFORT,
     summary: str = _DEFAULT_SUMMARY,
+    *,
+    provider_bindings: dict[str, tuple[ToolBinding, ...]] | None = None,
 ) -> AgentRuntimeConfig:
     """Build the runtime config for an enabled-capability set (order-stable, deduped) plus the
     chosen model + reasoning effort + summary visibility. The model flows to the gateway as the
-    effective model name (ignored by the offline echo provider)."""
+    effective model name (ignored by the offline echo provider).
+
+    ``provider_bindings`` maps a provider-backed capability ("skills", "mcp") to the bindings its
+    attached provider exposes; they are merged when the capability is enabled, so the same
+    config-build path feeds both new chats and the settings hot-swap."""
     enabled = set(capabilities)
     tools: list[ToolBinding] = [_PLAN_BINDING]  # plan tool is always bound (observability)
     for capability in _ALL_CAPABILITIES:
         if capability in enabled:
             tools.extend(_capability_bindings(capability))
+    for capability, bindings in (provider_bindings or {}).items():
+        if capability in enabled:
+            tools.extend(bindings)
     return AgentRuntimeConfig(
         definition_id="studio-agent",
         model=ModelConfig(model=model, reasoning=ReasoningConfig(effort=effort, summary=summary)),
@@ -244,6 +267,11 @@ class StudioConfig:
     # "offline" -> echo model (no key). "openai" -> reference OpenAIModelAdapter (needs OPENAI_API_KEY).
     provider: str = "offline"
     run_root: Path = field(default_factory=lambda: Path("runs"))
+    # Agent Skills directory (progressive disclosure). Defaults to the bundled sample skill so
+    # `studio serve` demonstrates Skills with zero config; None disables Skills entirely.
+    skills_directory: Path | None = field(default_factory=lambda: _SAMPLE_SKILLS_DIR)
+    # Attach the bundled offline reference MCP server (fake, loopback) and expose its tools.
+    mcp: bool = False
 
 
 class StudioServer:
@@ -264,7 +292,16 @@ class StudioServer:
         self._ui_server: ThreadingHTTPServer | None = None
         self._ui_thread: threading.Thread | None = None
         self._backend: RunnerBackend | None = None
-        # The live-editable Agent capability set (Settings window, R6). Defaults to everything.
+        # Tool/context providers attached at boot (Skills, MCP). The MCP server is a bundled fake
+        # gateway on a loopback port (see start()); its provider holds a live connection closed on
+        # shutdown. Both are instances shared across runs (the backend's provider seam).
+        self._skill_provider: SkillProvider | None = None
+        self._mcp_provider: Any = None
+        self._mcp_server: ThreadingHTTPServer | None = None
+        self._mcp_thread: threading.Thread | None = None
+        # The live-editable Agent capability set (Settings window, R6). Defaults to every available
+        # capability; the provider-backed ones ("skills", "mcp") are appended in start() once their
+        # provider is attached.
         self._capabilities: list[str] = list(_ALL_CAPABILITIES)
         # Live-editable model + reasoning effort + summary visibility (chat composer setup bar).
         self._model: str = _DEFAULT_MODEL
@@ -286,6 +323,86 @@ class StudioServer:
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    # --- provider-backed capabilities (Skills / MCP) ------------------------------------
+
+    def _provider_bindings(self) -> dict[str, tuple[ToolBinding, ...]]:
+        """Bindings for each attached provider-backed capability (cached — no I/O: the MCP
+        provider's tool_bindings reuses its boot-time discovery)."""
+        bindings: dict[str, tuple[ToolBinding, ...]] = {}
+        if self._skill_provider is not None:
+            bindings["skills"] = self._skill_provider.tool_bindings()
+        if self._mcp_provider is not None:
+            bindings["mcp"] = self._mcp_provider.tool_bindings()
+        return bindings
+
+    def _available_capabilities(self) -> list[str]:
+        """All capabilities offered in settings: the static set plus provider-backed ones whose
+        provider is attached this boot."""
+        return list(_ALL_CAPABILITIES) + list(self._provider_bindings())
+
+    def _capability_labels(self) -> dict[str, str]:
+        labels = dict(_CAPABILITY_LABELS)
+        for cap in self._provider_bindings():
+            labels[cap] = _PROVIDER_CAPABILITY_LABELS.get(cap, cap)
+        return labels
+
+    def _build_config(self) -> AgentRuntimeConfig:
+        """The runtime config for the current settings, including any enabled provider tools."""
+        return _runtime_config_for(
+            self._capabilities,
+            self._model,
+            self._effort,
+            self._summary,
+            provider_bindings=self._provider_bindings(),
+        )
+
+    def _load_skill_provider(self) -> SkillProvider | None:
+        """Load Agent Skills from the configured directory into one provider (None if disabled or
+        empty). Offline and synchronous — no boot-ordering concern (unlike MCP)."""
+        directory = self.config.skills_directory
+        if directory is None:
+            return None
+        try:
+            definitions = load_skill_definitions(Path(directory))
+        except ValueError as exc:  # missing/unreadable directory → run without Skills
+            _LOGGER.warning("skills directory %s not loadable: %s", directory, exc)
+            return None
+        if not definitions:
+            return None
+        _LOGGER.info("loaded %d skill(s) from %s", len(definitions), directory)
+        return SkillProvider(definitions)
+
+    def _start_fake_mcp(self) -> McpToolProvider | None:
+        """Boot the bundled offline MCP gateway on a loopback port and connect a provider to it.
+
+        Strict ordering (the boot-ordering risk): serve -> wait until /healthz answers ->
+        construct the provider -> force discovery eagerly so its tools are cached before any run
+        validates against them. On any failure, tear down and return None — MCP degrades to
+        off, never crashing studio boot."""
+        server = create_mcp_server(
+            FakeMcpServer(), host="127.0.0.1", port=0, admin_token=self._admin_token
+        )
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, name="studio-mcp-gateway", daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{port}"
+        provider: McpToolProvider | None = None
+        try:
+            wait_http_ready(base_url, timeout_s=10)
+            provider = McpToolProvider(f"{base_url}/mcp", server="studio", token=self._admin_token)
+            provider.tool_bindings()  # force discovery now so it's cached, not lazy at first run
+        except (McpError, TimeoutError, OSError) as exc:
+            _LOGGER.warning("fake MCP gateway unavailable; continuing without MCP: %s", exc)
+            if provider is not None:
+                provider.close()
+            server.shutdown()
+            server.server_close()
+            return None
+        self._mcp_server = server
+        self._mcp_thread = thread
+        _LOGGER.info("fake MCP gateway on %s (%d tools)", base_url, len(provider.tool_bindings()))
+        return provider
 
     # --- lifecycle ----------------------------------------------------------------------
 
@@ -322,6 +439,26 @@ class StudioServer:
         )
         self._web_gateway_thread.start()
 
+        # Agent Skills (offline, no I/O): load the bundled/configured directory into one
+        # SkillProvider, attached to the backend as both a tool and a context provider.
+        self._skill_provider = self._load_skill_provider()
+
+        # MCP (opt-in): boot the bundled fake MCP gateway on loopback, then connect a provider to
+        # it. Strictly ordered (serve -> wait ready -> discover) and degrades to no-MCP on failure.
+        if self.config.mcp:
+            self._mcp_provider = self._start_fake_mcp()
+
+        # Enable the provider-backed capabilities by default when their provider is attached.
+        self._capabilities = self._available_capabilities()
+
+        subagent_definitions = dict(_SUBAGENT_DEFINITIONS)
+        if self._skill_provider is not None:
+            # Fork skills (context: fork) run as subagents; register their synthesized definitions
+            # (namespaced ids, so no collision with the built-in researcher). No-op for the sample.
+            subagent_definitions.update(self._skill_provider.subagent_definitions())
+
+        provider_instances = tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None)
+
         self._backend = RunnerBackend(
             run_root=self.config.run_root,
             token_manager=self._token_manager,
@@ -337,7 +474,12 @@ class StudioServer:
             # size limit must clear an inline image (the core normalizes it to a blob downstream).
             max_message_bytes=_MAX_BODY_BYTES,
             # Agent-as-tool: makes agent.spawn available (bound via the "delegate" capability).
-            subagent_definitions=_SUBAGENT_DEFINITIONS,
+            # Plus any fork-skill subagents synthesized by the skill provider.
+            subagent_definitions=subagent_definitions,
+            # The provider seam: Skills (tool + context) and MCP (tool) attach here, shared across
+            # runs and re-attached on resume. Their tools are declared to config validation too.
+            tool_providers=provider_instances,
+            context_providers=(self._skill_provider,) if self._skill_provider is not None else (),
         )
 
         self._ui_server = ThreadingHTTPServer(
@@ -358,7 +500,13 @@ class StudioServer:
         # no parked session coroutines at exit (DX-2: drain instead of cancel-each + sleep).
         if self._backend is not None:
             self._backend.shutdown(drain=True)
-        for server in (self._ui_server, self._gateway_server, self._web_gateway_server):
+        # Close the MCP provider's live connection before stopping its server (DX-2 ethos).
+        if self._mcp_provider is not None:
+            try:
+                self._mcp_provider.close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                _LOGGER.debug("error closing MCP provider", exc_info=True)
+        for server in (self._ui_server, self._gateway_server, self._web_gateway_server, self._mcp_server):
             if server is not None:
                 try:
                     server.shutdown()
@@ -405,7 +553,7 @@ class StudioServer:
         """Open a new multi-turn session in the workspace and deliver the first message (with any
         image/document attachments as multimodal content parts)."""
         assert self._backend is not None
-        runtime_config = _runtime_config_for(self._capabilities, self._model, self._effort, self._summary)
+        runtime_config = self._build_config()
         parts = self._parts_from_attachments(message, attachments)
         request = BackendRunRequest(
             tenant_id=_TENANT,
@@ -577,11 +725,12 @@ class StudioServer:
 
     def settings(self) -> dict[str, Any]:
         """Current Studio settings: provider, capability set, and the model + reasoning effort."""
+        labels = self._capability_labels()
         return {
             "provider": self.config.provider,
             "offline": self.offline,
             "capabilities": list(self._capabilities),
-            "available": [{"key": cap, "label": _CAPABILITY_LABELS[cap]} for cap in _ALL_CAPABILITIES],
+            "available": [{"key": cap, "label": labels[cap]} for cap in self._available_capabilities()],
             "model": self._model,
             "effort": self._effort,
             "efforts": list(_EFFORT_CHOICES),
@@ -589,6 +738,19 @@ class StudioServer:
             "summaries": list(_SUMMARY_CHOICES),
             "otel": self._otel,
         }
+
+    def capabilities_catalog(self) -> dict[str, Any]:
+        """Read-only catalog of the attached providers' offerings, for a UI list: the available
+        Agent Skills (name + description) and the connected MCP server's tools (id + description).
+        Both empty when their provider isn't attached."""
+        skills = self._skill_provider.catalog() if self._skill_provider is not None else []
+        mcp_tools: list[dict[str, str]] = []
+        if self._mcp_provider is not None:
+            mcp_tools = [
+                {"id": spec.id, "description": spec.description}
+                for spec in self._mcp_provider.get_tools()
+            ]
+        return {"skills": skills, "mcp_tools": mcp_tools}
 
     def update_settings(
         self,
@@ -604,7 +766,8 @@ class StudioServer:
         place via runtime-config replacement (applied at their next turn)."""
         assert self._backend is not None
         if capabilities is not None:
-            self._capabilities = [cap for cap in _ALL_CAPABILITIES if cap in set(capabilities)]
+            requested = set(capabilities)
+            self._capabilities = [cap for cap in self._available_capabilities() if cap in requested]
         if model is not None and model.strip():
             self._model = model.strip()
         if effort is not None and effort in _ALL_EFFORTS:
@@ -613,7 +776,7 @@ class StudioServer:
             self._summary = summary
         if otel is not None:
             self._set_otel(otel)
-        new_config = _runtime_config_for(self._capabilities, self._model, self._effort, self._summary)
+        new_config = self._build_config()
         with self._lock:
             active = list(self._run_tokens.items())
         applied = 0
@@ -724,6 +887,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/api/settings":
                 self._write_json(studio.settings())
+                return
+            if parsed.path == "/api/capabilities-catalog":
+                self._write_json(studio.capabilities_catalog())
                 return
             if parsed.path == "/healthz":
                 self._write_json({"ok": True})

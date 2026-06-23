@@ -10,9 +10,11 @@ so all three layers harden in one place.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.request import Request, urlopen
 
 # Reject a declared request body larger than this outright (DoS / OOM guard). 10 MB
 # comfortably covers a by-value conversation turn while bounding a single request's cost.
@@ -63,6 +65,24 @@ def redact_internal_error(logger: Any, handler: BaseHTTPRequestHandler, exc: Exc
         exc_info=exc,
     )
     return f"internal server error (ref {correlation_id})"
+
+
+def wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
+    """Poll ``<base_url>/healthz`` until the server answers, or raise ``TimeoutError``. The
+    runtime counterpart of the test harness's poll — an embedder that boots an auxiliary HTTP
+    server in-process (e.g. studio's fake MCP gateway) must wait for it to serve before wiring a
+    client that discovers against it."""
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with urlopen(Request(f"{base_url}/healthz"), timeout=2) as response:
+                response.read()
+            return
+        except Exception as exc:  # noqa: BLE001 - any failure means not-yet-ready
+            last_error = exc
+            time.sleep(0.02)
+    raise TimeoutError(f"server did not become ready: {last_error}")
 
 
 def log_http_request(logger: Any, handler: BaseHTTPRequestHandler, code: Any) -> None:

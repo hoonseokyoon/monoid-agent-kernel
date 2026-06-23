@@ -603,4 +603,68 @@ memory/store, never through the `max_bytes_read` text-read cap.
 durable log holds `blob:` not `data:`) + live HTTP (studio follow-up attach → forwarded, blob in
 store, zero workspace files). Fork still seeds `media_blobs`, so subagents inherit blob refs.
 
+### R14 (Skills + MCP attach through the studio) — the backend had no provider seam
+**What shipped:** Skills and MCP were already fully implemented in core (merged to main:
+`skills/SkillProvider` = ContextProvider + ToolProvider with progressive disclosure;
+`mcp/McpToolProvider` = ToolProvider over JSON-RPC/httpx), and the CLI wired Skills
+(`--skills-directory`). But **neither was reachable from an app**, because the embedder-facing
+`RunnerBackend` exposed no provider seam. Studio now attaches both; the work surfaced three real
+gaps (and one to note).
+
+- **DX-14 🟢 `RunnerBackend` had no `tool_providers`/`context_providers` seam.** The loop accepts
+  both (`AgentLoop.tool_providers`/`context_providers`) and the CLI passes them straight to the
+  loop, but the backend an out-of-process embedder drives dropped them — it only had
+  `subagent_definitions` + `extra_event_sink_factories`. Added the two fields (INSTANCES, not
+  factories like the event-sink seam: a provider holds a shared reusable resource — MCP's live
+  httpx client + discovery cache — or is immutable, and is safe to share across concurrent runs).
+  Passed at BOTH AgentLoop construction sites (`_build_loop` + the resume-from-checkpoint site),
+  so a parked run re-attaches its providers on restart for free.
+- **DX-15 🟢 Config validation rejected provider tools as unknown.** `skill` / `mcp.<server>.<tool>`
+  are registered by the loop bootstrap from the providers, so `validate_runtime_config` saw them as
+  unknown registry tools — the exact DX-10/`agent_spawn` precedent. Extended
+  `_backend_builtin_tool_specs` to also append each provider's `get_tools()` specs (cheap:
+  SkillProvider does no I/O; MCP caches discovery after the first call), at both the `submit_run`
+  and `replace_runtime_config` (hot-swap) validation sites.
+- **DX-16 🟢 No offline/fake MCP server existed.** `McpToolProvider` only talks to a real server URL;
+  the only fake was a private test stub. To honor the zero-key/offline ethos (echo gateway /
+  `FakeWebProvider`), built `reference/mcp_gateway/` — `FakeMcpServer` (catalog + JSON-RPC dispatch)
+  + `make_mcp_handler`/`create_mcp_server` (modeled on `web_gateway/`), speaking the MCP
+  Streamable-HTTP wire (`initialize`/`tools/list`/`tools/call`/`notifications/initialized`,
+  `Mcp-Session-Id`, Bearer auth, `/healthz`). The **production** `McpToolProvider` round-trips
+  against it (wire-compat test). Also added a runtime `wait_http_ready` to `_shared/http_util` (the
+  test harness's poll was test-only) so an embedder can wait on an in-process aux server.
+- **Studio wiring.** `start()` loads a bundled sample skill (`sample-skills/commit-message`, so
+  `studio serve` shows Skills with zero config) into a `SkillProvider`, and with `--mcp` boots the
+  fake gateway on loopback then connects an `McpToolProvider`. Both attach via the new seam. Skills
+  and MCP are **hot-swappable capability toggles** (the user's choice) — `_runtime_config_for` gained
+  a `provider_bindings` map so the same config-build feeds new chats AND the settings hot-swap, which
+  directly exercises DX-15's `replace_runtime_config` path. The **boot-ordering risk** (MCP discovery
+  is a network call) is handled in one place: serve → `wait_http_ready` → construct provider → force
+  discovery in try/except → **degrade to Skills-only on failure, never crash boot**; the UI server
+  boots last. Shutdown closes the MCP provider + stops the fake server thread (DX-2 ethos).
+- **Minimal UI (goal is not a pretty UI).** `GET /api/capabilities-catalog` (skills name+desc via a
+  new `SkillProvider.catalog()`; MCP tools id+desc from the cached provider) feeds two sidebar lists,
+  hidden when empty. `describe_event` gained a thin branch so the feed reads "Using skill: <name>" /
+  "Calling MCP tool: …" instead of a bare "Running skill" (the R5 narration lesson).
+- **DX-17 🟢 Context-provider segments were boot-time / all-or-nothing — now config-gated.** The
+  gap: toggling "skills" off mid-run removed the `skill` *tool* (config hot-swap) but the L1 catalog
+  stayed baked in the system prompt (a `static_segment` is composed once at bootstrap), so the model
+  saw a catalog for a tool it could no longer call. Fix (core seam, no new concept): `TurnContext`
+  gained `bound_tools` — the registry tool ids bound *this* turn — populated in the loop right after
+  the per-turn `compile_bound_tool_catalog`, so any `dynamic_segment` can gate itself on the live
+  config. `SkillProvider` moved its catalog from `static_segment` (→ now `None`) to a
+  `dynamic_segment` that emits only when `skill` is in `turn.bound_tools`. The catalog now appears/
+  disappears with the capability toggle on the next turn (CLI behavior is unchanged — there the
+  skill tool is always bound, so the catalog shows every turn as before). Regression: a studio
+  multi-turn test toggles skills off mid-run and asserts the catalog leaves the next turn's system
+  prompt; a core unit test asserts the catalog is emitted only when the tool is bound.
+
+**Verified:** core/backend units (provider validates only when attached; hot-swap accepts a provider
+tool; provider tool executes through the loop; resume re-attaches providers), the fake MCP gateway
+against the real client (discovery + call round-trip, `/healthz`, JSON-RPC errors, bearer auth),
+studio Skills (catalog in prompt, `skill.activated` flows, hot-swap, no-dir no-op), studio MCP
+(boot-orders discovery, end-to-end `mcp.studio.echo` call, **discovery-failure degrades to off**,
+shutdown stops the thread, hot-swap), and a live HTTP smoke (`/api/capabilities-catalog` lists the
+skill + both MCP tools, both capabilities enabled). All offline, zero keys.
+
 <!-- Add new entries below as later rungs surface them. -->
