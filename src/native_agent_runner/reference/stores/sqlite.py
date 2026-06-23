@@ -22,6 +22,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+from native_agent_runner.core._util import sha256_bytes
 from native_agent_runner.core.checkpoint import CheckpointRecord, RunCheckpoint
 
 _SCHEMA = """
@@ -122,6 +123,28 @@ class SqliteCheckpointStore:
         if checkpoint is None:
             return None
         return CheckpointRecord(seq=seq, checkpoint=checkpoint, _blob_reader=self._read_blob)
+
+    def put_blob(self, run_id: str, data: bytes) -> str:
+        """Store a standalone content-addressed blob (write-once, shared ``blobs`` table — the same
+        namespace ``put`` fills for checkpoints) and return its sha256 digest."""
+        del run_id  # blobs are global/content-addressed in this store; run scope is the token's job
+        sha = sha256_bytes(data)
+        with self._lock:
+            conn = _connect(self._db_path)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("INSERT OR IGNORE INTO blobs(sha, data) VALUES (?, ?)", (sha, data))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+        return sha
+
+    def get_blob(self, run_id: str, sha256: str) -> bytes:
+        del run_id  # content-addressed lookup; the token already authorized the run
+        return self._read_blob(sha256)
 
     def _read_blob(self, sha256: str) -> bytes:
         conn = _connect(self._db_path)

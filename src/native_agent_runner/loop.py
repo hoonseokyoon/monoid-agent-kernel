@@ -29,11 +29,14 @@ from native_agent_runner.core.media import (
     MAX_FORWARDABLE_BLOCKS,
     WIRE_FORWARDABLE_PART_TYPES,
     WorkspaceMediaResolver,
+    blob_shas_in_messages,
     count_tool_result_images,
     estimate_image_tokens,
     evict_tool_result_images,
     image_dimensions,
     native_image_token_cap,
+    normalize_inline_media_dicts,
+    normalize_inline_media_part,
     resolve_wire_messages,
 )
 from native_agent_runner.core.context import (
@@ -85,6 +88,7 @@ from native_agent_runner.errors import (
     RunCancelled,
     RunTimeout,
     ToolExecutionError,
+    TurnInterrupted,
     error_code_for_exception,
 )
 from native_agent_runner.tasks import (
@@ -99,6 +103,8 @@ from native_agent_runner.providers.base import (
     ModelRequest,
     ModelStreamChunk,
     ModelTurn,
+    ReasoningDelta,
+    TextDelta,
     ToolObservation,
     assemble_streamed_turn,
     format_async_result_text,
@@ -135,6 +141,24 @@ def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     (``fs.read``), patterns (``mcp.*``, ``mcp.github.*``), or ``*`` for all."""
     candidates = (binding.ref.tool_id, binding.binding_id, binding.model_name or "")
     return any(fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name)
+
+
+def _recoverable_turn_error(exc: BaseException) -> bool:
+    """Whether a model-turn exception is *recoverable* — the session should survive and the
+    turn can be re-attempted (after backoff, or after the user fixes config) rather than
+    terminalizing the whole run.
+
+    Recoverable = a ``ModelAdapterError`` that is gateway-flagged ``retryable`` (transient:
+    timeouts, network, 429, exhausted 5xx) OR any 4xx (config/auth/rate-limit the user can fix
+    and resend against). Everything else — a generic exception, or an un-flagged 5xx — stays
+    terminal, matching today's behavior.
+    """
+    if not isinstance(exc, ModelAdapterError):
+        return False
+    if exc.retryable:
+        return True
+    status = exc.http_status
+    return status is not None and 400 <= status < 500
 
 
 def _failure_result(exc: Exception, *, error_code: str | None = None) -> ToolResult:
@@ -349,7 +373,7 @@ class AgentToolContext(ToolContext):
         return requested
 
 
-def _observation_message(observation: ToolObservation) -> dict[str, Any]:
+def _observation_message(observation: ToolObservation, media_store: dict[str, bytes]) -> dict[str, Any]:
     """Provider-neutral by-value message for a tool/async observation. Preserves the
     ``is_background`` → role semantics the adapters use: a background/hosted result is a
     new user message; a tool result is a ``tool`` message keyed by ``call_id``."""
@@ -361,9 +385,10 @@ def _observation_message(observation: ToolObservation) -> dict[str, Any]:
         "content": observation.output,
     }
     if observation.media:
-        # By reference; resolved to wire blocks at send time and delivered per provider
-        # (a follow-up user message for OpenAI/gateway).
-        message["media"] = list(observation.media)
+        # By reference; resolved to wire blocks at send time and delivered per provider (a follow-up
+        # user message for OpenAI/gateway). Inline (data:) media a tool returned is normalized to a
+        # durable blob here, symmetric with user-input media — so tool media survives restart too.
+        message["media"] = normalize_inline_media_dicts(list(observation.media), media_store)
     return message
 
 
@@ -408,6 +433,11 @@ class RunState:
     # owns and resends each turn (vendor-independent continuation). The system prompt is
     # NOT here — it is regenerated per turn and applied via ModelRequest.system_prompt.
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # Content-addressed bytes for inline-ingested media (``blob:<sha>`` refs in ``messages``).
+    # In-memory working state, NOT serialized into the manifest — it travels as checkpoint blobs
+    # (``collect_checkpoint_blobs``) and is rehydrated on restore, so an inline image survives a
+    # restart and a base re-provisioning.
+    media_blobs: dict[str, bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -449,6 +479,11 @@ class AgentLoop:
     tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
     event_sinks: tuple[EventSink, ...] = ()
     status_file: bool = True
+    # Opt-in token streaming for the autonomous (non-RunStream) drive: when set and the model
+    # adapter supports ``astream_turn``, each text fragment is emitted as a ``model.output.delta``
+    # event so an event-stream consumer (e.g. the studio app over SSE) can render tokens live.
+    # Falls back to a one-shot ``next_turn`` for adapters that can't stream. Off by default.
+    emit_output_deltas: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
     shell_approval_provider: ShellApprovalProvider | None = None
@@ -480,6 +515,11 @@ class AgentLoop:
     # Dormant sink installed on the run's EventBus at bootstrap; astream activates it to tap
     # orchestration events and relay token deltas onto a stream queue. None until bootstrap.
     _stream_sink: QueueEventSink | None = field(default=None, init=False, repr=False)
+    # Turn-level "stop": set from another thread via :meth:`interrupt_turn`, consumed at the
+    # next step boundary (see ``_check_run_boundary``). Distinct from ``cancellation_token``
+    # (which is run-level/terminal); an interrupt keeps the session alive. Cleared at the start
+    # of each new user submit so a stale stop never kills the next turn.
+    _interrupt_requested: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
@@ -617,6 +657,17 @@ class AgentLoop:
         Sync facade over :meth:`arun_until_suspended`."""
         return self._run_sync(self.arun_until_suspended(user_input))
 
+    def interrupt_turn(self) -> None:
+        """Request a turn-level stop: the running turn halts at its next step boundary and
+        suspends with ``reason="interrupted"`` (the session stays alive — the next message
+        continues the conversation). Thread-safe one-way signal (a bare flag set, mirroring
+        ``cancellation_token.cancel()``). A no-op if no turn is in flight: the flag is cleared
+        when the next submit starts, so it never kills a turn the user did not mean to stop.
+        With token streaming (``emit_output_deltas`` + an ``astream_turn`` adapter) it takes
+        effect mid-generation — the in-flight stream is aborted at the next token. Otherwise it
+        lands at the next step boundary (a non-streamed model call finishes first)."""
+        self._interrupt_requested = True
+
     async def arun_until_suspended(
         self, user_input: str | tuple[ContentPart, ...] | None = None
     ) -> Suspension:
@@ -638,6 +689,8 @@ class AgentLoop:
             state.final_text = ""
             # A run.finish in a prior submit must not short-circuit this one.
             res.context.finished = False
+            # Drop a stale stop so it can't immediately interrupt this fresh turn.
+            self._interrupt_requested = False
             state.pending_user_input = input_to_parts(user_input)
             self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
             session.submit_local_step = 0
@@ -662,6 +715,58 @@ class AgentLoop:
             )
             self._persist_checkpoint(session)
             return result
+        except ModelAdapterError as exc:
+            if not _recoverable_turn_error(exc):
+                # Non-recoverable model error -> terminal (same bookkeeping as the generic
+                # handler below; a re-raise here would skip that handler, so inline it).
+                self._record_failure(state, res, exc)
+                session.terminal = True
+                result = replace(
+                    Suspension(reason="terminal", status="failed"),
+                    error=state.error,
+                    error_code=state.error_code,
+                    turn=self._checkpoint_on_settle(state, res),
+                )
+                self._persist_checkpoint(session)
+                return result
+            # Recoverable model-turn failure: keep the session alive so the turn can be
+            # re-attempted (driver decides: backoff-retry transient, or park for the user to
+            # fix config + resend). The user message + observations are already committed to
+            # state.messages (appended before the model call); the assistant reply was never
+            # appended (success-only). The ONLY leftover to clear for an idempotent re-attempt
+            # is pending_observations — otherwise a re-issue re-appends the same tool outputs.
+            state.provider_error_code = exc.provider_error_code
+            state.provider_http_status = exc.http_status
+            res.recorder.emit(
+                "turn.failed",
+                data={
+                    "error": public_error_message(str(exc)),
+                    "error_code": exc.error_code,
+                    "provider_error_code": exc.provider_error_code,
+                    "http_status": exc.http_status,
+                    "retryable": exc.retryable,
+                },
+                level="warning",
+            )
+            state.pending_observations = ()
+            self._persist_checkpoint(session)
+            return replace(
+                Suspension(reason="turn_failed", status="failed"),
+                error=public_error_message(str(exc)),
+                error_code=exc.error_code,
+                retryable=exc.retryable,
+                http_status=exc.http_status,
+            )
+        except TurnInterrupted:
+            # Turn-level stop: keep the session alive (no error, not terminal). Same idempotency
+            # as turn_failed — the user message/observations are already committed; only clear
+            # pending_observations so a re-issue doesn't re-append tool outputs. The driver parks
+            # for the next user message. ``status`` is cosmetic here; branch on ``reason``.
+            self._interrupt_requested = False
+            res.recorder.emit("turn.interrupted", data={"reason": "user_stop"}, level="info")
+            state.pending_observations = ()
+            self._persist_checkpoint(session)
+            return Suspension(reason="interrupted", status="completed")
         except Exception as exc:  # controlled recording boundary for standalone CLI
             self._record_failure(state, res, exc)
             session.terminal = True
@@ -694,6 +799,18 @@ class AgentLoop:
         multi-turn driver calls this before blocking on its message channel."""
         session = self._require_open()
         session.res.recorder.emit("run.awaiting_input", data={"reason": "user"})
+
+    def fail_recoverable(self, message: str, *, error_code: str = "model_error") -> None:
+        """Promote a now-exhausted recoverable turn failure to a terminal run failure.
+
+        A driver that has given up retrying a ``turn_failed`` suspension (e.g. the consecutive
+        failure cap was hit) calls this to record the durable failure (``failure.json`` +
+        ``run.failed``) and mark the session terminal, without having to duplicate the loop's
+        terminal bookkeeping. The driver then closes the run as usual."""
+        session = self._require_open()
+        self._record_failure(session.state, session.res, ModelAdapterError(message, error_code=error_code))
+        session.terminal = True
+        self._persist_checkpoint(session)
 
     def has_pending_tasks(self) -> bool:
         """Whether the run has resume-tasks still outstanding (not yet drained)."""
@@ -746,17 +863,22 @@ class AgentLoop:
         user_input: str | tuple[ContentPart, ...],
         *,
         seed_messages: tuple[dict[str, Any], ...] | None = None,
+        seed_media_blobs: Mapping[str, bytes] | None = None,
     ) -> AgentRunResult:
         """Async form of :meth:`run_once`. ``seed_messages`` pre-loads the by-value
         conversation log before the first turn — used by a ``context: fork`` subagent to
         inherit the parent's conversation snapshot (the system prompt is regenerated from
-        this run's own config, so a fork sees the history but applies its own directive)."""
+        this run's own config, so a fork sees the history but applies its own directive).
+        ``seed_media_blobs`` carries the parent's inline-media bytes so ``blob:`` refs in
+        ``seed_messages`` still resolve in the child."""
         self.open()
         try:
             session = self._require_open()
             if not session.terminal:
                 if seed_messages:
                     session.state.messages = [dict(message) for message in seed_messages]
+                if seed_media_blobs:
+                    session.state.media_blobs = dict(seed_media_blobs)
                 await self.asubmit(user_input)
         finally:
             result = self.close()
@@ -845,6 +967,10 @@ class AgentLoop:
             astream_turn = getattr(adapter, "astream_turn", None)
             if astream_turn is not None:
                 return await self._acall_model_streaming(astream_turn, request, sink)
+        if self.emit_output_deltas:
+            astream_turn = getattr(adapter, "astream_turn", None)
+            if astream_turn is not None:
+                return await self._acall_model_emitting_deltas(astream_turn, request)
         anext = getattr(adapter, "anext_turn", None)
         if anext is not None:
             return await anext(request)
@@ -865,6 +991,41 @@ class AgentLoop:
         async for chunk in astream_turn(request):
             sink.push_delta(chunk)
             chunks.append(chunk)
+        return assemble_streamed_turn(chunks)
+
+    async def _acall_model_emitting_deltas(
+        self,
+        astream_turn: Callable[[ModelRequest], Any],
+        request: ModelRequest,
+    ) -> ModelTurn:
+        """Autonomous-drive streaming (no RunStream queue): drive ``astream_turn`` and emit each
+        text fragment as a ``model.output.delta`` event, so an event-stream consumer renders
+        tokens live. Tool-call/usage chunks are folded only — the assembled ``ModelTurn`` is
+        identical to the one-shot path, so the rest of the turn is unchanged."""
+        assert self._session is not None
+        recorder = self._session.res.recorder
+        chunks: list[ModelStreamChunk] = []
+        agen = astream_turn(request)
+        try:
+            async for chunk in agen:
+                chunks.append(chunk)
+                if isinstance(chunk, TextDelta) and chunk.text:
+                    recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
+                elif isinstance(chunk, ReasoningDelta) and chunk.text:
+                    # Display-only reasoning summary (DX-13b): a separate event so a consumer
+                    # renders it in a "thinking" view, distinct from the answer text.
+                    recorder.emit("model.reasoning.delta", data={"text": chunk.text}, level="debug")
+                # Immediate stop: when a turn interrupt arrives mid-stream, abort the in-flight
+                # generation now (don't wait for the next step boundary). The text already
+                # streamed stays; the except in arun_until_suspended parks the live session.
+                if self._interrupt_requested:
+                    raise TurnInterrupted("turn interrupted")
+        finally:
+            # Close the generator so the provider's stream/connection is released promptly
+            # (on a normal drain this is a no-op; on the mid-stream abort it cancels the wire).
+            aclose = getattr(agen, "aclose", None)
+            if aclose is not None:
+                await aclose()
         return assemble_streamed_turn(chunks)
 
     def _record_failure(self, state: RunState, res: _RunResources, exc: Exception) -> None:
@@ -1001,6 +1162,17 @@ class AgentLoop:
             self.checkpoint_store = LocalFsCheckpointStore(self.spec.run_root)
         return self.checkpoint_store
 
+    def _media_blob_reader(self) -> Callable[[str], bytes] | None:
+        """A ``sha -> bytes`` reader over the durable blob store, so the wire-build resolver can
+        resolve a ``blob:`` ref that a peer persisted (e.g. the backend normalizing a queued inline
+        message via ``put_blob``) and that is therefore not in this loop's in-memory ``media_blobs``.
+        ``None`` when no store is configured (in-memory media_blobs then covers everything)."""
+        store = self.checkpoint_store
+        if store is None:
+            return None
+        run_id = self.spec.run_id
+        return lambda sha: store.get_blob(run_id, sha)
+
     def _persist_checkpoint(self, session: _Session) -> None:
         """Best-effort durable checkpoint at a park point. No-op when ``snapshot()``
         refuses (a live shell job is parked-on) — that park is simply not durable yet.
@@ -1033,11 +1205,13 @@ class AgentLoop:
         return entries
 
     def collect_checkpoint_blobs(self) -> dict[str, bytes]:
-        """Content-addressed blobs for the current park's workspace delta: the bytes of
-        each created/modified file, keyed by sha256. Read at the same quiescent park as
-        ``snapshot()`` so the keys match the manifest's ``content_sha256`` refs."""
+        """Content-addressed blobs for the current park, keyed by sha256: the bytes of each
+        created/modified workspace file, PLUS the inline-ingested media bytes
+        (``state.media_blobs``). Read at the same quiescent park as ``snapshot()`` so the keys
+        match the manifest's ``content_sha256`` / ``blob:<sha>`` refs. Both kinds share one
+        content-addressed namespace (identical content dedups)."""
         session = self._require_open()
-        blobs: dict[str, bytes] = {}
+        blobs: dict[str, bytes] = dict(session.state.media_blobs)
         for entry in session.res.workspace.changed_entries():
             if entry.content is not None:
                 blobs[sha256_bytes(entry.content)] = entry.content
@@ -1108,6 +1282,17 @@ class AgentLoop:
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
         )
+        # Rehydrate inline-ingested media: load every blob:<sha> referenced by the restored log
+        # back into the in-memory map so wire-build can resolve it after the restart. A blob
+        # missing from the store is skipped (not fatal) — resolution then surfaces it as a
+        # MediaResolveError at wire-build, the same degraded path as a deleted workspace file.
+        media_blobs: dict[str, bytes] = {}
+        for sha in blob_shas_in_messages(tuple(state.messages)):
+            try:
+                media_blobs[sha] = blob_reader(sha)
+            except KeyError:
+                pass
+        state.media_blobs = media_blobs
         # Re-apply the agent's workspace delta on top of the (backend-re-provisioned)
         # base, so the restored workspace matches the checkpoint instant and
         # changed_entries() reports the same delta again.
@@ -1280,8 +1465,10 @@ class AgentLoop:
         # A fork inherits the parent's conversation snapshot; a fresh subagent starts empty.
         # mode/limits: a fork inherits the parent's outright; a fresh subagent may narrow them.
         seed_messages: tuple[dict[str, Any], ...] | None = None
+        seed_media_blobs: Mapping[str, bytes] | None = None
         if is_fork and self._session is not None:
             seed_messages = tuple(dict(message) for message in self._session.state.messages)
+            seed_media_blobs = dict(self._session.state.media_blobs)
         # Correlate the delegation on the PARENT's event stream (the child records to its
         # own run dir; stateful sinks like OTel/StatusJson are NOT shared to avoid clobber).
         started = recorder.emit(
@@ -1327,8 +1514,13 @@ class AgentLoop:
             checkpoint_store=self.checkpoint_store,
             subagent_definitions=child_definitions,
             status_file=False,
+            # Inherit token streaming so a child's work streams into its own events.jsonl too
+            # (an observer can tail run_root/<child_run_id>/events.jsonl for live subagent output).
+            emit_output_deltas=self.emit_output_deltas,
         )
-        result = await child.arun_once(task.prompt, seed_messages=seed_messages)
+        result = await child.arun_once(
+            task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
+        )
         usage = {
             key: result.metrics[key]
             for key in ("input_tokens", "output_tokens", "total_tokens")
@@ -1708,6 +1900,12 @@ class AgentLoop:
             turn_registry = self._registry_for_turn(context, turn_context, res)
             runtime_config = self._current_runtime_config(turn_registry)
             bound_catalog = compile_bound_tool_catalog(runtime_config, turn_registry)
+            # Now that the active tool set for this turn is known, expose it on the turn context so
+            # a context provider's dynamic_segment can gate itself on the live config (e.g. the
+            # Skills catalog tracks the skill tool binding across a hot-swap).
+            turn_context = replace(
+                turn_context, bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools)
+            )
             self._emit_runtime_config_if_changed(
                 recorder=recorder,
                 state=state,
@@ -1763,6 +1961,14 @@ class AgentLoop:
             instruction: str | None = None
             user_message: dict[str, Any] | None = None
             if state.pending_user_input is not None:
+                # Inline ingress: any part handed in by value (a ``data:`` source_ref) is
+                # persisted to the content-addressed media-blob store and rewritten to a durable
+                # ``blob:<sha>`` ref BEFORE it enters the by-value log — so the log/checkpoint
+                # stay by-reference (tiny, resumable) and never carry the bytes inline.
+                state.pending_user_input = tuple(
+                    normalize_inline_media_part(part, state.media_blobs)
+                    for part in state.pending_user_input
+                )
                 # ``instruction`` is the text projection used only by the by-reference
                 # fallback path (first turn / follow-up on a handle). ``user_message``
                 # is the durable by-value log entry: a plain string for all-text input,
@@ -1778,7 +1984,7 @@ class AgentLoop:
             if user_message is not None:
                 state.messages.append(user_message)
             for observation in state.pending_observations:
-                state.messages.append(_observation_message(observation))
+                state.messages.append(_observation_message(observation, state.media_blobs))
             # Bound the by-value conversation log: a runaway multi-turn run must settle
             # safely (status ``limited``, last-good checkpoint intact) rather than grow the
             # resent-every-turn log without limit. Checked before the call so an over-limit
@@ -1837,7 +2043,9 @@ class AgentLoop:
                     evicted = before - count_tool_result_images(wire_messages)
                 wire_messages = resolve_wire_messages(
                     wire_messages,
-                    WorkspaceMediaResolver(res.workspace),
+                    WorkspaceMediaResolver(
+                        res.workspace, blobs=state.media_blobs, blob_reader=self._media_blob_reader()
+                    ),
                     encoding=getattr(self.model_adapter, "wire_image_encoding", "base64"),
                 )
                 self._emit_media_accounting(
@@ -1908,13 +2116,23 @@ class AgentLoop:
             _accumulate_usage(state.total_usage, turn)
             state.previous_turn_handle = turn.response_id or state.previous_turn_handle
             # Append the assistant reply to the by-value log (text + any tool calls).
-            state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": turn.final_text or "",
-                    "tool_calls": [call.__dict__ for call in turn.tool_calls],
-                }
-            )
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": turn.final_text or "",
+                "tool_calls": [call.__dict__ for call in turn.tool_calls],
+            }
+            # Carry provider-native reasoning artifacts so they round-trip on the next turn
+            # (DX-13a). Tagged with provider+model so replay only happens against a matching
+            # adapter/model; non-reasoning adapters leave ``turn.reasoning`` empty (neutral seam).
+            if turn.reasoning:
+                provider_name = getattr(self.model_adapter, "provider_name", None)
+                if provider_name:
+                    assistant_message["reasoning"] = {
+                        "provider": provider_name,
+                        "model": (runtime_config.model or ModelConfig()).model,
+                        "items": [dict(item) for item in turn.reasoning],
+                    }
+            state.messages.append(assistant_message)
             recorder.transcript(
                 {
                     "kind": "model_turn",
@@ -1937,21 +2155,26 @@ class AgentLoop:
                     "usage": turn.usage,
                 },
             )
+            metrics_data: dict[str, Any] = {
+                "step": step,
+                "tool_calls": state.total_tool_calls,
+                "input_tokens": state.total_usage["input_tokens"],
+                "output_tokens": state.total_usage["output_tokens"],
+                "total_tokens": state.total_usage["total_tokens"],
+                "web_search_calls": context.web_service.web_search_calls,
+                "web_fetch_calls": context.web_service.web_fetch_calls,
+                "web_context_calls": context.web_service.web_context_calls,
+                "web_failed_calls": context.web_service.web_failed_calls,
+            }
+            # Surface reasoning tokens (the priced, invisible "thinking" sub-count) when the
+            # adapter reports them, so the studio meter can show the reasoning share (R10).
+            if state.total_usage.get("reasoning_tokens"):
+                metrics_data["reasoning_tokens"] = state.total_usage["reasoning_tokens"]
             recorder.emit(
                 "metrics.updated",
                 turn_id=turn_id,
                 parent_id=turn_started.event_id,
-                data={
-                    "step": step,
-                    "tool_calls": state.total_tool_calls,
-                    "input_tokens": state.total_usage["input_tokens"],
-                    "output_tokens": state.total_usage["output_tokens"],
-                    "total_tokens": state.total_usage["total_tokens"],
-                    "web_search_calls": context.web_service.web_search_calls,
-                    "web_fetch_calls": context.web_service.web_fetch_calls,
-                    "web_context_calls": context.web_service.web_context_calls,
-                    "web_failed_calls": context.web_service.web_failed_calls,
-                },
+                data=metrics_data,
             )
 
             if not turn.tool_calls:
@@ -2710,6 +2933,9 @@ class AgentLoop:
             raise RunCancelled("run cancelled")
         if deadline is not None and time.time() >= deadline:
             raise RunTimeout("run exceeded max duration")
+        # Run-level cancel (terminal) takes precedence over a turn-level interrupt (non-terminal).
+        if self._interrupt_requested:
+            raise TurnInterrupted("turn interrupted")
 
     def _emit_side_effect_event(
         self,

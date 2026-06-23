@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Studio — Settings</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --border: #262b38; --text: #e6e8ee;
+    --muted: #8b91a0; --accent: #6ea8fe; --warn: #f0b35b;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); margin: 0; padding: 20px;
+    font: 14px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  h1 { font-size: 16px; margin: 0; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .close { background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 8px; width: 30px; height: 30px; font-size: 15px; line-height: 1; cursor: pointer;
+    padding: 0; }
+  .close:hover { color: var(--text); border-color: var(--muted); }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
+  .group { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; margin-bottom: 16px; }
+  .group h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); margin: 0 0 10px; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+  .row input { width: 16px; height: 16px; accent-color: var(--accent); }
+  .row label { cursor: pointer; }
+  .provider { color: var(--text); }
+  .provider .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--warn); color: var(--warn); margin-left: 6px; }
+  .actions { display: flex; align-items: center; gap: 12px; }
+  button { background: var(--accent); color: #0b0e14; border: 0; border-radius: 10px;
+    padding: 9px 18px; font-weight: 600; cursor: pointer; }
+  #status { color: var(--muted); font-size: 12.5px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>Settings</h1>
+    <button class="close" id="close" type="button" title="Back to chat" aria-label="Back to chat">✕</button>
+  </div>
+  <div class="sub">Changes apply to new chats and hot-swap any active session.</div>
+
+  <div class="group">
+    <h2>Model provider</h2>
+    <div class="provider" id="provider">…</div>
+    <div class="hint">Set at launch (<code>--provider</code>). Offline uses a key-less echo model.</div>
+  </div>
+
+  <div class="group">
+    <h2>Agent capabilities</h2>
+    <div id="caps"></div>
+    <div class="hint">Uncheck to take a capability away from the agent.</div>
+  </div>
+
+  <div class="actions">
+    <button id="save" type="button">Save</button>
+    <span id="status"></span>
+  </div>
+
+<script>
+const capsEl = document.getElementById("caps");
+const statusEl = document.getElementById("status");
+
+// Back to chat: prefer history (keeps the in-progress chat in this window); otherwise navigate.
+document.getElementById("close").addEventListener("click", () => {
+  if (window.history.length > 1) window.history.back();
+  else window.location.href = "/";
+});
+
+async function load() {
+  const s = await (await fetch("/api/settings")).json();
+  const badge = s.offline ? '<span class="badge">offline · echo model</span>' : "";
+  document.getElementById("provider").innerHTML = (s.provider || "?") + badge;
+  const enabled = new Set(s.capabilities || []);
+  capsEl.innerHTML = "";
+  for (const cap of s.available || []) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const id = "cap_" + cap.key;
+    const checked = enabled.has(cap.key) ? "checked" : "";
+    row.innerHTML = `<input type="checkbox" id="${id}" value="${cap.key}" ${checked}/>` +
+      `<label for="${id}">${cap.label}</label>`;
+    capsEl.appendChild(row);
+  }
+}
+
+document.getElementById("save").addEventListener("click", async () => {
+  const capabilities = [...capsEl.querySelectorAll("input:checked")].map((i) => i.value);
+  statusEl.textContent = "Saving…";
+  try {
+    const res = await (await fetch("/api/settings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ capabilities }),
+    })).json();
+    if (res.error) { statusEl.textContent = "Error: " + res.error; return; }
+    statusEl.textContent = `Saved — ${res.capabilities.length} capabilities (hot-swapped ${res.applied_runs} active session(s)).`;
+  } catch (err) {
+    statusEl.textContent = "Error: " + err;
+  }
+});
+
+load();
+</script>
+</body>
+</html>

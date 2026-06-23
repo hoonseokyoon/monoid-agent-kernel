@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -14,11 +15,18 @@ from conftest import http_json, runtime_config, tool_binding, wait_http_ready
 from native_agent_runner.core._util import write_json_atomic
 from native_agent_runner.core.checkpoint import RunCheckpoint
 from native_agent_runner.core.tool_surface import ToolScope
-from native_agent_runner.errors import PermissionDenied
+from native_agent_runner.core.spec import ModelRetryConfig
+from native_agent_runner.errors import AgentConfigError, ModelAdapterError, PermissionDenied
 from native_agent_runner.permissions import PermissionPolicy
+from native_agent_runner.core.content import ImagePart, TextPart
 from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from native_agent_runner.providers.fake import (
+    FakeModelAdapter,
+    FakeMultimodalModelAdapter,
+    fake_tool_call,
+)
 from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
+from native_agent_runner.skills import SkillDefinition, SkillProvider
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import (
     _RUN_META_SCHEMA_VERSION,
@@ -352,6 +360,504 @@ def test_backend_recovers_parked_hitl_run_from_checkpoint(tmp_path: Path) -> Non
     backend1.cancel_run(run_id, token)  # cleanup: stop the defunct first-process worker
 
 
+def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> None:
+    # The token-scoped, single-run analog of recover_runs: a parked multi-turn session is resumed
+    # by run id from a *fresh backend*, then a follow-up send_message threads a new user turn.
+    # This is the studio "continue an old chat after a restart" path.
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+
+    def _wait(predicate, tries: int = 1000) -> bool:
+        for _ in range(tries):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    # Process 1: open a multi-turn session; the first turn settles and parks awaiting input.
+    crashed: list = []
+    backend1 = _recoverable_backend(
+        run_root, token_manager, workspace, crashed,
+        turns=[ModelTurn(response_id="r1", final_text="first")],
+    )
+    backend1.idle_timeout_s = 30.0
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert _wait(lambda: backend1.checkpoint_store.latest(run_id) is not None)
+    assert _wait(lambda: backend1._record(run_id).status == "awaiting_input")
+
+    # Process 2: a fresh backend (empty _records). send_message would KeyError; resume_run
+    # materializes the record from the checkpoint, then the follow-up threads a second turn.
+    resumed: list = []
+    backend2 = _recoverable_backend(
+        run_root, token_manager, workspace, resumed,
+        turns=[ModelTurn(response_id="r2", final_text="second")],
+    )
+    backend2.idle_timeout_s = 30.0
+    backend2.max_recover_attempts = 10_000
+
+    with pytest.raises(KeyError):
+        backend2.send_message(run_id, token, "before resume")
+
+    info = backend2.resume_run(run_id, token)
+    assert info["resumed"] is True
+    assert run_id in backend2._records
+    # Idempotent: a second resume on the now-live run is a no-op.
+    assert backend2.resume_run(run_id, token)["resumed"] is False
+
+    assert backend2.send_message(run_id, token, "again")["status"] == "queued"
+    assert _wait(lambda: len([r for a in resumed for r in a.requests if r.instruction]) >= 1)
+
+    backend2.cancel_run(run_id, token)
+    assert backend2.wait_for_run(run_id, timeout_s=20) in {"completed", "limited", "failed"}
+    instructions = [r.instruction for a in resumed for r in a.requests if r.instruction]
+    assert "again" in instructions
+    backend1.cancel_run(run_id, token)  # stop the defunct first-process worker
+
+
+# --- Provider seam (Skills/MCP attach through the backend) --------------------------------
+#
+# RunnerBackend exposes tool_providers/context_providers so an embedder can attach Skills, MCP,
+# or any custom provider (the loop already supports them; the backend was the missing seam).
+# A SkillProvider built from an in-memory definition is the cleanest offline provider to test
+# with — no directory, no network.
+
+
+def _skill_provider() -> SkillProvider:
+    return SkillProvider(
+        {
+            "greeter": SkillDefinition(
+                name="greeter",
+                description="Greet the user warmly.",
+                instructions="Say a warm hello to the user.",
+            )
+        }
+    )
+
+
+def _provider_backend(
+    run_root: Path,
+    token_manager: TokenManager,
+    workspace: Path,
+    *,
+    turns: list,
+    adapters: list | None = None,
+    provider: SkillProvider | None = None,
+) -> RunnerBackend:
+    sink = adapters if adapters is not None else []
+
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        adapter = FakeModelAdapter(turns=list(turns))
+        sink.append(adapter)
+        return adapter
+
+    skill = provider if provider is not None else _skill_provider()
+    return RunnerBackend(
+        run_root=run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+        tool_providers=(skill,),
+        context_providers=(skill,),
+    )
+
+
+def _wait_for(predicate, tries: int = 1000) -> bool:
+    for _ in range(tries):
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_backend_validates_provider_tool_only_when_attached(tmp_path: Path) -> None:
+    # A binding to a provider tool (`skill`) is "unknown" to validation unless the provider is
+    # attached — and accepted once it is. This is the DX-15 / agent_spawn precedent for providers.
+    workspace = _workspace(tmp_path)
+    token_manager = _token_manager()
+    request = BackendRunRequest(
+        tenant_id="tenant_a",
+        user_id="user_a",
+        workspace_root=workspace,
+        instruction="hi",
+        runtime_config=runtime_config("skill", "run.finish"),
+    )
+
+    bare = RunnerBackend(
+        run_root=tmp_path / "runs-bare",
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _s, _t: FakeModelAdapter(turns=[ModelTurn(final_text="x")]),
+    )
+    with pytest.raises(AgentConfigError):
+        bare.submit_run(request)
+
+    attached = _provider_backend(
+        tmp_path / "runs", token_manager, workspace, turns=[ModelTurn(final_text="x")]
+    )
+    submission = attached.submit_run(request)
+    assert attached.wait_for_run(submission.run_id, timeout_s=20) == "completed"
+
+
+def test_backend_replace_runtime_config_accepts_provider_tool(tmp_path: Path) -> None:
+    # The hot-swap path (settings change) re-validates the config; a provider tool added on the
+    # swap must remain valid (covers the replace_runtime_config validation call site).
+    workspace = _workspace(tmp_path)
+    token_manager = _token_manager()
+    backend = _provider_backend(
+        tmp_path / "runs", token_manager, workspace, turns=[ModelTurn(response_id="r1", final_text="first")]
+    )
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_default_config(),  # no skill binding yet
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert _wait_for(lambda: backend._record(run_id).status == "awaiting_input")
+
+    current = backend.current_runtime_config(run_id)
+    result = backend.replace_runtime_config(
+        run_id,
+        token,
+        expected_version=current.config_version,
+        issuer="test",
+        reason="enable skills mid-run",
+        config=runtime_config("fs.read", "fs.write", "run.finish", "skill"),
+    )
+    assert result["config_version"] > current.config_version
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_backend_executes_provider_tool_through_loop(tmp_path: Path) -> None:
+    # End-to-end: a `skill` tool call issued by the model is registered from the backend's
+    # provider, executed, and its result reaches the model — proving the provider is actually
+    # wired into the run's tool registry, not just past validation.
+    workspace = _workspace(tmp_path)
+    token_manager = _token_manager()
+    adapters: list = []
+    backend = _provider_backend(
+        tmp_path / "runs",
+        token_manager,
+        workspace,
+        adapters=adapters,
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("skill", {"name": "greeter"}, "c1"),)),
+            ModelTurn(response_id="r2", final_text="greeted"),
+        ],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="greet the user",
+            runtime_config=runtime_config("skill", "run.finish"),
+        )
+    )
+    assert backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
+    observations = [obs for a in adapters for r in a.requests for obs in r.observations]
+    skill_obs = [obs for obs in observations if obs.tool_name == "skill"]
+    assert skill_obs, "the skill tool result never reached the model"
+    assert "warm hello" in json.dumps(skill_obs[0].output, default=str)
+
+
+def test_backend_resume_carries_providers(tmp_path: Path) -> None:
+    # A parked run resumed by a fresh backend (simulated restart) must re-attach providers —
+    # they are backend-instance fields read at every loop build, including the resume site.
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+
+    backend1 = _provider_backend(
+        run_root, token_manager, workspace, turns=[ModelTurn(response_id="r1", final_text="first")]
+    )
+    backend1.idle_timeout_s = 30.0
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=runtime_config("skill", "run.finish"),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert _wait_for(lambda: backend1.checkpoint_store.latest(run_id) is not None)
+    assert _wait_for(lambda: backend1._record(run_id).status == "awaiting_input")
+
+    # Fresh backend (empty _records) with its own provider instance resumes the run, then a
+    # follow-up triggers a skill call that must resolve against the re-attached provider.
+    resumed: list = []
+    backend2 = _provider_backend(
+        run_root,
+        token_manager,
+        workspace,
+        adapters=resumed,
+        turns=[
+            ModelTurn(response_id="r2", tool_calls=(fake_tool_call("skill", {"name": "greeter"}, "c2"),)),
+            ModelTurn(response_id="r3", final_text="greeted"),
+        ],
+    )
+    backend2.idle_timeout_s = 30.0
+    backend2.max_recover_attempts = 10_000
+    assert backend2.resume_run(run_id, token)["resumed"] is True
+    assert backend2.send_message(run_id, token, "use the greeter skill")["status"] == "queued"
+    assert _wait_for(
+        lambda: any(obs.tool_name == "skill" for a in resumed for r in a.requests for obs in r.observations)
+    ), "the skill tool did not resolve after resume — providers were not re-attached"
+
+    backend2.cancel_run(run_id, token)
+    backend2.wait_for_run(run_id, timeout_s=20)
+    backend1.cancel_run(run_id, token)
+
+
+def test_read_run_artifact_by_digest_with_slicing(tmp_path: Path) -> None:
+    # The R9 data-returning seam: a blob put under a run is fetched back by its sha256 digest,
+    # token-scoped, with offset/limit slicing — and malformed/unknown digests are rejected.
+    import hashlib
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+    backend = _recoverable_backend(run_root, token_manager, workspace, [], turns=[ModelTurn(final_text="x")])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hi",
+            runtime_config=_default_config(),
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    backend.wait_for_run(run_id, timeout_s=20)
+
+    data = b"PK\x03\x04artifact-bytes-0123456789"
+    digest = backend.checkpoint_store.put_blob(run_id, data)
+    assert digest == hashlib.sha256(data).hexdigest()
+
+    assert backend.read_run_artifact(run_id, token, digest) == data
+    assert backend.read_run_artifact(run_id, token, digest, offset=2) == data[2:]
+    assert backend.read_run_artifact(run_id, token, digest, offset=2, limit=4) == data[2:6]
+
+    with pytest.raises(ValueError):
+        backend.read_run_artifact(run_id, token, "ZZZ")  # malformed digest → 400
+    with pytest.raises(KeyError):
+        backend.read_run_artifact(run_id, token, "a" * 64)  # unknown digest → 404
+
+
+def test_resume_run_rejects_terminal_and_unknown(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+    backend = _recoverable_backend(run_root, token_manager, workspace, [], turns=[ModelTurn(final_text="x")])
+
+    # An unknown run id (no run.json) is rejected even with a syntactically valid token.
+    bogus = token_manager.issue(
+        kind="run_access", audience="native-agent-runner.backend",
+        run_id="run_missing", tenant_id="tenant_a", user_id="user_a", ttl_s=300,
+    )
+    with pytest.raises(KeyError):
+        backend.resume_run("run_missing", bogus)
+
+
+# A 1x1 transparent PNG — small enough to ride the default max_bytes_read.
+_PNG_1x1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+
+def test_send_message_forwards_multimodal_image_by_reference(tmp_path: Path) -> None:
+    # The string-only blocker fix: send_message accepts content parts; the loop resolves the
+    # workspace image reference to a base64 wire block and forwards it to a multimodal adapter.
+    workspace = _workspace(tmp_path)
+    workspace.joinpath("shot.png").write_bytes(_PNG_1x1)
+    run_root = tmp_path / "runs"
+
+    adapters: list = []
+
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        adapter = FakeMultimodalModelAdapter(
+            turns=[ModelTurn(response_id="r1", final_text="first"), ModelTurn(response_id="r2", final_text="an image")]
+        )
+        adapters.append(adapter)
+        return adapter
+
+    backend = RunnerBackend(
+        run_root=run_root,
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+    )
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hi",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+
+    def _wait(predicate, tries: int = 2000) -> bool:
+        for _ in range(tries):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+
+    # Deliver a multimodal follow-up: a workspace image reference + a text part.
+    backend.send_message(
+        run_id,
+        token,
+        [TextPart("describe this"), ImagePart(source_ref="shot.png", mime_type="image/png")],
+    )
+
+    # The resolved request carries a base64 image block (resolution happened at wire-build time).
+    def _image_block_forwarded() -> bool:
+        for adapter in adapters:
+            for req in adapter.requests:
+                for msg in req.messages:
+                    content = msg.get("content")
+                    if isinstance(content, list) and any(
+                        isinstance(b, dict) and b.get("type") == "image" for b in content
+                    ):
+                        return True
+        return False
+
+    assert _wait(_image_block_forwarded)
+
+    backend.cancel_run(run_id, token)
+    assert backend.wait_for_run(run_id, timeout_s=20) in {"completed", "limited", "failed"}
+
+
+def test_send_message_inline_media_is_blobified_before_queue(tmp_path: Path) -> None:
+    # R13b edge fix: an inline (data:) follow-up is normalized to a durable blob at send_message —
+    # BEFORE it enters the queue — so the queue (and any checkpoint of it) never carries the bytes
+    # inline. The loop then resolves the blob: ref via the checkpoint-store blob_reader fallback.
+    import base64
+    import hashlib
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    adapters: list = []
+
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        adapter = FakeMultimodalModelAdapter(
+            turns=[ModelTurn(response_id="r1", final_text="first"), ModelTurn(response_id="r2", final_text="img")]
+        )
+        adapters.append(adapter)
+        return adapter
+
+    backend = RunnerBackend(
+        run_root=run_root,
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+    )
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a", user_id="user_a", workspace_root=workspace,
+            instruction="hi", runtime_config=_default_config(), multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+
+    def _wait(predicate, tries: int = 2000) -> bool:
+        for _ in range(tries):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+
+    data_uri = "data:image/png;base64," + base64.b64encode(_PNG_1x1).decode()
+    backend.send_message(run_id, token, [TextPart("look"), ImagePart(source_ref=data_uri, mime_type="image/png")])
+
+    # The bytes were persisted to the blob store at ingress (so the queue held only a blob: ref).
+    sha = hashlib.sha256(_PNG_1x1).hexdigest()
+    assert backend.checkpoint_store.get_blob(run_id, sha) == _PNG_1x1
+
+    # The loop resolves that blob (via the store fallback) and forwards the image.
+    def _image_forwarded() -> bool:
+        return any(
+            isinstance(m.get("content"), list)
+            and any(isinstance(b, dict) and b.get("type") == "image" for b in m["content"])
+            for a in adapters for r in a.requests for m in r.messages
+        )
+
+    assert _wait(_image_forwarded)
+    # The durable log carries a blob: ref, never the data: bytes.
+    record = backend._record(run_id)
+    assert any(
+        isinstance(m.get("content"), list)
+        and any(isinstance(b, dict) and str(b.get("source_ref", "")).startswith("blob:") for b in m["content"])
+        for m in record.loop._session.state.messages  # type: ignore[union-attr]
+    )
+
+    backend.cancel_run(run_id, token)
+    assert backend.wait_for_run(run_id, timeout_s=20) in {"completed", "limited", "failed"}
+
+
+def test_queued_multimodal_message_round_trips_through_checkpoint() -> None:
+    # The queue + checkpoint stay JSON-native, so a parked multimodal message survives a restart.
+    from native_agent_runner.core.checkpoint import RunCheckpoint
+    from native_agent_runner.reference.backend.service import (
+        _normalize_inbound_message,
+        _queued_message_to_loop_input,
+    )
+
+    wire = _normalize_inbound_message(
+        [TextPart("describe"), ImagePart(source_ref="shot.png", mime_type="image/png")]
+    )
+    assert isinstance(wire, list)  # JSON-native: a list of content-part dicts
+
+    # Survives the durable checkpoint round-trip with no dataclass (de)serialization.
+    ckpt = RunCheckpoint(run_id="r", queued_messages=["plain text", wire])
+    restored = RunCheckpoint.from_json(ckpt.to_json())
+    assert restored is not None
+    assert restored.queued_messages[0] == "plain text"
+
+    # On dequeue it rebuilds the typed parts for the loop.
+    loop_input = _queued_message_to_loop_input(restored.queued_messages[1])
+    assert isinstance(loop_input, tuple)
+    assert isinstance(loop_input[0], TextPart) and isinstance(loop_input[1], ImagePart)
+    assert loop_input[1].source_ref == "shot.png"
+
+
 def test_recover_runs_skips_terminal_and_metaless_checkpoints(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     run_root = tmp_path / "runs"
@@ -504,17 +1010,27 @@ def test_watchdog_concurrent_claim_has_single_winner(tmp_path: Path) -> None:
     b1 = _recoverable_backend(run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")])
     b2 = _recoverable_backend(run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")])
     results: list = []
-    barrier = threading.Barrier(2)
+    errors: list = []
+    barrier = threading.Barrier(2, timeout=30.0)
 
     def claim(backend) -> None:
-        barrier.wait()
-        results.append(backend.lease_store.try_claim("run_x", backend._worker_id, backend.lease_ttl_s))
+        # Bound the rendezvous and capture any failure: under the full suite's background-thread
+        # contention a worker can stall before it reaches the barrier; an unbounded wait/join
+        # there would wedge the whole run forever (only the faulthandler watchdog could break it).
+        # A bounded barrier + surfaced error fails this test loudly instead of hanging the suite.
+        try:
+            barrier.wait()
+            results.append(backend.lease_store.try_claim("run_x", backend._worker_id, backend.lease_ttl_s))
+        except BaseException as exc:  # noqa: BLE001 - surface to the main thread, don't swallow
+            errors.append(exc)
 
     threads = [threading.Thread(target=claim, args=(b,)) for b in (b1, b2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=60.0)
+    assert not any(thread.is_alive() for thread in threads), "claim worker did not finish in time"
+    assert not errors, f"claim worker raised: {errors}"
 
     assert results.count(True) == 1
 
@@ -560,22 +1076,38 @@ def test_sqlite_lease_concurrent_claim_across_instances(tmp_path: Path) -> None:
     # in for two hosts) race to claim the same absent/stale run; the transactional CAS lets
     # exactly one win.
     db = tmp_path / "shared.db"
+    # Initialize the db file (schema + WAL-mode switch, which needs an EXCLUSIVE lock) ONCE up
+    # front. Doing it concurrently inside both workers raced the WAL init against the CAS write,
+    # and under the full suite's background-thread contention one worker could sit out the entire
+    # 30s busy_timeout ("database is locked"), miss the barrier, and previously wedge the suite.
+    # Pre-creating each instance keeps the raced section to exactly the try_claim CAS — the thing
+    # under test — with no setup-time lock contention.
+    stores = [SqliteLeaseStore(db) for _ in range(2)]
     results: list[bool] = []
+    errors: list[BaseException] = []
     results_lock = threading.Lock()
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(2, timeout=30.0)
 
-    def claim(worker_id: str) -> None:
-        store = SqliteLeaseStore(db)
-        barrier.wait()
-        won = store.try_claim("run_x", worker_id, ttl_s=30.0)
-        with results_lock:
-            results.append(won)
+    def claim(worker_id: str, store: SqliteLeaseStore) -> None:
+        # Bound the rendezvous and capture any failure: a worker that still stalls fails this test
+        # loudly instead of hanging the suite forever (an unbounded barrier/join would wedge the
+        # whole run, breakable only by the faulthandler watchdog).
+        try:
+            barrier.wait()
+            won = store.try_claim("run_x", worker_id, ttl_s=30.0)
+            with results_lock:
+                results.append(won)
+        except BaseException as exc:  # noqa: BLE001 - surface to the main thread, don't swallow
+            with results_lock:
+                errors.append(exc)
 
-    threads = [threading.Thread(target=claim, args=(f"w{i}",)) for i in range(2)]
+    threads = [threading.Thread(target=claim, args=(f"w{i}", stores[i])) for i in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=60.0)
+    assert not any(thread.is_alive() for thread in threads), "claim worker did not finish in time"
+    assert not errors, f"claim worker raised: {errors}"
 
     assert results.count(True) == 1
 
@@ -596,6 +1128,68 @@ def test_backend_single_turn_run_closes_after_first_settle(tmp_path: Path) -> No
     )
     status = backend.wait_for_run(submission.run_id, timeout_s=20)
     assert status == "completed"
+
+
+def test_backend_proposal_diff_returns_unified_diff(tmp_path: Path) -> None:
+    # DX-4: the diff is available via a token-scoped API (not only via result() at run end,
+    # and without reading run artifacts off disk).
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_write", {"path": "NEW.md", "content": "hi\n"}, "c1"),)),
+            ModelTurn(response_id="r2", final_text="wrote NEW.md"),
+        ],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="write NEW.md",
+            runtime_config=_default_config(),
+        )
+    )
+    backend.wait_for_run(submission.run_id, timeout_s=20)
+    out = backend.proposal_diff(submission.run_id, submission.run_token)
+    assert out["ready"] is True
+    assert "NEW.md" in out["diff"]
+    assert "hi" in out["diff"]
+
+
+def test_backend_drain_ends_parked_multi_turn_sessions(tmp_path: Path) -> None:
+    # DX-2: drain() cooperatively ends owned runs in one call, so a parked multi-turn session
+    # reaches a terminal state (no dangling coroutine on the shared loop).
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")])
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    run_id = submission.run_id
+
+    def _wait(predicate, tries: int = 1000) -> bool:
+        for _ in range(tries):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+    pending = backend.drain(timeout_s=20)
+    assert pending == []
+    assert backend._record(run_id).status in {"completed", "failed", "limited"}
 
 
 def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
@@ -1120,3 +1714,307 @@ def _json_get(url: str, *, token: str) -> dict:
 
 def _wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
     wait_http_ready(base_url, timeout_s=timeout_s)
+
+
+# --- recoverable turn errors: backend retry policy -------------------------------------
+
+
+class _ScriptedTurnAdapter:
+    """Drives a script of turns/exceptions: a ModelTurn is returned, a BaseException raised."""
+
+    def __init__(self, script: list) -> None:
+        self.script = list(script)
+        self.requests: list = []
+
+    def next_turn(self, request):  # noqa: ANN001
+        self.requests.append(request)
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _scripted_backend(tmp_path: Path, workspace: Path, adapters: list, script: list) -> RunnerBackend:
+    token_manager = _token_manager()
+
+    def factory(spec, llm_gateway_token):  # noqa: ANN001
+        del spec, llm_gateway_token
+        adapter = _ScriptedTurnAdapter(script)
+        adapters.append(adapter)
+        return adapter
+
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+    )
+    backend.turn_retry = ModelRetryConfig(initial_delay_s=0.0, jitter_s=0.0, max_delay_s=0.0)
+    return backend
+
+
+def _calls(adapters: list) -> int:
+    return sum(len(a.requests) for a in adapters)
+
+
+def _poll(pred, tries: int = 2000) -> bool:
+    for _ in range(tries):
+        if pred():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _submit_multi_turn(backend: RunnerBackend, workspace: Path):
+    return backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hi",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+
+
+def test_backend_auto_retries_transient_turn_failure(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        [ModelAdapterError("rate limited", http_status=503, retryable=True),
+         ModelTurn(response_id="r2", final_text="recovered")],
+    )
+    submission = _submit_multi_turn(backend, workspace)
+    try:
+        # the transient failure is auto-retried; the run settles + parks awaiting input
+        assert _poll(lambda: backend._record(submission.run_id).status == "awaiting_input")
+        assert backend._record(submission.run_id).status != "failed"
+        assert _calls(adapters) == 2  # initial attempt + one retry
+    finally:
+        backend.cancel_run(submission.run_id, submission.run_token)
+        backend.wait_for_run(submission.run_id, timeout_s=20)
+
+
+def test_backend_parks_on_nonretryable_turn_failure_then_resumes(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        [ModelAdapterError("bad effort", http_status=400, retryable=False),
+         ModelTurn(response_id="r2", final_text="fixed")],
+    )
+    backend.idle_timeout_s = 30.0
+    submission = _submit_multi_turn(backend, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    try:
+        # config 4xx is NOT auto-retried — it parks for the user (status awaiting_input, not failed)
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+        assert _calls(adapters) == 1
+        # send_message succeeds (run is NOT terminal) and the resend settles
+        assert backend.send_message(run_id, token, "try again")["status"] == "queued"
+        assert _poll(lambda: _calls(adapters) >= 2)
+    finally:
+        backend.cancel_run(run_id, token)
+        backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_backend_gives_up_after_max_consecutive_turn_failures(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        [ModelAdapterError("transient", http_status=503, retryable=True) for _ in range(10)],
+    )
+    backend.max_consecutive_turn_failures = 2
+    submission = _submit_multi_turn(backend, workspace)
+    status = backend.wait_for_run(submission.run_id, timeout_s=20)
+    assert status == "failed"
+    assert _calls(adapters) == 2  # initial attempt + one retry, then give up at the cap
+
+
+def test_backend_consecutive_failure_counter_resets_on_settle(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        [
+            ModelAdapterError("t1", http_status=503, retryable=True),
+            ModelTurn(response_id="a", final_text="a"),
+            ModelAdapterError("t2", http_status=503, retryable=True),
+            ModelTurn(response_id="b", final_text="b"),
+        ],
+    )
+    backend.max_consecutive_turn_failures = 2
+    backend.idle_timeout_s = 30.0
+    submission = _submit_multi_turn(backend, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    try:
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")  # retried + settled
+        assert _calls(adapters) == 2
+        backend.send_message(run_id, token, "again")  # drives the 2nd fail+retry+settle
+        assert _poll(lambda: _calls(adapters) >= 4)
+        # streak reset between settles -> cap of 2 never tripped
+        assert backend._record(run_id).status != "failed"
+    finally:
+        backend.cancel_run(run_id, token)
+        backend.wait_for_run(run_id, timeout_s=20)
+
+
+# --- DX-9: turn-level interrupt drives a non-terminal park, then resumes ----------------
+
+
+class _InterruptingTurnAdapter:
+    """First model turn calls a tool; the second grabs the loop (handed in via ``loop_box``)
+    and interrupts the turn — simulating a user "stop" mid-turn — then yields another tool
+    call so a step boundary trips. A third call (after the user resumes) settles."""
+
+    def __init__(self) -> None:
+        self.requests: list = []
+        self.loop_box: list = []
+        self.calls = 0
+
+    def next_turn(self, request):  # noqa: ANN001
+        self.requests.append(request)
+        self.calls += 1
+        if self.calls == 1:
+            return ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_read", {"path": "x.md"}, "c1"),))
+        if self.calls == 2:
+            deadline = time.time() + 5.0
+            while not self.loop_box and time.time() < deadline:
+                time.sleep(0.01)
+            self.loop_box[0].interrupt_turn()
+            return ModelTurn(response_id="r2", tool_calls=(fake_tool_call("fs_read", {"path": "x.md"}, "c2"),))
+        return ModelTurn(response_id="r3", final_text="resumed ok")
+
+
+def test_backend_interrupt_parks_turn_then_resumes(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    (workspace / "x.md").write_text("hi\n", encoding="utf-8")
+    captured: dict = {}
+
+    def factory(spec, llm_gateway_token):  # noqa: ANN001
+        del spec, llm_gateway_token
+        adapter = _InterruptingTurnAdapter()
+        captured["adapter"] = adapter
+        return adapter
+
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+    )
+    backend.idle_timeout_s = 30.0
+    submission = _submit_multi_turn(backend, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    try:
+        # Hand the loop to the adapter so it can interrupt itself mid-turn (deterministic).
+        assert _poll(lambda: backend._record(run_id).loop is not None)
+        captured["adapter"].loop_box.append(backend._record(run_id).loop)
+        # The interrupt parks the multi-turn session (awaiting_input) — it is NOT terminal.
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+        assert backend._record(run_id).status not in {"completed", "failed", "limited"}
+        # The session is alive: a follow-up message resumes and settles.
+        backend.send_message(run_id, token, "continue")
+        assert _poll(lambda: captured["adapter"].calls >= 3)
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+    finally:
+        backend.cancel_run(run_id, token)
+        backend.wait_for_run(run_id, timeout_s=20)
+
+
+# --- DX-11: descendant (subagent) events API -------------------------------------------
+
+
+def test_backend_descendant_events_reads_child_and_checks_lineage(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _scripted_backend(tmp_path, workspace, adapters, [ModelTurn(response_id="r1", final_text="ok")])
+    submission = _submit_multi_turn(backend, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    try:
+        assert _poll(lambda: backend._record(run_id).status == "awaiting_input")
+        # Simulate an isolated child subagent run's events.jsonl under the same run_root.
+        child_id = f"{run_id}.sub.task_abc"
+        child_dir = backend.run_root / child_id
+        child_dir.mkdir(parents=True)
+        (child_dir / "events.jsonl").write_text(
+            json.dumps({"seq": 0, "type": "model.output.delta", "data": {"text": "hi"}}) + "\n"
+            + json.dumps({"seq": 1, "type": "turn.settled", "data": {"final_text": "hi"}}) + "\n",
+            encoding="utf-8",
+        )
+        out = backend.descendant_events(run_id, token, child_id)
+        assert [e["type"] for e in out["events"]] == ["model.output.delta", "turn.settled"]
+        # from_seq filters
+        tail = backend.descendant_events(run_id, token, child_id, from_seq=1)
+        assert [e["seq"] for e in tail["events"]] == [1]
+        # a non-descendant id is rejected even with a valid token
+        with pytest.raises(PermissionDenied):
+            backend.descendant_events(run_id, token, "some.other.run")
+        # path traversal is rejected
+        with pytest.raises(PermissionDenied):
+            backend.descendant_events(run_id, token, f"{run_id}.sub.../escape")
+        # a bad token is rejected
+        with pytest.raises(Exception):  # noqa: B017 - TokenError family
+            backend.descendant_events(run_id, "bad-token", child_id)
+    finally:
+        backend.cancel_run(run_id, token)
+        backend.wait_for_run(run_id, timeout_s=20)
+
+
+# --- DX-12: list_runs + historical (no-record) reads survive a restart -----------------
+
+
+def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend1 = _scripted_backend(
+        tmp_path, workspace, adapters, [ModelTurn(response_id="r1", final_text="hello world")]
+    )
+    submission = _submit_multi_turn(backend1, workspace)  # instruction "hi"
+    run_id = submission.run_id
+    try:
+        assert _poll(lambda: backend1._record(run_id).status == "awaiting_input")
+    finally:
+        backend1.cancel_run(run_id, submission.run_token)
+        backend1.wait_for_run(run_id, timeout_s=20)
+
+    # "restart": a brand-new backend over the same run_root, with NO in-memory records.
+    backend2 = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda *_a, **_k: _ScriptedTurnAdapter([]),
+    )
+    listing = backend2.list_runs("tenant_a")["runs"]
+    entry = next(r for r in listing if r["run_id"] == run_id)
+    assert entry["title"] == "hi"
+    token = entry["read_token"]
+    # historical event read with no live record
+    events = backend2.events(run_id, token)["events"]
+    assert any(e.get("type") == "turn.settled" for e in events)
+    assert "status" in backend2.status(run_id, token)
+    # tenant scoping
+    assert backend2.list_runs("nobody")["runs"] == []
+    # auth: a bad token, and a path-traversal run id, are rejected
+    with pytest.raises(PermissionDenied):
+        backend2.events(run_id, "not-a-token")
+    traversal = backend2.token_manager.issue(
+        kind="run_access", audience="native-agent-runner.backend",
+        run_id="../escape", tenant_id="tenant_a", user_id="user_a", ttl_s=60,
+    )
+    with pytest.raises(PermissionDenied):
+        backend2.events("../escape", traversal)

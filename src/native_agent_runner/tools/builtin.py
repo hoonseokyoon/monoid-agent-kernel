@@ -243,6 +243,16 @@ def _fs_read_media(workspace: Workspace) -> ToolSpec:
         path = str(args["path"])
         max_bytes = int(args.get("max_bytes", workspace.max_bytes_read))
         data, digest = workspace.read_bytes(path, max_bytes=max_bytes)
+        # Eager guard (gap 2b): the media is forwarded by reference and re-read at wire-build under
+        # the run's max_bytes_read. Reject here — adjacent to the cause — if it would not fit then,
+        # so the run never produces a media reference doomed to fail mid-turn. Same threshold as the
+        # wire-build read (single source of truth), with an actionable remedy.
+        if len(data) > workspace.max_bytes_read:
+            raise WorkspaceError(
+                f"media {path!r} is {len(data)} bytes, over the run's max_bytes_read "
+                f"({workspace.max_bytes_read}); it cannot be forwarded to the model. "
+                f"Raise max_bytes_read or downsample the media."
+            )
         mime = _sniff_media_mime(data)
         if mime is None:
             raise WorkspaceError(f"not a supported image or PDF file: {path}")

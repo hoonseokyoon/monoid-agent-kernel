@@ -4,14 +4,22 @@ Standalone API-backed agent harness for safe, structured file work in a local
 workspace. This research package intentionally has no dependency on CSP runtime
 modules. CSP integration is a later adapter layer.
 
-## Boundary: core vs reference
+## Boundary: contracts / core / reference
 
-The supported integration surface is the **core runner plus its contracts**, exposed from
-`native_agent_runner` and collected in `native_agent_runner.contracts`. The `backend`,
-`llm_gateway`, and `web_gateway` packages live under `native_agent_runner.reference` and are
-**example implementations** — the core never imports them, and real integrators are expected to
-build their own services against the contracts. See [docs/CONTRACTS.md](docs/CONTRACTS.md) for the
-Python and HTTP wire contracts.
+The package is layered in three tiers:
+
+- **contracts** — the stable integration surface, collected in `native_agent_runner.contracts`
+  and re-exported from the top-level `native_agent_runner`. These are the specs and protocols you
+  depend on and implement: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig`, `ModelAdapter`,
+  `ToolSpec` / `@tool`, `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest. See
+  [docs/CONTRACTS.md](docs/CONTRACTS.md) for the Python and HTTP wire contracts.
+- **core** — the engine that implements those contracts: the default, batteries-included runner
+  (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). This is the supported
+  implementation you actually run.
+- **reference** — example services under `native_agent_runner.reference` (`backend`,
+  `llm_gateway`, `web_gateway`, `stores`). **Not** part of the supported surface: core never
+  imports them, and real integrators are expected to build their own services against the
+  contracts.
 
 For the dynamic binding-based tool surface, see
 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md).
@@ -63,7 +71,7 @@ your own `ModelAdapter`. Author tools from typed functions with the `@tool` deco
 This package is pre-1.0 (`0.x`): the public surface may change between minor versions, but
 breaking changes are called out in commit messages and this README.
 
-- **Stable** — the engine and core contracts: `AgentLoop`, `AgentRunSpec`,
+- **Stable** — the core engine and the contracts it implements: `AgentLoop`, `AgentRunSpec`,
   `AgentRuntimeConfig` / `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `@tool`,
   `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest of
   `native_agent_runner.contracts`.

@@ -451,3 +451,143 @@ def test_audio_degrades_even_on_multimodal_adapter(tmp_path: Path) -> None:
     # The audio part is dropped from the wire; only text reaches the model.
     user = [m for m in adapter.requests[0].messages if m["role"] == "user"][0]
     assert all(p.get("type") != "audio" for p in user["content"] if isinstance(p, dict))
+
+
+# --- inline ingress -> content-addressed blob normalization (gap 2a) --------------------
+
+
+def test_normalize_inline_media_part_and_blob_resolver(tmp_path: Path) -> None:
+    from native_agent_runner.core.media import (
+        WorkspaceMediaResolver,
+        blob_shas_in_messages,
+        normalize_inline_media_part,
+        parse_data_uri,
+    )
+
+    data_uri = "data:image/png;base64," + base64.b64encode(_PNG_BYTES).decode()
+    assert parse_data_uri(data_uri) == ("image/png", _PNG_BYTES)
+    assert parse_data_uri("img.png") is None
+
+    store: dict[str, bytes] = {}
+    part = ImagePart(source_ref=data_uri, mime_type="image/png")
+    norm = normalize_inline_media_part(part, store)
+    assert norm.source_ref.startswith("blob:")
+    sha = norm.source_ref[len("blob:"):]
+    assert store[sha] == _PNG_BYTES
+    # A by-reference (workspace) part passes through untouched.
+    ws_part = ImagePart(source_ref="img.png", mime_type="image/png")
+    assert normalize_inline_media_part(ws_part, store) is ws_part
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    resolver = WorkspaceMediaResolver(LocalWorkspaceBackend(root=workspace), blobs=store)
+    resolved = resolver.resolve(norm.source_ref, "image/png")
+    assert resolved.data == _PNG_BYTES and resolved.sha256 == sha
+
+    msgs = ({"role": "user", "content": [{"type": "image", "source_ref": norm.source_ref, "mime_type": "image/png"}]},)
+    assert sha in blob_shas_in_messages(msgs)
+
+
+def test_inline_media_ingested_to_blob_survives_restore(tmp_path: Path) -> None:
+    # The durability claim: an inline (by-value) image is normalized to a content-addressed blob,
+    # so it survives a restart AND a base re-provisioning (the new workspace has NO attachment file)
+    # — resolution reads from the rehydrated blob, not the workspace.
+    data_uri = "data:image/png;base64," + base64.b64encode(_PNG_BYTES).decode()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()  # deliberately empty: no img.png on disk
+
+    adapter_a = FakeMultimodalModelAdapter(turns=[_finish_turn()])
+    spec_a = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    loop_a = AgentLoop(
+        spec=spec_a,
+        model_adapter=adapter_a,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+    loop_a.open()
+    loop_a.submit((TextPart("describe"), ImagePart(source_ref=data_uri, mime_type="image/png")))
+
+    # The inline bytes were forwarded (resolved from the blob, since no workspace file exists).
+    user_a = [m for m in adapter_a.requests[0].messages if m["role"] == "user"][0]
+    img_a = [p for p in user_a["content"] if p.get("type") == "image"][0]
+    assert base64.b64decode(img_a["source"]["data"]) == _PNG_BYTES
+
+    checkpoint = loop_a.snapshot()
+    assert checkpoint is not None
+    blobs = loop_a.collect_checkpoint_blobs()
+    # The DURABLE log holds a blob: ref, not the bytes; the bytes live in the content blob.
+    logged_user = [m for m in checkpoint.messages if m["role"] == "user"][0]
+    blob_ref = logged_user["content"][1]["source_ref"]
+    assert blob_ref.startswith("blob:")
+    assert blob_ref[len("blob:"):] in blobs
+    loop_a.close()
+
+    # Fresh process: a re-provisioned, EMPTY workspace; restore only from the checkpoint + blobs.
+    workspace2 = tmp_path / "workspace2"
+    workspace2.mkdir()
+    adapter_b = FakeMultimodalModelAdapter(turns=[_finish_turn()])
+    spec_b = AgentRunSpec(workspace_root=workspace2, run_root=tmp_path / "runs2", run_id=spec_a.run_id)
+    loop_b = AgentLoop(
+        spec=spec_b,
+        model_adapter=adapter_b,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+    loop_b.restore(checkpoint, blobs=blobs)
+    loop_b.submit("again")
+
+    # The resent log STILL forwards the image, resolved from the rehydrated blob.
+    user_b = [m for m in adapter_b.requests[0].messages if m["role"] == "user"][0]
+    img_b = [p for p in user_b["content"] if p.get("type") == "image"][0]
+    assert base64.b64decode(img_b["source"]["data"]) == _PNG_BYTES
+    loop_b.close()
+
+
+# --- close-out: resolver blob fallback, tool inline media, gap-2b eager guard ----------
+
+
+def test_resolver_blob_reader_fallback(tmp_path: Path) -> None:
+    from native_agent_runner.core.media import WorkspaceMediaResolver
+
+    (tmp_path / "workspace").mkdir()
+    workspace = LocalWorkspaceBackend(tmp_path / "workspace")
+    sha = __import__("hashlib").sha256(_PNG_BYTES).hexdigest()
+    # Not in the in-memory map; only reachable via the blob_reader (e.g. the checkpoint store).
+    resolver = WorkspaceMediaResolver(
+        workspace, blobs={}, blob_reader=lambda s: _PNG_BYTES if s == sha else (_ for _ in ()).throw(KeyError(s))
+    )
+    resolved = resolver.resolve(f"blob:{sha}", "image/png")
+    assert resolved.data == _PNG_BYTES and resolved.sha256 == sha
+    # A blob absent from both map and reader raises.
+    with pytest.raises(Exception):
+        resolver.resolve("blob:" + "0" * 64, "image/png")
+
+
+def test_observation_message_normalizes_inline_tool_media() -> None:
+    # A tool that returns inline (data:) media gets it normalized to a durable blob — symmetric
+    # with user-input media (gap: tool-result inline media).
+    from native_agent_runner.loop import _observation_message
+    from native_agent_runner.providers.base import ToolObservation
+
+    data_uri = "data:image/png;base64," + base64.b64encode(_PNG_BYTES).decode()
+    obs = ToolObservation(
+        tool_name="snap", call_id="c1", output="took a screenshot",
+        media=({"type": "image", "source_ref": data_uri, "mime_type": "image/png"},),
+    )
+    store: dict[str, bytes] = {}
+    msg = _observation_message(obs, store)
+    ref = msg["media"][0]["source_ref"]
+    assert ref.startswith("blob:")
+    assert store[ref[len("blob:"):]] == _PNG_BYTES
+
+
+def test_fs_read_media_rejects_oversized_eagerly(tmp_path: Path) -> None:
+    # gap 2b: media that would not fit the wire-build cap (max_bytes_read) is rejected at the tool
+    # call — adjacent to the cause — with an actionable message, not late at wire-build.
+    ws_dir = tmp_path / "workspace"
+    ws_dir.mkdir()
+    ws_dir.joinpath("big.png").write_bytes(_PNG_BYTES + b"\x00" * 2000)
+    workspace = LocalWorkspaceBackend(ws_dir, max_bytes_read=500)
+    tools = {tool.id: tool for tool in builtin_tools(workspace)}
+    with pytest.raises(WorkspaceError) as exc:
+        # max_bytes arg larger than the run cap would otherwise let a doomed reference through.
+        tools["fs.read_media"].handler(None, {"path": "big.png", "max_bytes": 10000})  # type: ignore[arg-type]
+    assert "max_bytes_read" in str(exc.value)

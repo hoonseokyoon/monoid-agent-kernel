@@ -79,3 +79,20 @@ def test_blob_round_trips_and_is_write_once(store: CheckpointStore) -> None:
     # re-putting the same sha is a no-op write, and the bytes are still readable.
     store.put(RunCheckpoint(run_id="run_1", seq=2), blobs={sha: b"created\n"})
     assert store.latest("run_1").blob(sha) == b"created\n"  # type: ignore[union-attr]
+
+
+def test_put_blob_is_content_addressed_and_readable(store: CheckpointStore) -> None:
+    # The standalone blob API (for on-demand artifacts like an exported package): put_blob returns
+    # the sha256 digest = the retrieval handle, get_blob round-trips, and it is content-addressed
+    # (identical bytes dedup to the same digest).
+    import hashlib
+
+    data = b"proposal-tar-bytes\x00\x01"
+    digest = store.put_blob("run_art", data)
+    assert digest == hashlib.sha256(data).hexdigest()
+    assert store.get_blob("run_art", digest) == data
+    # Idempotent / content-addressed: storing the same bytes again yields the same handle.
+    assert store.put_blob("run_art", data) == digest
+    # An unknown digest raises KeyError (→ 404 at the API boundary).
+    with pytest.raises(KeyError):
+        store.get_blob("run_art", "f" * 64)

@@ -17,6 +17,7 @@ from native_agent_runner.core.agents import (
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import RunnerBackend
 from native_agent_runner.reference._shared.tokens import TokenManager
+from native_agent_runner.narration import narrate_event
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
@@ -43,6 +44,7 @@ from native_agent_runner.tasks import (
     request_job_cancel,
 )
 from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
+from native_agent_runner.reference.llm_gateway.providers import offline_provider_factory
 from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.permissions import PermissionPolicy
@@ -63,11 +65,15 @@ from native_agent_runner.reference.web_gateway.providers import (
     SearchFetchContextProvider,
 )
 from native_agent_runner.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
+from native_agent_runner.reference.studio.cli import studio as studio_group
 
 
 @click.group()
 def main() -> None:
     """Run a standalone native agent harness."""
+
+
+main.add_command(studio_group)
 
 
 @main.command()
@@ -855,6 +861,14 @@ def llm_gateway() -> None:
     is_flag=True,
     help="Use an in-memory signing secret for local development.",
 )
+@click.option(
+    "--provider",
+    type=click.Choice(["openai", "fake"]),
+    default="openai",
+    show_default=True,
+    help="openai = direct OpenAIModelAdapter (needs OPENAI_API_KEY); "
+    "fake = key-less offline echo model for local development.",
+)
 def llm_gateway_serve(
     *,
     host: str,
@@ -862,6 +876,7 @@ def llm_gateway_serve(
     admin_token_env: str,
     token_secret_env: str,
     ephemeral_token_secret: bool,
+    provider: str,
 ) -> None:
     """Serve the internal LLM turn API consumed by GatewayModelAdapter."""
     admin_token = os.environ.get(admin_token_env)
@@ -877,7 +892,8 @@ def llm_gateway_serve(
             )
         token_manager = TokenManager.from_secret(signing_secret)
 
-    gateway = LlmGatewayBackend(token_manager=token_manager)
+    provider_factory = offline_provider_factory if provider == "fake" else None
+    gateway = LlmGatewayBackend(token_manager=token_manager, provider_adapter_factory=provider_factory)
     server = create_llm_gateway_server(gateway, host=host, port=port, admin_token=admin_token)
     click.echo(f"LLM gateway listening on http://{host}:{port}")
     click.echo("turn endpoint: /internal/llm/turns")
@@ -1174,18 +1190,26 @@ def _compact_event_line(line: str) -> str:
         event = json.loads(line)
     except json.JSONDecodeError:
         return line.rstrip("\n")
-    data = event.get("data") or {}
-    suffix = ""
-    if "status" in data:
-        suffix = f" status={data['status']}"
-    elif "job_id" in data:
-        suffix = f" job={data['job_id']}"
-    elif "tool" in data:
-        suffix = f" tool={data['tool']}"
-    elif "paths" in data:
-        suffix = f" paths={','.join(map(str, data['paths']))}"
-    elif "error" in data and data["error"]:
-        suffix = f" error={data['error']}"
+    # Tool activity goes through the shared narration projection (the same one the Studio feed
+    # uses), so the verb/target extraction lives in one place. Other events keep a generic dump.
+    narration = narrate_event(event)
+    if narration is not None:
+        suffix = f" {narration.action}"
+        if narration.target:
+            suffix += f" {narration.target}"
+        if narration.status == "error":
+            suffix += f" [error: {narration.detail}]" if narration.detail else " [error]"
+    else:
+        data = event.get("data") or {}
+        suffix = ""
+        if "status" in data:
+            suffix = f" status={data['status']}"
+        elif "job_id" in data:
+            suffix = f" job={data['job_id']}"
+        elif "paths" in data:
+            suffix = f" paths={','.join(map(str, data['paths']))}"
+        elif "error" in data and data["error"]:
+            suffix = f" error={data['error']}"
     return f"{event.get('seq', '?'):>4} {event.get('type', '?')}{suffix}"
 
 

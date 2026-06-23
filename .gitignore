@@ -26,6 +26,7 @@ env/
 
 # Run artifacts / outputs
 runs/
+runs-*/
 
 # IDE / OS
 .idea/

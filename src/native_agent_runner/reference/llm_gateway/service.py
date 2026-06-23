@@ -17,6 +17,7 @@ from native_agent_runner.providers.base import (
     ModelRequest,
     ModelStreamChunk,
     ModelTurn,
+    ReasoningDelta,
     TextDelta,
     ToolCallDelta,
     ToolObservation,
@@ -300,6 +301,8 @@ def _chunk_to_frame(chunk: ModelStreamChunk) -> dict[str, Any] | None:
     """
     if isinstance(chunk, TextDelta):
         return {"type": "text_delta", "text": chunk.text}
+    if isinstance(chunk, ReasoningDelta):
+        return {"type": "reasoning_delta", "text": chunk.text}
     if isinstance(chunk, ToolCallDelta):
         frame: dict[str, Any] = {
             "type": "tool_call_delta",

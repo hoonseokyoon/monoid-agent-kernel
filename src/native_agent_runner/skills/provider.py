@@ -4,7 +4,8 @@
 protocols, so a single instance attaches to ``AgentLoop`` without touching the core loop
 (the same zero-core-change pattern MCP uses):
 
-* as a ``ContextProvider`` — :meth:`static_segment` advertises the skill catalog (L1);
+* as a ``ContextProvider`` — :meth:`dynamic_segment` advertises the skill catalog (L1),
+  gated on the ``skill`` tool being bound this turn (so it tracks a capability hot-swap);
 * as a ``ToolProvider`` — :meth:`get_tools` yields the ``skill`` tool (load a skill's
   instructions, L2) and ``skill.read_file`` (read a bundled resource on demand, L3).
 
@@ -57,10 +58,17 @@ class SkillProvider:
     def __init__(self, definitions: Mapping[str, SkillDefinition]) -> None:
         self._definitions: dict[str, SkillDefinition] = dict(definitions)
 
-    # -- ContextProvider (L1: always-resident catalog) ---------------------------------
+    # -- ContextProvider (L1: catalog, gated on the skill tool being bound) -------------
 
     def static_segment(self) -> str | None:
-        if not self._definitions:
+        # The catalog is config-gated (it must vanish if the skill tool is unbound, e.g. a
+        # capability toggled off mid-run), which a once-at-bootstrap static segment can't
+        # express — so it is emitted per-turn by dynamic_segment instead. A catalog advertising
+        # a skill the model has no tool to activate would be misleading.
+        return None
+
+    def dynamic_segment(self, turn: TurnContext) -> str | None:
+        if not self._definitions or SKILL_TOOL_ID not in turn.bound_tools:
             return None
         lines = [
             "# Available Skills",
@@ -73,11 +81,6 @@ class SkillProvider:
         ]
         lines.extend(self._catalog_lines())
         return "\n".join(lines)
-
-    def dynamic_segment(self, turn: TurnContext) -> str | None:  # noqa: ARG002 - no per-turn context
-        # Once activated, a skill's L2 instructions live in tool-result history, so there
-        # is nothing to inject per turn.
-        return None
 
     # -- ToolProvider (L2: load instructions, L3: read a bundled resource) --------------
 
@@ -181,6 +184,14 @@ class SkillProvider:
                 context="fresh",
             )
         return out
+
+    def catalog(self) -> list[dict[str, str]]:
+        """Plain ``[{name, description}]`` of available skills (the L1 catalog as data, for a UI
+        list) — no instructions/resources, which stay behind progressive disclosure."""
+        return [
+            {"name": name, "description": self._definitions[name].description.strip()}
+            for name in sorted(self._definitions)
+        ]
 
     # -- internals ---------------------------------------------------------------------
 

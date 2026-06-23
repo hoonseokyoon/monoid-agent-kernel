@@ -5,6 +5,9 @@ test never touches the process-global provider.
 
 from __future__ import annotations
 
+# Imports below the importorskip guard are intentionally not at top of file.
+# ruff: noqa: E402
+
 import asyncio
 from pathlib import Path
 

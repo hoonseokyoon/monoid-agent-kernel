@@ -141,6 +141,28 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         required=("step",),
     ),
+    "turn.failed": _data_schema(
+        {
+            "error": _STR,
+            "error_code": _STR,
+            "provider_error_code": _STR,
+            "http_status": {"type": ["integer", "null"]},
+            "retryable": _BOOL,
+        },
+        required=("error_code",),
+    ),
+    "turn.interrupted": _data_schema(
+        {"reason": _STR},
+        required=(),
+    ),
+    "model.output.delta": _data_schema(
+        {"text": _STR},
+        required=("text",),
+    ),
+    "model.reasoning.delta": _data_schema(
+        {"text": _STR},
+        required=("text",),
+    ),
     "model.input.degraded": _data_schema(
         {"dropped_part_types": _STR_ARRAY, "reason": _STR},
         required=("reason",),
@@ -152,6 +174,7 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "input_tokens": _INT,
             "output_tokens": _INT,
             "total_tokens": _INT,
+            "reasoning_tokens": _INT,
             "web_search_calls": _INT,
             "web_fetch_calls": _INT,
             "web_context_calls": _INT,

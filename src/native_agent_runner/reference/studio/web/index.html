@@ -1,0 +1,1148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Studio</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --border: #262b38; --text: #e6e8ee;
+    --muted: #8b91a0; --accent: #6ea8fe; --user: #1f3b66; --assistant: #1c2230;
+    --warn: #f0b35b; --err: #f08a8a;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text);
+    font: 14px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border); background: var(--panel); }
+  header .title { font-weight: 600; }
+  header .ws { color: var(--muted); font-size: 12px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; max-width: 50vw; }
+  .badge { margin-left: auto; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); }
+  .badge.offline { color: var(--warn); border-color: var(--warn); }
+  #body { flex: 1; display: flex; min-height: 0; }
+  #sidebar { width: 240px; min-width: 240px; overflow: auto; border-right: 1px solid var(--border);
+    background: var(--panel); padding: 10px 12px; }
+  .side-title { font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); margin-bottom: 8px; }
+  #tree { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
+  #tree li { padding: 2px 4px; border-radius: 6px; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  #tree li.dir { color: var(--muted); }
+  #tree li.file { color: var(--text); cursor: pointer; }
+  #tree li.file:hover { background: var(--assistant); }
+  #jobs { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+  #jobs li { padding: 3px 4px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+  #jobs li:hover { background: var(--assistant); }
+  #jobs .st { color: var(--muted); }
+  #jobs li.done .st { color: #7fd18b; }
+  #jobs li.failed .st { color: var(--err); }
+  #log { flex: 1; overflow-y: auto; padding: 18px 16px; display: flex;
+    flex-direction: column; gap: 12px; }
+  #proposal { width: 380px; min-width: 320px; border-left: 1px solid var(--border);
+    background: var(--panel); padding: 12px 14px; overflow: auto; display: flex;
+    flex-direction: column; gap: 10px; }
+  #proposal[hidden] { display: none; }
+  #viewer { width: 420px; min-width: 320px; border-left: 1px solid var(--border);
+    background: var(--panel); padding: 12px 14px; overflow: auto; display: flex; flex-direction: column; }
+  #viewer[hidden] { display: none; }
+  #viewer .side-title { display: flex; justify-content: space-between; align-items: center; }
+  #viewer-body { flex: 1; margin: 0; white-space: pre; overflow: auto; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+    font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  #proposal-all { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #proposal-files { font-size: 12.5px; color: var(--muted); display: flex; flex-direction: column; gap: 3px; }
+  #proposal-files label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  #proposal-files .f { color: var(--text); font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+  #proposal-actions { display: flex; gap: 8px; }
+  #export { background: transparent; color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 14px; cursor: pointer; }
+  #export:disabled { opacity: .5; cursor: default; }
+  #diff { flex: 1; margin: 0; overflow: auto; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre; }
+  #diff .add { color: #7fd18b; }
+  #diff .del { color: #f08a8a; }
+  #diff .meta { color: var(--muted); }
+  #apply { background: #7fd18b; color: #06210c; border: 0; border-radius: 8px; padding: 9px 14px;
+    font-weight: 600; cursor: pointer; }
+  #apply:disabled { opacity: .5; cursor: default; }
+  #apply-status { font-size: 12.5px; color: var(--muted); }
+  .msg { max-width: 760px; padding: 10px 14px; border-radius: 12px; white-space: pre-wrap;
+    word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user); }
+  .msg.assistant { align-self: flex-start; background: var(--assistant);
+    border: 1px solid var(--border); }
+  .msg.error { align-self: flex-start; background: #2a1c1c; border: 1px solid var(--err);
+    color: var(--err); }
+  .msg.error .retry { margin-top: 8px; background: var(--err); color: #1c0606; border: 0;
+    border-radius: 8px; padding: 6px 14px; font-weight: 600; cursor: pointer; }
+  .msg.error .retry:disabled { opacity: .5; cursor: default; }
+  .msg strong { color: var(--accent); }
+  .msg blockquote { margin: 6px 0; padding-left: 10px; border-left: 3px solid var(--border);
+    color: var(--muted); }
+  .activity { align-self: center; color: var(--muted); font-size: 12px; font-style: italic; }
+  .typing { align-self: flex-start; color: var(--muted); font-size: 13px; }
+  /* DX-13b: collapsible reasoning ("Thinking") panel — dim, set apart from the answer. */
+  .reasoning { align-self: flex-start; max-width: 760px; margin: 2px 0; color: var(--muted);
+    border-left: 2px solid #3a3a3a; padding-left: 8px; font-size: 12px; }
+  .reasoning > summary { cursor: pointer; color: var(--muted); font-style: italic; list-style: none; }
+  .reasoning-body { white-space: pre-wrap; margin-top: 4px; opacity: 0.85; }
+  .subagent .sa-reason { white-space: pre-wrap; font-size: 12px; color: var(--muted);
+    font-style: italic; margin-top: 4px; }
+  /* Markdown: fenced code blocks (with copy button + lang label) and inline code. */
+  .msg code, .reasoning-body code { background: #11151c; border: 1px solid var(--border, #2a2f3a);
+    border-radius: 4px; padding: 0 4px; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  .codeblock { position: relative; margin: 8px 0; }
+  .codeblock pre { background: #0c0f14; border: 1px solid var(--border, #2a2f3a); border-radius: 8px;
+    padding: 10px 12px; overflow-x: auto; margin: 0; }
+  .codeblock pre code { background: none; border: 0; padding: 0; white-space: pre;
+    font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color: #d7dde6; }
+  .codeblock .code-lang { position: absolute; top: 6px; left: 10px; font-size: 10.5px;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .codeblock .copy-btn { position: absolute; top: 5px; right: 6px; font-size: 11px; cursor: pointer;
+    background: #1b2330; color: var(--muted); border: 1px solid var(--border, #2a2f3a);
+    border-radius: 6px; padding: 1px 8px; }
+  .codeblock .copy-btn:hover { color: var(--text); }
+  .msg h3, .msg h4, .msg h5, .msg h6 { margin: 8px 0 4px; font-size: 14px; }
+  .msg li { margin-left: 18px; }
+  .hitl { align-self: stretch; max-width: 760px; background: #2a2410; border: 1px solid var(--warn);
+    border-radius: 12px; padding: 12px 14px; }
+  .hitl .q { margin-bottom: 10px; white-space: pre-wrap; }
+  .hitl .q b { color: var(--warn); }
+  .hitl .opts { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hitl button { background: var(--warn); color: #1c1606; border: 0; border-radius: 8px;
+    padding: 7px 14px; font-weight: 600; cursor: pointer; }
+  .hitl button.deny { background: transparent; color: var(--warn); border: 1px solid var(--warn); }
+  .hitl button:disabled { opacity: .5; cursor: default; }
+  .hitl.answered { opacity: .65; }
+  .hitl .answered-note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
+  #setup { display: flex; align-items: center; gap: 14px; max-width: 900px; margin: 0 auto 8px;
+    font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  #setup label { display: flex; align-items: center; gap: 6px; }
+  #setup input, #setup select { background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; font: inherit; }
+  #setup input { width: 150px; }
+  #setup input:disabled { opacity: .5; }
+  #setup-status { color: var(--accent); }
+  form { display: flex; gap: 10px; max-width: 900px; margin: 0 auto; align-items: flex-end; }
+  #attachments { display: flex; flex-wrap: wrap; gap: 6px; max-width: 900px; margin: 0 auto 8px; }
+  #attachments:empty { display: none; }
+  .attach-pill { font-size: 11.5px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 999px; padding: 3px 6px 3px 10px; color: var(--text); display: inline-flex;
+    align-items: center; gap: 4px; }
+  .attach-pill button { background: transparent; color: var(--muted); border: 0; padding: 0 2px;
+    font-weight: 700; cursor: pointer; }
+  #attach-btn { display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px; min-height: 44px;
+    padding: 0 12px; font-size: 16px; }
+  textarea { flex: 1; resize: none; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font: inherit;
+    min-height: 44px; max-height: 160px; }
+  button { background: var(--accent); color: #0b0e14; border: 0; border-radius: 10px;
+    padding: 0 18px; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #stop { background: var(--err); color: #1c0606; }
+  .usage { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #plan { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+  #plan li { padding: 3px 0; color: var(--muted); display: flex; gap: 6px; align-items: baseline; }
+  #plan li .st { flex: none; width: 14px; text-align: center; }
+  #plan li.done { color: var(--text); }
+  #plan li.done .step { text-decoration: line-through; opacity: .7; }
+  #plan li.active { color: var(--accent); }
+  .subagent { border-left: 2px solid var(--accent); padding: 4px 0 4px 10px; margin: 8px 0; }
+  .subagent .sa-head { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .subagent .sa-head b { color: var(--text); }
+  .subagent .sa-status { float: right; }
+  .subagent.done .sa-status { color: var(--ok, #4ec9b0); }
+  .subagent.failed { border-left-color: var(--err); }
+  .subagent.failed .sa-status { color: var(--err); }
+  .subagent .sa-act { font-size: 12px; color: var(--muted); padding: 1px 0; }
+  .subagent .sa-out { white-space: pre-wrap; font-size: 13px; margin-top: 4px; }
+  .hlink { color: var(--muted); text-decoration: none; font-size: 12px; margin-left: 10px; cursor: pointer; }
+  .hlink:hover, .hlink.on { color: var(--accent); }
+  #sessions { list-style: none; padding: 0; margin: 0; }
+  #sessions li { font-size: 12px; padding: 4px 6px; border-radius: 6px; cursor: pointer; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #sessions li:hover { background: rgba(255,255,255,.05); }
+  #sessions li.active { background: rgba(255,255,255,.08); color: var(--text); }
+  #sessions li .dot { display: inline-block; width: 6px; height: 6px; border-radius: 999px; margin-right: 6px;
+    background: var(--muted); vertical-align: middle; }
+  #sessions li.live .dot { background: var(--accent); }
+  #sessions li.recoverable .dot { background: #e0b341; }
+  #sessions li .resume-tag { font-size: 10px; color: #e0b341; margin-left: 6px; }
+  #trace { overflow: auto; }
+  #trace-tree { font-size: 12px; font-variant-numeric: tabular-nums; }
+  #trace-tree ul { list-style: none; margin: 0; padding-left: 14px; border-left: 1px solid var(--border, #2a2f3a); }
+  #trace-tree > ul { padding-left: 0; border-left: 0; }
+  #trace-tree li { padding: 2px 0; color: var(--muted); }
+  #trace-tree .tt-type { color: var(--text); }
+  #trace-tree li.err .tt-type { color: var(--err); }
+</style>
+</head>
+<body>
+  <header>
+    <span class="title">Agent Studio</span>
+    <span class="ws" id="ws">…</span>
+    <span class="badge" id="provider">…</span>
+    <span class="usage" id="usage" title="tokens this run"></span>
+    <a href="#" id="newchat" class="hlink" title="Start a new chat">＋ New</a>
+    <a href="#" id="trace-btn" class="hlink" title="Toggle the run trace">Trace</a>
+    <a href="/settings" title="Settings" style="color:var(--muted);text-decoration:none;font-size:16px;margin-left:6px">⚙</a>
+  </header>
+  <div id="body">
+    <aside id="sidebar">
+      <div class="side-title">Chats</div>
+      <ul id="sessions"></ul>
+      <div class="side-title" style="margin-top:14px">Files</div>
+      <ul id="tree"></ul>
+      <div class="side-title" id="plan-title" style="margin-top:14px" hidden>Plan</div>
+      <ol id="plan" hidden></ol>
+      <div class="side-title" style="margin-top:14px">Jobs</div>
+      <ul id="jobs"></ul>
+      <div class="side-title" id="skills-title" style="margin-top:14px" hidden>Skills</div>
+      <ul id="skills" hidden></ul>
+      <div class="side-title" id="mcp-title" style="margin-top:14px" hidden>MCP tools</div>
+      <ul id="mcp-tools" hidden></ul>
+    </aside>
+    <div id="log"></div>
+    <aside id="proposal" hidden>
+      <div class="side-title">Proposed changes</div>
+      <label id="proposal-all"><input type="checkbox" id="select-all" checked /> Select all</label>
+      <div id="proposal-files"></div>
+      <pre id="diff"></pre>
+      <div id="proposal-actions">
+        <button id="apply" type="button">Approve &amp; apply</button>
+        <button id="export" type="button" title="Download a portable, self-verifying proposal package (.tar)">Export package</button>
+      </div>
+      <div id="apply-status"></div>
+    </aside>
+    <aside id="trace" hidden>
+      <div class="side-title">Trace</div>
+      <div id="trace-tree"></div>
+    </aside>
+    <aside id="viewer" hidden>
+      <div class="side-title"><span id="viewer-name">File</span>
+        <a href="#" id="viewer-close" class="hlink" title="Close">✕</a></div>
+      <pre id="viewer-body"></pre>
+    </aside>
+  </div>
+  <footer>
+    <div id="setup">
+      <label>Model <input id="model" type="text" spellcheck="false" autocomplete="off" /></label>
+      <label>Effort <select id="effort"></select></label>
+      <label>Thinking <select id="summary"></select></label>
+      <label title="Export OpenTelemetry spans to the configured OTLP collector">OTel <input type="checkbox" id="otel" /></label>
+      <span id="setup-status"></span>
+    </div>
+    <div id="attachments"></div>
+    <form id="form">
+      <label id="attach-btn" title="Attach an image or PDF">📎
+        <input id="attach" type="file" accept="image/*,application/pdf" multiple hidden />
+      </label>
+      <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)" autofocus></textarea>
+      <button id="send" type="submit">Send</button>
+      <button id="stop" type="button" hidden>Stop</button>
+    </form>
+  </footer>
+
+<script>
+const log = document.getElementById("log");
+const form = document.getElementById("form");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const stopBtn = document.getElementById("stop");
+const usageEl = document.getElementById("usage");
+const attachInput = document.getElementById("attach");
+const attachmentsEl = document.getElementById("attachments");
+let pendingAttachments = [];  // [{name, mime, data_b64}]
+let runId = null;
+
+function renderAttachments() {
+  attachmentsEl.innerHTML = "";
+  pendingAttachments.forEach((a, i) => {
+    const pill = document.createElement("span");
+    pill.className = "attach-pill";
+    pill.textContent = a.name;
+    const x = document.createElement("button");
+    x.type = "button"; x.textContent = "✕"; x.title = "Remove";
+    x.addEventListener("click", () => { pendingAttachments.splice(i, 1); renderAttachments(); });
+    pill.appendChild(x);
+    attachmentsEl.appendChild(pill);
+  });
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      resolve(result.slice(result.indexOf(",") + 1));  // strip the data: URL prefix
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+attachInput.addEventListener("change", async () => {
+  for (const file of attachInput.files) {
+    try {
+      const data_b64 = await readFileAsBase64(file);
+      pendingAttachments.push({ name: file.name, mime: file.type || "application/octet-stream", data_b64 });
+    } catch (_) {}
+  }
+  attachInput.value = "";  // allow re-selecting the same file
+  renderAttachments();
+});
+let evtSource = null;
+let seenSeq = -1;
+let typingEl = null;
+let lastUserMessage = "";
+let pendingConfigFix = false;  // a non-retryable turn.failed is awaiting a model/effort change
+let generating = false;
+let streamingEl = null;        // the assistant bubble currently being streamed into
+let streamingText = "";
+let reasoningWrap = null;      // the collapsible "Thinking" panel for the current turn
+let reasoningEl = null;
+let reasoningText = "";
+
+function setGenerating(on) {
+  generating = on;
+  stopBtn.hidden = !on;
+}
+
+async function stopRun() {
+  if (!runId) return;
+  setGenerating(false);
+  try {
+    await fetch("/api/interrupt", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId }),
+    });
+  } catch (_) {}
+  // Interrupt is turn-level: the session stays alive, so the conversation continues with the
+  // next message (the run is NOT terminalized). Takes effect at the next step boundary.
+  activity("⏹ Stopped — the session is still open; send another message to continue.");
+}
+stopBtn.addEventListener("click", stopRun);
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+// Copy a code block's text (inline onclick survives the streaming innerHTML re-render).
+function copyCode(btn) {
+  const code = btn.parentElement.querySelector("code");
+  const text = code ? code.textContent : "";
+  if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+  const prev = btn.textContent;
+  btn.textContent = "copied";
+  setTimeout(() => { btn.textContent = prev; }, 1200);
+}
+function renderMarkdown(text) {
+  // Pull fenced code blocks out first so their contents aren't formatted; handles an unclosed
+  // trailing fence mid-stream (renders the partial as code).
+  const blocks = [];
+  let src = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_m, lang, code) => {
+    blocks.push({ lang, code });
+    return "@@C" + (blocks.length - 1) + "@@";
+  });
+  const open = src.indexOf("```");
+  if (open >= 0) {
+    const rest = src.slice(open + 3);
+    const nl = rest.indexOf("\n");
+    blocks.push({ lang: (nl >= 0 ? rest.slice(0, nl) : rest).trim(), code: nl >= 0 ? rest.slice(nl + 1) : "" });
+    src = src.slice(0, open) + "@@C" + (blocks.length - 1) + "@@";
+  }
+  // Inline formatting on the escaped non-code text.
+  let html = escapeHtml(src)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.split("\n").map((line) => {
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { const n = Math.min(h[1].length + 2, 6); return "<h" + n + ">" + h[2] + "</h" + n + ">"; }
+    if (line.startsWith("&gt; ")) return "<blockquote>" + line.slice(5) + "</blockquote>";
+    if (/^[-*]\s+/.test(line)) return "<li>" + line.replace(/^[-*]\s+/, "") + "</li>";
+    return line;
+  }).join("\n");
+  // Reinsert code blocks with a language label + copy button.
+  html = html.replace(/@@C(\d+)@@/g, (_m, i) => {
+    const b = blocks[i];
+    const lang = b.lang ? '<span class="code-lang">' + escapeHtml(b.lang) + "</span>" : "";
+    return '<div class="codeblock">' + lang + '<button class="copy-btn" onclick="copyCode(this)">copy</button>' +
+      "<pre><code>" + escapeHtml(b.code) + "</code></pre></div>";
+  });
+  return html;
+}
+
+function bubble(cls, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + cls;
+  el.innerHTML = renderMarkdown(text);
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+// Live token streaming: append model.output.delta fragments into one assistant bubble.
+function appendDelta(text) {
+  hideTyping();
+  if (!streamingEl) { streamingEl = bubble("assistant", ""); streamingText = ""; }
+  streamingText += text;
+  streamingEl.innerHTML = renderMarkdown(streamingText);
+  log.scrollTop = log.scrollHeight;
+}
+function finalizeStream(finalText) {
+  if (!streamingEl) return false;
+  // Prefer the authoritative assembled final_text if the turn settled with one.
+  if (finalText) streamingEl.innerHTML = renderMarkdown(finalText);
+  streamingEl = null; streamingText = "";
+  return true;
+}
+
+// Display-only reasoning summary (DX-13b): stream model.reasoning.delta into a collapsible
+// "Thinking" panel that auto-collapses once the answer starts.
+function appendReasoning(text) {
+  hideTyping();
+  if (!reasoningWrap) {
+    reasoningWrap = document.createElement("details");
+    reasoningWrap.className = "reasoning";
+    reasoningWrap.open = true;
+    const sum = document.createElement("summary");
+    sum.textContent = "🧠 Thinking";
+    reasoningWrap.appendChild(sum);
+    reasoningEl = document.createElement("div");
+    reasoningEl.className = "reasoning-body";
+    reasoningWrap.appendChild(reasoningEl);
+    log.appendChild(reasoningWrap);
+    reasoningText = "";
+  }
+  reasoningText += text;
+  reasoningEl.textContent = reasoningText;
+  log.scrollTop = log.scrollHeight;
+}
+function collapseReasoning() {
+  if (reasoningWrap) reasoningWrap.open = false;  // fold once the answer begins
+}
+
+function activity(text) {
+  const el = document.createElement("div");
+  el.className = "activity";
+  el.textContent = text;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+}
+
+function showTyping() {
+  if (typingEl) return;
+  typingEl = document.createElement("div");
+  typingEl.className = "typing";
+  typingEl.textContent = "agent is thinking…";
+  log.appendChild(typingEl);
+  log.scrollTop = log.scrollHeight;
+}
+function hideTyping() {
+  if (typingEl) { typingEl.remove(); typingEl = null; }
+}
+
+function handleEvent(ev) {
+  const seq = ev.seq ?? -1;
+  if (seq >= 0 && seq <= seenSeq) return; // dedup across reconnects
+  if (seq >= 0) seenSeq = seq;
+  const type = ev.type || "";
+  const data = ev.data || {};
+  if (ev.event_id && !_TRACE_SKIP.has(type)) {  // collect for the trace tree
+    runEvents.push(ev);
+    if (traceAside && !traceAside.hidden) renderTrace();
+  }
+  if (ev.studio_activity) { hideTyping(); activity(ev.studio_activity); return; }
+  if (type === "proposal.ready" || type === "workspace.diff.updated" || type === "workspace.proposal.updated") {
+    refreshProposal();
+    return;
+  }
+  if (type === "task.started" && data.kind === "hitl") { hideTyping(); renderHitl(data); return; }
+  if (type.indexOf("job.") === 0) { refreshJobs(); return; }
+  if (type === "plan.updated") { renderPlan(data.items); return; }
+  if (type === "subagent.started") { startSubagent(data); return; }
+  if (type === "subagent.finished" || type === "subagent.failed") { finishSubagent(data, type === "subagent.failed"); return; }
+  if (type === "metrics.updated") { updateUsage(data); return; }
+  if (type === "turn.failed") {
+    hideTyping();
+    setGenerating(false);
+    const msg = data.error || "the model turn failed";
+    if (data.retryable) {
+      activity("⚠ " + msg + " — retrying…");
+      setGenerating(true);  // a transient failure is auto-retried server-side
+    } else {
+      // recoverable but not retryable (e.g. a config 4xx): the session stays alive; the user
+      // fixes model/effort above and resends. Composer stays enabled.
+      pendingConfigFix = true;
+      const card = bubble("error", msg + "\n\nAdjust the model/effort above, then retry.");
+      showRetry(card);
+    }
+    return;
+  }
+  if (type === "turn.interrupted") { hideTyping(); setGenerating(false); finalizeStream(""); return; }
+  if (type === "model.turn.started") {
+    pendingConfigFix = false; setGenerating(true);
+    streamingEl = null; streamingText = "";  // a fresh turn streams into a new bubble
+    reasoningWrap = null; reasoningEl = null;  // …and a fresh "Thinking" panel
+    showTyping();
+    return;
+  }
+  if (type === "model.reasoning.delta") { appendReasoning(data.text || ""); return; }
+  if (type === "model.output.delta") { collapseReasoning(); appendDelta(data.text || ""); return; }
+  if (type === "model.turn.finished") { hideTyping(); return; }
+  if (type === "turn.settled" || type === "run.finished") {
+    hideTyping();
+    setGenerating(false);
+    if (finalizeStream(data.final_text)) return;  // a streamed bubble is already on screen
+    if (data.final_text) bubble("assistant", data.final_text);
+    return;
+  }
+  if (type === "run.awaiting_input") { setGenerating(false); return; }
+  if (type === "run.failed" || type === "ModelAdapterError") {
+    hideTyping();
+    setGenerating(false);
+    finalizeStream("");
+    bubble("error", data.error || data.message || "the run failed");
+    return;
+  }
+  if (type === "studio.stream.end") { hideTyping(); setGenerating(false); return; }
+}
+
+function updateUsage(data) {
+  const i = data.input_tokens, o = data.output_tokens, t = data.total_tokens;
+  if (t === undefined && i === undefined) return;
+  // 🧠 = reasoning ("thinking") tokens, the priced-but-invisible share of the output (R10).
+  const r = data.reasoning_tokens;
+  const brain = r ? " · 🧠" + r : "";
+  usageEl.textContent = "↑" + (i ?? 0) + " ↓" + (o ?? 0) + brain + " · " + (t ?? 0) + " tok";
+}
+
+const planTitle = document.getElementById("plan-title");
+const planEl = document.getElementById("plan");
+function renderPlan(items) {
+  if (!Array.isArray(items) || items.length === 0) { planTitle.hidden = true; planEl.hidden = true; return; }
+  planTitle.hidden = false; planEl.hidden = false;
+  planEl.innerHTML = "";
+  for (const it of items) {
+    const li = document.createElement("li");
+    const status = String((it && it.status) || "").toLowerCase();
+    let icon = "○";
+    if (status === "completed" || status === "done") { icon = "✓"; li.className = "done"; }
+    else if (status === "in_progress" || status === "active" || status === "running") { icon = "▸"; li.className = "active"; }
+    const st = document.createElement("span"); st.className = "st"; st.textContent = icon;
+    const step = document.createElement("span"); step.className = "step";
+    step.textContent = String((it && (it.step || it.title || it.name)) || "");
+    li.appendChild(st); li.appendChild(step);
+    planEl.appendChild(li);
+  }
+}
+
+// Subagents: a spawned subagent is an isolated child run; its work isn't in the parent stream,
+// so we poll its own events.jsonl (via /api/subagent-events) to stream tokens + tool calls into
+// a nested card. child_run_id arrives on subagent.started.
+const subagents = {};
+function startSubagent(data) {
+  const cid = data.child_run_id;
+  if (!cid || subagents[cid]) return;
+  hideTyping();
+  const card = document.createElement("div");
+  card.className = "subagent";
+  const head = document.createElement("div");
+  head.className = "sa-head";
+  head.textContent = "🤖 subagent · " + String(data.subagent_type || "");
+  const status = document.createElement("span");
+  status.className = "sa-status"; status.textContent = "running…";
+  head.appendChild(status);
+  const body = document.createElement("div");
+  body.className = "sa-body";
+  card.appendChild(head); card.appendChild(body);
+  log.appendChild(card); log.scrollTop = log.scrollHeight;
+  const state = { card, status, body, outEl: null, lastSeq: -1, done: false, timer: null };
+  subagents[cid] = state;
+  pollSubagent(cid);
+}
+function drainSubagent(cid) {
+  const state = subagents[cid];
+  if (!state) return Promise.resolve();
+  return fetch("/api/subagent-events?run_id=" + encodeURIComponent(cid) + "&from=" + (state.lastSeq + 1))
+    .then((r) => r.json())
+    .then((body) => {
+      for (const ev of (body.events || [])) {
+        const seq = ev.seq ?? -1;
+        if (seq <= state.lastSeq) continue;
+        state.lastSeq = seq;
+        renderChildEvent(state, ev);
+      }
+    })
+    .catch(() => {});
+}
+function pollSubagent(cid) {
+  const state = subagents[cid];
+  if (!state || state.done) return;
+  drainSubagent(cid).finally(() => {
+    if (!state.done) state.timer = setTimeout(() => pollSubagent(cid), 600);
+  });
+}
+function renderChildEvent(state, ev) {
+  const type = ev.type || "", data = ev.data || {};
+  if (type === "model.reasoning.delta") {
+    if (!state.reasonEl) { state.reasonEl = document.createElement("div"); state.reasonEl.className = "sa-reason"; state.body.appendChild(state.reasonEl); }
+    state.reasonEl.textContent += (data.text || "");
+    log.scrollTop = log.scrollHeight;
+  } else if (type === "model.output.delta") {
+    if (!state.outEl) { state.outEl = document.createElement("div"); state.outEl.className = "sa-out"; state.body.appendChild(state.outEl); }
+    state.outEl.textContent += (data.text || "");
+    log.scrollTop = log.scrollHeight;
+  } else if (type === "tool.call.started") {
+    const line = document.createElement("div");
+    line.className = "sa-act";
+    line.textContent = "↳ " + childActivity(data);
+    state.body.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  }
+}
+function childActivity(data) {
+  const tool = String(data.tool || "tool").replace(/_/g, ".");
+  const ap = data.args_preview || {};
+  const target = (data.paths && data.paths[0]) || ap.path || ap.query_preview || ap.url_preview || ap.query || "";
+  return target ? (tool + " " + target) : tool;
+}
+function finishSubagent(data, failed) {
+  const cid = data.child_run_id;
+  const state = subagents[cid];
+  if (!state) return;
+  if (state.timer) clearTimeout(state.timer);
+  state.done = true;
+  drainSubagent(cid);  // catch the tail of the child's events
+  state.card.classList.add(failed ? "failed" : "done");
+  state.status.textContent = failed ? "✕ failed" : "✓ done";
+}
+
+const proposalEl = document.getElementById("proposal");
+const proposalFilesEl = document.getElementById("proposal-files");
+const diffEl = document.getElementById("diff");
+const applyBtn = document.getElementById("apply");
+const applyStatus = document.getElementById("apply-status");
+let applied = false;
+
+function renderDiff(text) {
+  diffEl.innerHTML = "";
+  for (const line of text.split("\n")) {
+    const span = document.createElement("span");
+    if (line.startsWith("+") && !line.startsWith("+++")) span.className = "add";
+    else if (line.startsWith("-") && !line.startsWith("---")) span.className = "del";
+    else if (line.startsWith("@@") || line.startsWith("diff ") || line.startsWith("index ")) span.className = "meta";
+    span.textContent = line + "\n";
+    diffEl.appendChild(span);
+  }
+}
+
+const selectAllEl = document.getElementById("select-all");
+const exportBtn = document.getElementById("export");
+
+function checkedPaths() {
+  return [...proposalFilesEl.querySelectorAll("input[type=checkbox]")]
+    .filter(cb => cb.checked).map(cb => cb.value);
+}
+
+async function refreshProposal() {
+  if (!runId || applied) return;
+  try {
+    const p = await (await fetch(`/api/proposal?run_id=${encodeURIComponent(runId)}`)).json();
+    if (!p.ready || !p.diff) return;
+    const files = (p.changed_paths || (p.files || []).map(f => f.path) || []);
+    // Preserve any prior per-file selection across refreshes (proposal updates mid-run).
+    const prior = new Set([...proposalFilesEl.querySelectorAll("input:not(:checked)")].map(cb => cb.value));
+    proposalFilesEl.innerHTML = files.map(f => {
+      const checked = prior.has(f) ? "" : "checked";
+      const safe = f.replace(/"/g, "&quot;");
+      return `<label><input type="checkbox" value="${safe}" ${checked} /><span class="f">${f}</span></label>`;
+    }).join("");
+    syncSelectAll();
+    renderDiff(p.diff);
+    proposalEl.hidden = false;
+    applyBtn.disabled = false;
+    exportBtn.disabled = false;
+    applyStatus.textContent = "";
+  } catch (_) {}
+}
+
+function syncSelectAll() {
+  const boxes = [...proposalFilesEl.querySelectorAll("input[type=checkbox]")];
+  selectAllEl.checked = boxes.length > 0 && boxes.every(cb => cb.checked);
+}
+selectAllEl.addEventListener("change", () => {
+  proposalFilesEl.querySelectorAll("input[type=checkbox]").forEach(cb => { cb.checked = selectAllEl.checked; });
+});
+proposalFilesEl.addEventListener("change", syncSelectAll);
+
+async function applyProposal() {
+  if (!runId) return;
+  const approved = checkedPaths();
+  if (!approved.length) { applyStatus.textContent = "Select at least one file to apply."; return; }
+  applyBtn.disabled = true;
+  applyStatus.textContent = "Applying…";
+  try {
+    const res = await (await fetch("/api/apply", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId, approved_paths: approved }),
+    })).json();
+    if (res.error) { applyStatus.textContent = "Error: " + res.error; applyBtn.disabled = false; return; }
+    if (res.status === "conflict") {
+      applyStatus.textContent = "Conflict — workspace changed since the proposal.";
+      applyBtn.disabled = false;
+      return;
+    }
+    applied = true;
+    const skipped = (res.skipped_paths || []).length;
+    applyStatus.textContent = "Applied " + ((res.applied_paths || []).length) + " file(s)"
+      + (skipped ? `, skipped ${skipped}.` : ".");
+    activity("Applied proposed changes to the workspace");
+    loadTree();
+  } catch (err) {
+    applyStatus.textContent = "Error: " + err;
+    applyBtn.disabled = false;
+  }
+}
+applyBtn.addEventListener("click", applyProposal);
+
+async function exportPackage() {
+  if (!runId) return;
+  exportBtn.disabled = true;
+  applyStatus.textContent = "Exporting…";
+  try {
+    // 1) Build → receipt (digest + name). No bytes, no server path.
+    const buildRes = await fetch("/api/export-package", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId }),
+    });
+    const receipt = await buildRes.json();
+    if (!buildRes.ok || receipt.error) {
+      applyStatus.textContent = "Error: " + (receipt.error || buildRes.status);
+      exportBtn.disabled = false;
+      return;
+    }
+    // 2) Fetch the bytes by digest (the data-returning seam — works co-located or remote).
+    const url = `/api/artifact?run_id=${encodeURIComponent(runId)}&digest=${encodeURIComponent(receipt.digest)}`;
+    const dlRes = await fetch(url);
+    if (!dlRes.ok) {
+      applyStatus.textContent = "Error: artifact fetch " + dlRes.status;
+      exportBtn.disabled = false;
+      return;
+    }
+    const blob = await dlRes.blob();
+    const cd = dlRes.headers.get("Content-Disposition") || "";
+    const name = (cd.match(/filename="([^"]+)"/) || [])[1] || receipt.name || "proposal.tar";
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl; a.download = name; a.click();
+    URL.revokeObjectURL(objUrl);
+    applyStatus.textContent = "Exported " + name;
+    exportBtn.disabled = false;
+  } catch (err) {
+    applyStatus.textContent = "Error: " + err;
+    exportBtn.disabled = false;
+  }
+}
+exportBtn.addEventListener("click", exportPackage);
+
+async function refreshJobs() {
+  if (!runId) return;
+  const ul = document.getElementById("jobs");
+  try {
+    const body = await (await fetch(`/api/jobs?run_id=${encodeURIComponent(runId)}`)).json();
+    const jobs = body.jobs || [];
+    ul.innerHTML = "";
+    for (const j of jobs) {
+      const li = document.createElement("li");
+      const status = j.status || "";
+      if (status === "exited" || status === "finished") li.className = "done";
+      else if (status === "failed" || status === "timed_out") li.className = "failed";
+      const short = (j.job_id || "").slice(0, 12);
+      const code = (j.exit_code !== null && j.exit_code !== undefined) ? " (" + j.exit_code + ")" : "";
+      li.innerHTML = short + ' <span class="st">' + status + code + "</span>";
+      li.title = j.command_preview || j.job_id || "";
+      li.addEventListener("click", () => showJobLogs(j.job_id));
+      ul.appendChild(li);
+    }
+  } catch (_) {}
+}
+
+// One-time catalog of the attached providers (Skills, MCP tools). Hidden sections when empty.
+async function refreshCapabilities() {
+  try {
+    const body = await (await fetch("/api/capabilities-catalog")).json();
+    fillCatalog("skills", body.skills || [], (x) => x.name, (x) => x.description);
+    fillCatalog("mcp-tools", body.mcp_tools || [], (x) => x.id, (x) => x.description);
+  } catch (_) {}
+}
+function fillCatalog(listId, items, nameOf, descOf) {
+  const ul = document.getElementById(listId);
+  const title = document.getElementById((listId === "mcp-tools" ? "mcp" : listId) + "-title");
+  ul.innerHTML = "";
+  for (const it of items) {
+    const li = document.createElement("li");
+    li.textContent = nameOf(it);
+    li.title = descOf(it) || "";
+    ul.appendChild(li);
+  }
+  const show = items.length > 0;
+  ul.hidden = !show;
+  if (title) title.hidden = !show;
+}
+
+async function showJobLogs(jobId) {
+  try {
+    const body = await (await fetch(
+      `/api/job-logs?run_id=${encodeURIComponent(runId)}&job_id=${encodeURIComponent(jobId)}`
+    )).json();
+    const block = document.createElement("pre");
+    block.className = "msg assistant";
+    block.style.font = "12px ui-monospace, Menlo, Consolas, monospace";
+    block.textContent = "$ job " + jobId.slice(0, 12) + " (stdout)\n" + (body.content || "(no output)");
+    log.appendChild(block);
+    log.scrollTop = log.scrollHeight;
+  } catch (_) {}
+}
+
+function renderHitl(data) {
+  const taskId = data.task_id;
+  const choices = (Array.isArray(data.choices) && data.choices.length) ? data.choices : ["Approve", "Deny"];
+  const card = document.createElement("div");
+  card.className = "hitl";
+  const q = document.createElement("div");
+  q.className = "q";
+  const prompt = (data.prompt || "Approve this action?")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  q.innerHTML = "<b>The agent needs your approval</b>\n" + prompt;
+  card.appendChild(q);
+  const opts = document.createElement("div");
+  opts.className = "opts";
+  choices.forEach((choice, idx) => {
+    const b = document.createElement("button");
+    if (choices.length === 2 && idx === 1) b.className = "deny";
+    b.textContent = choice;
+    b.addEventListener("click", () => answerHitl(taskId, choice, card));
+    opts.appendChild(b);
+  });
+  card.appendChild(opts);
+  log.appendChild(card);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function answerHitl(taskId, answer, card) {
+  card.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  try {
+    const res = await fetch("/api/hitl", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId, task_id: taskId, answer }),
+    });
+    const body = await res.json();
+    if (body.error) throw new Error(body.error);
+    card.classList.add("answered");
+    const note = document.createElement("div");
+    note.className = "answered-note";
+    note.textContent = "You answered: " + answer;
+    card.appendChild(note);
+  } catch (err) {
+    card.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    activity("Failed to send approval: " + err);
+  }
+}
+
+function openStream() {
+  if (evtSource) evtSource.close();
+  seenSeq = -1;
+  evtSource = new EventSource(`/api/events?run_id=${encodeURIComponent(runId)}&from=0`);
+  evtSource.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (_) {} };
+  evtSource.onerror = () => { /* EventSource auto-reconnects */ };
+}
+
+function showRetry(afterCard) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "retry";
+  btn.textContent = "Retry";
+  btn.addEventListener("click", () => {
+    btn.disabled = true;
+    if (lastUserMessage) send(lastUserMessage);
+  });
+  afterCard.appendChild(document.createElement("br"));
+  afterCard.appendChild(btn);
+}
+
+async function send(message) {
+  // Snapshot + clear attachments so a config-fix retry (which re-calls send) doesn't resend them.
+  const attachments = pendingAttachments;
+  pendingAttachments = [];
+  renderAttachments();
+  lastUserMessage = message;
+  pendingConfigFix = false;
+  const label = attachments.length
+    ? (message ? message + " " : "") + "📎 " + attachments.map(a => a.name).join(", ")
+    : message;
+  bubble("user", label);
+  sendBtn.disabled = true;
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId, message, attachments }),
+    });
+    const body = await res.json();
+    if (body.error) { bubble("error", body.error); return; }
+    if (!runId && body.run_id) { runId = body.run_id; openStream(); refreshSessions(); }
+    setGenerating(true);  // show Stop until the turn settles/parks
+  } catch (err) {
+    bubble("error", String(err));
+  } finally {
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const message = input.value.trim();
+  if (!message && !pendingAttachments.length) return;
+  input.value = "";
+  send(message);
+});
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+});
+
+const viewerAside = document.getElementById("viewer");
+const viewerName = document.getElementById("viewer-name");
+const viewerBody = document.getElementById("viewer-body");
+document.getElementById("viewer-close").addEventListener("click", (e) => { e.preventDefault(); viewerAside.hidden = true; });
+async function openFile(path) {
+  viewerName.textContent = path;
+  viewerBody.textContent = "loading…";
+  viewerAside.hidden = false;
+  try {
+    const r = await (await fetch("/api/file?path=" + encodeURIComponent(path))).json();
+    if (r.error) { viewerBody.textContent = "error: " + r.error; return; }
+    if (r.binary) { viewerBody.textContent = "(binary file — not shown)"; return; }
+    viewerBody.textContent = r.content + (r.truncated ? "\n\n… (truncated)" : "");
+  } catch (_) { viewerBody.textContent = "error loading file"; }
+}
+
+async function loadTree() {
+  const tree = document.getElementById("tree");
+  try {
+    const body = await (await fetch("/api/files")).json();
+    tree.innerHTML = "";
+    if (!body.files || !body.files.length) {
+      const li = document.createElement("li");
+      li.className = "dir";
+      li.textContent = "(empty workspace)";
+      tree.appendChild(li);
+      return;
+    }
+    for (const entry of body.files) {
+      const li = document.createElement("li");
+      li.className = entry.is_dir ? "dir" : "file";
+      const depth = (entry.path.match(/\//g) || []).length;
+      const name = entry.path.split("/").pop();
+      li.style.paddingLeft = (4 + depth * 12) + "px";
+      li.textContent = entry.is_dir ? name + "/" : name;
+      li.title = entry.path;
+      if (!entry.is_dir) {
+        // Click opens the file viewer; Shift/Ctrl-click inserts the path into the composer.
+        li.addEventListener("click", (e) => {
+          if (e.shiftKey || e.ctrlKey || e.metaKey) {
+            input.value = (input.value ? input.value + " " : "") + entry.path;
+            input.focus();
+          } else {
+            openFile(entry.path);
+          }
+        });
+      }
+      tree.appendChild(li);
+    }
+  } catch (_) {}
+}
+
+async function saveSetting(payload, label) {
+  const st = document.getElementById("setup-status");
+  st.textContent = "saving…";
+  try {
+    const r = await (await fetch("/api/settings", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    })).json();
+    if (r.error) { st.textContent = "error: " + r.error; return; }
+    st.textContent = label + " updated" + (r.applied_runs ? " · hot-swapped " + r.applied_runs : "");
+    setTimeout(() => { st.textContent = ""; }, 2500);
+    // If a turn just failed on a config issue, the fix is in — auto-resend the last message.
+    if (pendingConfigFix && lastUserMessage) {
+      pendingConfigFix = false;
+      send(lastUserMessage);
+    }
+  } catch (_) { st.textContent = "error"; }
+}
+
+async function loadSetup() {
+  try {
+    const s = await (await fetch("/api/settings")).json();
+    const modelEl = document.getElementById("model");
+    const effortEl = document.getElementById("effort");
+    const summaryEl = document.getElementById("summary");
+    modelEl.value = s.model || "";
+    if (s.offline) { modelEl.disabled = true; modelEl.title = "offline echo model — ignored"; }
+    effortEl.innerHTML = "";
+    for (const e of (s.efforts || [])) {
+      const opt = document.createElement("option");
+      opt.value = e; opt.textContent = e;
+      if (e === s.effort) opt.selected = true;
+      effortEl.appendChild(opt);
+    }
+    summaryEl.innerHTML = "";
+    for (const v of (s.summaries || [])) {
+      const opt = document.createElement("option");
+      opt.value = v; opt.textContent = v;
+      if (v === s.summary) opt.selected = true;
+      summaryEl.appendChild(opt);
+    }
+    const otelEl = document.getElementById("otel");
+    otelEl.checked = !!s.otel;
+    modelEl.addEventListener("change", () => saveSetting({ model: modelEl.value }, "Model"));
+    effortEl.addEventListener("change", () => saveSetting({ effort: effortEl.value }, "Effort"));
+    summaryEl.addEventListener("change", () => saveSetting({ summary: summaryEl.value }, "Thinking"));
+    otelEl.addEventListener("change", () => saveSetting({ otel: otelEl.checked }, "OTel"));
+  } catch (_) {}
+}
+
+// --- R8: session history + trace tree ---------------------------------------------------
+const sessionsEl = document.getElementById("sessions");
+const newchatBtn = document.getElementById("newchat");
+const traceBtn = document.getElementById("trace-btn");
+const traceAside = document.getElementById("trace");
+const traceTreeEl = document.getElementById("trace-tree");
+let runEvents = [];
+const _TRACE_SKIP = new Set([
+  "model.output.delta", "model.reasoning.delta", "metrics.updated", "workspace.file.read",
+  "workspace.file.changed", "workspace.diff.updated", "workspace.proposal.updated", "checkpoint.committed",
+]);
+
+function resetChatView() {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  log.innerHTML = "";
+  seenSeq = -1; typingEl = null; streamingEl = null; streamingText = "";
+  reasoningWrap = null; reasoningEl = null; reasoningText = "";
+  runEvents = []; pendingConfigFix = false;
+  for (const cid in subagents) { if (subagents[cid].timer) clearTimeout(subagents[cid].timer); delete subagents[cid]; }
+  renderPlan([]); setGenerating(false);
+  usageEl.textContent = "";
+  if (traceAside && !traceAside.hidden) renderTrace();
+}
+
+function newChat() {
+  runId = null;
+  resetChatView();
+  refreshSessions();
+  input.focus();
+}
+
+function loadSession(id) {
+  if (id === runId) return;
+  runId = id;
+  resetChatView();
+  openStream();       // replays from seq 0, then streams live
+  refreshSessions();  // highlight the active session
+}
+
+async function refreshSessions() {
+  try {
+    const body = await (await fetch("/api/sessions")).json();
+    sessionsEl.innerHTML = "";
+    for (const s of (body.sessions || [])) {
+      const li = document.createElement("li");
+      if (!["completed", "failed", "limited"].includes(s.status)) li.classList.add("live");
+      if (s.recoverable) li.classList.add("recoverable");
+      if (s.run_id === runId) li.classList.add("active");
+      const dot = document.createElement("span"); dot.className = "dot";
+      li.appendChild(dot);
+      li.appendChild(document.createTextNode(s.title || s.run_id));
+      if (s.recoverable) {
+        const tag = document.createElement("span"); tag.className = "resume-tag"; tag.textContent = "⟳ resume";
+        li.appendChild(tag);
+      }
+      li.title = (s.title || s.run_id) + " — " + s.status
+        + (s.recoverable ? " (parked — send a message to resume from its checkpoint)" : "");
+      li.addEventListener("click", () => loadSession(s.run_id));
+      sessionsEl.appendChild(li);
+    }
+  } catch (_) {}
+}
+
+function traceLabel(ev) {
+  const d = ev.data || {};
+  if (ev.type === "tool.call.started") return "tool · " + childActivity(d);
+  if (ev.type === "tool.call.finished") return "tool · " + (d.tool || "") + (d.ok === false ? " ✕ " + (d.error || "") : " ✓");
+  if (ev.type === "subagent.started") return "subagent · " + (d.subagent_type || "");
+  if (ev.type === "subagent.finished" || ev.type === "subagent.failed") return "subagent · " + (d.status || "");
+  if (ev.type === "plan.updated") return "plan · " + ((d.items || []).length) + " steps";
+  if (ev.type === "turn.settled") return "turn settled";
+  return ev.type;
+}
+function renderTrace() {
+  if (!traceTreeEl) return;
+  const evs = runEvents.filter((e) => e.event_id);
+  const ids = new Set(evs.map((e) => e.event_id));
+  const children = {};
+  const roots = [];
+  for (const e of evs) {
+    if (e.parent_id && ids.has(e.parent_id)) (children[e.parent_id] = children[e.parent_id] || []).push(e);
+    else roots.push(e);
+  }
+  const build = (list) => {
+    const ul = document.createElement("ul");
+    for (const e of list) {
+      const li = document.createElement("li");
+      if (e.level === "error" || (e.data && e.data.ok === false)) li.classList.add("err");
+      const sp = document.createElement("span"); sp.className = "tt-type"; sp.textContent = traceLabel(e);
+      li.appendChild(sp);
+      const kids = children[e.event_id];
+      if (kids) li.appendChild(build(kids));
+      ul.appendChild(li);
+    }
+    return ul;
+  };
+  traceTreeEl.innerHTML = "";
+  if (!roots.length) { traceTreeEl.textContent = "(no events yet)"; return; }
+  traceTreeEl.appendChild(build(roots));
+}
+
+newchatBtn.addEventListener("click", (e) => { e.preventDefault(); newChat(); });
+traceBtn.addEventListener("click", (e) => {
+  e.preventDefault();
+  const show = traceAside.hidden;
+  traceAside.hidden = !show;
+  traceBtn.classList.toggle("on", show);
+  if (show) renderTrace();
+});
+
+(async function init() {
+  try {
+    const cfg = await (await fetch("/api/config")).json();
+    document.getElementById("ws").textContent = cfg.workspace;
+    document.getElementById("ws").title = cfg.workspace;
+    const badge = document.getElementById("provider");
+    badge.textContent = cfg.offline ? "offline · echo model" : cfg.provider;
+    if (cfg.offline) badge.classList.add("offline");
+  } catch (_) {}
+  loadTree();
+  loadSetup();
+  refreshSessions();
+  refreshCapabilities();
+})();
+</script>
+</body>
+</html>

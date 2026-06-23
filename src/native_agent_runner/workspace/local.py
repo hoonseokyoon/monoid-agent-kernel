@@ -106,11 +106,14 @@ class LocalWorkspaceBackend:
                 raise WorkspaceError(f"file does not exist: {rel}")
             if not abs_path.exists() or not abs_path.is_file():
                 raise WorkspaceError(f"file does not exist: {rel}")
-            if abs_path.stat().st_size > (max_bytes or self.max_bytes_read):
-                raise WorkspaceError(f"file exceeds max read size: {rel}")
+            limit = max_bytes or self.max_bytes_read
+            size = abs_path.stat().st_size
+            if size > limit:
+                raise WorkspaceError(f"file exceeds max read size: {rel} ({size} bytes > {limit} bytes)")
             data = abs_path.read_bytes()
-        if len(data) > (max_bytes or self.max_bytes_read):
-            raise WorkspaceError(f"file exceeds max read size: {rel}")
+        limit = max_bytes or self.max_bytes_read
+        if len(data) > limit:
+            raise WorkspaceError(f"file exceeds max read size: {rel} ({len(data)} bytes > {limit} bytes)")
         return data, sha256_bytes(data)
 
     def write_bytes(

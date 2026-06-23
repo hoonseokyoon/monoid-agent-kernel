@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from native_agent_runner.core._util import file_lock, write_json_atomic
+from native_agent_runner.core._util import file_lock, sha256_bytes, write_json_atomic
 
 SCHEMA_VERSION = "native-agent-runner.checkpoint.v1"
 
@@ -87,8 +87,11 @@ class RunCheckpoint:
     # --- run-level bookkeeping ---
     remaining_duration_s: float | None = None
     cancellation_requested: bool = False
-    # Filled by the backend driver (the message queue lives outside the loop).
-    queued_messages: list[str] = field(default_factory=list)
+    # Filled by the backend driver (the message queue lives outside the loop). Each entry is
+    # JSON-native: a ``str`` (text message) or a ``list[dict]`` of content-part dicts (a
+    # multimodal message carried by-reference). Kept JSON-native so the checkpoint round-trips
+    # without any dataclass (de)serialization here.
+    queued_messages: list[Any] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -160,6 +163,18 @@ class CheckpointStore(Protocol):
 
     def delete(self, run_id: str) -> None: ...
 
+    def put_blob(self, run_id: str, data: bytes) -> str:
+        """Store ``data`` as a content-addressed, write-once blob and return its sha256 digest.
+        The digest IS the retrieval handle (see ``get_blob``) — content-addressed, so an identical
+        payload dedups and the same bytes always map to the same handle. This is the standalone
+        entry to the same blob namespace ``put`` fills for checkpoints, used for on-demand
+        artifacts (e.g. an exported package) that must be fetched back as data, never by path."""
+        ...
+
+    def get_blob(self, run_id: str, sha256: str) -> bytes:
+        """Read a content-addressed blob by its sha256 digest. Raises ``KeyError`` if absent."""
+        ...
+
 
 @dataclass
 class LocalFsCheckpointStore:
@@ -210,6 +225,27 @@ class LocalFsCheckpointStore:
             #    the backend does to fold in the message queue, is a no-op flip).
             if checkpoint.seq > self._read_latest_seq(cdir):
                 write_json_atomic(cdir / "LATEST", {"seq": checkpoint.seq})
+
+    def put_blob(self, run_id: str, data: bytes) -> str:
+        """Write a standalone content-addressed blob into the run's ``blobs/`` dir (write-once,
+        same namespace as checkpoint blobs) and return its sha256 digest."""
+        sha = sha256_bytes(data)
+        cdir = self._dir(run_id)
+        blobs_dir = cdir / "blobs"
+        blobs_dir.mkdir(parents=True, exist_ok=True)
+        with file_lock(cdir / ".put.lock", timeout_s=self.lock_timeout_s, stale_s=self.lock_stale_s):
+            target = blobs_dir / sha
+            if not target.exists():
+                tmp = target.with_suffix(".tmp")
+                tmp.write_bytes(data)
+                tmp.replace(target)
+        return sha
+
+    def get_blob(self, run_id: str, sha256: str) -> bytes:
+        try:
+            return (self._dir(run_id) / "blobs" / sha256).read_bytes()
+        except OSError as exc:
+            raise KeyError(sha256) from exc
 
     def _read_latest_seq(self, cdir: Path) -> int:
         try:

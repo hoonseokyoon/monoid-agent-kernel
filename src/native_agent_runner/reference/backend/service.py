@@ -4,10 +4,12 @@ import asyncio
 import atexit
 import json
 import logging
+import random
+import re
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
 from dataclasses import dataclass, field
@@ -18,6 +20,7 @@ from native_agent_runner.core.agents import (
     AgentDefinition,
     AgentRuntimeConfig,
     RuntimeConfigProvider,
+    SubagentDefinition,
     validate_runtime_config,
 )
 from native_agent_runner.core.cancellation import CancellationToken
@@ -38,9 +41,16 @@ from native_agent_runner.core.checkpoint import (
 from native_agent_runner.reference.stores.lease import LeaseStore, LocalFsLeaseStore
 from native_agent_runner.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from native_agent_runner.core.result import AgentRunResult, Suspension
+from native_agent_runner.core.content import (
+    ContentPart,
+    content_part_from_json,
+    content_part_to_json,
+)
+from native_agent_runner.core.media import normalize_inline_media_dicts
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
+    ModelRetryConfig,
     RunLimits,
     RunMode,
     WorkspaceBackendKind,
@@ -59,7 +69,7 @@ from native_agent_runner.providers.base import ModelAdapter
 from native_agent_runner.providers.gateway import GatewayModelAdapter
 from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
 from native_agent_runner.recorder import append_event_to_run
-from native_agent_runner.tools.builtin import builtin_tools
+from native_agent_runner.tools.builtin import agent_spawn_tool, builtin_tools
 from native_agent_runner.web import WebGatewayClient
 from native_agent_runner.workspace.paths import is_within
 
@@ -68,6 +78,38 @@ BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "f
 # Sentinel enqueued to wake/stop a session worker blocked on its message queue.
 _CLOSE_SESSION = object()
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
+
+# A run-artifact fetch handle is a bare sha256 hex digest — validated before any store lookup so a
+# crafted value can never reach the blob layer as a path.
+_ARTIFACT_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
+
+
+# --- multimodal message normalization (the backend message queue stays JSON-native) ---------
+# A backend message is either a ``str`` (text) or a ``list[dict]`` of content-part dicts (a
+# multimodal message carried by-reference). Keeping the queue + checkpoint JSON-native means a
+# parked multimodal message survives a restart with no dataclass (de)serialization in the driver.
+
+
+def _normalize_inbound_message(content: str | Sequence[Any]) -> str | list[dict[str, Any]]:
+    """Normalize a ``send_message`` argument into the queue's JSON-native wire form. Accepts a
+    plain ``str``, a sequence of ``ContentPart`` dataclasses, or a sequence of already-serialized
+    content-part dicts (the HTTP boundary sends the latter)."""
+    if isinstance(content, str):
+        return content
+    parts: list[dict[str, Any]] = []
+    for item in content:
+        parts.append(item if isinstance(item, dict) else content_part_to_json(item))
+    if not parts:
+        raise ValueError("message has no content")
+    return parts
+
+
+def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]:
+    """Convert a dequeued backend message (text ``str`` or ``list[dict]`` of part dicts) into a
+    loop ``submit`` input. ``content_part_from_json`` rebuilds the typed parts at the boundary."""
+    if isinstance(message, list):
+        return tuple(content_part_from_json(part) for part in message)
+    return message  # str
 
 # Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
 _RUN_META_SCHEMA_VERSION = "native-agent-runner.backend-run.v1"
@@ -92,6 +134,10 @@ class BackendRunRequest:
     user_id: str
     workspace_root: Path
     instruction: str
+    # Optional multimodal first turn: when non-empty, these content parts (text + image/document
+    # references) drive the opening turn instead of ``instruction``. ``instruction`` is still used
+    # for the run title / metadata, so callers pass the text alongside.
+    input_parts: tuple[ContentPart, ...] = ()
     mode: RunMode = "propose"
     workspace_backend: WorkspaceBackendKind = "overlay"
     max_steps: int = 30
@@ -247,8 +293,24 @@ class BackendRuntimeConfigProvider(RuntimeConfigProvider):
         return self._backend.current_runtime_config(self._run_id)
 
 
-def _backend_builtin_tool_specs() -> tuple[Any, ...]:
-    return tuple(builtin_tools(cast(Workspace, None)))
+def _backend_builtin_tool_specs(
+    subagent_definitions: Mapping[str, SubagentDefinition] | None = None,
+    tool_providers: Sequence[Any] = (),
+) -> tuple[Any, ...]:
+    specs = list(builtin_tools(cast(Workspace, None)))
+    # agent.spawn is registered dynamically by the loop bootstrap (only when the run carries
+    # subagent_definitions), so config validation must know about it too when they're present —
+    # otherwise a binding to agent.spawn looks like an unknown tool.
+    if subagent_definitions:
+        catalog = {sid: d.description for sid, d in subagent_definitions.items()}
+        specs.append(agent_spawn_tool(catalog))
+    # Provider tools (skill, skill.read_file, mcp.<server>.<tool>, …) are likewise registered by
+    # the loop bootstrap from tool_providers, so validation must know them too or a binding to a
+    # provider tool looks unknown (the DX-10/agent_spawn precedent). get_tools() is cheap here:
+    # SkillProvider does no I/O, and McpToolProvider caches its discovery after the first call.
+    for provider in tool_providers:
+        specs.extend(provider.get_tools())
+    return tuple(specs)
 
 
 def _runtime_config_uses_web(config: AgentRuntimeConfig) -> bool:
@@ -317,6 +379,17 @@ def _get_shared_loop() -> asyncio.AbstractEventLoop:
         return _shared_loop
 
 
+async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> None:
+    """Awaitable, cancellable exponential backoff with jitter — the async counterpart of the
+    gateway's sync ``_sleep_before_retry`` (used between turn-level auto-retries on the shared
+    loop). ``attempt`` is 1-based."""
+    delay = min(retry.max_delay_s, retry.initial_delay_s * (retry.backoff_multiplier ** max(0, attempt - 1)))
+    if retry.jitter_s > 0:
+        delay += random.uniform(0, retry.jitter_s)
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
 @dataclass
 class RunnerBackend:
     run_root: Path
@@ -335,6 +408,36 @@ class RunnerBackend:
     max_session_lifetime_s: float = 1800.0
     max_turns: int = 50
     task_wait_poll_s: float = 5.0
+    # A recoverable model-turn failure (turn_failed) keeps the session alive: a transient one
+    # is auto-retried with backoff; a config/auth 4xx parks for the user to fix + resend. A run
+    # that takes this many CONSECUTIVE failed turns (no settle between) is given up as failed.
+    # Only auto-retries count toward this cap; user-initiated resends are bounded by max_turns.
+    max_consecutive_turn_failures: int = 5
+    turn_retry: ModelRetryConfig = field(default_factory=ModelRetryConfig)
+    # Opt-in token streaming for the autonomous drive: when set, runs emit model.output.delta
+    # events (for adapters that support astream_turn) so an event-stream consumer renders tokens
+    # live. Off by default; a UI-facing embedder (e.g. studio) turns it on.
+    emit_output_deltas: bool = False
+    # Agent-as-tool delegation: subagent id -> definition. When non-empty, runs can bind
+    # agent.spawn (the loop bootstrap registers it). Child runs write to run_root/<child_id>/.
+    subagent_definitions: Mapping[str, SubagentDefinition] = field(default_factory=dict)
+    # Per-run factories for extra event sinks, appended to every run's sinks (besides the
+    # backend's own state sink). A FACTORY (not a shared instance) so each run gets its own sink —
+    # required for stateful sinks like OtelEventSink (per-run span state). The seam an embedder
+    # uses to attach observability without a core dep — e.g. studio sets ``(OtelEventSink,)`` when
+    # OTel is toggled on. Read at loop-build time so it can change at runtime. Empty → no deps.
+    extra_event_sink_factories: tuple[Any, ...] = ()
+    # Tool/context providers attached to every run the backend builds (Skills, MCP, custom).
+    # The embedder-facing seam for the loop's tool_providers/context_providers (the CLI passes
+    # these to AgentLoop directly; without these fields an out-of-process embedder could not
+    # attach a provider at all). INSTANCES, not factories (unlike extra_event_sink_factories):
+    # a provider holds a shared, reusable resource (MCP's live httpx client + discovery cache)
+    # or is immutable (SkillProvider) — both are safe to share across concurrent runs (the MCP
+    # client is documented thread-safe; SkillProvider is read-only). Read at loop-build time so
+    # a parked run re-attaches them on resume/restart. Their tools must also be declared to
+    # config validation — see _backend_builtin_tool_specs. Empty → no providers.
+    tool_providers: tuple[Any, ...] = ()
+    context_providers: tuple[Any, ...] = ()
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -411,11 +514,48 @@ class RunnerBackend:
         if record is not None:
             record.cancellation_token.cancel()
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, drain: bool = False, drain_timeout_s: float = 5.0) -> None:
         """Stop this backend's watchdog. The run loop is process-shared (one per process,
         cleaned up at exit via atexit), so there is nothing per-backend to tear down — and
-        stopping it here would break other backends in the process. Idempotent."""
+        stopping it here would break other backends in the process. Idempotent.
+
+        Pass ``drain=True`` to first cooperatively end this backend's own runs (see
+        :meth:`drain`), so an embedder that stops a backend mid-session leaves no parked
+        session coroutines on the shared loop (otherwise teardown logs "Task was destroyed
+        but it is pending")."""
+        if drain:
+            self.drain(timeout_s=drain_timeout_s)
         self.stop_watchdog()
+
+    def drain(self, *, timeout_s: float = 5.0) -> list[str]:
+        """Cooperatively end every non-terminal run this backend owns: cancel it and wake any
+        session parked on its message queue, then wait (bounded by ``timeout_s``) for each to
+        reach a terminal state.
+
+        Returns the run ids still non-terminal when the timeout elapsed (empty on a clean
+        drain). Idempotent; safe to call before :meth:`shutdown`. This is the one-call
+        counterpart to issuing a ``cancel_run`` per run and sleeping."""
+        terminal = {"completed", "failed", "limited"}
+        with self._lock:
+            records = [record for record in self._records.values() if record.status not in terminal]
+        for record in records:
+            with self._lock:
+                record.cancellation_token.cancel()
+                if not record.error_code:
+                    record.error = "run drained on shutdown"
+                    record.error_code = "cancelled"
+            # Wake a session parked on its message queue (put runs on the shared loop).
+            self._call_soon(record.message_queue.put_nowait, _CLOSE_SESSION)
+        deadline = time.time() + timeout_s
+        pending: list[str] = []
+        for record in records:
+            while time.time() < deadline:
+                if record.status in terminal:
+                    break
+                time.sleep(0.02)
+            else:
+                pending.append(record.run_id)
+        return pending
 
     def submit_run(self, request: BackendRunRequest) -> BackendRunSubmission:
         prepared = self._prepare_run_record(request)
@@ -449,7 +589,7 @@ class RunnerBackend:
             user_id=request.user_id,
             ttl_s=self.run_token_ttl_s,
         )
-        tool_specs = _backend_builtin_tool_specs()
+        tool_specs = _backend_builtin_tool_specs(self.subagent_definitions, self.tool_providers)
         initial_runtime_config = request.runtime_config
         runtime_config_issuer = "submit_run"
         runtime_config_reason = "initial runtime config"
@@ -547,12 +687,21 @@ class RunnerBackend:
         )
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        status_file = record.run_dir / "status.json"
+        run_dir = self._authorized_run_dir(run_id, token)
+        status_file = run_dir / "status.json"
         status_payload: dict[str, Any] | None = None
         if status_file.exists():
             status_payload = json.loads(status_file.read_text(encoding="utf-8"))
+        with self._lock:
+            record = self._records.get(run_id)
+        if record is None:
+            # Historical run (no live record, e.g. after a restart): report from status.json.
+            return {
+                "run_id": run_id,
+                "status": (status_payload or {}).get("status", "ended"),
+                "run_dir": str(run_dir),
+                "status_file": status_payload,
+            }
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
@@ -622,6 +771,16 @@ class RunnerBackend:
             **payload,
         }
 
+    def proposal_diff(self, run_id: str, token: str) -> dict[str, Any]:
+        """The unified diff of the current proposal, on demand (works mid-run, not only at the
+        end like ``result()``). Token-scoped so an embedder never reads the run dir off disk.
+        Binary files appear as a ``<binary sha256=… size=…>`` marker line in the patch."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        diff_path = record.run_dir / "diff.patch"
+        diff = diff_path.read_text(encoding="utf-8") if diff_path.exists() else ""
+        return {"run_id": run_id, "ready": diff_path.exists(), "diff": diff}
+
     def cancel_run(self, run_id: str, token: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)
         record = self._record(run_id)
@@ -650,12 +809,51 @@ class RunnerBackend:
             "error_code": record.error_code,
         }
 
-    def send_message(self, run_id: str, token: str, content: str) -> dict[str, Any]:
-        """Deliver a follow-up user message to a running multi-turn session. It is
-        queued and consumed as the next user turn once the current turn settles."""
+    def interrupt_turn(self, run_id: str, token: str) -> dict[str, Any]:
+        """Turn-level stop (keeps the session alive): signal the loop to halt the current
+        turn at its next step boundary; the driver then parks for the next message. Unlike
+        :meth:`cancel_run` this does NOT terminalize the run. A no-op on a terminal or
+        not-yet-built run. The flag set is a thread-safe one-way signal (like cancel)."""
         self._authorize_run(run_id, token)
         record = self._record(run_id)
-        if len(content.encode("utf-8")) > self.max_message_bytes:
+        with self._lock:
+            loop = record.loop
+            terminal = record.status in {"completed", "failed", "limited"}
+        requested = not terminal and loop is not None
+        if requested:
+            loop.interrupt_turn()
+        return {
+            "run_id": record.run_id,
+            "tenant_id": record.tenant_id,
+            "status": record.status,
+            "interrupt_requested": requested,
+        }
+
+    def send_message(
+        self, run_id: str, token: str, content: str | Sequence[Any]
+    ) -> dict[str, Any]:
+        """Deliver a follow-up user message to a running multi-turn session. It is queued and
+        consumed as the next user turn once the current turn settles.
+
+        ``content`` is either a plain ``str`` or a sequence of content parts (``ContentPart``
+        dataclasses or their JSON dicts) for a multimodal message. Multimodal parts reference
+        workspace files by ``source_ref`` — the bytes are resolved at wire-build time — so the
+        message itself stays small; the size limit applies to the by-reference wire form."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        message = _normalize_inbound_message(content)
+        # Normalize inline (data:) media to durable blobs BEFORE queueing, so the queue — and any
+        # checkpoint taken while the message is still unconsumed — carries only small blob: refs,
+        # never the bytes inline. The loop resolves these via the checkpoint-store blob_reader.
+        if isinstance(message, list) and self.checkpoint_store is not None:
+            pending: dict[str, bytes] = {}
+            message = normalize_inline_media_dicts(message, pending)
+            for data in pending.values():
+                self.checkpoint_store.put_blob(run_id, data)
+        wire_bytes = len(
+            (message if isinstance(message, str) else json.dumps(message)).encode("utf-8")
+        )
+        if wire_bytes > self.max_message_bytes:
             raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
@@ -663,7 +861,7 @@ class RunnerBackend:
             if record.message_queue.qsize() >= self.max_message_queue_depth:
                 raise ValueError("message queue is full; retry once the run drains it")
         # Enqueue on the shared loop (asyncio.Queue is not thread-safe across threads).
-        self._call_soon(record.message_queue.put_nowait, str(content))
+        self._call_soon(record.message_queue.put_nowait, message)
         return {"run_id": run_id, "status": "queued"}
 
     def current_runtime_config(self, run_id: str) -> AgentRuntimeConfig | None:
@@ -708,7 +906,9 @@ class RunnerBackend:
         config: AgentRuntimeConfig,
     ) -> dict[str, Any]:
         self._authorize_run(run_id, token)
-        validate_runtime_config(config, _backend_builtin_tool_specs())
+        validate_runtime_config(
+            config, _backend_builtin_tool_specs(self.subagent_definitions, self.tool_providers)
+        )
         record = self._record(run_id)
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
@@ -836,16 +1036,54 @@ class RunnerBackend:
         }
 
     def export_proposal_package(self, run_id: str, token: str) -> dict[str, Any]:
+        """Build the portable proposal package and return a RECEIPT — never a filesystem path.
+
+        The tar is stored as a content-addressed blob; the receipt's ``digest`` (sha256 of the tar
+        bytes) is the retrieval handle for :meth:`read_run_artifact`. This keeps the
+        "embedder never reads run_dir off disk" invariant for binary artifacts too: a remote
+        embedder fetches the bytes back by digest, exactly like Bazel CAS / an OCI blob."""
         self._authorize_run(run_id, token)
         record = self._record(run_id)
         output = record.run_dir / "proposal.tar"
         payload = export_package(record.run_dir, output)
+        tar_bytes = output.read_bytes()
+        assert self.checkpoint_store is not None
+        digest = self.checkpoint_store.put_blob(run_id, tar_bytes)
         append_event_to_run(
             record.run_dir,
             "proposal.package.exported",
-            data={"package_hash": payload["package_hash"], "package_path": str(output)},
+            data={"package_hash": payload["package_hash"], "digest": digest, "size_bytes": len(tar_bytes)},
         )
-        return payload
+        return {
+            "package_hash": payload["package_hash"],
+            "digest": digest,  # the fetch handle (sha256 of the tar bytes)
+            "size_bytes": len(tar_bytes),
+            "media_type": "application/x-tar",
+            "name": "proposal.tar",  # advisory filename for Content-Disposition only
+        }
+
+    def read_run_artifact(
+        self, run_id: str, token: str, digest: str, *, offset: int = 0, limit: int | None = None
+    ) -> bytes:
+        """Fetch a run artifact's bytes by its sha256 ``digest`` — the single token-scoped,
+        data-returning seam for binary artifacts (the export tar today, any blob tomorrow).
+
+        Content-addressed: the digest IS the capability (a sha256 is unguessable, so possessing one
+        is proof of knowledge of the content). ``offset``/``limit`` are accepted now so a future
+        streaming/range fetch is a non-breaking addition; today they slice the in-memory bytes.
+        Raises ``KeyError`` (→ 404) when the digest is unknown for this run, ``ValueError`` (→ 400)
+        for a malformed digest."""
+        self._authorize_run(run_id, token)
+        if not _ARTIFACT_DIGEST_RE.match(digest):
+            raise ValueError("digest must be a 64-char sha256 hex string")
+        assert self.checkpoint_store is not None
+        try:
+            data = self.checkpoint_store.get_blob(run_id, digest)
+        except KeyError as exc:
+            raise KeyError(f"artifact not found: {digest}") from exc
+        if offset or limit is not None:
+            data = data[offset : (None if limit is None else offset + limit)]
+        return data
 
     def approve_proposal(
         self,
@@ -931,9 +1169,7 @@ class RunnerBackend:
         return result.to_json()
 
     def events(self, run_id: str, token: str, *, from_seq: int = 0) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        events_path = record.run_dir / "events.jsonl"
+        events_path = self._authorized_run_dir(run_id, token) / "events.jsonl"
         events: list[dict[str, Any]] = []
         if events_path.exists():
             for line in events_path.read_text(encoding="utf-8").splitlines():
@@ -943,6 +1179,33 @@ class RunnerBackend:
                 if int(event.get("seq") or 0) >= from_seq:
                     events.append(event)
         return {"run_id": run_id, "events": events}
+
+    def descendant_events(
+        self, run_id: str, token: str, descendant_run_id: str, *, from_seq: int = 0
+    ) -> dict[str, Any]:
+        """Stream a descendant (subagent) run's events, authorized via the ancestor's run token.
+
+        A spawned subagent is an isolated child run (id ``<parent>.sub.<task>``) under the same
+        run_root but with NO backend record/token, so :meth:`events` can't reach it. The owner of
+        an ancestor run reads a descendant's events.jsonl here — its tool calls + token deltas —
+        for live subagent observability, without touching the filesystem itself. Authorization is
+        the ancestor's token plus an id-prefix descendant check (a subagent id always extends its
+        parent's with ``.sub.<task>``, at any depth)."""
+        self._authorize_run(run_id, token)
+        if descendant_run_id != run_id and not descendant_run_id.startswith(f"{run_id}.sub."):
+            raise PermissionDenied("run is not a descendant of the authorized run")
+        if any(sep in descendant_run_id for sep in ("/", "\\")) or ".." in descendant_run_id:
+            raise PermissionDenied("invalid descendant run id")
+        events_path = self.run_root / descendant_run_id / "events.jsonl"
+        events: list[dict[str, Any]] = []
+        if events_path.exists():
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                if int(event.get("seq") or 0) >= from_seq:
+                    events.append(event)
+        return {"run_id": descendant_run_id, "events": events}
 
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)
@@ -1038,8 +1301,9 @@ class RunnerBackend:
         shared open-session loop (also used by checkpoint recovery)."""
         record = self._record(run_id)
         await loop.aopen()
+        first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
         try:
-            suspension = await loop.arun_until_suspended(request.instruction)
+            suspension = await loop.arun_until_suspended(first_input)
         except NativeAgentError:
             # Bootstrap failed (terminal session already recorded); just finalize.
             return await loop.aclose()
@@ -1065,6 +1329,7 @@ class RunnerBackend:
         task-wait is offloaded with asyncio.to_thread (bounded by task_wait_poll_s and
         retried) since it blocks on the job manager's cross-thread condition (P2);
         report_task_result wakes it from another thread."""
+        consecutive_turn_failures = 0
         while True:
             if suspension.reason in {"terminal", "limited"}:
                 break
@@ -1078,7 +1343,66 @@ class RunnerBackend:
                     suspension = await loop.arun_until_suspended(None)
                 # else: tasks still pending after the poll window -> keep waiting.
                 continue
+            if suspension.reason == "turn_failed":
+                # Recoverable model-turn failure: the session is alive (core kept it so). Apply
+                # the retry POLICY here. Give up once too many turns fail in a row.
+                consecutive_turn_failures += 1
+                if consecutive_turn_failures >= self.max_consecutive_turn_failures or self._session_should_stop(
+                    record, started, turns
+                ):
+                    loop.fail_recoverable(
+                        suspension.error or "model turn failed repeatedly",
+                        error_code=suspension.error_code or "model_error",
+                    )
+                    break
+                if suspension.retryable:
+                    # Transient (429 / exhausted-5xx / network): bounded auto-retry with backoff,
+                    # then re-issue the SAME turn (no new user message).
+                    self._persist_run_checkpoint(record)
+                    await _async_sleep_before_retry(consecutive_turn_failures, self.turn_retry)
+                    if self._session_should_stop(record, started, turns):
+                        break
+                    suspension = await loop.arun_until_suspended(None)
+                    continue
+                # Non-retryable but recoverable (config/auth 4xx): a blind retry would just fail
+                # again. Park for the user to fix the config (model/effort) and resend. A one-shot
+                # run has nobody to resend, so finalize it as failed.
+                if not request.multi_turn:
+                    loop.fail_recoverable(
+                        suspension.error or "model turn failed",
+                        error_code=suspension.error_code or "model_error",
+                    )
+                    break
+                loop.await_user_input()
+                self._persist_run_checkpoint(record)
+                try:
+                    message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                except asyncio.TimeoutError:
+                    break
+                if message is _CLOSE_SESSION:
+                    break
+                turns += 1
+                suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
+                continue
+            if suspension.reason == "interrupted":
+                # Turn-level stop (the user hit "stop"): not a failure, not terminal. Park the
+                # multi-turn session for the next message; a one-shot run just closes. Does not
+                # count against the turn-failure streak.
+                if not request.multi_turn or self._session_should_stop(record, started, turns):
+                    break
+                loop.await_user_input()
+                self._persist_run_checkpoint(record)
+                try:
+                    message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                except asyncio.TimeoutError:
+                    break
+                if message is _CLOSE_SESSION:
+                    break
+                turns += 1
+                suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
+                continue
             # settled. One-shot runs close here; multi-turn awaits the next message.
+            consecutive_turn_failures = 0  # a settled turn clears the failure streak
             if not request.multi_turn:
                 break
             if self._session_should_stop(record, started, turns):
@@ -1093,7 +1417,7 @@ class RunnerBackend:
             if message is _CLOSE_SESSION:
                 break
             turns += 1
-            suspension = await loop.arun_until_suspended(message)
+            suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
         return await loop.aclose()
 
     def _persist_run_checkpoint(self, record: BackendRunRecord) -> None:
@@ -1111,7 +1435,9 @@ class RunnerBackend:
         # loop, so reading the asyncio.Queue's backing deque needs no lock (single-threaded
         # loop; producers enqueue via _call_soon on this same loop).
         residual = [
-            message for message in list(record.message_queue._queue) if isinstance(message, str)
+            message
+            for message in list(record.message_queue._queue)
+            if isinstance(message, (str, list))  # str text or list[dict] parts; drop the close sentinel
         ]
         checkpoint.queued_messages = residual
         # Overwrites the same seq the loop just committed, now with the queue included.
@@ -1173,13 +1499,17 @@ class RunnerBackend:
         return AgentLoop(
             spec=spec,
             model_adapter=adapter,
-            event_sinks=(BackendRunStateSink(self, run_id),),
+            event_sinks=(BackendRunStateSink(self, run_id), *(make() for make in self.extra_event_sink_factories)),
             permission_policy=request.permission_policy,
             cancellation_token=self._record(run_id).cancellation_token,
             shell_approval_provider=None,
             web_gateway_client=self._web_gateway_client(web_gateway_token),
             runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
             checkpoint_store=self.checkpoint_store,
+            emit_output_deltas=self.emit_output_deltas,
+            subagent_definitions=self.subagent_definitions,
+            tool_providers=self.tool_providers,
+            context_providers=self.context_providers,
         )
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
@@ -1212,7 +1542,8 @@ class RunnerBackend:
             self._write_run_meta(prepared.record, request)
             await loop.aopen()
             suspension: Suspension | None = None
-            async with loop.astream(request.instruction) as stream:
+            first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
+            async with loop.astream(first_input) as stream:
                 async for item in stream:
                     yield self._frame(item)
                 suspension = stream.suspension
@@ -1363,6 +1694,9 @@ class RunnerBackend:
             "mode": request.mode,
             "workspace_backend": request.workspace_backend,
             "multi_turn": request.multi_turn,
+            # For history listing (DX-12): a created-at stamp + a short title (first instruction).
+            "created_at": time.time(),
+            "title": " ".join((request.instruction or "").split())[:80],
             "limits": {
                 "max_steps": request.max_steps,
                 "max_tool_calls": request.max_tool_calls,
@@ -1435,6 +1769,45 @@ class RunnerBackend:
             return False
         self._clear_recover_attempts(run_dir)
         return True
+
+    def resume_run(self, run_id: str, token: str) -> dict[str, Any]:
+        """Resume a single parked run from its checkpoint — the token-scoped, single-run analog of
+        :meth:`recover_runs` (which is a process-global, no-token operator primitive).
+
+        This closes the read/write asymmetry: a token holder could always *read* a historical run
+        (:meth:`_authorized_run_dir` needs no in-memory record), but every *write* path goes through
+        :meth:`_authorize_run` → :meth:`_record`, which raises ``KeyError`` for a run not currently
+        in memory. ``resume_run`` materializes that record from the durable checkpoint so a follow-up
+        :meth:`send_message` works after a restart. Idempotent: a run already tracked in memory
+        returns ``resumed=False`` with its current status. The run token is the capability; its
+        claims are checked against the persisted ``run.json`` identity since there is no record yet.
+        """
+        claims = self._verify_run_token(run_id, token)
+        with self._lock:
+            existing = self._records.get(run_id)
+        if existing is not None:
+            if claims.tenant_id != existing.tenant_id or claims.user_id != existing.user_id:
+                raise PermissionDenied("token subject mismatch")
+            return {"run_id": run_id, "status": existing.status, "resumed": False}
+        if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
+            raise PermissionDenied("invalid run id")
+        run_dir = self.run_root / run_id
+        meta = _read_run_meta(run_dir)
+        if meta is None:
+            raise KeyError(f"unknown run: {run_id}")
+        if claims.tenant_id != (meta.get("tenant_id") or "") or claims.user_id != (meta.get("user_id") or ""):
+            raise PermissionDenied("token subject mismatch")
+        if (run_dir / "failure.json").exists():
+            raise ValueError("run is marked unrecoverable; inspect failure.json")
+        assert self.checkpoint_store is not None
+        stored = self.checkpoint_store.latest(run_id)
+        if stored is None or stored.checkpoint.terminal:
+            raise ValueError("run has no resumable checkpoint")
+        if not self._attempt_resume(run_dir, run_id):
+            # _attempt_resume bumps the durable attempt counter / writes failure.json at the cap.
+            raise ValueError("resume failed; inspect run logs / failure.json")
+        record = self._record(run_id)
+        return {"run_id": run_id, "status": record.status, "resumed": True}
 
     # --- Active watchdog / lease (operational layer; the core never auto-recovers) -------
 
@@ -1575,13 +1948,17 @@ class RunnerBackend:
         loop = AgentLoop(
             spec=spec,
             model_adapter=adapter,
-            event_sinks=(BackendRunStateSink(self, run_id),),
+            event_sinks=(BackendRunStateSink(self, run_id), *(make() for make in self.extra_event_sink_factories)),
             permission_policy=request.permission_policy,
             cancellation_token=record.cancellation_token,
             shell_approval_provider=None,
             web_gateway_client=self._web_gateway_client(web_gateway_token),
             runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
             checkpoint_store=self.checkpoint_store,
+            emit_output_deltas=self.emit_output_deltas,
+            subagent_definitions=self.subagent_definitions,
+            tool_providers=self.tool_providers,
+            context_providers=self.context_providers,
         )
         # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
         # restore re-applies the agent's delta from the checkpoint's content blobs.
@@ -1639,8 +2016,8 @@ class RunnerBackend:
             raise ValueError("tenant_id is required")
         if not request.user_id.strip():
             raise ValueError("user_id is required")
-        if not request.instruction.strip():
-            raise ValueError("instruction is required")
+        if not request.instruction.strip() and not request.input_parts:
+            raise ValueError("instruction or input_parts is required")
         if request.mode not in {"read-only", "propose", "apply"}:
             raise ValueError(f"unsupported mode: {request.mode}")
         if request.workspace_backend not in {"overlay", "staging"}:
@@ -1655,18 +2032,104 @@ class RunnerBackend:
             raise PermissionDenied(f"workspace root is outside allowed roots: {workspace_root}")
 
     def _authorize_run(self, run_id: str, token: str) -> None:
-        try:
-            claims = self.token_manager.verify(
-                token,
-                kind="run_access",
-                audience="native-agent-runner.backend",
-                run_id=run_id,
-            )
-        except TokenError as exc:
-            raise PermissionDenied(str(exc)) from exc
+        claims = self._verify_run_token(run_id, token)
         record = self._record(run_id)
         if claims.tenant_id != record.tenant_id or claims.user_id != record.user_id:
             raise PermissionDenied("token subject mismatch")
+
+    def _verify_run_token(self, run_id: str, token: str) -> Any:
+        """Verify a run-access token for ``run_id`` (signature/kind/audience/run id), returning
+        its claims. Does NOT require an in-memory record — the signed token is the capability."""
+        try:
+            return self.token_manager.verify(
+                token, kind="run_access", audience="native-agent-runner.backend", run_id=run_id
+            )
+        except TokenError as exc:
+            raise PermissionDenied(str(exc)) from exc
+
+    def _authorized_run_dir(self, run_id: str, token: str) -> Path:
+        """Resolve a run's directory for a token-authorized READ — live or historical.
+
+        A live run is checked against its in-memory record (as :meth:`_authorize_run` does). A run
+        with no record (e.g. after a restart, surfaced by :meth:`list_runs`) is authorized on the
+        signed run token's own claims and read straight from run_root. Rejects path separators so
+        a crafted run id can't escape run_root."""
+        claims = self._verify_run_token(run_id, token)
+        with self._lock:
+            record = self._records.get(run_id)
+        if record is not None:
+            if claims.tenant_id != record.tenant_id or claims.user_id != record.user_id:
+                raise PermissionDenied("token subject mismatch")
+            return record.run_dir
+        if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
+            raise PermissionDenied("invalid run id")
+        return self.run_root / run_id
+
+    def list_runs(
+        self, tenant_id: str, *, user_id: str | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        """List a tenant's runs from ``run_root`` (newest first) — the durable history.
+
+        A trusted-host call (no token, like :meth:`recover_runs`): the embedder owns the run_root
+        and is responsible for tenant scoping. Reads each run.json (skipping subagent child runs,
+        which have none) for identity + title + created_at, takes the live status from an
+        in-memory record when present else status.json, and mints a fresh read-scoped run token
+        per entry so the caller can fetch events/status afterwards (mirrors submit_run returning a
+        run token). ``recoverable`` flags a parked run a restart can resume via recover_runs."""
+        runs: list[dict[str, Any]] = []
+        if not self.run_root.is_dir():
+            return {"runs": runs}
+        for run_dir in self.run_root.iterdir():
+            meta_path = run_dir / "run.json"
+            if not run_dir.is_dir() or not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            if meta.get("tenant_id") != tenant_id:
+                continue
+            run_user = meta.get("user_id") or ""
+            if user_id is not None and run_user != user_id:
+                continue
+            run_id = meta.get("run_id") or run_dir.name
+            with self._lock:
+                record = self._records.get(run_id)
+            if record is not None:
+                status = record.status
+            else:
+                status = "ended"
+                status_path = run_dir / "status.json"
+                if status_path.exists():
+                    try:
+                        status = json.loads(status_path.read_text(encoding="utf-8")).get("status", "ended")
+                    except (ValueError, OSError):
+                        pass
+            recoverable = False
+            if record is None and not (run_dir / "failure.json").exists() and self.checkpoint_store is not None:
+                stored = self.checkpoint_store.latest(run_id)
+                recoverable = stored is not None and not stored.checkpoint.terminal
+            runs.append(
+                {
+                    "run_id": run_id,
+                    "tenant_id": tenant_id,
+                    "user_id": run_user,
+                    "title": meta.get("title") or "",
+                    "created_at": meta.get("created_at") or 0.0,
+                    "status": status,
+                    "recoverable": recoverable,
+                    "read_token": self.token_manager.issue(
+                        kind="run_access",
+                        audience="native-agent-runner.backend",
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        user_id=run_user,
+                        ttl_s=self.run_token_ttl_s,
+                    ),
+                }
+            )
+        runs.sort(key=lambda entry: entry["created_at"], reverse=True)
+        return {"runs": runs[:limit]}
 
     def _record(self, run_id: str) -> BackendRunRecord:
         with self._lock:

@@ -8,7 +8,12 @@ touching the loop or the model adapter, in two layers:
   context fixed for the whole run (environment notes, conventions).
 * ``dynamic_segment(turn)`` is called every turn and appended to that turn's
   system prompt. Use it for context that changes as the run progresses (plan
-  state, remaining budget) — analogous to per-turn "system reminders".
+  state, remaining budget) — analogous to per-turn "system reminders". Because
+  ``turn`` carries ``bound_tools`` (the tool ids actually bound this turn), a
+  provider can **gate its segment on the live config** — e.g. a Skills catalog
+  appears only while the ``skill`` tool is bound, and disappears the turn after
+  the capability is toggled off (a hot-swap). This is the per-run gating that
+  ``static_segment`` (composed once at bootstrap) cannot express.
 
 Both return ``None`` (or blank) to contribute nothing. With no providers the
 per-turn prompt is byte-identical to the static composed prompt, so the default
@@ -34,6 +39,10 @@ class TurnContext:
     deadline_s: float | None  # seconds left until the run deadline, or None if unbounded
     plan: tuple[dict[str, Any], ...]
     pending_observation_count: int
+    # Registry tool ids bound for THIS turn (after runtime-config + tool-surface resolution).
+    # Lets a dynamic_segment gate itself on what's actually available now — the seam that makes
+    # a provider's context hot-swappable with the config. Empty by default (back-compat).
+    bound_tools: frozenset[str] = frozenset()
 
 
 class ContextProvider(Protocol):

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from conftest import runtime_config, runtime_provider, tool_binding
 
+from native_agent_runner.core.context import TurnContext
 from native_agent_runner.core.spec import AgentRunSpec
 from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelTurn
@@ -107,16 +108,32 @@ def test_from_frontmatter_allowed_tools_inline_list() -> None:
     assert definition.allowed_tools == ("fs.read", "shell.exec")
 
 
-# --- L1: catalog (static_segment) --------------------------------------------------
+# --- L1: catalog (dynamic_segment, gated on the skill tool being bound) ------------
 
 
-def test_static_segment_lists_catalog(tmp_path: Path) -> None:
+def _turn(*, bound_tools: frozenset[str] = frozenset()) -> TurnContext:
+    return TurnContext(
+        step=1,
+        remaining_steps=10,
+        remaining_tool_calls=10,
+        deadline_s=None,
+        plan=(),
+        pending_observation_count=0,
+        bound_tools=bound_tools,
+    )
+
+
+def test_catalog_emitted_only_when_skill_tool_is_bound(tmp_path: Path) -> None:
     _write_skill(tmp_path, "pdf-fill", description="Fill PDF forms")
     _write_skill(tmp_path, "commit-msg", description="Write commit messages")
     provider = SkillProvider(load_skill_definitions(tmp_path))
 
-    segment = provider.static_segment()
+    # The catalog is config-gated (DX-17): it is a per-turn dynamic segment, present only when
+    # the `skill` tool is bound this turn — so it disappears when the capability is toggled off.
+    assert provider.static_segment() is None
+    assert provider.dynamic_segment(_turn(bound_tools=frozenset())) is None
 
+    segment = provider.dynamic_segment(_turn(bound_tools=frozenset({"skill"})))
     assert segment is not None
     assert "- pdf-fill: Fill PDF forms" in segment
     assert "- commit-msg: Write commit messages" in segment
@@ -126,6 +143,7 @@ def test_static_segment_lists_catalog(tmp_path: Path) -> None:
 def test_empty_provider_is_inert() -> None:
     provider = SkillProvider({})
     assert provider.static_segment() is None
+    assert provider.dynamic_segment(_turn(bound_tools=frozenset({"skill"}))) is None
     assert list(provider.get_tools()) == []
     assert provider.tool_bindings() == ()
 
