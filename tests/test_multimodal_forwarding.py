@@ -539,3 +539,55 @@ def test_inline_media_ingested_to_blob_survives_restore(tmp_path: Path) -> None:
     img_b = [p for p in user_b["content"] if p.get("type") == "image"][0]
     assert base64.b64decode(img_b["source"]["data"]) == _PNG_BYTES
     loop_b.close()
+
+
+# --- close-out: resolver blob fallback, tool inline media, gap-2b eager guard ----------
+
+
+def test_resolver_blob_reader_fallback(tmp_path: Path) -> None:
+    from native_agent_runner.core.media import WorkspaceMediaResolver
+
+    (tmp_path / "workspace").mkdir()
+    workspace = LocalWorkspaceBackend(tmp_path / "workspace")
+    sha = __import__("hashlib").sha256(_PNG_BYTES).hexdigest()
+    # Not in the in-memory map; only reachable via the blob_reader (e.g. the checkpoint store).
+    resolver = WorkspaceMediaResolver(
+        workspace, blobs={}, blob_reader=lambda s: _PNG_BYTES if s == sha else (_ for _ in ()).throw(KeyError(s))
+    )
+    resolved = resolver.resolve(f"blob:{sha}", "image/png")
+    assert resolved.data == _PNG_BYTES and resolved.sha256 == sha
+    # A blob absent from both map and reader raises.
+    with pytest.raises(Exception):
+        resolver.resolve("blob:" + "0" * 64, "image/png")
+
+
+def test_observation_message_normalizes_inline_tool_media() -> None:
+    # A tool that returns inline (data:) media gets it normalized to a durable blob — symmetric
+    # with user-input media (gap: tool-result inline media).
+    from native_agent_runner.loop import _observation_message
+    from native_agent_runner.providers.base import ToolObservation
+
+    data_uri = "data:image/png;base64," + base64.b64encode(_PNG_BYTES).decode()
+    obs = ToolObservation(
+        tool_name="snap", call_id="c1", output="took a screenshot",
+        media=({"type": "image", "source_ref": data_uri, "mime_type": "image/png"},),
+    )
+    store: dict[str, bytes] = {}
+    msg = _observation_message(obs, store)
+    ref = msg["media"][0]["source_ref"]
+    assert ref.startswith("blob:")
+    assert store[ref[len("blob:"):]] == _PNG_BYTES
+
+
+def test_fs_read_media_rejects_oversized_eagerly(tmp_path: Path) -> None:
+    # gap 2b: media that would not fit the wire-build cap (max_bytes_read) is rejected at the tool
+    # call — adjacent to the cause — with an actionable message, not late at wire-build.
+    ws_dir = tmp_path / "workspace"
+    ws_dir.mkdir()
+    ws_dir.joinpath("big.png").write_bytes(_PNG_BYTES + b"\x00" * 2000)
+    workspace = LocalWorkspaceBackend(ws_dir, max_bytes_read=500)
+    tools = {tool.id: tool for tool in builtin_tools(workspace)}
+    with pytest.raises(WorkspaceError) as exc:
+        # max_bytes arg larger than the run cap would otherwise let a doomed reference through.
+        tools["fs.read_media"].handler(None, {"path": "big.png", "max_bytes": 10000})  # type: ignore[arg-type]
+    assert "max_bytes_read" in str(exc.value)

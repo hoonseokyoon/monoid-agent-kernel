@@ -46,6 +46,7 @@ from native_agent_runner.core.content import (
     content_part_from_json,
     content_part_to_json,
 )
+from native_agent_runner.core.media import normalize_inline_media_dicts
 from native_agent_runner.core.spec import (
     AgentRunSpec,
     ModelConfig,
@@ -823,6 +824,14 @@ class RunnerBackend:
         self._authorize_run(run_id, token)
         record = self._record(run_id)
         message = _normalize_inbound_message(content)
+        # Normalize inline (data:) media to durable blobs BEFORE queueing, so the queue — and any
+        # checkpoint taken while the message is still unconsumed — carries only small blob: refs,
+        # never the bytes inline. The loop resolves these via the checkpoint-store blob_reader.
+        if isinstance(message, list) and self.checkpoint_store is not None:
+            pending: dict[str, bytes] = {}
+            message = normalize_inline_media_dicts(message, pending)
+            for data in pending.values():
+                self.checkpoint_store.put_blob(run_id, data)
         wire_bytes = len(
             (message if isinstance(message, str) else json.dumps(message)).encode("utf-8")
         )

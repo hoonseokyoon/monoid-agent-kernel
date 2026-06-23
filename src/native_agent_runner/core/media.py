@@ -17,7 +17,7 @@ import base64
 import math
 import re
 import struct
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, TypeVar
 
@@ -125,22 +125,48 @@ def parse_data_uri(source_ref: str) -> tuple[str, bytes] | None:
     return (match.group("mime") or "application/octet-stream"), data
 
 
-def normalize_inline_media_part(part: _PartT, store: dict[str, bytes]) -> _PartT:
-    """If ``part`` carries inline bytes (a ``data:`` ``source_ref``), persist the bytes into
-    ``store`` keyed by sha256 and return a copy whose ``source_ref`` is the durable
-    ``blob:<sha256>`` reference. Non-media parts and already-by-reference parts pass through
-    unchanged. ``store`` is the loop's content-addressed media-blob map (collected into the
-    checkpoint), so an inline image becomes durable the moment it is ingested."""
-    source_ref = getattr(part, "source_ref", None)
+def _blobify_data_uri(source_ref: Any, store: dict[str, bytes]) -> str | None:
+    """If ``source_ref`` is an inline ``data:`` URI, persist its bytes into ``store`` keyed by
+    sha256 and return the durable ``blob:<sha256>`` reference; otherwise ``None``."""
     if not isinstance(source_ref, str) or not source_ref.startswith("data:"):
-        return part
+        return None
     parsed = parse_data_uri(source_ref)
     if parsed is None:  # pragma: no cover - startswith("data:") guarantees a match
-        return part
+        return None
     data = parsed[1]
     sha = sha256_bytes(data)
     store[sha] = data
-    return replace(part, source_ref=f"{BLOB_SCHEME}{sha}")  # type: ignore[type-var]
+    return f"{BLOB_SCHEME}{sha}"
+
+
+def normalize_inline_media_part(part: _PartT, store: dict[str, bytes]) -> _PartT:
+    """If ``part`` (a ``ContentPart`` dataclass) carries inline bytes (a ``data:`` ``source_ref``),
+    persist the bytes into ``store`` and return a copy whose ``source_ref`` is the durable
+    ``blob:<sha256>`` reference. Non-media / already-by-reference parts pass through unchanged.
+    ``store`` is the loop's content-addressed media-blob map, so an inline image becomes durable
+    the moment it is ingested."""
+    blob_ref = _blobify_data_uri(getattr(part, "source_ref", None), store)
+    if blob_ref is None:
+        return part
+    return replace(part, source_ref=blob_ref)  # type: ignore[type-var]
+
+
+def normalize_inline_media_dicts(
+    parts: list[dict[str, Any]], store: dict[str, bytes]
+) -> list[dict[str, Any]]:
+    """Dict form of :func:`normalize_inline_media_part`, for the by-value message media lists
+    (``ToolObservation.media`` / a user message's ``content`` parts are already JSON dicts). Any
+    part with an inline ``data:`` source is rewritten to a ``blob:<sha>`` ref with the bytes in
+    ``store`` — so tool-returned inline media is symmetric with user-input inline media."""
+    out: list[dict[str, Any]] = []
+    for part in parts:
+        if isinstance(part, dict):
+            blob_ref = _blobify_data_uri(part.get("source_ref"), store)
+            if blob_ref is not None:
+                out.append({**part, "source_ref": blob_ref})
+                continue
+        out.append(part)
+    return out
 
 
 def blob_shas_in_messages(messages: tuple[dict[str, Any], ...]) -> set[str]:
@@ -187,25 +213,30 @@ class MediaResolver(Protocol):
 class WorkspaceMediaResolver:
     """Resolve media references to bytes at wire-build time.
 
-    Two reference kinds are resolvable: a ``blob:<sha256>`` content-addressed reference (read from
-    the in-memory ``blobs`` map — inline-ingested media that was normalized to a durable checkpoint
-    blob), and a workspace path (bare, or with a ``workspace:`` / ``workspace://`` prefix), read via
-    ``Workspace.read_bytes``. Any other URI scheme (``http://``, ``file_id:`` …) is a deferred
-    remote/opaque handle and raises ``MediaResolveError``.
+    Three reference kinds are resolvable: a ``blob:<sha256>`` content-addressed reference (read from
+    the in-memory ``blobs`` map first, then the optional ``blob_reader`` fallback — typically the
+    checkpoint blob store, so a blob a *peer* persisted, e.g. the backend normalizing a queued inline
+    message, still resolves); and a workspace path (bare, or with a ``workspace:`` / ``workspace://``
+    prefix), read via ``Workspace.read_bytes``. Any other URI scheme (``http://``, ``file_id:`` …) is
+    a deferred remote/opaque handle and raises ``MediaResolveError``.
     """
 
     workspace: Workspace
     blobs: Mapping[str, bytes] = field(default_factory=dict)
+    # Fallback for a blob: ref absent from the in-memory map — e.g. ``store.get_blob(run_id, sha)``.
+    blob_reader: Callable[[str], bytes] | None = None
 
     def resolve(self, source_ref: str, mime_type: str, *, max_bytes: int | None = None) -> ResolvedMedia:
         if source_ref.startswith(BLOB_SCHEME):
             sha = source_ref[len(BLOB_SCHEME):]
-            try:
-                data = self.blobs[sha]
-            except KeyError as exc:
-                raise MediaResolveError(
-                    f"cannot resolve media blob {source_ref!r}: not in the blob store"
-                ) from exc
+            data = self.blobs.get(sha)
+            if data is None and self.blob_reader is not None:
+                try:
+                    data = self.blob_reader(sha)
+                except KeyError:
+                    data = None
+            if data is None:
+                raise MediaResolveError(f"cannot resolve media blob {source_ref!r}: not in the blob store")
             if max_bytes is not None and len(data) > max_bytes:
                 raise MediaResolveError(f"media blob exceeds max read size: {source_ref!r}")
             return ResolvedMedia(data=data, sha256=sha, mime_type=mime_type)
@@ -213,9 +244,12 @@ class WorkspaceMediaResolver:
         try:
             data, digest = self.workspace.read_bytes(path, max_bytes=max_bytes)
         except NativeAgentError as exc:
-            # Surface a missing/oversized blob loudly under the resolver contract,
-            # preserving the underlying cause (e.g. on resume with a deleted file).
-            raise MediaResolveError(f"cannot resolve media source_ref {source_ref!r}: {exc}") from exc
+            # Surface a missing/oversized workspace read loudly, with an actionable remedy — the
+            # cap is a run-level knob a caller would not associate with media (gap 2b).
+            raise MediaResolveError(
+                f"cannot resolve media source_ref {source_ref!r}: {exc}. If this is a size limit, "
+                f"raise the run's max_bytes_read, or downsample/re-ingest the media below the cap."
+            ) from exc
         return ResolvedMedia(data=data, sha256=digest, mime_type=mime_type)
 
     @staticmethod

@@ -565,4 +565,42 @@ carries no `package_path`; the fetched bytes' sha256 equals the receipt digest; 
 data path and proxying bytes is the bottleneck — until then it only adds expiry/range-signing/HEAD
 pitfalls); actual range streaming (the `offset`/`limit` seam is in place for it).
 
+### R13c (media gap close-out: queue bloat, tool-result inline, late size error) — researched, then unified on the blob path
+Three remaining media gaps closed in one pass; each researched against prior art first.
+
+**(1) R13b edge — unconsumed inline follow-up bloats the queue checkpoint.** A `data:` follow-up sent
+via `send_message` sat in the backend queue as raw bytes; a checkpoint taken before it was consumed
+wrote the bytes into `queued_messages`. **Fix:** `send_message` now normalizes inline `data:` media to
+a durable blob via the new `put_blob` (R9b) BEFORE queueing — the queue (and any checkpoint of it)
+carries only a small `blob:<sha>` ref. For the loop to resolve a blob a *peer* persisted (not in its
+in-memory `media_blobs`), `WorkspaceMediaResolver` gained a `blob_reader` fallback wired to
+`store.get_blob(run_id, sha)`. This is the **resolver unification**: a `blob:` ref resolves from
+(in-memory media_blobs ∪ checkpoint store), so export artifacts, user media, and queued media all
+share one digest-addressed path.
+
+**(2) Tool-result inline media (symmetry).** Inline normalization was user-input-only;
+`ToolResult.media` was workspace-reference-only. Research (Anthropic `tool_result` reuses the *same*
+image block as user messages; MCP carries tool media by-value `ImageContent` AND by-reference
+`ResourceLink`) → the content-model-first systems choose **symmetry**; the asymmetric ones
+(OpenAI/LangChain) only differ because their tool channel is text-only, which we don't have. **Fix:**
+`_observation_message` runs tool media through `normalize_inline_media_dicts` — a tool returning a
+`data:` part lands in the same blob store as user media and survives restart. (Our sha-keyed dedup is
+actually ahead of every public spec — nobody else mandates it.)
+
+**(3) Gap 2b — workspace-path media fails the size cap late & non-actionably.** Research (Anthropic/
+OpenAI/Gemini all reject at the API/upload boundary with the limit + actual + remedy; guard-clause /
+413 literature: validate at the edge) recommended **both** an eager boundary check and an actionable
+backstop, sharing one threshold. **Fix:** (a) `fs.read_media` — the producer of workspace-path tool
+media — now rejects eagerly, adjacent to the cause, if the media exceeds the run's `max_bytes_read`
+(the *same* cap wire-build uses, so the two checks can't disagree — research pitfall #1), with an
+actionable message ("Raise max_bytes_read or downsample"); (b) the wire-build `MediaResolveError`
+gained the remedy text; (c) `Workspace.read_bytes`'s size error now names the actual bytes + the
+limit (Anthropic-style "N bytes > M bytes"). Inline/`blob:` media is unaffected — it resolves from
+memory/store, never through the `max_bytes_read` text-read cap.
+
+**Verified:** core units (resolver `blob_reader` fallback; `_observation_message` inline→blob;
+`fs.read_media` eager reject) + backend (inline follow-up blobified before the queue, blob in store,
+durable log holds `blob:` not `data:`) + live HTTP (studio follow-up attach → forwarded, blob in
+store, zero workspace files). Fork still seeds `media_blobs`, so subagents inherit blob refs.
+
 <!-- Add new entries below as later rungs surface them. -->

@@ -35,6 +35,7 @@ from native_agent_runner.core.media import (
     evict_tool_result_images,
     image_dimensions,
     native_image_token_cap,
+    normalize_inline_media_dicts,
     normalize_inline_media_part,
     resolve_wire_messages,
 )
@@ -372,7 +373,7 @@ class AgentToolContext(ToolContext):
         return requested
 
 
-def _observation_message(observation: ToolObservation) -> dict[str, Any]:
+def _observation_message(observation: ToolObservation, media_store: dict[str, bytes]) -> dict[str, Any]:
     """Provider-neutral by-value message for a tool/async observation. Preserves the
     ``is_background`` → role semantics the adapters use: a background/hosted result is a
     new user message; a tool result is a ``tool`` message keyed by ``call_id``."""
@@ -384,9 +385,10 @@ def _observation_message(observation: ToolObservation) -> dict[str, Any]:
         "content": observation.output,
     }
     if observation.media:
-        # By reference; resolved to wire blocks at send time and delivered per provider
-        # (a follow-up user message for OpenAI/gateway).
-        message["media"] = list(observation.media)
+        # By reference; resolved to wire blocks at send time and delivered per provider (a follow-up
+        # user message for OpenAI/gateway). Inline (data:) media a tool returned is normalized to a
+        # durable blob here, symmetric with user-input media — so tool media survives restart too.
+        message["media"] = normalize_inline_media_dicts(list(observation.media), media_store)
     return message
 
 
@@ -1159,6 +1161,17 @@ class AgentLoop:
         if self.checkpoint_store is None:
             self.checkpoint_store = LocalFsCheckpointStore(self.spec.run_root)
         return self.checkpoint_store
+
+    def _media_blob_reader(self) -> Callable[[str], bytes] | None:
+        """A ``sha -> bytes`` reader over the durable blob store, so the wire-build resolver can
+        resolve a ``blob:`` ref that a peer persisted (e.g. the backend normalizing a queued inline
+        message via ``put_blob``) and that is therefore not in this loop's in-memory ``media_blobs``.
+        ``None`` when no store is configured (in-memory media_blobs then covers everything)."""
+        store = self.checkpoint_store
+        if store is None:
+            return None
+        run_id = self.spec.run_id
+        return lambda sha: store.get_blob(run_id, sha)
 
     def _persist_checkpoint(self, session: _Session) -> None:
         """Best-effort durable checkpoint at a park point. No-op when ``snapshot()``
@@ -1965,7 +1978,7 @@ class AgentLoop:
             if user_message is not None:
                 state.messages.append(user_message)
             for observation in state.pending_observations:
-                state.messages.append(_observation_message(observation))
+                state.messages.append(_observation_message(observation, state.media_blobs))
             # Bound the by-value conversation log: a runaway multi-turn run must settle
             # safely (status ``limited``, last-good checkpoint intact) rather than grow the
             # resent-every-turn log without limit. Checked before the call so an over-limit
@@ -2024,7 +2037,9 @@ class AgentLoop:
                     evicted = before - count_tool_result_images(wire_messages)
                 wire_messages = resolve_wire_messages(
                     wire_messages,
-                    WorkspaceMediaResolver(res.workspace, blobs=state.media_blobs),
+                    WorkspaceMediaResolver(
+                        res.workspace, blobs=state.media_blobs, blob_reader=self._media_blob_reader()
+                    ),
                     encoding=getattr(self.model_adapter, "wire_image_encoding", "base64"),
                 )
                 self._emit_media_accounting(
