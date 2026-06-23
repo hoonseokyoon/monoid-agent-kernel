@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.errors import ModelAdapterError
+from native_agent_runner.errors import ModelAdapterError, NativeAgentError
 from native_agent_runner.providers.base import ModelRequest, ModelTurn, TextDelta, TurnComplete
 from native_agent_runner.providers.fake import (
     FakeModelAdapter,
@@ -420,6 +420,34 @@ def test_settings_lists_capabilities_and_provider(tmp_path: Path) -> None:
     assert {a["key"] for a in s["available"]} == set(_ALL_CAPABILITIES)
 
 
+def test_read_file_returns_workspace_content(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "notes.md").write_bytes(b"# hi\nbody")  # bytes: avoid Windows newline translation
+    server = StudioServer(StudioConfig(workspace=ws, provider="offline"))
+    r = server.read_file("notes.md")
+    assert r["binary"] is False and r["truncated"] is False
+    assert r["content"] == "# hi\nbody"
+
+
+def test_read_file_rejects_traversal(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (tmp_path / "secret.txt").write_text("nope", encoding="utf-8")
+    server = StudioServer(StudioConfig(workspace=ws, provider="offline"))
+    with pytest.raises(NativeAgentError):
+        server.read_file("../secret.txt")
+
+
+def test_read_file_flags_binary(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "blob.bin").write_bytes(b"PK\x03\x04\x00\x00binary")
+    server = StudioServer(StudioConfig(workspace=ws, provider="offline"))
+    r = server.read_file("blob.bin")
+    assert r["binary"] is True and r["content"] == ""
+
+
 def test_settings_change_applies_to_new_chats(studio: StudioServer) -> None:
     studio.update_settings(capabilities=["read"])
     run_id = studio.start_chat("hi")["run_id"]
@@ -446,6 +474,21 @@ def test_settings_reasoning_summary_visibility(studio: StudioServer) -> None:
     config = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
     assert config.model is not None
     assert config.model.reasoning.summary == "off"
+
+
+def test_otel_toggle_attaches_per_run_sink_factory(studio: StudioServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Tier-3: toggling OTel attaches a per-run OtelEventSink FACTORY (not a shared instance) on
+    # the backend; toggling off detaches it. Provider setup is stubbed (real SDK = Jaeger live test).
+    import native_agent_runner.reference.studio.server as srv
+    from native_agent_runner.observability.otel import OtelEventSink
+
+    monkeypatch.setattr(srv, "_ensure_otel_provider", lambda endpoint: None)
+    assert studio.settings()["otel"] is False
+    studio.update_settings(otel=True)
+    assert studio.settings()["otel"] is True
+    assert studio._backend.extra_event_sink_factories == (OtelEventSink,)  # type: ignore[union-attr]
+    studio.update_settings(otel=False)
+    assert studio._backend.extra_event_sink_factories == ()  # type: ignore[union-attr]
 
 
 def test_settings_hot_swaps_active_session(studio: StudioServer) -> None:

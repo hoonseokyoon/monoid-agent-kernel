@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 import threading
 import time
@@ -59,6 +60,7 @@ _USER = "local"
 # Directories never shown in the file tree (and not worth walking).
 _TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".ruff_cache", ".pytest_cache"}
 _TREE_MAX_ENTRIES = 2000
+_VIEW_MAX_BYTES = 256 * 1024  # file-viewer read cap — keep a huge file from stalling the UI
 
 
 # Obvious destructive command prefixes the shell binding refuses outright (a binding-level
@@ -152,6 +154,35 @@ _ALL_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh")
 _DEFAULT_SUMMARY = "auto"
 _SUMMARY_CHOICES = ("off", "auto", "detailed")
 
+# OTel tracing (Tier-3): when toggled on, runs emit GenAI spans via OtelEventSink to an OTLP
+# collector (default = a local Jaeger's OTLP/HTTP port). The exporter + global provider are set
+# up once, lazily; the sink is a no-op until then.
+_OTEL_ENDPOINT = os.environ.get("NAR_OTEL_ENDPOINT", "http://localhost:4318/v1/traces")
+_otel_provider_ready = False
+
+
+def _ensure_otel_provider(endpoint: str) -> None:
+    """Install a global OTel TracerProvider with an OTLP/HTTP span exporter (idempotent). Raises
+    NativeAgentError with an actionable hint if the OTel SDK/exporter extras aren't installed."""
+    global _otel_provider_ready
+    if _otel_provider_ready:
+        return
+    try:
+        from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    except ImportError as exc:
+        raise NativeAgentError(
+            "OTel tracing needs the opentelemetry SDK + OTLP/HTTP exporter "
+            "(pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http)"
+        ) from exc
+    provider = TracerProvider(resource=Resource.create({"service.name": "agent-studio"}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+    trace.set_tracer_provider(provider)
+    _otel_provider_ready = True
+
 
 # System prompt: introduce the agent + nudge it to keep a live plan (Plan panel). The plan is
 # pure observability — the model self-reports via run.update_plan; the engine never enforces it.
@@ -232,6 +263,7 @@ class StudioServer:
         self._model: str = _DEFAULT_MODEL
         self._effort: str = _DEFAULT_EFFORT
         self._summary: str = _DEFAULT_SUMMARY
+        self._otel: bool = False  # OTel span export toggle (Tier-3)
         # run_id -> run access token (held server-side, never sent to the browser).
         self._run_tokens: dict[str, str] = {}
         # Chat sessions started this server run (newest first): the history list. In-memory only —
@@ -473,6 +505,7 @@ class StudioServer:
             "efforts": list(_EFFORT_CHOICES),
             "summary": self._summary,
             "summaries": list(_SUMMARY_CHOICES),
+            "otel": self._otel,
         }
 
     def update_settings(
@@ -482,10 +515,11 @@ class StudioServer:
         model: str | None = None,
         effort: str | None = None,
         summary: str | None = None,
+        otel: bool | None = None,
     ) -> dict[str, Any]:
-        """Change the Agent's capabilities / model / reasoning effort / summary. Only provided
-        fields change. New chats use the result; active sessions are hot-swapped in place via
-        runtime-config replacement (applied at their next turn)."""
+        """Change the Agent's capabilities / model / reasoning effort / summary / OTel tracing.
+        Only provided fields change. New chats use the result; active sessions are hot-swapped in
+        place via runtime-config replacement (applied at their next turn)."""
         assert self._backend is not None
         if capabilities is not None:
             self._capabilities = [cap for cap in _ALL_CAPABILITIES if cap in set(capabilities)]
@@ -495,6 +529,8 @@ class StudioServer:
             self._effort = effort
         if summary is not None and summary in _SUMMARY_CHOICES:
             self._summary = summary
+        if otel is not None:
+            self._set_otel(otel)
         new_config = _runtime_config_for(self._capabilities, self._model, self._effort, self._summary)
         with self._lock:
             active = list(self._run_tokens.items())
@@ -520,8 +556,22 @@ class StudioServer:
             "model": self._model,
             "effort": self._effort,
             "summary": self._summary,
+            "otel": self._otel,
             "applied_runs": applied,
         }
+
+    def _set_otel(self, enabled: bool) -> None:
+        """Toggle OTel span export: install the global provider on enable and attach/detach the
+        per-run OtelEventSink factory on the backend (new runs pick it up)."""
+        assert self._backend is not None
+        if enabled:
+            _ensure_otel_provider(_OTEL_ENDPOINT)
+            from native_agent_runner.observability.otel import OtelEventSink
+
+            self._backend.extra_event_sink_factories = (OtelEventSink,)
+        else:
+            self._backend.extra_event_sink_factories = ()
+        self._otel = enabled
 
     def list_files(self) -> list[dict[str, Any]]:
         """A flat, sorted listing of the workspace for the file-tree panel (read-only;
@@ -538,6 +588,29 @@ class StudioServer:
             if len(entries) >= _TREE_MAX_ENTRIES:
                 break
         return entries
+
+    def read_file(self, rel_path: str) -> dict[str, Any]:
+        """Read a workspace file for the file viewer. Path-guarded to the workspace root (rejects
+        traversal / absolute paths), size-capped, and refuses binary content (NUL byte)."""
+        if not rel_path:
+            raise NativeAgentError("path is required")
+        root = self.workspace.resolve()
+        candidate = (root / rel_path).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise NativeAgentError("path escapes the workspace")
+        if not candidate.is_file():
+            raise NativeAgentError("not a file")
+        raw = candidate.read_bytes()
+        truncated = len(raw) > _VIEW_MAX_BYTES
+        raw = raw[:_VIEW_MAX_BYTES]
+        if b"\x00" in raw:
+            return {"path": rel_path, "binary": True, "truncated": False, "content": ""}
+        return {
+            "path": rel_path,
+            "binary": False,
+            "truncated": truncated,
+            "content": raw.decode("utf-8", errors="replace"),
+        }
 
     def _token_for(self, run_id: str) -> str:
         with self._lock:
@@ -584,6 +657,13 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/api/files":
                 self._write_json({"workspace": str(studio.workspace), "files": studio.list_files()})
+                return
+            if parsed.path == "/api/file":
+                rel = (parse_qs(parsed.query).get("path") or [""])[0]
+                try:
+                    self._write_json(studio.read_file(rel))
+                except NativeAgentError as exc:
+                    self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
             if parsed.path == "/api/sessions":
                 self._write_json(studio.sessions())
@@ -677,6 +757,8 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                         kwargs["effort"] = str(body.get("effort") or "")
                     if "summary" in body:
                         kwargs["summary"] = str(body.get("summary") or "")
+                    if "otel" in body:
+                        kwargs["otel"] = bool(body.get("otel"))
                     self._write_json(studio.update_settings(**kwargs))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")

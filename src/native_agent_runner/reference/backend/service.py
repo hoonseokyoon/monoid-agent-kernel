@@ -371,6 +371,12 @@ class RunnerBackend:
     # Agent-as-tool delegation: subagent id -> definition. When non-empty, runs can bind
     # agent.spawn (the loop bootstrap registers it). Child runs write to run_root/<child_id>/.
     subagent_definitions: Mapping[str, SubagentDefinition] = field(default_factory=dict)
+    # Per-run factories for extra event sinks, appended to every run's sinks (besides the
+    # backend's own state sink). A FACTORY (not a shared instance) so each run gets its own sink —
+    # required for stateful sinks like OtelEventSink (per-run span state). The seam an embedder
+    # uses to attach observability without a core dep — e.g. studio sets ``(OtelEventSink,)`` when
+    # OTel is toggled on. Read at loop-build time so it can change at runtime. Empty → no deps.
+    extra_event_sink_factories: tuple[Any, ...] = ()
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -1370,7 +1376,7 @@ class RunnerBackend:
         return AgentLoop(
             spec=spec,
             model_adapter=adapter,
-            event_sinks=(BackendRunStateSink(self, run_id),),
+            event_sinks=(BackendRunStateSink(self, run_id), *(make() for make in self.extra_event_sink_factories)),
             permission_policy=request.permission_policy,
             cancellation_token=self._record(run_id).cancellation_token,
             shell_approval_provider=None,
@@ -1777,7 +1783,7 @@ class RunnerBackend:
         loop = AgentLoop(
             spec=spec,
             model_adapter=adapter,
-            event_sinks=(BackendRunStateSink(self, run_id),),
+            event_sinks=(BackendRunStateSink(self, run_id), *(make() for make in self.extra_event_sink_factories)),
             permission_policy=request.permission_policy,
             cancellation_token=record.cancellation_token,
             shell_approval_provider=None,

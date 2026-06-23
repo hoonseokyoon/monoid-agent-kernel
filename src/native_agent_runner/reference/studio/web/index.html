@@ -47,6 +47,13 @@
     background: var(--panel); padding: 12px 14px; overflow: auto; display: flex;
     flex-direction: column; gap: 10px; }
   #proposal[hidden] { display: none; }
+  #viewer { width: 420px; min-width: 320px; border-left: 1px solid var(--border);
+    background: var(--panel); padding: 12px 14px; overflow: auto; display: flex; flex-direction: column; }
+  #viewer[hidden] { display: none; }
+  #viewer .side-title { display: flex; justify-content: space-between; align-items: center; }
+  #viewer-body { flex: 1; margin: 0; white-space: pre; overflow: auto; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+    font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
   #proposal-files { font-size: 12.5px; color: var(--muted); }
   #proposal-files .f { color: var(--text); }
   #diff { flex: 1; margin: 0; overflow: auto; background: var(--bg); border: 1px solid var(--border);
@@ -81,6 +88,22 @@
   .reasoning-body { white-space: pre-wrap; margin-top: 4px; opacity: 0.85; }
   .subagent .sa-reason { white-space: pre-wrap; font-size: 12px; color: var(--muted);
     font-style: italic; margin-top: 4px; }
+  /* Markdown: fenced code blocks (with copy button + lang label) and inline code. */
+  .msg code, .reasoning-body code { background: #11151c; border: 1px solid var(--border, #2a2f3a);
+    border-radius: 4px; padding: 0 4px; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  .codeblock { position: relative; margin: 8px 0; }
+  .codeblock pre { background: #0c0f14; border: 1px solid var(--border, #2a2f3a); border-radius: 8px;
+    padding: 10px 12px; overflow-x: auto; margin: 0; }
+  .codeblock pre code { background: none; border: 0; padding: 0; white-space: pre;
+    font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color: #d7dde6; }
+  .codeblock .code-lang { position: absolute; top: 6px; left: 10px; font-size: 10.5px;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .codeblock .copy-btn { position: absolute; top: 5px; right: 6px; font-size: 11px; cursor: pointer;
+    background: #1b2330; color: var(--muted); border: 1px solid var(--border, #2a2f3a);
+    border-radius: 6px; padding: 1px 8px; }
+  .codeblock .copy-btn:hover { color: var(--text); }
+  .msg h3, .msg h4, .msg h5, .msg h6 { margin: 8px 0 4px; font-size: 14px; }
+  .msg li { margin-left: 18px; }
   .hitl { align-self: stretch; max-width: 760px; background: #2a2410; border: 1px solid var(--warn);
     border-radius: 12px; padding: 12px 14px; }
   .hitl .q { margin-bottom: 10px; white-space: pre-wrap; }
@@ -177,12 +200,18 @@
       <div class="side-title">Trace</div>
       <div id="trace-tree"></div>
     </aside>
+    <aside id="viewer" hidden>
+      <div class="side-title"><span id="viewer-name">File</span>
+        <a href="#" id="viewer-close" class="hlink" title="Close">✕</a></div>
+      <pre id="viewer-body"></pre>
+    </aside>
   </div>
   <footer>
     <div id="setup">
       <label>Model <input id="model" type="text" spellcheck="false" autocomplete="off" /></label>
       <label>Effort <select id="effort"></select></label>
       <label>Thinking <select id="summary"></select></label>
+      <label title="Export OpenTelemetry spans to the configured OTLP collector">OTel <input type="checkbox" id="otel" /></label>
       <span id="setup-status"></span>
     </div>
     <form id="form">
@@ -232,14 +261,52 @@ async function stopRun() {
 }
 stopBtn.addEventListener("click", stopRun);
 
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+// Copy a code block's text (inline onclick survives the streaming innerHTML re-render).
+function copyCode(btn) {
+  const code = btn.parentElement.querySelector("code");
+  const text = code ? code.textContent : "";
+  if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+  const prev = btn.textContent;
+  btn.textContent = "copied";
+  setTimeout(() => { btn.textContent = prev; }, 1200);
+}
 function renderMarkdown(text) {
-  // minimal markdown: **bold** and > quote
-  let html = text
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  // Pull fenced code blocks out first so their contents aren't formatted; handles an unclosed
+  // trailing fence mid-stream (renders the partial as code).
+  const blocks = [];
+  let src = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_m, lang, code) => {
+    blocks.push({ lang, code });
+    return "@@C" + (blocks.length - 1) + "@@";
+  });
+  const open = src.indexOf("```");
+  if (open >= 0) {
+    const rest = src.slice(open + 3);
+    const nl = rest.indexOf("\n");
+    blocks.push({ lang: (nl >= 0 ? rest.slice(0, nl) : rest).trim(), code: nl >= 0 ? rest.slice(nl + 1) : "" });
+    src = src.slice(0, open) + "@@C" + (blocks.length - 1) + "@@";
+  }
+  // Inline formatting on the escaped non-code text.
+  let html = escapeHtml(src)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  return html.split("\n").map(line =>
-    line.startsWith("&gt; ") ? "<blockquote>" + line.slice(5) + "</blockquote>" : line
-  ).join("\n");
+  html = html.split("\n").map((line) => {
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { const n = Math.min(h[1].length + 2, 6); return "<h" + n + ">" + h[2] + "</h" + n + ">"; }
+    if (line.startsWith("&gt; ")) return "<blockquote>" + line.slice(5) + "</blockquote>";
+    if (/^[-*]\s+/.test(line)) return "<li>" + line.replace(/^[-*]\s+/, "") + "</li>";
+    return line;
+  }).join("\n");
+  // Reinsert code blocks with a language label + copy button.
+  html = html.replace(/@@C(\d+)@@/g, (_m, i) => {
+    const b = blocks[i];
+    const lang = b.lang ? '<span class="code-lang">' + escapeHtml(b.lang) + "</span>" : "";
+    return '<div class="codeblock">' + lang + '<button class="copy-btn" onclick="copyCode(this)">copy</button>' +
+      "<pre><code>" + escapeHtml(b.code) + "</code></pre></div>";
+  });
+  return html;
 }
 
 function bubble(cls, text) {
@@ -684,6 +751,22 @@ input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
 });
 
+const viewerAside = document.getElementById("viewer");
+const viewerName = document.getElementById("viewer-name");
+const viewerBody = document.getElementById("viewer-body");
+document.getElementById("viewer-close").addEventListener("click", (e) => { e.preventDefault(); viewerAside.hidden = true; });
+async function openFile(path) {
+  viewerName.textContent = path;
+  viewerBody.textContent = "loading…";
+  viewerAside.hidden = false;
+  try {
+    const r = await (await fetch("/api/file?path=" + encodeURIComponent(path))).json();
+    if (r.error) { viewerBody.textContent = "error: " + r.error; return; }
+    if (r.binary) { viewerBody.textContent = "(binary file — not shown)"; return; }
+    viewerBody.textContent = r.content + (r.truncated ? "\n\n… (truncated)" : "");
+  } catch (_) { viewerBody.textContent = "error loading file"; }
+}
+
 async function loadTree() {
   const tree = document.getElementById("tree");
   try {
@@ -705,9 +788,14 @@ async function loadTree() {
       li.textContent = entry.is_dir ? name + "/" : name;
       li.title = entry.path;
       if (!entry.is_dir) {
-        li.addEventListener("click", () => {
-          input.value = (input.value ? input.value + " " : "") + entry.path;
-          input.focus();
+        // Click opens the file viewer; Shift/Ctrl-click inserts the path into the composer.
+        li.addEventListener("click", (e) => {
+          if (e.shiftKey || e.ctrlKey || e.metaKey) {
+            input.value = (input.value ? input.value + " " : "") + entry.path;
+            input.focus();
+          } else {
+            openFile(entry.path);
+          }
         });
       }
       tree.appendChild(li);
@@ -755,9 +843,12 @@ async function loadSetup() {
       if (v === s.summary) opt.selected = true;
       summaryEl.appendChild(opt);
     }
+    const otelEl = document.getElementById("otel");
+    otelEl.checked = !!s.otel;
     modelEl.addEventListener("change", () => saveSetting({ model: modelEl.value }, "Model"));
     effortEl.addEventListener("change", () => saveSetting({ effort: effortEl.value }, "Effort"));
     summaryEl.addEventListener("change", () => saveSetting({ summary: summaryEl.value }, "Thinking"));
+    otelEl.addEventListener("change", () => saveSetting({ otel: otelEl.checked }, "OTel"));
   } catch (_) {}
 }
 
