@@ -11,7 +11,7 @@ from native_agent_runner.core.spec import AgentRunSpec, RunLimits
 from native_agent_runner.core.tool_surface import ToolQuota
 from native_agent_runner.errors import ModelAdapterError
 from native_agent_runner.loop import AgentLoop, _recoverable_turn_error
-from native_agent_runner.providers.base import ModelTurn, TextDelta, TurnComplete
+from native_agent_runner.providers.base import ModelTurn, ReasoningDelta, TextDelta, TurnComplete
 from native_agent_runner.providers.fake import (
     FakeModelAdapter,
     FakeStreamingModelAdapter,
@@ -645,6 +645,33 @@ def test_autonomous_drive_emits_output_deltas(tmp_path: Path) -> None:
         assert susp.final_text == "Hello"  # assembled identically to the one-shot path
         deltas = [e for e in sink.events if e.type == "model.output.delta"]
         assert [d.data["text"] for d in deltas] == ["Hel", "lo"]
+    finally:
+        loop.close()
+
+
+def test_autonomous_drive_emits_reasoning_deltas(tmp_path: Path) -> None:
+    # DX-13b: reasoning summary fragments surface as model.reasoning.delta (display-only) and
+    # are NOT folded into the assembled final_text (that stays the answer text alone).
+    adapter = FakeStreamingModelAdapter(
+        chunk_turns=[
+            [
+                ReasoningDelta("thinking… "),
+                ReasoningDelta("almost there"),
+                TextDelta("Answer"),
+                TurnComplete(response_id="r1"),
+            ]
+        ]
+    )
+    loop, sink = _streaming_loop(tmp_path, adapter, emit=True)
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("hi")
+        assert susp.reason == "settled"
+        assert susp.final_text == "Answer"  # reasoning is not part of the answer
+        reasoning = [e.data["text"] for e in sink.events if e.type == "model.reasoning.delta"]
+        assert reasoning == ["thinking… ", "almost there"]
+        answer = [e.data["text"] for e in sink.events if e.type == "model.output.delta"]
+        assert answer == ["Answer"]
     finally:
         loop.close()
 

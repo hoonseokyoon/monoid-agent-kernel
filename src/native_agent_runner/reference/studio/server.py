@@ -146,6 +146,11 @@ _DEFAULT_EFFORT = "medium"
 _EFFORT_CHOICES = ("none", "low", "medium", "high", "xhigh")
 # Validation superset = the engine's full ReasoningEffort literal (some values suit other models).
 _ALL_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh")
+# Reasoning *summary* visibility (DX-13b): "auto" surfaces a model-written summary of its thinking
+# in the chat's collapsible "Thinking" panel; "off" hides it. Display-only — independent of the
+# reasoning round-trip, which always travels by-value.
+_DEFAULT_SUMMARY = "auto"
+_SUMMARY_CHOICES = ("off", "auto", "detailed")
 
 
 # System prompt: introduce the agent + nudge it to keep a live plan (Plan panel). The plan is
@@ -167,11 +172,14 @@ _PLAN_BINDING = ToolBinding(
 
 
 def _runtime_config_for(
-    capabilities: list[str], model: str = _DEFAULT_MODEL, effort: str = _DEFAULT_EFFORT
+    capabilities: list[str],
+    model: str = _DEFAULT_MODEL,
+    effort: str = _DEFAULT_EFFORT,
+    summary: str = _DEFAULT_SUMMARY,
 ) -> AgentRuntimeConfig:
     """Build the runtime config for an enabled-capability set (order-stable, deduped) plus the
-    chosen model + reasoning effort. The model flows to the gateway as the effective model name
-    (ignored by the offline echo provider)."""
+    chosen model + reasoning effort + summary visibility. The model flows to the gateway as the
+    effective model name (ignored by the offline echo provider)."""
     enabled = set(capabilities)
     tools: list[ToolBinding] = [_PLAN_BINDING]  # plan tool is always bound (observability)
     for capability in _ALL_CAPABILITIES:
@@ -179,7 +187,7 @@ def _runtime_config_for(
             tools.extend(_capability_bindings(capability))
     return AgentRuntimeConfig(
         definition_id="studio-agent",
-        model=ModelConfig(model=model, reasoning=ReasoningConfig(effort=effort)),  # provider="gateway"
+        model=ModelConfig(model=model, reasoning=ReasoningConfig(effort=effort, summary=summary)),
         prompt=PromptSpec(system_prompt_base=_SYSTEM_PROMPT),
         tools=tuple(tools),
     )
@@ -220,9 +228,10 @@ class StudioServer:
         self._backend: RunnerBackend | None = None
         # The live-editable Agent capability set (Settings window, R6). Defaults to everything.
         self._capabilities: list[str] = list(_ALL_CAPABILITIES)
-        # Live-editable model + reasoning effort (chat composer setup bar).
+        # Live-editable model + reasoning effort + summary visibility (chat composer setup bar).
         self._model: str = _DEFAULT_MODEL
         self._effort: str = _DEFAULT_EFFORT
+        self._summary: str = _DEFAULT_SUMMARY
         # run_id -> run access token (held server-side, never sent to the browser).
         self._run_tokens: dict[str, str] = {}
         # Chat sessions started this server run (newest first): the history list. In-memory only —
@@ -320,7 +329,7 @@ class StudioServer:
     def start_chat(self, message: str) -> dict[str, Any]:
         """Open a new multi-turn session in the workspace and deliver the first message."""
         assert self._backend is not None
-        runtime_config = _runtime_config_for(self._capabilities, self._model, self._effort)
+        runtime_config = _runtime_config_for(self._capabilities, self._model, self._effort, self._summary)
         request = BackendRunRequest(
             tenant_id=_TENANT,
             user_id=_USER,
@@ -462,6 +471,8 @@ class StudioServer:
             "model": self._model,
             "effort": self._effort,
             "efforts": list(_EFFORT_CHOICES),
+            "summary": self._summary,
+            "summaries": list(_SUMMARY_CHOICES),
         }
 
     def update_settings(
@@ -470,9 +481,10 @@ class StudioServer:
         capabilities: list[str] | None = None,
         model: str | None = None,
         effort: str | None = None,
+        summary: str | None = None,
     ) -> dict[str, Any]:
-        """Change the Agent's capabilities / model / reasoning effort. Only provided fields
-        change. New chats use the result; active sessions are hot-swapped in place via
+        """Change the Agent's capabilities / model / reasoning effort / summary. Only provided
+        fields change. New chats use the result; active sessions are hot-swapped in place via
         runtime-config replacement (applied at their next turn)."""
         assert self._backend is not None
         if capabilities is not None:
@@ -481,7 +493,9 @@ class StudioServer:
             self._model = model.strip()
         if effort is not None and effort in _ALL_EFFORTS:
             self._effort = effort
-        new_config = _runtime_config_for(self._capabilities, self._model, self._effort)
+        if summary is not None and summary in _SUMMARY_CHOICES:
+            self._summary = summary
+        new_config = _runtime_config_for(self._capabilities, self._model, self._effort, self._summary)
         with self._lock:
             active = list(self._run_tokens.items())
         applied = 0
@@ -505,6 +519,7 @@ class StudioServer:
             "capabilities": list(self._capabilities),
             "model": self._model,
             "effort": self._effort,
+            "summary": self._summary,
             "applied_runs": applied,
         }
 
@@ -660,6 +675,8 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                         kwargs["model"] = str(body.get("model") or "")
                     if "effort" in body:
                         kwargs["effort"] = str(body.get("effort") or "")
+                    if "summary" in body:
+                        kwargs["summary"] = str(body.get("summary") or "")
                     self._write_json(studio.update_settings(**kwargs))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")

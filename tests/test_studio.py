@@ -436,6 +436,18 @@ def test_settings_model_and_effort_apply_to_new_chats(studio: StudioServer) -> N
     assert config.model.reasoning.effort == "high"
 
 
+def test_settings_reasoning_summary_visibility(studio: StudioServer) -> None:
+    # DX-13b: the "Thinking" (reasoning summary) toggle is a real setting that flows into the
+    # runtime config so the model returns a displayable summary.
+    s = studio.settings()
+    assert s["summary"] == "auto" and "off" in s["summaries"]
+    studio.update_settings(summary="off")
+    run_id = studio.start_chat("hi")["run_id"]
+    config = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
+    assert config.model is not None
+    assert config.model.reasoning.summary == "off"
+
+
 def test_settings_hot_swaps_active_session(studio: StudioServer) -> None:
     run_id = studio.start_chat("hello")["run_id"]
     _wait_settled(studio, run_id, 1)  # turn settles -> session active (awaiting input), not terminal

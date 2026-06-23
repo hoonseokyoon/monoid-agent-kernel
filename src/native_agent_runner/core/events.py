@@ -21,6 +21,7 @@ AgentEventType = Literal[
     "agent.config.updated",
     "model.turn.started",
     "model.output.delta",
+    "model.reasoning.delta",
     "model.turn.finished",
     "turn.failed",
     "turn.interrupted",

@@ -11,6 +11,30 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
+### DX-13b 🟢 Reasoning wasn't *shown* to the user (display, on top of DX-13a's round-trip) — FIXED
+With DX-13a carrying reasoning for correctness, the studio still showed nothing of the model's
+thinking. OpenAI doesn't expose raw chain-of-thought, only a model-written **summary** (request via
+`reasoning.summary`); we modeled the `summary` field but never surfaced its text. Built the same
+3-layer streaming path as DX-8 (token streaming), kept strictly separate from the round-trip:
+- **Core seam:** new presentational stream chunk `ReasoningDelta` (a *summary* fragment, distinct
+  from `TextDelta`) + event `model.reasoning.delta` (mirrors `model.output.delta`).
+  `assemble_streamed_turn` ignores it — the assembled turn (answer + the round-trippable
+  `TurnComplete.reasoning`) is unchanged, so display can't corrupt correctness.
+- **OpenAI:** `astream_turn` maps `response.reasoning_summary_text.delta` → `ReasoningDelta`. The
+  loop's `_acall_model_emitting_deltas` emits `model.reasoning.delta` per chunk (immediate-stop
+  interrupt applies for free). Also wired through the gateway (`_chunk_from_event` /
+  `_frame_from_chunk`) so the container path isn't silently dropping it.
+- **Studio:** a `summary` setting (off/auto/detailed, default `auto`) in the composer setup bar,
+  flowing to `ReasoningConfig.summary`; a collapsible dim "🧠 Thinking" panel that streams the
+  summary and **auto-collapses on the first answer token**; subagent cards get a dim reasoning line;
+  `model.reasoning.delta` is trace-skipped (noise). Display is a setting (privacy: summaries can leak;
+  redacted/encrypted blocks are never shown raw — only the round-trip carries them).
+- Verified live (real OpenAI gpt-5.5, effort high, summary auto, no tools so the turn is
+  reasoning+answer): `response.reasoning_summary_text.delta` fires (70 summary fragments / 384 chars,
+  e.g. *"**Deciding on the response format**…"*) → `model.reasoning.delta` events stream ahead of the
+  118 answer-token `model.output.delta` events; the turn settles. (A tool-only turn streams no summary
+  text — expected.)
+
 ### DX-13a 🟢 Reasoning artifacts weren't round-tripped (latent 400 on reasoning models) — FIXED
 Pressure-testing a reasoning model (gpt-5.x via the Responses API) over a multi-turn tool loop. The
 model emits **reasoning items** (`{type:"reasoning", id:"rs_…", encrypted_content:"…"}`) alongside

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from native_agent_runner.errors import ModelAdapterError
 from native_agent_runner.providers.base import (
     ModelRequest,
     ModelTurn,
+    ReasoningDelta,
     TextDelta,
     TurnComplete,
     assemble_streamed_turn,
@@ -217,6 +219,64 @@ def test_openai_parse_captures_reasoning_subsequence_verbatim() -> None:
     assert turn.reasoning == (_RS_A, _FC_A, _RS_B, _FC_B, msg)
     assert tuple(c.id for c in turn.tool_calls) == ("c_a", "c_b")
     assert turn.final_text == "ok"
+
+
+class _Ev:
+    def __init__(self, type: str, **kw) -> None:  # noqa: A002, ANN003
+        self.type = type
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class _StreamResp:
+    def model_dump(self) -> dict:
+        return {"id": "r1", "usage": {}, "output": []}
+
+
+class _AsyncStream:
+    def __init__(self, events: list) -> None:
+        self._events = events
+
+    def __aiter__(self):  # noqa: ANN204
+        self._it = iter(self._events)
+        return self
+
+    async def __anext__(self):  # noqa: ANN204
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+def test_openai_astream_yields_reasoning_delta_then_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    # DX-13b: a reasoning-summary stream event maps to a ReasoningDelta, distinct from the
+    # answer's TextDelta, ahead of the terminal TurnComplete.
+    events = [
+        _Ev("response.reasoning_summary_text.delta", delta="think"),
+        _Ev("response.output_text.delta", delta="Hi"),
+        _Ev("response.completed", response=_StreamResp()),
+    ]
+
+    class _Responses:
+        async def create(self, **kwargs):  # noqa: ANN003, ANN202
+            return _AsyncStream(events)
+
+    class _AsyncClient:
+        def __init__(self, **kwargs) -> None:  # noqa: ANN003
+            self.responses = _Responses()
+
+    monkeypatch.setattr("openai.AsyncOpenAI", _AsyncClient)
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"), api_key="test", allow_direct_provider_api=True)
+    request = ModelRequest(instruction="hi", system_prompt="", tools=())
+
+    async def _drain() -> list:
+        return [chunk async for chunk in adapter.astream_turn(request)]
+
+    chunks = asyncio.run(_drain())
+
+    assert isinstance(chunks[0], ReasoningDelta) and chunks[0].text == "think"
+    assert isinstance(chunks[1], TextDelta) and chunks[1].text == "Hi"
+    assert isinstance(chunks[-1], TurnComplete)
 
 
 def test_openai_capture_strips_output_only_status() -> None:

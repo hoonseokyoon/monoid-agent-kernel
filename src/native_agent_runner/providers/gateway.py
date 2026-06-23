@@ -22,6 +22,7 @@ from native_agent_runner.providers.base import (
     ModelRequest,
     ModelStreamChunk,
     ModelTurn,
+    ReasoningDelta,
     TextDelta,
     ToolCall,
     ToolCallDelta,
@@ -347,6 +348,8 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
     event_type = event.get("type")
     if event_type == "text_delta":
         return TextDelta(text=str(event.get("text") or ""))
+    if event_type == "reasoning_delta":
+        return ReasoningDelta(text=str(event.get("text") or ""))
     if event_type == "tool_call_delta":
         return ToolCallDelta(
             index=int(event.get("index") or 0),

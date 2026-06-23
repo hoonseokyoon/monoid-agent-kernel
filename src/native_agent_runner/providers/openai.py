@@ -16,6 +16,7 @@ from native_agent_runner.providers.base import (
     ModelRequest,
     ModelStreamChunk,
     ModelTurn,
+    ReasoningDelta,
     TextDelta,
     ToolCall,
     ToolCallDelta,
@@ -114,6 +115,12 @@ class OpenAIModelAdapter:
                     text = getattr(event, "delta", "") or ""
                     if text:
                         yield TextDelta(text)
+                elif etype == "response.reasoning_summary_text.delta":
+                    # Display-only reasoning summary fragment (DX-13b). Only present when the
+                    # request asked for a summary (reasoning.summary != "off").
+                    text = getattr(event, "delta", "") or ""
+                    if text:
+                        yield ReasoningDelta(text)
                 elif etype == "response.output_item.added":
                     item = getattr(event, "item", None)
                     if item is not None and getattr(item, "type", "") == "function_call":

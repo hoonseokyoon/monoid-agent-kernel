@@ -100,6 +100,7 @@ from native_agent_runner.providers.base import (
     ModelRequest,
     ModelStreamChunk,
     ModelTurn,
+    ReasoningDelta,
     TextDelta,
     ToolObservation,
     assemble_streamed_turn,
@@ -996,6 +997,10 @@ class AgentLoop:
                 chunks.append(chunk)
                 if isinstance(chunk, TextDelta) and chunk.text:
                     recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
+                elif isinstance(chunk, ReasoningDelta) and chunk.text:
+                    # Display-only reasoning summary (DX-13b): a separate event so a consumer
+                    # renders it in a "thinking" view, distinct from the answer text.
+                    recorder.emit("model.reasoning.delta", data={"text": chunk.text}, level="debug")
                 # Immediate stop: when a turn interrupt arrives mid-stream, abort the in-flight
                 # generation now (don't wait for the next step boundary). The text already
                 # streamed stays; the except in arun_until_suspended parks the live session.

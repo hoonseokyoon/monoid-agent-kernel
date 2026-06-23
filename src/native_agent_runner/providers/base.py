@@ -179,6 +179,19 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class ReasoningDelta:
+    """A fragment of the model's reasoning *summary* text (display-only). Distinct from
+    :class:`TextDelta` (the answer) so a consumer can render it in a separate "thinking" view.
+    Purely presentational — :func:`assemble_streamed_turn` ignores it (the round-trippable
+    reasoning artifacts ride :attr:`TurnComplete.reasoning`, not these deltas)."""
+
+    text: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {"type": "reasoning_delta", "text": self.text}
+
+
+@dataclass(frozen=True)
 class ToolCallDelta:
     """A fragment of one tool call, keyed by ``index`` (its slot in the response). ``id`` and
     ``name`` typically arrive once (first fragment); ``arguments_fragment`` is a raw,
@@ -219,7 +232,7 @@ class TurnComplete:
         }
 
 
-ModelStreamChunk = TextDelta | ToolCallDelta | TurnComplete
+ModelStreamChunk = TextDelta | ReasoningDelta | ToolCallDelta | TurnComplete
 
 
 def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
