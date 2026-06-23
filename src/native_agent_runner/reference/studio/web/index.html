@@ -381,7 +381,10 @@ function handleEvent(ev) {
 function updateUsage(data) {
   const i = data.input_tokens, o = data.output_tokens, t = data.total_tokens;
   if (t === undefined && i === undefined) return;
-  usageEl.textContent = "↑" + (i ?? 0) + " ↓" + (o ?? 0) + " · " + (t ?? 0) + " tok";
+  // 🧠 = reasoning ("thinking") tokens, the priced-but-invisible share of the output (R10).
+  const r = data.reasoning_tokens;
+  const brain = r ? " · 🧠" + r : "";
+  usageEl.textContent = "↑" + (i ?? 0) + " ↓" + (o ?? 0) + brain + " · " + (t ?? 0) + " tok";
 }
 
 const planTitle = document.getElementById("plan-title");

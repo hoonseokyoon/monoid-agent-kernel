@@ -2097,21 +2097,26 @@ class AgentLoop:
                     "usage": turn.usage,
                 },
             )
+            metrics_data: dict[str, Any] = {
+                "step": step,
+                "tool_calls": state.total_tool_calls,
+                "input_tokens": state.total_usage["input_tokens"],
+                "output_tokens": state.total_usage["output_tokens"],
+                "total_tokens": state.total_usage["total_tokens"],
+                "web_search_calls": context.web_service.web_search_calls,
+                "web_fetch_calls": context.web_service.web_fetch_calls,
+                "web_context_calls": context.web_service.web_context_calls,
+                "web_failed_calls": context.web_service.web_failed_calls,
+            }
+            # Surface reasoning tokens (the priced, invisible "thinking" sub-count) when the
+            # adapter reports them, so the studio meter can show the reasoning share (R10).
+            if state.total_usage.get("reasoning_tokens"):
+                metrics_data["reasoning_tokens"] = state.total_usage["reasoning_tokens"]
             recorder.emit(
                 "metrics.updated",
                 turn_id=turn_id,
                 parent_id=turn_started.event_id,
-                data={
-                    "step": step,
-                    "tool_calls": state.total_tool_calls,
-                    "input_tokens": state.total_usage["input_tokens"],
-                    "output_tokens": state.total_usage["output_tokens"],
-                    "total_tokens": state.total_usage["total_tokens"],
-                    "web_search_calls": context.web_service.web_search_calls,
-                    "web_fetch_calls": context.web_service.web_fetch_calls,
-                    "web_context_calls": context.web_service.web_context_calls,
-                    "web_failed_calls": context.web_service.web_failed_calls,
-                },
+                data=metrics_data,
             )
 
             if not turn.tool_calls:

@@ -11,6 +11,15 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
+### R10 🟢 Studio reasoning UX — Thinking disclosure + summary toggle + reasoning-tokens meter
+The studio surface for reasoning. The disclosure (collapsible "🧠 Thinking" panel, auto-collapse on
+the first answer token) and the summary toggle (off/auto/detailed in the composer setup bar) shipped
+with DX-13b. The remaining piece — the **reasoning-tokens meter** — surfaces the priced-but-invisible
+"thinking" token share: `_accumulate_usage` already sums `reasoning_tokens` into `total_usage`, so the
+loop now includes it in `metrics.updated` (only when reported) and the meter shows `🧠N` next to
+`↑in ↓out · total`. Two-line plumbing; data was already there. (Cache tokens are similarly available
+in `total_usage` if a meter for those is wanted later.)
+
 ### DX-13b 🟢 Reasoning wasn't *shown* to the user (display, on top of DX-13a's round-trip) — FIXED
 With DX-13a carrying reasoning for correctness, the studio still showed nothing of the model's
 thinking. OpenAI doesn't expose raw chain-of-thought, only a model-written **summary** (request via

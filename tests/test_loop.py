@@ -447,6 +447,35 @@ def _loop_with(tmp_path: Path, adapter, *tool_ids: str) -> tuple[AgentLoop, Memo
     return loop, sink, run_root
 
 
+def test_metrics_surface_reasoning_tokens_when_reported(tmp_path: Path) -> None:
+    # R10: reasoning tokens reach the metrics.updated event when the adapter reports them, so the
+    # studio meter can show the reasoning share.
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(final_text="done", usage={"input_tokens": 5, "output_tokens": 9, "total_tokens": 14, "reasoning_tokens": 7})]
+    )
+    loop, sink, _ = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        loop.run_until_suspended("hi")
+        metrics = [e for e in sink.events if e.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["reasoning_tokens"] == 7
+    finally:
+        loop.close()
+
+
+def test_metrics_omit_reasoning_tokens_when_absent(tmp_path: Path) -> None:
+    # A non-reasoning model reports none → the key is omitted (no "🧠0" noise in the meter).
+    adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done", usage={"input_tokens": 5, "output_tokens": 9, "total_tokens": 14})])
+    loop, sink, _ = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        loop.run_until_suspended("hi")
+        metrics = [e for e in sink.events if e.type == "metrics.updated"]
+        assert metrics and "reasoning_tokens" not in metrics[-1].data
+    finally:
+        loop.close()
+
+
 def test_recoverable_turn_error_classifier() -> None:
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=400))
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=401))

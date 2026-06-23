@@ -174,6 +174,7 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "input_tokens": _INT,
             "output_tokens": _INT,
             "total_tokens": _INT,
+            "reasoning_tokens": _INT,
             "web_search_calls": _INT,
             "web_fetch_calls": _INT,
             "web_context_calls": _INT,
