@@ -412,9 +412,17 @@ class StudioServer:
         return {"sessions": out}
 
     def continue_chat(self, run_id: str, message: str) -> dict[str, Any]:
+        """Deliver a follow-up message. If the run is no longer live in memory (a parked session
+        surviving a restart), transparently resume it from its checkpoint first, then send — so
+        "continue an old chat" just works. ``send_message`` raises KeyError for a non-in-memory run;
+        we resume on that signal and retry once."""
         assert self._backend is not None
         token = self._token_for(run_id)
-        return self._backend.send_message(run_id, token, message)
+        try:
+            return self._backend.send_message(run_id, token, message)
+        except KeyError:
+            self._backend.resume_run(run_id, token)
+            return self._backend.send_message(run_id, token, message)
 
     def cancel_chat(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None

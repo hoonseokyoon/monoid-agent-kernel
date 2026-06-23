@@ -410,4 +410,38 @@ that returns the tar bytes (or a streaming handle), or a generic token-scoped ru
 Deferred (reference studio is co-located), but it's a real seam to fix before the backend is used
 out-of-process.
 
+### R12 (resume a parked session after a restart) — the read/write asymmetry was the real core gap
+**Symptom (DX blocker):** the studio could *list* and *replay* a past chat after a restart (DX-12),
+but typing a follow-up into a parked-but-not-in-memory session threw `KeyError: unknown run`. The
+session looked alive in the sidebar yet was unwritable — a dead end for "continue an old chat".
+
+**Root cause (Core/Contract, not UI):** the backend had an asymmetry between read and write paths:
+- **Reads** (`events`, `proposal`, `status` via `_authorized_run_dir`) authorize on the *signed run
+  token alone* and read straight from `run_root` — they work with no in-memory record.
+- **Writes** (`send_message` via `_authorize_run` → `_record`) require an in-memory record and
+  `KeyError` for any run not currently hosted (e.g. after a restart).
+
+`recover_runs()` existed but is the wrong tool here: it is a process-global, **no-token** operator
+primitive that scans and resumes *every* parked run at startup. There was no token-scoped way for a
+specific caller to resume *its own* run on demand — the exact missing contract piece.
+
+**Fix (one new core primitive + thin studio wiring):**
+- `RunnerBackend.resume_run(run_id, token)` — the token-scoped, single-run analog of
+  `recover_runs()`. Verifies the run token (the capability), checks its claims against the persisted
+  `run.json` identity (no record to check against yet), then materializes the record from the latest
+  non-terminal checkpoint via the existing `_attempt_resume`. **Idempotent**: an already-live run
+  returns `resumed=False`. Rejects terminal/failed/unknown runs with the usual `ValueError`/`KeyError`.
+- `studio.continue_chat` now catches the `KeyError` from `send_message`, calls `resume_run`, and
+  retries the send once — so "continue an old chat" just works. The resume reconstructs the full
+  conversation from the checkpoint (prior assistant turns included), then threads the new message.
+- UI: parked runs surface a `⟳ resume` tag in the session list; the composer was never disabled, so
+  loading one and sending already routes through the resume path. Live-verified over HTTP: park →
+  evict record (simulated restart) → `/api/sessions` reports `recoverable: true` → `POST /api/chat`
+  resumes and threads the follow-up as a real second turn.
+
+**Takeaway:** the principled fix wasn't "make `send_message` auto-recover" (that conflates a heavy,
+fail-able operation with a hot path); it was to make the *write* surface symmetric with the *read*
+surface by giving callers a token-scoped resume primitive. The studio orchestrates the two calls,
+keeping the resume observable and `send_message` single-responsibility.
+
 <!-- Add new entries below as later rungs surface them. -->

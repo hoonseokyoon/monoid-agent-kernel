@@ -1644,6 +1644,45 @@ class RunnerBackend:
         self._clear_recover_attempts(run_dir)
         return True
 
+    def resume_run(self, run_id: str, token: str) -> dict[str, Any]:
+        """Resume a single parked run from its checkpoint — the token-scoped, single-run analog of
+        :meth:`recover_runs` (which is a process-global, no-token operator primitive).
+
+        This closes the read/write asymmetry: a token holder could always *read* a historical run
+        (:meth:`_authorized_run_dir` needs no in-memory record), but every *write* path goes through
+        :meth:`_authorize_run` → :meth:`_record`, which raises ``KeyError`` for a run not currently
+        in memory. ``resume_run`` materializes that record from the durable checkpoint so a follow-up
+        :meth:`send_message` works after a restart. Idempotent: a run already tracked in memory
+        returns ``resumed=False`` with its current status. The run token is the capability; its
+        claims are checked against the persisted ``run.json`` identity since there is no record yet.
+        """
+        claims = self._verify_run_token(run_id, token)
+        with self._lock:
+            existing = self._records.get(run_id)
+        if existing is not None:
+            if claims.tenant_id != existing.tenant_id or claims.user_id != existing.user_id:
+                raise PermissionDenied("token subject mismatch")
+            return {"run_id": run_id, "status": existing.status, "resumed": False}
+        if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
+            raise PermissionDenied("invalid run id")
+        run_dir = self.run_root / run_id
+        meta = _read_run_meta(run_dir)
+        if meta is None:
+            raise KeyError(f"unknown run: {run_id}")
+        if claims.tenant_id != (meta.get("tenant_id") or "") or claims.user_id != (meta.get("user_id") or ""):
+            raise PermissionDenied("token subject mismatch")
+        if (run_dir / "failure.json").exists():
+            raise ValueError("run is marked unrecoverable; inspect failure.json")
+        assert self.checkpoint_store is not None
+        stored = self.checkpoint_store.latest(run_id)
+        if stored is None or stored.checkpoint.terminal:
+            raise ValueError("run has no resumable checkpoint")
+        if not self._attempt_resume(run_dir, run_id):
+            # _attempt_resume bumps the durable attempt counter / writes failure.json at the cap.
+            raise ValueError("resume failed; inspect run logs / failure.json")
+        record = self._record(run_id)
+        return {"run_id": run_id, "status": record.status, "resumed": True}
+
     # --- Active watchdog / lease (operational layer; the core never auto-recovers) -------
 
     def start_watchdog(self) -> None:

@@ -164,6 +164,8 @@
   #sessions li .dot { display: inline-block; width: 6px; height: 6px; border-radius: 999px; margin-right: 6px;
     background: var(--muted); vertical-align: middle; }
   #sessions li.live .dot { background: var(--accent); }
+  #sessions li.recoverable .dot { background: #e0b341; }
+  #sessions li .resume-tag { font-size: 10px; color: #e0b341; margin-left: 6px; }
   #trace { overflow: auto; }
   #trace-tree { font-size: 12px; font-variant-numeric: tabular-nums; }
   #trace-tree ul { list-style: none; margin: 0; padding-left: 14px; border-left: 1px solid var(--border, #2a2f3a); }
@@ -966,11 +968,17 @@ async function refreshSessions() {
     for (const s of (body.sessions || [])) {
       const li = document.createElement("li");
       if (!["completed", "failed", "limited"].includes(s.status)) li.classList.add("live");
+      if (s.recoverable) li.classList.add("recoverable");
       if (s.run_id === runId) li.classList.add("active");
       const dot = document.createElement("span"); dot.className = "dot";
       li.appendChild(dot);
       li.appendChild(document.createTextNode(s.title || s.run_id));
-      li.title = (s.title || s.run_id) + " — " + s.status;
+      if (s.recoverable) {
+        const tag = document.createElement("span"); tag.className = "resume-tag"; tag.textContent = "⟳ resume";
+        li.appendChild(tag);
+      }
+      li.title = (s.title || s.run_id) + " — " + s.status
+        + (s.recoverable ? " (parked — send a message to resume from its checkpoint)" : "");
       li.addEventListener("click", () => loadSession(s.run_id));
       sessionsEl.appendChild(li);
     }

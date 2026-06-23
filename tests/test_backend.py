@@ -353,6 +353,86 @@ def test_backend_recovers_parked_hitl_run_from_checkpoint(tmp_path: Path) -> Non
     backend1.cancel_run(run_id, token)  # cleanup: stop the defunct first-process worker
 
 
+def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> None:
+    # The token-scoped, single-run analog of recover_runs: a parked multi-turn session is resumed
+    # by run id from a *fresh backend*, then a follow-up send_message threads a new user turn.
+    # This is the studio "continue an old chat after a restart" path.
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+
+    def _wait(predicate, tries: int = 1000) -> bool:
+        for _ in range(tries):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    # Process 1: open a multi-turn session; the first turn settles and parks awaiting input.
+    crashed: list = []
+    backend1 = _recoverable_backend(
+        run_root, token_manager, workspace, crashed,
+        turns=[ModelTurn(response_id="r1", final_text="first")],
+    )
+    backend1.idle_timeout_s = 30.0
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert _wait(lambda: backend1.checkpoint_store.latest(run_id) is not None)
+    assert _wait(lambda: backend1._record(run_id).status == "awaiting_input")
+
+    # Process 2: a fresh backend (empty _records). send_message would KeyError; resume_run
+    # materializes the record from the checkpoint, then the follow-up threads a second turn.
+    resumed: list = []
+    backend2 = _recoverable_backend(
+        run_root, token_manager, workspace, resumed,
+        turns=[ModelTurn(response_id="r2", final_text="second")],
+    )
+    backend2.idle_timeout_s = 30.0
+    backend2.max_recover_attempts = 10_000
+
+    with pytest.raises(KeyError):
+        backend2.send_message(run_id, token, "before resume")
+
+    info = backend2.resume_run(run_id, token)
+    assert info["resumed"] is True
+    assert run_id in backend2._records
+    # Idempotent: a second resume on the now-live run is a no-op.
+    assert backend2.resume_run(run_id, token)["resumed"] is False
+
+    assert backend2.send_message(run_id, token, "again")["status"] == "queued"
+    assert _wait(lambda: len([r for a in resumed for r in a.requests if r.instruction]) >= 1)
+
+    backend2.cancel_run(run_id, token)
+    assert backend2.wait_for_run(run_id, timeout_s=20) in {"completed", "limited", "failed"}
+    instructions = [r.instruction for a in resumed for r in a.requests if r.instruction]
+    assert "again" in instructions
+    backend1.cancel_run(run_id, token)  # stop the defunct first-process worker
+
+
+def test_resume_run_rejects_terminal_and_unknown(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+    backend = _recoverable_backend(run_root, token_manager, workspace, [], turns=[ModelTurn(final_text="x")])
+
+    # An unknown run id (no run.json) is rejected even with a syntactically valid token.
+    bogus = token_manager.issue(
+        kind="run_access", audience="native-agent-runner.backend",
+        run_id="run_missing", tenant_id="tenant_a", user_id="user_a", ttl_s=300,
+    )
+    with pytest.raises(KeyError):
+        backend.resume_run("run_missing", bogus)
+
+
 def test_recover_runs_skips_terminal_and_metaless_checkpoints(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     run_root = tmp_path / "runs"

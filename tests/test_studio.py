@@ -306,6 +306,71 @@ def test_export_package_builds_self_verifying_tar(tmp_path: Path) -> None:
         server.shutdown()
 
 
+def test_continue_chat_resumes_a_parked_session_after_restart(tmp_path: Path) -> None:
+    # The studio "continue an old chat" path: a multi-turn session parked awaiting input is
+    # evicted from memory (simulating a process restart), then continue_chat transparently
+    # resumes it from the checkpoint and delivers the follow-up.
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(response_id="r1", final_text="first"),
+            ModelTurn(response_id="r2", final_text="second"),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("hello")["run_id"]
+        _wait_settled(server, run_id, 1)
+
+        def _await_status(target: str, timeout: float = 10.0) -> bool:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if server.run_status(run_id).get("status") == target:
+                    return True
+                time.sleep(0.05)
+            return False
+
+        assert _await_status("awaiting_input")
+
+        # Simulate a restart: drop the in-memory record. A bare send_message would now KeyError;
+        # continue_chat must resume from the durable checkpoint first.
+        backend = server._backend
+        assert backend.checkpoint_store.latest(run_id) is not None
+        with backend._lock:
+            backend._records.pop(run_id)
+
+        result = server.continue_chat(run_id, "again")
+        assert result["status"] == "queued"
+
+        # The resumed session threads the follow-up as a real second model turn, with the
+        # conversation rebuilt from the checkpoint (user "hello" → assistant "first" → user "again").
+        def _again_threaded() -> bool:
+            return any(
+                msg.get("role") == "user" and msg.get("content") == "again"
+                for req in fake.requests
+                for msg in (req.messages or [])
+            )
+
+        deadline = time.time() + 10.0
+        while time.time() < deadline and not _again_threaded():
+            time.sleep(0.05)
+        assert _again_threaded()
+        # And the prior turn's assistant reply survived the restart (proves checkpoint restore, not
+        # a fresh conversation).
+        assert any(
+            msg.get("role") == "assistant" and msg.get("content") == "first"
+            for req in fake.requests
+            for msg in (req.messages or [])
+        )
+    finally:
+        server.shutdown()
+
+
 # --- R3: human-in-the-loop approval gate ------------------------------------------------
 
 
