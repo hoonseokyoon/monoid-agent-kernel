@@ -484,4 +484,45 @@ workspace → resolved to a base64 `image/png` block → forwarded to a multimod
 test (image via `send_message` forwarded as a resolved block) + checkpoint round-trip test (a queued
 multimodal message rebuilds its typed parts) + studio test (attach persists + forwards).
 
+### R13b (inline media ingress → content-addressed blob) — closing the R13 contract gap in the core
+**Why:** R13 surfaced two media-input contract gaps. The sharp one (2a): the resolver only accepted
+**workspace-path** `source_ref`s — there was no by-value/inline path, so every attachment had to be
+written into the workspace first. That has a latent durability hole: a file the embedder writes
+directly to the workspace base is NOT part of the agent's checkpoint delta, so a deployment that
+re-clones a pristine base on restore loses it (the studio only survived because its base is a stable
+local dir). The user pushed on exactly this: *"by-value면 resume 때 날아가는 거 아냐?"* — correct for
+naive by-value; the fix is inline-at-ingress, persist-internally.
+
+**What shipped (core, ~no studio logic):**
+- **`blob:<sha256>` scheme** — a durable, content-addressed media reference. `WorkspaceMediaResolver`
+  now resolves `blob:` refs from an in-memory `blobs` map in addition to workspace paths.
+- **Inline ingress** — `parse_data_uri` + `normalize_inline_media_part` (core/media.py): a part handed
+  in by value as a `data:<mime>;base64,…` URI is, **at loop ingestion** (before it enters the durable
+  by-value log), written to the loop's content-addressed media-blob map (`RunState.media_blobs`) and
+  rewritten to a `blob:<sha>` ref. So the durable log/checkpoint stay by-reference (tiny); the bytes
+  never sit inline in the log.
+- **Durability** — `collect_checkpoint_blobs` now emits the media blobs alongside workspace-delta
+  blobs (one content-addressed namespace, identical content dedups). On `restore`, every `blob:<sha>`
+  referenced by the rehydrated log is loaded back from the checkpoint blob store into `media_blobs`.
+  So an inline image survives a restart **and a base re-provisioning** — it travels with the
+  checkpoint bundle, not the workspace. Forks seed `media_blobs` so `blob:` refs in inherited history
+  still resolve in a child.
+- **Studio simplified** — `_parts_from_attachments` now hands attachments by value as `data:` URIs and
+  writes **nothing** to the workspace (the `.studio-attachments/` dir is gone). Side effect: gap 2b
+  (the run's 1 MB `max_bytes_read` ceiling on workspace reads) no longer gates inline media — blob
+  resolution reads from memory, bounded by the studio's own `_MAX_ATTACH_BYTES` + the existing
+  oversized-wire guard.
+
+**Known v1 edges (logged, not blocking):** (1) a follow-up inline message transits the backend queue
+as a `data:` URI, so if the run is checkpointed while that message is still *unconsumed*, the bytes
+land transiently in `queued_messages` (round-trips correctly, just not compact) — the clean fix is a
+standalone `store.put_blob` at backend ingress, deferred. (2) tool-result media is still
+workspace-by-reference (tools write to the workspace by convention); inline normalization is
+user-input-only for now.
+
+**Tests:** core media unit (data-URI parse + normalize + blob resolver + `blob_shas_in_messages`) +
+the durability integration (inline image → checkpoint → restore into a **fresh empty workspace** →
+still forwarded, resolved from the rehydrated blob). Live HTTP: attach → forwarded with matching
+bytes → **zero workspace files**.
+
 <!-- Add new entries below as later rungs surface them. -->

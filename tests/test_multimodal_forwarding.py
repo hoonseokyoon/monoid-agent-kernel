@@ -451,3 +451,91 @@ def test_audio_degrades_even_on_multimodal_adapter(tmp_path: Path) -> None:
     # The audio part is dropped from the wire; only text reaches the model.
     user = [m for m in adapter.requests[0].messages if m["role"] == "user"][0]
     assert all(p.get("type") != "audio" for p in user["content"] if isinstance(p, dict))
+
+
+# --- inline ingress -> content-addressed blob normalization (gap 2a) --------------------
+
+
+def test_normalize_inline_media_part_and_blob_resolver(tmp_path: Path) -> None:
+    from native_agent_runner.core.media import (
+        WorkspaceMediaResolver,
+        blob_shas_in_messages,
+        normalize_inline_media_part,
+        parse_data_uri,
+    )
+
+    data_uri = "data:image/png;base64," + base64.b64encode(_PNG_BYTES).decode()
+    assert parse_data_uri(data_uri) == ("image/png", _PNG_BYTES)
+    assert parse_data_uri("img.png") is None
+
+    store: dict[str, bytes] = {}
+    part = ImagePart(source_ref=data_uri, mime_type="image/png")
+    norm = normalize_inline_media_part(part, store)
+    assert norm.source_ref.startswith("blob:")
+    sha = norm.source_ref[len("blob:"):]
+    assert store[sha] == _PNG_BYTES
+    # A by-reference (workspace) part passes through untouched.
+    ws_part = ImagePart(source_ref="img.png", mime_type="image/png")
+    assert normalize_inline_media_part(ws_part, store) is ws_part
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    resolver = WorkspaceMediaResolver(LocalWorkspaceBackend(root=workspace), blobs=store)
+    resolved = resolver.resolve(norm.source_ref, "image/png")
+    assert resolved.data == _PNG_BYTES and resolved.sha256 == sha
+
+    msgs = ({"role": "user", "content": [{"type": "image", "source_ref": norm.source_ref, "mime_type": "image/png"}]},)
+    assert sha in blob_shas_in_messages(msgs)
+
+
+def test_inline_media_ingested_to_blob_survives_restore(tmp_path: Path) -> None:
+    # The durability claim: an inline (by-value) image is normalized to a content-addressed blob,
+    # so it survives a restart AND a base re-provisioning (the new workspace has NO attachment file)
+    # — resolution reads from the rehydrated blob, not the workspace.
+    data_uri = "data:image/png;base64," + base64.b64encode(_PNG_BYTES).decode()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()  # deliberately empty: no img.png on disk
+
+    adapter_a = FakeMultimodalModelAdapter(turns=[_finish_turn()])
+    spec_a = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    loop_a = AgentLoop(
+        spec=spec_a,
+        model_adapter=adapter_a,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+    loop_a.open()
+    loop_a.submit((TextPart("describe"), ImagePart(source_ref=data_uri, mime_type="image/png")))
+
+    # The inline bytes were forwarded (resolved from the blob, since no workspace file exists).
+    user_a = [m for m in adapter_a.requests[0].messages if m["role"] == "user"][0]
+    img_a = [p for p in user_a["content"] if p.get("type") == "image"][0]
+    assert base64.b64decode(img_a["source"]["data"]) == _PNG_BYTES
+
+    checkpoint = loop_a.snapshot()
+    assert checkpoint is not None
+    blobs = loop_a.collect_checkpoint_blobs()
+    # The DURABLE log holds a blob: ref, not the bytes; the bytes live in the content blob.
+    logged_user = [m for m in checkpoint.messages if m["role"] == "user"][0]
+    blob_ref = logged_user["content"][1]["source_ref"]
+    assert blob_ref.startswith("blob:")
+    assert blob_ref[len("blob:"):] in blobs
+    loop_a.close()
+
+    # Fresh process: a re-provisioned, EMPTY workspace; restore only from the checkpoint + blobs.
+    workspace2 = tmp_path / "workspace2"
+    workspace2.mkdir()
+    adapter_b = FakeMultimodalModelAdapter(turns=[_finish_turn()])
+    spec_b = AgentRunSpec(workspace_root=workspace2, run_root=tmp_path / "runs2", run_id=spec_a.run_id)
+    loop_b = AgentLoop(
+        spec=spec_b,
+        model_adapter=adapter_b,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+    loop_b.restore(checkpoint, blobs=blobs)
+    loop_b.submit("again")
+
+    # The resent log STILL forwards the image, resolved from the rehydrated blob.
+    user_b = [m for m in adapter_b.requests[0].messages if m["role"] == "user"][0]
+    img_b = [p for p in user_b["content"] if p.get("type") == "image"][0]
+    assert base64.b64decode(img_b["source"]["data"]) == _PNG_BYTES
+    loop_b.close()

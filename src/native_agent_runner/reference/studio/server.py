@@ -21,7 +21,6 @@ import base64
 import json
 import logging
 import os
-import re
 import secrets
 import threading
 import time
@@ -56,19 +55,17 @@ from native_agent_runner.reference.studio.activity import describe_event
 _LOGGER = logging.getLogger("native_agent_runner.studio")
 
 _WEB_DIR = Path(__file__).parent / "web"
-# Per-attachment cap. Images/PDFs ride a base64 JSON body, so the HTTP body limit and the run's
-# workspace read limit are both sized to clear it (a multimodal message references the workspace
-# file; the bytes are resolved at wire-build time, capped by the run's max_bytes_read).
+# Per-attachment cap. An attachment rides a base64 ``data:`` URI inside the JSON body (handed to
+# the runner by value; the core normalizes it to a content-addressed blob), so the HTTP body limit
+# is sized to clear one inflated image plus the JSON envelope.
 _MAX_ATTACH_BYTES = 8 * 1024 * 1024
 _MAX_BODY_BYTES = _MAX_ATTACH_BYTES + 2 * 1024 * 1024  # room for base64 inflation + JSON envelope
-# Uploaded attachments are persisted here under the workspace so a workspace-path source_ref resolves.
-_ATTACH_DIR = ".studio-attachments"
 # Studio is a single-user local app; the tenant/user are fixed placeholders.
 _TENANT = "studio"
 _USER = "local"
 
 # Directories never shown in the file tree (and not worth walking).
-_TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".ruff_cache", ".pytest_cache", _ATTACH_DIR}
+_TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".ruff_cache", ".pytest_cache"}
 _TREE_MAX_ENTRIES = 2000
 _VIEW_MAX_BYTES = 256 * 1024  # file-viewer read cap — keep a huge file from stalling the UI
 
@@ -336,6 +333,9 @@ class StudioServer:
             # Stream tokens live: emit model.output.delta events the UI renders incrementally
             # (effective for adapters that support astream_turn — the gateway/openai path).
             emit_output_deltas=True,
+            # Follow-up attachments ride a base64 data: URI through send_message, so the message
+            # size limit must clear an inline image (the core normalizes it to a blob downstream).
+            max_message_bytes=_MAX_BODY_BYTES,
             # Agent-as-tool: makes agent.spawn available (bound via the "delegate" capability).
             subagent_definitions=_SUBAGENT_DEFINITIONS,
         )
@@ -371,36 +371,34 @@ class StudioServer:
     def _parts_from_attachments(
         self, message: str, attachments: Sequence[dict[str, Any]]
     ) -> tuple[ContentPart, ...]:
-        """Persist uploaded attachments under the workspace and build the multimodal content parts
-        for a user message. Each attachment is ``{name, mime, data_b64}``; ``image/*`` becomes an
-        ``ImagePart``, anything else (e.g. ``application/pdf``) a ``DocumentPart``. The file is
-        written into the workspace so its by-reference ``source_ref`` resolves at wire-build time.
+        """Build the multimodal content parts for a user message. Each attachment is
+        ``{name, mime, data_b64}``; ``image/*`` becomes an ``ImagePart``, anything else (e.g.
+        ``application/pdf``) a ``DocumentPart``. The bytes are handed in **by value** as a ``data:``
+        URI — the runner core normalizes that to a durable content-addressed blob at ingestion, so
+        the studio manages no attachment files and the image survives restart/re-provisioning.
         Returns ``()`` when there are no attachments (the caller uses the plain-text path)."""
         if not attachments:
             return ()
         parts: list[ContentPart] = []
         if message.strip():
             parts.append(TextPart(message.strip()))
-        attach_root = self.workspace / _ATTACH_DIR
-        attach_root.mkdir(parents=True, exist_ok=True)
         for att in attachments:
             name = str(att.get("name") or "file")
             mime = str(att.get("mime") or "application/octet-stream")
+            data_b64 = str(att.get("data_b64") or "")
             try:
-                raw = base64.b64decode(str(att.get("data_b64") or ""), validate=True)
+                raw = base64.b64decode(data_b64, validate=True)
             except (ValueError, TypeError) as exc:
                 raise NativeAgentError(f"attachment {name!r} is not valid base64") from exc
             if not raw:
                 raise NativeAgentError(f"attachment {name!r} is empty")
             if len(raw) > _MAX_ATTACH_BYTES:
                 raise NativeAgentError(f"attachment {name!r} exceeds the {_MAX_ATTACH_BYTES}-byte limit")
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:80] or "file"
-            rel = f"{_ATTACH_DIR}/{secrets.token_hex(4)}-{safe}"
-            (self.workspace / rel).write_bytes(raw)
+            source_ref = f"data:{mime};base64,{data_b64}"
             if mime.startswith("image/"):
-                parts.append(ImagePart(source_ref=rel, mime_type=mime))
+                parts.append(ImagePart(source_ref=source_ref, mime_type=mime))
             else:
-                parts.append(DocumentPart(source_ref=rel, mime_type=mime))
+                parts.append(DocumentPart(source_ref=source_ref, mime_type=mime))
         return tuple(parts)
 
     def start_chat(self, message: str, attachments: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
@@ -417,8 +415,6 @@ class StudioServer:
             input_parts=parts,
             mode="propose",
             multi_turn=True,
-            # Sized so a workspace image/PDF reference resolves to bytes at wire-build time.
-            max_bytes_read=_MAX_ATTACH_BYTES,
             runtime_config=runtime_config,
         )
         submission = self._backend.submit_run(request)

@@ -17,9 +17,11 @@ import base64
 import math
 import re
 import struct
-from dataclasses import dataclass
-from typing import Any, Protocol
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from typing import Any, Protocol, TypeVar
 
+from native_agent_runner.core._util import sha256_bytes
 from native_agent_runner.core.workspace import Workspace
 from native_agent_runner.errors import NativeAgentError
 
@@ -95,6 +97,68 @@ def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
 _SCHEME_RE = re.compile(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*)://")
 _WORKSPACE_PREFIX_RE = re.compile(r"^workspace:(//)?")
 
+# A durable, content-addressed media reference: ``blob:<sha256>``. The bytes live in the
+# checkpoint blob store (write-once, content-addressed), so a blob ref survives a restart and a
+# base re-provisioning — unlike a workspace path, whose bytes vanish if the base is re-cloned.
+BLOB_SCHEME = "blob:"
+# Inline ingress: an embedder may hand media by value as a ``data:`` URI (what a browser
+# FileReader produces). The loop normalizes it to a ``blob:`` ref at ingestion, so the durable
+# message log never carries the bytes inline.
+_DATA_URI_RE = re.compile(r"^data:(?P<mime>[^;,]*)(?P<b64>;base64)?,(?P<data>.*)$", re.DOTALL)
+
+_PartT = TypeVar("_PartT")
+
+
+def parse_data_uri(source_ref: str) -> tuple[str, bytes] | None:
+    """Decode a ``data:[<mime>][;base64],<payload>`` URI into ``(mime_type, bytes)``; ``None`` if
+    ``source_ref`` is not a data URI. Only base64 payloads are accepted (a non-base64 data URI is
+    rejected loudly — the inline-media path is for binary attachments)."""
+    match = _DATA_URI_RE.match(source_ref)
+    if match is None:
+        return None
+    if not match.group("b64"):
+        raise MediaResolveError("inline media must be a base64 data URI (data:<mime>;base64,...)")
+    try:
+        data = base64.b64decode(match.group("data"), validate=True)
+    except (ValueError, TypeError) as exc:
+        raise MediaResolveError(f"inline media is not valid base64: {exc}") from exc
+    return (match.group("mime") or "application/octet-stream"), data
+
+
+def normalize_inline_media_part(part: _PartT, store: dict[str, bytes]) -> _PartT:
+    """If ``part`` carries inline bytes (a ``data:`` ``source_ref``), persist the bytes into
+    ``store`` keyed by sha256 and return a copy whose ``source_ref`` is the durable
+    ``blob:<sha256>`` reference. Non-media parts and already-by-reference parts pass through
+    unchanged. ``store`` is the loop's content-addressed media-blob map (collected into the
+    checkpoint), so an inline image becomes durable the moment it is ingested."""
+    source_ref = getattr(part, "source_ref", None)
+    if not isinstance(source_ref, str) or not source_ref.startswith("data:"):
+        return part
+    parsed = parse_data_uri(source_ref)
+    if parsed is None:  # pragma: no cover - startswith("data:") guarantees a match
+        return part
+    data = parsed[1]
+    sha = sha256_bytes(data)
+    store[sha] = data
+    return replace(part, source_ref=f"{BLOB_SCHEME}{sha}")  # type: ignore[type-var]
+
+
+def blob_shas_in_messages(messages: tuple[dict[str, Any], ...]) -> set[str]:
+    """Every ``blob:<sha>`` referenced by a by-reference message log — user-content part lists
+    and tool-message ``media`` lists. Used on restore to know which durable blobs to rehydrate
+    into the loop's in-memory media-blob map."""
+    shas: set[str] = set()
+    for message in messages:
+        for carrier in ("content", "media"):
+            parts = message.get(carrier)
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                ref = part.get("source_ref") if isinstance(part, dict) else None
+                if isinstance(ref, str) and ref.startswith(BLOB_SCHEME):
+                    shas.add(ref[len(BLOB_SCHEME):])
+    return shas
+
 
 class MediaResolveError(NativeAgentError):
     """Raised when a ``source_ref`` cannot be resolved to bytes."""
@@ -121,16 +185,30 @@ class MediaResolver(Protocol):
 
 @dataclass(frozen=True)
 class WorkspaceMediaResolver:
-    """Resolve workspace-path references via ``Workspace.read_bytes``.
+    """Resolve media references to bytes at wire-build time.
 
-    Accepts bare workspace paths and an optional ``workspace:`` / ``workspace://``
-    prefix. Any other URI scheme (``http://``, ``https://``, ``file_id:`` …) is a
-    deferred remote/opaque handle and raises ``MediaResolveError``.
+    Two reference kinds are resolvable: a ``blob:<sha256>`` content-addressed reference (read from
+    the in-memory ``blobs`` map — inline-ingested media that was normalized to a durable checkpoint
+    blob), and a workspace path (bare, or with a ``workspace:`` / ``workspace://`` prefix), read via
+    ``Workspace.read_bytes``. Any other URI scheme (``http://``, ``file_id:`` …) is a deferred
+    remote/opaque handle and raises ``MediaResolveError``.
     """
 
     workspace: Workspace
+    blobs: Mapping[str, bytes] = field(default_factory=dict)
 
     def resolve(self, source_ref: str, mime_type: str, *, max_bytes: int | None = None) -> ResolvedMedia:
+        if source_ref.startswith(BLOB_SCHEME):
+            sha = source_ref[len(BLOB_SCHEME):]
+            try:
+                data = self.blobs[sha]
+            except KeyError as exc:
+                raise MediaResolveError(
+                    f"cannot resolve media blob {source_ref!r}: not in the blob store"
+                ) from exc
+            if max_bytes is not None and len(data) > max_bytes:
+                raise MediaResolveError(f"media blob exceeds max read size: {source_ref!r}")
+            return ResolvedMedia(data=data, sha256=sha, mime_type=mime_type)
         path = self._workspace_path(source_ref)
         try:
             data, digest = self.workspace.read_bytes(path, max_bytes=max_bytes)

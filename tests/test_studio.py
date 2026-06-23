@@ -401,9 +401,9 @@ def test_start_chat_attaches_image_and_forwards_resolved_block(tmp_path: Path) -
         run_id = result["run_id"]
         _wait_settled(server, run_id, 1)
 
-        # The attachment was persisted under the workspace (so its source_ref resolves).
-        attach_dir = workspace / ".studio-attachments"
-        assert attach_dir.is_dir() and any(attach_dir.iterdir())
+        # Inline ingress: the studio writes NO attachment file into the workspace — the bytes ride
+        # a data: URI and the core normalizes them to a content-addressed blob.
+        assert not (workspace / ".studio-attachments").exists()
 
         # The adapter received a resolved base64 image block on the user turn.
         def _image_forwarded() -> bool:

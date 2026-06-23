@@ -29,11 +29,13 @@ from native_agent_runner.core.media import (
     MAX_FORWARDABLE_BLOCKS,
     WIRE_FORWARDABLE_PART_TYPES,
     WorkspaceMediaResolver,
+    blob_shas_in_messages,
     count_tool_result_images,
     estimate_image_tokens,
     evict_tool_result_images,
     image_dimensions,
     native_image_token_cap,
+    normalize_inline_media_part,
     resolve_wire_messages,
 )
 from native_agent_runner.core.context import (
@@ -429,6 +431,11 @@ class RunState:
     # owns and resends each turn (vendor-independent continuation). The system prompt is
     # NOT here — it is regenerated per turn and applied via ModelRequest.system_prompt.
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # Content-addressed bytes for inline-ingested media (``blob:<sha>`` refs in ``messages``).
+    # In-memory working state, NOT serialized into the manifest — it travels as checkpoint blobs
+    # (``collect_checkpoint_blobs``) and is rehydrated on restore, so an inline image survives a
+    # restart and a base re-provisioning.
+    media_blobs: dict[str, bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -854,17 +861,22 @@ class AgentLoop:
         user_input: str | tuple[ContentPart, ...],
         *,
         seed_messages: tuple[dict[str, Any], ...] | None = None,
+        seed_media_blobs: Mapping[str, bytes] | None = None,
     ) -> AgentRunResult:
         """Async form of :meth:`run_once`. ``seed_messages`` pre-loads the by-value
         conversation log before the first turn — used by a ``context: fork`` subagent to
         inherit the parent's conversation snapshot (the system prompt is regenerated from
-        this run's own config, so a fork sees the history but applies its own directive)."""
+        this run's own config, so a fork sees the history but applies its own directive).
+        ``seed_media_blobs`` carries the parent's inline-media bytes so ``blob:`` refs in
+        ``seed_messages`` still resolve in the child."""
         self.open()
         try:
             session = self._require_open()
             if not session.terminal:
                 if seed_messages:
                     session.state.messages = [dict(message) for message in seed_messages]
+                if seed_media_blobs:
+                    session.state.media_blobs = dict(seed_media_blobs)
                 await self.asubmit(user_input)
         finally:
             result = self.close()
@@ -1180,11 +1192,13 @@ class AgentLoop:
         return entries
 
     def collect_checkpoint_blobs(self) -> dict[str, bytes]:
-        """Content-addressed blobs for the current park's workspace delta: the bytes of
-        each created/modified file, keyed by sha256. Read at the same quiescent park as
-        ``snapshot()`` so the keys match the manifest's ``content_sha256`` refs."""
+        """Content-addressed blobs for the current park, keyed by sha256: the bytes of each
+        created/modified workspace file, PLUS the inline-ingested media bytes
+        (``state.media_blobs``). Read at the same quiescent park as ``snapshot()`` so the keys
+        match the manifest's ``content_sha256`` / ``blob:<sha>`` refs. Both kinds share one
+        content-addressed namespace (identical content dedups)."""
         session = self._require_open()
-        blobs: dict[str, bytes] = {}
+        blobs: dict[str, bytes] = dict(session.state.media_blobs)
         for entry in session.res.workspace.changed_entries():
             if entry.content is not None:
                 blobs[sha256_bytes(entry.content)] = entry.content
@@ -1255,6 +1269,17 @@ class AgentLoop:
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
         )
+        # Rehydrate inline-ingested media: load every blob:<sha> referenced by the restored log
+        # back into the in-memory map so wire-build can resolve it after the restart. A blob
+        # missing from the store is skipped (not fatal) — resolution then surfaces it as a
+        # MediaResolveError at wire-build, the same degraded path as a deleted workspace file.
+        media_blobs: dict[str, bytes] = {}
+        for sha in blob_shas_in_messages(tuple(state.messages)):
+            try:
+                media_blobs[sha] = blob_reader(sha)
+            except KeyError:
+                pass
+        state.media_blobs = media_blobs
         # Re-apply the agent's workspace delta on top of the (backend-re-provisioned)
         # base, so the restored workspace matches the checkpoint instant and
         # changed_entries() reports the same delta again.
@@ -1427,8 +1452,10 @@ class AgentLoop:
         # A fork inherits the parent's conversation snapshot; a fresh subagent starts empty.
         # mode/limits: a fork inherits the parent's outright; a fresh subagent may narrow them.
         seed_messages: tuple[dict[str, Any], ...] | None = None
+        seed_media_blobs: Mapping[str, bytes] | None = None
         if is_fork and self._session is not None:
             seed_messages = tuple(dict(message) for message in self._session.state.messages)
+            seed_media_blobs = dict(self._session.state.media_blobs)
         # Correlate the delegation on the PARENT's event stream (the child records to its
         # own run dir; stateful sinks like OTel/StatusJson are NOT shared to avoid clobber).
         started = recorder.emit(
@@ -1478,7 +1505,9 @@ class AgentLoop:
             # (an observer can tail run_root/<child_run_id>/events.jsonl for live subagent output).
             emit_output_deltas=self.emit_output_deltas,
         )
-        result = await child.arun_once(task.prompt, seed_messages=seed_messages)
+        result = await child.arun_once(
+            task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
+        )
         usage = {
             key: result.metrics[key]
             for key in ("input_tokens", "output_tokens", "total_tokens")
@@ -1913,6 +1942,14 @@ class AgentLoop:
             instruction: str | None = None
             user_message: dict[str, Any] | None = None
             if state.pending_user_input is not None:
+                # Inline ingress: any part handed in by value (a ``data:`` source_ref) is
+                # persisted to the content-addressed media-blob store and rewritten to a durable
+                # ``blob:<sha>`` ref BEFORE it enters the by-value log — so the log/checkpoint
+                # stay by-reference (tiny, resumable) and never carry the bytes inline.
+                state.pending_user_input = tuple(
+                    normalize_inline_media_part(part, state.media_blobs)
+                    for part in state.pending_user_input
+                )
                 # ``instruction`` is the text projection used only by the by-reference
                 # fallback path (first turn / follow-up on a handle). ``user_message``
                 # is the durable by-value log entry: a plain string for all-text input,
@@ -1987,7 +2024,7 @@ class AgentLoop:
                     evicted = before - count_tool_result_images(wire_messages)
                 wire_messages = resolve_wire_messages(
                     wire_messages,
-                    WorkspaceMediaResolver(res.workspace),
+                    WorkspaceMediaResolver(res.workspace, blobs=state.media_blobs),
                     encoding=getattr(self.model_adapter, "wire_image_encoding", "base64"),
                 )
                 self._emit_media_accounting(
