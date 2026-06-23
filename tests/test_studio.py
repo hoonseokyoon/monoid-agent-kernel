@@ -236,6 +236,76 @@ def test_agent_write_is_staged_then_applied(tmp_path: Path) -> None:
         server.shutdown()
 
 
+def test_partial_approval_applies_only_selected_paths(tmp_path: Path) -> None:
+    # R9: the per-file approval gate. The agent stages two files; Studio approves only one, so
+    # apply writes that file and reports the other as skipped (never touching disk for it).
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call("fs_write", {"path": "KEEP.md", "content": "keep\n"}, "c1"),
+                    fake_tool_call("fs_write", {"path": "DROP.md", "content": "drop\n"}, "c2"),
+                )
+            ),
+            ModelTurn(final_text="Wrote two files."),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("stage two files")["run_id"]
+        _wait_settled(server, run_id, 1)
+        _wait_proposal(server, run_id)
+
+        result = server.apply(run_id, approved_paths=("KEEP.md",))
+        assert result["status"] != "conflict"
+        assert "KEEP.md" in str(result.get("applied_paths"))
+        assert "DROP.md" in str(result.get("skipped_paths"))
+        assert (workspace / "KEEP.md").exists()
+        assert not (workspace / "DROP.md").exists()
+    finally:
+        server.shutdown()
+
+
+def test_export_package_builds_self_verifying_tar(tmp_path: Path) -> None:
+    # R9: export hands back a portable, self-verifying package the studio can stream to the user.
+    import tarfile
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("fs_write", {"path": "OUT.md", "content": "hi\n"}, "c1"),)),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("write OUT.md")["run_id"]
+        _wait_settled(server, run_id, 1)
+        _wait_proposal(server, run_id)
+
+        path, payload = server.export_package(run_id)
+        assert path.exists()
+        assert payload.get("package_hash")
+        with tarfile.open(path, "r") as archive:
+            names = archive.getnames()
+        assert "proposal.package.json" in names
+        assert any(name == "proposal.json" for name in names)
+    finally:
+        server.shutdown()
+
+
 # --- R3: human-in-the-loop approval gate ------------------------------------------------
 
 

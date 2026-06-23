@@ -466,13 +466,31 @@ class StudioServer:
         payload["diff"] = self._backend.proposal_diff(run_id, token).get("diff", "")
         return payload
 
-    def apply(self, run_id: str) -> dict[str, Any]:
-        """Approve and apply the current proposal into the workspace (the propose→apply step)."""
+    def apply(self, run_id: str, *, approved_paths: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Approve and apply the current proposal into the workspace (the propose→apply step).
+
+        ``approved_paths`` empty = approve every changed path (the legacy all-or-nothing behavior).
+        A non-empty subset records a partial approval, so apply_package writes only those files and
+        reports the rest as skipped — the per-file approval gate the core has always supported but
+        the studio used to bypass."""
         assert self._backend is not None
         token = self._token_for(run_id)
-        self._backend.approve_proposal(run_id, token, approver_id=_USER)
+        self._backend.approve_proposal(
+            run_id, token, approver_id=_USER, approved_paths=approved_paths
+        )
         result = self._backend.apply_proposal(run_id, token, target=self.workspace)
         return result
+
+    def export_package(self, run_id: str) -> tuple[Path, dict[str, Any]]:
+        """Build the portable proposal package (a self-verifying tar) and hand back its on-disk path
+        plus the manifest. The studio is co-located with the backend, so it streams the tar straight
+        off ``run_dir``. NOTE (contract gap): ``export_proposal_package`` returns only a server-local
+        path, so a *remote* embedder has no token-scoped way to fetch the package bytes — see
+        DX_NOTES R9."""
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        payload = self._backend.export_proposal_package(run_id, token)
+        return Path(str(payload["package_path"])), payload
 
     def jobs(self, run_id: str) -> dict[str, Any]:
         """Background shell jobs for the run (running + finished)."""
@@ -733,7 +751,16 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/apply":
                     body = self._read_json()
                     run_id = str(body.get("run_id") or "")
-                    self._write_json(studio.apply(run_id))
+                    raw = body.get("approved_paths")
+                    approved = tuple(str(p) for p in raw) if isinstance(raw, list) else ()
+                    self._write_json(studio.apply(run_id, approved_paths=approved))
+                    return
+                if parsed.path == "/api/export-package":
+                    body = self._read_json()
+                    run_id = str(body.get("run_id") or "")
+                    path, payload = studio.export_package(run_id)
+                    name = f"proposal-{str(payload.get('package_hash') or 'package')[:12]}.tar"
+                    self._serve_file(path, "application/x-tar", download_name=name)
                     return
                 if parsed.path == "/api/hitl":
                     body = self._read_json()
@@ -845,7 +872,7 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
-        def _serve_file(self, path: Path, content_type: str) -> None:
+        def _serve_file(self, path: Path, content_type: str, *, download_name: str = "") -> None:
             try:
                 body = path.read_bytes()
             except OSError:
@@ -854,6 +881,8 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            if download_name:
+                self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
             self.end_headers()
             self.wfile.write(body)
 

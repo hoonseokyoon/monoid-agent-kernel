@@ -54,8 +54,14 @@
   #viewer-body { flex: 1; margin: 0; white-space: pre; overflow: auto; background: var(--bg);
     border: 1px solid var(--border); border-radius: 8px; padding: 10px;
     font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
-  #proposal-files { font-size: 12.5px; color: var(--muted); }
-  #proposal-files .f { color: var(--text); }
+  #proposal-all { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #proposal-files { font-size: 12.5px; color: var(--muted); display: flex; flex-direction: column; gap: 3px; }
+  #proposal-files label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  #proposal-files .f { color: var(--text); font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+  #proposal-actions { display: flex; gap: 8px; }
+  #export { background: transparent; color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 14px; cursor: pointer; }
+  #export:disabled { opacity: .5; cursor: default; }
   #diff { flex: 1; margin: 0; overflow: auto; background: var(--bg); border: 1px solid var(--border);
     border-radius: 8px; padding: 10px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
     white-space: pre; }
@@ -191,9 +197,13 @@
     <div id="log"></div>
     <aside id="proposal" hidden>
       <div class="side-title">Proposed changes</div>
+      <label id="proposal-all"><input type="checkbox" id="select-all" checked /> Select all</label>
       <div id="proposal-files"></div>
       <pre id="diff"></pre>
-      <button id="apply" type="button">Approve &amp; apply</button>
+      <div id="proposal-actions">
+        <button id="apply" type="button">Approve &amp; apply</button>
+        <button id="export" type="button" title="Download a portable, self-verifying proposal package (.tar)">Export package</button>
+      </div>
       <div id="apply-status"></div>
     </aside>
     <aside id="trace" hidden>
@@ -574,30 +584,55 @@ function renderDiff(text) {
   }
 }
 
+const selectAllEl = document.getElementById("select-all");
+const exportBtn = document.getElementById("export");
+
+function checkedPaths() {
+  return [...proposalFilesEl.querySelectorAll("input[type=checkbox]")]
+    .filter(cb => cb.checked).map(cb => cb.value);
+}
+
 async function refreshProposal() {
   if (!runId || applied) return;
   try {
     const p = await (await fetch(`/api/proposal?run_id=${encodeURIComponent(runId)}`)).json();
     if (!p.ready || !p.diff) return;
     const files = (p.changed_paths || (p.files || []).map(f => f.path) || []);
-    proposalFilesEl.innerHTML = files.length
-      ? "Changed: " + files.map(f => `<span class="f">${f}</span>`).join(", ")
-      : "";
+    // Preserve any prior per-file selection across refreshes (proposal updates mid-run).
+    const prior = new Set([...proposalFilesEl.querySelectorAll("input:not(:checked)")].map(cb => cb.value));
+    proposalFilesEl.innerHTML = files.map(f => {
+      const checked = prior.has(f) ? "" : "checked";
+      const safe = f.replace(/"/g, "&quot;");
+      return `<label><input type="checkbox" value="${safe}" ${checked} /><span class="f">${f}</span></label>`;
+    }).join("");
+    syncSelectAll();
     renderDiff(p.diff);
     proposalEl.hidden = false;
     applyBtn.disabled = false;
+    exportBtn.disabled = false;
     applyStatus.textContent = "";
   } catch (_) {}
 }
 
+function syncSelectAll() {
+  const boxes = [...proposalFilesEl.querySelectorAll("input[type=checkbox]")];
+  selectAllEl.checked = boxes.length > 0 && boxes.every(cb => cb.checked);
+}
+selectAllEl.addEventListener("change", () => {
+  proposalFilesEl.querySelectorAll("input[type=checkbox]").forEach(cb => { cb.checked = selectAllEl.checked; });
+});
+proposalFilesEl.addEventListener("change", syncSelectAll);
+
 async function applyProposal() {
   if (!runId) return;
+  const approved = checkedPaths();
+  if (!approved.length) { applyStatus.textContent = "Select at least one file to apply."; return; }
   applyBtn.disabled = true;
   applyStatus.textContent = "Applying…";
   try {
     const res = await (await fetch("/api/apply", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id: runId }),
+      body: JSON.stringify({ run_id: runId, approved_paths: approved }),
     })).json();
     if (res.error) { applyStatus.textContent = "Error: " + res.error; applyBtn.disabled = false; return; }
     if (res.status === "conflict") {
@@ -606,7 +641,9 @@ async function applyProposal() {
       return;
     }
     applied = true;
-    applyStatus.textContent = "Applied " + ((res.applied_paths || []).length) + " file(s).";
+    const skipped = (res.skipped_paths || []).length;
+    applyStatus.textContent = "Applied " + ((res.applied_paths || []).length) + " file(s)"
+      + (skipped ? `, skipped ${skipped}.` : ".");
     activity("Applied proposed changes to the workspace");
     loadTree();
   } catch (err) {
@@ -615,6 +652,37 @@ async function applyProposal() {
   }
 }
 applyBtn.addEventListener("click", applyProposal);
+
+async function exportPackage() {
+  if (!runId) return;
+  exportBtn.disabled = true;
+  applyStatus.textContent = "Exporting…";
+  try {
+    const res = await fetch("/api/export-package", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      applyStatus.textContent = "Error: " + (err.error || res.status);
+      exportBtn.disabled = false;
+      return;
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") || "";
+    const name = (cd.match(/filename="([^"]+)"/) || [])[1] || "proposal.tar";
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name; a.click();
+    URL.revokeObjectURL(url);
+    applyStatus.textContent = "Exported " + name;
+    exportBtn.disabled = false;
+  } catch (err) {
+    applyStatus.textContent = "Error: " + err;
+    exportBtn.disabled = false;
+  }
+}
+exportBtn.addEventListener("click", exportPackage);
 
 async function refreshJobs() {
   if (!runId) return;

@@ -382,4 +382,32 @@ pipe: a hung pytest never flushes, so the run looks dead.
 every thread's stack — pinpointing the exact blocked line — and aborts, instead of hanging. So
 the background can never stall indefinitely again, and the next occurrence is self-diagnosing.
 
+### R9 (per-file proposal approval + package export) — studio bypassed an existing core gate; one remote-embedder contract gap
+**What shipped:** the studio now exposes two capabilities the core+backend already had but the
+reference app never reached:
+- **Per-file approval.** `studio.apply(run_id, approved_paths=…)` forwards a chosen subset to
+  `approve_proposal`; `apply_package` writes only those files and returns the rest as
+  `skipped_paths`. The UI renders the changed-path list as checkboxes (+ select-all), so a human
+  can land a subset and leave the rest staged. Empty subset still = approve-all (legacy behavior).
+- **Package export.** `studio.export_package` → `export_proposal_package` builds the self-verifying
+  tar; a new `POST /api/export-package` route streams it with `Content-Disposition`, and the UI
+  triggers a browser download. Live-verified end-to-end: partial apply skips the unselected file on
+  disk; export returns a real `ustar` tar with the package-hash filename.
+
+**DX finding (no core change needed):** the gate was never missing — the studio's `apply()` simply
+hard-coded approve-all and dropped the `approved_paths` parameter. The core contract is already
+strict (unknown paths and approved∩rejected overlap both raise in `create_approval`), so wiring the
+subset through was pure plumbing. The lesson is that a reference app can silently *hide* a core
+safety feature by not threading one kwarg — worth auditing the other backend kwargs the studio
+defaults away.
+
+**🟠 Contract gap (remote embedders):** `export_proposal_package` returns only a **server-local
+filesystem path** (`run_dir/proposal.tar`), not bytes. The studio gets away with reading it off disk
+because it is co-located with the backend, but that violates the same "an embedder never reads the
+run dir off disk" principle the `proposal()` API was built around — a *remote* embedder has no
+token-scoped way to fetch the package bytes. Closing it cleanly would mean either a backend method
+that returns the tar bytes (or a streaming handle), or a generic token-scoped run-artifact GET.
+Deferred (reference studio is co-located), but it's a real seam to fix before the backend is used
+out-of-process.
+
 <!-- Add new entries below as later rungs surface them. -->
