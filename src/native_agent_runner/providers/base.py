@@ -82,6 +82,12 @@ class ModelTurn:
     tool_calls: tuple[ToolCall, ...] = ()
     usage: dict[str, int] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
+    # Provider-native reasoning artifacts (e.g. OpenAI ``reasoning``/``function_call`` output
+    # items), captured verbatim and in their original order so the engine can round-trip them
+    # on the next by-value turn. Opaque to the core — never displayed, never reconstructed; an
+    # adapter that has no reasoning leaves this empty (the neutral seam). See the OpenAI adapter
+    # and the loop's assistant-message append for capture + re-injection.
+    reasoning: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -195,13 +201,22 @@ class ToolCallDelta:
 
 @dataclass(frozen=True)
 class TurnComplete:
-    """Terminal chunk carrying the provider handle and final usage for the turn."""
+    """Terminal chunk carrying the provider handle, final usage, and any reasoning artifacts
+    for the turn. ``reasoning`` mirrors :attr:`ModelTurn.reasoning`: the streaming path can only
+    read provider reasoning items (with their ``encrypted_content``) off the final response
+    object, so they ride this terminal chunk rather than the per-token deltas."""
 
     response_id: str | None = None
     usage: dict[str, int] = field(default_factory=dict)
+    reasoning: tuple[dict[str, Any], ...] = ()
 
     def to_json(self) -> dict[str, Any]:
-        return {"type": "turn_complete", "response_id": self.response_id, "usage": dict(self.usage)}
+        return {
+            "type": "turn_complete",
+            "response_id": self.response_id,
+            "usage": dict(self.usage),
+            "reasoning": [dict(item) for item in self.reasoning],
+        }
 
 
 ModelStreamChunk = TextDelta | ToolCallDelta | TurnComplete
@@ -217,6 +232,7 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     order: list[int] = []
     response_id: str | None = None
     usage: dict[str, int] = {}
+    reasoning: tuple[dict[str, Any], ...] = ()
     for chunk in chunks:
         if isinstance(chunk, TextDelta):
             text_parts.append(chunk.text)
@@ -236,6 +252,8 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
                 response_id = chunk.response_id
             if chunk.usage:
                 usage = chunk.usage
+            if chunk.reasoning:
+                reasoning = chunk.reasoning
     tool_calls: list[ToolCall] = []
     for index in order:
         slot = slots[index]
@@ -258,5 +276,6 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         final_text="".join(text_parts) if text_parts else None,
         tool_calls=tuple(tool_calls),
         usage=normalize_usage(usage) if usage else {},
+        reasoning=reasoning,
     )
 

@@ -384,6 +384,78 @@ def test_by_value_conversation_accumulates_and_survives_restore(tmp_path: Path) 
     loop2.close()
 
 
+def test_openai_reasoning_block_attached_and_survives_restore(tmp_path: Path) -> None:
+    # DX-13a: when the adapter reports provider_name=="openai" and a turn carries reasoning,
+    # the assistant message gets a provider+model-tagged block — and it survives a checkpoint
+    # JSON round-trip byte-identical (no serializer change; arbitrary message keys persist).
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    provider = runtime_provider(runtime_config("fs.write"))
+    items = ({"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc"},)
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done", reasoning=items)])
+    adapter.provider_name = "openai"  # tag this fake like the real OpenAI adapter
+    loop = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=provider)
+    loop.open()
+    loop.submit("hi")
+
+    cp = loop.snapshot()
+    assert cp is not None
+    assistant = next(m for m in cp.messages if m["role"] == "assistant")
+    block = assistant["reasoning"]
+    assert block["provider"] == "openai"
+    assert block["items"] == [dict(items[0])]
+    assert block["model"]  # tagged with the active model
+
+    restored = RunCheckpoint.from_json(cp.to_json())
+    restored_assistant = next(m for m in restored.messages if m["role"] == "assistant")
+    assert restored_assistant["reasoning"] == block  # byte-identical after round-trip
+    loop.close()
+
+
+def test_non_openai_adapter_attaches_no_reasoning_block(tmp_path: Path) -> None:
+    # The neutral seam: a fake adapter without provider_name never tags reasoning, even if a
+    # turn happens to carry it.
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    provider = runtime_provider(runtime_config("fs.write"))
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(final_text="done", reasoning=({"type": "reasoning", "id": "rs_1"},))]
+    )
+    loop = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=provider)
+    loop.open()
+    loop.submit("hi")
+
+    cp = loop.snapshot()
+    assert cp is not None
+    assistant = next(m for m in cp.messages if m["role"] == "assistant")
+    assert "reasoning" not in assistant
+    loop.close()
+
+
+def test_failed_turn_appends_no_assistant_message(tmp_path: Path) -> None:
+    # DX-13a idempotency: the assistant message (and its reasoning) is appended only on success,
+    # so a failed turn leaves the message log unchanged → a retry re-sends reasoning naturally.
+    class _RaisingAdapter:
+        provider_name = "openai"
+
+        def next_turn(self, request):  # noqa: ANN001, ANN201
+            from native_agent_runner.errors import ModelAdapterError
+
+            raise ModelAdapterError("boom", error_code="provider_unavailable")
+
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=_RaisingAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop.run_once("hello")
+
+    cp = _latest_checkpoint(spec)
+    assert cp is not None
+    roles = [m["role"] for m in cp.messages]
+    assert "assistant" not in roles
+    assert ("user", "hello") in [(m["role"], m.get("content")) for m in cp.messages]
+
+
 def test_failed_run_writes_failure_bundle_and_keeps_checkpoint(tmp_path: Path) -> None:
     class _RaisingAdapter:
         def next_turn(self, request):  # noqa: ANN001, ANN201

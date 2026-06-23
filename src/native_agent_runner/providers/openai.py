@@ -38,6 +38,9 @@ class OpenAIModelAdapter:
 
     # Maps resolved base64 image blocks to Responses ``input_image`` items.
     supports_multimodal: ClassVar[bool] = True
+    # Identifies which provider's reasoning artifacts this adapter produces, so the loop tags
+    # the captured reasoning block and replay only happens against a matching model.
+    provider_name: ClassVar[str] = "openai"
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         if not self.allow_direct_provider_api and os.environ.get("NAR_ALLOW_DIRECT_PROVIDER_API") != "1":
@@ -138,6 +141,9 @@ class OpenAIModelAdapter:
         yield TurnComplete(
             response_id=final_data.get("id"),
             usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
+            # encrypted_content lives only on the final response object, so reasoning items
+            # are captured here (from response.completed) rather than the per-token deltas.
+            reasoning=_capture_reasoning_items(final_data.get("output") or []),
         )
 
     def _payload(self, request: ModelRequest) -> dict[str, Any]:
@@ -146,18 +152,28 @@ class OpenAIModelAdapter:
             "model": config.model,
             "instructions": request.system_prompt,
             "tools": [_openai_tool_schema(tool) for tool in request.tools],
+            # ZDR-faithful reasoning round-trip: don't persist server-side state, and ask for
+            # the encrypted reasoning so it travels by-value in the message log (re-injected by
+            # ``_message_to_input_items``). The engine never relies on ``previous_response_id``.
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
         }
         reasoning_payload = build_reasoning_payload(config.reasoning)
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
 
         if request.messages is not None:
-            # By-value: the full conversation travels as input; no server-side handle.
+            # By-value: the full conversation travels as input; no server-side handle. Reasoning
+            # captured on assistant turns is re-injected verbatim within the active window when it
+            # matches the current model (ZDR round-trip); see ``_reasoning_replay_flags``.
             input_items: list[dict[str, Any]] = []
-            for message in request.messages:
-                input_items.extend(_message_to_input_items(message))
+            replay_flags = _reasoning_replay_flags(request.messages, config.model)
+            for message, replay in zip(request.messages, replay_flags):
+                input_items.extend(_message_to_input_items(message, replay_reasoning=replay))
             payload["input"] = input_items
         elif request.previous_turn_handle:
+            # By-reference (non-ZDR): relies on server-side storage and is unsupported for
+            # reasoning round-trip — the engine uses the by-value path above in production.
             payload["previous_response_id"] = request.previous_turn_handle
             input_items = []
             # Third shape: a new user message on top of an existing continuation handle.
@@ -248,10 +264,18 @@ def _user_content_items(content: list[Any]) -> list[dict[str, Any]]:
     return items
 
 
-def _message_to_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+def _message_to_input_items(
+    message: dict[str, Any], *, replay_reasoning: bool = False
+) -> list[dict[str, Any]]:
     """Translate one provider-neutral by-value message into OpenAI Responses input items.
     An assistant turn with tool calls expands to an assistant text item (if any) plus a
-    ``function_call`` item per call; a tool message is a ``function_call_output``."""
+    ``function_call`` item per call; a tool message is a ``function_call_output``.
+
+    When ``replay_reasoning`` is set and the assistant message carries a captured ``reasoning``
+    block (see ``_capture_reasoning_items``), its verbatim item subsequence is emitted instead —
+    preserving the reasoning→following-item adjacency OpenAI validates — and the reconstructed
+    text/function_calls are suppressed to avoid duplication. Callers gate this flag per the
+    active-window model-identity rule (``_reasoning_replay_flags``)."""
     role = message.get("role")
     if role == "user":
         content = message.get("content")
@@ -277,6 +301,9 @@ def _message_to_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
                 items.append({"role": "user", "content": media_items})
         return items
     if role == "assistant":
+        reasoning = message.get("reasoning")
+        if replay_reasoning and isinstance(reasoning, dict) and reasoning.get("items"):
+            return [dict(item) for item in reasoning["items"]]
         items: list[dict[str, Any]] = []
         content = message.get("content") or ""
         if content:
@@ -292,6 +319,59 @@ def _message_to_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
             )
         return items
     return []
+
+
+def _reasoning_replay_flags(
+    messages: tuple[dict[str, Any], ...], current_model: str
+) -> list[bool]:
+    """Per-message decision of whether to replay its captured OpenAI reasoning verbatim.
+
+    Two rules (see the DX-13a plan):
+    - **Active window only**: reasoning is mandatory to round-trip only since the last ``user``
+      message (the in-flight tool loop). Earlier reasoning is historical and droppable — OpenAI
+      tolerates historical function_call pairs without their reasoning.
+    - **All-or-nothing model identity**: ``config.model`` is re-read every step, so a hot-swap
+      can land mid-loop. If any active-window reasoning block isn't ``openai`` at the current
+      model, drop reasoning for the whole window so we never send a half-paired set (→ no 400).
+    """
+    last_user = -1
+    for index, message in enumerate(messages):
+        if message.get("role") == "user":
+            last_user = index
+    window_ok = True
+    for message in messages[last_user + 1 :]:
+        reasoning = message.get("reasoning")
+        if isinstance(reasoning, dict) and reasoning.get("items"):
+            if reasoning.get("provider") != "openai" or reasoning.get("model") != current_model:
+                window_ok = False
+                break
+    return [index > last_user and window_ok for index in range(len(messages))]
+
+
+def _capture_reasoning_items(output: list[Any]) -> tuple[dict[str, Any], ...]:
+    """The verbatim ``reasoning``/``function_call``/``message`` output subsequence, in order.
+
+    OpenAI pairs each reasoning item with the item that immediately follows it (a
+    ``function_call`` or an assistant ``message``) and validates that adjacency on the next
+    by-value request; dropping or reordering them yields a ``required following item`` 400.
+    Capturing the exact subsequence verbatim — rather than reconstructing items from the parsed
+    ``tool_calls``/``final_text`` — is the only construction that survives parallel/interleaved
+    tool calls and reasoning→message pairings. The opaque payload (``encrypted_content`` etc.)
+    is preserved; only the output-only ``status`` field is dropped, since the Responses *input*
+    schema rejects it (``Unknown parameter: input[..].status``). Returns ``()`` when the turn
+    carried no reasoning (non-reasoning models are untouched).
+    """
+    captured: list[dict[str, Any]] = []
+    has_reasoning = False
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in {"reasoning", "function_call", "message"}:
+            captured.append({k: v for k, v in item.items() if k != "status"})
+            if item_type == "reasoning":
+                has_reasoning = True
+    return tuple(captured) if has_reasoning else ()
 
 
 def _parse_response(data: dict[str, Any]) -> ModelTurn:
@@ -327,6 +407,7 @@ def _parse_response(data: dict[str, Any]) -> ModelTurn:
         tool_calls=tuple(tool_calls),
         usage=usage_out,
         raw=data,
+        reasoning=_capture_reasoning_items(output),
     )
 
 

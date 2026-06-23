@@ -11,6 +11,39 @@ Building the app is the pressure test; this file is the yield.
 
 ---
 
+### DX-13a 🟢 Reasoning artifacts weren't round-tripped (latent 400 on reasoning models) — FIXED
+Pressure-testing a reasoning model (gpt-5.x via the Responses API) over a multi-turn tool loop. The
+model emits **reasoning items** (`{type:"reasoning", id:"rs_…", encrypted_content:"…"}`) alongside
+its `function_call`s. Under the **by-value** request shape Studio uses (full `messages` resent each
+turn — `ModelRequest.messages` overrides `previous_turn_handle`), OpenAI *requires* those reasoning
+items to be sent back, paired with and in the original order relative to their function_calls, for
+everything since the last user message — or it hard-`400`s (`Item 'rs_…' without its required
+following item`) plus a ~3% tool-accuracy loss. We were **dropping reasoning entirely**: the parser
+read only function_call/message/output_text, the streaming path read no reasoning, the assistant
+by-value message carried only content+tool_calls, and `_payload` set neither `store` nor `include`.
+- **Core seam (neutral):** `ModelTurn.reasoning` + `TurnComplete.reasoning` (+ `assemble_streamed_turn`
+  threads it) carry provider-native reasoning items opaquely; adapters with no reasoning leave it
+  empty, so gateway/fake are untouched.
+- **OpenAI (deep, ZDR):** capture the verbatim ordered `reasoning`/`function_call`/`message`
+  subsequence (parse + stream, off `response.completed`); `_payload` sets `store=false` +
+  `include=["reasoning.encrypted_content"]` so reasoning travels by-value (no `previous_response_id`
+  reliance); on the next turn re-inject the captured items **verbatim** (suppressing the
+  reconstructed function_calls) only within the active window (since the last user message) and only
+  when the message's `(provider, model)` tag matches the current model — all-or-nothing per window,
+  since the model can hot-swap mid-loop. Historical reasoning is dropped (tolerated).
+- **Loop:** the assistant by-value message gains a `{provider, model, items}` reasoning block when the
+  adapter reports `provider_name=="openai"`; it round-trips through the checkpoint unchanged (arbitrary
+  message keys already persist).
+- **Gotcha found live:** echoing output items back as *input* `400`s with
+  `Unknown parameter: input[..].status` — the output-only `status` field must be stripped on capture.
+- Verified live (real OpenAI, gpt-5.5, effort high): a multi-turn tool loop (incl. a **parallel**
+  1-reasoning→2-calls turn) settles with **zero 400** and the reasoning carried on the continuation;
+  a second user turn continues cleanly (historical drop); every payload is ZDR (`store=false`,
+  `include=encrypted_content`, no `previous_response_id`); and the **streaming** path delivers
+  reasoning+`encrypted_content` on `response.completed`. Display of reasoning (panel/stream) is a
+  separate later item (DX-13b/R10); other providers slot into the same seam with their own policy
+  (Anthropic/Gemini = preserve, DeepSeek = strip).
+
 ### DX-12 🟢 Session history doesn't survive a restart (no backend run-listing API) — FIXED
 Building R8 (chat history). Studio first listed only the chats it started this server run (in-memory
 `_sessions`); a history that survived a **restart** couldn't be rebuilt — the run dirs persist under

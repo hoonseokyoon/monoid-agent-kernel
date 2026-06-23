@@ -2053,13 +2053,23 @@ class AgentLoop:
             _accumulate_usage(state.total_usage, turn)
             state.previous_turn_handle = turn.response_id or state.previous_turn_handle
             # Append the assistant reply to the by-value log (text + any tool calls).
-            state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": turn.final_text or "",
-                    "tool_calls": [call.__dict__ for call in turn.tool_calls],
-                }
-            )
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": turn.final_text or "",
+                "tool_calls": [call.__dict__ for call in turn.tool_calls],
+            }
+            # Carry provider-native reasoning artifacts so they round-trip on the next turn
+            # (DX-13a). Tagged with provider+model so replay only happens against a matching
+            # adapter/model; non-reasoning adapters leave ``turn.reasoning`` empty (neutral seam).
+            if turn.reasoning:
+                provider_name = getattr(self.model_adapter, "provider_name", None)
+                if provider_name:
+                    assistant_message["reasoning"] = {
+                        "provider": provider_name,
+                        "model": (runtime_config.model or ModelConfig()).model,
+                        "items": [dict(item) for item in turn.reasoning],
+                    }
+            state.messages.append(assistant_message)
             recorder.transcript(
                 {
                     "kind": "model_turn",
