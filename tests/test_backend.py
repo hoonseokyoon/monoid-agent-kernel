@@ -695,17 +695,27 @@ def test_watchdog_concurrent_claim_has_single_winner(tmp_path: Path) -> None:
     b1 = _recoverable_backend(run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")])
     b2 = _recoverable_backend(run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")])
     results: list = []
-    barrier = threading.Barrier(2)
+    errors: list = []
+    barrier = threading.Barrier(2, timeout=30.0)
 
     def claim(backend) -> None:
-        barrier.wait()
-        results.append(backend.lease_store.try_claim("run_x", backend._worker_id, backend.lease_ttl_s))
+        # Bound the rendezvous and capture any failure: under the full suite's background-thread
+        # contention a worker can stall before it reaches the barrier; an unbounded wait/join
+        # there would wedge the whole run forever (only the faulthandler watchdog could break it).
+        # A bounded barrier + surfaced error fails this test loudly instead of hanging the suite.
+        try:
+            barrier.wait()
+            results.append(backend.lease_store.try_claim("run_x", backend._worker_id, backend.lease_ttl_s))
+        except BaseException as exc:  # noqa: BLE001 - surface to the main thread, don't swallow
+            errors.append(exc)
 
     threads = [threading.Thread(target=claim, args=(b,)) for b in (b1, b2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=60.0)
+    assert not any(thread.is_alive() for thread in threads), "claim worker did not finish in time"
+    assert not errors, f"claim worker raised: {errors}"
 
     assert results.count(True) == 1
 
@@ -751,22 +761,38 @@ def test_sqlite_lease_concurrent_claim_across_instances(tmp_path: Path) -> None:
     # in for two hosts) race to claim the same absent/stale run; the transactional CAS lets
     # exactly one win.
     db = tmp_path / "shared.db"
+    # Initialize the db file (schema + WAL-mode switch, which needs an EXCLUSIVE lock) ONCE up
+    # front. Doing it concurrently inside both workers raced the WAL init against the CAS write,
+    # and under the full suite's background-thread contention one worker could sit out the entire
+    # 30s busy_timeout ("database is locked"), miss the barrier, and previously wedge the suite.
+    # Pre-creating each instance keeps the raced section to exactly the try_claim CAS — the thing
+    # under test — with no setup-time lock contention.
+    stores = [SqliteLeaseStore(db) for _ in range(2)]
     results: list[bool] = []
+    errors: list[BaseException] = []
     results_lock = threading.Lock()
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(2, timeout=30.0)
 
-    def claim(worker_id: str) -> None:
-        store = SqliteLeaseStore(db)
-        barrier.wait()
-        won = store.try_claim("run_x", worker_id, ttl_s=30.0)
-        with results_lock:
-            results.append(won)
+    def claim(worker_id: str, store: SqliteLeaseStore) -> None:
+        # Bound the rendezvous and capture any failure: a worker that still stalls fails this test
+        # loudly instead of hanging the suite forever (an unbounded barrier/join would wedge the
+        # whole run, breakable only by the faulthandler watchdog).
+        try:
+            barrier.wait()
+            won = store.try_claim("run_x", worker_id, ttl_s=30.0)
+            with results_lock:
+                results.append(won)
+        except BaseException as exc:  # noqa: BLE001 - surface to the main thread, don't swallow
+            with results_lock:
+                errors.append(exc)
 
-    threads = [threading.Thread(target=claim, args=(f"w{i}",)) for i in range(2)]
+    threads = [threading.Thread(target=claim, args=(f"w{i}", stores[i])) for i in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=60.0)
+    assert not any(thread.is_alive() for thread in threads), "claim worker did not finish in time"
+    assert not errors, f"claim worker raised: {errors}"
 
     assert results.count(True) == 1
 
