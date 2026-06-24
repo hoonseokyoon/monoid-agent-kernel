@@ -32,6 +32,29 @@ from native_agent_runner.core.checkpoint import (
     write_checkpoint,
 )
 
+# Session lifecycle (formal FSM + AgentSession contract)
+from native_agent_runner.core.lifecycle import (
+    LEGAL_TRANSITIONS,
+    AgentSession,
+    LoopSession,
+    SessionHealth,
+    SessionInspection,
+    SessionState,
+    assert_transition,
+    can_transition,
+    state_from_suspension,
+    to_session_state,
+)
+
+# Control protocol (transport-independent command envelope + dispatch seam)
+from native_agent_runner.core.control import (
+    CONTROL_PROTOCOL_VERSION,
+    ControlCommand,
+    ControlCommandType,
+    ControlDispatcher,
+    ControlResult,
+)
+
 # Context providers (pluggable static + per-turn system context)
 from native_agent_runner.core.context import ContextProvider, TurnContext
 from native_agent_runner.core.agents import (
@@ -148,6 +171,23 @@ __all__ = [
     "LocalFsCheckpointStore",
     "read_checkpoint",
     "write_checkpoint",
+    # session lifecycle (formal FSM + AgentSession contract)
+    "SessionState",
+    "LEGAL_TRANSITIONS",
+    "can_transition",
+    "assert_transition",
+    "state_from_suspension",
+    "to_session_state",
+    "AgentSession",
+    "LoopSession",
+    "SessionInspection",
+    "SessionHealth",
+    # control protocol (transport-independent command envelope + dispatch seam)
+    "CONTROL_PROTOCOL_VERSION",
+    "ControlCommand",
+    "ControlCommandType",
+    "ControlResult",
+    "ControlDispatcher",
     # context providers
     "AgentDefinition",
     "AgentRuntimeConfig",

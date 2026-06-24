@@ -89,6 +89,7 @@ from native_agent_runner.errors import (
     RunTimeout,
     ToolExecutionError,
     TurnInterrupted,
+    TurnPaused,
     error_code_for_exception,
 )
 from native_agent_runner.tasks import (
@@ -520,6 +521,12 @@ class AgentLoop:
     # (which is run-level/terminal); an interrupt keeps the session alive. Cleared at the start
     # of each new user submit so a stale stop never kills the next turn.
     _interrupt_requested: bool = field(default=False, init=False, repr=False)
+    # Cooperative "pause": set via :meth:`pause_turn`, consumed ONLY at the start-of-step
+    # boundary (top of the pump loop) — never mid-step — so ``pending_observations`` are
+    # always in a clean, resumable shape. Unlike an interrupt, a pause freezes the turn and a
+    # later ``run_until_suspended(None)`` re-pump continues it. Bare one-way flag (CPython-atomic,
+    # mirroring ``_interrupt_requested``). Cleared at the start of each new user submit.
+    _pause_requested: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
@@ -668,6 +675,17 @@ class AgentLoop:
         lands at the next step boundary (a non-streamed model call finishes first)."""
         self._interrupt_requested = True
 
+    def pause_turn(self) -> None:
+        """Request a cooperative pause: the running turn freezes at the start of its next step
+        and suspends with ``reason="paused"`` (the session stays alive; resume by re-pumping
+        via ``run_until_suspended(None)``). Thread-safe one-way signal (a bare flag set, like
+        ``interrupt_turn``). Unlike an interrupt, a pause keeps the turn's in-flight
+        ``pending_observations`` so the resumed turn continues exactly where it left off, and it
+        lands ONLY at a start-of-step boundary — never mid-step and never mid-generation (an
+        in-flight model call always completes first). The flag is cleared when the next user
+        submit starts, so a stale pause never freezes a fresh turn."""
+        self._pause_requested = True
+
     async def arun_until_suspended(
         self, user_input: str | tuple[ContentPart, ...] | None = None
     ) -> Suspension:
@@ -689,8 +707,9 @@ class AgentLoop:
             state.final_text = ""
             # A run.finish in a prior submit must not short-circuit this one.
             res.context.finished = False
-            # Drop a stale stop so it can't immediately interrupt this fresh turn.
+            # Drop a stale stop/pause so neither can immediately halt this fresh turn.
             self._interrupt_requested = False
+            self._pause_requested = False
             state.pending_user_input = input_to_parts(user_input)
             self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
             session.submit_local_step = 0
@@ -767,6 +786,22 @@ class AgentLoop:
             state.pending_observations = ()
             self._persist_checkpoint(session)
             return Suspension(reason="interrupted", status="completed")
+        except TurnPaused:
+            # Cooperative pause: freeze the turn at a clean start-of-step boundary and keep
+            # the session alive. Unlike interrupt, pending_observations are KEPT — the resumed
+            # turn (a run_until_suspended(None) re-pump) re-sends them at the next step, so the
+            # pause is transparent. The park persists a checkpoint (which already serializes
+            # pending_observations + the step counter), so a paused run also survives a restart.
+            # ``status`` is cosmetic here; branch on ``reason``.
+            self._pause_requested = False
+            # Literal state names keep the engine decoupled from the FSM module (the lifecycle
+            # layer sits ABOVE the loop); they match SessionState.RUNNING/PAUSED values.
+            res.recorder.emit(
+                "session.state.changed",
+                data={"state": "paused", "from": "running", "reason": "pause_requested"},
+            )
+            self._persist_checkpoint(session)
+            return Suspension(reason="paused", status="completed")
         except Exception as exc:  # controlled recording boundary for standalone CLI
             self._record_failure(state, res, exc)
             session.terminal = True
@@ -1883,6 +1918,12 @@ class AgentLoop:
         max_steps = self.spec.limits.max_steps
         while session.submit_local_step < max_steps:
             self._check_run_boundary(deadline)
+            # Cooperative pause is checked ONLY here, at the start of a step — never inside
+            # _check_run_boundary (which also runs mid-step). At this boundary the prior step's
+            # tool results sit in state.pending_observations not-yet-sent, so a paused park is
+            # clean and a None re-pump resumes the same turn without losing or double-sending them.
+            if self._pause_requested:
+                raise TurnPaused("turn paused")
             session.submit_local_step += 1
             local_step = session.submit_local_step
             session.session_step += 1

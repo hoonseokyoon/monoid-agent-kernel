@@ -24,7 +24,14 @@ from native_agent_runner.core.agents import (
     validate_runtime_config,
 )
 from native_agent_runner.core.cancellation import CancellationToken
+from native_agent_runner.core.control import ControlCommand, ControlResult
 from native_agent_runner.core.events import AgentEvent
+from native_agent_runner.core.lifecycle import (
+    LoopSession,
+    SessionState,
+    state_from_suspension,
+    to_session_state,
+)
 from native_agent_runner.core.packages import (
     apply_package,
     create_approval,
@@ -75,8 +82,11 @@ from native_agent_runner.workspace.paths import is_within
 
 BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "failed", "limited"]
 
-# Sentinel enqueued to wake/stop a session worker blocked on its message queue.
+# Sentinels enqueued to wake/stop a session worker blocked on its message queue.
 _CLOSE_SESSION = object()
+# Wakes a paused worker: resume the SAME turn with no new input. Ignored (a no-op) by the other
+# queue-waiting branches, which expect a real user message or _CLOSE_SESSION.
+_RESUME_SESSION = object()
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
 
 # A run-artifact fetch handle is a bare sha256 hex digest — validated before any store lookup so a
@@ -213,6 +223,10 @@ class BackendRunRecord:
     runtime_config: AgentRuntimeConfig | None = None
     runtime_config_issuer: str = ""
     runtime_config_reason: str = ""
+    # Authoritative lifecycle FSM state, updated by the session driver as it observes each
+    # suspension. The control protocol's inspect/health read this (a throwaway LoopSession is
+    # seeded with it) since the backend drives the loop directly, not through a facade.
+    session_state: SessionState = SessionState.CREATED
     loop: AgentLoop | None = None
     # Pending user messages for a multi-turn session. asyncio.Queue (not queue.Queue) so the
     # run coroutine awaits the next message WITHOUT holding a thread — a parked multi-turn
@@ -829,6 +843,135 @@ class RunnerBackend:
             "interrupt_requested": requested,
         }
 
+    def pause_run(self, run_id: str, token: str) -> dict[str, Any]:
+        """Cooperative pause (keeps the session alive): signal the loop to freeze the current
+        turn at its next start-of-step boundary; the driver then parks until a resume wakes it.
+        A no-op on a terminal or not-yet-built run. The flag set is a thread-safe one-way signal
+        (like cancel/interrupt). Resume via the ``resume`` control command (``signal_resume``)."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            loop = record.loop
+            terminal = record.status in {"completed", "failed", "limited"}
+        requested = not terminal and loop is not None
+        if requested:
+            loop.pause_turn()
+        return {
+            "run_id": record.run_id,
+            "tenant_id": record.tenant_id,
+            "status": record.status,
+            "pause_requested": requested,
+        }
+
+    def signal_resume(self, run_id: str, token: str) -> dict[str, Any]:
+        """Wake a paused *live* run: push a resume signal so the driver re-pumps the frozen turn
+        with no new input. For a run not currently in memory (parked after a restart), use
+        :meth:`resume_run` (checkpoint recovery) instead — the ``resume`` control command picks
+        the right one. A no-op on a terminal run."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            terminal = record.status in {"completed", "failed", "limited"}
+        if terminal:
+            return {"run_id": run_id, "status": record.status, "resumed": False}
+        # asyncio.Queue is not thread-safe; schedule the put on the shared loop.
+        self._call_soon(record.message_queue.put_nowait, _RESUME_SESSION)
+        return {"run_id": run_id, "status": record.status, "resumed": True}
+
+    def dispatch(self, command: ControlCommand) -> ControlResult:
+        """Reference ``ControlDispatcher``: route one ``ControlCommand`` to the in-process method
+        that already backs it. The run token travels in ``command.args['token']`` (the HTTP layer
+        injects the bearer token); it is consumed here and never echoed back. Auth failures
+        propagate (the HTTP layer maps them to 401); a missing run is reported as ``unsupported``;
+        a controlled operation error is reported as ``error`` with its code. Unknown command types
+        return ``unsupported`` — the wire vocabulary stays forward-compatible."""
+        args = dict(command.args)
+        token = str(args.pop("token", "") or "")
+        run_id = command.run_id
+        ctype = command.type
+
+        def ok(data: dict[str, Any], *, state: str | None = None) -> ControlResult:
+            return ControlResult(run_id=run_id, type=ctype, status="ok", state=state, data=dict(data))
+
+        try:
+            if ctype == "pause":
+                return ok(self.pause_run(run_id, token))
+            if ctype == "resume":
+                with self._lock:
+                    live = run_id in self._records
+                return ok(self.signal_resume(run_id, token) if live else self.resume_run(run_id, token))
+            if ctype == "cancel":
+                return ok(self.cancel_run(run_id, token))
+            if ctype == "interrupt":
+                return ok(self.interrupt_turn(run_id, token))
+            if ctype in {"inspect", "health"}:
+                loop = self._authorize_active_loop(run_id, token)
+                # Seed the throwaway facade with the record's authoritative FSM state (the backend
+                # drives the loop directly, so the facade's own cache never tracked this run).
+                session = LoopSession(loop, _state=self._record(run_id).session_state)
+                if ctype == "inspect":
+                    inspection = session.inspect()
+                    return ok(inspection.to_json(), state=inspection.state.value)
+                health = session.health()
+                return ok(health.to_json(), state=health.state.value)
+            if ctype == "status":
+                return ok(self.status(run_id, token))
+            if ctype == "runtime_config":
+                return ok(self.runtime_config(run_id, token))
+            if ctype == "replace_runtime_config":
+                return ok(
+                    self.replace_runtime_config(
+                        run_id,
+                        token,
+                        expected_version=int(args.get("expected_version", 0)),
+                        issuer=command.issuer,
+                        reason=command.reason,
+                        config=AgentRuntimeConfig.from_json(args["config"]),
+                    )
+                )
+            if ctype == "send_message":
+                return ok(self.send_message(run_id, token, content=args.get("content") or ""))
+            if ctype == "create_task":
+                return ok(
+                    self.create_task(
+                        run_id,
+                        token,
+                        kind=str(args.get("kind") or ""),
+                        request=dict(args.get("request") or {}),
+                    )
+                )
+            if ctype == "report_task_result":
+                return ok(
+                    self.report_task_result(
+                        run_id,
+                        token,
+                        task_id=str(args.get("task_id") or ""),
+                        result=dict(args.get("result") or {}),
+                        status=str(args.get("status") or "answered"),
+                    )
+                )
+            return ControlResult(
+                run_id=run_id,
+                type=ctype,
+                status="unsupported",
+                error=f"unknown control command type: {ctype}",
+                error_code="unknown_control_command",
+            )
+        except PermissionDenied:
+            raise  # auth failures map to HTTP 401 in the route layer
+        except KeyError as exc:
+            return ControlResult(
+                run_id=run_id, type=ctype, status="unsupported", error=str(exc), error_code="run_not_found"
+            )
+        except (ValueError, NativeAgentError) as exc:
+            return ControlResult(
+                run_id=run_id,
+                type=ctype,
+                status="error",
+                error=str(exc),
+                error_code=getattr(exc, "error_code", "control_error"),
+            )
+
     def send_message(
         self, run_id: str, token: str, content: str | Sequence[Any]
     ) -> dict[str, Any]:
@@ -1331,6 +1474,9 @@ class RunnerBackend:
         report_task_result wakes it from another thread."""
         consecutive_turn_failures = 0
         while True:
+            # Keep the authoritative FSM state on the record current with each park, so a
+            # concurrent control inspect/health reports the live state.
+            record.session_state = state_from_suspension(suspension)
             if suspension.reason in {"terminal", "limited"}:
                 break
             if suspension.reason == "awaiting_tasks":
@@ -1342,6 +1488,27 @@ class RunnerBackend:
                     # A task was delivered (or none remain): resume the pump.
                     suspension = await loop.arun_until_suspended(None)
                 # else: tasks still pending after the poll window -> keep waiting.
+                continue
+            if suspension.reason == "paused":
+                # Cooperative pause: the loop froze the turn at a clean step boundary (its
+                # pending_observations are kept). Park until a resume signal wakes us, then
+                # re-pump the SAME turn with no new input. The loop already checkpointed the
+                # pause park; persist the backend queue too.
+                if self._session_should_stop(record, started, turns):
+                    break
+                self._persist_run_checkpoint(record)
+                try:
+                    # Raw get: the paused branch is the one place that must SEE _RESUME_SESSION.
+                    signal = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                except asyncio.TimeoutError:
+                    break
+                if signal is _CLOSE_SESSION:
+                    break
+                if signal is not _RESUME_SESSION:
+                    # A user message arrived while paused: resume the frozen turn first, then
+                    # let the settled branch consume this message as the next turn.
+                    record.message_queue.put_nowait(signal)
+                suspension = await loop.arun_until_suspended(None)
                 continue
             if suspension.reason == "turn_failed":
                 # Recoverable model-turn failure: the session is alive (core kept it so). Apply
@@ -1376,7 +1543,7 @@ class RunnerBackend:
                 loop.await_user_input()
                 self._persist_run_checkpoint(record)
                 try:
-                    message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                    message = await self._await_session_message(record)
                 except asyncio.TimeoutError:
                     break
                 if message is _CLOSE_SESSION:
@@ -1393,7 +1560,7 @@ class RunnerBackend:
                 loop.await_user_input()
                 self._persist_run_checkpoint(record)
                 try:
-                    message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                    message = await self._await_session_message(record)
                 except asyncio.TimeoutError:
                     break
                 if message is _CLOSE_SESSION:
@@ -1411,7 +1578,7 @@ class RunnerBackend:
             self._persist_run_checkpoint(record)
             try:
                 # Pure async await — a parked multi-turn session holds no thread.
-                message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                message = await self._await_session_message(record)
             except asyncio.TimeoutError:
                 break  # idle timeout
             if message is _CLOSE_SESSION:
@@ -1419,6 +1586,21 @@ class RunnerBackend:
             turns += 1
             suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
         return await loop.aclose()
+
+    async def _await_session_message(self, record: BackendRunRecord) -> Any:
+        """Await the next queued user message, dropping stray ``_RESUME_SESSION`` sentinels (a
+        resume aimed at a run that is not currently paused is a no-op). Raises
+        ``asyncio.TimeoutError`` once the idle timeout elapses, mirroring the bare
+        ``wait_for`` it replaces."""
+        deadline = time.monotonic() + self.idle_timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            message = await asyncio.wait_for(record.message_queue.get(), remaining)
+            if message is _RESUME_SESSION:
+                continue  # stray resume (run not paused): ignore and keep waiting
+            return message
 
     def _persist_run_checkpoint(self, record: BackendRunRecord) -> None:
         """Augment the loop's own park-point checkpoint with the backend-owned message
@@ -1589,6 +1771,8 @@ class RunnerBackend:
             record = self._records[run_id]
             record.result = result
             record.status = result.status
+            # Reconcile the terminal BackendRunState onto the FSM (cancel -> CANCELLED).
+            record.session_state = to_session_state(result.status, error_code=result.error_code)
             record.error = result.error
             record.error_code = result.error_code
             record.finished_at = time.time()

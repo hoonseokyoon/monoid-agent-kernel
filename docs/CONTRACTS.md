@@ -32,7 +32,9 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `tool`, `EventSink`,
   `CheckpointStore`, `PermissionPolicy`, and the rest of `contracts`.
 - **Experimental**: async-task seams (`TaskExecutor`, `ResultInjector`,
-  `TaskReporter`); multimodal content parts (`ImagePart` / `DocumentPart`
+  `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
+  `LoopSession`, `SessionState`, `ControlCommand` / `ControlResult` /
+  `ControlDispatcher`); multimodal content parts (`ImagePart` / `DocumentPart`
   round-trip but are not yet forwarded to models).
 - **Not a contract**: `native_agent_runner.reference.*` (example services).
 
@@ -358,6 +360,51 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
   SKILL.md's parent directory is the bundle root. Frontmatter fields: `name`, `description`,
   `allowed-tools` (space-separated per the spec, or an inline list), `metadata`. Parsed by
   the same zero-dependency `parse_frontmatter` used for subagents.
+
+### Session Lifecycle (`AgentSession` + FSM)
+
+`AgentLoop` is the engine; `AgentSession` is the embedder contract a control plane depends
+on (so an Agent Daemon/Cell never imports the loop). `LoopSession` is the reference facade
+that wraps an `AgentLoop`, owns the FSM, and delegates execution:
+
+- `SessionState` — the formal lifecycle FSM (a `str`-enum): `created`, `idle`, `running`,
+  `awaiting_input`, `awaiting_tasks`, `paused`, `interrupted`, `turn_failed`, `limited`,
+  `cancelled`, `completed`, `failed`. `cancelled`/`completed`/`failed` are terminal.
+- `state_from_suspension(suspension)` projects a pump `Suspension` onto a state (the seam that
+  keeps the FSM in sync with the engine without the engine knowing about it). `LEGAL_TRANSITIONS`
+  + `can_transition` / `assert_transition` define the legal edges. `to_session_state(status,
+  error_code=...)` reconciles the legacy status strings (`BackendRunState` / `status.json` /
+  `project_run_status`) onto the one enum.
+- `LoopSession.open() / submit() / run_until_suspended() / close()` delegate to the loop and
+  re-derive `state` at each boundary. `inspect() -> SessionInspection` and `health() ->
+  SessionHealth` are recomputed from live loop state on every call (never stale).
+- `pause()` / `resume()` / `cancel(reason)`: pause freezes the turn at the *next start-of-step*
+  boundary (its in-flight `pending_observations` are kept), suspends with `reason="paused"`, and
+  persists a checkpoint — so resume (a `run_until_suspended(None)` re-pump) continues the same
+  turn, in-process or after a restart. Pause lands only at a step boundary (an in-flight model
+  call completes first; only an interrupt aborts mid-generation under token streaming). Entering
+  `paused` emits a `session.state.changed` event.
+
+### Control Protocol
+
+`native-agent-runner.control-command.v1` is a transport-independent envelope + a single
+`dispatch` seam, so a Daemon drives a session through one entry point instead of a route per op:
+
+- `ControlCommand(type, run_id, args, issuer, reason)` and `ControlResult(run_id, type, status,
+  state, data, error, error_code)` are plain data (`status` ∈ `ok` / `not_implemented` /
+  `unsupported` / `error`). `ControlDispatcher.dispatch(command) -> ControlResult` is the contract;
+  `RunnerBackend.dispatch` is the reference impl, routing each command to the in-process method it
+  already exposes.
+- Command types: `pause`, `resume`, `cancel`, `interrupt`, `inspect`, `health`, `send_message`,
+  `runtime_config`, `replace_runtime_config`, `create_task`, `report_task_result`, `status`. An
+  unknown type returns `unsupported` (the wire vocabulary stays forward-compatible).
+- HTTP: `POST /v1/runs/{run_id}/control` with `{"type": ..., "args": {...}, "issuer": ...,
+  "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
+  envelope stays credential-free). `resume` on a *live* paused run wakes it; on a run not in
+  memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
+- `resolve_capability` rides the hosted-task seam: a `capability` task kind parks a run awaiting an
+  external grant (a credential lease / tool-enable decision) and is resolved through the same
+  `report_task_result` -> reentry path as hitl/automation.
 
 ### Permission Boundary
 

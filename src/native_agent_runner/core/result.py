@@ -51,15 +51,17 @@ class Suspension:
     ``retryable``/``http_status`` carry the classification for that decision.
     ``interrupted`` — an external caller stopped the current turn (a "stop"); like
     ``turn_failed`` the session is **not** terminal (no error), so a caller parks for
-    the next user message. The non-terminal-ness is carried by ``reason`` alone —
-    ``status`` mirrors the failure (``"failed"``) for ``turn_failed`` since ``RunStatus``
-    has no non-terminal value, so callers must branch on ``reason``, not ``status``, to
-    detect a live run. For every reason except ``awaiting_tasks`` a settle checkpoint ran
-    and ``turn`` carries its result.
+    the next user message. ``paused`` — a cooperative pause froze the turn at the start of
+    a step; unlike ``interrupted`` the in-flight ``pending_observations`` are kept, so a
+    ``run_until_suspended(None)`` re-pump resumes the same turn where it left off. The
+    non-terminal-ness is carried by ``reason`` alone — ``status`` mirrors the failure
+    (``"failed"``) for ``turn_failed`` since ``RunStatus`` has no non-terminal value, so
+    callers must branch on ``reason``, not ``status``, to detect a live run. For every
+    reason except ``awaiting_tasks`` a settle checkpoint ran and ``turn`` carries its result.
     """
 
     reason: Literal[
-        "settled", "awaiting_tasks", "limited", "terminal", "turn_failed", "interrupted"
+        "settled", "awaiting_tasks", "limited", "terminal", "turn_failed", "interrupted", "paused"
     ]
     status: RunStatus
     final_text: str = ""

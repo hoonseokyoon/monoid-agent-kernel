@@ -829,12 +829,19 @@ class TaskManager:
             "shell": ShellTaskExecutor(),
             "hitl": HostedTaskExecutor(kind="hitl"),
             "automation": HostedTaskExecutor(kind="automation"),
+            # A scoped-capability request: the run parks awaiting an external grant (a credential
+            # lease / tool-enable decision), resolved through the same report_result -> reentry
+            # path as hitl/automation. The grant is injected back as an async tool result.
+            "capability": HostedTaskExecutor(kind="capability"),
         }
         self.injectors = {
             "shell": ShellResultInjector(),
             "hitl": HostedResultInjector(kind="hitl", tool_name="human_input", result_type="human_input_result"),
             "automation": HostedResultInjector(
                 kind="automation", tool_name="automation", result_type="automation_result"
+            ),
+            "capability": HostedResultInjector(
+                kind="capability", tool_name="capability", result_type="capability_grant"
             ),
         }
 

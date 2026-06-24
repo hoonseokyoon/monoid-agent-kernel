@@ -109,6 +109,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         {"reason": _STR, "task_ids": _STR_ARRAY, "prompt": _STR_NULL},
         required=("reason",),
     ),
+    "session.state.changed": _data_schema(
+        {"state": _STR, "from": _STR, "reason": _STR},
+        required=("state",),
+    ),
     "turn.settled": _data_schema(
         {"status": _STR, "final_text": _STR, "error_code": _STR, "changed_paths": _STR_ARRAY},
         required=("status",),
