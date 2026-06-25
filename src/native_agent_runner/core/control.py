@@ -38,6 +38,7 @@ ControlCommandType = Literal[
     "create_task",
     "report_task_result",
     "status",
+    "revoke_capability",
 ]
 
 ControlResultStatus = Literal["ok", "not_implemented", "unsupported", "error"]

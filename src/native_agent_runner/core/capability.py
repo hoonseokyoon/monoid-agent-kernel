@@ -20,6 +20,7 @@ Security invariants the core enforces (see ``CapabilityVault.admit``):
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -70,6 +71,10 @@ class CapabilityLease:
     # marked durable so a restart does not re-prompt the approver. The handle (token_ref), never a
     # secret, is what persists.
     durable: bool = False
+    # When the lease was minted (epoch seconds). Backs the per-run "revoke everything issued before
+    # T" watermark (a bulk cohort kill, à la AWS STS ``aws:TokenIssueTime``). Old checkpoint payloads
+    # without it decode to ``0.0`` — safely *before* any watermark, so they fail closed.
+    issued_at: float = field(default_factory=time.time)
 
     def is_valid(self, now: float) -> bool:
         return now < self.expires_at
@@ -83,6 +88,7 @@ class CapabilityLease:
             "expires_at": self.expires_at,
             "token_ref": self.token_ref,
             "durable": self.durable,
+            "issued_at": self.issued_at,
         }
 
     @classmethod
@@ -93,6 +99,7 @@ class CapabilityLease:
             "expires_at": float(payload.get("expires_at") or 0.0),
             "scope": dict(payload.get("scope") or {}),
             "durable": bool(payload.get("durable", False)),
+            "issued_at": float(payload.get("issued_at") or 0.0),
         }
         if payload.get("lease_id"):
             kwargs["lease_id"] = str(payload["lease_id"])
@@ -166,17 +173,35 @@ def scope_within(inner: dict[str, Any], outer: dict[str, Any]) -> bool:
 @dataclass
 class CapabilityVault:
     """Per-run, in-memory cache of granted leases. Holds only handles (``token_ref``), never
-    secrets, and is intentionally NOT serialized into checkpoints — on restart leases are
-    re-brokered (so a stale handle never survives on disk). ``admit`` is the core's fail-closed
-    gate: a grant that widens the requested scope is rejected."""
+    secrets. Durable (human/policy-approved) leases are checkpointed; ephemeral sync grants are
+    not, so they re-broker on restart and no handle for them survives on disk. ``admit`` is the
+    core's fail-closed gate: a grant that widens the requested scope is rejected.
+
+    Revocation is an *object-capability caretaker* move: because a tool only ever holds a handle
+    that it re-fetches per call (via :meth:`token_for`), revoking is simply the vault refusing to
+    hand the handle back. The read path (:meth:`get_valid` / :meth:`token_for`) is **fail-closed**
+    against three revocation records — a per-lease set, a per-capability set, and a per-run
+    ``issued_before`` watermark (a bulk cohort kill). The gate additionally refuses to *re-broker*
+    a revoked capability (see ``AgentLoop._ensure_capability_lease``) so revocation survives even a
+    permissive broker."""
 
     _leases: dict[str, CapabilityLease] = field(default_factory=dict)
+    _revoked_lease_ids: set[str] = field(default_factory=set)
+    _revoked_capabilities: set[str] = field(default_factory=set)
+    _revoked_before: float = 0.0
+
+    def _is_revoked(self, lease: CapabilityLease) -> bool:
+        return (
+            lease.lease_id in self._revoked_lease_ids
+            or lease.capability in self._revoked_capabilities
+            or lease.issued_at < self._revoked_before
+        )
 
     def get_valid(self, capability: str, scope: dict[str, Any], *, now: float) -> CapabilityLease | None:
-        """Return a cached, non-expired lease that COVERS ``scope`` (the requested constraints
-        are within the lease's scope), else ``None``."""
+        """Return a cached, non-expired, non-revoked lease that COVERS ``scope`` (the requested
+        constraints are within the lease's scope), else ``None``."""
         lease = self._leases.get(capability)
-        if lease is None or not lease.is_valid(now):
+        if lease is None or not lease.is_valid(now) or self._is_revoked(lease):
             return None
         # The cached lease must be at least as broad as what this call needs.
         if not scope_within(scope, lease.scope):
@@ -184,11 +209,12 @@ class CapabilityVault:
         return lease
 
     def token_for(self, capability: str, *, now: float) -> str | None:
-        """The ``token_ref`` (access handle) of a currently-valid lease for ``capability``, or
-        ``None``. A tool handler reads this (via ``ToolContext.capability_token``) to obtain the
-        handle the gate acquired — the handle, never the secret; the edge resolves it."""
+        """The ``token_ref`` (access handle) of a currently-valid, non-revoked lease for
+        ``capability``, or ``None``. A tool handler reads this (via ``ToolContext.capability_token``)
+        to obtain the handle the gate acquired — the handle, never the secret; the edge resolves it.
+        Returns ``None`` once revoked: the caretaker has cleared its slot."""
         lease = self._leases.get(capability)
-        if lease is None or not lease.is_valid(now):
+        if lease is None or not lease.is_valid(now) or self._is_revoked(lease):
             return None
         return lease.token_ref
 
@@ -202,12 +228,69 @@ class CapabilityVault:
         self._leases[lease.capability] = lease
         return lease
 
+    def revoke(
+        self,
+        *,
+        capability: str | None = None,
+        lease_id: str | None = None,
+        before: float | None = None,
+    ) -> dict[str, Any]:
+        """Record a revocation and return a summary of what was revoked. Three granularities,
+        composable in one call:
+          - ``capability`` — block this capability for the run, authoritatively (the gate will not
+            re-broker it). The primary operator kill switch.
+          - ``lease_id`` — invalidate one specific grant (a compromised lease).
+          - ``before`` — a watermark: every lease issued before this epoch time is rejected in O(1)
+            (a bulk cohort kill).
+        Revocation is monotonic and additive — there is no un-revoke (start a fresh lease cohort)."""
+        revoked_caps = sorted(self._leases.keys()) if capability == "*" else []
+        if capability and capability != "*":
+            self._revoked_capabilities.add(capability)
+            revoked_caps = [capability]
+        elif capability == "*":
+            self._revoked_capabilities.update(self._leases.keys())
+        if lease_id:
+            self._revoked_lease_ids.add(lease_id)
+        if before is not None:
+            self._revoked_before = max(self._revoked_before, before)
+        return {
+            "capabilities": revoked_caps,
+            "lease_id": lease_id or "",
+            "revoked_before": self._revoked_before,
+        }
+
+    def is_capability_revoked(self, capability: str) -> bool:
+        """True if this capability is under a per-capability revocation — the gate's hard stop that
+        refuses to even re-broker (so revocation cannot be undone by a permissive broker)."""
+        return capability in self._revoked_capabilities
+
     def export_durable(self) -> list[dict[str, Any]]:
         """Serialize the leases marked ``durable`` (e.g. human/policy-approved) for the checkpoint.
         Ephemeral sync grants are intentionally excluded — they re-broker on restart, so no handle
         for them ever lands on disk. Expiry is re-checked on use, so an expired lease here is
         harmless (it is filtered by ``get_valid`` after restore)."""
         return [lease.to_json() for lease in self._leases.values() if lease.durable]
+
+    def export_revocations(self) -> dict[str, Any]:
+        """Serialize the revocation records for the checkpoint, so a revoked durable lease stays
+        dead across a restart (the kill switch must not be forgotten when the run resumes)."""
+        return {
+            "revoked_lease_ids": sorted(self._revoked_lease_ids),
+            "revoked_capabilities": sorted(self._revoked_capabilities),
+            "revoked_before": self._revoked_before,
+        }
+
+    def import_revocations(
+        self,
+        *,
+        lease_ids: list[str] | None = None,
+        capabilities: list[str] | None = None,
+        before: float = 0.0,
+    ) -> None:
+        """Rehydrate revocation records on restore (paired with :meth:`export_revocations`)."""
+        self._revoked_lease_ids.update(lease_ids or ())
+        self._revoked_capabilities.update(capabilities or ())
+        self._revoked_before = max(self._revoked_before, before)
 
     def install(self, lease: CapabilityLease) -> None:
         """Directly install a lease (no scope re-check) — used on restore to rehydrate durable

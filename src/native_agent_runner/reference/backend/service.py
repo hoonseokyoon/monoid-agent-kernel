@@ -884,6 +884,40 @@ class RunnerBackend:
         self._call_soon(record.message_queue.put_nowait, _RESUME_SESSION)
         return {"run_id": run_id, "status": record.status, "resumed": True}
 
+    def revoke_capability(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        capability: str | None = None,
+        lease_id: str | None = None,
+        before: float | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Revoke a capability lease on a *live* run (the operator/Daemon kill switch). Mirrors
+        :meth:`pause_run`: signal the loop directly (a thread-safe vault mutation). A no-op on a
+        terminal or not-in-memory run (revoking a parked-and-evicted run is not supported in v1 —
+        load it first). The ``capability.denied`` audit event is emitted on the loop thread when the
+        next gated call hits the revocation."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            loop = record.loop
+            terminal = record.status in {"completed", "failed", "limited"}
+        summary: dict[str, Any] = {}
+        revoked = not terminal and loop is not None
+        if revoked:
+            summary = loop.revoke_capability(
+                capability=capability, lease_id=lease_id, before=before, reason=reason
+            )
+        return {
+            "run_id": record.run_id,
+            "tenant_id": record.tenant_id,
+            "status": record.status,
+            "revoked": revoked,
+            **summary,
+        }
+
     def dispatch(self, command: ControlCommand) -> ControlResult:
         """Reference ``ControlDispatcher``: route one ``ControlCommand`` to the in-process method
         that already backs it. The run token travels in ``command.args['token']`` (the HTTP layer
@@ -954,6 +988,18 @@ class RunnerBackend:
                         task_id=str(args.get("task_id") or ""),
                         result=dict(args.get("result") or {}),
                         status=str(args.get("status") or "answered"),
+                    )
+                )
+            if ctype == "revoke_capability":
+                before = args.get("before")
+                return ok(
+                    self.revoke_capability(
+                        run_id,
+                        token,
+                        capability=(str(args["capability"]) if args.get("capability") else None),
+                        lease_id=(str(args["lease_id"]) if args.get("lease_id") else None),
+                        before=(float(before) if before is not None else None),
+                        reason=command.reason,
                     )
                 )
             return ControlResult(

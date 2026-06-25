@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import http_json, runtime_config, serving
+from conftest import http_json, runtime_config, serving, tool_binding
 
+from native_agent_runner.core.capability import AutoGrantBroker
 from native_agent_runner.core.control import ControlCommand
 from native_agent_runner.core.lifecycle import SessionState
+from native_agent_runner.core.tool_surface import ToolScope
 from native_agent_runner.errors import PermissionDenied
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
@@ -244,6 +246,88 @@ class _GateToolProvider:
                 handler=handler,
             )
         ]
+
+
+class _CapCountingProvider:
+    """A capability-gated tool that counts executions — for the revoke end-to-end test."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+        provider = self
+
+        def handler(ctx: ToolContext, args: dict) -> ToolResult:
+            provider.calls += 1
+            return ToolResult(ok=True, content={"ran": True})
+
+        return [
+            ToolSpec(
+                id="ext.fetch",
+                description="external fetch needing web.search capability",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+                capability="web.search",
+                side_effect="read",
+                handler=handler,
+            )
+        ]
+
+
+def test_dispatch_revoke_capability_blocks_subsequent_call(tmp_path: Path) -> None:
+    # End-to-end operator kill switch: a gated tool runs on a granted lease, the Daemon dispatches
+    # revoke_capability, and the next gated call is refused — through the Control protocol.
+    workspace = _workspace(tmp_path)
+    provider = _CapCountingProvider()
+    turns = [
+        ModelTurn(response_id="r1", tool_calls=(fake_tool_call("ext_fetch", {}, "c1"),)),
+        ModelTurn(response_id="r2", final_text="first"),
+        ModelTurn(response_id="r3", tool_calls=(fake_tool_call("ext_fetch", {}, "c2"),)),
+        ModelTurn(response_id="r4", final_text="second"),
+    ]
+
+    def factory(spec: Any, llm_gateway_token: str) -> FakeModelAdapter:
+        del spec, llm_gateway_token
+        return FakeModelAdapter(turns=list(turns))
+
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+        tool_providers=(provider,),
+        capability_broker_factory=lambda req: AutoGrantBroker(),
+    )
+    backend.idle_timeout_s = 10.0
+    binding = tool_binding(
+        "ext.fetch", runtime={"requires_lease": True}, scope=ToolScope(allowed_domains=("a.edu",))
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="go",
+            runtime_config=runtime_config(bindings=(binding,)),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+    assert provider.calls == 1  # the tool ran on the granted lease
+
+    revoke = _dispatch(backend, run_id, token, "revoke_capability", capability="web.search")
+    assert revoke.status == "ok"
+    assert revoke.data["revoked"] is True
+    assert revoke.data["capabilities"] == ["web.search"]
+
+    # A follow-up message re-issues the gated call; revocation refuses it (no re-broker).
+    backend.send_message(run_id, token, content="again")
+    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+    assert provider.calls == 1  # still 1 — the gated tool stayed blocked after revocation
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
 
 
 def test_driver_pauses_mid_turn_then_resumes_to_settle(tmp_path: Path) -> None:

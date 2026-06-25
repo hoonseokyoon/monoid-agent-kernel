@@ -475,3 +475,122 @@ def test_backend_no_factory_leaves_gating_off(tmp_path: Path) -> None:
     # No broker -> requires_lease is a no-op; the tool runs and sees no token.
     assert provider.calls == 1
     assert provider.seen_tokens == [None]
+
+
+# --- revocation: the vault's fail-closed read path + the operator kill switch --------------
+
+
+def test_vault_revoke_per_capability_blocks_reads() -> None:
+    vault = CapabilityVault()
+    request = CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
+    vault.admit(request, CapabilityLease(capability="web.search", token_ref="t", expires_at=9e9, scope={"allowed_domains": ["a.edu"]}))
+    assert vault.token_for("web.search", now=0.0) == "t"
+    vault.revoke(capability="web.search")
+    assert vault.is_capability_revoked("web.search")
+    # Fail-closed: both reads now miss even though the lease has not expired.
+    assert vault.token_for("web.search", now=0.0) is None
+    assert vault.get_valid("web.search", {"allowed_domains": ["a.edu"]}, now=0.0) is None
+
+
+def test_vault_revoke_per_lease_id_and_watermark() -> None:
+    vault = CapabilityVault()
+    early = CapabilityLease(capability="cap.a", token_ref="ta", expires_at=9e9, issued_at=100.0)
+    late = CapabilityLease(capability="cap.b", token_ref="tb", expires_at=9e9, issued_at=200.0)
+    vault.admit(CapabilityRequest(capability="cap.a"), early)
+    vault.admit(CapabilityRequest(capability="cap.b"), late)
+    # A watermark kills the cohort issued before T (early), leaving the later one usable.
+    vault.revoke(before=150.0)
+    assert vault.token_for("cap.a", now=0.0) is None
+    assert vault.token_for("cap.b", now=0.0) == "tb"
+    # A per-lease_id revoke kills exactly that grant (and does NOT block re-brokering at the gate).
+    vault.revoke(lease_id=late.lease_id)
+    assert vault.token_for("cap.b", now=0.0) is None
+    assert not vault.is_capability_revoked("cap.b")
+
+
+def test_vault_export_import_revocations_roundtrip() -> None:
+    vault = CapabilityVault()
+    vault.revoke(capability="web.search", lease_id="lease_x", before=42.0)
+    exported = vault.export_revocations()
+    assert exported == {
+        "revoked_lease_ids": ["lease_x"],
+        "revoked_capabilities": ["web.search"],
+        "revoked_before": 42.0,
+    }
+    fresh = CapabilityVault()
+    fresh.import_revocations(**{
+        "lease_ids": exported["revoked_lease_ids"],
+        "capabilities": exported["revoked_capabilities"],
+        "before": exported["revoked_before"],
+    })
+    assert fresh.is_capability_revoked("web.search")
+    assert "lease_x" in fresh._revoked_lease_ids
+    assert fresh._revoked_before == 42.0
+
+
+def test_loop_revoke_blocks_next_call_without_rebrokering(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    broker = _CountingBroker(AutoGrantBroker())
+    loop = _cap_loop(
+        tmp_path,
+        provider,
+        broker,
+        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), _FETCH2, _DONE],
+    )
+    loop.open()
+    # First turn: the tool runs on a freshly-brokered lease.
+    first = loop.run_until_suspended("go")
+    assert first.reason == "settled"
+    assert provider.calls == 1
+    assert broker.requests == 1
+
+    loop.revoke_capability(capability="web.search")  # operator kill switch
+
+    # Second turn: the gated call is refused at the gate — and crucially NOT re-brokered, so even
+    # this permissive AutoGrantBroker cannot resurrect it.
+    second = loop.run_until_suspended("again")
+    assert second.reason == "settled"
+    assert provider.calls == 1  # the tool never ran again
+    assert broker.requests == 1  # no re-broker after revocation
+    run_dir = loop._session.res.recorder.run_dir  # type: ignore[union-attr]
+    events = _events(run_dir)
+    assert any(e["type"] == "capability.revoked" and e["data"]["capability"] == "web.search" for e in events)
+    loop.close()
+
+
+def test_revocation_survives_restart(tmp_path: Path) -> None:
+    # Approve a durable lease, revoke it, then restore a fresh loop from the checkpoint: the
+    # revocation must persist so the gated call stays blocked (the kill switch is not forgotten).
+    provider1 = _CapToolProvider()
+    loop1 = _escalation_loop(
+        tmp_path,
+        provider1,
+        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), _FETCH2, ModelTurn(response_id="rd", final_text="done")],
+    )
+    loop1.open()
+    parked = loop1.run_until_suspended("go")
+    assert parked.reason == "awaiting_tasks"
+    loop1.report_task_result(parked.awaiting_task_ids[0], _grant_lease())
+    settled = loop1.run_until_suspended(None)
+    assert settled.reason == "settled"
+    assert provider1.calls == 1
+
+    loop1.revoke_capability(capability="web.search")
+    cp = loop1.snapshot()
+    assert cp is not None
+    assert cp.revoked_capabilities == ["web.search"]
+    blobs = loop1.collect_checkpoint_blobs()
+    run_id = loop1.spec.run_id
+
+    provider2 = _CapToolProvider()
+    loop2 = _escalation_loop(
+        tmp_path,
+        provider2,
+        turns=[ModelTurn(response_id="r1b", tool_calls=(fake_tool_call("ext_fetch", {}, "cb"),)), ModelTurn(response_id="r2b", final_text="done2")],
+        run_id=run_id,
+    )
+    loop2.restore(cp, blobs=blobs)
+    resumed = loop2.run_until_suspended("again")
+    assert resumed.reason == "settled"
+    assert provider2.calls == 0  # revoked across the restart -> the gated tool stays blocked
+    loop2.close()

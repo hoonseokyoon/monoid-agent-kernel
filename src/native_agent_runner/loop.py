@@ -717,6 +717,26 @@ class AgentLoop:
         submit starts, so a stale pause never freezes a fresh turn."""
         self._pause_requested = True
 
+    def revoke_capability(
+        self,
+        *,
+        capability: str | None = None,
+        lease_id: str | None = None,
+        before: float | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Revoke a capability lease NOW (the operator/Daemon kill switch). Records the revocation
+        in the per-run vault; the gate (``_ensure_capability_lease``) and ``token_for`` then refuse
+        the handle fail-closed — a per-capability revoke is also refused re-brokering, so it cannot
+        be undone by a permissive broker. Thread-safe (set mutation only, like ``pause_turn`` /
+        ``interrupt_turn``); the ``capability.denied`` audit event is emitted on the loop thread at
+        the gate when the next gated call hits the revocation, so this is safe to call from a
+        control-plane thread. Pass ``capability="*"`` to revoke every currently-held capability.
+        Returns a summary of what was revoked."""
+        return self._capability_vault.revoke(
+            capability=capability, lease_id=lease_id, before=before
+        )
+
     async def arun_until_suspended(
         self, user_input: str | tuple[ContentPart, ...] | None = None
     ) -> Suspension:
@@ -1222,6 +1242,8 @@ class AgentLoop:
             # Durable (approved) capability leases — handles only — so a restart does not re-prompt.
             capability_leases=self._capability_vault.export_durable(),
             pending_capability_replays=[dict(replay) for replay in state.pending_capability_replays],
+            # Revocation records so a revoked capability stays dead across the restart.
+            **self._capability_vault.export_revocations(),
         )
 
     def _checkpoint_store(self) -> CheckpointStore:
@@ -1356,6 +1378,12 @@ class AgentLoop:
         # re-prompted after a restart. Ephemeral sync grants were never persisted; they re-broker.
         for lease_payload in cp.capability_leases:
             self._capability_vault.install(CapabilityLease.from_json(lease_payload))
+        # Restore revocation records so a capability revoked before the restart stays dead.
+        self._capability_vault.import_revocations(
+            lease_ids=cp.revoked_lease_ids,
+            capabilities=cp.revoked_capabilities,
+            before=cp.revoked_before,
+        )
         # Rehydrate inline-ingested media: load every blob:<sha> referenced by the restored log
         # back into the in-memory map so wire-build can resolve it after the restart. A blob
         # missing from the store is skipped (not fatal) — resolution then surfaces it as a
@@ -3200,10 +3228,24 @@ class AgentLoop:
             return None
         scope = {key: value for key, value in bound_tool.binding.scope.to_json().items() if value}
         now = time.time()
-        if self._capability_vault.get_valid(capability, scope, now=now) is not None:
-            return None  # a valid, scope-covering lease is already cached for this run
         binding_id = bound_tool.binding_id
         parent_id = started_event.event_id if started_event else None
+        if self._capability_vault.is_capability_revoked(capability):
+            # Hard stop: a revoked capability is refused WITHOUT re-brokering, so a permissive broker
+            # cannot resurrect it. (A revoked lease_id / pre-watermark lease is filtered by get_valid
+            # below and would re-broker; per-capability revocation is the authoritative kill.)
+            recorder.emit(
+                "capability.revoked",
+                turn_id=turn_id,
+                parent_id=parent_id,
+                level="warning",
+                data={"capability": capability, "scope": scope, "reason": "revoked"},
+            )
+            raise PermissionDenied(
+                f"capability revoked: {capability}", error_code="capability_revoked"
+            )
+        if self._capability_vault.get_valid(capability, scope, now=now) is not None:
+            return None  # a valid, scope-covering lease is already cached for this run
         request = CapabilityRequest(
             capability=capability,
             scope=scope,

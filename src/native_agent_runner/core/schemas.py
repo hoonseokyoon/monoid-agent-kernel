@@ -281,6 +281,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         {"capability": _STR, "binding_id": _STR, "reason": _STR, "retryable": _BOOL},
         required=("capability",),
     ),
+    "capability.revoked": _data_schema(
+        {"capability": _STR, "lease_id": _STR, "reason": _STR, "scope": _OBJ},
+        required=("capability",),
+    ),
     "workspace.file.read": _data_schema(
         {"tool": _STR, "paths": _STR_ARRAY},
         required=("tool",),
