@@ -84,6 +84,13 @@ class RunCheckpoint:
     workspace_delta: list[dict[str, Any]] = field(default_factory=list)
     workspace_base: dict[str, Any] | None = None
 
+    # --- capability leases (durable/approved only; ephemeral sync grants are not persisted) ---
+    # Handles only (token_ref), never secrets; re-installed into the vault on restore so a
+    # human-approved capability is not re-prompted after a restart. See core/capability.py.
+    capability_leases: list[dict[str, Any]] = field(default_factory=list)
+    # Gated tool calls awaiting auto-redispatch after their capability is granted (Phase ⑤).
+    pending_capability_replays: list[dict[str, Any]] = field(default_factory=list)
+
     # --- run-level bookkeeping ---
     remaining_duration_s: float | None = None
     cancellation_requested: bool = False

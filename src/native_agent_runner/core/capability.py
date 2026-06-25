@@ -65,6 +65,11 @@ class CapabilityLease:
     expires_at: float  # epoch seconds; checked before every use
     scope: dict[str, Any] = field(default_factory=dict)
     lease_id: str = field(default_factory=lambda: f"lease_{uuid.uuid4().hex[:12]}")
+    # Whether this lease should survive a restart (checkpointed). Sync auto-grants stay ephemeral
+    # (False) — re-brokering is cheap and no handle touches disk. A human/policy-approved lease is
+    # marked durable so a restart does not re-prompt the approver. The handle (token_ref), never a
+    # secret, is what persists.
+    durable: bool = False
 
     def is_valid(self, now: float) -> bool:
         return now < self.expires_at
@@ -77,7 +82,21 @@ class CapabilityLease:
             "scope": dict(self.scope),
             "expires_at": self.expires_at,
             "token_ref": self.token_ref,
+            "durable": self.durable,
         }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, Any]) -> CapabilityLease:
+        kwargs: dict[str, Any] = {
+            "capability": str(payload.get("capability") or ""),
+            "token_ref": str(payload.get("token_ref") or ""),
+            "expires_at": float(payload.get("expires_at") or 0.0),
+            "scope": dict(payload.get("scope") or {}),
+            "durable": bool(payload.get("durable", False)),
+        }
+        if payload.get("lease_id"):
+            kwargs["lease_id"] = str(payload["lease_id"])
+        return cls(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -182,6 +201,18 @@ class CapabilityVault:
             )
         self._leases[lease.capability] = lease
         return lease
+
+    def export_durable(self) -> list[dict[str, Any]]:
+        """Serialize the leases marked ``durable`` (e.g. human/policy-approved) for the checkpoint.
+        Ephemeral sync grants are intentionally excluded — they re-broker on restart, so no handle
+        for them ever lands on disk. Expiry is re-checked on use, so an expired lease here is
+        harmless (it is filtered by ``get_valid`` after restore)."""
+        return [lease.to_json() for lease in self._leases.values() if lease.durable]
+
+    def install(self, lease: CapabilityLease) -> None:
+        """Directly install a lease (no scope re-check) — used on restore to rehydrate durable
+        leases from a trusted checkpoint. The lease was already scope-checked at grant time."""
+        self._leases[lease.capability] = lease
 
 
 @dataclass

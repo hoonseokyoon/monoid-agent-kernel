@@ -439,6 +439,10 @@ class RunState:
     pending_user_input: tuple[ContentPart, ...] | None = None
     pending_observations: tuple[ToolObservation, ...] = ()
     pending_binding_loads: tuple[str, ...] = ()
+    # Gated tool calls whose capability was escalated and is now (or will be) granted; the loop
+    # auto-redispatches them at the next step boundary instead of relying on a model retry (⑤).
+    # Each entry: {call_name, call_id, arguments, binding_id, task_id, capability}.
+    pending_capability_replays: tuple[dict[str, Any], ...] = ()
     tool_call_counts: dict[str, int] = field(default_factory=dict)
     previous_surface_snapshot: ToolSurfaceSnapshot | None = None
     previous_runtime_config: AgentRuntimeConfig | None = None
@@ -522,6 +526,10 @@ class AgentLoop:
     # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
     # Secrets stay in the broker; the core only gates on the lease. None = capability gating off.
     capability_broker: CapabilityBroker | None = None
+    # When True (default), after a gated tool's capability is granted the loop auto-executes the
+    # gated call (no model retry); see ⑤ auto-redispatch. When False, the model must retry the tool
+    # (the lease is still admitted). Either way model-retry remains the fallback if replay can't run.
+    capability_auto_redispatch: bool = True
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
@@ -1211,6 +1219,9 @@ class AgentLoop:
             cancellation_requested=bool(
                 self.cancellation_token is not None and self.cancellation_token.requested
             ),
+            # Durable (approved) capability leases — handles only — so a restart does not re-prompt.
+            capability_leases=self._capability_vault.export_durable(),
+            pending_capability_replays=[dict(replay) for replay in state.pending_capability_replays],
         )
 
     def _checkpoint_store(self) -> CheckpointStore:
@@ -1339,7 +1350,12 @@ class AgentLoop:
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
+            pending_capability_replays=tuple(dict(replay) for replay in cp.pending_capability_replays),
         )
+        # Reinstall durable (approved) capability leases so a human-approved capability is not
+        # re-prompted after a restart. Ephemeral sync grants were never persisted; they re-broker.
+        for lease_payload in cp.capability_leases:
+            self._capability_vault.install(CapabilityLease.from_json(lease_payload))
         # Rehydrate inline-ingested media: load every blob:<sha> referenced by the restored log
         # back into the in-memory map so wire-build can resolve it after the restart. A blob
         # missing from the store is skipped (not fatal) — resolution then surfaces it as a
@@ -2611,6 +2627,8 @@ class AgentLoop:
             token_ref=str(lease_payload.get("token_ref") or ""),
             expires_at=float(lease_payload.get("expires_at") or 0.0),
             scope=dict(lease_payload.get("scope") or {}),
+            # Approved out-of-band → persist (handle only) so a restart does not re-prompt.
+            durable=True,
         )
         try:
             self._capability_vault.admit(request, lease)

@@ -272,6 +272,97 @@ def test_human_escalation_broker_returns_pending() -> None:
     assert "web.search" in grant.prompt
 
 
+# --- ④ durable-lease checkpoint -----------------------------------------------------------
+
+
+def test_vault_export_durable_and_install_roundtrip() -> None:
+    vault = CapabilityVault()
+    request = CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
+    # An ephemeral (sync) lease is NOT exported; a durable (approved) one is.
+    vault.admit(request, CapabilityLease(capability="web.search", token_ref="t", expires_at=9e9, scope={"allowed_domains": ["a.edu"]}))
+    assert vault.export_durable() == []
+    vault.admit(
+        CapabilityRequest(capability="email.send", scope={}),
+        CapabilityLease(capability="email.send", token_ref="secret-ref://l", expires_at=9e9, durable=True),
+    )
+    exported = vault.export_durable()
+    assert [e["capability"] for e in exported] == ["email.send"]
+
+    # install() rehydrates without a scope re-check.
+    fresh = CapabilityVault()
+    fresh.install(CapabilityLease.from_json(exported[0]))
+    assert fresh.token_for("email.send", now=0.0) == "secret-ref://l"
+
+
+def _escalation_loop(tmp_path: Path, provider: _CapToolProvider, turns: list[ModelTurn], run_id: str | None = None) -> AgentLoop:
+    binding = tool_binding(
+        "ext.fetch", runtime={"requires_lease": True}, scope=ToolScope(allowed_domains=("a.edu",))
+    )
+    workspace = tmp_path / "ws"
+    if not workspace.exists():
+        workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs", run_id=run_id) if run_id else AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    return AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=turns),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=(binding,))),
+        tool_providers=(provider,),
+        capability_broker=HumanEscalationBroker(),
+        capability_auto_redispatch=False,  # exercise the model-retry path for ④
+    )
+
+
+def _grant_lease() -> dict:
+    return {
+        "granted": True,
+        "lease": {
+            "capability": "web.search",
+            "token_ref": "approved:web.search",
+            "expires_at": time.time() + 600,
+            "scope": {"allowed_domains": ["a.edu"]},
+        },
+    }
+
+
+def test_approved_lease_survives_restart_no_reprompt(tmp_path: Path) -> None:
+    # Escalate -> approve -> the lease is admitted durable. A fresh loop restored from the
+    # checkpoint already holds the lease, so a later gated call runs WITHOUT re-escalating.
+    provider1 = _CapToolProvider()
+    loop1 = _escalation_loop(
+        tmp_path,
+        provider1,
+        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), _FETCH2, ModelTurn(response_id="rd", final_text="done")],
+    )
+    loop1.open()
+    parked = loop1.run_until_suspended("go")
+    assert parked.reason == "awaiting_tasks"
+    loop1.report_task_result(parked.awaiting_task_ids[0], _grant_lease())
+    settled = loop1.run_until_suspended(None)
+    assert settled.reason == "settled"
+    assert provider1.calls == 1  # model retried + the tool ran
+
+    cp = loop1.snapshot()
+    assert cp is not None
+    assert [lease["capability"] for lease in cp.capability_leases] == ["web.search"]  # durable, persisted
+    blobs = loop1.collect_checkpoint_blobs()
+    run_id = loop1.spec.run_id
+
+    # Fresh "process": restore into a new loop whose model calls the gated tool again.
+    provider2 = _CapToolProvider()
+    loop2 = _escalation_loop(
+        tmp_path,
+        provider2,
+        turns=[ModelTurn(response_id="r1b", tool_calls=(fake_tool_call("ext_fetch", {}, "cb"),)), ModelTurn(response_id="r2b", final_text="done2")],
+        run_id=run_id,
+    )
+    loop2.restore(cp, blobs=blobs)
+    resumed = loop2.run_until_suspended("again")
+    assert resumed.reason == "settled"  # NOT awaiting_tasks — no re-prompt
+    assert provider2.calls == 1  # the gated tool ran on the restored lease
+    assert provider2.seen_tokens == ["approved:web.search"]
+    loop2.close()
+
+
 # --- backend injection (A-2): RunnerBackend provisions a per-run broker -------------------
 
 
