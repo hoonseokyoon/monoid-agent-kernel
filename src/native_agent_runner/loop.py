@@ -204,6 +204,9 @@ class AgentToolContext(ToolContext):
     finished: bool = False
     plan: list[dict[str, Any]] = field(default_factory=list)
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
+    # Per-run capability leases (handles only). A tool handler reads ``capability_token`` to get
+    # the access handle the gate acquired for its declared capability. None when no broker is set.
+    capability_vault: CapabilityVault | None = None
     tool_search_entries: tuple[ToolSearchEntry, ...] = ()
     tool_search_max_results: int = 5
     # Depth of this run in the subagent tree (0 = top-level). Threaded into spawned
@@ -378,6 +381,11 @@ class AgentToolContext(ToolContext):
         requested = tuple(self._requested_tool_loads)
         self._requested_tool_loads.clear()
         return requested
+
+    def capability_token(self, capability: str) -> str | None:
+        if self.capability_vault is None:
+            return None
+        return self.capability_vault.token_for(capability, now=time.time())
 
 
 def _observation_message(observation: ToolObservation, media_store: dict[str, bytes]) -> dict[str, Any]:
@@ -1692,6 +1700,7 @@ class AgentLoop:
             web_service,
             jobs_service,
             permission_policy=self.permission_policy,
+            capability_vault=self._capability_vault,
         )
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))

@@ -23,6 +23,7 @@ from native_agent_runner.loop import AgentLoop
 from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.reference._shared.tokens import TokenManager
+from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
 from native_agent_runner.reference.capability import DenyAllBroker, GatewayCapabilityBroker
 from native_agent_runner.tools.base import ToolContext, ToolResult, ToolSpec
 
@@ -94,12 +95,15 @@ class _CapToolProvider:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.seen_tokens: list[str | None] = []
 
     def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
         provider = self
 
         def handler(ctx: ToolContext, args: dict) -> ToolResult:
             provider.calls += 1
+            # The handler obtains the access handle the gate acquired (A-1: token delivery).
+            provider.seen_tokens.append(ctx.capability_token("web.search"))
             return ToolResult(ok=True, content={"ran": True})
 
         return [
@@ -156,6 +160,7 @@ def test_loop_grants_lease_then_runs_tool(tmp_path: Path) -> None:
 
     assert result.status == "completed"
     assert provider.calls == 1  # the tool ran AFTER the grant
+    assert provider.seen_tokens == ["auto:web.search"]  # the handle reached the handler
     events = _events(result.run_dir)
     assert any(
         e["type"] == "capability.granted" and e["data"]["capability"] == "web.search" for e in events
@@ -199,3 +204,68 @@ def test_gateway_broker_mints_verifiable_token() -> None:
         lease.token_ref, kind="capability", audience="csp.capability-gateway", run_id="run_1"
     )
     assert claims.metadata["capability"] == "web.search"
+
+
+# --- backend injection (A-2): RunnerBackend provisions a per-run broker -------------------
+
+
+def _cap_backend(tmp_path: Path, provider: _CapToolProvider, broker_factory: object) -> tuple[RunnerBackend, Path]:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    workspace.joinpath("notes.md").write_text("n\n", encoding="utf-8")
+
+    def factory(spec: object, llm_gateway_token: str) -> FakeModelAdapter:
+        del spec, llm_gateway_token
+        return FakeModelAdapter(turns=[_FETCH, _DONE])
+
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=TokenManager.from_secret("x" * 32),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+        tool_providers=(provider,),
+        capability_broker_factory=broker_factory,  # type: ignore[arg-type]
+    )
+    return backend, workspace
+
+
+def _run_cap_backend(backend: RunnerBackend, workspace: Path) -> str:
+    binding = tool_binding(
+        "ext.fetch", runtime={"requires_lease": True}, scope=ToolScope(allowed_domains=("a.edu",))
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="go",
+            runtime_config=runtime_config(bindings=(binding,)),
+        )
+    )
+    return backend.wait_for_run(submission.run_id, timeout_s=20)
+
+
+def test_backend_grants_capability_via_factory(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    backend, workspace = _cap_backend(tmp_path, provider, lambda req: AutoGrantBroker())
+    assert _run_cap_backend(backend, workspace) == "completed"
+    assert provider.calls == 1
+    assert provider.seen_tokens == ["auto:web.search"]  # broker reached the tool through the backend
+
+
+def test_backend_denies_capability_via_factory(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    backend, workspace = _cap_backend(tmp_path, provider, lambda req: DenyAllBroker())
+    # The run completes; the gated tool call was blocked (the model got an error obs).
+    assert _run_cap_backend(backend, workspace) in {"completed", "limited", "failed"}
+    assert provider.calls == 0  # the tool never executed
+
+
+def test_backend_no_factory_leaves_gating_off(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    backend, workspace = _cap_backend(tmp_path, provider, None)
+    assert _run_cap_backend(backend, workspace) == "completed"
+    # No broker -> requires_lease is a no-op; the tool runs and sees no token.
+    assert provider.calls == 1
+    assert provider.seen_tokens == [None]

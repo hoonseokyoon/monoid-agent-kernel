@@ -146,6 +146,15 @@ class CapabilityVault:
             return None
         return lease
 
+    def token_for(self, capability: str, *, now: float) -> str | None:
+        """The ``token_ref`` (access handle) of a currently-valid lease for ``capability``, or
+        ``None``. A tool handler reads this (via ``ToolContext.capability_token``) to obtain the
+        handle the gate acquired — the handle, never the secret; the edge resolves it."""
+        lease = self._leases.get(capability)
+        if lease is None or not lease.is_valid(now):
+            return None
+        return lease.token_ref
+
     def admit(self, request: CapabilityRequest, lease: CapabilityLease) -> CapabilityLease:
         """Store a granted lease after enforcing least-privilege (grant scope ⊆ request scope).
         Raises ``ValueError`` if the broker tried to widen scope (fail-closed)."""

@@ -422,6 +422,11 @@ statically provisioned.
   gates the call: a cache miss requests a lease (scoped to the binding) and on grant proceeds; a
   denial raises so the call never runs and the model gets an actionable error. Events
   `capability.requested` / `capability.granted` / `capability.denied` give the audit trail.
+- **Using the lease**: the granted handle reaches the running tool via
+  `ToolContext.capability_token(capability) -> token_ref | None` (the handle, resolved at the
+  edge). The reference backend provisions a per-run broker with
+  `RunnerBackend(capability_broker_factory=lambda request: ...)` — scoped to the run's identity
+  (e.g. a `GatewayCapabilityBroker` per tenant); `None` leaves gating off for that run.
 - **Security invariants the core enforces**: a grant may only NARROW the requested scope, never
   widen it (`CapabilityVault.admit` is fail-closed); a lease is expiry-checked before reuse; the
   per-run vault holds handles only and is NOT checkpointed — on restart leases are re-brokered, so

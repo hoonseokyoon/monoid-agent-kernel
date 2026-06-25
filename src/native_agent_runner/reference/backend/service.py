@@ -452,6 +452,12 @@ class RunnerBackend:
     # config validation — see _backend_builtin_tool_specs. Empty → no providers.
     tool_providers: tuple[Any, ...] = ()
     context_providers: tuple[Any, ...] = ()
+    # Per-run capability broker factory: ``(request) -> CapabilityBroker | None``. Called at
+    # loop-build time so a broker can be scoped to the run's identity (tenant/user/run id) — e.g.
+    # a GatewayCapabilityBroker minting per-tenant tokens. None (or a None return) leaves capability
+    # gating off for that run. A factory (not an instance) because a broker is typically per-run
+    # identity-bound, unlike the shared tool/context providers above.
+    capability_broker_factory: Callable[[BackendRunRequest], Any] | None = None
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -1662,6 +1668,13 @@ class RunnerBackend:
             if self._run_semaphore is not None:
                 self._run_semaphore.release()
 
+    def _capability_broker_for(self, request: BackendRunRequest) -> Any:
+        """Build the run's capability broker from the factory (scoped to run identity), or None
+        to leave capability gating off for this run."""
+        if self.capability_broker_factory is None:
+            return None
+        return self.capability_broker_factory(request)
+
     def _build_loop(
         self,
         run_id: str,
@@ -1692,6 +1705,7 @@ class RunnerBackend:
             subagent_definitions=self.subagent_definitions,
             tool_providers=self.tool_providers,
             context_providers=self.context_providers,
+            capability_broker=self._capability_broker_for(request),
         )
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
@@ -2143,6 +2157,7 @@ class RunnerBackend:
             subagent_definitions=self.subagent_definitions,
             tool_providers=self.tool_providers,
             context_providers=self.context_providers,
+            capability_broker=self._capability_broker_for(request),
         )
         # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
         # restore re-applies the agent's delta from the checkpoint's content blobs.

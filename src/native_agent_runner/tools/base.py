@@ -96,6 +96,12 @@ class ToolContext(Protocol):
     def search_tools(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def capability_token(self, capability: str) -> str | None:
+        """The access handle (``token_ref``) of the lease the loop acquired for ``capability``
+        before invoking this tool, or ``None`` if no broker/lease applies. The handle is resolved
+        to the real secret at the edge (gateway), never in the core."""
+        ...
+
 
 ToolHandler = Callable[[ToolContext, dict[str, Any]], ToolResult]
 
