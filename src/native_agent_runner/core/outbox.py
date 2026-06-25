@@ -50,6 +50,11 @@ class OutboxRequest:
     created_at: float = field(default_factory=time.time)
     status: OutboxStatus = "pending"
     attempts: int = 0
+    # Epoch seconds the request is next eligible for dispatch. ``0.0`` = due immediately (a freshly
+    # staged request). The edge stamps a future value on a retryable failure (exponential backoff +
+    # jitter); the drain only dispatches requests whose time has come. Durable so the schedule
+    # survives a restart instead of living in an in-process timer.
+    next_attempt_at: float = 0.0
     reference: str = ""  # external id returned by the sender on success
     error: str = ""
 
@@ -71,6 +76,7 @@ class OutboxRequest:
             "created_at": self.created_at,
             "status": self.status,
             "attempts": self.attempts,
+            "next_attempt_at": self.next_attempt_at,
             "reference": self.reference,
             "error": self.error,
         }
@@ -91,6 +97,7 @@ class OutboxRequest:
             "created_at": float(payload.get("created_at") or 0.0),
             "status": str(payload.get("status") or "pending"),  # type: ignore[arg-type]
             "attempts": int(payload.get("attempts") or 0),
+            "next_attempt_at": float(payload.get("next_attempt_at") or 0.0),
             "reference": str(payload.get("reference") or ""),
             "error": str(payload.get("error") or ""),
         }
@@ -136,8 +143,14 @@ class Outbox:
         return self._requests.get(request_id)
 
     def pending(self) -> list[OutboxRequest]:
-        """Requests still awaiting (or eligible for re-)dispatch, oldest first."""
+        """Requests still awaiting (or eligible for re-)dispatch, oldest first. The full pending set
+        (regardless of schedule) — used by the snapshot so a not-yet-due request survives a restart."""
         return [r for r in self._requests.values() if r.status == "pending"]
+
+    def due(self, now: float) -> list[OutboxRequest]:
+        """Pending requests whose ``next_attempt_at`` has arrived — the drain's dispatch predicate.
+        A freshly staged request (``next_attempt_at == 0.0``) is always due."""
+        return [r for r in self._requests.values() if r.status == "pending" and r.next_attempt_at <= now]
 
     def mark(
         self,
@@ -145,6 +158,7 @@ class Outbox:
         *,
         status: OutboxStatus,
         attempts: int | None = None,
+        next_attempt_at: float | None = None,
         reference: str = "",
         error: str = "",
     ) -> OutboxRequest | None:
@@ -154,6 +168,8 @@ class Outbox:
         request.status = status
         if attempts is not None:
             request.attempts = attempts
+        if next_attempt_at is not None:
+            request.next_attempt_at = next_attempt_at
         if reference:
             request.reference = reference
         request.error = error

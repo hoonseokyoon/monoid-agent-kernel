@@ -787,17 +787,30 @@ class AgentLoop:
         )
 
     def pending_outbox(self) -> list[OutboxRequest]:
-        """Staged outbox requests awaiting (re)dispatch — the edge drains these between turns and
-        reports each outcome via :meth:`record_outbox_result`. The core never performs the send."""
+        """Staged outbox requests awaiting (re)dispatch — the full pending set regardless of retry
+        schedule. The edge drains :meth:`due_outbox`; this is for inspection/snapshot. The core never
+        performs the send."""
         return self._outbox.pending()
 
+    def due_outbox(self, now: float) -> list[OutboxRequest]:
+        """Pending requests whose retry schedule (``next_attempt_at``) has arrived — the edge's
+        dispatch set at time ``now``. A freshly staged request is due immediately."""
+        return self._outbox.due(now)
+
     def record_outbox_result(
-        self, request_id: str, receipt: OutboxReceipt, *, max_attempts: int = 5
+        self,
+        request_id: str,
+        receipt: OutboxReceipt,
+        *,
+        max_attempts: int = 5,
+        next_attempt_at: float | None = None,
     ) -> str:
         """Record an edge sender's outcome for a staged request and emit the lifecycle event.
-        Returns the new status. A retryable failure keeps the request ``pending`` (redispatched next
-        drain) until ``max_attempts`` attempts, then dead-letters it as ``failed``; a non-retryable
-        failure fails immediately. The ``idempotency_key`` makes the (at-least-once) redispatch safe."""
+        Returns the new status. A retryable failure keeps the request ``pending`` (redispatched on or
+        after ``next_attempt_at``, which the edge computes from its backoff policy) until
+        ``max_attempts`` attempts, then dead-letters it as ``failed``; a non-retryable failure fails
+        immediately. The loop never computes the schedule — it records what the edge decided. The
+        ``idempotency_key`` makes the (at-least-once) redispatch safe."""
         request = self._outbox.get(request_id)
         if request is None:
             return ""
@@ -820,7 +833,13 @@ class AgentLoop:
                 )
             return "dispatched"
         if receipt.retryable and attempts < max_attempts:
-            self._outbox.mark(request_id, status="pending", attempts=attempts, error=receipt.error)
+            self._outbox.mark(
+                request_id,
+                status="pending",
+                attempts=attempts,
+                next_attempt_at=next_attempt_at,
+                error=receipt.error,
+            )
             return "pending"
         self._outbox.mark(request_id, status="failed", attempts=attempts, error=receipt.error)
         if recorder is not None:

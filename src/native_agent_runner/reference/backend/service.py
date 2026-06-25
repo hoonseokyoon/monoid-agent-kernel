@@ -515,6 +515,13 @@ class RunnerBackend:
     # An outbox request is redispatched (at-least-once + idempotency_key) at most this many times on
     # a retryable failure before it is dead-lettered as failed.
     outbox_max_attempts: int = 5
+    # Retry schedule for a failed outbox send: capped exponential backoff with **full jitter**
+    # (delay = uniform(0, min(cap, base * factor**attempts))). The next-attempt time is stamped on
+    # the request (durable), so the schedule survives a restart; the watchdog redrive tick (below)
+    # dispatches a request once its time arrives, decoupling retry timing from run activity.
+    outbox_retry_base_s: float = 1.0
+    outbox_retry_factor: float = 2.0
+    outbox_retry_cap_s: float = 300.0
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -546,6 +553,9 @@ class RunnerBackend:
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _watchdog_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _run_semaphore: asyncio.BoundedSemaphore | None = field(default=None, init=False, repr=False)
+    # RNG for the outbox backoff jitter — a dedicated instance so a test can seed it deterministically
+    # (backend._outbox_rng.seed(...)) without perturbing global random state.
+    _outbox_rng: random.Random = field(default_factory=random.Random, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._worker_id = uuid.uuid4().hex
@@ -1789,17 +1799,27 @@ class RunnerBackend:
         self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
         self._drain_outbox(record, loop)
 
+    def _outbox_backoff_delay(self, attempts: int) -> float:
+        """Capped exponential backoff with full jitter — ``uniform(0, min(cap, base*factor**attempts))``.
+        Full jitter (AWS) maximally decorrelates retries so a fleet of failed sends doesn't restorm a
+        recovering target in lockstep. ``attempts`` is the number already made (>=1 here)."""
+        ceiling = min(self.outbox_retry_cap_s, self.outbox_retry_base_s * (self.outbox_retry_factor ** attempts))
+        return self._outbox_rng.uniform(0.0, max(0.0, ceiling))
+
     def _drain_outbox(self, record: BackendRunRecord, loop: AgentLoop) -> None:
-        """Dispatch staged outbox requests at the edge (after they are durably persisted as
+        """Dispatch *due* staged outbox requests at the edge (after they are durably persisted as
         ``pending``), then persist again so a ``dispatched`` status is recorded. The send happens
         here, never in the core; a crash between the two persists redispatches on recover, made safe
-        by the request's idempotency_key. No-op without a sender or pending requests."""
+        by the request's idempotency_key. A retryable failure stamps a backoff ``next_attempt_at`` so
+        the request is only redispatched once its time arrives (the watchdog redrive tick wakes it,
+        independent of run activity). No-op without a sender or due requests."""
         sender = record.outbox_sender
-        pending = loop.pending_outbox()
-        if sender is None or not pending:
+        now = time.time()
+        due = loop.due_outbox(now)
+        if sender is None or not due:
             return
         changed = False
-        for request in pending:
+        for request in due:
             # Ensure the request carries a trace before the edge sends it (requests staged via the
             # outbox tool already have one; this covers any other path). Observability only.
             if not request.traceparent:
@@ -1808,7 +1828,13 @@ class RunnerBackend:
                 receipt = sender.send(request)
             except Exception as exc:  # a sender raising is a retryable transport failure
                 receipt = OutboxReceipt(ok=False, error=str(exc), retryable=True)
-            loop.record_outbox_result(request.id, receipt, max_attempts=self.outbox_max_attempts)
+            next_attempt_at = now + self._outbox_backoff_delay(request.attempts + 1)
+            loop.record_outbox_result(
+                request.id,
+                receipt,
+                max_attempts=self.outbox_max_attempts,
+                next_attempt_at=next_attempt_at,
+            )
             changed = True
         if changed:
             checkpoint = loop.snapshot()
@@ -2232,8 +2258,27 @@ class RunnerBackend:
             try:
                 self._heartbeat_own_runs()
                 self._reclaim_stale_runs()
+                self._redrive_outbox()
             except Exception:  # pragma: no cover - the watchdog must never die on a tick
                 _LOGGER.exception("watchdog tick failed")
+
+    def _redrive_outbox(self) -> None:
+        """Redrive due outbox requests for this worker's live runs — the operational tick that makes
+        retry timing independent of run activity (a request whose backoff ``next_attempt_at`` has
+        arrived is dispatched even if its run is otherwise idle). Runs on the watchdog thread but
+        marshals the actual drain onto the shared loop via ``_call_soon`` (the loop and its ``_outbox``
+        are single-threaded on that loop; ``_drain_outbox`` itself filters to due requests)."""
+        terminal = {"completed", "failed", "limited"}
+        with self._lock:
+            live = [
+                (record, record.loop)
+                for record in self._records.values()
+                if record.loop is not None
+                and record.outbox_sender is not None
+                and record.status not in terminal
+            ]
+        for record, loop in live:
+            self._call_soon(self._drain_outbox, record, loop)
 
     def _heartbeat_own_runs(self) -> None:
         assert self.lease_store is not None

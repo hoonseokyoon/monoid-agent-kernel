@@ -454,6 +454,16 @@ pattern with the checkpoint as the transaction; the engine never performs the se
   crash in between re-dispatches on recover, made safe by the `idempotency_key` the external target
   honors. A retryable failure stays `pending` and redrives up to `outbox_max_attempts`, then
   dead-letters as `failed`. No sender → requests stay durably `pending`.
+- **Backoff + redrive (retry decoupled from run activity)**: a retryable failure stamps a durable
+  `next_attempt_at` on the request — capped exponential backoff with **full jitter** (`uniform(0,
+  min(outbox_retry_cap_s, outbox_retry_base_s * outbox_retry_factor**attempts))`). The drain only
+  dispatches **due** requests (`loop.due_outbox(now)`; a freshly staged one has `next_attempt_at=0.0`
+  → due immediately, so the happy path is unchanged), and because the schedule is on the checkpoint
+  it survives a restart. The backend's **watchdog tick** also runs `_redrive_outbox()`: for each live
+  run it marshals the drain onto the shared loop, so a due request is redispatched even while its run
+  sits idle (redrive requires the watchdog running — the backend's operational background loop). The
+  loop stays policy-free: the edge computes `next_attempt_at` and passes it to
+  `record_outbox_result(...)`.
 - Reference `reference/outbox.py`: `RecordingOutboxSender` (dev/tests), `FailingOutboxSender`
   (retry-path tests), and an `OutboxToolProvider` yielding a generic `outbox.send` tool.
 - A request also carries `traceparent`/`tracestate` (W3C Trace Context; see below) and

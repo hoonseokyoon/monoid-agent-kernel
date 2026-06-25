@@ -205,3 +205,85 @@ def test_pending_outbox_survives_snapshot_restore(tmp_path: Path) -> None:
     assert loop2.record_outbox_result(restored[0].id, OutboxReceipt(ok=True, reference="r")) == "dispatched"
     assert loop2.pending_outbox() == []
     loop2.close()
+
+
+# --- backoff scheduling + watchdog redrive ------------------------------------------------
+
+
+def test_outbox_request_next_attempt_at_round_trips() -> None:
+    req = OutboxRequest(destination="email", id="o1", next_attempt_at=1234.5)
+    assert OutboxRequest.from_json(req.to_json()).next_attempt_at == 1234.5
+    # An old payload without the field defaults to 0.0 (due immediately) — back-compat.
+    assert OutboxRequest.from_json({"destination": "email", "id": "o2"}).next_attempt_at == 0.0
+
+
+def test_backoff_delay_is_capped_with_full_jitter(tmp_path: Path) -> None:
+    sender = RecordingOutboxSender()
+    backend, _ws = _outbox_backend(tmp_path, [_DONE], sender=sender)
+    backend.outbox_retry_base_s, backend.outbox_retry_factor, backend.outbox_retry_cap_s = 1.0, 2.0, 10.0
+    backend._outbox_rng.seed(1234)
+    # Full jitter: each delay lands within [0, ceiling]; the ceiling grows with attempts but is capped.
+    for attempts in range(1, 12):
+        ceiling = min(10.0, 1.0 * 2.0**attempts)
+        assert 0.0 <= backend._outbox_backoff_delay(attempts) <= ceiling
+    assert all(backend._outbox_backoff_delay(20) <= 10.0 for _ in range(50))  # never exceeds the cap
+
+
+def test_retryable_failure_stamps_future_schedule_and_is_not_due(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    binding = tool_binding("outbox.send", runtime={"requires_lease": True}, scope=ToolScope())
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(turns=[_SEND, ModelTurn(response_id="rw", final_text="staged")]),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=(binding,))),
+        tool_providers=(OutboxToolProvider(),),
+        capability_broker=AutoGrantBroker(),
+    )
+    loop.open()
+    loop.run_until_suspended("go")
+    [req] = loop.pending_outbox()
+
+    now = 1000.0
+    status = loop.record_outbox_result(
+        req.id, OutboxReceipt(ok=False, error="x", retryable=True), next_attempt_at=now + 60
+    )
+    assert status == "pending"
+    assert loop.due_outbox(now) == []  # scheduled into the future — not due yet
+    assert [r.id for r in loop.due_outbox(now + 60)] == [req.id]  # due once its time arrives
+    assert [r.id for r in loop.pending_outbox()] == [req.id]  # still in the full pending set (snapshot)
+    loop.close()
+
+
+def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None:
+    # The first send fails (retryable); with base=0 the retry is immediately due. The run then parks
+    # (idle) — and the watchdog redrive tick dispatches the due request without any run activity.
+    class _FlakyOnce:
+        calls = 0
+
+        def send(self, request: Any) -> OutboxReceipt:
+            self.calls += 1
+            if self.calls == 1:
+                return OutboxReceipt(ok=False, error="flaky", retryable=True)
+            return OutboxReceipt(ok=True, reference=f"ok:{request.id}")
+
+    sender = _FlakyOnce()
+    backend, workspace = _outbox_backend(
+        tmp_path,
+        [_SEND, ModelTurn(response_id="rw", final_text="staged")],
+        sender=sender,
+        broker=AutoGrantBroker(),
+    )
+    backend.outbox_retry_base_s = 0.0  # next_attempt_at == now -> immediately due on redrive
+    backend.watchdog_interval_s = 0.05
+    run_id, token = _run(backend, workspace, multi_turn=True)
+    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+    assert _wait(lambda: sender.calls >= 1)  # the park-time drain attempted (and failed) once
+
+    backend.start_watchdog()
+    # Redrive resends the now-due request while the run sits idle (no turn drove this).
+    assert _wait(lambda: sender.calls >= 2)
+    backend.stop_watchdog()
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
