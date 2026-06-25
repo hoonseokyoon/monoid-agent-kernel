@@ -91,6 +91,55 @@ def test_gateway_payload_is_provider_keyless_and_uses_opaque_turn_handle(tmp_pat
     assert user_followup["observations"] == []
 
 
+def test_gateway_adapter_prefers_token_provider_and_reresolves() -> None:
+    # The refresh seam: a token_provider takes precedence over the static token and is consulted on
+    # every request (so a backend that re-mints near expiry keeps a long run authenticated).
+    calls = {"n": 0}
+
+    def provider() -> str:
+        calls["n"] += 1
+        return f"tok-{calls['n']}"
+
+    adapter = GatewayModelAdapter(
+        ModelConfig(gateway_url="https://llm-gateway.internal/v1/turns"), token="static", token_provider=provider
+    )
+    assert adapter._headers()["Authorization"] == "Bearer tok-1"
+    assert adapter._headers()["Authorization"] == "Bearer tok-2"  # re-resolved each request
+
+    # No provider -> the static token is used unchanged (back-compat).
+    plain = GatewayModelAdapter(ModelConfig(gateway_url="https://llm-gateway.internal/v1/turns"), token="static")
+    assert plain._headers()["Authorization"] == "Bearer static"
+
+
+def test_gateway_token_source_remints_near_expiry(monkeypatch) -> None:
+    from native_agent_runner.reference._shared.tokens import TokenManager
+    from native_agent_runner.reference.backend import service as svc
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(svc.time, "time", lambda: clock["t"])
+    manager = TokenManager.from_secret("x" * 32)
+    source = svc._GatewayTokenSource(
+        token_manager=manager,
+        kind="llm_gateway",
+        audience="csp.llm-gateway",
+        run_id="run_1",
+        tenant_id="t",
+        user_id="u",
+        ttl_s=100,
+        refresh_skew_s=20,
+    )
+    first = source()
+    # Refresh boundary = expires_at(1100) - skew(20) = 1080. Before it -> the cached token.
+    clock["t"] = 1079.0
+    assert source() == first
+    # Past the boundary -> a fresh token (new jti), still a valid llm_gateway token for this run.
+    clock["t"] = 1081.0
+    second = source()
+    assert second != first
+    claims = manager.verify(second, kind="llm_gateway", audience="csp.llm-gateway", run_id="run_1")
+    assert claims.run_id == "run_1"
+
+
 def test_gateway_response_parser_returns_model_turn() -> None:
     turn = _parse_gateway_response(
         {

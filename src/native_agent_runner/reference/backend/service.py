@@ -74,7 +74,7 @@ from native_agent_runner.loop import AgentLoop
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.providers.base import ModelAdapter
 from native_agent_runner.providers.gateway import GatewayModelAdapter
-from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
+from native_agent_runner.reference._shared.tokens import TokenError, TokenKind, TokenManager
 from native_agent_runner.recorder import append_event_to_run
 from native_agent_runner.tools.builtin import agent_spawn_tool, builtin_tools
 from native_agent_runner.web import WebGatewayClient
@@ -402,6 +402,44 @@ async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> No
         delay += random.uniform(0, retry.jitter_s)
     if delay > 0:
         await asyncio.sleep(delay)
+
+
+@dataclass
+class _GatewayTokenSource:
+    """A callable gateway-token source that re-mints shortly before expiry. Resolved per request by
+    the model adapter (``GatewayModelAdapter.token_provider``), so a run that outlives the token TTL
+    stays authenticated without a restart — the same re-mint the recovery path already performs,
+    applied proactively and in-process (the backend holds the signing key). Not thread-safe by design:
+    a run's model calls are serialized on its loop."""
+
+    token_manager: TokenManager
+    kind: TokenKind
+    audience: str
+    run_id: str
+    tenant_id: str
+    user_id: str
+    ttl_s: int
+    metadata: dict[str, Any] = field(default_factory=dict)
+    refresh_skew_s: int = 300
+    _token: str = ""
+    _expires_at: float = 0.0
+
+    def __call__(self) -> str:
+        now = time.time()
+        # Re-mint near expiry; cap the skew at half the TTL so a short TTL doesn't re-mint every call.
+        skew = min(self.refresh_skew_s, self.ttl_s // 2)
+        if not self._token or now >= self._expires_at - skew:
+            self._token = self.token_manager.issue(
+                kind=self.kind,
+                audience=self.audience,
+                run_id=self.run_id,
+                tenant_id=self.tenant_id,
+                user_id=self.user_id,
+                ttl_s=self.ttl_s,
+                metadata=dict(self.metadata),
+            )
+            self._expires_at = now + self.ttl_s
+        return self._token
 
 
 @dataclass
@@ -1736,6 +1774,7 @@ class RunnerBackend:
             spec,
             llm_gateway_token,
             runtime_config.model if runtime_config is not None else None,
+            token_provider=self._llm_token_source(run_id, request, runtime_config),
         )
         return AgentLoop(
             spec=spec,
@@ -2188,7 +2227,12 @@ class RunnerBackend:
         with self._lock:
             self._records[run_id] = record
         spec = self._run_spec_for_request(run_id, request, workspace_root)
-        adapter = self._build_model_adapter(spec, llm_gateway_token, runtime_config.model)
+        adapter = self._build_model_adapter(
+            spec,
+            llm_gateway_token,
+            runtime_config.model,
+            token_provider=self._llm_token_source(run_id, request, runtime_config),
+        )
         loop = AgentLoop(
             spec=spec,
             model_adapter=adapter,
@@ -2238,15 +2282,39 @@ class RunnerBackend:
             if self._run_semaphore is not None:
                 self._run_semaphore.release()
 
+    def _llm_token_source(
+        self, run_id: str, request: BackendRunRequest, runtime_config: AgentRuntimeConfig | None
+    ) -> _GatewayTokenSource:
+        """A re-minting source for the run's ``llm_gateway`` token (mirrors the eager issue + the
+        recovery re-issue), so a long run keeps LLM access past the token TTL without a restart."""
+        return _GatewayTokenSource(
+            token_manager=self.token_manager,
+            kind="llm_gateway",
+            audience="csp.llm-gateway",
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            ttl_s=self.llm_gateway_token_ttl_s,
+            metadata={"agent_config_hash": runtime_config.config_hash} if runtime_config is not None else {},
+        )
+
     def _build_model_adapter(
         self,
         spec: AgentRunSpec,
         llm_gateway_token: str,
         model_config: ModelConfig | None,
+        token_provider: Callable[[], str | None] | None = None,
     ) -> ModelAdapter:
         if self.model_adapter_factory is not None:
+            # Custom factories own their credential lifecycle (they get the freshly-minted token
+            # string); the refresh seam applies to the default gateway adapter only.
             return self.model_adapter_factory(spec, llm_gateway_token)
-        return GatewayModelAdapter(model_config or ModelConfig(), gateway_url=self.llm_gateway_url, token=llm_gateway_token)
+        return GatewayModelAdapter(
+            model_config or ModelConfig(),
+            gateway_url=self.llm_gateway_url,
+            token=llm_gateway_token,
+            token_provider=token_provider,
+        )
 
     def _web_gateway_client(
         self,
