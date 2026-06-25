@@ -469,6 +469,15 @@ pattern with the checkpoint as the transaction; the engine never performs the se
 - A request also carries `traceparent`/`tracestate` (W3C Trace Context; see below) and
   `correlation_id`/`causation_id` (the request↔result link reused by ack-back). Per-destination
   routing is deferred.
+- **Ack-back (request-reply, non-park)**: stage with `emit_outbox(..., expect_ack=True)` (the
+  `outbox.send` tool exposes `expect_ack`/`reply_to`). When the send reaches a terminal outcome
+  (`dispatched`/`failed`) the edge delivers the receipt **back to the run as an inbox message**
+  (`type="outbox_ack"`, `correlation_id` = the request's flow, `causation_id` = the request id,
+  carrying its `traceparent`) via the idempotent inbox path with a stable id (`ack_<request id>`) so a
+  redelivery is a no-op. The agent observes it on its **next activation — it never parks**; a
+  terminal run has no consumer, so the ack is dropped (documented). `reply_to` empty = the run's own
+  inbox. Park-and-await (the agent suspending until the reply lands) is a deferred superset that
+  reuses this same ack plumbing.
 
 ### Trace Context on envelopes (`traceparent` / `tracestate`)
 

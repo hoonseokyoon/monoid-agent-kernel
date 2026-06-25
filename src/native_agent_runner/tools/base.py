@@ -109,11 +109,14 @@ class ToolContext(Protocol):
         *,
         capability: str = "",
         idempotency_key: str = "",
+        expect_ack: bool = False,
+        reply_to: str = "",
     ) -> dict[str, Any]:
         """Stage a durable outbound side-effect (send an email, call a webhook) instead of doing the
         IO inline. The request is appended to the run's outbox (checkpointed) and an *edge* drains it
-        later; it carries the capability lease handle for ``capability`` (never a secret). Returns
-        ``{"status": "staged", "request_id": ...}``."""
+        later; it carries the capability lease handle for ``capability`` (never a secret). With
+        ``expect_ack`` the edge delivers the send's receipt back as an inbox message (non-park).
+        Returns ``{"status": "staged", "request_id": ...}``."""
         ...
 
 

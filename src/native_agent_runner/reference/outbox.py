@@ -65,6 +65,8 @@ class OutboxToolProvider:
                 payload=dict(args.get("payload") or {}),
                 capability=OUTBOX_SEND_CAPABILITY,
                 idempotency_key=str(args.get("idempotency_key") or ""),
+                expect_ack=bool(args.get("expect_ack", False)),
+                reply_to=str(args.get("reply_to") or ""),
             )
             return ToolResult(ok=True, content=result)
 
@@ -79,6 +81,8 @@ class OutboxToolProvider:
                         "destination": {"type": "string"},
                         "payload": {"type": "object", "additionalProperties": True},
                         "idempotency_key": {"type": "string"},
+                        "expect_ack": {"type": "boolean"},
+                        "reply_to": {"type": "string"},
                     },
                     "required": ["destination"],
                     "additionalProperties": True,

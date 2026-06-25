@@ -110,6 +110,10 @@ def _run(backend: RunnerBackend, workspace: Path, *, multi_turn: bool = False) -
 
 
 _SEND = ModelTurn(response_id="r1", tool_calls=(fake_tool_call("outbox_send", {"destination": "email", "payload": {"to": "x@a.edu"}}, "c1"),))
+_SEND_ACK = ModelTurn(
+    response_id="r1",
+    tool_calls=(fake_tool_call("outbox_send", {"destination": "email", "payload": {"to": "x@a.edu"}, "expect_ack": True}, "c1"),),
+)
 _DONE = ModelTurn(response_id="rN", final_text="done")
 
 
@@ -287,3 +291,60 @@ def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None
 
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)
+
+
+# --- ack-back (non-park): the receipt comes back as a correlated inbox message ------------
+
+
+def test_outbox_ack_delivered_to_run_inbox_and_consumed(tmp_path: Path) -> None:
+    from native_agent_runner.core.inbox import is_inbox_envelope
+
+    sender = RecordingOutboxSender()
+    backend, workspace = _outbox_backend(tmp_path, [_SEND_ACK, _DONE, _DONE], sender=sender, broker=AutoGrantBroker())
+
+    # Capture the exact ack envelope at staging (wrap put_nowait around the original call — no race,
+    # since the put happens synchronously on the shared loop before the parked driver can consume it).
+    captured: list[dict] = []
+    original_stage = backend._stage_outbox_ack
+
+    def stage_spy(record: Any, request: Any, status: str, receipt: Any) -> None:
+        real_put = record.message_queue.put_nowait
+
+        def put_spy(item: Any) -> None:
+            if is_inbox_envelope(item) and item.get("type") == "outbox_ack":
+                captured.append(item)
+            real_put(item)
+
+        record.message_queue.put_nowait = put_spy  # type: ignore[method-assign]
+        try:
+            original_stage(record, request, status, receipt)
+        finally:
+            record.message_queue.put_nowait = real_put  # type: ignore[method-assign]
+
+    backend._stage_outbox_ack = stage_spy  # type: ignore[method-assign]
+
+    run_id, token = _run(backend, workspace, multi_turn=True)
+    request_id = sender.sent[0].id if _wait(lambda: sender.sent) else ""
+    # The ack is delivered and *consumed* (the run takes a turn on it) — its id lands in the seen-set.
+    assert _wait(lambda: f"ack_{request_id}" in backend._record(run_id).seen_inbox_ids)
+
+    assert captured, "no outbox_ack envelope was staged"
+    ack = captured[0]
+    assert ack["type"] == "outbox_ack" and ack["source"] == "outbox"
+    assert ack["correlation_id"] == request_id  # correlated to the request's flow
+    assert ack["causation_id"] == request_id  # the send is the direct cause of the ack
+    assert "dispatched" in ack["content"]
+    assert ack["traceparent"] == sender.sent[0].traceparent  # the trace rides the ack
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_outbox_without_expect_ack_delivers_no_inbox_message(tmp_path: Path) -> None:
+    sender = RecordingOutboxSender()
+    backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    run_id, _token = _run(backend, workspace)
+    assert backend.wait_for_run(run_id, timeout_s=20) == "completed"
+    assert sender.sent and not sender.sent[0].expect_ack
+    # No ack id was ever marked seen (nothing was delivered back).
+    assert not any(sid.startswith("ack_") for sid in backend._record(run_id).seen_inbox_ids)

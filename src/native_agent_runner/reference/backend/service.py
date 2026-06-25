@@ -1829,13 +1829,15 @@ class RunnerBackend:
             except Exception as exc:  # a sender raising is a retryable transport failure
                 receipt = OutboxReceipt(ok=False, error=str(exc), retryable=True)
             next_attempt_at = now + self._outbox_backoff_delay(request.attempts + 1)
-            loop.record_outbox_result(
+            status = loop.record_outbox_result(
                 request.id,
                 receipt,
                 max_attempts=self.outbox_max_attempts,
                 next_attempt_at=next_attempt_at,
             )
             changed = True
+            if request.expect_ack and status in {"dispatched", "failed"}:
+                self._stage_outbox_ack(record, request, status, receipt)
         if changed:
             checkpoint = loop.snapshot()
             if checkpoint is not None:
@@ -1844,6 +1846,37 @@ class RunnerBackend:
                 ]
                 checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
                 self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
+
+    def _stage_outbox_ack(
+        self, record: BackendRunRecord, request: Any, status: str, receipt: OutboxReceipt
+    ) -> None:
+        """Deliver an outbox send's receipt back to the run as an inbox message (request-reply,
+        **non-park** — the agent observes it on its next activation), correlated by ``correlation_id``.
+        Reuses the idempotent inbox path: a stable ack id (``ack_<request id>``) + the inbox seen-set
+        make a redelivery a no-op. Dropped if the run is terminal (no consumer) or its queue is full
+        (best-effort). Runs on the shared loop, so the queue put needs no cross-thread marshaling."""
+        ack_id = f"ack_{request.id}"
+        if record.status in {"completed", "failed", "limited"}:
+            return  # terminal run — no consumer for the ack (documented limitation)
+        if ack_id in record.seen_inbox_ids or record.message_queue.qsize() >= self.max_message_queue_depth:
+            return
+        summary = f"[outbox-ack] request {request.id} to {request.destination!r}: {status}"
+        if receipt.reference:
+            summary += f" (ref={receipt.reference})"
+        if receipt.error:
+            summary += f" (error={receipt.error})"
+        envelope = InboxMessage(
+            content=summary,
+            id=ack_id,
+            source="outbox",
+            type="outbox_ack",
+            run_id=record.run_id,
+            correlation_id=request.correlation_id or request.id,
+            causation_id=request.id,
+            traceparent=request.traceparent,
+            tracestate=request.tracestate,
+        )
+        record.message_queue.put_nowait(envelope.to_json())
 
     def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
         return (

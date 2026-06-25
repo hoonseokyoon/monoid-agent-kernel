@@ -401,10 +401,13 @@ class AgentToolContext(ToolContext):
         *,
         capability: str = "",
         idempotency_key: str = "",
+        expect_ack: bool = False,
+        reply_to: str = "",
     ) -> dict[str, Any]:
         """Stage a durable outbound side-effect. Captures the capability lease handle (never the
         secret) so the edge sender can authenticate, appends the request to the run's outbox (which
-        is checkpointed), and emits ``outbox.requested``. The IO happens later, at the edge."""
+        is checkpointed), and emits ``outbox.requested``. The IO happens later, at the edge. With
+        ``expect_ack`` the edge delivers the send's receipt back as an inbox message (non-park)."""
         if self.outbox is None:
             raise ToolExecutionError("outbox is not available", error_code="outbox_unavailable")
         call = self._current_call
@@ -415,6 +418,8 @@ class AgentToolContext(ToolContext):
             token_ref=self.capability_token(capability) or "" if capability else "",
             run_id=self.run_id,
             idempotency_key=idempotency_key,
+            expect_ack=expect_ack,
+            reply_to=reply_to,
             # A fresh root trace at staging (pure, no IO): the request carries an id from birth, the
             # edge derives a child span for the actual send. Observability only — never gates anything.
             traceparent=new_traceparent(),

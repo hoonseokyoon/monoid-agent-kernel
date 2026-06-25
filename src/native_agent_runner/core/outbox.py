@@ -43,6 +43,11 @@ class OutboxRequest:
     idempotency_key: str = ""
     correlation_id: str = ""
     causation_id: str = ""
+    # Ack-back (request-reply): when ``expect_ack`` is set, the edge delivers the send's receipt back
+    # to the run as an inbox message correlated by ``correlation_id`` (non-park — the agent observes it
+    # on its next activation). ``reply_to`` names the inbox to reply to; empty = the run's own inbox.
+    expect_ack: bool = False
+    reply_to: str = ""
     # W3C Trace Context (observability only; see core/trace_context.py). Empty until the edge stamps
     # a trace at dispatch; complements correlation/causation, never drives behavior.
     traceparent: str = ""
@@ -71,6 +76,8 @@ class OutboxRequest:
             "idempotency_key": self.idempotency_key or self.id,
             "correlation_id": self.correlation_id or self.id,
             "causation_id": self.causation_id,
+            "expect_ack": self.expect_ack,
+            "reply_to": self.reply_to,
             "traceparent": self.traceparent,
             "tracestate": self.tracestate,
             "created_at": self.created_at,
@@ -92,6 +99,8 @@ class OutboxRequest:
             "idempotency_key": str(payload.get("idempotency_key") or ""),
             "correlation_id": str(payload.get("correlation_id") or ""),
             "causation_id": str(payload.get("causation_id") or ""),
+            "expect_ack": bool(payload.get("expect_ack", False)),
+            "reply_to": str(payload.get("reply_to") or ""),
             "traceparent": str(payload.get("traceparent") or ""),
             "tracestate": str(payload.get("tracestate") or ""),
             "created_at": float(payload.get("created_at") or 0.0),
