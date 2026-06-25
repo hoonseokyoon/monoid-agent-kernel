@@ -285,6 +285,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         {"capability": _STR, "lease_id": _STR, "reason": _STR, "scope": _OBJ},
         required=("capability",),
     ),
+    "capability.rotated": _data_schema(
+        {"capability": _STR, "old_lease_id": _STR, "new_lease_id": _STR, "expires_at": _NUM},
+        required=("capability",),
+    ),
     "workspace.file.read": _data_schema(
         {"tool": _STR, "paths": _STR_ARRAY},
         required=("tool",),

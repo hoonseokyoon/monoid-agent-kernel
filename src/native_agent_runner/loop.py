@@ -530,6 +530,10 @@ class AgentLoop:
     # gated call (no model retry); see ⑤ auto-redispatch. When False, the model must retry the tool
     # (the lease is still admitted). Either way model-retry remains the fallback if replay can't run.
     capability_auto_redispatch: bool = True
+    # Rotation: when > 0, a cached lease within this many seconds of expiry is proactively re-brokered
+    # on use (the handle/expiry refresh under a stable contract), bounded by the lease's
+    # ``max_expires_at`` ceiling. 0 (default) disables rotation — leases simply expire and re-broker.
+    capability_rotate_skew_seconds: float = 0.0
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
@@ -3244,8 +3248,20 @@ class AgentLoop:
             raise PermissionDenied(
                 f"capability revoked: {capability}", error_code="capability_revoked"
             )
-        if self._capability_vault.get_valid(capability, scope, now=now) is not None:
-            return None  # a valid, scope-covering lease is already cached for this run
+        cached = self._capability_vault.get_valid(capability, scope, now=now)
+        if cached is not None:
+            skew = self.capability_rotate_skew_seconds
+            if skew > 0 and cached.can_rotate(now, skew):
+                self._rotate_capability_lease(
+                    cached,
+                    capability,
+                    scope,
+                    binding_id,
+                    recorder=recorder,
+                    turn_id=turn_id,
+                    parent_id=parent_id,
+                )
+            return None  # a valid, scope-covering lease is cached (refreshed if it was due)
         request = CapabilityRequest(
             capability=capability,
             scope=scope,
@@ -3344,6 +3360,53 @@ class AgentLoop:
             },
         )
         return None
+
+    def _rotate_capability_lease(
+        self,
+        current: CapabilityLease,
+        capability: str,
+        scope: dict[str, Any],
+        binding_id: str,
+        *,
+        recorder: AgentRecorder,
+        turn_id: str,
+        parent_id: str | None,
+    ) -> None:
+        """Proactively refresh a near-expiry lease (see ``capability_rotate_skew_seconds``). Re-brokers
+        a fresh lease for the same scope and admits it, carrying over the lease's durability and its
+        ``max_expires_at`` ceiling (and capping the refreshed expiry at that ceiling). A non-grant
+        (deny/pending) or a scope-widening grant leaves the still-valid current lease untouched —
+        rotation never disrupts an in-flight capability; the lease just expires later and re-brokers
+        through the normal path."""
+        broker = self.capability_broker
+        if broker is None:
+            return
+        request = CapabilityRequest(
+            capability=capability, scope=scope, run_id=self.spec.run_id, binding_id=binding_id
+        )
+        grant = broker.request(request)
+        if not isinstance(grant, CapabilityLease):
+            return  # deny/pending — keep the current valid lease, no disruption
+        ceiling = current.max_expires_at
+        expires_at = grant.expires_at if ceiling is None else min(grant.expires_at, ceiling)
+        rotated = replace(
+            grant, durable=current.durable, max_expires_at=ceiling, expires_at=expires_at
+        )
+        try:
+            self._capability_vault.admit(request, rotated)
+        except ValueError:
+            return  # broker tried to widen scope — keep the current lease (fail-closed)
+        recorder.emit(
+            "capability.rotated",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data={
+                "capability": capability,
+                "old_lease_id": current.lease_id,
+                "new_lease_id": rotated.lease_id,
+                "expires_at": rotated.expires_at,
+            },
+        )
 
     def _check_run_boundary(self, deadline: float | None) -> None:
         if self.cancellation_token is not None and self.cancellation_token.requested:

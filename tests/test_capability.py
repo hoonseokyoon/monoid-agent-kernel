@@ -133,7 +133,14 @@ class _CountingBroker:
         return self.inner.request(req)  # type: ignore[attr-defined]
 
 
-def _cap_loop(tmp_path: Path, provider: _CapToolProvider, broker: object, turns: list[ModelTurn]) -> AgentLoop:
+def _cap_loop(
+    tmp_path: Path,
+    provider: _CapToolProvider,
+    broker: object,
+    turns: list[ModelTurn],
+    *,
+    rotate_skew: float = 0.0,
+) -> AgentLoop:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     binding = tool_binding(
@@ -145,6 +152,7 @@ def _cap_loop(tmp_path: Path, provider: _CapToolProvider, broker: object, turns:
         runtime_config_provider=runtime_provider(runtime_config(bindings=(binding,))),
         tool_providers=(provider,),
         capability_broker=broker,  # type: ignore[arg-type]
+        capability_rotate_skew_seconds=rotate_skew,
     )
 
 
@@ -594,3 +602,53 @@ def test_revocation_survives_restart(tmp_path: Path) -> None:
     assert resumed.reason == "settled"
     assert provider2.calls == 0  # revoked across the restart -> the gated tool stays blocked
     loop2.close()
+
+
+# --- rotation: refresh a near-expiry lease under a stable contract, bounded by a ceiling ----
+
+
+def test_lease_can_rotate_respects_skew_and_ceiling() -> None:
+    lease = CapabilityLease(capability="web.search", token_ref="t", expires_at=1000.0)
+    assert not lease.can_rotate(now=100.0, skew=50.0)  # far from expiry -> no
+    assert lease.can_rotate(now=970.0, skew=50.0)  # within skew of expiry -> yes
+    assert not lease.can_rotate(now=1001.0, skew=50.0)  # already expired -> no
+    capped = CapabilityLease(capability="web.search", token_ref="t", expires_at=1000.0, max_expires_at=980.0)
+    assert capped.can_rotate(now=970.0, skew=50.0)  # within skew, before the ceiling -> yes
+    assert not capped.can_rotate(now=985.0, skew=50.0)  # past the absolute ceiling -> no
+
+
+def test_lease_max_expires_at_round_trips() -> None:
+    lease = CapabilityLease(capability="c", token_ref="t", expires_at=10.0, max_expires_at=20.0, durable=True)
+    assert CapabilityLease.from_json(lease.to_json()).max_expires_at == 20.0
+    # Absent ceiling stays None across the round-trip (the ephemeral-grant default).
+    plain = CapabilityLease(capability="c", token_ref="t", expires_at=1.0)
+    assert CapabilityLease.from_json(plain.to_json()).max_expires_at is None
+
+
+def test_loop_rotates_near_expiry_lease_on_use(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    broker = _CountingBroker(AutoGrantBroker())  # ttl 600; a large skew forces rotation each use
+    loop = _cap_loop(tmp_path, provider, broker, [_FETCH, _FETCH2, _DONE], rotate_skew=700.0)
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert provider.calls == 2  # tool ran twice
+    # 1 initial broker + 1 rotation on the second (cached-but-near-expiry) call.
+    assert broker.requests == 2
+    events = _events(result.run_dir)
+    rotated = [e for e in events if e["type"] == "capability.rotated"]
+    assert len(rotated) == 1
+    assert rotated[0]["data"]["capability"] == "web.search"
+    assert rotated[0]["data"]["old_lease_id"] != rotated[0]["data"]["new_lease_id"]
+
+
+def test_loop_default_skew_does_not_rotate(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    broker = _CountingBroker(AutoGrantBroker())
+    # Default rotate_skew=0.0: the cached lease is reused as-is, never re-brokered.
+    loop = _cap_loop(tmp_path, provider, broker, [_FETCH, _FETCH2, _DONE])
+    result = loop.run_once("go")
+    assert result.status == "completed"
+    assert provider.calls == 2
+    assert broker.requests == 1  # cached, no rotation
+    assert not any(e["type"] == "capability.rotated" for e in _events(result.run_dir))

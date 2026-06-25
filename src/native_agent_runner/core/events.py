@@ -67,6 +67,7 @@ AgentEventType = Literal[
     "capability.granted",
     "capability.denied",
     "capability.revoked",
+    "capability.rotated",
     "workspace.file.read",
     "workspace.file.changed",
     "workspace.diff.updated",

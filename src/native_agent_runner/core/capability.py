@@ -75,9 +75,21 @@ class CapabilityLease:
     # T" watermark (a bulk cohort kill, à la AWS STS ``aws:TokenIssueTime``). Old checkpoint payloads
     # without it decode to ``0.0`` — safely *before* any watermark, so they fail closed.
     issued_at: float = field(default_factory=time.time)
+    # Absolute lifetime ceiling (epoch seconds). Rotation may refresh the lease repeatedly, but never
+    # past this — so a one-time human approval cannot be silently auto-extended forever. ``None`` =
+    # no ceiling (the default for ephemeral sync grants); a policy/approval broker sets it.
+    max_expires_at: float | None = None
 
     def is_valid(self, now: float) -> bool:
         return now < self.expires_at
+
+    def can_rotate(self, now: float, skew: float) -> bool:
+        """True if this lease should be refreshed now: still valid, within ``skew`` seconds of
+        expiry, and not yet at its absolute ceiling. Past the ceiling it is left to expire (then the
+        normal re-broker / re-escalation path applies) rather than auto-extended."""
+        if not self.is_valid(now) or now < self.expires_at - skew:
+            return False
+        return self.max_expires_at is None or now < self.max_expires_at
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -89,10 +101,12 @@ class CapabilityLease:
             "token_ref": self.token_ref,
             "durable": self.durable,
             "issued_at": self.issued_at,
+            "max_expires_at": self.max_expires_at,
         }
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> CapabilityLease:
+        max_expires_at = payload.get("max_expires_at")
         kwargs: dict[str, Any] = {
             "capability": str(payload.get("capability") or ""),
             "token_ref": str(payload.get("token_ref") or ""),
@@ -100,6 +114,7 @@ class CapabilityLease:
             "scope": dict(payload.get("scope") or {}),
             "durable": bool(payload.get("durable", False)),
             "issued_at": float(payload.get("issued_at") or 0.0),
+            "max_expires_at": float(max_expires_at) if max_expires_at is not None else None,
         }
         if payload.get("lease_id"):
             kwargs["lease_id"] = str(payload["lease_id"])
