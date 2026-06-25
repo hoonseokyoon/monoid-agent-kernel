@@ -450,6 +450,24 @@ statically provisioned.
   `token_ref` handle only, never a secret), so a restart does not re-prompt the approver; ephemeral
   sync grants are not persisted (re-brokered on restart). The gated call is captured in the durable
   hosted-task so auto-redispatch survives a restart too.
+- **Revocation** (the operator/Daemon kill switch): `revoke_capability` (a Control command, or
+  `AgentLoop.revoke_capability(...)`) records a revocation in the per-run vault; `get_valid` /
+  `token_for` then refuse the handle **fail-closed**. Three granularities, one mechanism: per
+  `capability` (authoritative — the gate refuses to even *re-broker*, so a permissive broker can't
+  resurrect it), per `lease_id`, and an issued-before `before` watermark (a bulk cohort kill, à la
+  AWS STS `aws:TokenIssueTime`). Because a lease is only a handle the tool re-fetches per call, the
+  vault is an object-capability *caretaker* — revoking is just refusing to hand the handle back, so
+  it is instant and needs no distributed secret clawback. Revocation state is checkpointed so a
+  revoked capability stays dead across a restart. Emits `capability.revoked`. (Edge enforcement —
+  the gateway refusing a revoked token too — is a deferred defense-in-depth follow-up; a tool that
+  cached a resolved secret past revocation is bounded only by the short TTL.)
+- **Rotation** (`AgentLoop.capability_rotate_skew_seconds`, default `0.0` = off): a cached lease
+  within `skew` seconds of expiry is re-brokered on use — the handle/expiry refresh under a stable
+  contract without a model retry or a re-prompt. Bounded by `CapabilityLease.max_expires_at`, an
+  absolute ceiling so a one-time human approval is never silently auto-extended forever; past the
+  ceiling the lease is left to expire (then the normal re-broker / re-escalation path applies). A
+  deny/pending/scope-widening rotation leaves the still-valid current lease untouched (no
+  in-flight disruption). Emits `capability.rotated`.
 
 ### Permission Boundary
 
