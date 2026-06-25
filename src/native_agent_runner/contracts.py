@@ -32,6 +32,16 @@ from native_agent_runner.core.checkpoint import (
     write_checkpoint,
 )
 
+# Workspace seam (the file-storage surface the engine works through; the local backend is
+# the default, integrators supply their own via AgentLoop.workspace_factory)
+from native_agent_runner.core.workspace import (
+    ChangedEntry,
+    FileEntry,
+    Workspace,
+    WorkspaceFactory,
+)
+from native_agent_runner.workspace.local import default_local_workspace_factory
+
 # Session lifecycle (formal FSM + AgentSession contract)
 from native_agent_runner.core.lifecycle import (
     LEGAL_TRANSITIONS,
@@ -207,6 +217,12 @@ __all__ = [
     "LocalFsCheckpointStore",
     "read_checkpoint",
     "write_checkpoint",
+    # workspace seam (file-storage surface; the local backend is the default)
+    "Workspace",
+    "WorkspaceFactory",
+    "FileEntry",
+    "ChangedEntry",
+    "default_local_workspace_factory",
     # session lifecycle (formal FSM + AgentSession contract)
     "SessionState",
     "LEGAL_TRANSITIONS",

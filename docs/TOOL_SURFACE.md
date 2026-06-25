@@ -101,7 +101,10 @@ Scope is declarative enforcement input:
 - `env_allowlist`
 
 Runtime holds implementation options. Shell bindings read `runtime.shell`.
-Web bindings read `runtime.web`.
+Web bindings read `runtime.web`. `runtime.requires_lease` (bool) declares that the binding's
+tool needs a capability lease before it runs (the capability name comes from the tool's
+`ToolSpec.capability`) — gated by `AgentLoop(capability_broker=...)`; see the Capability
+Request / Lease section in `docs/CONTRACTS.md`.
 
 Example shell binding:
 

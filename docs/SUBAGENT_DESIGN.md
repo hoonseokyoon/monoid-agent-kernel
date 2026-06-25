@@ -1,6 +1,6 @@
 # Subagent (agent-as-tool) design
 
-Status: P1 in progress (branch `feat/subagent-agent-as-tool`).
+Status: implemented (P1–P3) — merged to main.
 
 ## Goal
 

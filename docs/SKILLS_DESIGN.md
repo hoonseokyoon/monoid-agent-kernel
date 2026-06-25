@@ -1,6 +1,6 @@
 # Agent Skills (progressive disclosure) design
 
-Status: P1 + P2 + P3 implemented (branch `feat/skills-progressive-disclosure`).
+Status: P1 + P2 + P3 implemented — merged to main.
 
 ## Goal
 
@@ -23,8 +23,11 @@ already in the runner:
 A skill is not a new engine concept. It rides two extension seams that already exist,
 exactly as MCP rides `ToolProvider`:
 
-- **`ContextProvider`** (`core/context.py`) — `static_segment()` folds a fixed segment
-  into the system prompt at bootstrap.
+- **`ContextProvider`** (`core/context.py`) — contributes to the system prompt, either a
+  fixed `static_segment()` folded in at bootstrap or a per-turn `dynamic_segment(turn)`.
+  `SkillProvider` uses the **dynamic** one: the catalog must vanish when the skill tool is
+  unbound (e.g. a capability toggled off mid-run), which a once-at-bootstrap segment can't
+  express.
 - **`ToolProvider`** (`tools/base.py`) — `get_tools()` yields `ToolSpec`s registered in
   the run's tool registry.
 
@@ -35,8 +38,8 @@ feature. The pump / parking / reentry loop is untouched.
 ## Three levels of disclosure
 
 ```
-L1  catalog        SkillProvider.static_segment()
-    (~100 tok/skill, always resident)
+L1  catalog        SkillProvider.dynamic_segment(turn)
+    (~100 tok/skill, per-turn while the skill tool is bound)
     "# Available Skills
      - pdf-fill: Fill PDF forms
      - commit-msg: Write commit messages
@@ -51,8 +54,9 @@ L3  resources      skill.read_file(name, path) tool  ->  ToolResult
     { name, path, content: <utf-8 text> }
 ```
 
-Once a skill is activated at L2, its instructions live in tool-result history, so there
-is nothing to re-inject per turn (`dynamic_segment` returns `None`).
+Once a skill is activated at L2, its instructions live in tool-result history, so there is
+nothing to re-inject for L2 — `dynamic_segment` re-emits only the L1 catalog each turn, and
+only while the skill tool is bound; `static_segment` returns `None`.
 
 ### Why a tool for L2 (not a filesystem read or a router)
 
@@ -125,35 +129,24 @@ to the L1 catalog, which stays at the ~100-token name+description budget).
 
 L3 has two shapes: `skill.read_file` pulls a reference file's text *into* context, while
 `skill.run_script` **executes** a bundled script and returns only its output — the source
-never enters context (Anthropic's "code never loads, only output" property, realized at the
-execution boundary).
+never enters context.
 
-Design, reusing the shell machinery rather than re-implementing process handling:
+Design decisions (reusing the shell machinery, not re-implementing process handling):
 
-- **argv, never a shell.** `shell.exec` runs `bash -lc <command>` / `powershell -Command`,
-  so a command string is shell-interpreted (injection surface). `skill.run_script` instead
-  builds an **argv** (`[interpreter, abs_script, *args]`) and runs it directly. The low-level
-  `execute_shell` gained an `argv_override` seam (skip `shell_argv`); the `command` string is
-  then only the human-readable label for the approval preview and scope check. Model-supplied
-  `args` are literal argv elements — they can never be re-parsed by a shell.
-- **Reuse, not re-implement.** The handler resolves the script (the same traversal guard as
-  `read_file`), picks the interpreter by extension, and calls a new `ToolContext.run_script`,
-  which routes through `ShellService.execute(..., argv_override=...)`. So approval gating,
-  env scrubbing (secrets stripped), timeout, output-byte limits, `changed_paths`, and the
-  `shell.exec.*`/approval events are all inherited. `side_effect: "shell"` classifies it as
-  a side-effecting tool (`_risk_for`), so run-mode gating (blocked in read-only) and approval
-  match `shell.exec` by construction. Foreground-only (no background argv seam).
-- **cwd = workspace root** (chosen), like `shell.exec`, so script side effects land in the
-  workspace and are tracked; the script reaches its own bundle via the absolute path / `__file__`.
-- **Interpreter by extension** (chosen): `.py` → the runner's own `sys.executable` (always
-  present), `.sh`/`.bash` → bash, `.js`/`.mjs` → node, `.rb` → ruby, `.ps1` → powershell;
-  unknown extension → `skill_script_unsupported`.
-- **Security stance.** A skill script is arbitrary code, but skills are operator-provisioned
-  via `--skills-directory` — the *same* trust boundary as `--tool-module`, which already
-  imports arbitrary operator Python. So no new sandbox is introduced; the defense is operator
-  trust + the shell machinery's existing controls (approval, mode, timeout, output cap, env
-  scrub) + the model being able to choose only a script *path within the skill dir* and
-  literal args (not an arbitrary command). Documented: only load skills from trusted sources.
+- **argv, never a shell.** Instead of `shell.exec`'s `bash -lc <command>` (shell-interpreted,
+  an injection surface), `skill.run_script` builds an argv (`[interpreter, abs_script, *args]`)
+  via a new `execute_shell` `argv_override` seam and runs it directly; model-supplied `args`
+  are literal argv elements. The `command` string is only the approval-preview label.
+- **Reuse `ShellService`.** The handler resolves the script (same traversal guard as
+  `read_file`) and routes through `ShellService.execute(..., argv_override=...)`, inheriting
+  approval gating, env scrubbing, timeout, output-byte limits, `changed_paths`, and the
+  `shell.exec.*` events. `side_effect: "shell"` gives it `shell.exec`'s run-mode/approval
+  gating. Foreground-only; cwd = workspace root.
+- **Interpreter by extension:** `.py` → the runner's `sys.executable`, `.sh`/`.bash` → bash,
+  `.js`/`.mjs` → node, `.rb` → ruby, `.ps1` → powershell; unknown → `skill_script_unsupported`.
+- **Security stance.** Skills are operator-provisioned via `--skills-directory` — the same
+  trust boundary as `--tool-module` — so no new sandbox is introduced; load skills only from
+  trusted sources.
 
 ## Fork skills (P3: `context: fork`)
 
@@ -179,9 +172,11 @@ agent-as-tool machine, so there is almost no new plumbing.
   final message; otherwise it loads instructions inline as before. The subagent machine
   supplies depth/fan-out caps, re-entrancy safety, cancellation, usage roll-up, and the
   `subagent.*` events/metrics for free.
-- **allowed-tools is *enforced* here.** For inline skills `allowed_tools` is advisory; for a
-  fork skill it becomes the subagent's tool allowlist, resolved against the parent's bindings
-  — a hard ceiling. So "I want this skill restricted to certain tools" is answered by making
+- **A non-empty allowed-tools is *enforced* here.** For inline skills `allowed_tools` is
+  advisory; for a fork skill a non-empty `allowed_tools` becomes the subagent's tool allowlist,
+  resolved against the parent's bindings — a hard ceiling. (An empty `allowed_tools` inherits
+  all of the parent's tools — no narrowing.) So "I want this skill restricted to certain tools"
+  is answered by making
   it a fork skill, which is why a separate enforced-gating mechanism for inline skills is not
   worth building. (For a fork skill, write `allowed-tools` in the runner's tool-id namespace,
   e.g. `fs.read shell.exec`, since it is matched by fnmatch against tool ids.)

@@ -8,12 +8,12 @@ imports them back from here.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from native_agent_runner.core.spec import RunMode, WorkspaceBackendKind
+from native_agent_runner.core.spec import AgentRunSpec, RunMode, WorkspaceBackendKind
 
 
 @dataclass
@@ -149,3 +149,13 @@ class Workspace(Protocol):
 
     def workspace_base_payload(self, run_id: str) -> dict[str, Any]:
         ...
+
+
+WorkspaceFactory = Callable[[AgentRunSpec], Workspace]
+"""Builds the run's :class:`Workspace` from its :class:`AgentRunSpec`.
+
+This is the type of ``AgentLoop.workspace_factory``. The default is
+``default_local_workspace_factory`` (``workspace/local.py``), which returns the
+local-filesystem backend; pass your own to back the engine with a different
+workspace implementation.
+"""

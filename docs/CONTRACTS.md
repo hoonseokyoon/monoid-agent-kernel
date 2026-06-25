@@ -30,12 +30,16 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
 
 - **Stable**: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig` /
   `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `tool`, `EventSink`,
-  `CheckpointStore`, `PermissionPolicy`, and the rest of `contracts`.
+  `CheckpointStore`, `Workspace` / `workspace_factory`, `PermissionPolicy`, and the
+  rest of `contracts`.
 - **Experimental**: async-task seams (`TaskExecutor`, `ResultInjector`,
   `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
   `LoopSession`, `SessionState`, `ControlCommand` / `ControlResult` /
-  `ControlDispatcher`); multimodal content parts (`ImagePart` / `DocumentPart`
-  round-trip but are not yet forwarded to models).
+  `ControlDispatcher`); multimodal input — `ImagePart` and `DocumentPart` are
+  forwarded to multimodal-capable adapters (the gateway and OpenAI adapters), a
+  text-only adapter drops them with a `model.input.degraded` warning, and
+  `AudioPart` / `VideoPart` round-trip as a forward-compatible contract but are
+  not yet forwarded.
 - **Not a contract**: `native_agent_runner.reference.*` (example services).
 
 ## Python Contracts
@@ -43,9 +47,20 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
 ### AgentLoop
 
 `AgentLoop(spec, model_adapter, *, runtime_config_provider, tool_providers=(),
-event_sinks=(), status_file=True, permission_policy=PermissionPolicy(),
-cancellation_token=None, shell_approval_provider=None, web_gateway_client=None)`
-runs a single agent against one workspace.
+context_providers=(), event_sinks=(), status_file=True,
+permission_policy=PermissionPolicy(), cancellation_token=None,
+shell_approval_provider=None, web_gateway_client=None, workspace_factory=None,
+checkpoint_store=None, capability_broker=None, subagent_definitions={})` runs a single
+agent against one workspace.
+
+The optional seams let an integrator back the engine with their own implementations
+without changing it: `workspace_factory` (file storage — see [Workspace](#workspace)),
+`checkpoint_store` (durable run state — see [Durable Persistence](#durable-persistence)),
+`capability_broker` (sensitive-tool gating — see
+[Capability Request / Lease](#capability-request--lease)), and `subagent_definitions`
+(agent-as-tool delegation — see [Subagents](#subagents-agent-as-tool)). Each defaults to
+the local / in-process behavior. `tool_providers` and `context_providers` are the
+extension seams that Skills and MCP ride (see [Skills](#skills-progressive-disclosure)).
 
 `runtime_config_provider` is required, but accepts any of three forms — a
 `RuntimeConfigProvider`, a bare `AgentRuntimeConfig`, or a
@@ -86,11 +101,42 @@ instruction(s) flow in through `submit()` / `run_once()`:
 - `workspace_backend`: `overlay` or `staging`
 - `limits: RunLimits`
 - `permission_policy: PermissionPolicy`
-- `input`: optional multimodal content-parts surface (contract-only)
+- `input`: optional multimodal content-parts surface (image/document parts are
+  forwarded to multimodal-capable adapters)
 - `metadata`
 
 It does not carry model, prompt, tool, shell, or web settings. Those values live
 in runtime config.
+
+### Workspace
+
+The engine never touches the filesystem directly — it works through a `Workspace`
+(the file-storage surface), which stores and diffs the run's files. `AgentLoop` builds
+one per run by calling `workspace_factory(spec)`. The default,
+`default_local_workspace_factory`, returns the local-filesystem `LocalWorkspaceBackend`.
+Supply your own `workspace_factory` to back a run with a different store — a git worktree,
+an object store, a remote or in-memory filesystem — without changing the engine.
+
+A `Workspace` exposes:
+
+- path handling — `normalize`, `path_kind`, `exists`, `resolve_existing_or_parent`
+- byte IO — `read_bytes` (honors a `max_bytes` cap), `write_bytes` (optimistic
+  `expected_sha256` guard), `mkdir`, `copy_path`, `move_path`, `delete_path`
+- listing — `list_entries`, `glob`, `text_files`
+- proposal generation — `changed_entries`, `diff_patch`,
+  `snapshot_current_as_new_baseline` (re-baseline for incremental apply),
+  `workspace_base_payload`
+
+It carries `root`, `mode`, `backend_kind`, and `max_bytes_read`. The value types it
+returns, `FileEntry` and `ChangedEntry`, are exported from `contracts`.
+
+`mode` (`read-only` / `propose` / `apply`) and `backend_kind` (`overlay` / `staging`)
+select how the local backend stages writes; a custom backend interprets them or pins its
+own. Every backend must pass the parametrized contract suite
+(`tests/test_workspace_contract.py`): write/read round-trips with their sha256, the
+proposed state is observable, the optimistic and byte-cap guards hold, no path escapes the
+root, the changed-entry delta tracks edits, and re-baselining collapses it. Passing it
+makes a backend a drop-in.
 
 ### AgentDefinition And Runtime Config
 
@@ -236,7 +282,7 @@ seams are pluggable:
   monitor and is completed by an external reporter.
 - `ResultInjector` — how a finished task is injected into the model: as a tool
   observation (`is_background=False`) or as a new user message
-  (`is_background=True`). This is the "appropriate way, defined by the integrator".
+  (`is_background=True`).
 - `TaskReporter` — how the backend drives tasks in a running run: `create_task`
   and `report_result`. Transport-agnostic — only `(task_id, dict)` cross the
   boundary, so an in-process reporter and a future durable/cross-process reporter
@@ -321,15 +367,18 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
   as an isolated **subagent** (reusing the subagent machine) and only its final message
   returns — heavy skills keep their working noise out of the main context. The model calls
   `skill(name, task)` with `task` describing the goal; the subagent's persona is the skill's
-  instructions and `task` is its first user message. The skill's `allowed_tools` become the
+  instructions and `task` is its first user message. A **non-empty** `allowed_tools` becomes the
   subagent's tool **allowlist** — resolved against the parent's bindings, so it is a hard
-  ceiling (here `allowed-tools` is genuinely *enforced*, unlike inline skills). Enable by
+  ceiling (here `allowed-tools` is genuinely *enforced*, unlike inline skills); an empty
+  `allowed_tools` inherits all of the parent's tools (no narrowing). Enable by
   merging `SkillProvider.subagent_definitions()` (namespaced `skill:<name>` ids) into
   `AgentLoop(subagent_definitions=...)`; the CLI does this automatically. The delegated run
   is reported in the usual `subagent_count`/`subagent.*` events and metrics.
 - **Three levels of disclosure**:
-  - **L1 — catalog** (~100 tokens/skill, always resident): `SkillProvider.static_segment()`
-    lists each `name: description` in the system prompt plus how to load one.
+  - **L1 — catalog** (~100 tokens/skill, emitted per-turn while the skill tool is bound):
+    `SkillProvider.dynamic_segment(turn)` lists each `name: description` in the system prompt
+    plus how to load one. It is config-gated — the catalog vanishes when the skill tool is
+    unbound, so `static_segment()` returns `None` and the catalog rides the per-turn segment.
   - **L2 — instructions** (on trigger): the model calls the `skill(name)` tool; the result
     carries `{name, instructions, allowed_tools?, resources?}`. Model-native triggering —
     the model picks a skill by its description, no router.
@@ -390,14 +439,15 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
 `native-agent-runner.control-command.v1` is a transport-independent envelope + a single
 `dispatch` seam, so a Daemon drives a session through one entry point instead of a route per op:
 
-- `ControlCommand(type, run_id, args, issuer, reason)` and `ControlResult(run_id, type, status,
-  state, data, error, error_code)` are plain data (`status` ∈ `ok` / `not_implemented` /
+- `ControlCommand(type, run_id, args, issuer, reason, command_id)` and `ControlResult(run_id,
+  type, status, state, data, error, error_code)` are plain data (`status` ∈ `ok` / `not_implemented` /
   `unsupported` / `error`). `ControlDispatcher.dispatch(command) -> ControlResult` is the contract;
   `RunnerBackend.dispatch` is the reference impl, routing each command to the in-process method it
   already exposes.
 - Command types: `pause`, `resume`, `cancel`, `interrupt`, `inspect`, `health`, `send_message`,
-  `runtime_config`, `replace_runtime_config`, `create_task`, `report_task_result`, `status`. An
-  unknown type returns `unsupported` (the wire vocabulary stays forward-compatible).
+  `runtime_config`, `replace_runtime_config`, `create_task`, `report_task_result`, `status`,
+  `revoke_capability`. An unknown type returns `unsupported` (the wire vocabulary stays
+  forward-compatible).
 - HTTP: `POST /v1/runs/{run_id}/control` with `{"type": ..., "args": {...}, "issuer": ...,
   "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
   envelope stays credential-free). `resume` on a *live* paused run wakes it; on a run not in
@@ -410,8 +460,8 @@ edge/transport contract — the reference `RunnerBackend` wraps inbound content 
 (`AgentLoop`) never sees the envelope (it still receives unwrapped `content` via `submit`).
 
 - Fields (CloudEvents-shaped): `id` (the dedup key), `source`, `type`, `run_id`, `created_at`,
-  `correlation_id` (defaults to `id` — a flow root), `causation_id`, `traceparent`/`tracestate`
-  (W3C Trace Context; see below), `content` (the JSON-native payload: a `str` or a list of
+  `correlation_id` (defaults to `id` — a flow root), `causation_id`, `traceparent`/`tracestate`,
+  `content` (the JSON-native payload: a `str` or a list of
   content-part dicts), `metadata`. `is_inbox_envelope(obj)` discriminates an envelope from a legacy
   raw `str`/`list` queue entry.
 - **Idempotent ingress**: `RunnerBackend.send_message(..., message_id=, source=, correlation_id=,
@@ -419,8 +469,8 @@ edge/transport contract — the reference `RunnerBackend` wraps inbound content 
   wraps + enqueues the envelope. A caller-supplied `message_id` makes the send idempotent — an
   already-processed id short-circuits to `status="duplicate"`, and a redelivery still in flight is
   dropped at dequeue. Processed ids are tracked per-run and **checkpointed** (`RunCheckpoint
-  .inbox_seen_ids`), so dedup survives a restart (effectively-once ingress — the marker rides the
-  same checkpoint as the message's effects, the Idempotent-Consumer pattern). Absent an id the edge
+  .inbox_seen_ids`), so dedup survives a restart (the marker rides the same checkpoint as the
+  message's effects). Absent an id the edge
   mints one. HTTP `POST /v1/runs/{id}/messages` accepts optional `message_id`/`source`/
   `correlation_id`; a control `send_message` uses the command's `command_id` as the dedup key.
 - Back-compat: the queue/checkpoint carry envelopes (JSON dicts), but legacy raw `str`/`list`
@@ -430,15 +480,14 @@ edge/transport contract — the reference `RunnerBackend` wraps inbound content 
   retry) is a safe no-op that neither clobbers the recorded result nor re-publishes to the reentry
   queue (which would make the agent observe the result twice). The dedup signal is the
   already-persisted+rehydrated `ready_for_reentry`/`finished_at` job state, so it holds across a
-  restart with no extra bookkeeping; the result dict carries a `duplicate` flag. (A sequence/CAS to
-  let a genuinely *newer* report supersede an older one is a deferred refinement.)
+  restart with no extra bookkeeping; the result dict carries a `duplicate` flag.
 
 ### Outbox Request
 
-`native-agent-runner.outbox-request.v1` (`core/outbox.py`, `OutboxRequest`) is the symmetric half of
-the inbox and the outbound twin of a capability lease: a tool **stages** an external side-effect
-(send an email, call a webhook) durably instead of doing the IO inline. The Transactional-Outbox
-pattern with the checkpoint as the transaction; the engine never performs the send.
+`native-agent-runner.outbox-request.v1` (`core/outbox.py`, `OutboxRequest`): a tool **stages** an
+external side-effect (send an email, call a webhook) durably in the per-run `Outbox` instead of doing
+the IO inline. The request is checkpointed, so it survives a restart; the engine never performs the
+send.
 
 - A tool handler calls `ToolContext.emit_outbox(destination, payload, *, capability,
   idempotency_key="")`; the request is appended to the per-run `Outbox` (checkpointed in full as
@@ -466,7 +515,7 @@ pattern with the checkpoint as the transaction; the engine never performs the se
   `record_outbox_result(...)`.
 - Reference `reference/outbox.py`: `RecordingOutboxSender` (dev/tests), `FailingOutboxSender`
   (retry-path tests), and an `OutboxToolProvider` yielding a generic `outbox.send` tool.
-- A request also carries `traceparent`/`tracestate` (W3C Trace Context; see below) and
+- A request also carries `traceparent`/`tracestate` and
   `correlation_id`/`causation_id` (the request↔result link reused by ack-back). Per-destination
   routing is deferred.
 - **Ack-back (request-reply, non-park)**: stage with `emit_outbox(..., expect_ack=True)` (the
@@ -502,10 +551,7 @@ header is ignored.
 ### Capability Request / Lease
 
 Secrets stay outside the core. When a tool needs external access it carries a *capability*
-requirement, and the loop acquires a scoped, expiring **lease** from a broker before running it —
-generalizing the gateway-token pattern (LLM/web access already keep the provider key behind a
-gateway) into one contract any capability can use, acquired on-demand rather than only
-statically provisioned.
+requirement, and the loop acquires a scoped, expiring **lease** from a broker before running it.
 
 - `CapabilityRequest` (`...capability-request.v1`) / `CapabilityLease` (`...capability-lease.v1`) /
   `CapabilityDenial` are plain data. A lease carries a `token_ref` **handle, never the secret** —
@@ -551,10 +597,9 @@ statically provisioned.
   `AgentLoop.revoke_capability(...)`) records a revocation in the per-run vault; `get_valid` /
   `token_for` then refuse the handle **fail-closed**. Three granularities, one mechanism: per
   `capability` (authoritative — the gate refuses to even *re-broker*, so a permissive broker can't
-  resurrect it), per `lease_id`, and an issued-before `before` watermark (a bulk cohort kill, à la
-  AWS STS `aws:TokenIssueTime`). Because a lease is only a handle the tool re-fetches per call, the
-  vault is an object-capability *caretaker* — revoking is just refusing to hand the handle back, so
-  it is instant and needs no distributed secret clawback. Revocation state is checkpointed so a
+  resurrect it), per `lease_id`, and an issued-before `before` watermark (a bulk cohort kill). Because
+  a lease is only a handle the tool re-fetches per call, revocation just refuses to hand the handle
+  back — instant, with no distributed secret clawback. Revocation state is checkpointed so a
   revoked capability stays dead across a restart. Emits `capability.revoked`. (Edge enforcement —
   the gateway refusing a revoked token too — is a deferred defense-in-depth follow-up; a tool that
   cached a resolved secret past revocation is bounded only by the short TTL.)
@@ -616,7 +661,15 @@ bindings.
 }
 ```
 
-The turn request has three shapes, selected by `previous_turn_handle` and
+The runner sends one of two request styles. **By-value `messages` is the default**: the
+full provider-neutral conversation log (`messages`, a list of `{role, content}` user /
+assistant / tool entries) travels on every turn, and the gateway forwards it statelessly —
+`previous_turn_handle` and `observations` are not consulted. The conversation is
+reconstructed from the checkpoint rather than a server-side handle, so this style survives a
+restart.
+
+The **handle-based** style (shown in the example above) is the fallback, used when a turn
+carries no `messages`. It has three shapes, selected by `previous_turn_handle` and
 `instruction`:
 
 - **first turn** — no `previous_turn_handle`; carries `instruction`.
@@ -624,8 +677,9 @@ The turn request has three shapes, selected by `previous_turn_handle` and
 - **user follow-up** — `previous_turn_handle` + `instruction` (a new user message on
   top of an existing continuation handle; `observations` is empty).
 
-This is what lets one run accept multiple user turns: the runner threads the last
-`turn_handle` into the next user message.
+Either style lets one run accept multiple user turns: with `messages` the new user message
+is appended to the log; with a handle the runner threads the last `turn_handle` into the
+next user message.
 
 Successful response:
 
@@ -767,10 +821,10 @@ length is bounded by idle timeout, max lifetime, and max turns.
 
 A checkpoint is a **complete, self-contained "save file."** A parked run survives a
 process restart even when the agent's workspace is *not* durable: workspace, the
-conversation, and run state all roll back to one aligned instant (a time machine).
-This is a **state-snapshot at the suspend points** (the LangGraph-checkpointer
-pattern, not event-sourcing replay); snapshots are only taken at clean park points,
-so there is no determinism constraint and no double-side-effect risk.
+conversation, and run state all roll back to one aligned instant. This is a
+**state-snapshot at the suspend points** (not event-sourcing replay); snapshots are
+only taken at clean park points, so there is no determinism constraint and no
+double-side-effect risk.
 
 **Division of responsibility:** the core defines *what* a checkpoint contains
 (`RunCheckpoint`) and how to `restore()` it; the integrator decides *how* it is
@@ -817,9 +871,9 @@ durable storage — a mounted volume needs no code change.
 
 **Limitations (v2):** a mid-run `commit_checkpoint` re-baseline combined with delta-
 restore is a documented follow-up (the common no-re-baseline case is covered).
-Multimodal message parts are text-only for now. `transcript.jsonl` is a debug
-artifact (the by-value `messages` in the checkpoint are the load-bearing
-conversation record).
+Multimodal message parts (image/document) round-trip through the checkpoint, so a
+resumed run re-forwards the media. `transcript.jsonl` is a debug artifact (the
+by-value `messages` in the checkpoint are the load-bearing conversation record).
 
 ## Production Hardening
 
@@ -897,13 +951,9 @@ backend = RunnerBackend(
 )
 ```
 
-**Limitation / follow-up:** SQLite is single-host (it proves the seams + the transactional
-commit/CAS pattern + crossing the *instance* boundary with zero deps). A true cross-*host*
-deployment swaps in a networked backend behind the same seams — an object store
-(S3 `put` + `If-Match`/ETag CAS on the latest pointer) or a networked DB (Postgres
-`UPDATE ... WHERE seq < :new` / `WHERE lease stale`) — as an optional dependency. The
-run-recovery descriptor (`run.json`) would also move into the shared store for a fully
-host-independent resume.
+**Limitation / follow-up:** SQLite is single-host. A true cross-*host* deployment swaps in a
+networked `CheckpointStore` / `LeaseStore` (an object store or a networked DB) behind the same
+seams, as an optional dependency.
 
 ### HTTP hardening & request bounds
 

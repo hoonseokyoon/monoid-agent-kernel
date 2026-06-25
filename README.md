@@ -1,8 +1,11 @@
-# Native Agent Runner v0.11.0
+# Native Agent Runner
 
-Standalone API-backed agent harness for safe, structured file work in a local
-workspace. This research package intentionally has no dependency on CSP runtime
-modules. CSP integration is a later adapter layer.
+Standalone API-backed agent harness for safe, structured file work in a
+workspace. The workspace is a pluggable seam: the engine ships with a
+local-filesystem backend and accepts your own implementation (see
+[Custom workspace backend](#custom-workspace-backend)). This research package
+intentionally has no dependency on CSP runtime modules. CSP integration is a
+later adapter layer.
 
 ## Boundary: contracts / core / reference
 
@@ -73,19 +76,23 @@ breaking changes are called out in commit messages and this README.
 
 - **Stable** — the core engine and the contracts it implements: `AgentLoop`, `AgentRunSpec`,
   `AgentRuntimeConfig` / `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `@tool`,
-  `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest of
-  `native_agent_runner.contracts`.
+  `EventSink`, `CheckpointStore`, `Workspace` / `workspace_factory`, `PermissionPolicy`, and
+  the rest of `native_agent_runner.contracts`.
 - **Experimental** — surfaces still settling: the async-task seams (`TaskExecutor`,
-  `ResultInjector`, `TaskReporter`) and the multimodal content parts (`ImagePart` /
-  `DocumentPart` round-trip but are not yet forwarded to models).
+  `ResultInjector`, `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
+  `LoopSession`, `SessionState`, `ControlCommand` / `ControlDispatcher`); capability leases
+  (`CapabilityBroker` / `CapabilityLease`); agent-as-tool delegation (`SubagentDefinition`)
+  and Agent Skills (`SkillProvider`); and the multimodal content parts. `ImagePart` and
+  `DocumentPart` are forwarded to multimodal-capable adapters (the gateway and OpenAI
+  adapters); a text-only adapter drops them with a `model.input.degraded` warning.
+  `AudioPart` / `VideoPart` round-trip as a forward-compatible contract but are not yet
+  forwarded.
 - **Not a contract** — everything under `native_agent_runner.reference.*` is an example
   implementation; build your own services against the contracts instead.
 
-Agent configuration is centered on `AgentDefinition` and mutable
-`AgentRuntimeConfig`. A definition describes the reusable agent blueprint, while
-runtime config carries the current prompt and `ToolBinding` set for a run.
-Backends can replace runtime config during a run; the runner applies the new
-config at the next turn and records config snapshots for audit.
+Agent configuration is centered on `AgentDefinition` (the reusable blueprint) and the
+mutable `AgentRuntimeConfig` (the current prompt and `ToolBinding` set). Backends can replace
+runtime config mid-run; the runner applies it at the next turn boundary.
 
 ## Run
 
@@ -128,6 +135,28 @@ where tools and shell write directly to a staging workspace and the runner
 compares that workspace with `workspace.base.json` to generate the proposal.
 Use `--mode apply` for local direct workspace writes.
 
+### Custom workspace backend
+
+The runner never touches the filesystem directly — it works through a `Workspace`
+(the file-storage surface in `native_agent_runner.contracts`). `AgentLoop` builds one
+per run with `workspace_factory(spec)`, defaulting to `default_local_workspace_factory`,
+which returns the local-filesystem backend. Supply your own factory to back a run with a
+different store — a git worktree, an object store, a remote or in-memory filesystem —
+without changing the engine:
+
+```python
+from native_agent_runner import AgentLoop, Workspace
+
+def my_workspace_factory(spec) -> Workspace:
+    return MyWorkspace(spec.workspace_root, mode=spec.mode)
+
+loop = AgentLoop.from_config(spec, adapter, config, workspace_factory=my_workspace_factory)
+```
+
+A custom backend must honor the `Workspace` contract suite
+(`tests/test_workspace_contract.py`) to be a drop-in: add one `pytest.param` for your
+factory and the existing invariants run against it.
+
 The default model provider is `gateway`. Container runs should call an internal
 CSP LLM gateway with a short-lived run token. The runner should not receive
 OpenAI, Anthropic, or other provider API keys.
@@ -139,17 +168,14 @@ perform direct web egress and does not receive search-provider credentials.
 `web.context` returns
 LLM-ready grounding context through a provider-neutral ContextProvider contract.
 
-Shell is available when runtime config binds `shell.exec`. `shell.exec`
-supports foreground commands and background jobs. A background call returns a
-`job_id` immediately; if `resume_on_exit=true`, the runner waits when the model has no
-immediate tool work and re-enters the model with a `background_job_result`
-observation when the job exits, times out, is cancelled, or hits the output
-limit. Background jobs are run-scoped and are cleaned up when the run finishes.
+Shell is available when runtime config binds `shell.exec`, which supports foreground
+commands and run-scoped background jobs. A background call returns a `job_id` immediately;
+the runner feeds the job's result back to the model when it finishes (inspect jobs with the
+`jobs` / `job` CLI commands below).
 
-Path permission defaults are permissive. The runner records every
-root-contained path it can inspect and treats files such as `.env`,
-`tokenizer.json`, `secret_santa.md`, and `*.key` as normal workspace files.
-Backends can explicitly deny or redact paths per run:
+Path permission defaults are permissive: the runner treats every root-contained file as a
+normal workspace file, including dotfiles and keys. Backends can explicitly deny or redact
+paths per run:
 
 ```bash
 native-agent run \
@@ -169,16 +195,25 @@ native-agent run \
 }
 ```
 
-`deny_patterns` blocks tool and shell access. `redact_patterns` affects public
-events and status projection only; private run artifacts such as
-`transcript.jsonl`, `proposal.json`, and `proposal/files/` keep real paths and
-contents.
+`deny_patterns` blocks tool and shell access. `redact_patterns` masks paths in the public
+event/status stream only; private run artifacts keep real paths and contents.
 
-Public events are not heuristically scrubbed for secrets. The runner keeps
-file-content fields out of the public stream and masks `redact_patterns` paths,
-but it does not guess at secret-bearing arguments by name. Redacting secrets that
-flow through tool arguments or shell commands is the integrating backend's
-responsibility — wrap or post-process the event stream via an `EventSink`.
+Public events are not heuristically scrubbed for secrets: the runner keeps file-content out
+of the public stream and masks `redact_patterns` paths, but redacting secret-bearing tool
+arguments or shell commands is the backend's responsibility (see [Event Sinks](#event-sinks)).
+
+### Subagents, Skills, and capability gating
+
+Three optional features on `native-agent run`, each off unless its flag is set:
+
+- `--agents-directory DIR` — load subagent definitions (`*.md` with frontmatter) from
+  `DIR`, enabling the `agent.spawn` tool so the model can delegate to isolated child runs.
+- `--skills-directory DIR` — load Agent Skills (`SKILL.md` with frontmatter) from `DIR`,
+  enabling the progressive-disclosure skill tools.
+- `--capability-broker path.py:factory` — load a `CapabilityBroker` that gates any tool
+  declaring `runtime.requires_lease` behind a scoped, short-lived lease. For local dev,
+  `--auto-grant-capabilities` uses the built-in `AutoGrantBroker` (grants every request,
+  scoped to its binding) instead. Pass at most one of the two.
 
 For machine-readable real-time progress:
 
@@ -330,25 +365,12 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
 curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/runtime-config
 
+# POST replaces the run's config (optimistic concurrency via expected_version); the runner
+# applies it at the next turn boundary. See docs/CONTRACTS.md for the request schema.
 curl -sS -X POST http://127.0.0.1:8765/v1/runs/$RUN_ID/runtime-config \
   -H "Authorization: Bearer $RUN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{
-    "expected_version": 1,
-    "issuer": "backend",
-    "reason": "update read guidance",
-    "config": {
-      "definition_id": "coding-agent",
-      "config_version": 2,
-      "tools": [
-        {"binding_id": "read_file",
-         "ref": {"kind": "registry", "tool_id": "fs.read"},
-         "exposure": "immediate",
-         "authorization": "allow",
-         "guidance": {"summary": "Read source files before editing."}}
-      ]
-    }
-  }'
+  -d @new-runtime-config.json
 
 curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/jobs
@@ -369,10 +391,10 @@ call. That token is passed only to `GatewayModelAdapter` and is not returned fro
 the run APIs. For web-enabled runs, it also generates a separate `web_gateway`
 token for `WebGatewayClient`.
 
-The LLM gateway validates `llm_gateway` tokens, calls the provider adapter,
-stores provider continuation ids server-side, and returns only opaque
-`turn_handle` values to the runner. The turn request carries the effective
-model from runtime config. Its usage endpoint is
+The LLM gateway validates `llm_gateway` tokens, calls the provider adapter, and returns only
+opaque `turn_handle` values to the runner. The default by-value `messages` request is
+forwarded statelessly; for handle-based continuation it stores provider continuation ids
+server-side. The turn request carries the effective model from runtime config. Its usage endpoint is
 admin-scoped:
 
 ```bash
@@ -381,17 +403,10 @@ curl -H "Authorization: Bearer $NAR_LLM_GATEWAY_ADMIN_TOKEN" \
 ```
 
 The WebGateway validates `web_gateway` tokens, enforces per-request binding
-constraints, calls a web provider adapter, and reports tenant usage. v0.11 includes the deterministic
-fake provider plus real search/fetch/context provider composition:
-
-- `BraveSearchProvider`: Brave Search API for result discovery
-- `HttpFetchProvider`: direct HTTP fetch + lightweight HTML-to-text extraction
-- `BraveLlmContextProvider`: Brave LLM Context API normalized behind
-  `ContextProvider`
-- `SearchFetchContextProvider`: provider-agnostic context builder from
-  search/fetch results
-- `CompositeWebProvider`: search/fetch split so Brave can later be replaced by
-  Serper or a CSP-owned context builder without changing runner tools
+constraints, calls a web provider adapter, and reports tenant usage. The reference ships a
+deterministic fake provider plus Brave-backed search/fetch/context providers behind the
+provider-neutral `ContextProvider` seam, so the search backend can be swapped without
+changing runner tools.
 
 ```bash
 curl -H "Authorization: Bearer $NAR_WEB_GATEWAY_ADMIN_TOKEN" \
@@ -412,10 +427,7 @@ Each run writes:
 - `diff.patch`: proposed or applied workspace diff
 - `proposal.json`: proposed output snapshot metadata
 - `proposal/files/`: materialized changed-file snapshots
-- `artifacts/jobs/<job_id>/job.json`: background job status
-- `artifacts/jobs/<job_id>/stdout.log`
-- `artifacts/jobs/<job_id>/stderr.log`
-- `artifacts/`
+- `artifacts/jobs/<job_id>/`: background job status (`job.json`) and `stdout.log` / `stderr.log`
 
 `events.jsonl` remains public/redacted. Proposed file contents are exposed only
 through the run directory snapshot or run-token protected backend proposal APIs.
