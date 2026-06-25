@@ -55,6 +55,13 @@ from native_agent_runner.core.control import (
     ControlResult,
 )
 
+# Inbox message envelope (provenance + idempotent ingress; an edge/transport contract)
+from native_agent_runner.core.inbox import (
+    INBOX_PROTOCOL_VERSION,
+    InboxMessage,
+    is_inbox_envelope,
+)
+
 # Capability request/lease (scoped, short-lived access; secrets stay outside the core)
 from native_agent_runner.core.capability import (
     CAPABILITY_LEASE_VERSION,
@@ -199,6 +206,10 @@ __all__ = [
     "CONTROL_PROTOCOL_VERSION",
     "ControlCommand",
     "ControlCommandType",
+    # inbox message envelope (provenance + idempotent ingress)
+    "INBOX_PROTOCOL_VERSION",
+    "InboxMessage",
+    "is_inbox_envelope",
     "ControlResult",
     "ControlDispatcher",
     # capability request/lease

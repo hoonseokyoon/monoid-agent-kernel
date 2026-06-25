@@ -104,6 +104,9 @@ class RunCheckpoint:
     # multimodal message carried by-reference). Kept JSON-native so the checkpoint round-trips
     # without any dataclass (de)serialization here.
     queued_messages: list[Any] = field(default_factory=list)
+    # Idempotency: ids of inbox messages already processed, so a redelivery after a restart is
+    # recognized and dropped (effectively-once ingress). Additive; old checkpoints default to [].
+    inbox_seen_ids: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

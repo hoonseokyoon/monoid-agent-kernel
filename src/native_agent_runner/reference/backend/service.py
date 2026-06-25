@@ -26,6 +26,7 @@ from native_agent_runner.core.agents import (
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.control import ControlCommand, ControlResult
 from native_agent_runner.core.events import AgentEvent
+from native_agent_runner.core.inbox import InboxMessage, is_inbox_envelope
 from native_agent_runner.core.lifecycle import (
     LoopSession,
     SessionState,
@@ -115,8 +116,11 @@ def _normalize_inbound_message(content: str | Sequence[Any]) -> str | list[dict[
 
 
 def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]:
-    """Convert a dequeued backend message (text ``str`` or ``list[dict]`` of part dicts) into a
-    loop ``submit`` input. ``content_part_from_json`` rebuilds the typed parts at the boundary."""
+    """Convert a dequeued backend message into a loop ``submit`` input. Unwraps an inbox envelope to
+    its ``content`` (the provenance/id stay on the queue/checkpoint, not in the loop); a legacy raw
+    ``str``/``list[dict]`` entry passes through. ``content_part_from_json`` rebuilds typed parts."""
+    if is_inbox_envelope(message):
+        message = InboxMessage.from_json(message).content
     if isinstance(message, list):
         return tuple(content_part_from_json(part) for part in message)
     return message  # str
@@ -235,6 +239,10 @@ class BackendRunRecord:
     # backend's _call_soon so the put runs on the loop. Created without a running loop (3.10+
     # binds lazily); all gets/puts happen on the shared loop.
     message_queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue, repr=False)
+    # Ids of inbox messages already processed — the idempotency/dedup set. Checkpointed (restored on
+    # recover) so a redelivered message is dropped once, even across a restart. Mutated only on the
+    # shared loop (dequeue), so no extra lock is needed.
+    seen_inbox_ids: set[str] = field(default_factory=set, repr=False)
 
 
 @dataclass
@@ -1008,7 +1016,17 @@ class RunnerBackend:
                     )
                 )
             if ctype == "send_message":
-                return ok(self.send_message(run_id, token, content=args.get("content") or ""))
+                # A control command carries its own id (command_id) — use it as the inbox dedup key
+                # so a redelivered control send is processed once.
+                return ok(
+                    self.send_message(
+                        run_id,
+                        token,
+                        content=args.get("content") or "",
+                        message_id=command.command_id,
+                        source="control",
+                    )
+                )
             if ctype == "create_task":
                 return ok(
                     self.create_task(
@@ -1063,7 +1081,15 @@ class RunnerBackend:
             )
 
     def send_message(
-        self, run_id: str, token: str, content: str | Sequence[Any]
+        self,
+        run_id: str,
+        token: str,
+        content: str | Sequence[Any],
+        *,
+        message_id: str = "",
+        source: str = "api",
+        correlation_id: str = "",
+        causation_id: str = "",
     ) -> dict[str, Any]:
         """Deliver a follow-up user message to a running multi-turn session. It is queued and
         consumed as the next user turn once the current turn settles.
@@ -1071,9 +1097,17 @@ class RunnerBackend:
         ``content`` is either a plain ``str`` or a sequence of content parts (``ContentPart``
         dataclasses or their JSON dicts) for a multimodal message. Multimodal parts reference
         workspace files by ``source_ref`` — the bytes are resolved at wire-build time — so the
-        message itself stays small; the size limit applies to the by-reference wire form."""
+        message itself stays small; the size limit applies to the by-reference wire form.
+
+        The message is wrapped in an ``inbox-message.v1`` envelope (provenance + idempotency). A
+        caller-supplied ``message_id`` is the dedup key: re-sending it (a retry) is processed once —
+        an already-processed id short-circuits to ``status="duplicate"``. Absent an id, a uuid is
+        minted (only duplicates still in flight dedup)."""
         self._authorize_run(run_id, token)
         record = self._record(run_id)
+        # Already-processed id -> idempotent no-op (the dequeue-time check below catches the rest).
+        if message_id and message_id in record.seen_inbox_ids:
+            return {"run_id": run_id, "status": "duplicate", "message_id": message_id}
         message = _normalize_inbound_message(content)
         # Normalize inline (data:) media to durable blobs BEFORE queueing, so the queue — and any
         # checkpoint taken while the message is still unconsumed — carries only small blob: refs,
@@ -1088,14 +1122,22 @@ class RunnerBackend:
         )
         if wire_bytes > self.max_message_bytes:
             raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
+        envelope = InboxMessage(
+            content=message,
+            id=message_id or f"inbox_{uuid.uuid4().hex[:12]}",
+            source=source,
+            run_id=run_id,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+        )
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
                 raise ValueError("cannot send a message to a terminal run")
             if record.message_queue.qsize() >= self.max_message_queue_depth:
                 raise ValueError("message queue is full; retry once the run drains it")
         # Enqueue on the shared loop (asyncio.Queue is not thread-safe across threads).
-        self._call_soon(record.message_queue.put_nowait, message)
-        return {"run_id": run_id, "status": "queued"}
+        self._call_soon(record.message_queue.put_nowait, envelope.to_json())
+        return {"run_id": run_id, "status": "queued", "message_id": envelope.id}
 
     def current_runtime_config(self, run_id: str) -> AgentRuntimeConfig | None:
         record = self._record(run_id)
@@ -1690,6 +1732,14 @@ class RunnerBackend:
             message = await asyncio.wait_for(record.message_queue.get(), remaining)
             if message is _RESUME_SESSION:
                 continue  # stray resume (run not paused): ignore and keep waiting
+            if is_inbox_envelope(message):
+                msg_id = str(message.get("id") or "")
+                if msg_id and msg_id in record.seen_inbox_ids:
+                    continue  # idempotent ingress: a redelivered message is processed once
+                if msg_id:
+                    # Mark processed; persisted at the next park checkpoint so the dedup survives a
+                    # restart (the marker rides the same checkpoint as the message's effects).
+                    record.seen_inbox_ids.add(msg_id)
             return message
 
     def _persist_run_checkpoint(self, record: BackendRunRecord) -> None:
@@ -1709,9 +1759,12 @@ class RunnerBackend:
         residual = [
             message
             for message in list(record.message_queue._queue)
-            if isinstance(message, (str, list))  # str text or list[dict] parts; drop the close sentinel
+            # inbox envelope dict, or legacy raw str/list parts; the close/resume sentinels (objects)
+            # are dropped.
+            if isinstance(message, (str, list, dict))
         ]
         checkpoint.queued_messages = residual
+        checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
         # Overwrites the same seq the loop just committed, now with the queue included.
         assert self.checkpoint_store is not None
         self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
@@ -2254,6 +2307,9 @@ class RunnerBackend:
         loop.restore(checkpoint, blobs=stored.blob)
         with self._lock:
             record.loop = loop
+        # Restore the inbox dedup set so a message processed before the restart is not reprocessed
+        # if it (or a redelivery) is queued again.
+        record.seen_inbox_ids = set(checkpoint.inbox_seen_ids)
         # Re-enqueue durable pending messages on the shared loop (before the resume coroutine
         # drains them); asyncio.Queue puts must run on the loop, not this thread.
         for message in checkpoint.queued_messages:

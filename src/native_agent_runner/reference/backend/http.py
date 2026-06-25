@@ -157,8 +157,17 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "messages":
                     run_id = parts[2]
                     payload = self._read_json()
+                    # Optional inbox envelope fields: a client-supplied message_id makes the send
+                    # idempotent (a retry with the same id is processed once).
                     self._write_json(
-                        backend.send_message(run_id, self._bearer_token(), content=str(payload.get("content") or ""))
+                        backend.send_message(
+                            run_id,
+                            self._bearer_token(),
+                            content=str(payload.get("content") or ""),
+                            message_id=str(payload.get("message_id") or ""),
+                            source=str(payload.get("source") or "http"),
+                            correlation_id=str(payload.get("correlation_id") or ""),
+                        )
                     )
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "control":

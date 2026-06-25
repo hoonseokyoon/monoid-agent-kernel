@@ -402,6 +402,29 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
   envelope stays credential-free). `resume` on a *live* paused run wakes it; on a run not in
   memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
+### Inbox Message Envelope
+
+`native-agent-runner.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a
+run so it carries **provenance** and an idempotency key. Like the control protocol it is an
+edge/transport contract — the reference `RunnerBackend` wraps inbound content into it; the engine
+(`AgentLoop`) never sees the envelope (it still receives unwrapped `content` via `submit`).
+
+- Fields (CloudEvents-shaped): `id` (the dedup key), `source`, `type`, `run_id`, `created_at`,
+  `correlation_id` (defaults to `id` — a flow root), `causation_id`, `content` (the JSON-native
+  payload: a `str` or a list of content-part dicts), `metadata`. `is_inbox_envelope(obj)`
+  discriminates an envelope from a legacy raw `str`/`list` queue entry.
+- **Idempotent ingress**: `RunnerBackend.send_message(..., message_id=, source=, correlation_id=)`
+  wraps + enqueues the envelope. A caller-supplied `message_id` makes the send idempotent — an
+  already-processed id short-circuits to `status="duplicate"`, and a redelivery still in flight is
+  dropped at dequeue. Processed ids are tracked per-run and **checkpointed** (`RunCheckpoint
+  .inbox_seen_ids`), so dedup survives a restart (effectively-once ingress — the marker rides the
+  same checkpoint as the message's effects, the Idempotent-Consumer pattern). Absent an id the edge
+  mints one. HTTP `POST /v1/runs/{id}/messages` accepts optional `message_id`/`source`/
+  `correlation_id`; a control `send_message` uses the command's `command_id` as the dedup key.
+- Back-compat: the queue/checkpoint carry envelopes (JSON dicts), but legacy raw `str`/`list`
+  entries from older checkpoints still restore and process. The **outbox** (`outbox-request.v1`,
+  capability-gated external sends) and `report_task_result` idempotency are deferred follow-ups.
+
 ### Capability Request / Lease
 
 Secrets stay outside the core. When a tool needs external access it carries a *capability*
