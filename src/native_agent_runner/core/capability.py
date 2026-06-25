@@ -97,7 +97,25 @@ class CapabilityDenial:
         }
 
 
-CapabilityGrant = CapabilityLease | CapabilityDenial
+@dataclass(frozen=True)
+class CapabilityPending:
+    """The broker cannot grant synchronously — the request must be escalated (e.g. human/Daemon
+    approval). The loop parks the run on a ``capability`` hosted-task carrying ``request``; when the
+    grant is reported (``report_task_result``) the lease is admitted to the vault and the model
+    retries the gated tool. ``prompt`` is a human-facing description for the approval UI."""
+
+    request: CapabilityRequest
+    prompt: str = ""
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "capability": self.request.capability,
+            "request_id": self.request.request_id,
+            "prompt": self.prompt,
+        }
+
+
+CapabilityGrant = CapabilityLease | CapabilityDenial | CapabilityPending
 
 
 @runtime_checkable

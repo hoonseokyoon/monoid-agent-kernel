@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,11 @@ from native_agent_runner.providers.base import ModelTurn
 from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.reference._shared.tokens import TokenManager
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.reference.capability import DenyAllBroker, GatewayCapabilityBroker
+from native_agent_runner.reference.capability import (
+    DenyAllBroker,
+    GatewayCapabilityBroker,
+    HumanEscalationBroker,
+)
 from native_agent_runner.tools.base import ToolContext, ToolResult, ToolSpec
 
 
@@ -204,6 +209,67 @@ def test_gateway_broker_mints_verifiable_token() -> None:
         lease.token_ref, kind="capability", audience="csp.capability-gateway", run_id="run_1"
     )
     assert claims.metadata["capability"] == "web.search"
+
+
+# --- B: human-escalation (async approval) -------------------------------------------------
+
+
+def test_loop_escalates_capability_then_resumes_after_grant(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    binding = tool_binding(
+        "ext.fetch", runtime={"requires_lease": True}, scope=ToolScope(allowed_domains=("a.edu",))
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                _FETCH,  # 1) model calls the gated tool -> escalation -> parks
+                ModelTurn(response_id="rw", final_text="waiting"),  # 2) settles so the run parks
+                _FETCH2,  # 3) after the grant, the model retries the tool
+                ModelTurn(response_id="rd", final_text="done"),  # 4) settles
+            ]
+        ),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=(binding,))),
+        tool_providers=(provider,),
+        capability_broker=HumanEscalationBroker(),
+    )
+    loop.open()
+
+    suspension = loop.run_until_suspended("go")
+    assert suspension.reason == "awaiting_tasks"  # parked awaiting the capability grant
+    assert provider.calls == 0  # gated: the tool did NOT run
+    task_id = suspension.awaiting_task_ids[0]
+
+    # The Daemon/human approves, reporting a lease for the capability.
+    loop.report_task_result(
+        task_id,
+        {
+            "granted": True,
+            "lease": {
+                "capability": "web.search",
+                "token_ref": "approved:web.search",
+                "expires_at": time.time() + 600,
+                "scope": {"allowed_domains": ["a.edu"]},
+            },
+        },
+    )
+
+    resumed = loop.run_until_suspended(None)
+    assert resumed.reason == "settled"
+    assert provider.calls == 1  # retried and ran once the lease was admitted
+    assert provider.seen_tokens == ["approved:web.search"]  # the approved handle reached the tool
+    loop.close()
+
+
+def test_human_escalation_broker_returns_pending() -> None:
+    from native_agent_runner.core.capability import CapabilityPending
+
+    broker = HumanEscalationBroker()
+    grant = broker.request(CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]}))
+    assert isinstance(grant, CapabilityPending)
+    assert "web.search" in grant.prompt
 
 
 # --- backend injection (A-2): RunnerBackend provisions a per-run broker -------------------

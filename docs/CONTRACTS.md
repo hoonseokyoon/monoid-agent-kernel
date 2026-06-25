@@ -431,9 +431,13 @@ statically provisioned.
   widen it (`CapabilityVault.admit` is fail-closed); a lease is expiry-checked before reuse; the
   per-run vault holds handles only and is NOT checkpointed — on restart leases are re-brokered, so
   no stale handle survives on disk.
-- A `capability` hosted-task kind also exists, so a broker can park the run awaiting an external
-  grant (human/policy escalation) and resolve it through the same `report_task_result` -> reentry
-  path as hitl/automation.
+- **Async approval (escalation)**: a broker may return `CapabilityPending` instead of granting
+  synchronously — the loop then parks the run on a `capability` hosted-task carrying the request and
+  hands the model a "pending" observation; when the grant is reported (`report_task_result` with a
+  `lease`), the lease is admitted to the vault (fail-closed against the original request scope) and
+  the model retries the gated tool. `HumanEscalationBroker` (reference) escalates every request; a
+  real policy broker auto-grants low-risk capabilities, denies forbidden ones, and escalates only
+  the sensitive ones (the three-way `lease`/`denial`/`pending` outcome is the point).
 
 ### Permission Boundary
 

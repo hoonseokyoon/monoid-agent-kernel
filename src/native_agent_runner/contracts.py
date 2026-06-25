@@ -63,6 +63,7 @@ from native_agent_runner.core.capability import (
     CapabilityBroker,
     CapabilityDenial,
     CapabilityLease,
+    CapabilityPending,
     CapabilityRequest,
     CapabilityVault,
 )
@@ -206,6 +207,7 @@ __all__ = [
     "CapabilityRequest",
     "CapabilityLease",
     "CapabilityDenial",
+    "CapabilityPending",
     "CapabilityBroker",
     "CapabilityVault",
     "AutoGrantBroker",

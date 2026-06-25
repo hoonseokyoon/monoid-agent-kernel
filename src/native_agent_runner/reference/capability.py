@@ -20,6 +20,7 @@ from native_agent_runner.core.capability import (
     CapabilityDenial,
     CapabilityGrant,
     CapabilityLease,
+    CapabilityPending,
     CapabilityRequest,
 )
 from native_agent_runner.reference._shared.tokens import TokenManager
@@ -63,3 +64,18 @@ class DenyAllBroker:
 
     def request(self, req: CapabilityRequest) -> CapabilityGrant:
         return CapabilityDenial(capability=req.capability, reason=self.reason)
+
+
+@dataclass
+class HumanEscalationBroker:
+    """Escalates every request to an external (human/Daemon) decision instead of granting
+    synchronously: returns `CapabilityPending`, so the loop parks the run on a `capability`
+    hosted-task and resumes once the grant is reported via `report_task_result`. The simplest
+    async broker — a real policy broker would auto-grant low-risk capabilities, deny forbidden
+    ones, and escalate only the sensitive ones (the three-way outcome is the point)."""
+
+    prompt_template: str = "Approve capability '{capability}' (scope={scope})?"
+
+    def request(self, req: CapabilityRequest) -> CapabilityGrant:
+        prompt = self.prompt_template.format(capability=req.capability, scope=req.scope)
+        return CapabilityPending(request=req, prompt=prompt)

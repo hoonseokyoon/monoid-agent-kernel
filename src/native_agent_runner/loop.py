@@ -95,6 +95,8 @@ from native_agent_runner.errors import (
 from native_agent_runner.core.capability import (
     CapabilityBroker,
     CapabilityDenial,
+    CapabilityLease,
+    CapabilityPending,
     CapabilityRequest,
     CapabilityVault,
 )
@@ -2578,7 +2580,61 @@ class AgentLoop:
             # so hitl/automation results don't emit phantom workspace events.
             if observation.output.get("type") == "background_job_result":
                 self._emit_background_workspace_events(observation.output, context, recorder)
+            # A resolved capability escalation: admit the granted lease into the vault so the
+            # model's retry of the gated tool passes (the lease was approved out-of-band).
+            elif observation.output.get("type") == "capability_grant":
+                self._admit_capability_grant(observation, context, recorder)
         return tuple(observations)
+
+    def _admit_capability_grant(
+        self, observation: ToolObservation, context: AgentToolContext, recorder: AgentRecorder
+    ) -> None:
+        """Store the lease from a resolved ``capability`` task in the vault (fail-closed against the
+        original request scope). A denial / malformed grant stores nothing — the model just sees the
+        result observation."""
+        task = context.job_manager.jobs.get(str(observation.output.get("task_id") or ""))
+        request_payload = getattr(task, "request", None) if task is not None else None
+        result_payload = getattr(task, "result", None) if task is not None else None
+        if not isinstance(request_payload, dict) or not isinstance(result_payload, dict):
+            return
+        lease_payload = result_payload.get("lease")
+        if not isinstance(lease_payload, dict):
+            return  # denied or no lease granted
+        request = CapabilityRequest(
+            capability=str(request_payload.get("capability") or ""),
+            scope=dict(request_payload.get("scope") or {}),
+            run_id=self.spec.run_id,
+            binding_id=str(request_payload.get("binding_id") or ""),
+        )
+        lease = CapabilityLease(
+            capability=str(lease_payload.get("capability") or request.capability),
+            token_ref=str(lease_payload.get("token_ref") or ""),
+            expires_at=float(lease_payload.get("expires_at") or 0.0),
+            scope=dict(lease_payload.get("scope") or {}),
+        )
+        try:
+            self._capability_vault.admit(request, lease)
+        except ValueError as exc:
+            recorder.emit(
+                "capability.denied",
+                data={
+                    "capability": request.capability,
+                    "binding_id": request.binding_id,
+                    "reason": str(exc),
+                },
+                level="warning",
+            )
+            return
+        recorder.emit(
+            "capability.granted",
+            data={
+                "capability": request.capability,
+                "binding_id": request.binding_id,
+                "lease_id": lease.lease_id,
+                "expires_at": lease.expires_at,
+                "scope": lease.scope,
+            },
+        )
 
     def _wait_for_background_jobs(
         self,
@@ -2926,18 +2982,25 @@ class AgentLoop:
                 ToolRegistry().validate_args(spec, arguments)
                 self._check_tool_surface_scope(spec, arguments, authorization)
                 self._check_permissions(bound_tool.base_spec, arguments)
-                self._ensure_capability_lease(bound_tool, recorder, started_event, turn_id)
-                call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
-                result = self._invoke_handler(
-                    bound_tool,
-                    context,
-                    arguments,
-                    call_id=call_id,
-                    turn_id=turn_id,
-                    recorder=recorder,
-                    started_event=started_event,
-                    authorization=authorization,
+                pending = self._ensure_capability_lease(
+                    bound_tool, context, recorder, started_event, turn_id
                 )
+                if pending is not None:
+                    # Capability escalated: the call parks (does not execute); the model retries
+                    # once the lease is granted. Not counted against the binding's call quota.
+                    result = pending
+                else:
+                    call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
+                    result = self._invoke_handler(
+                        bound_tool,
+                        context,
+                        arguments,
+                        call_id=call_id,
+                        turn_id=turn_id,
+                        recorder=recorder,
+                        started_event=started_event,
+                        authorization=authorization,
+                    )
         except ToolExecutionError as exc:
             if started_event is None:
                 started_event = self._emit_tool_started(
@@ -2995,25 +3058,28 @@ class AgentLoop:
     def _ensure_capability_lease(
         self,
         bound_tool: BoundTool,
+        context: AgentToolContext,
         recorder: AgentRecorder,
         started_event: AgentEvent | None,
         turn_id: str,
-    ) -> None:
-        """Gate a tool call on a capability lease. A no-op unless a broker is configured AND the
-        binding declares ``runtime.requires_lease``. On a cache miss the loop asks the broker for a
-        lease scoped to the binding; a denial (or a scope-widening grant) raises ``PermissionDenied``
-        so the call never runs. Secrets never enter the core — the lease carries only a handle."""
+    ) -> ToolResult | None:
+        """Gate a tool call on a capability lease. Returns ``None`` to proceed (a valid lease is
+        cached or was granted synchronously), or a *pending* ``ToolResult`` when the broker
+        escalated the request (the run will park on a ``capability`` task and the model retries the
+        tool once granted). A denial — or a scope-widening grant — raises ``PermissionDenied`` so the
+        call never runs. A no-op unless a broker is configured AND the binding declares
+        ``runtime.requires_lease``. Secrets never enter the core — a lease carries only a handle."""
         broker = self.capability_broker
         runtime = bound_tool.binding.runtime or {}
         if broker is None or not runtime.get("requires_lease"):
-            return
+            return None
         capability = bound_tool.base_spec.capability
         if not capability:
-            return
+            return None
         scope = {key: value for key, value in bound_tool.binding.scope.to_json().items() if value}
         now = time.time()
         if self._capability_vault.get_valid(capability, scope, now=now) is not None:
-            return  # a valid, scope-covering lease is already cached for this run
+            return None  # a valid, scope-covering lease is already cached for this run
         binding_id = bound_tool.binding_id
         parent_id = started_event.event_id if started_event else None
         request = CapabilityRequest(
@@ -3052,6 +3118,35 @@ class AgentLoop:
             raise PermissionDenied(
                 f"capability denied: {capability}: {grant.reason}", error_code="capability_denied"
             )
+        if isinstance(grant, CapabilityPending):
+            # Async approval: park the run on a capability hosted-task carrying the request, and
+            # hand the model a "pending" observation. On resolution the lease is admitted to the
+            # vault (see _pop_background_observations) and the model retries the gated tool.
+            task_id = context.job_manager.create_task(
+                "capability",
+                {
+                    "capability": capability,
+                    "scope": scope,
+                    "binding_id": binding_id,
+                    "request_id": request.request_id,
+                    "ttl_seconds": request.ttl_seconds,
+                    "reason": request.reason,
+                    "prompt": grant.prompt,
+                },
+            )
+            return ToolResult(
+                ok=True,
+                content={
+                    "status": "pending_capability",
+                    "capability": capability,
+                    "request_id": request.request_id,
+                    "task_id": task_id,
+                    "message": (
+                        f"Access to '{capability}' is pending approval (task {task_id}). "
+                        "Do not repeat other work for it; once it is granted, retry this tool."
+                    ),
+                },
+            )
         try:
             lease = self._capability_vault.admit(request, grant)
         except ValueError as exc:
@@ -3077,6 +3172,7 @@ class AgentLoop:
                 "scope": lease.scope,
             },
         )
+        return None
 
     def _check_run_boundary(self, deadline: float | None) -> None:
         if self.cancellation_token is not None and self.cancellation_token.requested:
