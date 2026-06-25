@@ -54,7 +54,8 @@ from native_agent_runner.providers.openai import OpenAIModelAdapter
 from native_agent_runner.recorder import StdoutJsonlSink, append_event_to_run
 from native_agent_runner.skills import SkillProvider, load_skill_definitions
 from native_agent_runner.subagent_loader import load_subagent_definitions
-from native_agent_runner.tool_loader import load_tool_provider
+from native_agent_runner.tool_loader import load_capability_broker, load_tool_provider
+from native_agent_runner.core.capability import AutoGrantBroker
 from native_agent_runner.web import WebGatewayClient
 from native_agent_runner.reference.web_gateway.http import create_web_gateway_server
 from native_agent_runner.reference.web_gateway.providers import (
@@ -144,6 +145,17 @@ main.add_command(studio_group)
     default=None,
     help="Load Agent Skills (SKILL.md with frontmatter) from a directory, enabling the skill tools.",
 )
+@click.option(
+    "--capability-broker",
+    type=str,
+    default=None,
+    help="Load a CapabilityBroker from path.py:factory to gate tools that declare requires_lease.",
+)
+@click.option(
+    "--auto-grant-capabilities",
+    is_flag=True,
+    help="Use the built-in AutoGrantBroker (local dev): grant any requires_lease tool, scoped to its binding.",
+)
 @click.option("--deny-path", multiple=True, help="Deny workspace paths matching a backend-provided glob.")
 @click.option("--redact-path", multiple=True, help="Redact matching paths from public events and projections.")
 @click.option("--permission-policy-file", type=click.Path(path_type=Path), default=None)
@@ -189,6 +201,8 @@ def run(
     tool_module: tuple[str, ...],
     agents_directory: Path | None,
     skills_directory: Path | None,
+    capability_broker: str | None,
+    auto_grant_capabilities: bool,
     deny_path: tuple[str, ...],
     redact_path: tuple[str, ...],
     permission_policy_file: Path | None,
@@ -280,6 +294,15 @@ def run(
             extra_sinks.append(StdoutJsonlSink())
         for item in event_sink_module:
             extra_sinks.extend(load_event_sinks(item))
+        if capability_broker and auto_grant_capabilities:
+            raise ValueError("use either --capability-broker or --auto-grant-capabilities, not both")
+        broker = (
+            load_capability_broker(capability_broker)
+            if capability_broker
+            else AutoGrantBroker()
+            if auto_grant_capabilities
+            else None
+        )
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -295,6 +318,7 @@ def run(
         ),
         tool_providers=providers + ((skill_provider,) if skill_provider is not None else ()),
         context_providers=(skill_provider,) if skill_provider is not None else (),
+        capability_broker=broker,
         event_sinks=tuple(extra_sinks),
         status_file=not no_status_file,
         permission_policy=spec.permission_policy,

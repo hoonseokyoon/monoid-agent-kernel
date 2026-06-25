@@ -429,8 +429,11 @@ statically provisioned.
   (e.g. a `GatewayCapabilityBroker` per tenant); `None` leaves gating off for that run.
 - **Security invariants the core enforces**: a grant may only NARROW the requested scope, never
   widen it (`CapabilityVault.admit` is fail-closed); a lease is expiry-checked before reuse; the
-  per-run vault holds handles only and is NOT checkpointed — on restart leases are re-brokered, so
-  no stale handle survives on disk.
+  per-run vault holds handles only and durable (approved) leases are checkpointed as handles, while
+  ephemeral sync grants are re-brokered on restart. Any `CapabilityBroker` can be verified against
+  these invariants with the parametrized `tests/test_capability_broker_contract.py` suite.
+- **CLI**: `native-agent run --auto-grant-capabilities` wires the built-in `AutoGrantBroker` (local
+  dev), or `--capability-broker path.py:factory` loads a custom broker (`factory()` returns it).
 - **Async approval (escalation)**: a broker may return `CapabilityPending` instead of granting
   synchronously — the loop then parks the run on a `capability` hosted-task (carrying the request
   AND the gated call) and hands the model a "pending" observation; when the grant is reported

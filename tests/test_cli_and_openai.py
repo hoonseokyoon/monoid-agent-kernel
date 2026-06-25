@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from conftest import runtime_config
+from conftest import runtime_config, tool_binding
 
 from native_agent_runner.cli import main
 from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
@@ -21,7 +21,7 @@ from native_agent_runner.providers.base import (
     TurnComplete,
     assemble_streamed_turn,
 )
-from native_agent_runner.providers.fake import FakeModelAdapter
+from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
 from native_agent_runner.providers.openai import (
     OpenAIModelAdapter,
     _capture_reasoning_items,
@@ -83,6 +83,59 @@ def test_cli_run_accepts_runtime_config_file(monkeypatch: pytest.MonkeyPatch, tm
     run_id = next(line for line in result.output.splitlines() if line.startswith("run_id: ")).removeprefix("run_id: ")
     manifest = json.loads((tmp_path / "runs" / run_id / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["agent_config"]["definition_id"] == "test-agent"
+
+
+def test_cli_auto_grant_capabilities_gates_tool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("hi\n", encoding="utf-8")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "c1"),)),
+            ModelTurn(response_id="r2", final_text="done"),
+        ]
+    )
+    monkeypatch.setattr("native_agent_runner.cli._model_adapter", lambda *_a, **_k: adapter)
+    binding = tool_binding("fs.read", runtime={"requires_lease": True})
+    config_file = tmp_path / "runtime.json"
+    config_file.write_text(
+        json.dumps(runtime_config(bindings=(binding, tool_binding("run.finish"))).to_json()),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "go",
+            "--run-root", str(tmp_path / "runs"), "--runtime-config-file", str(config_file),
+            "--auto-grant-capabilities",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_id = next(line for line in result.output.splitlines() if line.startswith("run_id: ")).removeprefix("run_id: ")
+    events = (tmp_path / "runs" / run_id / "events.jsonl").read_text(encoding="utf-8")
+    assert "capability.granted" in events  # the broker was wired and gated the requires_lease tool
+
+
+def test_cli_capability_flags_are_mutually_exclusive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "native_agent_runner.cli._model_adapter",
+        lambda *_a, **_k: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+    )
+    config_file = _write_config(tmp_path / "runtime.json", "run.finish")
+    result = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "go",
+            "--run-root", str(tmp_path / "runs"), "--runtime-config-file", str(config_file),
+            "--auto-grant-capabilities", "--capability-broker", "x.py:make",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "not both" in result.output
 
 
 def test_cli_spec_file_pairs_with_runtime_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

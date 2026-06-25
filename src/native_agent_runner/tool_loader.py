@@ -26,6 +26,20 @@ def load_tool_provider(spec: str) -> FunctionToolProvider:
     return FunctionToolProvider(func)
 
 
+def load_capability_broker(spec: str) -> object:
+    """Load a ``CapabilityBroker`` from ``path.py:factory`` — ``factory()`` returns the broker.
+    Mirrors :func:`load_tool_provider`. The returned object must implement ``request(req)``."""
+    if ":" not in spec:
+        raise ValueError("--capability-broker must use path.py:factory")
+    path_raw, func_name = spec.rsplit(":", 1)
+    module = _load_module(Path(path_raw))
+    factory = getattr(module, func_name)
+    broker = factory()
+    if not hasattr(broker, "request"):
+        raise ValueError("--capability-broker factory must return an object with a request() method")
+    return broker
+
+
 def _load_module(path: Path) -> ModuleType:
     resolved = path.resolve()
     module_name = f"native_agent_runner_custom_{abs(hash(str(resolved)))}"
