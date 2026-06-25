@@ -956,13 +956,21 @@ class TaskManager:
 
     def report_result(self, task_id: str, result: dict[str, Any], *, status: str = "answered") -> dict[str, Any]:
         """External completion entry for hosted tasks (hitl/automation): set the
-        terminal status/result and publish it through the shared reentry pipe."""
+        terminal status/result and publish it through the shared reentry pipe.
+
+        Idempotent — first report wins. A duplicate report (a callback retry) is a safe no-op: it
+        neither clobbers the recorded result nor re-publishes to the reentry queue (which would make
+        the agent observe the result twice). The dedup signal is the already-persisted+rehydrated
+        ``ready_for_reentry``/``finished_at`` job state, so it holds across a restart with no extra
+        bookkeeping. Mirrors the inbox's dedup-by-id (effectively-once result ingestion)."""
         task = self.get_job(task_id)
+        if task.ready_for_reentry or task.finished_at is not None:
+            return {"task_id": task_id, "status": task.status, "delivered": False, "duplicate": True}
         task.status = status  # type: ignore[assignment]
         task.finished_at = time.time()
         task.result = result  # type: ignore[attr-defined]
         self.mark_ready(task)
-        return {"task_id": task_id, "status": status, "delivered": True}
+        return {"task_id": task_id, "status": status, "delivered": True, "duplicate": False}
 
     def mark_ready(self, job: BackgroundJob) -> None:
         """Single completion entry: publish a finished task to the reentry queue.

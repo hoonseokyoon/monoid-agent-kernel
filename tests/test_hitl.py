@@ -75,6 +75,29 @@ def test_hitl_request_parks_and_resumes_with_user_message(tmp_path: Path) -> Non
     assert result.status == "completed"
 
 
+def test_report_result_is_idempotent_first_report_wins(tmp_path: Path) -> None:
+    # A duplicate hosted-task result report (e.g. a callback retry) must be a safe no-op: it neither
+    # clobbers the recorded result nor re-publishes to the reentry queue (which would make the agent
+    # observe the result twice). Mirrors the inbox's dedup-by-id.
+    loop = _build_loop(tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")]))
+    loop.open()
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    task = manager.start_task("hitl", {"prompt": "Pick a name"})
+
+    first = manager.report_result(task.job_id, {"answer": "Ada"})
+    assert first["delivered"] is True and first["duplicate"] is False
+    assert manager._reentry_queue.count(task.job_id) == 1
+    assert task.result == {"answer": "Ada"} and task.status == "answered"
+
+    # Re-report with a different (stale) result: rejected as a duplicate, state unchanged.
+    second = manager.report_result(task.job_id, {"answer": "STALE"}, status="answered")
+    assert second["delivered"] is False and second["duplicate"] is True
+    assert task.result == {"answer": "Ada"}  # not clobbered
+    assert manager._reentry_queue.count(task.job_id) == 1  # no double reentry
+
+    loop.close()
+
+
 def test_hitl_answer_can_be_delivered_as_tool_result(tmp_path: Path) -> None:
     # Flip the injector to deliver the answer as a tool result instead of a user
     # message (both shapes are supported; the backend chooses per kind).

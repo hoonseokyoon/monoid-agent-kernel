@@ -424,8 +424,14 @@ edge/transport contract — the reference `RunnerBackend` wraps inbound content 
   mints one. HTTP `POST /v1/runs/{id}/messages` accepts optional `message_id`/`source`/
   `correlation_id`; a control `send_message` uses the command's `command_id` as the dedup key.
 - Back-compat: the queue/checkpoint carry envelopes (JSON dicts), but legacy raw `str`/`list`
-  entries from older checkpoints still restore and process. The **outbox** (`outbox-request.v1`,
-  capability-gated external sends) and `report_task_result` idempotency are deferred follow-ups.
+  entries from older checkpoints still restore and process.
+- **Symmetric dedup on result ingestion**: `TaskManager.report_result` (the hosted-task result
+  callback) is idempotent the same way — **first report wins**. A duplicate report (a callback
+  retry) is a safe no-op that neither clobbers the recorded result nor re-publishes to the reentry
+  queue (which would make the agent observe the result twice). The dedup signal is the
+  already-persisted+rehydrated `ready_for_reentry`/`finished_at` job state, so it holds across a
+  restart with no extra bookkeeping; the result dict carries a `duplicate` flag. (A sequence/CAS to
+  let a genuinely *newer* report supersede an older one is a deferred refinement.)
 
 ### Outbox Request
 
