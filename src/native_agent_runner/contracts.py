@@ -55,6 +55,18 @@ from native_agent_runner.core.control import (
     ControlResult,
 )
 
+# Capability request/lease (scoped, short-lived access; secrets stay outside the core)
+from native_agent_runner.core.capability import (
+    CAPABILITY_LEASE_VERSION,
+    CAPABILITY_REQUEST_VERSION,
+    AutoGrantBroker,
+    CapabilityBroker,
+    CapabilityDenial,
+    CapabilityLease,
+    CapabilityRequest,
+    CapabilityVault,
+)
+
 # Context providers (pluggable static + per-turn system context)
 from native_agent_runner.core.context import ContextProvider, TurnContext
 from native_agent_runner.core.agents import (
@@ -188,6 +200,15 @@ __all__ = [
     "ControlCommandType",
     "ControlResult",
     "ControlDispatcher",
+    # capability request/lease
+    "CAPABILITY_REQUEST_VERSION",
+    "CAPABILITY_LEASE_VERSION",
+    "CapabilityRequest",
+    "CapabilityLease",
+    "CapabilityDenial",
+    "CapabilityBroker",
+    "CapabilityVault",
+    "AutoGrantBroker",
     # context providers
     "AgentDefinition",
     "AgentRuntimeConfig",

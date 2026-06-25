@@ -402,9 +402,33 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
   envelope stays credential-free). `resume` on a *live* paused run wakes it; on a run not in
   memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
-- `resolve_capability` rides the hosted-task seam: a `capability` task kind parks a run awaiting an
-  external grant (a credential lease / tool-enable decision) and is resolved through the same
-  `report_task_result` -> reentry path as hitl/automation.
+### Capability Request / Lease
+
+Secrets stay outside the core. When a tool needs external access it carries a *capability*
+requirement, and the loop acquires a scoped, expiring **lease** from a broker before running it —
+generalizing the gateway-token pattern (LLM/web access already keep the provider key behind a
+gateway) into one contract any capability can use, acquired on-demand rather than only
+statically provisioned.
+
+- `CapabilityRequest` (`...capability-request.v1`) / `CapabilityLease` (`...capability-lease.v1`) /
+  `CapabilityDenial` are plain data. A lease carries a `token_ref` **handle, never the secret** —
+  the gateway/tool edge resolves it, not the core.
+- `CapabilityBroker.request(req) -> CapabilityLease | CapabilityDenial` is the seam an integrator
+  (Daemon/Cell) implements. `AutoGrantBroker` is the zero-config dev default; the reference
+  `GatewayCapabilityBroker` mints a scoped gateway token as the lease handle (the "absorb the
+  gateway" path); `DenyAllBroker` is the safe default.
+- **Implicit, binding-declared**: a `ToolBinding` with `runtime.requires_lease` declares its tool's
+  `capability` needs a lease; the agent just calls the tool. `AgentLoop(capability_broker=...)`
+  gates the call: a cache miss requests a lease (scoped to the binding) and on grant proceeds; a
+  denial raises so the call never runs and the model gets an actionable error. Events
+  `capability.requested` / `capability.granted` / `capability.denied` give the audit trail.
+- **Security invariants the core enforces**: a grant may only NARROW the requested scope, never
+  widen it (`CapabilityVault.admit` is fail-closed); a lease is expiry-checked before reuse; the
+  per-run vault holds handles only and is NOT checkpointed — on restart leases are re-brokered, so
+  no stale handle survives on disk.
+- A `capability` hosted-task kind also exists, so a broker can park the run awaiting an external
+  grant (human/policy escalation) and resolve it through the same `report_task_result` -> reentry
+  path as hitl/automation.
 
 ### Permission Boundary
 

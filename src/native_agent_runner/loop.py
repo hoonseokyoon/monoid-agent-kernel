@@ -92,6 +92,12 @@ from native_agent_runner.errors import (
     TurnPaused,
     error_code_for_exception,
 )
+from native_agent_runner.core.capability import (
+    CapabilityBroker,
+    CapabilityDenial,
+    CapabilityRequest,
+    CapabilityVault,
+)
 from native_agent_runner.tasks import (
     HostedResultInjector,
     HostedTask,
@@ -502,6 +508,10 @@ class AgentLoop:
     # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
     # Defaults to a local-fs store under the run root; a backend injects a durable one.
     checkpoint_store: CheckpointStore | None = None
+    # Optional capability broker: when set, a bound tool that declares ``runtime.requires_lease``
+    # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
+    # Secrets stay in the broker; the core only gates on the lease. None = capability gating off.
+    capability_broker: CapabilityBroker | None = None
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
@@ -527,6 +537,9 @@ class AgentLoop:
     # later ``run_until_suspended(None)`` re-pump continues it. Bare one-way flag (CPython-atomic,
     # mirroring ``_interrupt_requested``). Cleared at the start of each new user submit.
     _pause_requested: bool = field(default=False, init=False, repr=False)
+    # Per-run cache of granted capability leases (handles only, never secrets). Deliberately not
+    # checkpointed — on restore leases are re-brokered, so a stale handle never survives on disk.
+    _capability_vault: CapabilityVault = field(default_factory=CapabilityVault, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
@@ -2904,6 +2917,7 @@ class AgentLoop:
                 ToolRegistry().validate_args(spec, arguments)
                 self._check_tool_surface_scope(spec, arguments, authorization)
                 self._check_permissions(bound_tool.base_spec, arguments)
+                self._ensure_capability_lease(bound_tool, recorder, started_event, turn_id)
                 call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
                 result = self._invoke_handler(
                     bound_tool,
@@ -2967,6 +2981,92 @@ class AgentLoop:
             step=step,
             turn_id=turn_id,
             parent_id=parent_id,
+        )
+
+    def _ensure_capability_lease(
+        self,
+        bound_tool: BoundTool,
+        recorder: AgentRecorder,
+        started_event: AgentEvent | None,
+        turn_id: str,
+    ) -> None:
+        """Gate a tool call on a capability lease. A no-op unless a broker is configured AND the
+        binding declares ``runtime.requires_lease``. On a cache miss the loop asks the broker for a
+        lease scoped to the binding; a denial (or a scope-widening grant) raises ``PermissionDenied``
+        so the call never runs. Secrets never enter the core — the lease carries only a handle."""
+        broker = self.capability_broker
+        runtime = bound_tool.binding.runtime or {}
+        if broker is None or not runtime.get("requires_lease"):
+            return
+        capability = bound_tool.base_spec.capability
+        if not capability:
+            return
+        scope = {key: value for key, value in bound_tool.binding.scope.to_json().items() if value}
+        now = time.time()
+        if self._capability_vault.get_valid(capability, scope, now=now) is not None:
+            return  # a valid, scope-covering lease is already cached for this run
+        binding_id = bound_tool.binding_id
+        parent_id = started_event.event_id if started_event else None
+        request = CapabilityRequest(
+            capability=capability,
+            scope=scope,
+            run_id=self.spec.run_id,
+            binding_id=binding_id,
+            reason=str(runtime.get("capability_reason") or ""),
+        )
+        recorder.emit(
+            "capability.requested",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data={
+                "capability": capability,
+                "binding_id": binding_id,
+                "request_id": request.request_id,
+                "scope": scope,
+                "reason": request.reason,
+            },
+        )
+        grant = broker.request(request)
+        if isinstance(grant, CapabilityDenial):
+            recorder.emit(
+                "capability.denied",
+                turn_id=turn_id,
+                parent_id=parent_id,
+                level="warning",
+                data={
+                    "capability": capability,
+                    "binding_id": binding_id,
+                    "reason": grant.reason,
+                    "retryable": grant.retryable,
+                },
+            )
+            raise PermissionDenied(
+                f"capability denied: {capability}: {grant.reason}", error_code="capability_denied"
+            )
+        try:
+            lease = self._capability_vault.admit(request, grant)
+        except ValueError as exc:
+            recorder.emit(
+                "capability.denied",
+                turn_id=turn_id,
+                parent_id=parent_id,
+                level="warning",
+                data={"capability": capability, "binding_id": binding_id, "reason": str(exc)},
+            )
+            raise PermissionDenied(
+                f"capability grant rejected: {exc}", error_code="capability_scope_widened"
+            ) from exc
+        recorder.emit(
+            "capability.granted",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data={
+                "capability": capability,
+                "binding_id": binding_id,
+                "lease_id": lease.lease_id,
+                "expires_at": lease.expires_at,
+                "scope": lease.scope,
+            },
         )
 
     def _check_run_boundary(self, deadline: float | None) -> None:
