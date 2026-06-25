@@ -17,6 +17,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from native_agent_runner.core.outbox import OutboxReceipt, OutboxRequest
+from native_agent_runner.core.trace_context import child_traceparent
 from native_agent_runner.tools.base import ToolContext, ToolResult, ToolSpec
 
 OUTBOX_SEND_CAPABILITY = "outbox.send"
@@ -29,9 +30,13 @@ class RecordingOutboxSender:
     never a secret, which the core never held."""
 
     sent: list[OutboxRequest] = field(default_factory=list)
+    # The child span this sender would attach to each outbound call — derived from the request's
+    # traceparent so the dispatch is a child of the staged request's trace. Recorded for assertions.
+    child_traceparents: list[str] = field(default_factory=list)
 
     def send(self, request: OutboxRequest) -> OutboxReceipt:
         self.sent.append(request)
+        self.child_traceparents.append(child_traceparent(request.traceparent))
         return OutboxReceipt(ok=True, reference=f"recorded:{request.id}")
 
 

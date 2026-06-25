@@ -128,6 +128,17 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(tmp_path: Path)
     dispatched = [e for e in events if e["type"] == "outbox.dispatched"]
     assert dispatched and dispatched[0]["data"]["destination"] == "email"
 
+    # The request carried a W3C trace from staging; the dispatched event surfaces it, and the edge
+    # sender attached a *child* span (same trace-id, new span-id) for the actual outbound call.
+    from native_agent_runner.core.trace_context import parse_traceparent
+
+    tp = sender.sent[0].traceparent
+    assert parse_traceparent(tp) is not None
+    assert dispatched[0]["data"]["traceparent"] == tp
+    child = parse_traceparent(sender.child_traceparents[0])
+    assert child is not None and child["trace_id"] == parse_traceparent(tp)["trace_id"]
+    assert child["span_id"] != parse_traceparent(tp)["span_id"]
+
 
 def test_outbox_not_staged_when_capability_denied(tmp_path: Path) -> None:
     from native_agent_runner.reference.capability import DenyAllBroker

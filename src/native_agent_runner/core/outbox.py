@@ -43,6 +43,10 @@ class OutboxRequest:
     idempotency_key: str = ""
     correlation_id: str = ""
     causation_id: str = ""
+    # W3C Trace Context (observability only; see core/trace_context.py). Empty until the edge stamps
+    # a trace at dispatch; complements correlation/causation, never drives behavior.
+    traceparent: str = ""
+    tracestate: str = ""
     created_at: float = field(default_factory=time.time)
     status: OutboxStatus = "pending"
     attempts: int = 0
@@ -62,6 +66,8 @@ class OutboxRequest:
             "idempotency_key": self.idempotency_key or self.id,
             "correlation_id": self.correlation_id or self.id,
             "causation_id": self.causation_id,
+            "traceparent": self.traceparent,
+            "tracestate": self.tracestate,
             "created_at": self.created_at,
             "status": self.status,
             "attempts": self.attempts,
@@ -80,6 +86,8 @@ class OutboxRequest:
             "idempotency_key": str(payload.get("idempotency_key") or ""),
             "correlation_id": str(payload.get("correlation_id") or ""),
             "causation_id": str(payload.get("causation_id") or ""),
+            "traceparent": str(payload.get("traceparent") or ""),
+            "tracestate": str(payload.get("tracestate") or ""),
             "created_at": float(payload.get("created_at") or 0.0),
             "status": str(payload.get("status") or "pending"),  # type: ignore[arg-type]
             "attempts": int(payload.get("attempts") or 0),

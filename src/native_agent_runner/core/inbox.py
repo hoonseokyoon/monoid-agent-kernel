@@ -42,6 +42,10 @@ class InboxMessage:
     created_at: float = field(default_factory=time.time)
     correlation_id: str = ""
     causation_id: str = ""
+    # W3C Trace Context (observability only; never drives behavior). Complements correlation/causation
+    # — see core/trace_context.py. Empty when the caller propagated no trace.
+    traceparent: str = ""
+    tracestate: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
@@ -55,6 +59,8 @@ class InboxMessage:
             # An empty correlation defaults to this message's own id — it is the root of a flow.
             "correlation_id": self.correlation_id or self.id,
             "causation_id": self.causation_id,
+            "traceparent": self.traceparent,
+            "tracestate": self.tracestate,
             "metadata": dict(self.metadata),
             "content": self.content,
         }
@@ -69,6 +75,8 @@ class InboxMessage:
             "created_at": float(payload.get("created_at") or 0.0),
             "correlation_id": str(payload.get("correlation_id") or ""),
             "causation_id": str(payload.get("causation_id") or ""),
+            "traceparent": str(payload.get("traceparent") or ""),
+            "tracestate": str(payload.get("tracestate") or ""),
             "metadata": dict(payload.get("metadata") or {}),
         }
         if payload.get("id"):

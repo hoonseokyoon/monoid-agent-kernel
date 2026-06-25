@@ -410,10 +410,12 @@ edge/transport contract — the reference `RunnerBackend` wraps inbound content 
 (`AgentLoop`) never sees the envelope (it still receives unwrapped `content` via `submit`).
 
 - Fields (CloudEvents-shaped): `id` (the dedup key), `source`, `type`, `run_id`, `created_at`,
-  `correlation_id` (defaults to `id` — a flow root), `causation_id`, `content` (the JSON-native
-  payload: a `str` or a list of content-part dicts), `metadata`. `is_inbox_envelope(obj)`
-  discriminates an envelope from a legacy raw `str`/`list` queue entry.
-- **Idempotent ingress**: `RunnerBackend.send_message(..., message_id=, source=, correlation_id=)`
+  `correlation_id` (defaults to `id` — a flow root), `causation_id`, `traceparent`/`tracestate`
+  (W3C Trace Context; see below), `content` (the JSON-native payload: a `str` or a list of
+  content-part dicts), `metadata`. `is_inbox_envelope(obj)` discriminates an envelope from a legacy
+  raw `str`/`list` queue entry.
+- **Idempotent ingress**: `RunnerBackend.send_message(..., message_id=, source=, correlation_id=,
+  traceparent=, tracestate=)`
   wraps + enqueues the envelope. A caller-supplied `message_id` makes the send idempotent — an
   already-processed id short-circuits to `status="duplicate"`, and a redelivery still in flight is
   dropped at dequeue. Processed ids are tracked per-run and **checkpointed** (`RunCheckpoint
@@ -447,9 +449,30 @@ pattern with the checkpoint as the transaction; the engine never performs the se
   honors. A retryable failure stays `pending` and redrives up to `outbox_max_attempts`, then
   dead-letters as `failed`. No sender → requests stay durably `pending`.
 - Reference `reference/outbox.py`: `RecordingOutboxSender` (dev/tests), `FailingOutboxSender`
-  (retry-path tests), and an `OutboxToolProvider` yielding a generic `outbox.send` tool. **Scope is
-  fire-and-forget + events** — ack-back to the agent (request-reply via inbox correlation), a
-  backoff scheduler, and per-destination routing are deferred.
+  (retry-path tests), and an `OutboxToolProvider` yielding a generic `outbox.send` tool.
+- A request also carries `traceparent`/`tracestate` (W3C Trace Context; see below) and
+  `correlation_id`/`causation_id` (the request↔result link reused by ack-back). Per-destination
+  routing is deferred.
+
+### Trace Context on envelopes (`traceparent` / `tracestate`)
+
+Both envelopes carry optional W3C Trace Context (`core/trace_context.py`): `traceparent`
+(`00-{trace-id}-{span-id}-{flags}`) and the opaque vendor `tracestate`. This is **observability
+only** — it complements `correlation_id`/`causation_id` (the domain identity routing and
+reply-matching depend on) and **application behavior never depends on it**; a missing or malformed
+header is ignored.
+
+- Helpers: `new_traceparent()` (fresh root), `child_traceparent(parent)` (same trace-id, new
+  span-id), `parse_traceparent(s)` (validates shape, rejects all-zero ids, returns `None` on
+  garbage), `trace_id_of(s)`.
+- **Inbox (ingress)**: `send_message(..., traceparent=, tracestate=)` propagates an inbound trace
+  onto the envelope. The engine unwraps the envelope before `submit`, so an outbox request can't
+  auto-inherit the *causing* inbox message's trace inside the core — a fresh root is minted instead
+  (cross-loop inheritance is a later edge enhancement).
+- **Outbox (egress)**: `emit_outbox` stamps a fresh root `traceparent` at staging (pure, no IO) so
+  the request is traced from birth; the edge sender derives a `child_traceparent` for the actual
+  outbound call. The trace rides the `outbox.requested`/`outbox.dispatched`/`outbox.failed` events so
+  the OTel event-sink mapper can stitch spans across a restart.
 
 ### Capability Request / Lease
 

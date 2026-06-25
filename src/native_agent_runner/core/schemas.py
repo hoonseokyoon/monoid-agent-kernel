@@ -290,15 +290,15 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         required=("capability",),
     ),
     "outbox.requested": _data_schema(
-        {"request_id": _STR, "destination": _STR, "capability": _STR},
+        {"request_id": _STR, "destination": _STR, "capability": _STR, "traceparent": _STR},
         required=("request_id",),
     ),
     "outbox.dispatched": _data_schema(
-        {"request_id": _STR, "destination": _STR, "reference": _STR, "attempts": _NUM},
+        {"request_id": _STR, "destination": _STR, "reference": _STR, "attempts": _NUM, "traceparent": _STR},
         required=("request_id",),
     ),
     "outbox.failed": _data_schema(
-        {"request_id": _STR, "destination": _STR, "reason": _STR, "attempts": _NUM},
+        {"request_id": _STR, "destination": _STR, "reason": _STR, "attempts": _NUM, "traceparent": _STR},
         required=("request_id",),
     ),
     "workspace.file.read": _data_schema(

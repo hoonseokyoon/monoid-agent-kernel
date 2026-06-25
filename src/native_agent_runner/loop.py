@@ -101,6 +101,7 @@ from native_agent_runner.core.capability import (
     CapabilityVault,
 )
 from native_agent_runner.core.outbox import Outbox, OutboxReceipt, OutboxRequest
+from native_agent_runner.core.trace_context import new_traceparent
 from native_agent_runner.tasks import (
     HostedResultInjector,
     HostedTask,
@@ -414,13 +415,21 @@ class AgentToolContext(ToolContext):
             token_ref=self.capability_token(capability) or "" if capability else "",
             run_id=self.run_id,
             idempotency_key=idempotency_key,
+            # A fresh root trace at staging (pure, no IO): the request carries an id from birth, the
+            # edge derives a child span for the actual send. Observability only — never gates anything.
+            traceparent=new_traceparent(),
         )
         self.outbox.append(request)
         self.recorder.emit(
             "outbox.requested",
             turn_id=call.turn_id,
             parent_id=call.tool_event_id,
-            data={"request_id": request.id, "destination": destination, "capability": capability},
+            data={
+                "request_id": request.id,
+                "destination": destination,
+                "capability": capability,
+                "traceparent": request.traceparent,
+            },
         )
         return {"status": "staged", "request_id": request.id}
 
@@ -806,6 +815,7 @@ class AgentLoop:
                         "destination": request.destination,
                         "reference": receipt.reference,
                         "attempts": attempts,
+                        "traceparent": request.traceparent,
                     },
                 )
             return "dispatched"
@@ -822,6 +832,7 @@ class AgentLoop:
                     "destination": request.destination,
                     "reason": receipt.error,
                     "attempts": attempts,
+                    "traceparent": request.traceparent,
                 },
             )
         return "failed"

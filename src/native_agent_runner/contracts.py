@@ -70,6 +70,14 @@ from native_agent_runner.core.outbox import (
     OutboxSender,
 )
 
+# W3C Trace Context helpers (observability metadata carried on the envelopes)
+from native_agent_runner.core.trace_context import (
+    child_traceparent,
+    new_traceparent,
+    parse_traceparent,
+    trace_id_of,
+)
+
 # Capability request/lease (scoped, short-lived access; secrets stay outside the core)
 from native_agent_runner.core.capability import (
     CAPABILITY_LEASE_VERSION,
@@ -223,6 +231,11 @@ __all__ = [
     "OutboxRequest",
     "OutboxReceipt",
     "OutboxSender",
+    # W3C Trace Context helpers
+    "parse_traceparent",
+    "new_traceparent",
+    "child_traceparent",
+    "trace_id_of",
     "ControlResult",
     "ControlDispatcher",
     # capability request/lease

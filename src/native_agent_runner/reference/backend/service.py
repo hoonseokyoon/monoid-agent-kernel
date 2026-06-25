@@ -28,6 +28,7 @@ from native_agent_runner.core.control import ControlCommand, ControlResult
 from native_agent_runner.core.events import AgentEvent
 from native_agent_runner.core.inbox import InboxMessage, is_inbox_envelope
 from native_agent_runner.core.outbox import OutboxReceipt
+from native_agent_runner.core.trace_context import new_traceparent
 from native_agent_runner.core.lifecycle import (
     LoopSession,
     SessionState,
@@ -1100,6 +1101,8 @@ class RunnerBackend:
         source: str = "api",
         correlation_id: str = "",
         causation_id: str = "",
+        traceparent: str = "",
+        tracestate: str = "",
     ) -> dict[str, Any]:
         """Deliver a follow-up user message to a running multi-turn session. It is queued and
         consumed as the next user turn once the current turn settles.
@@ -1139,6 +1142,8 @@ class RunnerBackend:
             run_id=run_id,
             correlation_id=correlation_id,
             causation_id=causation_id,
+            traceparent=traceparent,
+            tracestate=tracestate,
         )
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
@@ -1795,6 +1800,10 @@ class RunnerBackend:
             return
         changed = False
         for request in pending:
+            # Ensure the request carries a trace before the edge sends it (requests staged via the
+            # outbox tool already have one; this covers any other path). Observability only.
+            if not request.traceparent:
+                request.traceparent = new_traceparent()
             try:
                 receipt = sender.send(request)
             except Exception as exc:  # a sender raising is a retryable transport failure
