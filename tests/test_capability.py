@@ -206,9 +206,11 @@ def test_loop_caches_lease_across_calls(tmp_path: Path) -> None:
 def test_gateway_broker_mints_verifiable_token() -> None:
     token_manager = TokenManager.from_secret("x" * 32)
     broker = GatewayCapabilityBroker(token_manager=token_manager, tenant_id="t", user_id="u")
+    # A generic (non-gateway-mapped) capability mints a "capability"-kind token. (web.* is mapped to
+    # the web gateway — see test_gateway_broker_mints_web_gateway_token_for_web_capabilities.)
     lease = broker.request(
         CapabilityRequest(
-            capability="web.search", scope={"allowed_domains": ["a.edu"]}, run_id="run_1", ttl_seconds=300
+            capability="email.send", scope={"to": ["x@example.edu"]}, run_id="run_1", ttl_seconds=300
         )
     )
     assert isinstance(lease, CapabilityLease)
@@ -216,7 +218,7 @@ def test_gateway_broker_mints_verifiable_token() -> None:
     claims = token_manager.verify(
         lease.token_ref, kind="capability", audience="csp.capability-gateway", run_id="run_1"
     )
-    assert claims.metadata["capability"] == "web.search"
+    assert claims.metadata["capability"] == "email.send"
 
 
 # --- B: human-escalation (async approval) -------------------------------------------------
@@ -652,3 +654,104 @@ def test_loop_default_skew_does_not_rotate(tmp_path: Path) -> None:
     assert provider.calls == 2
     assert broker.requests == 1  # cached, no rotation
     assert not any(e["type"] == "capability.rotated" for e in _events(result.run_dir))
+
+
+# --- web capability routing (Phase A): web tools pull a lease token via the gate ----------
+
+
+class _RecordingWebClient:
+    """A duck-typed WebGatewayClient that records the per-call credential it was handed."""
+
+    def __init__(self) -> None:
+        self.tokens: list[str | None] = []
+
+    def search(self, payload: dict, *, token: str | None = None) -> dict:
+        self.tokens.append(token)
+        return {"results": [], "result_count": 0}
+
+
+def _web_loop(
+    tmp_path: Path,
+    client: object,
+    broker: object | None,
+    *,
+    requires_lease: bool,
+    turns: list[ModelTurn] | None = None,
+) -> AgentLoop:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    runtime = {"requires_lease": True} if requires_lease else {}
+    binding = tool_binding("web.search", runtime=runtime, scope=ToolScope(allowed_domains=("a.edu",)))
+    turns = turns or [
+        ModelTurn(response_id="r1", tool_calls=(fake_tool_call("web_search", {"query": "hi"}, "c1"),)),
+        ModelTurn(response_id="rN", final_text="done"),
+    ]
+    return AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(turns=turns),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=(binding,))),
+        web_gateway_client=client,  # type: ignore[arg-type]
+        capability_broker=broker,  # type: ignore[arg-type]
+    )
+
+
+def test_web_tool_uses_lease_token_when_required(tmp_path: Path) -> None:
+    client = _RecordingWebClient()
+    loop = _web_loop(tmp_path, client, AutoGrantBroker(), requires_lease=True)
+    result = loop.run_once("go")
+    assert result.status == "completed"
+    # The gate brokered a web.search lease; its handle (not the static credential) reached the client.
+    assert client.tokens == ["auto:web.search"]
+
+
+def test_web_tool_falls_back_to_static_credential_when_not_gated(tmp_path: Path) -> None:
+    client = _RecordingWebClient()
+    # No requires_lease, no broker -> no lease; the per-call override is None and the client uses
+    # its own static credential (back-compat).
+    loop = _web_loop(tmp_path, client, None, requires_lease=False)
+    result = loop.run_once("go")
+    assert result.status == "completed"
+    assert client.tokens == [None]
+
+
+def test_gateway_broker_mints_web_gateway_token_for_web_capabilities() -> None:
+    manager = TokenManager.from_secret("x" * 32)
+    broker = GatewayCapabilityBroker(token_manager=manager, tenant_id="t", user_id="u")
+    web = broker.request(CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]}, run_id="run_1"))
+    assert isinstance(web, CapabilityLease)
+    # The web lease's token_ref IS a web-gateway token the existing web gateway already accepts.
+    claims = manager.verify(web.token_ref, kind="web_gateway", audience="csp.web-gateway", run_id="run_1")
+    assert claims.metadata["capability"] == "web.search"
+    # A non-web capability still mints the generic capability-kind token.
+    other = broker.request(CapabilityRequest(capability="email.send", run_id="run_1"))
+    assert isinstance(other, CapabilityLease)
+    manager.verify(other.token_ref, kind="capability", audience="csp.capability-gateway", run_id="run_1")
+
+
+def test_web_access_can_be_revoked_mid_run(tmp_path: Path) -> None:
+    # The headline payoff: routing web through the capability gate means an operator can kill web
+    # access on a live run (without cancelling it) — web inherits revocation for free.
+    client = _RecordingWebClient()
+    loop = _web_loop(
+        tmp_path,
+        client,
+        AutoGrantBroker(),
+        requires_lease=True,
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("web_search", {"query": "a"}, "c1"),)),
+            ModelTurn(response_id="rw", final_text="first"),
+            ModelTurn(response_id="r2", tool_calls=(fake_tool_call("web_search", {"query": "b"}, "c2"),)),
+            ModelTurn(response_id="rd", final_text="second"),
+        ],
+    )
+    loop.open()
+    first = loop.run_until_suspended("go")
+    assert first.reason == "settled"
+    assert client.tokens == ["auto:web.search"]  # web ran on the lease
+
+    loop.revoke_capability(capability="web.search")  # operator kills web access
+
+    second = loop.run_until_suspended("again")
+    assert second.reason == "settled"
+    assert client.tokens == ["auto:web.search"]  # the 2nd web call was refused at the gate (no new call)
+    loop.close()

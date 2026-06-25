@@ -31,23 +31,23 @@ class WebGatewayClient:
     token_env: str = DEFAULT_WEB_GATEWAY_TOKEN_ENV
     token_file: Path | None = None
 
-    def search(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/internal/web/search", payload)
+    def search(self, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
+        return self._post("/internal/web/search", payload, token=token)
 
-    def fetch(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/internal/web/fetch", payload)
+    def fetch(self, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
+        return self._post("/internal/web/fetch", payload, token=token)
 
-    def context(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/internal/web/context", payload)
+    def context(self, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
+        return self._post("/internal/web/context", payload, token=token)
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, path: str, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
         url = f"{self.gateway_url.rstrip('/')}{path}"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         timeout_s = payload.get("timeout_s") or 30
         attempts = 3
         last_error: WebGatewayError | None = None
         for attempt in range(attempts):
-            request = Request(url, data=body, headers=self._headers(), method="POST")
+            request = Request(url, data=body, headers=self._headers(token), method="POST")
             try:
                 with urlopen(request, timeout=timeout_s) as response:
                     return _decode_json(response.read())
@@ -69,15 +69,17 @@ class WebGatewayClient:
         assert last_error is not None
         raise last_error
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, token: str | None = None) -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": "native-agent-runner/0.11",
         }
-        token = self._resolve_token()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        # A per-call capability lease handle (when web tools are routed through the capability gate)
+        # overrides the static run-start credential; otherwise fall back to the configured token.
+        resolved = token if token is not None else self._resolve_token()
+        if resolved:
+            headers["Authorization"] = f"Bearer {resolved}"
         return headers
 
     def _resolve_token(self) -> str | None:

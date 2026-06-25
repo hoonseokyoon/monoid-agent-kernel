@@ -14,7 +14,7 @@ examples, not part of the supported surface (like the other `reference.*` servic
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from native_agent_runner.core.capability import (
     CapabilityDenial,
@@ -23,7 +23,17 @@ from native_agent_runner.core.capability import (
     CapabilityPending,
     CapabilityRequest,
 )
-from native_agent_runner.reference._shared.tokens import TokenManager
+from native_agent_runner.reference._shared.tokens import TokenKind, TokenManager
+
+# Capabilities whose lease token must be accepted by an EXISTING gateway (not the generic capability
+# gateway): the runner's web tools post to the web gateway, which verifies a ``web_gateway``/``csp.web-
+# gateway`` token. Minting that exact token as the lease handle is the "the gateway token IS a
+# capability lease" absorption, made concrete — the web path needs no separate credential.
+_GATEWAY_TOKEN_KINDS: dict[str, tuple[TokenKind, str]] = {
+    "web.search": ("web_gateway", "csp.web-gateway"),
+    "web.fetch": ("web_gateway", "csp.web-gateway"),
+    "web.context": ("web_gateway", "csp.web-gateway"),
+}
 
 
 @dataclass
@@ -36,12 +46,19 @@ class GatewayCapabilityBroker:
     tenant_id: str
     user_id: str
     audience: str = "csp.capability-gateway"
+    # Per-capability override of the minted token's (kind, audience), so a lease for a capability
+    # backed by an existing gateway (e.g. ``web.*`` -> the web gateway) is a token that gateway
+    # already accepts. Defaults to the web mapping; other capabilities use ``("capability", audience)``.
+    gateway_token_kinds: dict[str, tuple[TokenKind, str]] = field(
+        default_factory=lambda: dict(_GATEWAY_TOKEN_KINDS)
+    )
 
     def request(self, req: CapabilityRequest) -> CapabilityGrant:
         ttl = req.ttl_seconds or 600
+        kind, audience = self.gateway_token_kinds.get(req.capability, ("capability", self.audience))
         token = self.token_manager.issue(
-            kind="capability",
-            audience=self.audience,
+            kind=kind,
+            audience=audience,
             run_id=req.run_id,
             tenant_id=self.tenant_id,
             user_id=self.user_id,

@@ -131,7 +131,7 @@ class WebService:
         )
         return result
 
-    def search(self, args: dict[str, Any], call: CallContext) -> dict[str, Any]:
+    def search(self, args: dict[str, Any], call: CallContext, *, capability_token: str | None = None) -> dict[str, Any]:
         self._check_enabled(
             call=call,
             max_calls=self._max_calls(call, "search", 20),
@@ -183,11 +183,11 @@ class WebService:
             "web.search",
             call,
             event_data=event_data,
-            invoke=lambda: self.web_gateway_client.search(payload),
+            invoke=lambda: self.web_gateway_client.search(payload, token=capability_token),
             on_success=on_success,
         )
 
-    def fetch(self, args: dict[str, Any], call: CallContext) -> dict[str, Any]:
+    def fetch(self, args: dict[str, Any], call: CallContext, *, capability_token: str | None = None) -> dict[str, Any]:
         self._check_enabled(
             call=call,
             max_calls=self._max_calls(call, "fetch", 50),
@@ -249,11 +249,11 @@ class WebService:
             "web.fetch",
             call,
             event_data=event_data,
-            invoke=lambda: self.web_gateway_client.fetch(payload),
+            invoke=lambda: self.web_gateway_client.fetch(payload, token=capability_token),
             on_success=on_success,
         )
 
-    def context(self, args: dict[str, Any], call: CallContext) -> dict[str, Any]:
+    def context(self, args: dict[str, Any], call: CallContext, *, capability_token: str | None = None) -> dict[str, Any]:
         self._check_enabled(
             call=call,
             max_calls=self._max_calls(call, "context", 10),
@@ -335,6 +335,6 @@ class WebService:
             "web.context",
             call,
             event_data=event_data,
-            invoke=lambda: self.web_gateway_client.context(payload),
+            invoke=lambda: self.web_gateway_client.context(payload, token=capability_token),
             on_success=on_success,
         )

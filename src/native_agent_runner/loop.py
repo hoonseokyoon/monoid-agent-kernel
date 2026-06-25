@@ -352,13 +352,13 @@ class AgentToolContext(ToolContext):
         )
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.search(args, self._current_call)
+        return self.web_service.search(args, self._current_call, capability_token=self.capability_token("web.search"))
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.fetch(args, self._current_call)
+        return self.web_service.fetch(args, self._current_call, capability_token=self.capability_token("web.fetch"))
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.context(args, self._current_call)
+        return self.web_service.context(args, self._current_call, capability_token=self.capability_token("web.context"))
 
     def configure_tool_search(self, entries: tuple[ToolSearchEntry, ...], max_results: int) -> None:
         self.tool_search_entries = entries

@@ -468,6 +468,20 @@ statically provisioned.
   ceiling the lease is left to expire (then the normal re-broker / re-escalation path applies). A
   deny/pending/scope-widening rotation leaves the still-valid current lease untouched (no
   in-flight disruption). Emits `capability.rotated`.
+- **Web tools through the gate (opt-in)**: the built-in `web.search` / `web.fetch` / `web.context`
+  tools declare a `capability`; set `runtime.requires_lease` on their binding and the existing gate
+  brokers a lease before each call. The lease handle becomes the request's `Authorization` (threaded
+  context → `WebService` → `WebGatewayClient` as a per-call credential override; absent a lease, the
+  client uses its static run-start token — back-compat). The reference `GatewayCapabilityBroker`
+  mints a **web-gateway-compatible** token (`kind=web_gateway`/`aud=csp.web-gateway`) for `web.*` so
+  the existing web gateway accepts it unchanged. Net effect: web access inherits rotation +
+  revocation (an operator can `revoke_capability("web.search")` to kill a live run's web access
+  without cancelling it). The LLM path is deliberately NOT routed this way.
+- **Gateway model-token refresh** (separate from capabilities): `GatewayModelAdapter.token_provider`
+  is an optional per-request token source; the reference backend wires a source that re-mints the
+  `llm_gateway` token near expiry, so a run outliving the token TTL keeps LLM access without a
+  restart. Default (no provider) is the static token. This is a refresh seam, not capability routing
+  — the LLM hot path stays out of the broker.
 
 ### Permission Boundary
 
