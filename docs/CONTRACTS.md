@@ -425,6 +425,32 @@ edge/transport contract — the reference `RunnerBackend` wraps inbound content 
   entries from older checkpoints still restore and process. The **outbox** (`outbox-request.v1`,
   capability-gated external sends) and `report_task_result` idempotency are deferred follow-ups.
 
+### Outbox Request
+
+`native-agent-runner.outbox-request.v1` (`core/outbox.py`, `OutboxRequest`) is the symmetric half of
+the inbox and the outbound twin of a capability lease: a tool **stages** an external side-effect
+(send an email, call a webhook) durably instead of doing the IO inline. The Transactional-Outbox
+pattern with the checkpoint as the transaction; the engine never performs the send.
+
+- A tool handler calls `ToolContext.emit_outbox(destination, payload, *, capability,
+  idempotency_key="")`; the request is appended to the per-run `Outbox` (checkpointed in full as
+  `RunCheckpoint.outbox_requests`) and `outbox.requested` is emitted. The request carries the
+  capability lease **handle** (`token_ref`, captured via `capability_token(capability)`) — never a
+  secret. Bind the outbox tool with `runtime.requires_lease` so the existing capability gate
+  brokers/revokes the lease *before* the send is staged (least-privilege egress).
+- **Edge drains, effectively-once**: `RunnerBackend(outbox_sender_factory=lambda request: ...)`
+  supplies an `OutboxSender` (`send(request) -> OutboxReceipt`); the backend drains
+  `loop.pending_outbox()` at each park/settle, performing the IO (resolving `token_ref` to the real
+  credential) and recording the outcome via `loop.record_outbox_result(...)` → `outbox.dispatched` /
+  `outbox.failed`. The request is persisted `pending` before the send and `dispatched` after; a
+  crash in between re-dispatches on recover, made safe by the `idempotency_key` the external target
+  honors. A retryable failure stays `pending` and redrives up to `outbox_max_attempts`, then
+  dead-letters as `failed`. No sender → requests stay durably `pending`.
+- Reference `reference/outbox.py`: `RecordingOutboxSender` (dev/tests), `FailingOutboxSender`
+  (retry-path tests), and an `OutboxToolProvider` yielding a generic `outbox.send` tool. **Scope is
+  fire-and-forget + events** — ack-back to the agent (request-reply via inbox correlation), a
+  backoff scheduler, and per-destination routing are deferred.
+
 ### Capability Request / Lease
 
 Secrets stay outside the core. When a tool needs external access it carries a *capability*

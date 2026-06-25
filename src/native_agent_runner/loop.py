@@ -100,6 +100,7 @@ from native_agent_runner.core.capability import (
     CapabilityRequest,
     CapabilityVault,
 )
+from native_agent_runner.core.outbox import Outbox, OutboxReceipt, OutboxRequest
 from native_agent_runner.tasks import (
     HostedResultInjector,
     HostedTask,
@@ -209,6 +210,9 @@ class AgentToolContext(ToolContext):
     # Per-run capability leases (handles only). A tool handler reads ``capability_token`` to get
     # the access handle the gate acquired for its declared capability. None when no broker is set.
     capability_vault: CapabilityVault | None = None
+    # Per-run outbox of staged external sends (handles only). A tool handler calls ``emit_outbox``
+    # to durably stage a side-effect the edge drains later. None when outbox staging is unavailable.
+    outbox: Outbox | None = None
     tool_search_entries: tuple[ToolSearchEntry, ...] = ()
     tool_search_max_results: int = 5
     # Depth of this run in the subagent tree (0 = top-level). Threaded into spawned
@@ -389,6 +393,37 @@ class AgentToolContext(ToolContext):
             return None
         return self.capability_vault.token_for(capability, now=time.time())
 
+    def emit_outbox(
+        self,
+        destination: str,
+        payload: dict[str, Any],
+        *,
+        capability: str = "",
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        """Stage a durable outbound side-effect. Captures the capability lease handle (never the
+        secret) so the edge sender can authenticate, appends the request to the run's outbox (which
+        is checkpointed), and emits ``outbox.requested``. The IO happens later, at the edge."""
+        if self.outbox is None:
+            raise ToolExecutionError("outbox is not available", error_code="outbox_unavailable")
+        call = self._current_call
+        request = OutboxRequest(
+            destination=destination,
+            payload=dict(payload),
+            capability=capability,
+            token_ref=self.capability_token(capability) or "" if capability else "",
+            run_id=self.run_id,
+            idempotency_key=idempotency_key,
+        )
+        self.outbox.append(request)
+        self.recorder.emit(
+            "outbox.requested",
+            turn_id=call.turn_id,
+            parent_id=call.tool_event_id,
+            data={"request_id": request.id, "destination": destination, "capability": capability},
+        )
+        return {"status": "staged", "request_id": request.id}
+
 
 def _observation_message(observation: ToolObservation, media_store: dict[str, bytes]) -> dict[str, Any]:
     """Provider-neutral by-value message for a tool/async observation. Preserves the
@@ -562,6 +597,7 @@ class AgentLoop:
     # Per-run cache of granted capability leases (handles only, never secrets). Deliberately not
     # checkpointed — on restore leases are re-brokered, so a stale handle never survives on disk.
     _capability_vault: CapabilityVault = field(default_factory=CapabilityVault, init=False, repr=False)
+    _outbox: Outbox = field(default_factory=Outbox, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
@@ -740,6 +776,55 @@ class AgentLoop:
         return self._capability_vault.revoke(
             capability=capability, lease_id=lease_id, before=before
         )
+
+    def pending_outbox(self) -> list[OutboxRequest]:
+        """Staged outbox requests awaiting (re)dispatch — the edge drains these between turns and
+        reports each outcome via :meth:`record_outbox_result`. The core never performs the send."""
+        return self._outbox.pending()
+
+    def record_outbox_result(
+        self, request_id: str, receipt: OutboxReceipt, *, max_attempts: int = 5
+    ) -> str:
+        """Record an edge sender's outcome for a staged request and emit the lifecycle event.
+        Returns the new status. A retryable failure keeps the request ``pending`` (redispatched next
+        drain) until ``max_attempts`` attempts, then dead-letters it as ``failed``; a non-retryable
+        failure fails immediately. The ``idempotency_key`` makes the (at-least-once) redispatch safe."""
+        request = self._outbox.get(request_id)
+        if request is None:
+            return ""
+        attempts = request.attempts + 1
+        recorder = self._session.res.recorder if self._session is not None else None
+        if receipt.ok:
+            self._outbox.mark(
+                request_id, status="dispatched", attempts=attempts, reference=receipt.reference
+            )
+            if recorder is not None:
+                recorder.emit(
+                    "outbox.dispatched",
+                    data={
+                        "request_id": request_id,
+                        "destination": request.destination,
+                        "reference": receipt.reference,
+                        "attempts": attempts,
+                    },
+                )
+            return "dispatched"
+        if receipt.retryable and attempts < max_attempts:
+            self._outbox.mark(request_id, status="pending", attempts=attempts, error=receipt.error)
+            return "pending"
+        self._outbox.mark(request_id, status="failed", attempts=attempts, error=receipt.error)
+        if recorder is not None:
+            recorder.emit(
+                "outbox.failed",
+                level="warning",
+                data={
+                    "request_id": request_id,
+                    "destination": request.destination,
+                    "reason": receipt.error,
+                    "attempts": attempts,
+                },
+            )
+        return "failed"
 
     async def arun_until_suspended(
         self, user_input: str | tuple[ContentPart, ...] | None = None
@@ -1245,6 +1330,7 @@ class AgentLoop:
             ),
             # Durable (approved) capability leases — handles only — so a restart does not re-prompt.
             capability_leases=self._capability_vault.export_durable(),
+            outbox_requests=self._outbox.export(),
             pending_capability_replays=[dict(replay) for replay in state.pending_capability_replays],
             # Revocation records so a revoked capability stays dead across the restart.
             **self._capability_vault.export_revocations(),
@@ -1382,6 +1468,9 @@ class AgentLoop:
         # re-prompted after a restart. Ephemeral sync grants were never persisted; they re-broker.
         for lease_payload in cp.capability_leases:
             self._capability_vault.install(CapabilityLease.from_json(lease_payload))
+        # Rehydrate staged outbox requests so a pending send survives the restart (the edge
+        # re-dispatches it; the idempotency_key guards against a double-send).
+        self._outbox.import_(cp.outbox_requests)
         # Restore revocation records so a capability revoked before the restart stays dead.
         self._capability_vault.import_revocations(
             lease_ids=cp.revoked_lease_ids,
@@ -1751,6 +1840,7 @@ class AgentLoop:
             jobs_service,
             permission_policy=self.permission_policy,
             capability_vault=self._capability_vault,
+            outbox=self._outbox,
         )
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))

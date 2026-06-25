@@ -107,6 +107,9 @@ class RunCheckpoint:
     # Idempotency: ids of inbox messages already processed, so a redelivery after a restart is
     # recognized and dropped (effectively-once ingress). Additive; old checkpoints default to [].
     inbox_seen_ids: list[str] = field(default_factory=list)
+    # Staged outbound side-effects (capability-gated). Persisted in full (handles only, never
+    # secrets) so a pending request survives a restart and is (re)dispatched by the edge. Additive.
+    outbox_requests: list[dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

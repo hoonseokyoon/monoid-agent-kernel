@@ -62,6 +62,14 @@ from native_agent_runner.core.inbox import (
     is_inbox_envelope,
 )
 
+# Outbox request (capability-gated durable egress; the edge drains via an OutboxSender)
+from native_agent_runner.core.outbox import (
+    OUTBOX_REQUEST_VERSION,
+    OutboxReceipt,
+    OutboxRequest,
+    OutboxSender,
+)
+
 # Capability request/lease (scoped, short-lived access; secrets stay outside the core)
 from native_agent_runner.core.capability import (
     CAPABILITY_LEASE_VERSION,
@@ -210,6 +218,11 @@ __all__ = [
     "INBOX_PROTOCOL_VERSION",
     "InboxMessage",
     "is_inbox_envelope",
+    # outbox request (capability-gated durable egress)
+    "OUTBOX_REQUEST_VERSION",
+    "OutboxRequest",
+    "OutboxReceipt",
+    "OutboxSender",
     "ControlResult",
     "ControlDispatcher",
     # capability request/lease

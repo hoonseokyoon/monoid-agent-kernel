@@ -27,6 +27,7 @@ from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.control import ControlCommand, ControlResult
 from native_agent_runner.core.events import AgentEvent
 from native_agent_runner.core.inbox import InboxMessage, is_inbox_envelope
+from native_agent_runner.core.outbox import OutboxReceipt
 from native_agent_runner.core.lifecycle import (
     LoopSession,
     SessionState,
@@ -243,6 +244,8 @@ class BackendRunRecord:
     # recover) so a redelivered message is dropped once, even across a restart. Mutated only on the
     # shared loop (dequeue), so no extra lock is needed.
     seen_inbox_ids: set[str] = field(default_factory=set, repr=False)
+    # The run's outbox sender (drains staged sends), or None to leave staged requests pending.
+    outbox_sender: Any = field(default=None, repr=False)
 
 
 @dataclass
@@ -504,6 +507,13 @@ class RunnerBackend:
     # gating off for that run. A factory (not an instance) because a broker is typically per-run
     # identity-bound, unlike the shared tool/context providers above.
     capability_broker_factory: Callable[[BackendRunRequest], Any] | None = None
+    # Per-run outbox sender (drains staged outbound sends at the edge — see core/outbox.py). A
+    # factory like capability_broker_factory; None (or a None return) leaves staged requests pending
+    # (durable, never dispatched). The drain performs the actual IO; the core only stages.
+    outbox_sender_factory: Callable[[BackendRunRequest], Any] | None = None
+    # An outbox request is redispatched (at-least-once + idempotency_key) at most this many times on
+    # a retryable failure before it is dead-lettered as failed.
+    outbox_max_attempts: int = 5
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -1702,6 +1712,10 @@ class RunnerBackend:
                 continue
             # settled. One-shot runs close here; multi-turn awaits the next message.
             consecutive_turn_failures = 0  # a settled turn clears the failure streak
+            # Drain staged outbox sends now (the loop is still open) so a one-shot run that finishes
+            # without parking still gets its side-effects dispatched; the multi-turn await below
+            # also drains (a no-op then, since these are already dispatched).
+            self._drain_outbox(record, loop)
             if not request.multi_turn:
                 break
             if self._session_should_stop(record, started, turns):
@@ -1768,6 +1782,33 @@ class RunnerBackend:
         # Overwrites the same seq the loop just committed, now with the queue included.
         assert self.checkpoint_store is not None
         self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
+        self._drain_outbox(record, loop)
+
+    def _drain_outbox(self, record: BackendRunRecord, loop: AgentLoop) -> None:
+        """Dispatch staged outbox requests at the edge (after they are durably persisted as
+        ``pending``), then persist again so a ``dispatched`` status is recorded. The send happens
+        here, never in the core; a crash between the two persists redispatches on recover, made safe
+        by the request's idempotency_key. No-op without a sender or pending requests."""
+        sender = record.outbox_sender
+        pending = loop.pending_outbox()
+        if sender is None or not pending:
+            return
+        changed = False
+        for request in pending:
+            try:
+                receipt = sender.send(request)
+            except Exception as exc:  # a sender raising is a retryable transport failure
+                receipt = OutboxReceipt(ok=False, error=str(exc), retryable=True)
+            loop.record_outbox_result(request.id, receipt, max_attempts=self.outbox_max_attempts)
+            changed = True
+        if changed:
+            checkpoint = loop.snapshot()
+            if checkpoint is not None:
+                checkpoint.queued_messages = [
+                    m for m in list(record.message_queue._queue) if isinstance(m, (str, list, dict))
+                ]
+                checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
+                self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
 
     def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
         return (
@@ -1794,6 +1835,7 @@ class RunnerBackend:
                 loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
                 with self._lock:
                     self._records[run_id].loop = loop
+                    self._records[run_id].outbox_sender = self._outbox_sender_for(request)
                 # Persist the recovery metadata before the first turn so a crash at any park
                 # point can be resumed (the checkpoint itself is written by the driver).
                 self._write_run_meta(self._record(run_id), request)
@@ -1811,6 +1853,13 @@ class RunnerBackend:
         if self.capability_broker_factory is None:
             return None
         return self.capability_broker_factory(request)
+
+    def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
+        """Build the run's outbox sender from the factory (scoped to run identity), or None to leave
+        staged outbox requests pending (durable, never dispatched)."""
+        if self.outbox_sender_factory is None:
+            return None
+        return self.outbox_sender_factory(request)
 
     def _build_loop(
         self,
@@ -1873,6 +1922,7 @@ class RunnerBackend:
             )
             with self._lock:
                 self._records[run_id].loop = loop
+                self._records[run_id].outbox_sender = self._outbox_sender_for(request)
             self._write_run_meta(prepared.record, request)
             await loop.aopen()
             suspension: Suspension | None = None
@@ -2307,6 +2357,7 @@ class RunnerBackend:
         loop.restore(checkpoint, blobs=stored.blob)
         with self._lock:
             record.loop = loop
+            record.outbox_sender = self._outbox_sender_for(request)
         # Restore the inbox dedup set so a message processed before the restart is not reprocessed
         # if it (or a redelivery) is queued again.
         record.seen_inbox_ids = set(checkpoint.inbox_seen_ids)

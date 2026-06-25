@@ -289,6 +289,18 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         {"capability": _STR, "old_lease_id": _STR, "new_lease_id": _STR, "expires_at": _NUM},
         required=("capability",),
     ),
+    "outbox.requested": _data_schema(
+        {"request_id": _STR, "destination": _STR, "capability": _STR},
+        required=("request_id",),
+    ),
+    "outbox.dispatched": _data_schema(
+        {"request_id": _STR, "destination": _STR, "reference": _STR, "attempts": _NUM},
+        required=("request_id",),
+    ),
+    "outbox.failed": _data_schema(
+        {"request_id": _STR, "destination": _STR, "reason": _STR, "attempts": _NUM},
+        required=("request_id",),
+    ),
     "workspace.file.read": _data_schema(
         {"tool": _STR, "paths": _STR_ARRAY},
         required=("tool",),

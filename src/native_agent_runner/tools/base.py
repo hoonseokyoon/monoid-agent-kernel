@@ -102,6 +102,20 @@ class ToolContext(Protocol):
         to the real secret at the edge (gateway), never in the core."""
         ...
 
+    def emit_outbox(
+        self,
+        destination: str,
+        payload: dict[str, Any],
+        *,
+        capability: str = "",
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        """Stage a durable outbound side-effect (send an email, call a webhook) instead of doing the
+        IO inline. The request is appended to the run's outbox (checkpointed) and an *edge* drains it
+        later; it carries the capability lease handle for ``capability`` (never a secret). Returns
+        ``{"status": "staged", "request_id": ...}``."""
+        ...
+
 
 ToolHandler = Callable[[ToolContext, dict[str, Any]], ToolResult]
 
