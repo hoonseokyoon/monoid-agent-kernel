@@ -96,6 +96,29 @@ class ToolContext(Protocol):
     def search_tools(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def capability_token(self, capability: str) -> str | None:
+        """The access handle (``token_ref``) of the lease the loop acquired for ``capability``
+        before invoking this tool, or ``None`` if no broker/lease applies. The handle is resolved
+        to the real secret at the edge (gateway), never in the core."""
+        ...
+
+    def emit_outbox(
+        self,
+        destination: str,
+        payload: dict[str, Any],
+        *,
+        capability: str = "",
+        idempotency_key: str = "",
+        expect_ack: bool = False,
+        reply_to: str = "",
+    ) -> dict[str, Any]:
+        """Stage a durable outbound side-effect (send an email, call a webhook) instead of doing the
+        IO inline. The request is appended to the run's outbox (checkpointed) and an *edge* drains it
+        later; it carries the capability lease handle for ``capability`` (never a secret). With
+        ``expect_ack`` the edge delivers the send's receipt back as an inbox message (non-park).
+        Returns ``{"status": "staged", "request_id": ...}``."""
+        ...
+
 
 ToolHandler = Callable[[ToolContext, dict[str, Any]], ToolResult]
 

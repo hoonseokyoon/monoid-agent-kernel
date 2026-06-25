@@ -89,6 +89,17 @@ class TurnInterrupted(NativeAgentError):
     error_code = "interrupted"
 
 
+class TurnPaused(NativeAgentError):
+    """Raised at the start-of-step boundary when a cooperative pause is requested. Unlike
+    :class:`TurnInterrupted` (a "stop" that abandons the turn and parks for the next user
+    message), a pause **freezes the turn in place**: the loop converts it to a non-terminal
+    ``Suspension(reason="paused")`` keeping the in-flight ``pending_observations`` intact, so
+    a later resume (a ``run_until_suspended(None)`` re-pump) continues the same turn exactly
+    where it left off. Pause lands only at the start of the next step, never mid-step."""
+
+    error_code = "paused"
+
+
 def error_code_for_exception(exc: Exception) -> str:
     code = getattr(exc, "error_code", None)
     return str(code) if code else "internal_error"

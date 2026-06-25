@@ -109,6 +109,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         {"reason": _STR, "task_ids": _STR_ARRAY, "prompt": _STR_NULL},
         required=("reason",),
     ),
+    "session.state.changed": _data_schema(
+        {"state": _STR, "from": _STR, "reason": _STR},
+        required=("state",),
+    ),
     "turn.settled": _data_schema(
         {"status": _STR, "final_text": _STR, "error_code": _STR, "changed_paths": _STR_ARRAY},
         required=("status",),
@@ -264,6 +268,38 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "surface_reason": _STR_NULL,
         },
         required=("tool",),
+    ),
+    "capability.requested": _data_schema(
+        {"capability": _STR, "binding_id": _STR, "request_id": _STR, "reason": _STR, "scope": _OBJ},
+        required=("capability",),
+    ),
+    "capability.granted": _data_schema(
+        {"capability": _STR, "binding_id": _STR, "lease_id": _STR, "expires_at": _NUM, "scope": _OBJ},
+        required=("capability",),
+    ),
+    "capability.denied": _data_schema(
+        {"capability": _STR, "binding_id": _STR, "reason": _STR, "retryable": _BOOL},
+        required=("capability",),
+    ),
+    "capability.revoked": _data_schema(
+        {"capability": _STR, "lease_id": _STR, "reason": _STR, "scope": _OBJ},
+        required=("capability",),
+    ),
+    "capability.rotated": _data_schema(
+        {"capability": _STR, "old_lease_id": _STR, "new_lease_id": _STR, "expires_at": _NUM},
+        required=("capability",),
+    ),
+    "outbox.requested": _data_schema(
+        {"request_id": _STR, "destination": _STR, "capability": _STR, "traceparent": _STR},
+        required=("request_id",),
+    ),
+    "outbox.dispatched": _data_schema(
+        {"request_id": _STR, "destination": _STR, "reference": _STR, "attempts": _NUM, "traceparent": _STR},
+        required=("request_id",),
+    ),
+    "outbox.failed": _data_schema(
+        {"request_id": _STR, "destination": _STR, "reason": _STR, "attempts": _NUM, "traceparent": _STR},
+        required=("request_id",),
     ),
     "workspace.file.read": _data_schema(
         {"tool": _STR, "paths": _STR_ARRAY},

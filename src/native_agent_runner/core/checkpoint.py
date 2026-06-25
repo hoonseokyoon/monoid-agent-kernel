@@ -84,6 +84,18 @@ class RunCheckpoint:
     workspace_delta: list[dict[str, Any]] = field(default_factory=list)
     workspace_base: dict[str, Any] | None = None
 
+    # --- capability leases (durable/approved only; ephemeral sync grants are not persisted) ---
+    # Handles only (token_ref), never secrets; re-installed into the vault on restore so a
+    # human-approved capability is not re-prompted after a restart. See core/capability.py.
+    capability_leases: list[dict[str, Any]] = field(default_factory=list)
+    # Gated tool calls awaiting auto-redispatch after their capability is granted (Phase ⑤).
+    pending_capability_replays: list[dict[str, Any]] = field(default_factory=list)
+    # Capability revocation records (per-lease, per-capability, and an issued-before watermark) so a
+    # revoked capability stays dead across a restart — the kill switch is not forgotten on resume.
+    revoked_lease_ids: list[str] = field(default_factory=list)
+    revoked_capabilities: list[str] = field(default_factory=list)
+    revoked_before: float = 0.0
+
     # --- run-level bookkeeping ---
     remaining_duration_s: float | None = None
     cancellation_requested: bool = False
@@ -92,6 +104,12 @@ class RunCheckpoint:
     # multimodal message carried by-reference). Kept JSON-native so the checkpoint round-trips
     # without any dataclass (de)serialization here.
     queued_messages: list[Any] = field(default_factory=list)
+    # Idempotency: ids of inbox messages already processed, so a redelivery after a restart is
+    # recognized and dropped (effectively-once ingress). Additive; old checkpoints default to [].
+    inbox_seen_ids: list[str] = field(default_factory=list)
+    # Staged outbound side-effects (capability-gated). Persisted in full (handles only, never
+    # secrets) so a pending request survives a restart and is (re)dispatched by the edge. Additive.
+    outbox_requests: list[dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

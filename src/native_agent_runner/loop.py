@@ -89,8 +89,19 @@ from native_agent_runner.errors import (
     RunTimeout,
     ToolExecutionError,
     TurnInterrupted,
+    TurnPaused,
     error_code_for_exception,
 )
+from native_agent_runner.core.capability import (
+    CapabilityBroker,
+    CapabilityDenial,
+    CapabilityLease,
+    CapabilityPending,
+    CapabilityRequest,
+    CapabilityVault,
+)
+from native_agent_runner.core.outbox import Outbox, OutboxReceipt, OutboxRequest
+from native_agent_runner.core.trace_context import new_traceparent
 from native_agent_runner.tasks import (
     HostedResultInjector,
     HostedTask,
@@ -197,6 +208,12 @@ class AgentToolContext(ToolContext):
     finished: bool = False
     plan: list[dict[str, Any]] = field(default_factory=list)
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
+    # Per-run capability leases (handles only). A tool handler reads ``capability_token`` to get
+    # the access handle the gate acquired for its declared capability. None when no broker is set.
+    capability_vault: CapabilityVault | None = None
+    # Per-run outbox of staged external sends (handles only). A tool handler calls ``emit_outbox``
+    # to durably stage a side-effect the edge drains later. None when outbox staging is unavailable.
+    outbox: Outbox | None = None
     tool_search_entries: tuple[ToolSearchEntry, ...] = ()
     tool_search_max_results: int = 5
     # Depth of this run in the subagent tree (0 = top-level). Threaded into spawned
@@ -340,13 +357,13 @@ class AgentToolContext(ToolContext):
         )
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.search(args, self._current_call)
+        return self.web_service.search(args, self._current_call, capability_token=self.capability_token("web.search"))
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.fetch(args, self._current_call)
+        return self.web_service.fetch(args, self._current_call, capability_token=self.capability_token("web.fetch"))
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.context(args, self._current_call)
+        return self.web_service.context(args, self._current_call, capability_token=self.capability_token("web.context"))
 
     def configure_tool_search(self, entries: tuple[ToolSearchEntry, ...], max_results: int) -> None:
         self.tool_search_entries = entries
@@ -371,6 +388,55 @@ class AgentToolContext(ToolContext):
         requested = tuple(self._requested_tool_loads)
         self._requested_tool_loads.clear()
         return requested
+
+    def capability_token(self, capability: str) -> str | None:
+        if self.capability_vault is None:
+            return None
+        return self.capability_vault.token_for(capability, now=time.time())
+
+    def emit_outbox(
+        self,
+        destination: str,
+        payload: dict[str, Any],
+        *,
+        capability: str = "",
+        idempotency_key: str = "",
+        expect_ack: bool = False,
+        reply_to: str = "",
+    ) -> dict[str, Any]:
+        """Stage a durable outbound side-effect. Captures the capability lease handle (never the
+        secret) so the edge sender can authenticate, appends the request to the run's outbox (which
+        is checkpointed), and emits ``outbox.requested``. The IO happens later, at the edge. With
+        ``expect_ack`` the edge delivers the send's receipt back as an inbox message (non-park)."""
+        if self.outbox is None:
+            raise ToolExecutionError("outbox is not available", error_code="outbox_unavailable")
+        call = self._current_call
+        request = OutboxRequest(
+            destination=destination,
+            payload=dict(payload),
+            capability=capability,
+            token_ref=self.capability_token(capability) or "" if capability else "",
+            run_id=self.run_id,
+            idempotency_key=idempotency_key,
+            expect_ack=expect_ack,
+            reply_to=reply_to,
+            # A fresh root trace at staging (pure, no IO): the request carries an id from birth, the
+            # edge derives a child span for the actual send. Observability only — never gates anything.
+            traceparent=new_traceparent(),
+        )
+        self.outbox.append(request)
+        self.recorder.emit(
+            "outbox.requested",
+            turn_id=call.turn_id,
+            parent_id=call.tool_event_id,
+            data={
+                "request_id": request.id,
+                "destination": destination,
+                "capability": capability,
+                "traceparent": request.traceparent,
+            },
+        )
+        return {"status": "staged", "request_id": request.id}
 
 
 def _observation_message(observation: ToolObservation, media_store: dict[str, bytes]) -> dict[str, Any]:
@@ -422,6 +488,10 @@ class RunState:
     pending_user_input: tuple[ContentPart, ...] | None = None
     pending_observations: tuple[ToolObservation, ...] = ()
     pending_binding_loads: tuple[str, ...] = ()
+    # Gated tool calls whose capability was escalated and is now (or will be) granted; the loop
+    # auto-redispatches them at the next step boundary instead of relying on a model retry (⑤).
+    # Each entry: {call_name, call_id, arguments, binding_id, task_id, capability}.
+    pending_capability_replays: tuple[dict[str, Any], ...] = ()
     tool_call_counts: dict[str, int] = field(default_factory=dict)
     previous_surface_snapshot: ToolSurfaceSnapshot | None = None
     previous_runtime_config: AgentRuntimeConfig | None = None
@@ -501,6 +571,18 @@ class AgentLoop:
     # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
     # Defaults to a local-fs store under the run root; a backend injects a durable one.
     checkpoint_store: CheckpointStore | None = None
+    # Optional capability broker: when set, a bound tool that declares ``runtime.requires_lease``
+    # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
+    # Secrets stay in the broker; the core only gates on the lease. None = capability gating off.
+    capability_broker: CapabilityBroker | None = None
+    # When True (default), after a gated tool's capability is granted the loop auto-executes the
+    # gated call (no model retry); see ⑤ auto-redispatch. When False, the model must retry the tool
+    # (the lease is still admitted). Either way model-retry remains the fallback if replay can't run.
+    capability_auto_redispatch: bool = True
+    # Rotation: when > 0, a cached lease within this many seconds of expiry is proactively re-brokered
+    # on use (the handle/expiry refresh under a stable contract), bounded by the lease's
+    # ``max_expires_at`` ceiling. 0 (default) disables rotation — leases simply expire and re-broker.
+    capability_rotate_skew_seconds: float = 0.0
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
@@ -520,6 +602,16 @@ class AgentLoop:
     # (which is run-level/terminal); an interrupt keeps the session alive. Cleared at the start
     # of each new user submit so a stale stop never kills the next turn.
     _interrupt_requested: bool = field(default=False, init=False, repr=False)
+    # Cooperative "pause": set via :meth:`pause_turn`, consumed ONLY at the start-of-step
+    # boundary (top of the pump loop) — never mid-step — so ``pending_observations`` are
+    # always in a clean, resumable shape. Unlike an interrupt, a pause freezes the turn and a
+    # later ``run_until_suspended(None)`` re-pump continues it. Bare one-way flag (CPython-atomic,
+    # mirroring ``_interrupt_requested``). Cleared at the start of each new user submit.
+    _pause_requested: bool = field(default=False, init=False, repr=False)
+    # Per-run cache of granted capability leases (handles only, never secrets). Deliberately not
+    # checkpointed — on restore leases are re-brokered, so a stale handle never survives on disk.
+    _capability_vault: CapabilityVault = field(default_factory=CapabilityVault, init=False, repr=False)
+    _outbox: Outbox = field(default_factory=Outbox, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
@@ -668,6 +760,107 @@ class AgentLoop:
         lands at the next step boundary (a non-streamed model call finishes first)."""
         self._interrupt_requested = True
 
+    def pause_turn(self) -> None:
+        """Request a cooperative pause: the running turn freezes at the start of its next step
+        and suspends with ``reason="paused"`` (the session stays alive; resume by re-pumping
+        via ``run_until_suspended(None)``). Thread-safe one-way signal (a bare flag set, like
+        ``interrupt_turn``). Unlike an interrupt, a pause keeps the turn's in-flight
+        ``pending_observations`` so the resumed turn continues exactly where it left off, and it
+        lands ONLY at a start-of-step boundary — never mid-step and never mid-generation (an
+        in-flight model call always completes first). The flag is cleared when the next user
+        submit starts, so a stale pause never freezes a fresh turn."""
+        self._pause_requested = True
+
+    def revoke_capability(
+        self,
+        *,
+        capability: str | None = None,
+        lease_id: str | None = None,
+        before: float | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Revoke a capability lease NOW (the operator/Daemon kill switch). Records the revocation
+        in the per-run vault; the gate (``_ensure_capability_lease``) and ``token_for`` then refuse
+        the handle fail-closed — a per-capability revoke is also refused re-brokering, so it cannot
+        be undone by a permissive broker. Thread-safe (set mutation only, like ``pause_turn`` /
+        ``interrupt_turn``); the ``capability.denied`` audit event is emitted on the loop thread at
+        the gate when the next gated call hits the revocation, so this is safe to call from a
+        control-plane thread. Pass ``capability="*"`` to revoke every currently-held capability.
+        Returns a summary of what was revoked."""
+        return self._capability_vault.revoke(
+            capability=capability, lease_id=lease_id, before=before
+        )
+
+    def pending_outbox(self) -> list[OutboxRequest]:
+        """Staged outbox requests awaiting (re)dispatch — the full pending set regardless of retry
+        schedule. The edge drains :meth:`due_outbox`; this is for inspection/snapshot. The core never
+        performs the send."""
+        return self._outbox.pending()
+
+    def due_outbox(self, now: float) -> list[OutboxRequest]:
+        """Pending requests whose retry schedule (``next_attempt_at``) has arrived — the edge's
+        dispatch set at time ``now``. A freshly staged request is due immediately."""
+        return self._outbox.due(now)
+
+    def record_outbox_result(
+        self,
+        request_id: str,
+        receipt: OutboxReceipt,
+        *,
+        max_attempts: int = 5,
+        next_attempt_at: float | None = None,
+    ) -> str:
+        """Record an edge sender's outcome for a staged request and emit the lifecycle event.
+        Returns the new status. A retryable failure keeps the request ``pending`` (redispatched on or
+        after ``next_attempt_at``, which the edge computes from its backoff policy) until
+        ``max_attempts`` attempts, then dead-letters it as ``failed``; a non-retryable failure fails
+        immediately. The loop never computes the schedule — it records what the edge decided. The
+        ``idempotency_key`` makes the (at-least-once) redispatch safe."""
+        request = self._outbox.get(request_id)
+        if request is None:
+            return ""
+        attempts = request.attempts + 1
+        recorder = self._session.res.recorder if self._session is not None else None
+        if receipt.ok:
+            self._outbox.mark(
+                request_id, status="dispatched", attempts=attempts, reference=receipt.reference
+            )
+            if recorder is not None:
+                recorder.emit(
+                    "outbox.dispatched",
+                    data={
+                        "request_id": request_id,
+                        "destination": request.destination,
+                        "reference": receipt.reference,
+                        "attempts": attempts,
+                        "traceparent": request.traceparent,
+                    },
+                )
+            return "dispatched"
+        if receipt.retryable and attempts < max_attempts:
+            self._outbox.mark(
+                request_id,
+                status="pending",
+                attempts=attempts,
+                next_attempt_at=next_attempt_at,
+                error=receipt.error,
+            )
+            return "pending"
+        self._outbox.mark(request_id, status="failed", attempts=attempts, error=receipt.error)
+        if recorder is not None:
+            recorder.emit(
+                "outbox.failed",
+                level="warning",
+                data={
+                    "request_id": request_id,
+                    "destination": request.destination,
+                    "reason": receipt.error,
+                    "attempts": attempts,
+                    "traceparent": request.traceparent,
+                },
+            )
+        return "failed"
+
     async def arun_until_suspended(
         self, user_input: str | tuple[ContentPart, ...] | None = None
     ) -> Suspension:
@@ -689,8 +882,9 @@ class AgentLoop:
             state.final_text = ""
             # A run.finish in a prior submit must not short-circuit this one.
             res.context.finished = False
-            # Drop a stale stop so it can't immediately interrupt this fresh turn.
+            # Drop a stale stop/pause so neither can immediately halt this fresh turn.
             self._interrupt_requested = False
+            self._pause_requested = False
             state.pending_user_input = input_to_parts(user_input)
             self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
             session.submit_local_step = 0
@@ -767,6 +961,22 @@ class AgentLoop:
             state.pending_observations = ()
             self._persist_checkpoint(session)
             return Suspension(reason="interrupted", status="completed")
+        except TurnPaused:
+            # Cooperative pause: freeze the turn at a clean start-of-step boundary and keep
+            # the session alive. Unlike interrupt, pending_observations are KEPT — the resumed
+            # turn (a run_until_suspended(None) re-pump) re-sends them at the next step, so the
+            # pause is transparent. The park persists a checkpoint (which already serializes
+            # pending_observations + the step counter), so a paused run also survives a restart.
+            # ``status`` is cosmetic here; branch on ``reason``.
+            self._pause_requested = False
+            # Literal state names keep the engine decoupled from the FSM module (the lifecycle
+            # layer sits ABOVE the loop); they match SessionState.RUNNING/PAUSED values.
+            res.recorder.emit(
+                "session.state.changed",
+                data={"state": "paused", "from": "running", "reason": "pause_requested"},
+            )
+            self._persist_checkpoint(session)
+            return Suspension(reason="paused", status="completed")
         except Exception as exc:  # controlled recording boundary for standalone CLI
             self._record_failure(state, res, exc)
             session.terminal = True
@@ -1153,6 +1363,12 @@ class AgentLoop:
             cancellation_requested=bool(
                 self.cancellation_token is not None and self.cancellation_token.requested
             ),
+            # Durable (approved) capability leases — handles only — so a restart does not re-prompt.
+            capability_leases=self._capability_vault.export_durable(),
+            outbox_requests=self._outbox.export(),
+            pending_capability_replays=[dict(replay) for replay in state.pending_capability_replays],
+            # Revocation records so a revoked capability stays dead across the restart.
+            **self._capability_vault.export_revocations(),
         )
 
     def _checkpoint_store(self) -> CheckpointStore:
@@ -1281,6 +1497,20 @@ class AgentLoop:
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
+            pending_capability_replays=tuple(dict(replay) for replay in cp.pending_capability_replays),
+        )
+        # Reinstall durable (approved) capability leases so a human-approved capability is not
+        # re-prompted after a restart. Ephemeral sync grants were never persisted; they re-broker.
+        for lease_payload in cp.capability_leases:
+            self._capability_vault.install(CapabilityLease.from_json(lease_payload))
+        # Rehydrate staged outbox requests so a pending send survives the restart (the edge
+        # re-dispatches it; the idempotency_key guards against a double-send).
+        self._outbox.import_(cp.outbox_requests)
+        # Restore revocation records so a capability revoked before the restart stays dead.
+        self._capability_vault.import_revocations(
+            lease_ids=cp.revoked_lease_ids,
+            capabilities=cp.revoked_capabilities,
+            before=cp.revoked_before,
         )
         # Rehydrate inline-ingested media: load every blob:<sha> referenced by the restored log
         # back into the in-memory map so wire-build can resolve it after the restart. A blob
@@ -1644,6 +1874,8 @@ class AgentLoop:
             web_service,
             jobs_service,
             permission_policy=self.permission_policy,
+            capability_vault=self._capability_vault,
+            outbox=self._outbox,
         )
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))
@@ -1883,11 +2115,17 @@ class AgentLoop:
         max_steps = self.spec.limits.max_steps
         while session.submit_local_step < max_steps:
             self._check_run_boundary(deadline)
+            # Cooperative pause is checked ONLY here, at the start of a step — never inside
+            # _check_run_boundary (which also runs mid-step). At this boundary the prior step's
+            # tool results sit in state.pending_observations not-yet-sent, so a paused park is
+            # clean and a None re-pump resumes the same turn without losing or double-sending them.
+            if self._pause_requested:
+                raise TurnPaused("turn paused")
             session.submit_local_step += 1
             local_step = session.submit_local_step
             session.session_step += 1
             step = session.session_step
-            background_observations = self._pop_background_observations(context, recorder, step)
+            background_observations = self._pop_background_observations(context, recorder, step, state)
             if background_observations:
                 state.pending_observations = (*state.pending_observations, *background_observations)
             turn_id = f"turn_{step:04d}"
@@ -1942,6 +2180,33 @@ class AgentLoop:
             )
             state.previous_surface_snapshot = surface_snapshot
             state.pending_binding_loads = ()
+            # Auto-redispatch (⑤): run any gated calls whose capability was just granted, now that
+            # this turn's context (catalog/surface/turn_id) exists. Each goes through the normal
+            # _execute_tool_call (real permission/quota/events); the result is injected as a
+            # user-message observation so the model sees the outcome without retrying. A replay that
+            # can't run cleanly (no valid lease) is skipped — the model then retries (fallback).
+            if state.pending_capability_replays:
+                pending_replays = state.pending_capability_replays
+                state.pending_capability_replays = ()
+                replay_obs = tuple(
+                    obs
+                    for replay in pending_replays
+                    if (
+                        obs := self._execute_capability_replay(
+                            replay,
+                            bound_catalog=bound_catalog,
+                            surface_snapshot=surface_snapshot,
+                            call_counts=state.tool_call_counts,
+                            context=context,
+                            recorder=recorder,
+                            turn_id=turn_id,
+                            step=step,
+                        )
+                    )
+                    is not None
+                )
+                if replay_obs:
+                    state.pending_observations = (*state.pending_observations, *replay_obs)
             dynamic_segment = self._dynamic_context_segment(res, turn_context)
             if surface_snapshot.delta_notice:
                 dynamic_segment = (
@@ -2489,6 +2754,7 @@ class AgentLoop:
         context: AgentToolContext,
         recorder: AgentRecorder,
         step: int,
+        state: RunState,
     ) -> tuple[ToolObservation, ...]:
         observations = context.job_manager.pop_reentry_observations()
         if not observations:
@@ -2515,7 +2781,128 @@ class AgentLoop:
             # so hitl/automation results don't emit phantom workspace events.
             if observation.output.get("type") == "background_job_result":
                 self._emit_background_workspace_events(observation.output, context, recorder)
+            # A resolved capability escalation: admit the granted lease into the vault, and (if a
+            # gated call was captured + auto-redispatch is on) queue it to run at this step's top.
+            elif observation.output.get("type") == "capability_grant":
+                self._admit_capability_grant(observation, context, recorder, state)
         return tuple(observations)
+
+    def _admit_capability_grant(
+        self,
+        observation: ToolObservation,
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        state: RunState,
+    ) -> None:
+        """Store the lease from a resolved ``capability`` task in the vault (fail-closed against the
+        original request scope), and queue the gated call for auto-redispatch when one was captured.
+        A denial / malformed grant stores nothing — the model just sees the result observation."""
+        task = context.job_manager.jobs.get(str(observation.output.get("task_id") or ""))
+        request_payload = getattr(task, "request", None) if task is not None else None
+        result_payload = getattr(task, "result", None) if task is not None else None
+        if not isinstance(request_payload, dict) or not isinstance(result_payload, dict):
+            return
+        lease_payload = result_payload.get("lease")
+        if not isinstance(lease_payload, dict):
+            return  # denied or no lease granted
+        request = CapabilityRequest(
+            capability=str(request_payload.get("capability") or ""),
+            scope=dict(request_payload.get("scope") or {}),
+            run_id=self.spec.run_id,
+            binding_id=str(request_payload.get("binding_id") or ""),
+        )
+        lease = CapabilityLease(
+            capability=str(lease_payload.get("capability") or request.capability),
+            token_ref=str(lease_payload.get("token_ref") or ""),
+            expires_at=float(lease_payload.get("expires_at") or 0.0),
+            scope=dict(lease_payload.get("scope") or {}),
+            # Approved out-of-band → persist (handle only) so a restart does not re-prompt.
+            durable=True,
+        )
+        try:
+            self._capability_vault.admit(request, lease)
+        except ValueError as exc:
+            recorder.emit(
+                "capability.denied",
+                data={
+                    "capability": request.capability,
+                    "binding_id": request.binding_id,
+                    "reason": str(exc),
+                },
+                level="warning",
+            )
+            return
+        recorder.emit(
+            "capability.granted",
+            data={
+                "capability": request.capability,
+                "binding_id": request.binding_id,
+                "lease_id": lease.lease_id,
+                "expires_at": lease.expires_at,
+                "scope": lease.scope,
+            },
+        )
+        # Queue the captured gated call for auto-redispatch (drained at the next step top, where
+        # turn context exists). If nothing was captured or the flag is off, the model retries.
+        replay_call_name = request_payload.get("replay_call_name")
+        if self.capability_auto_redispatch and replay_call_name:
+            state.pending_capability_replays = (
+                *state.pending_capability_replays,
+                {
+                    "call_name": str(replay_call_name),
+                    "call_id": str(request_payload.get("replay_call_id") or ""),
+                    "arguments": dict(request_payload.get("replay_arguments") or {}),
+                    "binding_id": request.binding_id,
+                    "capability": request.capability,
+                    "task_id": str(observation.output.get("task_id") or ""),
+                },
+            )
+
+    def _execute_capability_replay(
+        self,
+        replay: dict[str, Any],
+        *,
+        bound_catalog: BoundToolCatalog,
+        surface_snapshot: ToolSurfaceSnapshot,
+        call_counts: dict[str, int],
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        turn_id: str,
+        step: int,
+    ) -> ToolObservation | None:
+        """Re-execute one gated tool call after its capability was granted, returning the result as
+        a user-message observation (so it never collides with the original call's pending tool
+        result). Returns ``None`` to skip — falling back to model-retry — when no valid lease is
+        present (the gate would otherwise re-escalate and re-park)."""
+        capability = str(replay.get("capability") or "")
+        if not capability or self._capability_vault.token_for(capability, now=time.time()) is None:
+            return None  # lease missing/expired -> let the model retry (the granted message stands)
+        observation = self._execute_tool_call(
+            call_name=str(replay.get("call_name") or ""),
+            call_id=str(replay.get("call_id") or ""),
+            arguments=dict(replay.get("arguments") or {}),
+            bound_catalog=bound_catalog,
+            surface_snapshot=surface_snapshot,
+            call_counts=call_counts,
+            context=context,
+            recorder=recorder,
+            turn_id=turn_id,
+            parent_id=None,
+            step=step,
+        )
+        # Deliver as a user message (is_background) under a distinct call_id — the original call_id
+        # already carries the "pending" tool result, so a second tool result there would be malformed.
+        return ToolObservation(
+            call_id=f"capability_replay:{replay.get('call_id') or ''}",
+            tool_name=str(replay.get("call_name") or ""),
+            output={
+                "type": "capability_replay_result",
+                "capability": capability,
+                "call": str(replay.get("call_name") or ""),
+                "result": observation.output,
+            },
+            is_background=True,
+        )
 
     def _wait_for_background_jobs(
         self,
@@ -2863,17 +3250,32 @@ class AgentLoop:
                 ToolRegistry().validate_args(spec, arguments)
                 self._check_tool_surface_scope(spec, arguments, authorization)
                 self._check_permissions(bound_tool.base_spec, arguments)
-                call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
-                result = self._invoke_handler(
+                pending = self._ensure_capability_lease(
                     bound_tool,
                     context,
-                    arguments,
+                    recorder,
+                    started_event,
+                    turn_id,
+                    call_name=call_name,
                     call_id=call_id,
-                    turn_id=turn_id,
-                    recorder=recorder,
-                    started_event=started_event,
-                    authorization=authorization,
+                    arguments=arguments,
                 )
+                if pending is not None:
+                    # Capability escalated: the call parks (does not execute); the model retries
+                    # once the lease is granted. Not counted against the binding's call quota.
+                    result = pending
+                else:
+                    call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
+                    result = self._invoke_handler(
+                        bound_tool,
+                        context,
+                        arguments,
+                        call_id=call_id,
+                        turn_id=turn_id,
+                        recorder=recorder,
+                        started_event=started_event,
+                        authorization=authorization,
+                    )
         except ToolExecutionError as exc:
             if started_event is None:
                 started_event = self._emit_tool_started(
@@ -2926,6 +3328,209 @@ class AgentLoop:
             step=step,
             turn_id=turn_id,
             parent_id=parent_id,
+        )
+
+    def _ensure_capability_lease(
+        self,
+        bound_tool: BoundTool,
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        started_event: AgentEvent | None,
+        turn_id: str,
+        *,
+        call_name: str,
+        call_id: str,
+        arguments: dict[str, Any],
+    ) -> ToolResult | None:
+        """Gate a tool call on a capability lease. Returns ``None`` to proceed (a valid lease is
+        cached or was granted synchronously), or a *pending* ``ToolResult`` when the broker
+        escalated the request (the run will park on a ``capability`` task and the model retries the
+        tool once granted). A denial — or a scope-widening grant — raises ``PermissionDenied`` so the
+        call never runs. A no-op unless a broker is configured AND the binding declares
+        ``runtime.requires_lease``. Secrets never enter the core — a lease carries only a handle."""
+        broker = self.capability_broker
+        runtime = bound_tool.binding.runtime or {}
+        if broker is None or not runtime.get("requires_lease"):
+            return None
+        capability = bound_tool.base_spec.capability
+        if not capability:
+            return None
+        scope = {key: value for key, value in bound_tool.binding.scope.to_json().items() if value}
+        now = time.time()
+        binding_id = bound_tool.binding_id
+        parent_id = started_event.event_id if started_event else None
+        if self._capability_vault.is_capability_revoked(capability):
+            # Hard stop: a revoked capability is refused WITHOUT re-brokering, so a permissive broker
+            # cannot resurrect it. (A revoked lease_id / pre-watermark lease is filtered by get_valid
+            # below and would re-broker; per-capability revocation is the authoritative kill.)
+            recorder.emit(
+                "capability.revoked",
+                turn_id=turn_id,
+                parent_id=parent_id,
+                level="warning",
+                data={"capability": capability, "scope": scope, "reason": "revoked"},
+            )
+            raise PermissionDenied(
+                f"capability revoked: {capability}", error_code="capability_revoked"
+            )
+        cached = self._capability_vault.get_valid(capability, scope, now=now)
+        if cached is not None:
+            skew = self.capability_rotate_skew_seconds
+            if skew > 0 and cached.can_rotate(now, skew):
+                self._rotate_capability_lease(
+                    cached,
+                    capability,
+                    scope,
+                    binding_id,
+                    recorder=recorder,
+                    turn_id=turn_id,
+                    parent_id=parent_id,
+                )
+            return None  # a valid, scope-covering lease is cached (refreshed if it was due)
+        request = CapabilityRequest(
+            capability=capability,
+            scope=scope,
+            run_id=self.spec.run_id,
+            binding_id=binding_id,
+            reason=str(runtime.get("capability_reason") or ""),
+        )
+        recorder.emit(
+            "capability.requested",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data={
+                "capability": capability,
+                "binding_id": binding_id,
+                "request_id": request.request_id,
+                "scope": scope,
+                "reason": request.reason,
+            },
+        )
+        grant = broker.request(request)
+        if isinstance(grant, CapabilityDenial):
+            recorder.emit(
+                "capability.denied",
+                turn_id=turn_id,
+                parent_id=parent_id,
+                level="warning",
+                data={
+                    "capability": capability,
+                    "binding_id": binding_id,
+                    "reason": grant.reason,
+                    "retryable": grant.retryable,
+                },
+            )
+            raise PermissionDenied(
+                f"capability denied: {capability}: {grant.reason}", error_code="capability_denied"
+            )
+        if isinstance(grant, CapabilityPending):
+            # Async approval: park the run on a capability hosted-task carrying the request AND the
+            # gated call (so it can be auto-redispatched on grant — see _capability_replay_for_grant),
+            # and hand the model a "pending" observation. On resolution the lease is admitted and the
+            # call runs automatically (or, if auto-redispatch is off/unsafe, the model retries it).
+            task_id = context.job_manager.create_task(
+                "capability",
+                {
+                    "capability": capability,
+                    "scope": scope,
+                    "binding_id": binding_id,
+                    "request_id": request.request_id,
+                    "ttl_seconds": request.ttl_seconds,
+                    "reason": request.reason,
+                    "prompt": grant.prompt,
+                    # The gated call, captured for auto-redispatch (durable via the hosted task).
+                    "replay_call_name": call_name,
+                    "replay_call_id": call_id,
+                    "replay_arguments": dict(arguments),
+                },
+            )
+            tail = (
+                "Once it is granted it will run automatically; you do not need to retry."
+                if self.capability_auto_redispatch
+                else "Do not repeat other work for it; once it is granted, retry this tool."
+            )
+            return ToolResult(
+                ok=True,
+                content={
+                    "status": "pending_capability",
+                    "capability": capability,
+                    "request_id": request.request_id,
+                    "task_id": task_id,
+                    "message": f"Access to '{capability}' is pending approval (task {task_id}). {tail}",
+                },
+            )
+        try:
+            lease = self._capability_vault.admit(request, grant)
+        except ValueError as exc:
+            recorder.emit(
+                "capability.denied",
+                turn_id=turn_id,
+                parent_id=parent_id,
+                level="warning",
+                data={"capability": capability, "binding_id": binding_id, "reason": str(exc)},
+            )
+            raise PermissionDenied(
+                f"capability grant rejected: {exc}", error_code="capability_scope_widened"
+            ) from exc
+        recorder.emit(
+            "capability.granted",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data={
+                "capability": capability,
+                "binding_id": binding_id,
+                "lease_id": lease.lease_id,
+                "expires_at": lease.expires_at,
+                "scope": lease.scope,
+            },
+        )
+        return None
+
+    def _rotate_capability_lease(
+        self,
+        current: CapabilityLease,
+        capability: str,
+        scope: dict[str, Any],
+        binding_id: str,
+        *,
+        recorder: AgentRecorder,
+        turn_id: str,
+        parent_id: str | None,
+    ) -> None:
+        """Proactively refresh a near-expiry lease (see ``capability_rotate_skew_seconds``). Re-brokers
+        a fresh lease for the same scope and admits it, carrying over the lease's durability and its
+        ``max_expires_at`` ceiling (and capping the refreshed expiry at that ceiling). A non-grant
+        (deny/pending) or a scope-widening grant leaves the still-valid current lease untouched —
+        rotation never disrupts an in-flight capability; the lease just expires later and re-brokers
+        through the normal path."""
+        broker = self.capability_broker
+        if broker is None:
+            return
+        request = CapabilityRequest(
+            capability=capability, scope=scope, run_id=self.spec.run_id, binding_id=binding_id
+        )
+        grant = broker.request(request)
+        if not isinstance(grant, CapabilityLease):
+            return  # deny/pending — keep the current valid lease, no disruption
+        ceiling = current.max_expires_at
+        expires_at = grant.expires_at if ceiling is None else min(grant.expires_at, ceiling)
+        rotated = replace(
+            grant, durable=current.durable, max_expires_at=ceiling, expires_at=expires_at
+        )
+        try:
+            self._capability_vault.admit(request, rotated)
+        except ValueError:
+            return  # broker tried to widen scope — keep the current lease (fail-closed)
+        recorder.emit(
+            "capability.rotated",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data={
+                "capability": capability,
+                "old_lease_id": current.lease_id,
+                "new_lease_id": rotated.lease_id,
+                "expires_at": rotated.expires_at,
+            },
         )
 
     def _check_run_boundary(self, deadline: float | None) -> None:

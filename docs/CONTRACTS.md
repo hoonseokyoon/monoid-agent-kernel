@@ -32,7 +32,9 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `tool`, `EventSink`,
   `CheckpointStore`, `PermissionPolicy`, and the rest of `contracts`.
 - **Experimental**: async-task seams (`TaskExecutor`, `ResultInjector`,
-  `TaskReporter`); multimodal content parts (`ImagePart` / `DocumentPart`
+  `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
+  `LoopSession`, `SessionState`, `ControlCommand` / `ControlResult` /
+  `ControlDispatcher`); multimodal content parts (`ImagePart` / `DocumentPart`
   round-trip but are not yet forwarded to models).
 - **Not a contract**: `native_agent_runner.reference.*` (example services).
 
@@ -358,6 +360,225 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
   SKILL.md's parent directory is the bundle root. Frontmatter fields: `name`, `description`,
   `allowed-tools` (space-separated per the spec, or an inline list), `metadata`. Parsed by
   the same zero-dependency `parse_frontmatter` used for subagents.
+
+### Session Lifecycle (`AgentSession` + FSM)
+
+`AgentLoop` is the engine; `AgentSession` is the embedder contract a control plane depends
+on (so an Agent Daemon/Cell never imports the loop). `LoopSession` is the reference facade
+that wraps an `AgentLoop`, owns the FSM, and delegates execution:
+
+- `SessionState` — the formal lifecycle FSM (a `str`-enum): `created`, `idle`, `running`,
+  `awaiting_input`, `awaiting_tasks`, `paused`, `interrupted`, `turn_failed`, `limited`,
+  `cancelled`, `completed`, `failed`. `cancelled`/`completed`/`failed` are terminal.
+- `state_from_suspension(suspension)` projects a pump `Suspension` onto a state (the seam that
+  keeps the FSM in sync with the engine without the engine knowing about it). `LEGAL_TRANSITIONS`
+  + `can_transition` / `assert_transition` define the legal edges. `to_session_state(status,
+  error_code=...)` reconciles the legacy status strings (`BackendRunState` / `status.json` /
+  `project_run_status`) onto the one enum.
+- `LoopSession.open() / submit() / run_until_suspended() / close()` delegate to the loop and
+  re-derive `state` at each boundary. `inspect() -> SessionInspection` and `health() ->
+  SessionHealth` are recomputed from live loop state on every call (never stale).
+- `pause()` / `resume()` / `cancel(reason)`: pause freezes the turn at the *next start-of-step*
+  boundary (its in-flight `pending_observations` are kept), suspends with `reason="paused"`, and
+  persists a checkpoint — so resume (a `run_until_suspended(None)` re-pump) continues the same
+  turn, in-process or after a restart. Pause lands only at a step boundary (an in-flight model
+  call completes first; only an interrupt aborts mid-generation under token streaming). Entering
+  `paused` emits a `session.state.changed` event.
+
+### Control Protocol
+
+`native-agent-runner.control-command.v1` is a transport-independent envelope + a single
+`dispatch` seam, so a Daemon drives a session through one entry point instead of a route per op:
+
+- `ControlCommand(type, run_id, args, issuer, reason)` and `ControlResult(run_id, type, status,
+  state, data, error, error_code)` are plain data (`status` ∈ `ok` / `not_implemented` /
+  `unsupported` / `error`). `ControlDispatcher.dispatch(command) -> ControlResult` is the contract;
+  `RunnerBackend.dispatch` is the reference impl, routing each command to the in-process method it
+  already exposes.
+- Command types: `pause`, `resume`, `cancel`, `interrupt`, `inspect`, `health`, `send_message`,
+  `runtime_config`, `replace_runtime_config`, `create_task`, `report_task_result`, `status`. An
+  unknown type returns `unsupported` (the wire vocabulary stays forward-compatible).
+- HTTP: `POST /v1/runs/{run_id}/control` with `{"type": ..., "args": {...}, "issuer": ...,
+  "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
+  envelope stays credential-free). `resume` on a *live* paused run wakes it; on a run not in
+  memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
+### Inbox Message Envelope
+
+`native-agent-runner.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a
+run so it carries **provenance** and an idempotency key. Like the control protocol it is an
+edge/transport contract — the reference `RunnerBackend` wraps inbound content into it; the engine
+(`AgentLoop`) never sees the envelope (it still receives unwrapped `content` via `submit`).
+
+- Fields (CloudEvents-shaped): `id` (the dedup key), `source`, `type`, `run_id`, `created_at`,
+  `correlation_id` (defaults to `id` — a flow root), `causation_id`, `traceparent`/`tracestate`
+  (W3C Trace Context; see below), `content` (the JSON-native payload: a `str` or a list of
+  content-part dicts), `metadata`. `is_inbox_envelope(obj)` discriminates an envelope from a legacy
+  raw `str`/`list` queue entry.
+- **Idempotent ingress**: `RunnerBackend.send_message(..., message_id=, source=, correlation_id=,
+  traceparent=, tracestate=)`
+  wraps + enqueues the envelope. A caller-supplied `message_id` makes the send idempotent — an
+  already-processed id short-circuits to `status="duplicate"`, and a redelivery still in flight is
+  dropped at dequeue. Processed ids are tracked per-run and **checkpointed** (`RunCheckpoint
+  .inbox_seen_ids`), so dedup survives a restart (effectively-once ingress — the marker rides the
+  same checkpoint as the message's effects, the Idempotent-Consumer pattern). Absent an id the edge
+  mints one. HTTP `POST /v1/runs/{id}/messages` accepts optional `message_id`/`source`/
+  `correlation_id`; a control `send_message` uses the command's `command_id` as the dedup key.
+- Back-compat: the queue/checkpoint carry envelopes (JSON dicts), but legacy raw `str`/`list`
+  entries from older checkpoints still restore and process.
+- **Symmetric dedup on result ingestion**: `TaskManager.report_result` (the hosted-task result
+  callback) is idempotent the same way — **first report wins**. A duplicate report (a callback
+  retry) is a safe no-op that neither clobbers the recorded result nor re-publishes to the reentry
+  queue (which would make the agent observe the result twice). The dedup signal is the
+  already-persisted+rehydrated `ready_for_reentry`/`finished_at` job state, so it holds across a
+  restart with no extra bookkeeping; the result dict carries a `duplicate` flag. (A sequence/CAS to
+  let a genuinely *newer* report supersede an older one is a deferred refinement.)
+
+### Outbox Request
+
+`native-agent-runner.outbox-request.v1` (`core/outbox.py`, `OutboxRequest`) is the symmetric half of
+the inbox and the outbound twin of a capability lease: a tool **stages** an external side-effect
+(send an email, call a webhook) durably instead of doing the IO inline. The Transactional-Outbox
+pattern with the checkpoint as the transaction; the engine never performs the send.
+
+- A tool handler calls `ToolContext.emit_outbox(destination, payload, *, capability,
+  idempotency_key="")`; the request is appended to the per-run `Outbox` (checkpointed in full as
+  `RunCheckpoint.outbox_requests`) and `outbox.requested` is emitted. The request carries the
+  capability lease **handle** (`token_ref`, captured via `capability_token(capability)`) — never a
+  secret. Bind the outbox tool with `runtime.requires_lease` so the existing capability gate
+  brokers/revokes the lease *before* the send is staged (least-privilege egress).
+- **Edge drains, effectively-once**: `RunnerBackend(outbox_sender_factory=lambda request: ...)`
+  supplies an `OutboxSender` (`send(request) -> OutboxReceipt`); the backend drains
+  `loop.pending_outbox()` at each park/settle, performing the IO (resolving `token_ref` to the real
+  credential) and recording the outcome via `loop.record_outbox_result(...)` → `outbox.dispatched` /
+  `outbox.failed`. The request is persisted `pending` before the send and `dispatched` after; a
+  crash in between re-dispatches on recover, made safe by the `idempotency_key` the external target
+  honors. A retryable failure stays `pending` and redrives up to `outbox_max_attempts`, then
+  dead-letters as `failed`. No sender → requests stay durably `pending`.
+- **Backoff + redrive (retry decoupled from run activity)**: a retryable failure stamps a durable
+  `next_attempt_at` on the request — capped exponential backoff with **full jitter** (`uniform(0,
+  min(outbox_retry_cap_s, outbox_retry_base_s * outbox_retry_factor**attempts))`). The drain only
+  dispatches **due** requests (`loop.due_outbox(now)`; a freshly staged one has `next_attempt_at=0.0`
+  → due immediately, so the happy path is unchanged), and because the schedule is on the checkpoint
+  it survives a restart. The backend's **watchdog tick** also runs `_redrive_outbox()`: for each live
+  run it marshals the drain onto the shared loop, so a due request is redispatched even while its run
+  sits idle (redrive requires the watchdog running — the backend's operational background loop). The
+  loop stays policy-free: the edge computes `next_attempt_at` and passes it to
+  `record_outbox_result(...)`.
+- Reference `reference/outbox.py`: `RecordingOutboxSender` (dev/tests), `FailingOutboxSender`
+  (retry-path tests), and an `OutboxToolProvider` yielding a generic `outbox.send` tool.
+- A request also carries `traceparent`/`tracestate` (W3C Trace Context; see below) and
+  `correlation_id`/`causation_id` (the request↔result link reused by ack-back). Per-destination
+  routing is deferred.
+- **Ack-back (request-reply, non-park)**: stage with `emit_outbox(..., expect_ack=True)` (the
+  `outbox.send` tool exposes `expect_ack`/`reply_to`). When the send reaches a terminal outcome
+  (`dispatched`/`failed`) the edge delivers the receipt **back to the run as an inbox message**
+  (`type="outbox_ack"`, `correlation_id` = the request's flow, `causation_id` = the request id,
+  carrying its `traceparent`) via the idempotent inbox path with a stable id (`ack_<request id>`) so a
+  redelivery is a no-op. The agent observes it on its **next activation — it never parks**; a
+  terminal run has no consumer, so the ack is dropped (documented). `reply_to` empty = the run's own
+  inbox. Park-and-await (the agent suspending until the reply lands) is a deferred superset that
+  reuses this same ack plumbing.
+
+### Trace Context on envelopes (`traceparent` / `tracestate`)
+
+Both envelopes carry optional W3C Trace Context (`core/trace_context.py`): `traceparent`
+(`00-{trace-id}-{span-id}-{flags}`) and the opaque vendor `tracestate`. This is **observability
+only** — it complements `correlation_id`/`causation_id` (the domain identity routing and
+reply-matching depend on) and **application behavior never depends on it**; a missing or malformed
+header is ignored.
+
+- Helpers: `new_traceparent()` (fresh root), `child_traceparent(parent)` (same trace-id, new
+  span-id), `parse_traceparent(s)` (validates shape, rejects all-zero ids, returns `None` on
+  garbage), `trace_id_of(s)`.
+- **Inbox (ingress)**: `send_message(..., traceparent=, tracestate=)` propagates an inbound trace
+  onto the envelope. The engine unwraps the envelope before `submit`, so an outbox request can't
+  auto-inherit the *causing* inbox message's trace inside the core — a fresh root is minted instead
+  (cross-loop inheritance is a later edge enhancement).
+- **Outbox (egress)**: `emit_outbox` stamps a fresh root `traceparent` at staging (pure, no IO) so
+  the request is traced from birth; the edge sender derives a `child_traceparent` for the actual
+  outbound call. The trace rides the `outbox.requested`/`outbox.dispatched`/`outbox.failed` events so
+  the OTel event-sink mapper can stitch spans across a restart.
+
+### Capability Request / Lease
+
+Secrets stay outside the core. When a tool needs external access it carries a *capability*
+requirement, and the loop acquires a scoped, expiring **lease** from a broker before running it —
+generalizing the gateway-token pattern (LLM/web access already keep the provider key behind a
+gateway) into one contract any capability can use, acquired on-demand rather than only
+statically provisioned.
+
+- `CapabilityRequest` (`...capability-request.v1`) / `CapabilityLease` (`...capability-lease.v1`) /
+  `CapabilityDenial` are plain data. A lease carries a `token_ref` **handle, never the secret** —
+  the gateway/tool edge resolves it, not the core.
+- `CapabilityBroker.request(req) -> CapabilityLease | CapabilityDenial` is the seam an integrator
+  (Daemon/Cell) implements. `AutoGrantBroker` is the zero-config dev default; the reference
+  `GatewayCapabilityBroker` mints a scoped gateway token as the lease handle (the "absorb the
+  gateway" path); `DenyAllBroker` is the safe default.
+- **Implicit, binding-declared**: a `ToolBinding` with `runtime.requires_lease` declares its tool's
+  `capability` needs a lease; the agent just calls the tool. `AgentLoop(capability_broker=...)`
+  gates the call: a cache miss requests a lease (scoped to the binding) and on grant proceeds; a
+  denial raises so the call never runs and the model gets an actionable error. Events
+  `capability.requested` / `capability.granted` / `capability.denied` give the audit trail.
+- **Using the lease**: the granted handle reaches the running tool via
+  `ToolContext.capability_token(capability) -> token_ref | None` (the handle, resolved at the
+  edge). The reference backend provisions a per-run broker with
+  `RunnerBackend(capability_broker_factory=lambda request: ...)` — scoped to the run's identity
+  (e.g. a `GatewayCapabilityBroker` per tenant); `None` leaves gating off for that run.
+- **Security invariants the core enforces**: a grant may only NARROW the requested scope, never
+  widen it (`CapabilityVault.admit` is fail-closed); a lease is expiry-checked before reuse; the
+  per-run vault holds handles only and durable (approved) leases are checkpointed as handles, while
+  ephemeral sync grants are re-brokered on restart. Any `CapabilityBroker` can be verified against
+  these invariants with the parametrized `tests/test_capability_broker_contract.py` suite.
+- **CLI**: `native-agent run --auto-grant-capabilities` wires the built-in `AutoGrantBroker` (local
+  dev), or `--capability-broker path.py:factory` loads a custom broker (`factory()` returns it).
+- **Async approval (escalation)**: a broker may return `CapabilityPending` instead of granting
+  synchronously — the loop then parks the run on a `capability` hosted-task (carrying the request
+  AND the gated call) and hands the model a "pending" observation; when the grant is reported
+  (`report_task_result` with a `lease`), the lease is admitted to the vault (fail-closed against the
+  original request scope). `HumanEscalationBroker` (reference) escalates every request; a real
+  policy broker auto-grants low-risk capabilities, denies forbidden ones, and escalates only the
+  sensitive ones (the three-way `lease`/`denial`/`pending` outcome is the point).
+- **Auto-redispatch** (`AgentLoop.capability_auto_redispatch`, default on): after the grant the loop
+  re-executes the gated call automatically at the next step (through the normal tool path, real
+  permission/quota/events) and delivers the result to the model — no model retry needed. If a replay
+  can't run cleanly (no valid lease), it falls back to model-retry. The gated tool never executed at
+  the gate, so the replay is its first and only execution (no double side effect).
+- **Durable leases**: an escalation-approved lease is marked `durable` and checkpointed (the
+  `token_ref` handle only, never a secret), so a restart does not re-prompt the approver; ephemeral
+  sync grants are not persisted (re-brokered on restart). The gated call is captured in the durable
+  hosted-task so auto-redispatch survives a restart too.
+- **Revocation** (the operator/Daemon kill switch): `revoke_capability` (a Control command, or
+  `AgentLoop.revoke_capability(...)`) records a revocation in the per-run vault; `get_valid` /
+  `token_for` then refuse the handle **fail-closed**. Three granularities, one mechanism: per
+  `capability` (authoritative — the gate refuses to even *re-broker*, so a permissive broker can't
+  resurrect it), per `lease_id`, and an issued-before `before` watermark (a bulk cohort kill, à la
+  AWS STS `aws:TokenIssueTime`). Because a lease is only a handle the tool re-fetches per call, the
+  vault is an object-capability *caretaker* — revoking is just refusing to hand the handle back, so
+  it is instant and needs no distributed secret clawback. Revocation state is checkpointed so a
+  revoked capability stays dead across a restart. Emits `capability.revoked`. (Edge enforcement —
+  the gateway refusing a revoked token too — is a deferred defense-in-depth follow-up; a tool that
+  cached a resolved secret past revocation is bounded only by the short TTL.)
+- **Rotation** (`AgentLoop.capability_rotate_skew_seconds`, default `0.0` = off): a cached lease
+  within `skew` seconds of expiry is re-brokered on use — the handle/expiry refresh under a stable
+  contract without a model retry or a re-prompt. Bounded by `CapabilityLease.max_expires_at`, an
+  absolute ceiling so a one-time human approval is never silently auto-extended forever; past the
+  ceiling the lease is left to expire (then the normal re-broker / re-escalation path applies). A
+  deny/pending/scope-widening rotation leaves the still-valid current lease untouched (no
+  in-flight disruption). Emits `capability.rotated`.
+- **Web tools through the gate (opt-in)**: the built-in `web.search` / `web.fetch` / `web.context`
+  tools declare a `capability`; set `runtime.requires_lease` on their binding and the existing gate
+  brokers a lease before each call. The lease handle becomes the request's `Authorization` (threaded
+  context → `WebService` → `WebGatewayClient` as a per-call credential override; absent a lease, the
+  client uses its static run-start token — back-compat). The reference `GatewayCapabilityBroker`
+  mints a **web-gateway-compatible** token (`kind=web_gateway`/`aud=csp.web-gateway`) for `web.*` so
+  the existing web gateway accepts it unchanged. Net effect: web access inherits rotation +
+  revocation (an operator can `revoke_capability("web.search")` to kill a live run's web access
+  without cancelling it). The LLM path is deliberately NOT routed this way.
+- **Gateway model-token refresh** (separate from capabilities): `GatewayModelAdapter.token_provider`
+  is an optional per-request token source; the reference backend wires a source that re-mints the
+  `llm_gateway` token near expiry, so a run outliving the token TTL keeps LLM access without a
+  restart. Default (no provider) is the static token. This is a refresh seam, not capability routing
+  — the LLM hot path stays out of the broker.
 
 ### Permission Boundary
 

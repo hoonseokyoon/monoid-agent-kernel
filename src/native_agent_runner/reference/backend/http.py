@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from native_agent_runner.core.agents import AgentDefinition, AgentRuntimeConfig
+from native_agent_runner.core.control import ControlCommand
 from native_agent_runner.reference._shared.http_util import (
     HardenedThreadingHTTPServer,
     HttpRequestTooLarge,
@@ -156,9 +157,35 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "messages":
                     run_id = parts[2]
                     payload = self._read_json()
+                    # Optional inbox envelope fields: a client-supplied message_id makes the send
+                    # idempotent (a retry with the same id is processed once).
                     self._write_json(
-                        backend.send_message(run_id, self._bearer_token(), content=str(payload.get("content") or ""))
+                        backend.send_message(
+                            run_id,
+                            self._bearer_token(),
+                            content=str(payload.get("content") or ""),
+                            message_id=str(payload.get("message_id") or ""),
+                            source=str(payload.get("source") or "http"),
+                            correlation_id=str(payload.get("correlation_id") or ""),
+                        )
                     )
+                    return
+                if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "control":
+                    run_id = parts[2]
+                    payload = self._read_json()
+                    # The bearer token authorizes the run; carry it into args so dispatch (and the
+                    # method it wraps) can authorize, without putting it on the wire envelope.
+                    args = dict(payload.get("args") or {})
+                    args["token"] = self._bearer_token()
+                    command = ControlCommand(
+                        type=str(payload.get("type") or ""),  # type: ignore[arg-type]
+                        run_id=run_id,
+                        args=args,
+                        issuer=str(payload.get("issuer") or ""),
+                        reason=str(payload.get("reason") or ""),
+                        command_id=str(payload.get("command_id") or ""),
+                    )
+                    self._write_json(backend.dispatch(command).to_json())
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "tasks":
                     run_id = parts[2]

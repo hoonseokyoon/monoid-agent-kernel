@@ -4,7 +4,7 @@ import json
 import os
 import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -49,6 +49,11 @@ class GatewayModelAdapter:
     token: str | None = None
     token_env: str = DEFAULT_GATEWAY_TOKEN_ENV
     token_file: Path | None = None
+    # Optional token source, consulted per request (``_headers`` already re-resolves every call).
+    # When set, it takes precedence over the static token/file/env — so a backend can supply a
+    # callable that re-mints a fresh gateway token near expiry, keeping a long run (one that outlives
+    # the token TTL) authenticated without a restart. ``None`` = today's static behavior.
+    token_provider: Callable[[], str | None] | None = None
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
     supports_multimodal: ClassVar[bool] = True
@@ -206,6 +211,8 @@ class GatewayModelAdapter:
         return headers
 
     def _resolve_gateway_token(self) -> str | None:
+        if self.token_provider is not None:
+            return self.token_provider()
         if self.token is not None:
             return self.token
         if self.token_file is not None:

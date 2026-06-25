@@ -24,7 +24,17 @@ from native_agent_runner.core.agents import (
     validate_runtime_config,
 )
 from native_agent_runner.core.cancellation import CancellationToken
+from native_agent_runner.core.control import ControlCommand, ControlResult
 from native_agent_runner.core.events import AgentEvent
+from native_agent_runner.core.inbox import InboxMessage, is_inbox_envelope
+from native_agent_runner.core.outbox import OutboxReceipt
+from native_agent_runner.core.trace_context import new_traceparent
+from native_agent_runner.core.lifecycle import (
+    LoopSession,
+    SessionState,
+    state_from_suspension,
+    to_session_state,
+)
 from native_agent_runner.core.packages import (
     apply_package,
     create_approval,
@@ -67,7 +77,7 @@ from native_agent_runner.loop import AgentLoop
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.providers.base import ModelAdapter
 from native_agent_runner.providers.gateway import GatewayModelAdapter
-from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
+from native_agent_runner.reference._shared.tokens import TokenError, TokenKind, TokenManager
 from native_agent_runner.recorder import append_event_to_run
 from native_agent_runner.tools.builtin import agent_spawn_tool, builtin_tools
 from native_agent_runner.web import WebGatewayClient
@@ -75,8 +85,11 @@ from native_agent_runner.workspace.paths import is_within
 
 BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "failed", "limited"]
 
-# Sentinel enqueued to wake/stop a session worker blocked on its message queue.
+# Sentinels enqueued to wake/stop a session worker blocked on its message queue.
 _CLOSE_SESSION = object()
+# Wakes a paused worker: resume the SAME turn with no new input. Ignored (a no-op) by the other
+# queue-waiting branches, which expect a real user message or _CLOSE_SESSION.
+_RESUME_SESSION = object()
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
 
 # A run-artifact fetch handle is a bare sha256 hex digest — validated before any store lookup so a
@@ -105,8 +118,11 @@ def _normalize_inbound_message(content: str | Sequence[Any]) -> str | list[dict[
 
 
 def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]:
-    """Convert a dequeued backend message (text ``str`` or ``list[dict]`` of part dicts) into a
-    loop ``submit`` input. ``content_part_from_json`` rebuilds the typed parts at the boundary."""
+    """Convert a dequeued backend message into a loop ``submit`` input. Unwraps an inbox envelope to
+    its ``content`` (the provenance/id stay on the queue/checkpoint, not in the loop); a legacy raw
+    ``str``/``list[dict]`` entry passes through. ``content_part_from_json`` rebuilds typed parts."""
+    if is_inbox_envelope(message):
+        message = InboxMessage.from_json(message).content
     if isinstance(message, list):
         return tuple(content_part_from_json(part) for part in message)
     return message  # str
@@ -213,6 +229,10 @@ class BackendRunRecord:
     runtime_config: AgentRuntimeConfig | None = None
     runtime_config_issuer: str = ""
     runtime_config_reason: str = ""
+    # Authoritative lifecycle FSM state, updated by the session driver as it observes each
+    # suspension. The control protocol's inspect/health read this (a throwaway LoopSession is
+    # seeded with it) since the backend drives the loop directly, not through a facade.
+    session_state: SessionState = SessionState.CREATED
     loop: AgentLoop | None = None
     # Pending user messages for a multi-turn session. asyncio.Queue (not queue.Queue) so the
     # run coroutine awaits the next message WITHOUT holding a thread — a parked multi-turn
@@ -221,6 +241,12 @@ class BackendRunRecord:
     # backend's _call_soon so the put runs on the loop. Created without a running loop (3.10+
     # binds lazily); all gets/puts happen on the shared loop.
     message_queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue, repr=False)
+    # Ids of inbox messages already processed — the idempotency/dedup set. Checkpointed (restored on
+    # recover) so a redelivered message is dropped once, even across a restart. Mutated only on the
+    # shared loop (dequeue), so no extra lock is needed.
+    seen_inbox_ids: set[str] = field(default_factory=set, repr=False)
+    # The run's outbox sender (drains staged sends), or None to leave staged requests pending.
+    outbox_sender: Any = field(default=None, repr=False)
 
 
 @dataclass
@@ -391,6 +417,44 @@ async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> No
 
 
 @dataclass
+class _GatewayTokenSource:
+    """A callable gateway-token source that re-mints shortly before expiry. Resolved per request by
+    the model adapter (``GatewayModelAdapter.token_provider``), so a run that outlives the token TTL
+    stays authenticated without a restart — the same re-mint the recovery path already performs,
+    applied proactively and in-process (the backend holds the signing key). Not thread-safe by design:
+    a run's model calls are serialized on its loop."""
+
+    token_manager: TokenManager
+    kind: TokenKind
+    audience: str
+    run_id: str
+    tenant_id: str
+    user_id: str
+    ttl_s: int
+    metadata: dict[str, Any] = field(default_factory=dict)
+    refresh_skew_s: int = 300
+    _token: str = ""
+    _expires_at: float = 0.0
+
+    def __call__(self) -> str:
+        now = time.time()
+        # Re-mint near expiry; cap the skew at half the TTL so a short TTL doesn't re-mint every call.
+        skew = min(self.refresh_skew_s, self.ttl_s // 2)
+        if not self._token or now >= self._expires_at - skew:
+            self._token = self.token_manager.issue(
+                kind=self.kind,
+                audience=self.audience,
+                run_id=self.run_id,
+                tenant_id=self.tenant_id,
+                user_id=self.user_id,
+                ttl_s=self.ttl_s,
+                metadata=dict(self.metadata),
+            )
+            self._expires_at = now + self.ttl_s
+        return self._token
+
+
+@dataclass
 class RunnerBackend:
     run_root: Path
     token_manager: TokenManager
@@ -438,6 +502,26 @@ class RunnerBackend:
     # config validation — see _backend_builtin_tool_specs. Empty → no providers.
     tool_providers: tuple[Any, ...] = ()
     context_providers: tuple[Any, ...] = ()
+    # Per-run capability broker factory: ``(request) -> CapabilityBroker | None``. Called at
+    # loop-build time so a broker can be scoped to the run's identity (tenant/user/run id) — e.g.
+    # a GatewayCapabilityBroker minting per-tenant tokens. None (or a None return) leaves capability
+    # gating off for that run. A factory (not an instance) because a broker is typically per-run
+    # identity-bound, unlike the shared tool/context providers above.
+    capability_broker_factory: Callable[[BackendRunRequest], Any] | None = None
+    # Per-run outbox sender (drains staged outbound sends at the edge — see core/outbox.py). A
+    # factory like capability_broker_factory; None (or a None return) leaves staged requests pending
+    # (durable, never dispatched). The drain performs the actual IO; the core only stages.
+    outbox_sender_factory: Callable[[BackendRunRequest], Any] | None = None
+    # An outbox request is redispatched (at-least-once + idempotency_key) at most this many times on
+    # a retryable failure before it is dead-lettered as failed.
+    outbox_max_attempts: int = 5
+    # Retry schedule for a failed outbox send: capped exponential backoff with **full jitter**
+    # (delay = uniform(0, min(cap, base * factor**attempts))). The next-attempt time is stamped on
+    # the request (durable), so the schedule survives a restart; the watchdog redrive tick (below)
+    # dispatches a request once its time arrives, decoupling retry timing from run activity.
+    outbox_retry_base_s: float = 1.0
+    outbox_retry_factor: float = 2.0
+    outbox_retry_cap_s: float = 300.0
     # A run whose checkpoint cannot be resumed is retried at most this many times across
     # restarts before being marked unrecoverable (a durable failure.json), so a poison
     # checkpoint never drives an unbounded restart/crash loop.
@@ -469,6 +553,9 @@ class RunnerBackend:
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _watchdog_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _run_semaphore: asyncio.BoundedSemaphore | None = field(default=None, init=False, repr=False)
+    # RNG for the outbox backoff jitter — a dedicated instance so a test can seed it deterministically
+    # (backend._outbox_rng.seed(...)) without perturbing global random state.
+    _outbox_rng: random.Random = field(default_factory=random.Random, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._worker_id = uuid.uuid4().hex
@@ -829,8 +916,203 @@ class RunnerBackend:
             "interrupt_requested": requested,
         }
 
+    def pause_run(self, run_id: str, token: str) -> dict[str, Any]:
+        """Cooperative pause (keeps the session alive): signal the loop to freeze the current
+        turn at its next start-of-step boundary; the driver then parks until a resume wakes it.
+        A no-op on a terminal or not-yet-built run. The flag set is a thread-safe one-way signal
+        (like cancel/interrupt). Resume via the ``resume`` control command (``signal_resume``)."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            loop = record.loop
+            terminal = record.status in {"completed", "failed", "limited"}
+        requested = not terminal and loop is not None
+        if requested:
+            loop.pause_turn()
+        return {
+            "run_id": record.run_id,
+            "tenant_id": record.tenant_id,
+            "status": record.status,
+            "pause_requested": requested,
+        }
+
+    def signal_resume(self, run_id: str, token: str) -> dict[str, Any]:
+        """Wake a paused *live* run: push a resume signal so the driver re-pumps the frozen turn
+        with no new input. For a run not currently in memory (parked after a restart), use
+        :meth:`resume_run` (checkpoint recovery) instead — the ``resume`` control command picks
+        the right one. A no-op on a terminal run."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            terminal = record.status in {"completed", "failed", "limited"}
+        if terminal:
+            return {"run_id": run_id, "status": record.status, "resumed": False}
+        # asyncio.Queue is not thread-safe; schedule the put on the shared loop.
+        self._call_soon(record.message_queue.put_nowait, _RESUME_SESSION)
+        return {"run_id": run_id, "status": record.status, "resumed": True}
+
+    def revoke_capability(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        capability: str | None = None,
+        lease_id: str | None = None,
+        before: float | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Revoke a capability lease on a *live* run (the operator/Daemon kill switch). Mirrors
+        :meth:`pause_run`: signal the loop directly (a thread-safe vault mutation). A no-op on a
+        terminal or not-in-memory run (revoking a parked-and-evicted run is not supported in v1 —
+        load it first). The ``capability.denied`` audit event is emitted on the loop thread when the
+        next gated call hits the revocation."""
+        self._authorize_run(run_id, token)
+        record = self._record(run_id)
+        with self._lock:
+            loop = record.loop
+            terminal = record.status in {"completed", "failed", "limited"}
+        summary: dict[str, Any] = {}
+        revoked = not terminal and loop is not None
+        if revoked:
+            summary = loop.revoke_capability(
+                capability=capability, lease_id=lease_id, before=before, reason=reason
+            )
+        return {
+            "run_id": record.run_id,
+            "tenant_id": record.tenant_id,
+            "status": record.status,
+            "revoked": revoked,
+            **summary,
+        }
+
+    def dispatch(self, command: ControlCommand) -> ControlResult:
+        """Reference ``ControlDispatcher``: route one ``ControlCommand`` to the in-process method
+        that already backs it. The run token travels in ``command.args['token']`` (the HTTP layer
+        injects the bearer token); it is consumed here and never echoed back. Auth failures
+        propagate (the HTTP layer maps them to 401); a missing run is reported as ``unsupported``;
+        a controlled operation error is reported as ``error`` with its code. Unknown command types
+        return ``unsupported`` — the wire vocabulary stays forward-compatible."""
+        args = dict(command.args)
+        token = str(args.pop("token", "") or "")
+        run_id = command.run_id
+        ctype = command.type
+
+        def ok(data: dict[str, Any], *, state: str | None = None) -> ControlResult:
+            return ControlResult(run_id=run_id, type=ctype, status="ok", state=state, data=dict(data))
+
+        try:
+            if ctype == "pause":
+                return ok(self.pause_run(run_id, token))
+            if ctype == "resume":
+                with self._lock:
+                    live = run_id in self._records
+                return ok(self.signal_resume(run_id, token) if live else self.resume_run(run_id, token))
+            if ctype == "cancel":
+                return ok(self.cancel_run(run_id, token))
+            if ctype == "interrupt":
+                return ok(self.interrupt_turn(run_id, token))
+            if ctype in {"inspect", "health"}:
+                loop = self._authorize_active_loop(run_id, token)
+                # Seed the throwaway facade with the record's authoritative FSM state (the backend
+                # drives the loop directly, so the facade's own cache never tracked this run).
+                session = LoopSession(loop, _state=self._record(run_id).session_state)
+                if ctype == "inspect":
+                    inspection = session.inspect()
+                    return ok(inspection.to_json(), state=inspection.state.value)
+                health = session.health()
+                return ok(health.to_json(), state=health.state.value)
+            if ctype == "status":
+                return ok(self.status(run_id, token))
+            if ctype == "runtime_config":
+                return ok(self.runtime_config(run_id, token))
+            if ctype == "replace_runtime_config":
+                return ok(
+                    self.replace_runtime_config(
+                        run_id,
+                        token,
+                        expected_version=int(args.get("expected_version", 0)),
+                        issuer=command.issuer,
+                        reason=command.reason,
+                        config=AgentRuntimeConfig.from_json(args["config"]),
+                    )
+                )
+            if ctype == "send_message":
+                # A control command carries its own id (command_id) — use it as the inbox dedup key
+                # so a redelivered control send is processed once.
+                return ok(
+                    self.send_message(
+                        run_id,
+                        token,
+                        content=args.get("content") or "",
+                        message_id=command.command_id,
+                        source="control",
+                    )
+                )
+            if ctype == "create_task":
+                return ok(
+                    self.create_task(
+                        run_id,
+                        token,
+                        kind=str(args.get("kind") or ""),
+                        request=dict(args.get("request") or {}),
+                    )
+                )
+            if ctype == "report_task_result":
+                return ok(
+                    self.report_task_result(
+                        run_id,
+                        token,
+                        task_id=str(args.get("task_id") or ""),
+                        result=dict(args.get("result") or {}),
+                        status=str(args.get("status") or "answered"),
+                    )
+                )
+            if ctype == "revoke_capability":
+                before = args.get("before")
+                return ok(
+                    self.revoke_capability(
+                        run_id,
+                        token,
+                        capability=(str(args["capability"]) if args.get("capability") else None),
+                        lease_id=(str(args["lease_id"]) if args.get("lease_id") else None),
+                        before=(float(before) if before is not None else None),
+                        reason=command.reason,
+                    )
+                )
+            return ControlResult(
+                run_id=run_id,
+                type=ctype,
+                status="unsupported",
+                error=f"unknown control command type: {ctype}",
+                error_code="unknown_control_command",
+            )
+        except PermissionDenied:
+            raise  # auth failures map to HTTP 401 in the route layer
+        except KeyError as exc:
+            return ControlResult(
+                run_id=run_id, type=ctype, status="unsupported", error=str(exc), error_code="run_not_found"
+            )
+        except (ValueError, NativeAgentError) as exc:
+            return ControlResult(
+                run_id=run_id,
+                type=ctype,
+                status="error",
+                error=str(exc),
+                error_code=getattr(exc, "error_code", "control_error"),
+            )
+
     def send_message(
-        self, run_id: str, token: str, content: str | Sequence[Any]
+        self,
+        run_id: str,
+        token: str,
+        content: str | Sequence[Any],
+        *,
+        message_id: str = "",
+        source: str = "api",
+        correlation_id: str = "",
+        causation_id: str = "",
+        traceparent: str = "",
+        tracestate: str = "",
     ) -> dict[str, Any]:
         """Deliver a follow-up user message to a running multi-turn session. It is queued and
         consumed as the next user turn once the current turn settles.
@@ -838,9 +1120,17 @@ class RunnerBackend:
         ``content`` is either a plain ``str`` or a sequence of content parts (``ContentPart``
         dataclasses or their JSON dicts) for a multimodal message. Multimodal parts reference
         workspace files by ``source_ref`` — the bytes are resolved at wire-build time — so the
-        message itself stays small; the size limit applies to the by-reference wire form."""
+        message itself stays small; the size limit applies to the by-reference wire form.
+
+        The message is wrapped in an ``inbox-message.v1`` envelope (provenance + idempotency). A
+        caller-supplied ``message_id`` is the dedup key: re-sending it (a retry) is processed once —
+        an already-processed id short-circuits to ``status="duplicate"``. Absent an id, a uuid is
+        minted (only duplicates still in flight dedup)."""
         self._authorize_run(run_id, token)
         record = self._record(run_id)
+        # Already-processed id -> idempotent no-op (the dequeue-time check below catches the rest).
+        if message_id and message_id in record.seen_inbox_ids:
+            return {"run_id": run_id, "status": "duplicate", "message_id": message_id}
         message = _normalize_inbound_message(content)
         # Normalize inline (data:) media to durable blobs BEFORE queueing, so the queue — and any
         # checkpoint taken while the message is still unconsumed — carries only small blob: refs,
@@ -855,14 +1145,24 @@ class RunnerBackend:
         )
         if wire_bytes > self.max_message_bytes:
             raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
+        envelope = InboxMessage(
+            content=message,
+            id=message_id or f"inbox_{uuid.uuid4().hex[:12]}",
+            source=source,
+            run_id=run_id,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            traceparent=traceparent,
+            tracestate=tracestate,
+        )
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
                 raise ValueError("cannot send a message to a terminal run")
             if record.message_queue.qsize() >= self.max_message_queue_depth:
                 raise ValueError("message queue is full; retry once the run drains it")
         # Enqueue on the shared loop (asyncio.Queue is not thread-safe across threads).
-        self._call_soon(record.message_queue.put_nowait, message)
-        return {"run_id": run_id, "status": "queued"}
+        self._call_soon(record.message_queue.put_nowait, envelope.to_json())
+        return {"run_id": run_id, "status": "queued", "message_id": envelope.id}
 
     def current_runtime_config(self, run_id: str) -> AgentRuntimeConfig | None:
         record = self._record(run_id)
@@ -1331,6 +1631,9 @@ class RunnerBackend:
         report_task_result wakes it from another thread."""
         consecutive_turn_failures = 0
         while True:
+            # Keep the authoritative FSM state on the record current with each park, so a
+            # concurrent control inspect/health reports the live state.
+            record.session_state = state_from_suspension(suspension)
             if suspension.reason in {"terminal", "limited"}:
                 break
             if suspension.reason == "awaiting_tasks":
@@ -1342,6 +1645,27 @@ class RunnerBackend:
                     # A task was delivered (or none remain): resume the pump.
                     suspension = await loop.arun_until_suspended(None)
                 # else: tasks still pending after the poll window -> keep waiting.
+                continue
+            if suspension.reason == "paused":
+                # Cooperative pause: the loop froze the turn at a clean step boundary (its
+                # pending_observations are kept). Park until a resume signal wakes us, then
+                # re-pump the SAME turn with no new input. The loop already checkpointed the
+                # pause park; persist the backend queue too.
+                if self._session_should_stop(record, started, turns):
+                    break
+                self._persist_run_checkpoint(record)
+                try:
+                    # Raw get: the paused branch is the one place that must SEE _RESUME_SESSION.
+                    signal = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                except asyncio.TimeoutError:
+                    break
+                if signal is _CLOSE_SESSION:
+                    break
+                if signal is not _RESUME_SESSION:
+                    # A user message arrived while paused: resume the frozen turn first, then
+                    # let the settled branch consume this message as the next turn.
+                    record.message_queue.put_nowait(signal)
+                suspension = await loop.arun_until_suspended(None)
                 continue
             if suspension.reason == "turn_failed":
                 # Recoverable model-turn failure: the session is alive (core kept it so). Apply
@@ -1376,7 +1700,7 @@ class RunnerBackend:
                 loop.await_user_input()
                 self._persist_run_checkpoint(record)
                 try:
-                    message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                    message = await self._await_session_message(record)
                 except asyncio.TimeoutError:
                     break
                 if message is _CLOSE_SESSION:
@@ -1393,7 +1717,7 @@ class RunnerBackend:
                 loop.await_user_input()
                 self._persist_run_checkpoint(record)
                 try:
-                    message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                    message = await self._await_session_message(record)
                 except asyncio.TimeoutError:
                     break
                 if message is _CLOSE_SESSION:
@@ -1403,6 +1727,10 @@ class RunnerBackend:
                 continue
             # settled. One-shot runs close here; multi-turn awaits the next message.
             consecutive_turn_failures = 0  # a settled turn clears the failure streak
+            # Drain staged outbox sends now (the loop is still open) so a one-shot run that finishes
+            # without parking still gets its side-effects dispatched; the multi-turn await below
+            # also drains (a no-op then, since these are already dispatched).
+            self._drain_outbox(record, loop)
             if not request.multi_turn:
                 break
             if self._session_should_stop(record, started, turns):
@@ -1411,7 +1739,7 @@ class RunnerBackend:
             self._persist_run_checkpoint(record)
             try:
                 # Pure async await — a parked multi-turn session holds no thread.
-                message = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
+                message = await self._await_session_message(record)
             except asyncio.TimeoutError:
                 break  # idle timeout
             if message is _CLOSE_SESSION:
@@ -1419,6 +1747,29 @@ class RunnerBackend:
             turns += 1
             suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
         return await loop.aclose()
+
+    async def _await_session_message(self, record: BackendRunRecord) -> Any:
+        """Await the next queued user message, dropping stray ``_RESUME_SESSION`` sentinels (a
+        resume aimed at a run that is not currently paused is a no-op). Raises
+        ``asyncio.TimeoutError`` once the idle timeout elapses, mirroring the bare
+        ``wait_for`` it replaces."""
+        deadline = time.monotonic() + self.idle_timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            message = await asyncio.wait_for(record.message_queue.get(), remaining)
+            if message is _RESUME_SESSION:
+                continue  # stray resume (run not paused): ignore and keep waiting
+            if is_inbox_envelope(message):
+                msg_id = str(message.get("id") or "")
+                if msg_id and msg_id in record.seen_inbox_ids:
+                    continue  # idempotent ingress: a redelivered message is processed once
+                if msg_id:
+                    # Mark processed; persisted at the next park checkpoint so the dedup survives a
+                    # restart (the marker rides the same checkpoint as the message's effects).
+                    record.seen_inbox_ids.add(msg_id)
+            return message
 
     def _persist_run_checkpoint(self, record: BackendRunRecord) -> None:
         """Augment the loop's own park-point checkpoint with the backend-owned message
@@ -1437,12 +1788,95 @@ class RunnerBackend:
         residual = [
             message
             for message in list(record.message_queue._queue)
-            if isinstance(message, (str, list))  # str text or list[dict] parts; drop the close sentinel
+            # inbox envelope dict, or legacy raw str/list parts; the close/resume sentinels (objects)
+            # are dropped.
+            if isinstance(message, (str, list, dict))
         ]
         checkpoint.queued_messages = residual
+        checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
         # Overwrites the same seq the loop just committed, now with the queue included.
         assert self.checkpoint_store is not None
         self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
+        self._drain_outbox(record, loop)
+
+    def _outbox_backoff_delay(self, attempts: int) -> float:
+        """Capped exponential backoff with full jitter — ``uniform(0, min(cap, base*factor**attempts))``.
+        Full jitter (AWS) maximally decorrelates retries so a fleet of failed sends doesn't restorm a
+        recovering target in lockstep. ``attempts`` is the number already made (>=1 here)."""
+        ceiling = min(self.outbox_retry_cap_s, self.outbox_retry_base_s * (self.outbox_retry_factor ** attempts))
+        return self._outbox_rng.uniform(0.0, max(0.0, ceiling))
+
+    def _drain_outbox(self, record: BackendRunRecord, loop: AgentLoop) -> None:
+        """Dispatch *due* staged outbox requests at the edge (after they are durably persisted as
+        ``pending``), then persist again so a ``dispatched`` status is recorded. The send happens
+        here, never in the core; a crash between the two persists redispatches on recover, made safe
+        by the request's idempotency_key. A retryable failure stamps a backoff ``next_attempt_at`` so
+        the request is only redispatched once its time arrives (the watchdog redrive tick wakes it,
+        independent of run activity). No-op without a sender or due requests."""
+        sender = record.outbox_sender
+        now = time.time()
+        due = loop.due_outbox(now)
+        if sender is None or not due:
+            return
+        changed = False
+        for request in due:
+            # Ensure the request carries a trace before the edge sends it (requests staged via the
+            # outbox tool already have one; this covers any other path). Observability only.
+            if not request.traceparent:
+                request.traceparent = new_traceparent()
+            try:
+                receipt = sender.send(request)
+            except Exception as exc:  # a sender raising is a retryable transport failure
+                receipt = OutboxReceipt(ok=False, error=str(exc), retryable=True)
+            next_attempt_at = now + self._outbox_backoff_delay(request.attempts + 1)
+            status = loop.record_outbox_result(
+                request.id,
+                receipt,
+                max_attempts=self.outbox_max_attempts,
+                next_attempt_at=next_attempt_at,
+            )
+            changed = True
+            if request.expect_ack and status in {"dispatched", "failed"}:
+                self._stage_outbox_ack(record, request, status, receipt)
+        if changed:
+            checkpoint = loop.snapshot()
+            if checkpoint is not None:
+                checkpoint.queued_messages = [
+                    m for m in list(record.message_queue._queue) if isinstance(m, (str, list, dict))
+                ]
+                checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
+                self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
+
+    def _stage_outbox_ack(
+        self, record: BackendRunRecord, request: Any, status: str, receipt: OutboxReceipt
+    ) -> None:
+        """Deliver an outbox send's receipt back to the run as an inbox message (request-reply,
+        **non-park** — the agent observes it on its next activation), correlated by ``correlation_id``.
+        Reuses the idempotent inbox path: a stable ack id (``ack_<request id>``) + the inbox seen-set
+        make a redelivery a no-op. Dropped if the run is terminal (no consumer) or its queue is full
+        (best-effort). Runs on the shared loop, so the queue put needs no cross-thread marshaling."""
+        ack_id = f"ack_{request.id}"
+        if record.status in {"completed", "failed", "limited"}:
+            return  # terminal run — no consumer for the ack (documented limitation)
+        if ack_id in record.seen_inbox_ids or record.message_queue.qsize() >= self.max_message_queue_depth:
+            return
+        summary = f"[outbox-ack] request {request.id} to {request.destination!r}: {status}"
+        if receipt.reference:
+            summary += f" (ref={receipt.reference})"
+        if receipt.error:
+            summary += f" (error={receipt.error})"
+        envelope = InboxMessage(
+            content=summary,
+            id=ack_id,
+            source="outbox",
+            type="outbox_ack",
+            run_id=record.run_id,
+            correlation_id=request.correlation_id or request.id,
+            causation_id=request.id,
+            traceparent=request.traceparent,
+            tracestate=request.tracestate,
+        )
+        record.message_queue.put_nowait(envelope.to_json())
 
     def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
         return (
@@ -1469,6 +1903,7 @@ class RunnerBackend:
                 loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
                 with self._lock:
                     self._records[run_id].loop = loop
+                    self._records[run_id].outbox_sender = self._outbox_sender_for(request)
                 # Persist the recovery metadata before the first turn so a crash at any park
                 # point can be resumed (the checkpoint itself is written by the driver).
                 self._write_run_meta(self._record(run_id), request)
@@ -1479,6 +1914,20 @@ class RunnerBackend:
         finally:
             if self._run_semaphore is not None:
                 self._run_semaphore.release()
+
+    def _capability_broker_for(self, request: BackendRunRequest) -> Any:
+        """Build the run's capability broker from the factory (scoped to run identity), or None
+        to leave capability gating off for this run."""
+        if self.capability_broker_factory is None:
+            return None
+        return self.capability_broker_factory(request)
+
+    def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
+        """Build the run's outbox sender from the factory (scoped to run identity), or None to leave
+        staged outbox requests pending (durable, never dispatched)."""
+        if self.outbox_sender_factory is None:
+            return None
+        return self.outbox_sender_factory(request)
 
     def _build_loop(
         self,
@@ -1495,6 +1944,7 @@ class RunnerBackend:
             spec,
             llm_gateway_token,
             runtime_config.model if runtime_config is not None else None,
+            token_provider=self._llm_token_source(run_id, request, runtime_config),
         )
         return AgentLoop(
             spec=spec,
@@ -1510,6 +1960,7 @@ class RunnerBackend:
             subagent_definitions=self.subagent_definitions,
             tool_providers=self.tool_providers,
             context_providers=self.context_providers,
+            capability_broker=self._capability_broker_for(request),
         )
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
@@ -1539,6 +1990,7 @@ class RunnerBackend:
             )
             with self._lock:
                 self._records[run_id].loop = loop
+                self._records[run_id].outbox_sender = self._outbox_sender_for(request)
             self._write_run_meta(prepared.record, request)
             await loop.aopen()
             suspension: Suspension | None = None
@@ -1589,6 +2041,8 @@ class RunnerBackend:
             record = self._records[run_id]
             record.result = result
             record.status = result.status
+            # Reconcile the terminal BackendRunState onto the FSM (cancel -> CANCELLED).
+            record.session_state = to_session_state(result.status, error_code=result.error_code)
             record.error = result.error
             record.error_code = result.error_code
             record.finished_at = time.time()
@@ -1837,8 +2291,27 @@ class RunnerBackend:
             try:
                 self._heartbeat_own_runs()
                 self._reclaim_stale_runs()
+                self._redrive_outbox()
             except Exception:  # pragma: no cover - the watchdog must never die on a tick
                 _LOGGER.exception("watchdog tick failed")
+
+    def _redrive_outbox(self) -> None:
+        """Redrive due outbox requests for this worker's live runs — the operational tick that makes
+        retry timing independent of run activity (a request whose backoff ``next_attempt_at`` has
+        arrived is dispatched even if its run is otherwise idle). Runs on the watchdog thread but
+        marshals the actual drain onto the shared loop via ``_call_soon`` (the loop and its ``_outbox``
+        are single-threaded on that loop; ``_drain_outbox`` itself filters to due requests)."""
+        terminal = {"completed", "failed", "limited"}
+        with self._lock:
+            live = [
+                (record, record.loop)
+                for record in self._records.values()
+                if record.loop is not None
+                and record.outbox_sender is not None
+                and record.status not in terminal
+            ]
+        for record, loop in live:
+            self._call_soon(self._drain_outbox, record, loop)
 
     def _heartbeat_own_runs(self) -> None:
         assert self.lease_store is not None
@@ -1944,7 +2417,12 @@ class RunnerBackend:
         with self._lock:
             self._records[run_id] = record
         spec = self._run_spec_for_request(run_id, request, workspace_root)
-        adapter = self._build_model_adapter(spec, llm_gateway_token, runtime_config.model)
+        adapter = self._build_model_adapter(
+            spec,
+            llm_gateway_token,
+            runtime_config.model,
+            token_provider=self._llm_token_source(run_id, request, runtime_config),
+        )
         loop = AgentLoop(
             spec=spec,
             model_adapter=adapter,
@@ -1959,12 +2437,17 @@ class RunnerBackend:
             subagent_definitions=self.subagent_definitions,
             tool_providers=self.tool_providers,
             context_providers=self.context_providers,
+            capability_broker=self._capability_broker_for(request),
         )
         # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
         # restore re-applies the agent's delta from the checkpoint's content blobs.
         loop.restore(checkpoint, blobs=stored.blob)
         with self._lock:
             record.loop = loop
+            record.outbox_sender = self._outbox_sender_for(request)
+        # Restore the inbox dedup set so a message processed before the restart is not reprocessed
+        # if it (or a redelivery) is queued again.
+        record.seen_inbox_ids = set(checkpoint.inbox_seen_ids)
         # Re-enqueue durable pending messages on the shared loop (before the resume coroutine
         # drains them); asyncio.Queue puts must run on the loop, not this thread.
         for message in checkpoint.queued_messages:
@@ -1993,15 +2476,39 @@ class RunnerBackend:
             if self._run_semaphore is not None:
                 self._run_semaphore.release()
 
+    def _llm_token_source(
+        self, run_id: str, request: BackendRunRequest, runtime_config: AgentRuntimeConfig | None
+    ) -> _GatewayTokenSource:
+        """A re-minting source for the run's ``llm_gateway`` token (mirrors the eager issue + the
+        recovery re-issue), so a long run keeps LLM access past the token TTL without a restart."""
+        return _GatewayTokenSource(
+            token_manager=self.token_manager,
+            kind="llm_gateway",
+            audience="csp.llm-gateway",
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            ttl_s=self.llm_gateway_token_ttl_s,
+            metadata={"agent_config_hash": runtime_config.config_hash} if runtime_config is not None else {},
+        )
+
     def _build_model_adapter(
         self,
         spec: AgentRunSpec,
         llm_gateway_token: str,
         model_config: ModelConfig | None,
+        token_provider: Callable[[], str | None] | None = None,
     ) -> ModelAdapter:
         if self.model_adapter_factory is not None:
+            # Custom factories own their credential lifecycle (they get the freshly-minted token
+            # string); the refresh seam applies to the default gateway adapter only.
             return self.model_adapter_factory(spec, llm_gateway_token)
-        return GatewayModelAdapter(model_config or ModelConfig(), gateway_url=self.llm_gateway_url, token=llm_gateway_token)
+        return GatewayModelAdapter(
+            model_config or ModelConfig(),
+            gateway_url=self.llm_gateway_url,
+            token=llm_gateway_token,
+            token_provider=token_provider,
+        )
 
     def _web_gateway_client(
         self,

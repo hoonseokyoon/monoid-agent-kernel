@@ -32,6 +32,65 @@ from native_agent_runner.core.checkpoint import (
     write_checkpoint,
 )
 
+# Session lifecycle (formal FSM + AgentSession contract)
+from native_agent_runner.core.lifecycle import (
+    LEGAL_TRANSITIONS,
+    AgentSession,
+    LoopSession,
+    SessionHealth,
+    SessionInspection,
+    SessionState,
+    assert_transition,
+    can_transition,
+    state_from_suspension,
+    to_session_state,
+)
+
+# Control protocol (transport-independent command envelope + dispatch seam)
+from native_agent_runner.core.control import (
+    CONTROL_PROTOCOL_VERSION,
+    ControlCommand,
+    ControlCommandType,
+    ControlDispatcher,
+    ControlResult,
+)
+
+# Inbox message envelope (provenance + idempotent ingress; an edge/transport contract)
+from native_agent_runner.core.inbox import (
+    INBOX_PROTOCOL_VERSION,
+    InboxMessage,
+    is_inbox_envelope,
+)
+
+# Outbox request (capability-gated durable egress; the edge drains via an OutboxSender)
+from native_agent_runner.core.outbox import (
+    OUTBOX_REQUEST_VERSION,
+    OutboxReceipt,
+    OutboxRequest,
+    OutboxSender,
+)
+
+# W3C Trace Context helpers (observability metadata carried on the envelopes)
+from native_agent_runner.core.trace_context import (
+    child_traceparent,
+    new_traceparent,
+    parse_traceparent,
+    trace_id_of,
+)
+
+# Capability request/lease (scoped, short-lived access; secrets stay outside the core)
+from native_agent_runner.core.capability import (
+    CAPABILITY_LEASE_VERSION,
+    CAPABILITY_REQUEST_VERSION,
+    AutoGrantBroker,
+    CapabilityBroker,
+    CapabilityDenial,
+    CapabilityLease,
+    CapabilityPending,
+    CapabilityRequest,
+    CapabilityVault,
+)
+
 # Context providers (pluggable static + per-turn system context)
 from native_agent_runner.core.context import ContextProvider, TurnContext
 from native_agent_runner.core.agents import (
@@ -148,6 +207,47 @@ __all__ = [
     "LocalFsCheckpointStore",
     "read_checkpoint",
     "write_checkpoint",
+    # session lifecycle (formal FSM + AgentSession contract)
+    "SessionState",
+    "LEGAL_TRANSITIONS",
+    "can_transition",
+    "assert_transition",
+    "state_from_suspension",
+    "to_session_state",
+    "AgentSession",
+    "LoopSession",
+    "SessionInspection",
+    "SessionHealth",
+    # control protocol (transport-independent command envelope + dispatch seam)
+    "CONTROL_PROTOCOL_VERSION",
+    "ControlCommand",
+    "ControlCommandType",
+    # inbox message envelope (provenance + idempotent ingress)
+    "INBOX_PROTOCOL_VERSION",
+    "InboxMessage",
+    "is_inbox_envelope",
+    # outbox request (capability-gated durable egress)
+    "OUTBOX_REQUEST_VERSION",
+    "OutboxRequest",
+    "OutboxReceipt",
+    "OutboxSender",
+    # W3C Trace Context helpers
+    "parse_traceparent",
+    "new_traceparent",
+    "child_traceparent",
+    "trace_id_of",
+    "ControlResult",
+    "ControlDispatcher",
+    # capability request/lease
+    "CAPABILITY_REQUEST_VERSION",
+    "CAPABILITY_LEASE_VERSION",
+    "CapabilityRequest",
+    "CapabilityLease",
+    "CapabilityDenial",
+    "CapabilityPending",
+    "CapabilityBroker",
+    "CapabilityVault",
+    "AutoGrantBroker",
     # context providers
     "AgentDefinition",
     "AgentRuntimeConfig",
