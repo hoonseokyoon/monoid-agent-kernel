@@ -234,6 +234,7 @@ def test_loop_escalates_capability_then_resumes_after_grant(tmp_path: Path) -> N
         runtime_config_provider=runtime_provider(runtime_config(bindings=(binding,))),
         tool_providers=(provider,),
         capability_broker=HumanEscalationBroker(),
+        capability_auto_redispatch=False,  # exercise the model-retry path explicitly
     )
     loop.open()
 
@@ -242,24 +243,72 @@ def test_loop_escalates_capability_then_resumes_after_grant(tmp_path: Path) -> N
     assert provider.calls == 0  # gated: the tool did NOT run
     task_id = suspension.awaiting_task_ids[0]
 
-    # The Daemon/human approves, reporting a lease for the capability.
-    loop.report_task_result(
-        task_id,
-        {
-            "granted": True,
-            "lease": {
-                "capability": "web.search",
-                "token_ref": "approved:web.search",
-                "expires_at": time.time() + 600,
-                "scope": {"allowed_domains": ["a.edu"]},
-            },
-        },
-    )
+    loop.report_task_result(task_id, _grant_lease())  # Daemon/human approves with a lease
 
     resumed = loop.run_until_suspended(None)
     assert resumed.reason == "settled"
-    assert provider.calls == 1  # retried and ran once the lease was admitted
+    assert provider.calls == 1  # the MODEL retried and the tool ran once the lease was admitted
     assert provider.seen_tokens == ["approved:web.search"]  # the approved handle reached the tool
+    loop.close()
+
+
+def _redispatch_loop(tmp_path: Path, provider: _CapToolProvider, turns: list[ModelTurn]) -> AgentLoop:
+    binding = tool_binding(
+        "ext.fetch", runtime={"requires_lease": True}, scope=ToolScope(allowed_domains=("a.edu",))
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    return AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(turns=turns),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=(binding,))),
+        tool_providers=(provider,),
+        capability_broker=HumanEscalationBroker(),  # capability_auto_redispatch defaults True
+    )
+
+
+def _capability_task_count(loop: AgentLoop) -> int:
+    jobs = loop._session.res.context.job_manager.jobs  # type: ignore[union-attr]
+    return sum(1 for job in jobs.values() if job.kind == "capability")
+
+
+def test_auto_redispatch_runs_gated_tool_without_model_retry(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    # No retry turn — the model never re-issues the call; the loop auto-runs it after the grant.
+    loop = _redispatch_loop(
+        tmp_path,
+        provider,
+        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), ModelTurn(response_id="rd", final_text="done")],
+    )
+    loop.open()
+    parked = loop.run_until_suspended("go")
+    assert parked.reason == "awaiting_tasks"
+    loop.report_task_result(parked.awaiting_task_ids[0], _grant_lease())
+
+    resumed = loop.run_until_suspended(None)
+    assert resumed.reason == "settled"
+    assert provider.calls == 1  # auto-executed exactly once; the model did NOT retry
+    assert provider.seen_tokens == ["approved:web.search"]
+    assert _capability_task_count(loop) == 1  # no re-escalation (a single capability task)
+    loop.close()
+
+
+def test_denied_capability_skips_replay(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    loop = _redispatch_loop(
+        tmp_path,
+        provider,
+        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), ModelTurn(response_id="rd", final_text="done")],
+    )
+    loop.open()
+    parked = loop.run_until_suspended("go")
+    assert parked.reason == "awaiting_tasks"
+    # The approver denies (no lease) -> no auto-redispatch, the tool never runs.
+    loop.report_task_result(parked.awaiting_task_ids[0], {"granted": False, "reason": "policy"})
+
+    resumed = loop.run_until_suspended(None)
+    assert resumed.reason == "settled"
+    assert provider.calls == 0
     loop.close()
 
 

@@ -1968,7 +1968,7 @@ class AgentLoop:
             local_step = session.submit_local_step
             session.session_step += 1
             step = session.session_step
-            background_observations = self._pop_background_observations(context, recorder, step)
+            background_observations = self._pop_background_observations(context, recorder, step, state)
             if background_observations:
                 state.pending_observations = (*state.pending_observations, *background_observations)
             turn_id = f"turn_{step:04d}"
@@ -2023,6 +2023,33 @@ class AgentLoop:
             )
             state.previous_surface_snapshot = surface_snapshot
             state.pending_binding_loads = ()
+            # Auto-redispatch (⑤): run any gated calls whose capability was just granted, now that
+            # this turn's context (catalog/surface/turn_id) exists. Each goes through the normal
+            # _execute_tool_call (real permission/quota/events); the result is injected as a
+            # user-message observation so the model sees the outcome without retrying. A replay that
+            # can't run cleanly (no valid lease) is skipped — the model then retries (fallback).
+            if state.pending_capability_replays:
+                pending_replays = state.pending_capability_replays
+                state.pending_capability_replays = ()
+                replay_obs = tuple(
+                    obs
+                    for replay in pending_replays
+                    if (
+                        obs := self._execute_capability_replay(
+                            replay,
+                            bound_catalog=bound_catalog,
+                            surface_snapshot=surface_snapshot,
+                            call_counts=state.tool_call_counts,
+                            context=context,
+                            recorder=recorder,
+                            turn_id=turn_id,
+                            step=step,
+                        )
+                    )
+                    is not None
+                )
+                if replay_obs:
+                    state.pending_observations = (*state.pending_observations, *replay_obs)
             dynamic_segment = self._dynamic_context_segment(res, turn_context)
             if surface_snapshot.delta_notice:
                 dynamic_segment = (
@@ -2570,6 +2597,7 @@ class AgentLoop:
         context: AgentToolContext,
         recorder: AgentRecorder,
         step: int,
+        state: RunState,
     ) -> tuple[ToolObservation, ...]:
         observations = context.job_manager.pop_reentry_observations()
         if not observations:
@@ -2596,18 +2624,22 @@ class AgentLoop:
             # so hitl/automation results don't emit phantom workspace events.
             if observation.output.get("type") == "background_job_result":
                 self._emit_background_workspace_events(observation.output, context, recorder)
-            # A resolved capability escalation: admit the granted lease into the vault so the
-            # model's retry of the gated tool passes (the lease was approved out-of-band).
+            # A resolved capability escalation: admit the granted lease into the vault, and (if a
+            # gated call was captured + auto-redispatch is on) queue it to run at this step's top.
             elif observation.output.get("type") == "capability_grant":
-                self._admit_capability_grant(observation, context, recorder)
+                self._admit_capability_grant(observation, context, recorder, state)
         return tuple(observations)
 
     def _admit_capability_grant(
-        self, observation: ToolObservation, context: AgentToolContext, recorder: AgentRecorder
+        self,
+        observation: ToolObservation,
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        state: RunState,
     ) -> None:
         """Store the lease from a resolved ``capability`` task in the vault (fail-closed against the
-        original request scope). A denial / malformed grant stores nothing — the model just sees the
-        result observation."""
+        original request scope), and queue the gated call for auto-redispatch when one was captured.
+        A denial / malformed grant stores nothing — the model just sees the result observation."""
         task = context.job_manager.jobs.get(str(observation.output.get("task_id") or ""))
         request_payload = getattr(task, "request", None) if task is not None else None
         result_payload = getattr(task, "result", None) if task is not None else None
@@ -2652,6 +2684,67 @@ class AgentLoop:
                 "expires_at": lease.expires_at,
                 "scope": lease.scope,
             },
+        )
+        # Queue the captured gated call for auto-redispatch (drained at the next step top, where
+        # turn context exists). If nothing was captured or the flag is off, the model retries.
+        replay_call_name = request_payload.get("replay_call_name")
+        if self.capability_auto_redispatch and replay_call_name:
+            state.pending_capability_replays = (
+                *state.pending_capability_replays,
+                {
+                    "call_name": str(replay_call_name),
+                    "call_id": str(request_payload.get("replay_call_id") or ""),
+                    "arguments": dict(request_payload.get("replay_arguments") or {}),
+                    "binding_id": request.binding_id,
+                    "capability": request.capability,
+                    "task_id": str(observation.output.get("task_id") or ""),
+                },
+            )
+
+    def _execute_capability_replay(
+        self,
+        replay: dict[str, Any],
+        *,
+        bound_catalog: BoundToolCatalog,
+        surface_snapshot: ToolSurfaceSnapshot,
+        call_counts: dict[str, int],
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        turn_id: str,
+        step: int,
+    ) -> ToolObservation | None:
+        """Re-execute one gated tool call after its capability was granted, returning the result as
+        a user-message observation (so it never collides with the original call's pending tool
+        result). Returns ``None`` to skip — falling back to model-retry — when no valid lease is
+        present (the gate would otherwise re-escalate and re-park)."""
+        capability = str(replay.get("capability") or "")
+        if not capability or self._capability_vault.token_for(capability, now=time.time()) is None:
+            return None  # lease missing/expired -> let the model retry (the granted message stands)
+        observation = self._execute_tool_call(
+            call_name=str(replay.get("call_name") or ""),
+            call_id=str(replay.get("call_id") or ""),
+            arguments=dict(replay.get("arguments") or {}),
+            bound_catalog=bound_catalog,
+            surface_snapshot=surface_snapshot,
+            call_counts=call_counts,
+            context=context,
+            recorder=recorder,
+            turn_id=turn_id,
+            parent_id=None,
+            step=step,
+        )
+        # Deliver as a user message (is_background) under a distinct call_id — the original call_id
+        # already carries the "pending" tool result, so a second tool result there would be malformed.
+        return ToolObservation(
+            call_id=f"capability_replay:{replay.get('call_id') or ''}",
+            tool_name=str(replay.get("call_name") or ""),
+            output={
+                "type": "capability_replay_result",
+                "capability": capability,
+                "call": str(replay.get("call_name") or ""),
+                "result": observation.output,
+            },
+            is_background=True,
         )
 
     def _wait_for_background_jobs(
@@ -3001,7 +3094,14 @@ class AgentLoop:
                 self._check_tool_surface_scope(spec, arguments, authorization)
                 self._check_permissions(bound_tool.base_spec, arguments)
                 pending = self._ensure_capability_lease(
-                    bound_tool, context, recorder, started_event, turn_id
+                    bound_tool,
+                    context,
+                    recorder,
+                    started_event,
+                    turn_id,
+                    call_name=call_name,
+                    call_id=call_id,
+                    arguments=arguments,
                 )
                 if pending is not None:
                     # Capability escalated: the call parks (does not execute); the model retries
@@ -3080,6 +3180,10 @@ class AgentLoop:
         recorder: AgentRecorder,
         started_event: AgentEvent | None,
         turn_id: str,
+        *,
+        call_name: str,
+        call_id: str,
+        arguments: dict[str, Any],
     ) -> ToolResult | None:
         """Gate a tool call on a capability lease. Returns ``None`` to proceed (a valid lease is
         cached or was granted synchronously), or a *pending* ``ToolResult`` when the broker
@@ -3137,9 +3241,10 @@ class AgentLoop:
                 f"capability denied: {capability}: {grant.reason}", error_code="capability_denied"
             )
         if isinstance(grant, CapabilityPending):
-            # Async approval: park the run on a capability hosted-task carrying the request, and
-            # hand the model a "pending" observation. On resolution the lease is admitted to the
-            # vault (see _pop_background_observations) and the model retries the gated tool.
+            # Async approval: park the run on a capability hosted-task carrying the request AND the
+            # gated call (so it can be auto-redispatched on grant — see _capability_replay_for_grant),
+            # and hand the model a "pending" observation. On resolution the lease is admitted and the
+            # call runs automatically (or, if auto-redispatch is off/unsafe, the model retries it).
             task_id = context.job_manager.create_task(
                 "capability",
                 {
@@ -3150,7 +3255,16 @@ class AgentLoop:
                     "ttl_seconds": request.ttl_seconds,
                     "reason": request.reason,
                     "prompt": grant.prompt,
+                    # The gated call, captured for auto-redispatch (durable via the hosted task).
+                    "replay_call_name": call_name,
+                    "replay_call_id": call_id,
+                    "replay_arguments": dict(arguments),
                 },
+            )
+            tail = (
+                "Once it is granted it will run automatically; you do not need to retry."
+                if self.capability_auto_redispatch
+                else "Do not repeat other work for it; once it is granted, retry this tool."
             )
             return ToolResult(
                 ok=True,
@@ -3159,10 +3273,7 @@ class AgentLoop:
                     "capability": capability,
                     "request_id": request.request_id,
                     "task_id": task_id,
-                    "message": (
-                        f"Access to '{capability}' is pending approval (task {task_id}). "
-                        "Do not repeat other work for it; once it is granted, retry this tool."
-                    ),
+                    "message": f"Access to '{capability}' is pending approval (task {task_id}). {tail}",
                 },
             )
         try:

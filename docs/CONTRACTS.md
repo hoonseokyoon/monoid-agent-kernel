@@ -432,12 +432,21 @@ statically provisioned.
   per-run vault holds handles only and is NOT checkpointed — on restart leases are re-brokered, so
   no stale handle survives on disk.
 - **Async approval (escalation)**: a broker may return `CapabilityPending` instead of granting
-  synchronously — the loop then parks the run on a `capability` hosted-task carrying the request and
-  hands the model a "pending" observation; when the grant is reported (`report_task_result` with a
-  `lease`), the lease is admitted to the vault (fail-closed against the original request scope) and
-  the model retries the gated tool. `HumanEscalationBroker` (reference) escalates every request; a
-  real policy broker auto-grants low-risk capabilities, denies forbidden ones, and escalates only
-  the sensitive ones (the three-way `lease`/`denial`/`pending` outcome is the point).
+  synchronously — the loop then parks the run on a `capability` hosted-task (carrying the request
+  AND the gated call) and hands the model a "pending" observation; when the grant is reported
+  (`report_task_result` with a `lease`), the lease is admitted to the vault (fail-closed against the
+  original request scope). `HumanEscalationBroker` (reference) escalates every request; a real
+  policy broker auto-grants low-risk capabilities, denies forbidden ones, and escalates only the
+  sensitive ones (the three-way `lease`/`denial`/`pending` outcome is the point).
+- **Auto-redispatch** (`AgentLoop.capability_auto_redispatch`, default on): after the grant the loop
+  re-executes the gated call automatically at the next step (through the normal tool path, real
+  permission/quota/events) and delivers the result to the model — no model retry needed. If a replay
+  can't run cleanly (no valid lease), it falls back to model-retry. The gated tool never executed at
+  the gate, so the replay is its first and only execution (no double side effect).
+- **Durable leases**: an escalation-approved lease is marked `durable` and checkpointed (the
+  `token_ref` handle only, never a secret), so a restart does not re-prompt the approver; ephemeral
+  sync grants are not persisted (re-brokered on restart). The gated call is captured in the durable
+  hosted-task so auto-redispatch survives a restart too.
 
 ### Permission Boundary
 
