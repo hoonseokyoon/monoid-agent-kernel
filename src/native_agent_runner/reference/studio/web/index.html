@@ -530,11 +530,20 @@ function handleEvent(ev) {
   if (type === "model.reasoning.delta") { appendReasoning(data.text || ""); return; }
   if (type === "model.output.delta") { collapseReasoning(); appendDelta(data.text || ""); return; }
   if (type === "model.turn.finished") { hideTyping(); return; }
-  if (type === "turn.settled" || type === "run.finished") {
+  if (type === "turn.settled") {
+    // The per-turn settle is the one place the assistant's final answer is rendered.
     hideTyping();
     setGenerating(false);
     if (finalizeStream(data.final_text)) return;  // a streamed bubble is already on screen
     if (data.final_text) bubble("assistant", data.final_text);
+    return;
+  }
+  if (type === "run.finished") {
+    // Run-level close. The last turn.settled already rendered the final answer (run.finished
+    // carries the same final_text), so only clean up here — re-rendering it duplicates the message.
+    hideTyping();
+    setGenerating(false);
+    finalizeStream("");  // close any still-open streamed bubble; do not add a new one
     return;
   }
   if (type === "run.awaiting_input") { setGenerating(false); return; }
