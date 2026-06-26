@@ -1261,6 +1261,18 @@ traceBtn.addEventListener("click", (e) => {
   loadSetup();
   refreshSessions();
   refreshCapabilities();
+  // Deep link (handy for sharing + reproducible screenshots): ?run=<id> opens that session,
+  // ?panel=trace opens the trace panel, ?file=<path> opens a workspace file in the viewer.
+  const params = new URLSearchParams(location.search);
+  const runParam = params.get("run");
+  if (runParam) {
+    loadSession(runParam);
+    if (params.get("panel") === "trace") {
+      setTimeout(() => { traceAside.hidden = false; traceBtn.classList.add("on"); renderTrace(); }, 1600);
+    }
+    const fileParam = params.get("file");
+    if (fileParam) setTimeout(() => openFile(fileParam), 1600);
+  }
 })();
 </script>
 </body>

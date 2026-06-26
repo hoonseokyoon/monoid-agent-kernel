@@ -17,6 +17,22 @@ integration is a later adapter layer.
 > backend you operate — the credential boundary that hosts the LLM and Web gateways. The
 > runner itself never holds provider keys; it calls your gateway with a short-lived, scoped token.
 
+## See it run
+
+The bundled **Agent Studio** reference app (`native-agent studio serve`) drives the runner
+through its Python API behind a single-page UI.
+
+![Agent Studio: an agent reasons, runs Python, and produces a result in the workspace](docs/img/hero.png)
+
+*A real agent — it plans, writes and runs code in a workspace, and reports back; every step is
+observable, and generated output (here, a plot) previews inline.*
+
+![Two agents collaborating over the durable outbox→inbox fabric](docs/img/a2a.png)
+
+*Two independently-configured agent profiles, running on one kernel, collaborate by passing
+messages over a durable, capability-gated **outbox→inbox** fabric — the capability and outbox
+events are visible in the trace on the right.*
+
 ## Boundary: contracts / core / reference
 
 The package is layered in three tiers:
