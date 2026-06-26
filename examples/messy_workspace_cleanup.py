@@ -528,7 +528,7 @@ def _followup_fixture() -> str:
 - Decided to keep API keys inside the LLM gateway.
 - Runner should receive only short-lived run-scoped gateway tokens.
 - Proposal packages need hashes, approval records, and conflict detection.
-- Needs confirmation: exact CSP ResourceAdapter mapping for wiki pages.
+- Needs confirmation: exact host-platform ResourceAdapter mapping for wiki pages.
 """
 
 
@@ -575,7 +575,7 @@ The workspace describes a lightweight native agent runner for general file work.
 
 ## Needs confirmation
 
-- Exact CSP ResourceAdapter mapping for wiki pages still needs confirmation.
+- Exact host-platform ResourceAdapter mapping for wiki pages still needs confirmation.
 - The final review UI shape is not decided, though side-by-side proposal review is desired.
 """
 
@@ -595,7 +595,7 @@ def _todo_output() -> str:
 - [ ] Support partial approval.
 - [ ] Show clear conflict messages when base hashes drift.
 
-## CSP Integration
+## Host-platform Integration
 
 - [ ] Define ResourceAdapter mapping for wiki pages. Needs confirmation.
 - [ ] Track tenant usage through the gateway.
@@ -605,7 +605,7 @@ def _todo_output() -> str:
 def _readme_status_section() -> str:
     return """## Current status
 
-The runner research is centered on propose-first file work. Current priorities are proposal review, approval records, conflict-safe apply, and CSP ResourceAdapter mapping.
+The runner research is centered on propose-first file work. Current priorities are proposal review, approval records, conflict-safe apply, and host-platform ResourceAdapter mapping.
 """
 
 

@@ -35,9 +35,9 @@ dev = [
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
 ]
-# Direct OpenAI provider adapter (local smoke tests only). Container / CSP-integrated
-# runs use GatewayModelAdapter and do not need this. The import is lazy, so the package
-# imports and OpenAIModelAdapter instantiates without it; only next_turn() requires it.
+# Direct OpenAI provider adapter (local smoke tests only). Gateway-integrated runs on a
+# host platform use GatewayModelAdapter and do not need this. The import is lazy, so the
+# package imports and OpenAIModelAdapter instantiates without it; only next_turn() requires it.
 openai = [
     "openai>=1.80",
 ]
@@ -72,6 +72,8 @@ Changelog = "https://github.com/hoonseokyoon/modular-agent-kernel/blob/main/CHAN
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/native_agent_runner"]
+# Internal developer journal — kept in the repo, excluded from the distributed wheel.
+exclude = ["**/DX_NOTES.md"]
 # Ship the PEP 561 marker so downstream type-checkers honor our inline type hints.
 force-include = { "src/native_agent_runner/py.typed" = "native_agent_runner/py.typed" }
 

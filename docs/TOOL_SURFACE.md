@@ -1,7 +1,8 @@
 # Tool Surface
 
-Tool Surface는 한 turn에서 모델에게 드러나는 도구 인터페이스다. Native runtime 모델에서는
-`AgentRuntimeConfig.tools`의 `ToolBinding` 목록이 surface의 유일한 public 입력이다.
+The tool surface is the tool interface exposed to the model within a single turn.
+In the native runtime model, the list of `ToolBinding`s in `AgentRuntimeConfig.tools`
+is the only public input to the surface.
 
 ## Flow
 
@@ -15,8 +16,9 @@ AgentRuntimeConfig
   -> model_name -> BoundTool -> base ToolSpec.handler
 ```
 
-Runner는 registry에 전체 builtin/custom tool을 보관한다. Registry tool은 구현체다.
-`ToolBinding`은 구현체를 agent-facing tool로 노출하는 public 단위다.
+The runner keeps every builtin and custom tool in the registry. A registry tool is
+the implementation. A `ToolBinding` is the public unit that exposes an implementation
+as an agent-facing tool.
 
 ## ToolBinding
 
