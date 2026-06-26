@@ -35,3 +35,6 @@ proposal.tar
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Crash dumps
+*.stackdump
