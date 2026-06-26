@@ -18,8 +18,12 @@
   header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
     border-bottom: 1px solid var(--border); background: var(--panel); }
   header .title { font-weight: 600; }
-  header .ws { color: var(--muted); font-size: 12px; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; max-width: 50vw; }
+  header .ws { color: var(--text); font-size: 12px; font-weight: 500; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
+  header .ws-copy { background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 6px; padding: 1px 7px; margin-left: 2px; font-size: 12px; line-height: 1.4;
+    min-height: 0; cursor: pointer; }
+  header .ws-copy:hover { color: var(--text); border-color: var(--accent); }
   .badge { margin-left: auto; font-size: 11px; padding: 2px 8px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--muted); }
   .badge.offline { color: var(--warn); border-color: var(--warn); }
@@ -199,6 +203,7 @@
   <header>
     <span class="title">Agent Studio</span>
     <span class="ws" id="ws">…</span>
+    <button class="ws-copy" id="ws-copy" type="button" title="Copy full workspace path">⧉</button>
     <span class="badge" id="provider">…</span>
     <span class="usage" id="usage" title="tokens this run"></span>
     <a href="#" id="newchat" class="hlink" title="Start a new chat">＋ New</a>
@@ -1233,8 +1238,21 @@ traceBtn.addEventListener("click", (e) => {
 (async function init() {
   try {
     const cfg = await (await fetch("/api/config")).json();
-    document.getElementById("ws").textContent = cfg.workspace;
-    document.getElementById("ws").title = cfg.workspace;
+    const wsPath = cfg.workspace || "";
+    // Show only the workspace folder name in the header (the full path is private/long and
+    // unflattering in screenshots); the full path is on hover + the copy button.
+    const wsBase = wsPath.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || wsPath;
+    const wsEl = document.getElementById("ws");
+    wsEl.textContent = wsBase;
+    wsEl.title = wsPath;
+    const wsCopy = document.getElementById("ws-copy");
+    wsCopy.title = "Copy full path: " + wsPath;
+    wsCopy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(wsPath); } catch (_) {}
+      const prev = wsCopy.textContent;
+      wsCopy.textContent = "✓";
+      setTimeout(() => { wsCopy.textContent = prev; }, 1200);
+    });
     const badge = document.getElementById("provider");
     badge.textContent = cfg.offline ? "offline · echo model" : cfg.provider;
     if (cfg.offline) badge.classList.add("offline");
