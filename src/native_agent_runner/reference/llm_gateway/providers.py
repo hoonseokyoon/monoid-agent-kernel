@@ -68,7 +68,7 @@ class EchoModelAdapter:
                 "**Offline echo model** — no provider key is configured, so I can't do real "
                 "reasoning or run tools yet.\n\n"
                 f"You said:\n\n> {user_text}\n\n"
-                "Configure a real provider (OpenAI key, or a CSP gateway) to get real answers."
+                "Configure a real provider (OpenAI key, or your gateway) to get real answers."
             )
         else:
             body = (

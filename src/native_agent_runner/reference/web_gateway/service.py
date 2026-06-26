@@ -40,7 +40,7 @@ DEFAULT_FAKE_CORPUS: tuple[dict[str, str], ...] = (
         "url": "https://docs.example.test/native-agent-runner/web",
         "title": "Native Agent Runner Web Tools",
         "content": (
-            "Native Agent Runner exposes web.search and web.fetch through a CSP WebGateway. "
+            "Native Agent Runner exposes web.search and web.fetch through a WebGateway. "
             "The runner never receives provider API keys."
         ),
     },

@@ -65,10 +65,10 @@ mcp = [
 native-agent = "native_agent_runner.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/hoonseokyoon/native-agent-runner"
-Repository = "https://github.com/hoonseokyoon/native-agent-runner"
-Issues = "https://github.com/hoonseokyoon/native-agent-runner/issues"
-Changelog = "https://github.com/hoonseokyoon/native-agent-runner/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/hoonseokyoon/modular-agent-kernel"
+Repository = "https://github.com/hoonseokyoon/modular-agent-kernel"
+Issues = "https://github.com/hoonseokyoon/modular-agent-kernel/issues"
+Changelog = "https://github.com/hoonseokyoon/modular-agent-kernel/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/native_agent_runner"]

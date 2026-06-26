@@ -763,7 +763,7 @@ def _web_search() -> ToolSpec:
 
     return ToolSpec(
         id="web.search",
-        description="Search the web through the configured CSP WebGateway.",
+        description="Search the web through the configured WebGateway.",
         input_schema=_object_schema(
             {
                 "query": {"type": "string"},
@@ -788,7 +788,7 @@ def _web_fetch() -> ToolSpec:
 
     return ToolSpec(
         id="web.fetch",
-        description="Fetch one web page through the configured CSP WebGateway.",
+        description="Fetch one web page through the configured WebGateway.",
         input_schema=_object_schema(
             {
                 "url": {"type": "string"},
@@ -811,7 +811,7 @@ def _web_context() -> ToolSpec:
 
     return ToolSpec(
         id="web.context",
-        description="Build LLM-ready web grounding context through the configured CSP WebGateway.",
+        description="Build LLM-ready web grounding context through the configured WebGateway.",
         input_schema=_object_schema(
             {
                 "query": {"type": "string"},

@@ -29,8 +29,8 @@ from native_agent_runner.providers.base import (
 class OpenAIModelAdapter:
     """Direct OpenAI adapter for local smoke tests.
 
-    Container and CSP-integrated runs should use GatewayModelAdapter so provider
-    credentials remain inside CSP backend infrastructure.
+    Container and gateway-integrated runs should use GatewayModelAdapter so provider
+    credentials remain inside your backend platform.
     """
 
     config: ModelConfig

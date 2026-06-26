@@ -95,7 +95,7 @@ main.add_command(studio_group)
 @click.option("--workspace", type=click.Path(path_type=Path), default=None)
 @click.option("--instruction", type=str, default="")
 @click.option("--instruction-file", type=click.Path(path_type=Path), default=None)
-@click.option("--llm-gateway-url", type=str, default=None, help="Internal CSP LLM gateway URL.")
+@click.option("--llm-gateway-url", type=str, default=None, help="Internal LLM gateway URL.")
 @click.option(
     "--llm-gateway-token-env",
     type=str,
@@ -159,7 +159,7 @@ main.add_command(studio_group)
 @click.option("--deny-path", multiple=True, help="Deny workspace paths matching a backend-provided glob.")
 @click.option("--redact-path", multiple=True, help="Redact matching paths from public events and projections.")
 @click.option("--permission-policy-file", type=click.Path(path_type=Path), default=None)
-@click.option("--web-gateway-url", type=str, default=None, help="Internal CSP WebGateway base URL.")
+@click.option("--web-gateway-url", type=str, default=None, help="Internal WebGateway base URL.")
 @click.option(
     "--web-gateway-token-env",
     type=str,
@@ -788,8 +788,8 @@ def backend() -> None:
     multiple=True,
     help="Allowed local reference apply root. Repeat for multiple roots.",
 )
-@click.option("--llm-gateway-url", type=str, required=True, help="Internal CSP LLM gateway URL.")
-@click.option("--web-gateway-url", type=str, default=None, help="Internal CSP WebGateway base URL.")
+@click.option("--llm-gateway-url", type=str, required=True, help="Internal LLM gateway URL.")
+@click.option("--web-gateway-url", type=str, default=None, help="Internal WebGateway base URL.")
 @click.option(
     "--admin-token-env",
     type=str,

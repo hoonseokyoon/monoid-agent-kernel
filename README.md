@@ -2,20 +2,20 @@
 
 *A provider-neutral, permission-aware agent runtime for safe, structured file work — secrets stay outside the engine, and every seam (model, tools, workspace, checkpoint store) is replaceable.*
 
-[![CI](https://github.com/hoonseokyoon/native-agent-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/hoonseokyoon/native-agent-runner/actions/workflows/ci.yml)
+[![CI](https://github.com/hoonseokyoon/modular-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/hoonseokyoon/modular-agent-kernel/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-
-> **Terminology:** Throughout these docs, **CSP** means the *Cloud Service Provider / backend
-> platform you operate* — the credential boundary that hosts the LLM and Web gateways. The runner
-> itself never holds provider keys; it calls your gateway with a short-lived, scoped token.
 
 Standalone API-backed agent harness for safe, structured file work in a
 workspace. The workspace is a pluggable seam: the engine ships with a
 local-filesystem backend and accepts your own implementation (see
 [Custom workspace backend](#custom-workspace-backend)). This research package
-intentionally has no dependency on CSP runtime modules. CSP integration is a
-later adapter layer.
+intentionally has no dependency on host-platform runtime modules. Platform
+integration is a later adapter layer.
+
+> Throughout these docs, **"your gateway" / "your backend platform"** refers to the
+> backend you operate — the credential boundary that hosts the LLM and Web gateways. The
+> runner itself never holds provider keys; it calls your gateway with a short-lived, scoped token.
 
 ## Boundary: contracts / core / reference
 
@@ -44,7 +44,7 @@ pip install native-agent-runner
 ```
 
 Core has no provider SDK dependency. The direct OpenAI adapter (local smoke tests only;
-container/CSP runs use `GatewayModelAdapter`) is an optional extra:
+container/hosted runs use `GatewayModelAdapter`) is an optional extra:
 
 ```bash
 pip install "native-agent-runner[openai]"
@@ -140,7 +140,7 @@ The default mode is `propose`, which means the runner creates a proposal package
 without committing to tenant source-of-truth storage. Local CLI runs default to
 `--workspace-backend overlay`, so writes are staged in an overlay and emitted as
 `runs/<run_id>/diff.patch` and `runs/<run_id>/proposal.json` without modifying
-the workspace. Container/CSP-style runs can use `--workspace-backend staging`,
+the workspace. Container/hosted runs can use `--workspace-backend staging`,
 where tools and shell write directly to a staging workspace and the runner
 compares that workspace with `workspace.base.json` to generate the proposal.
 Use `--mode apply` for local direct workspace writes.
@@ -168,12 +168,12 @@ A custom backend must honor the `Workspace` contract suite
 factory and the existing invariants run against it.
 
 The default model provider is `gateway`. Container runs should call an internal
-CSP LLM gateway with a short-lived run token. The runner should not receive
+LLM gateway with a short-lived run token. The runner should not receive
 OpenAI, Anthropic, or other provider API keys.
 
 Web tools are also gateway-backed. `web.search`, `web.fetch`, and `web.context`
-are available when runtime config binds those registry tools. The runner calls a
-CSP WebGateway with a short-lived `web_gateway` token. The runner does not
+are available when runtime config binds those registry tools. The runner calls
+your WebGateway with a short-lived `web_gateway` token. The runner does not
 perform direct web egress and does not receive search-provider credentials.
 `web.context` returns
 LLM-ready grounding context through a provider-neutral ContextProvider contract.
@@ -475,9 +475,9 @@ native-agent run \
 ## Model Provider Boundary
 
 `GatewayModelAdapter` is the default path. It sends normalized model-turn
-requests to a CSP-owned LLM gateway and can authenticate with
+requests to your LLM gateway and can authenticate with
 `NAR_LLM_GATEWAY_TOKEN` or `--llm-gateway-token-file`. Provider credentials stay
-inside CSP backend infrastructure, where tenant usage, budgets, and rate limits
+inside your backend platform, where tenant usage, budgets, and rate limits
 can be enforced.
 
 `OpenAIModelAdapter` is retained for local smoke tests. CLI use requires
