@@ -13,7 +13,7 @@ other ``reference.*`` services).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from native_agent_runner.core.outbox import OutboxReceipt, OutboxRequest
@@ -51,6 +51,40 @@ class FailingOutboxSender:
     def send(self, request: OutboxRequest) -> OutboxReceipt:
         del request
         return OutboxReceipt(ok=False, error=self.reason, retryable=self.retryable)
+
+
+@dataclass
+class InboxRoutingOutboxSender:
+    """Routes a staged outbound send into *another agent's inbox* — the agent-to-agent (A2A) edge.
+
+    The injected ``deliver`` callable performs the cross-run handoff (resolve ``destination`` to a
+    peer run and deliver the message through that run's idempotent inbox), keeping this module free
+    of any backend/transport import. ``send`` adapts an :class:`OutboxRequest` to that callable and
+    maps the outcome to an :class:`OutboxReceipt`: any exception becomes a *retryable* failure so the
+    edge's backoff/redrive path takes over (e.g. the peer isn't registered yet, or its queue is
+    momentarily full). The request's ``idempotency_key`` rides along as the inbox dedup key, so a
+    redelivery after a crash is effectively-once at the peer.
+
+    ``deliver(destination, payload, *, message_id, correlation_id, causation_id, traceparent) -> str``
+    returns an external reference recorded on the request; the trace is already a child span of the
+    staged request's trace.
+    """
+
+    deliver: Callable[..., str]
+
+    def send(self, request: OutboxRequest) -> OutboxReceipt:
+        try:
+            reference = self.deliver(
+                request.destination,
+                dict(request.payload),
+                message_id=request.idempotency_key or request.id,
+                correlation_id=request.correlation_id or request.id,
+                causation_id=request.id,
+                traceparent=child_traceparent(request.traceparent),
+            )
+        except Exception as exc:  # unresolved peer / full queue / terminal run -> redrive
+            return OutboxReceipt(ok=False, error=str(exc), retryable=True)
+        return OutboxReceipt(ok=True, reference=reference)
 
 
 class OutboxToolProvider:

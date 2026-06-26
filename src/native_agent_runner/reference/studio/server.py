@@ -25,7 +25,7 @@ import secrets
 import threading
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,12 +39,14 @@ from native_agent_runner.core.agents import (
     SubagentDefinition,
     ToolBinding,
 )
+from native_agent_runner.core.capability import AutoGrantBroker
 from native_agent_runner.core.content import ContentPart, DocumentPart, ImagePart, TextPart
 from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
 from native_agent_runner.core.tool_surface import ToolScope
 from native_agent_runner.errors import NativeAgentError
 from native_agent_runner.reference._shared.tokens import TokenManager
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
+from native_agent_runner.reference.outbox import InboxRoutingOutboxSender, OutboxToolProvider
 from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
 from native_agent_runner.reference.llm_gateway.providers import offline_provider_factory
 from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
@@ -313,6 +315,12 @@ class StudioServer:
         # Chat sessions started this server run (newest first): the history list. In-memory only —
         # see DX note: a cross-restart history would need a backend "list runs" API.
         self._sessions: list[dict[str, Any]] = []
+        # A2A demo (agent-to-agent messaging): a logical agent name -> run_id directory the routing
+        # outbox sender resolves so one peer can address another by name. The peer's run token comes
+        # from _run_tokens. One shared sender drains every run's outbox into the addressed peer's
+        # idempotent inbox via the backend's send_message.
+        self._agent_directory: dict[str, str] = {}
+        self._a2a_sender = InboxRoutingOutboxSender(deliver=self._a2a_deliver)
         self._lock = threading.RLock()
         self._base_url = ""
 
@@ -458,6 +466,10 @@ class StudioServer:
             subagent_definitions.update(self._skill_provider.subagent_definitions())
 
         provider_instances = tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None)
+        # A2A demo: the generic outbox.send tool is always available (its binding is added only for
+        # the demo peers, so a normal chat never sees it). Its tools are declared to config
+        # validation through the same provider seam as Skills/MCP.
+        provider_instances = provider_instances + (OutboxToolProvider(),)
 
         self._backend = RunnerBackend(
             run_root=self.config.run_root,
@@ -480,6 +492,14 @@ class StudioServer:
             # runs and re-attached on resume. Their tools are declared to config validation too.
             tool_providers=provider_instances,
             context_providers=(self._skill_provider,) if self._skill_provider is not None else (),
+            # A2A demo: drain each run's outbox into the addressed peer's inbox, and gate outbox.send
+            # behind a capability lease (the binding declares requires_lease). AutoGrantBroker grants
+            # every request — a dev/demo broker, never production — so the lease gate is *exercised*
+            # (brokered handle on the request + capability.* events) while the actual cross-agent
+            # transport uses Studio's server-side run token. Both are no-ops for a normal chat: a
+            # plain chat binds neither outbox.send nor any requires_lease tool.
+            outbox_sender_factory=lambda req: self._a2a_sender,
+            capability_broker_factory=lambda req: AutoGrantBroker(),
         )
 
         self._ui_server = ThreadingHTTPServer(
@@ -571,6 +591,99 @@ class StudioServer:
             self._run_tokens[submission.run_id] = submission.run_token
             self._sessions.insert(0, {"run_id": submission.run_id, "title": title, "created_at": time.time()})
         return {"run_id": submission.run_id, "status": submission.status}
+
+    # --- A2A demo (agent-to-agent durable messaging) ------------------------------------
+
+    def _a2a_deliver(
+        self,
+        destination: str,
+        payload: dict[str, Any],
+        *,
+        message_id: str,
+        correlation_id: str,
+        causation_id: str,
+        traceparent: str,
+    ) -> str:
+        """Deliver one staged outbox send into the addressed peer's inbox (the routing sender's
+        edge IO). Resolves the peer name through the agent directory, then hands the message to the
+        backend's idempotent ingress. Raises (→ a retryable send) when the peer isn't registered yet
+        or its run can't accept the message, so the backend redrives until it can. Runs on the shared
+        backend loop inside _drain_outbox; send_message only schedules the enqueue, so no blocking."""
+        assert self._backend is not None
+        with self._lock:
+            run_id = self._agent_directory.get(destination)
+            token = self._run_tokens.get(run_id or "")
+        if not run_id or not token:
+            raise LookupError(f"no agent registered as {destination!r}")
+        text = str(payload.get("text") or json.dumps(payload))
+        result = self._backend.send_message(
+            run_id,
+            token,
+            text,
+            message_id=message_id,
+            source="agent",
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            traceparent=traceparent,
+        )
+        return f"a2a:{run_id}:{result.get('message_id', '')}"
+
+    def _a2a_peer_config(self, name: str, peer: str) -> AgentRuntimeConfig:
+        """A peer's runtime config: the current settings' tools plus a lease-gated outbox.send
+        binding, with a persona segment naming the agent and how to message its peer."""
+        base = self._build_config()
+        outbox_binding = ToolBinding(
+            binding_id="outbox.send",
+            model_name="outbox_send",
+            ref=RegistryToolRef("outbox.send"),
+            # The capability gate brokers an outbox.send lease before each send is staged.
+            runtime={"requires_lease": True},
+        )
+        persona = (
+            f"You are the '{name}' agent, collaborating with your peer agent '{peer}'. "
+            f"To send a message to your peer, call the outbox_send tool with "
+            f"destination='{peer}' and payload={{\"text\": <your message>}}. A message from your "
+            f"peer arrives as a new user turn. When the task is complete, reply to your peer and "
+            f"then give a short final summary."
+        )
+        prompt = PromptSpec(system_prompt_base=f"{_SYSTEM_PROMPT}\n\n{persona}")
+        return replace(base, prompt=prompt, tools=base.tools + (outbox_binding,))
+
+    def _spawn_peer(self, name: str, peer: str, *, instruction: str) -> str:
+        assert self._backend is not None
+        request = BackendRunRequest(
+            tenant_id=_TENANT,
+            user_id=_USER,
+            workspace_root=self.workspace,
+            instruction=instruction,
+            mode="propose",
+            multi_turn=True,
+            runtime_config=self._a2a_peer_config(name, peer),
+        )
+        submission = self._backend.submit_run(request)
+        with self._lock:
+            self._run_tokens[submission.run_id] = submission.run_token
+            self._agent_directory[name] = submission.run_id
+            self._sessions.insert(
+                0,
+                {"run_id": submission.run_id, "title": f"A2A · {name}", "created_at": time.time()},
+            )
+        return submission.run_id
+
+    def start_a2a_demo(self, task: str) -> dict[str, Any]:
+        """Spin up two peer agents (planner + worker) wired to message each other through the
+        durable outbox→inbox fabric, and seed the planner with ``task``. The worker is started first
+        so its inbox exists before the planner addresses it. Returns both run ids.
+
+        Note: a real exchange needs a tool-calling model (the openai provider, or a scripted fake in
+        tests) — the offline echo provider won't emit outbox_send calls on its own."""
+        assert self._backend is not None
+        task = task.strip() or "Break a small task into steps and complete it together."
+        worker_id = self._spawn_peer(
+            "worker", "planner", instruction="Stand by for a task from planner."
+        )
+        planner_id = self._spawn_peer("planner", "worker", instruction=task)
+        return {"planner": planner_id, "worker": worker_id}
 
     def sessions(self) -> dict[str, Any]:
         """The chat history (newest first), restart-surviving via the backend (DX-12).
@@ -990,6 +1103,11 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     else:
                         result = studio.start_chat(message, attachments)
                     self._write_json(result)
+                    return
+                if parsed.path == "/api/a2a-demo":
+                    body = self._read_json()
+                    task = str(body.get("task") or "").strip()
+                    self._write_json(studio.start_a2a_demo(task))
                     return
                 if parsed.path == "/api/cancel":
                     body = self._read_json()

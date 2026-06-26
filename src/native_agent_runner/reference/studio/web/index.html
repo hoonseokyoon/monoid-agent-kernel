@@ -197,7 +197,10 @@
   </header>
   <div id="body">
     <aside id="sidebar">
-      <div class="side-title">Chats</div>
+      <div class="side-title">Chats
+        <a href="#" id="a2a-demo" class="hlink" style="float:right;font-weight:400"
+           title="Spin up two peer agents that message each other through the durable outbox→inbox fabric">⇄ A2A demo</a>
+      </div>
       <ul id="sessions"></ul>
       <div class="side-title" style="margin-top:14px">Files</div>
       <ul id="tree"></ul>
@@ -1022,6 +1025,7 @@ async function loadSetup() {
 // --- R8: session history + trace tree ---------------------------------------------------
 const sessionsEl = document.getElementById("sessions");
 const newchatBtn = document.getElementById("newchat");
+const a2aBtn = document.getElementById("a2a-demo");
 const traceBtn = document.getElementById("trace-btn");
 const traceAside = document.getElementById("trace");
 const traceTreeEl = document.getElementById("trace-tree");
@@ -1121,6 +1125,22 @@ function renderTrace() {
 }
 
 newchatBtn.addEventListener("click", (e) => { e.preventDefault(); newChat(); });
+a2aBtn.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const task = prompt("A2A demo — task for the planner (it will message the worker):",
+    "Draft a one-line release note together, then agree on the final wording.");
+  if (task === null) return;
+  try {
+    const res = await (await fetch("/api/a2a-demo", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task })
+    })).json();
+    if (res.error) { activity("A2A demo failed: " + res.error); return; }
+    activity("⇄ A2A demo started — planner & worker are messaging via outbox→inbox. Switch sessions to watch.");
+    await refreshSessions();
+    if (res.planner) loadSession(res.planner);
+  } catch (err) { activity("A2A demo failed: " + err); }
+});
 traceBtn.addEventListener("click", (e) => {
   e.preventDefault();
   const show = traceAside.hidden;

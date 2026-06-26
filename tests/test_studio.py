@@ -1246,3 +1246,27 @@ def test_skill_catalog_disappears_on_capability_hot_swap(tmp_path: Path) -> None
         assert "commit-message" not in fake.requests[1].system_prompt  # catalog gone next turn
     finally:
         server.shutdown()
+
+
+def test_a2a_demo_preset_wires_two_peers(studio: StudioServer) -> None:
+    """The one-click A2A preset spins up two named peers wired to message each other through the
+    durable outbox→inbox fabric: both are registered in the agent directory (addressable by name),
+    each carries a lease-gated outbox.send binding, and each persona names its counterpart. The
+    cross-agent delivery itself is covered end-to-end in test_outbox.py."""
+    result = studio.start_a2a_demo("draft a release note together")
+    planner_id, worker_id = result["planner"], result["worker"]
+    assert planner_id and worker_id and planner_id != worker_id
+
+    # Addressable by name; run tokens held server-side (never sent to the browser).
+    assert studio._agent_directory == {"worker": worker_id, "planner": planner_id}
+    assert planner_id in studio._run_tokens and worker_id in studio._run_tokens
+
+    # Each peer carries a lease-gated outbox.send binding + a persona naming its counterpart.
+    planner_cfg = studio._backend.current_runtime_config(planner_id)
+    outbox = [b for b in planner_cfg.tools if b.ref.tool_id == "outbox.send"]
+    assert outbox and outbox[0].runtime.get("requires_lease") is True
+    assert "worker" in planner_cfg.prompt.system_prompt_base
+
+    worker_cfg = studio._backend.current_runtime_config(worker_id)
+    assert any(b.ref.tool_id == "outbox.send" for b in worker_cfg.tools)
+    assert "planner" in worker_cfg.prompt.system_prompt_base
