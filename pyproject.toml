@@ -8,7 +8,7 @@ version = "0.11.0"
 description = "Standalone lightweight API-backed agent harness for safe file work"
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "Hoonseok Yoon", email = "hoonseok.ai@gmail.com" }]
+authors = [{ name = "Hoonseok Yoon", email = "yoonhs9dev@gmail.com" }]
 keywords = ["agent", "llm", "ai", "runtime", "tools", "harness", "openai", "mcp"]
 license = { text = "Apache-2.0" }
 classifiers = [

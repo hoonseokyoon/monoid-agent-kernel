@@ -7,7 +7,7 @@ vulnerability.
 
 - Use GitHub's [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)
   (the **Security → Report a vulnerability** tab), or
-- email **hoonseok.ai@gmail.com** with details and, if possible, a reproduction.
+- email **yoonhs9dev@gmail.com** with details and, if possible, a reproduction.
 
 We aim to acknowledge reports within a few days. Please give us a reasonable
 window to address the issue before public disclosure.

@@ -302,6 +302,7 @@ class _AsyncStream:
 
 
 def test_openai_astream_yields_reasoning_delta_then_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("openai")  # exercises the real SDK stream; skip on a minimal install
     # DX-13b: a reasoning-summary stream event maps to a ReasoningDelta, distinct from the
     # answer's TextDelta, ahead of the terminal TurnComplete.
     events = [
@@ -461,6 +462,7 @@ def test_openai_smoke_payload_only() -> None:
 
 
 def test_openai_adapter_maps_provider_400_to_model_adapter_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("openai")  # uses real SDK error types; skip on a minimal install
     # A provider 400 (e.g. unsupported reasoning effort) must surface as a classified, non-
     # retryable ModelAdapterError carrying http_status — NOT a raw SDK error (which the gateway
     # would mistranslate to a retryable 500). The message must not echo the request body.
