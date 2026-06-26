@@ -1,5 +1,15 @@
 # Native Agent Runner
 
+*A provider-neutral, permission-aware agent runtime for safe, structured file work — secrets stay outside the engine, and every seam (model, tools, workspace, checkpoint store) is replaceable.*
+
+[![CI](https://github.com/hoonseokyoon/native-agent-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/hoonseokyoon/native-agent-runner/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+
+> **Terminology:** Throughout these docs, **CSP** means the *Cloud Service Provider / backend
+> platform you operate* — the credential boundary that hosts the LLM and Web gateways. The runner
+> itself never holds provider keys; it calls your gateway with a short-lived, scoped token.
+
 Standalone API-backed agent harness for safe, structured file work in a
 workspace. The workspace is a pluggable seam: the engine ships with a
 local-filesystem backend and accepts your own implementation (see
@@ -489,3 +499,13 @@ To target your own LLM gateway, implement the `ModelAdapter` protocol or the
 - file mutation tools include write, patch, mkdir, copy, move, and delete in
   `propose` and `apply` modes when bound in runtime config
 - no path deny/redact policy unless explicitly provided
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+development setup and the lint/test workflow, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+For security issues, follow [SECURITY.md](SECURITY.md) (do not open a public issue).
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

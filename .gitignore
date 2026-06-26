@@ -27,6 +27,8 @@ env/
 # Run artifacts / outputs
 runs/
 runs-*/
+studio-workspace/
+proposal.tar
 
 # IDE / OS
 .idea/
