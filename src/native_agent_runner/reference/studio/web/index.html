@@ -58,6 +58,7 @@
   #proposal-files { font-size: 12.5px; color: var(--muted); display: flex; flex-direction: column; gap: 3px; }
   #proposal-files label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   #proposal-files .f { color: var(--text); font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+  #proposal-files .img-preview { margin-left: auto; text-decoration: none; font-size: 13px; }
   #proposal-actions { display: flex; gap: 8px; }
   #export { background: transparent; color: var(--text); border: 1px solid var(--border);
     border-radius: 8px; padding: 9px 14px; cursor: pointer; }
@@ -631,6 +632,7 @@ function finishSubagent(data, failed) {
 const proposalEl = document.getElementById("proposal");
 const proposalFilesEl = document.getElementById("proposal-files");
 const diffEl = document.getElementById("diff");
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp|ico|svg)$/i;  // file types the viewer previews as <img>
 const applyBtn = document.getElementById("apply");
 const applyStatus = document.getElementById("apply-status");
 let applied = false;
@@ -666,8 +668,14 @@ async function refreshProposal() {
     proposalFilesEl.innerHTML = files.map(f => {
       const checked = prior.has(f) ? "" : "checked";
       const safe = f.replace(/"/g, "&quot;");
-      return `<label><input type="checkbox" value="${safe}" ${checked} /><span class="f">${f}</span></label>`;
+      // An <a> inside the label is interactive content, so clicking it previews the image
+      // without toggling the file's apply checkbox.
+      const view = IMAGE_RE.test(f) ? `<a href="#" class="img-preview" data-path="${safe}" title="Preview proposed image">🖼</a>` : "";
+      return `<label><input type="checkbox" value="${safe}" ${checked} /><span class="f">${f}</span>${view}</label>`;
     }).join("");
+    proposalFilesEl.querySelectorAll("a.img-preview").forEach(a => {
+      a.addEventListener("click", (e) => { e.preventDefault(); openProposalImage(a.dataset.path); });
+    });
     syncSelectAll();
     renderDiff(p.diff);
     proposalEl.hidden = false;
@@ -932,9 +940,35 @@ async function openFile(path) {
   try {
     const r = await (await fetch("/api/file?path=" + encodeURIComponent(path))).json();
     if (r.error) { viewerBody.textContent = "error: " + r.error; return; }
+    if (r.image) {
+      viewerBody.textContent = "";
+      const img = document.createElement("img");
+      img.src = "/api/file-raw?path=" + encodeURIComponent(path);
+      img.alt = path;
+      img.style.maxWidth = "100%";
+      img.style.height = "auto";
+      img.onerror = () => { viewerBody.textContent = "(could not load image)"; };
+      viewerBody.appendChild(img);
+      return;
+    }
     if (r.binary) { viewerBody.textContent = "(binary file — not shown)"; return; }
     viewerBody.textContent = r.content + (r.truncated ? "\n\n… (truncated)" : "");
   } catch (_) { viewerBody.textContent = "error loading file"; }
+}
+
+// Preview a PROPOSED (not-yet-applied) image in the file viewer — its bytes come from the run's
+// proposal snapshot, not the live workspace (where it won't exist until apply).
+function openProposalImage(path) {
+  viewerName.textContent = path + " (proposed)";
+  viewerBody.textContent = "loading…";
+  viewerAside.hidden = false;
+  const img = document.createElement("img");
+  img.src = "/api/proposal-file-raw?run_id=" + encodeURIComponent(runId) + "&path=" + encodeURIComponent(path);
+  img.alt = path;
+  img.style.maxWidth = "100%";
+  img.style.height = "auto";
+  img.onload = () => { viewerBody.textContent = ""; viewerBody.appendChild(img); };
+  img.onerror = () => { viewerBody.textContent = "(could not load image preview)"; };
 }
 
 async function loadTree() {

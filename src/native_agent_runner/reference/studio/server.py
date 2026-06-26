@@ -74,6 +74,13 @@ _USER = "local"
 _TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".ruff_cache", ".pytest_cache"}
 _TREE_MAX_ENTRIES = 2000
 _VIEW_MAX_BYTES = 256 * 1024  # file-viewer read cap — keep a huge file from stalling the UI
+# File-viewer image preview: these extensions are served as raw bytes via /api/file-raw and
+# rendered with an <img>, instead of being refused as binary by the text viewer.
+_IMAGE_EXTS = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+    ".webp": "image/webp", ".bmp": "image/bmp", ".ico": "image/x-icon", ".svg": "image/svg+xml",
+}
+_IMAGE_VIEW_MAX_BYTES = 8 * 1024 * 1024  # raw-image preview cap
 
 
 # Obvious destructive command prefixes the shell binding refuses outright (a binding-level
@@ -817,6 +824,23 @@ class StudioServer:
         data = self._backend.read_run_artifact(run_id, token, digest)
         return data, f"proposal-{digest[:12]}.tar"
 
+    def proposal_image(self, run_id: str, path: str) -> tuple[bytes, str]:
+        """Bytes + content-type for an image in the run's PROPOSAL snapshot — lets the proposal
+        panel preview a generated image *before* it is applied. Mirrors :meth:`read_image` but
+        sources the bytes from the token-scoped backend ``proposal_file`` API (base64 for binary,
+        utf-8 for an SVG), never the live workspace (the image isn't there until apply)."""
+        assert self._backend is not None
+        mime = _IMAGE_EXTS.get(Path(path).suffix.lower())
+        if mime is None:
+            raise NativeAgentError("not an image file")
+        token = self._token_for(run_id)
+        payload = self._backend.proposal_file(run_id, token, path)
+        content = str(payload.get("content") or "")
+        data = base64.b64decode(content) if payload.get("encoding") == "base64" else content.encode("utf-8")
+        if len(data) > _IMAGE_VIEW_MAX_BYTES:
+            raise NativeAgentError(f"image exceeds the {_IMAGE_VIEW_MAX_BYTES}-byte preview limit")
+        return data, mime
+
     def jobs(self, run_id: str) -> dict[str, Any]:
         """Background shell jobs for the run (running + finished)."""
         assert self._backend is not None
@@ -947,9 +971,9 @@ class StudioServer:
                 break
         return entries
 
-    def read_file(self, rel_path: str) -> dict[str, Any]:
-        """Read a workspace file for the file viewer. Path-guarded to the workspace root (rejects
-        traversal / absolute paths), size-capped, and refuses binary content (NUL byte)."""
+    def _resolve_workspace_file(self, rel_path: str) -> Path:
+        """Resolve a viewer path to a real file inside the workspace, rejecting empty paths,
+        traversal / absolute paths that escape the root, and non-files."""
         if not rel_path:
             raise NativeAgentError("path is required")
         root = self.workspace.resolve()
@@ -958,17 +982,43 @@ class StudioServer:
             raise NativeAgentError("path escapes the workspace")
         if not candidate.is_file():
             raise NativeAgentError("not a file")
+        return candidate
+
+    def read_file(self, rel_path: str) -> dict[str, Any]:
+        """Read a workspace file for the file viewer. Path-guarded to the workspace root (rejects
+        traversal / absolute paths) and size-capped. An image file is flagged for inline ``<img>``
+        preview (its bytes are fetched via :meth:`read_image` / ``/api/file-raw``); other binary
+        content (NUL byte) is refused."""
+        candidate = self._resolve_workspace_file(rel_path)
+        mime = _IMAGE_EXTS.get(candidate.suffix.lower())
+        if mime is not None:
+            return {"path": rel_path, "image": True, "mime": mime, "binary": False,
+                    "truncated": False, "content": ""}
         raw = candidate.read_bytes()
         truncated = len(raw) > _VIEW_MAX_BYTES
         raw = raw[:_VIEW_MAX_BYTES]
         if b"\x00" in raw:
-            return {"path": rel_path, "binary": True, "truncated": False, "content": ""}
+            return {"path": rel_path, "binary": True, "image": False, "truncated": False, "content": ""}
         return {
             "path": rel_path,
             "binary": False,
+            "image": False,
             "truncated": truncated,
             "content": raw.decode("utf-8", errors="replace"),
         }
+
+    def read_image(self, rel_path: str) -> tuple[bytes, str]:
+        """Bytes + content-type for an image workspace file — the ``/api/file-raw`` seam that backs
+        the inline preview. Same path guard as :meth:`read_file`, restricted to known image
+        extensions and size-capped."""
+        candidate = self._resolve_workspace_file(rel_path)
+        mime = _IMAGE_EXTS.get(candidate.suffix.lower())
+        if mime is None:
+            raise NativeAgentError("not an image file")
+        data = candidate.read_bytes()
+        if len(data) > _IMAGE_VIEW_MAX_BYTES:
+            raise NativeAgentError(f"image exceeds the {_IMAGE_VIEW_MAX_BYTES}-byte preview limit")
+        return data, mime
 
     def _token_for(self, run_id: str) -> str:
         with self._lock:
@@ -1026,6 +1076,16 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 except NativeAgentError as exc:
                     self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
+            if parsed.path == "/api/file-raw":
+                # Raw image bytes for the inline <img> preview (read_file flags image=true).
+                rel = (parse_qs(parsed.query).get("path") or [""])[0]
+                try:
+                    data, mime = studio.read_image(rel)
+                except NativeAgentError as exc:
+                    self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                else:
+                    self._serve_bytes(data, mime)
+                return
             if parsed.path == "/api/artifact":
                 query = parse_qs(parsed.query)
                 run_id = (query.get("run_id") or [""])[0]
@@ -1052,6 +1112,20 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     self._write_json(studio.proposal(run_id))
                 except NativeAgentError as exc:
                     self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/proposal-file-raw":
+                # Raw image bytes for a PROPOSED (not-yet-applied) file — the proposal-panel preview.
+                query = parse_qs(parsed.query)
+                run_id = (query.get("run_id") or [""])[0]
+                rel = (query.get("path") or [""])[0]
+                try:
+                    data, mime = studio.proposal_image(run_id, rel)
+                except KeyError:
+                    self.send_error(HTTPStatus.NOT_FOUND, "not found")
+                except (NativeAgentError, ValueError) as exc:
+                    self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                else:
+                    self._serve_bytes(data, mime)
                 return
             if parsed.path == "/api/jobs":
                 run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]

@@ -1270,3 +1270,66 @@ def test_a2a_demo_preset_wires_two_peers(studio: StudioServer) -> None:
     worker_cfg = studio._backend.current_runtime_config(worker_id)
     assert any(b.ref.tool_id == "outbox.send" for b in worker_cfg.tools)
     assert "planner" in worker_cfg.prompt.system_prompt_base
+
+
+def test_file_viewer_previews_images(studio: StudioServer) -> None:
+    """The file viewer flags an image for inline <img> preview and serves its raw bytes via the
+    read_image (/api/file-raw) seam, while text files keep rendering inline and traversal / non-image
+    reads are refused."""
+    import base64
+
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+    ws = studio.workspace
+    (ws / "pic.png").write_bytes(png)
+    (ws / "code.py").write_text("print('hi')\n", encoding="utf-8")
+
+    meta = studio.read_file("pic.png")  # image: flagged for <img>, no inline content
+    assert meta["image"] is True and meta["mime"] == "image/png" and meta["content"] == ""
+
+    code = studio.read_file("code.py")  # text: still rendered inline, not an image
+    assert code["image"] is False and "print" in code["content"]
+
+    data, mime = studio.read_image("pic.png")  # raw bytes for /api/file-raw
+    assert data == png and mime == "image/png"
+
+    with pytest.raises(NativeAgentError):
+        studio.read_image("code.py")  # non-image refused by the raw endpoint
+    with pytest.raises(NativeAgentError):
+        studio.read_image("../escape.png")  # traversal rejected
+
+
+def test_proposal_panel_previews_proposed_image(tmp_path: Path) -> None:
+    """A generated image staged in the proposal (not yet on disk) is previewable: proposal_image
+    returns its bytes + content-type from the token-scoped proposal snapshot. Uses an SVG (a text
+    image) so the path is exercised end-to-end without a real binary plot."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>'
+    fake = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("fs_write", {"path": "chart.svg", "content": svg}, "c1"),)),
+            ModelTurn(final_text="Wrote chart.svg."),
+        ]
+    )
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("draw a chart")["run_id"]
+        _wait_settled(server, run_id, 1)
+        proposal = _wait_proposal(server, run_id)
+        assert "chart.svg" in (proposal.get("changed_paths") or [])
+
+        # Not on disk yet (propose mode) — but previewable straight from the proposal snapshot.
+        assert not (workspace / "chart.svg").exists()
+        data, mime = server.proposal_image(run_id, "chart.svg")
+        assert mime == "image/svg+xml" and data.decode("utf-8") == svg
+
+        with pytest.raises(NativeAgentError):
+            server.proposal_image(run_id, "notes.txt")  # non-image refused
+    finally:
+        server.shutdown()
