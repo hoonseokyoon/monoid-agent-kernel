@@ -1,0 +1,54 @@
+"""CLI-level tests for `native-agent studio doctor` — the preflight that turns late, cryptic
+setup failures (busy port, unwritable dir, missing key, no browser) into an upfront checklist.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from native_agent_runner.reference.studio.cli import studio
+
+
+def _invoke(tmp_path: Path, *extra: str):
+    args = [
+        "doctor",
+        "--workspace", str(tmp_path / "ws"),
+        "--run-root", str(tmp_path / "runs"),
+        "--port", "0",  # ephemeral → always "free", no busy-port flake
+        *extra,
+    ]
+    return CliRunner().invoke(studio, args)
+
+
+def test_doctor_offline_all_good(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "native_agent_runner.reference.studio.window.find_chromium", lambda: "/usr/bin/chromium"
+    )
+    result = _invoke(tmp_path)
+    assert result.exit_code == 0, result.output
+    assert "[PASS]" in result.output
+    assert "All hard checks passed" in result.output
+
+
+def test_doctor_openai_without_key_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    result = _invoke(tmp_path, "--provider", "openai")
+    assert result.exit_code == 1
+    assert "[FAIL]" in result.output
+    assert "OPENAI_API_KEY" in result.output
+
+
+def test_doctor_missing_chromium_is_warning_not_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "native_agent_runner.reference.studio.window.find_chromium", lambda: None
+    )
+    result = _invoke(tmp_path)
+    # No browser is a WARN, not a hard failure — serve still works headless.
+    assert result.exit_code == 0, result.output
+    assert "[WARN]" in result.output
+    assert "browser" in result.output.lower()

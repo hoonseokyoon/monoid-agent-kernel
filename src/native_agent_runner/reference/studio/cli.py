@@ -11,11 +11,14 @@ Three launch shapes, matching the two lifecycle models:
 
 from __future__ import annotations
 
+import os
+import socket
 import time
 from pathlib import Path
 
 import click
 
+from native_agent_runner.reference.studio import window
 from native_agent_runner.reference.studio.server import _SAMPLE_SKILLS_DIR, StudioConfig, StudioServer
 from native_agent_runner.reference.studio.window import open_app_window
 
@@ -178,7 +181,113 @@ def studio_open(*, url: str) -> None:
 @click.option("--url", type=str, default="http://127.0.0.1:8799", show_default=True)
 def studio_settings(*, url: str) -> None:
     """Open the small Settings window for an already-running Studio server."""
-    window = open_app_window(url.rstrip("/") + "/settings", width=520, height=660)
-    if window is None:
+    win = open_app_window(url.rstrip("/") + "/settings", width=520, height=660)
+    if win is None:
         raise click.ClickException(f"No Chromium browser found; open {url}/settings manually.")
-    window.wait()
+    win.wait()
+
+
+def _port_free(host: str, port: int) -> bool:
+    """True if ``host:port`` can be bound (i.e. is free). Port 0 is always free (ephemeral)."""
+    if port == 0:
+        return True
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def _dir_writable(path: Path) -> bool:
+    """True if ``path`` exists-or-can-be-created and a probe file can be written there."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".nar-doctor-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _otel_export_importable() -> bool:
+    """True if the OTel SDK + OTLP/HTTP exporter (the [otel-export] extra) are importable —
+    the same imports _ensure_otel_provider needs for the Studio OTel toggle."""
+    try:
+        from opentelemetry import trace  # noqa: F401
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (  # noqa: F401
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.resources import Resource  # noqa: F401
+        from opentelemetry.sdk.trace import TracerProvider  # noqa: F401
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@studio.command("doctor")
+@_common_server_options
+def studio_doctor(
+    *,
+    workspace: Path,
+    host: str,
+    port: int,
+    provider: str,
+    run_root: Path,
+    skills_directory: Path,
+    no_skills: bool,
+    mcp: bool,
+) -> None:
+    """Preflight the common setup failures and print pass/fail with exact remediation.
+
+    Exits non-zero if a hard requirement fails (busy port, unwritable dir, missing API key),
+    so it doubles as a CI/launch gate. Browser and OTel gaps are warnings — ``serve`` still runs."""
+    hard_failures = 0
+
+    def report(status: bool | None, label: str, remedy: str = "") -> None:
+        mark = {True: "PASS", False: "FAIL", None: "WARN"}[status]
+        click.echo(f"[{mark}] {label}")
+        if remedy and status is not True:
+            click.echo(f"       -> {remedy}")
+
+    # --- hard requirements ---
+    if _port_free(host, port):
+        report(True, f"port {host}:{port} is free")
+    else:
+        hard_failures += 1
+        report(False, f"port {host}:{port} is in use", "stop the process using it or pass --port <other>")
+
+    for label, directory in (("workspace", workspace), ("run root", run_root)):
+        if _dir_writable(directory):
+            report(True, f"{label} {directory} is writable")
+        else:
+            hard_failures += 1
+            report(False, f"{label} {directory} is not writable", "pick a writable path")
+
+    if provider == "openai":
+        if os.environ.get("OPENAI_API_KEY"):
+            report(True, "OPENAI_API_KEY is set")
+        else:
+            hard_failures += 1
+            report(False, "OPENAI_API_KEY is not set", "export OPENAI_API_KEY=... or use --provider offline")
+    else:
+        report(True, "provider 'offline' (no API key needed)")
+
+    # --- soft checks (warnings only) ---
+    if window.find_chromium() is not None:
+        report(True, "a Chromium-family browser is available")
+    else:
+        report(None, "no Chromium browser found", "install Chrome/Edge, or use 'studio serve' and open the URL manually")
+
+    if _otel_export_importable():
+        report(True, "OpenTelemetry SDK + OTLP exporter are importable")
+    else:
+        report(None, "OTel export deps not installed", "pip install 'native-agent-runner[otel-export]' (only needed for the OTel toggle)")
+
+    click.echo("")
+    if hard_failures:
+        click.echo(f"{hard_failures} hard check(s) failed.")
+        raise SystemExit(1)
+    click.echo("All hard checks passed.")
