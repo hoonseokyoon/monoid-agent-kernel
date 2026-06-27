@@ -443,6 +443,16 @@ function sendPrompt(text) {
   form.requestSubmit();
 }
 
+// The provider failure detail (code + HTTP status) to append to a failure message — shared by the
+// run.failed and turn.failed handlers so the real cause (e.g. insufficient_quota / HTTP 429) shows
+// in both. Skips the code if it's already in the message (turn.failed's error often embeds it).
+function providerDetail(data, msg) {
+  const parts = [];
+  if (data.provider_error_code && !(msg || "").includes(data.provider_error_code)) parts.push(data.provider_error_code);
+  if (data.http_status) parts.push("HTTP " + data.http_status);
+  return parts.length ? " — " + parts.join(" · ") : "";
+}
+
 // First-run empty-state: an intro + a few one-click prompts. Shown only when the chat is empty
 // (no active session); removed by bubble() on the first message.
 function showOnboarding(offline) {
@@ -557,7 +567,8 @@ function handleEvent(ev) {
   if (type === "turn.failed") {
     hideTyping();
     setGenerating(false);
-    const msg = data.error || "the model turn failed";
+    let msg = data.error || "the model turn failed";
+    msg += providerDetail(data, msg);  // recoverable 4xx/429 land here — show the provider code/status
     if (data.retryable) {
       activity("⚠ " + msg + " — retrying…");
       setGenerating(true);  // a transient failure is auto-retried server-side
@@ -603,10 +614,7 @@ function handleEvent(ev) {
     setGenerating(false);
     finalizeStream("");
     let msg = data.error || data.message || "the run failed";
-    // Surface the real provider failure (e.g. insufficient_quota / HTTP 429) when present.
-    const detail = [data.provider_error_code, data.http_status ? "HTTP " + data.http_status : ""]
-      .filter(Boolean).join(" · ");
-    if (detail) msg += " — " + detail;
+    msg += providerDetail(data, msg);  // surface insufficient_quota / HTTP 429 etc.
     bubble("error", msg);
     return;
   }
