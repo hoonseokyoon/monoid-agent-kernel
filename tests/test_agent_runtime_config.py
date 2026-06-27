@@ -300,9 +300,15 @@ def test_validate_collects_empty_model_name_instead_of_raising() -> None:
 
 
 def test_contracts_core_curated_namespace() -> None:
+    import types
+
+    import native_agent_runner as nar
     from native_agent_runner.contracts import core
 
     assert core.AgentLoop is AgentLoop
+    # The curated namespace must NOT shadow the native_agent_runner.core package at the root.
+    assert isinstance(nar.core, types.ModuleType) and hasattr(nar.core, "agents")
+    assert "core" not in nar.contracts.__all__
     names = {n for n in vars(core) if not n.startswith("_")}
     assert names == {
         "AgentLoop", "AgentRunSpec", "AgentRuntimeConfig", "ModelAdapter",

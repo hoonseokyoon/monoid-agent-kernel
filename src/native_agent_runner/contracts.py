@@ -348,8 +348,9 @@ __all__ = [
     # config validation
     "validate_runtime_config",
     "collect_runtime_config_issues",
-    # curated must-know namespace
-    "core",
+    # NOTE: the curated `core` namespace is intentionally NOT in __all__ — re-exporting it would
+    # shadow the `native_agent_runner.core` package at the root. Reach it via
+    # `from native_agent_runner.contracts import core`.
     # event contract
     "EVENT_SCHEMA_VERSION",
     "AgentEvent",
