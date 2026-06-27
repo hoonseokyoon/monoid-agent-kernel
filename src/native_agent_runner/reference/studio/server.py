@@ -148,36 +148,32 @@ _SUBAGENT_DEFINITIONS = {
 
 
 def _capability_bindings(capability: str) -> tuple[ToolBinding, ...]:
+    # ToolBinding.for_tool derives binding_id + model_name from the tool id; only the shell
+    # binding needs extra scope/runtime, which pass through as keyword arguments.
     if capability == "read":
-        return (ToolBinding(binding_id="fs.read", model_name="fs_read", ref=RegistryToolRef("fs.read")),)
+        return (ToolBinding.for_tool("fs.read"),)
     if capability == "write":
-        return (ToolBinding(binding_id="fs.write", model_name="fs_write", ref=RegistryToolRef("fs.write")),)
+        return (ToolBinding.for_tool("fs.write"),)
     if capability == "hitl":
-        return (
-            ToolBinding(binding_id="hitl.request", model_name="hitl_request", ref=RegistryToolRef("hitl.request")),
-        )
+        return (ToolBinding.for_tool("hitl.request"),)
     if capability == "shell":
         return (
-            ToolBinding(
-                binding_id="shell.exec",
-                model_name="shell_exec",
-                ref=RegistryToolRef("shell.exec"),
+            ToolBinding.for_tool(
+                "shell.exec",
                 scope=ToolScope(command_deny_prefixes=_SHELL_DENY_PREFIXES),
                 runtime={"shell": {"approval_mode": "auto-approve"}},
             ),
         )
     if capability == "web":
         return (
-            ToolBinding(binding_id="web.search", model_name="web_search", ref=RegistryToolRef("web.search")),
-            ToolBinding(binding_id="web.fetch", model_name="web_fetch", ref=RegistryToolRef("web.fetch")),
-            ToolBinding(binding_id="web.context", model_name="web_context", ref=RegistryToolRef("web.context")),
+            ToolBinding.for_tool("web.search"),
+            ToolBinding.for_tool("web.fetch"),
+            ToolBinding.for_tool("web.context"),
         )
     if capability == "delegate":
         # Only effective when the backend carries subagent_definitions (the loop bootstrap
         # registers agent.spawn then); studio always does.
-        return (
-            ToolBinding(binding_id="agent.spawn", model_name="agent_spawn", ref=RegistryToolRef("agent.spawn")),
-        )
+        return (ToolBinding.for_tool("agent.spawn"),)
     return ()
 
 

@@ -79,7 +79,7 @@ class RegistryToolRef:
 @dataclass(frozen=True)
 class ToolBinding:
     binding_id: str
-    ref: RegistryToolRef
+    ref: RegistryToolRef | str
     model_name: str | None = None
     exposure: ToolExposure = "immediate"
     authorization: ToolAuthorizationDecision = "allow"
@@ -93,6 +93,33 @@ class ToolBinding:
     reason: str = ""
     runtime: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Ergonomics: accept a bare tool-id string for ``ref`` and normalize it to a
+        # RegistryToolRef, so ``ToolBinding(binding_id="x", ref="fs.read")`` works (frozen-safe).
+        if isinstance(self.ref, str):
+            object.__setattr__(self, "ref", RegistryToolRef(self.ref))
+
+    @classmethod
+    def for_tool(
+        cls,
+        tool_id: str,
+        *,
+        binding_id: str | None = None,
+        model_name: str | None = None,
+        **kwargs: Any,
+    ) -> ToolBinding:
+        """One-token binding for a registry tool: ``ToolBinding.for_tool("fs.read")``.
+
+        Defaults ``binding_id`` to ``tool_id`` and leaves ``model_name`` for the catalog to
+        derive (``binding_id`` with dots → underscores). Extra binding fields (scope, runtime,
+        exposure, …) pass through as keyword arguments."""
+        return cls(
+            binding_id=binding_id or tool_id,
+            ref=RegistryToolRef(tool_id),
+            model_name=model_name,
+            **kwargs,
+        )
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ToolBinding:

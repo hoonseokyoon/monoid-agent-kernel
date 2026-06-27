@@ -233,3 +233,30 @@ def test_tool_search_binding_identity_conflicts_are_rejected(tmp_path: Path) -> 
             assert expected in str(exc)
         else:  # pragma: no cover
             raise AssertionError(f"accepted invalid config: {expected}")
+
+
+def test_tool_binding_for_tool_derives_binding_id_and_ref() -> None:
+    b = ToolBinding.for_tool("fs.read")
+    assert b.binding_id == "fs.read"
+    assert b.ref == RegistryToolRef("fs.read")
+    assert b.model_name is None  # left for the catalog to derive (fs_read)
+
+
+def test_tool_binding_for_tool_forwards_overrides() -> None:
+    b = ToolBinding.for_tool(
+        "fs.read", binding_id="reader", model_name="read_file", exposure="searchable"
+    )
+    assert (b.binding_id, b.model_name, b.exposure) == ("reader", "read_file", "searchable")
+
+
+def test_tool_binding_accepts_bare_string_ref() -> None:
+    b = ToolBinding(binding_id="x", ref="fs.read")
+    assert b.ref == RegistryToolRef("fs.read")
+    # identical to the explicit form
+    assert b == ToolBinding(binding_id="x", ref=RegistryToolRef("fs.read"))
+
+
+def test_tool_binding_for_tool_round_trips() -> None:
+    b = ToolBinding.for_tool("fs.read")
+    restored = ToolBinding.from_json(json.loads(json.dumps(b.to_json())))
+    assert restored == b

@@ -23,7 +23,6 @@ from native_agent_runner import (  # noqa: E402
     AgentRunSpec,
     AgentRuntimeConfig,
     FakeModelAdapter,
-    RegistryToolRef,
     ToolBinding,
     tool_ids,
 )
@@ -42,14 +41,14 @@ def main() -> None:
         #    stages changes as a diff.patch + proposal for review (nothing is mutated).
         spec = AgentRunSpec(workspace_root=workspace, run_root=Path(tmp) / "runs", mode="apply")
 
-        # 2) Runtime config: which tools the agent may use this run. (Bindings map a
-        #    registry tool id to an agent-facing tool.) Use the tool_ids constants for
-        #    autocomplete + typo-safety instead of bare strings.
+        # 2) Runtime config: which tools the agent may use this run. ToolBinding.for_tool
+        #    collapses the binding to one token (binding_id + model_name are derived); the
+        #    tool_ids constants give autocomplete + typo-safety instead of bare strings.
         config = AgentRuntimeConfig(
             definition_id="quickstart",
             tools=(
-                ToolBinding(binding_id="fs.write", ref=RegistryToolRef(tool_ids.FS_WRITE)),
-                ToolBinding(binding_id="run.finish", ref=RegistryToolRef(tool_ids.RUN_FINISH)),
+                ToolBinding.for_tool(tool_ids.FS_WRITE),
+                ToolBinding.for_tool(tool_ids.RUN_FINISH),
             ),
         )
 
