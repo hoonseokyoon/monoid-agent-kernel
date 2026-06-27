@@ -167,6 +167,8 @@ from native_agent_runner.tools.base import (
     ToolSpec,
 )
 from native_agent_runner.tools.decorator import tool
+from native_agent_runner.tools import tool_ids
+from native_agent_runner.tools.tool_ids import list_builtin_tools
 
 # Event contract
 from native_agent_runner.core.events import (
@@ -318,6 +320,8 @@ __all__ = [
     "ToolSideEffect",
     "ToolSpec",
     "tool",
+    "tool_ids",
+    "list_builtin_tools",
     # event contract
     "EVENT_SCHEMA_VERSION",
     "AgentEvent",
