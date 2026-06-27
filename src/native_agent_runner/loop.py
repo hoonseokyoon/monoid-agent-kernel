@@ -696,6 +696,10 @@ class AgentLoop:
         if registry is None:
             registry = ToolRegistry()
             registry.register_many(builtin_tools(None))  # type: ignore[arg-type]
+            # agent.spawn is registered only when a run supplies subagent_definitions; include it
+            # here so a valid delegation config (e.g. Studio's `delegate` capability) isn't
+            # false-rejected as an unknown tool.
+            registry.register(agent_spawn_tool())
             # Register the caller's tools one-by-one so a bad spec (id/exported-name collision)
             # is collected rather than raised — keeping the list-returning preflight contract.
             for spec in tools:

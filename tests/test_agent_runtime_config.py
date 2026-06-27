@@ -299,6 +299,16 @@ def test_validate_collects_empty_model_name_instead_of_raising() -> None:
     assert any("empty model name" in m for m in issues), issues
 
 
+def test_validate_accepts_agent_spawn_delegation_binding() -> None:
+    # agent.spawn is a conditional (subagent) tool; validate() must still accept a config that
+    # binds it (e.g. Studio's delegate capability) rather than report it as unknown.
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(ToolBinding.for_tool("fs.read"), ToolBinding.for_tool("agent.spawn")),
+    )
+    assert AgentLoop.validate(config) == []
+
+
 def test_validate_collects_tool_registration_collision() -> None:
     # A custom tool that shadows a builtin id must be collected by validate(), not raised — the
     # registration happens inside the preflight, which advertises returning a list.
