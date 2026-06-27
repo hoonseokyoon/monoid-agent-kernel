@@ -8,12 +8,16 @@ gateway, no API key).
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
 
-from native_agent_runner import AgentLoop, AgentRunSpec, FakeModelAdapter, tool
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import fake_tool_call
+# Make the example runnable from a checkout without installing the package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from native_agent_runner import AgentLoop, AgentRunSpec, FakeModelAdapter, tool  # noqa: E402
+from native_agent_runner.providers.base import ModelTurn  # noqa: E402
+from native_agent_runner.providers.fake import fake_tool_call  # noqa: E402
 
 
 # A custom tool. @tool derives the input schema from the type hints; its model-facing name is
