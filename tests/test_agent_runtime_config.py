@@ -299,6 +299,20 @@ def test_validate_collects_empty_model_name_instead_of_raising() -> None:
     assert any("empty model name" in m for m in issues), issues
 
 
+def test_validate_collects_tool_registration_collision() -> None:
+    # A custom tool that shadows a builtin id must be collected by validate(), not raised — the
+    # registration happens inside the preflight, which advertises returning a list.
+    from native_agent_runner import tool
+
+    @tool(id="fs.read", side_effect="read")  # collides with the builtin fs.read
+    def clash(text: str) -> dict:
+        return {"x": text}
+
+    config = AgentRuntimeConfig(definition_id="t", tools=(ToolBinding.for_tool("fs.write"),))
+    issues = AgentLoop.validate(config, tools=[clash])
+    assert any("duplicate tool id: fs.read" in m for m in issues), issues
+
+
 def test_contracts_core_curated_namespace() -> None:
     import types
 

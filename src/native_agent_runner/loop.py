@@ -692,11 +692,18 @@ class AgentLoop:
 
         Validates against the builtin tools plus any ``tools`` you'll bind (or an explicit
         ``registry``). The run ``spec`` is not needed — tool validation doesn't depend on it."""
+        issues: list[str] = []
         if registry is None:
             registry = ToolRegistry()
             registry.register_many(builtin_tools(None))  # type: ignore[arg-type]
-            registry.register_many(tools)
-        return collect_runtime_config_issues(config, registry)
+            # Register the caller's tools one-by-one so a bad spec (id/exported-name collision)
+            # is collected rather than raised — keeping the list-returning preflight contract.
+            for spec in tools:
+                try:
+                    registry.register(spec)
+                except ValueError as exc:
+                    issues.append(str(exc))
+        return issues + collect_runtime_config_issues(config, registry)
 
     def open(self) -> None:
         """Bootstrap the run and leave it idle, ready to accept submit().
