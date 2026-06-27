@@ -54,6 +54,20 @@ def test_doctor_openai_without_sdk_fails(tmp_path: Path, monkeypatch: pytest.Mon
     assert "openai SDK" in result.output
 
 
+def test_dir_writable_does_not_clobber_existing_files(tmp_path: Path) -> None:
+    from native_agent_runner.reference.studio.cli import _dir_writable
+
+    d = tmp_path / "ws"
+    d.mkdir()
+    sentinel = d / ".nar-doctor-probe"  # a file matching the old fixed probe name
+    sentinel.write_text("user data", encoding="utf-8")
+
+    assert _dir_writable(d) is True
+    # the diagnostic neither overwrote nor deleted the user's file, and left no probe behind.
+    assert sentinel.read_text(encoding="utf-8") == "user data"
+    assert [p.name for p in d.iterdir()] == [".nar-doctor-probe"]
+
+
 def test_doctor_missing_chromium_is_warning_not_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import socket
+import tempfile
 import time
 from pathlib import Path
 
@@ -200,12 +201,13 @@ def _port_free(host: str, port: int) -> bool:
 
 
 def _dir_writable(path: Path) -> bool:
-    """True if ``path`` exists-or-can-be-created and a probe file can be written there."""
+    """True if ``path`` exists-or-can-be-created and a file can be written there. Uses a unique
+    temp file (O_EXCL) so the diagnostic can never clobber an existing user file."""
     try:
         path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".nar-doctor-probe"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
+        fd, probe = tempfile.mkstemp(prefix=".nar-doctor-", dir=path)
+        os.close(fd)
+        os.unlink(probe)
         return True
     except OSError:
         return False
