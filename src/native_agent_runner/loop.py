@@ -1317,8 +1317,13 @@ class AgentLoop:
         state.error = str(exc)
         state.error_code = error_code_for_exception(exc)
         if isinstance(exc, ModelAdapterError):
-            state.provider_error_code = exc.provider_error_code
-            state.provider_http_status = exc.http_status
+            # Only adopt the exception's provider detail when it carries it: a promotion wrapper
+            # (fail_recoverable / retry budget exhausted) may be a fresh ModelAdapterError with the
+            # fields empty, and must not blank what the preceding turn.failed already recorded.
+            if exc.provider_error_code:
+                state.provider_error_code = exc.provider_error_code
+            if exc.http_status is not None:
+                state.provider_http_status = exc.http_status
         state.final_text = ""
         res.recorder.emit(
             "run.failed",

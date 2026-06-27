@@ -595,6 +595,25 @@ def test_fail_recoverable_promotes_to_terminal(tmp_path: Path) -> None:
         loop.close()
 
 
+def test_promotion_preserves_provider_details_from_turn_failed(tmp_path: Path) -> None:
+    # A recoverable provider failure records provider detail on the turn.failed; promoting it with
+    # fail_recoverable() (a fresh error with no provider fields) must NOT blank that detail.
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad request", http_status=400, provider_error_code="invalid_request_error")]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hi").reason == "turn_failed"
+        loop.fail_recoverable("gave up after retries", error_code="model_error")
+        failed = [e for e in sink.events if e.type == "run.failed"]
+        assert failed, "run.failed emitted"
+        assert failed[0].data["provider_error_code"] == "invalid_request_error"
+        assert failed[0].data["http_status"] == 400
+    finally:
+        loop.close()
+
+
 # --- DX-9: turn-level interrupt (a "stop" that keeps the session alive) -----------------
 
 
