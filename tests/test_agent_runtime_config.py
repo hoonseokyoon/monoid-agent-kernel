@@ -233,3 +233,108 @@ def test_tool_search_binding_identity_conflicts_are_rejected(tmp_path: Path) -> 
             assert expected in str(exc)
         else:  # pragma: no cover
             raise AssertionError(f"accepted invalid config: {expected}")
+
+
+def test_tool_binding_for_tool_derives_binding_id_and_ref() -> None:
+    b = ToolBinding.for_tool("fs.read")
+    assert b.binding_id == "fs.read"
+    assert b.ref == RegistryToolRef("fs.read")
+    assert b.model_name == "fs_read"  # derived: dots -> underscores
+
+
+def test_tool_binding_for_tool_forwards_overrides() -> None:
+    b = ToolBinding.for_tool(
+        "fs.read", binding_id="reader", model_name="read_file", exposure="searchable"
+    )
+    assert (b.binding_id, b.model_name, b.exposure) == ("reader", "read_file", "searchable")
+
+
+def test_tool_binding_accepts_bare_string_ref() -> None:
+    b = ToolBinding(binding_id="x", ref="fs.read")
+    assert b.ref == RegistryToolRef("fs.read")
+    # identical to the explicit form
+    assert b == ToolBinding(binding_id="x", ref=RegistryToolRef("fs.read"))
+
+
+def test_tool_binding_for_tool_round_trips() -> None:
+    b = ToolBinding.for_tool("fs.read")
+    restored = ToolBinding.from_json(json.loads(json.dumps(b.to_json())))
+    assert restored == b
+
+
+def test_validate_returns_empty_for_valid_config(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register_many(builtin_tools(LocalWorkspaceBackend(_workspace(tmp_path))))
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(ToolBinding.for_tool("fs.read"), ToolBinding.for_tool("fs.write")),
+    )
+    assert AgentLoop.validate(config, registry=registry) == []
+
+
+def test_validate_collects_all_issues_not_just_first(tmp_path: Path) -> None:
+    # An unknown tool AND a duplicate binding_id — both must be reported in one call.
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(
+            ToolBinding.for_tool("fs.read"),
+            ToolBinding.for_tool("fs.read"),  # duplicate binding_id
+            ToolBinding.for_tool("does.not.exist"),  # unknown tool id
+        ),
+    )
+    issues = AgentLoop.validate(config)  # builtins-only registry
+    assert any("duplicate tool binding_id: fs.read" in m for m in issues)
+    assert any("does.not.exist" in m for m in issues)
+    assert len(issues) >= 2  # collected, not first-and-raise
+
+
+def test_validate_collects_empty_model_name_instead_of_raising() -> None:
+    # A directly-constructed binding with a whitespace model_name makes _resolved_model_name raise;
+    # validate() must collect it, not throw (the whole point of the collect-all preflight).
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(ToolBinding(binding_id="rd", ref=RegistryToolRef("fs.read"), model_name="   "),),
+    )
+    issues = AgentLoop.validate(config)
+    assert any("empty model name" in m for m in issues), issues
+
+
+def test_validate_accepts_agent_spawn_delegation_binding() -> None:
+    # agent.spawn is a conditional (subagent) tool; validate() must still accept a config that
+    # binds it (e.g. Studio's delegate capability) rather than report it as unknown.
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(ToolBinding.for_tool("fs.read"), ToolBinding.for_tool("agent.spawn")),
+    )
+    assert AgentLoop.validate(config) == []
+
+
+def test_validate_collects_tool_registration_collision() -> None:
+    # A custom tool that shadows a builtin id must be collected by validate(), not raised — the
+    # registration happens inside the preflight, which advertises returning a list.
+    from native_agent_runner import tool
+
+    @tool(id="fs.read", side_effect="read")  # collides with the builtin fs.read
+    def clash(text: str) -> dict:
+        return {"x": text}
+
+    config = AgentRuntimeConfig(definition_id="t", tools=(ToolBinding.for_tool("fs.write"),))
+    issues = AgentLoop.validate(config, tools=[clash])
+    assert any("duplicate tool id: fs.read" in m for m in issues), issues
+
+
+def test_contracts_core_curated_namespace() -> None:
+    import types
+
+    import native_agent_runner as nar
+    from native_agent_runner.contracts import core
+
+    assert core.AgentLoop is AgentLoop
+    # The curated namespace must NOT shadow the native_agent_runner.core package at the root.
+    assert isinstance(nar.core, types.ModuleType) and hasattr(nar.core, "agents")
+    assert "core" not in nar.contracts.__all__
+    names = {n for n in vars(core) if not n.startswith("_")}
+    assert names == {
+        "AgentLoop", "AgentRunSpec", "AgentRuntimeConfig", "ModelAdapter",
+        "ToolSpec", "tool", "EventSink", "Workspace", "PermissionPolicy",
+    }

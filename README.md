@@ -488,6 +488,56 @@ native-agent run \
   --event-sink-module examples/redacting_event_sink.py:make_sink
 ```
 
+## Observability
+
+Every run emits a structured event stream and a metrics artifact, and can mirror that stream to
+OpenTelemetry — all without the core capturing prompt/response content.
+
+**OpenTelemetry tracing.** `OtelEventSink` is an event sink that turns the run's
+`run → model.turn → tool.call` event tree into a GenAI-semantic-convention span tree:
+
+```
+invoke_agent
+├── chat {model}          (one span per model turn)
+└── execute_tool {tool}   (one span per tool call)
+```
+
+`chat` and `execute_tool` are siblings under `invoke_agent` (linked by a `turn_id` attribute,
+not nested), and spans carry GenAI attributes (`gen_ai.operation.name`, `gen_ai.request.model`,
+`gen_ai.tool.name`, token usage). Wire it in with one line:
+
+```python
+from native_agent_runner import AgentLoop, OtelEventSink
+
+loop = AgentLoop.from_config(spec, adapter, config, event_sinks=(OtelEventSink(),))
+```
+
+`OtelEventSink` depends only on `opentelemetry-api` (a no-op until your app installs an SDK +
+exporter). To actually export spans, install the SDK and an OTLP exporter and configure a global
+`TracerProvider`:
+
+```bash
+pip install "native-agent-runner[otel-export]"
+```
+
+[`examples/otel_tracing.py`](examples/otel_tracing.py) is a runnable, offline demo: it prints the
+span tree to the console (via a local `ConsoleSpanExporter`, no collector) for a scripted run.
+
+**Live streaming.** Beyond the durable event sinks, `AgentLoop.astream(user_input)` returns a
+`RunStream` — an async context manager + iterator that yields `AgentEvent` (orchestration)
+interleaved with `ModelStreamChunk` (token deltas: `TextDelta` / `ReasoningDelta` /
+`ToolCallDelta` / `TurnComplete`) when the adapter exposes `astream_turn`. Read `stream.result`
+after the stream drains. Gateway token streaming uses Server-Sent Events and needs the
+`[http-async]` extra.
+
+**Metrics.** Each run writes `metrics.json` (and emits a `metrics.updated` event per turn) with
+final counters and timing: `status`, `duration_s`, `tool_calls`, shell/background-job counters,
+web-call counters, and token usage (`input_tokens`, `output_tokens`, `total_tokens`,
+`reasoning_tokens`). See [Outputs](#outputs) for the full run-directory artifact set.
+
+See also the design docs under [`docs/`](docs/README.md): `SUBAGENT_DESIGN.md` and
+`SKILLS_DESIGN.md` for the delegation and skills surfaces.
+
 ## Model Provider Boundary
 
 `GatewayModelAdapter` is the default path. It sends normalized model-turn

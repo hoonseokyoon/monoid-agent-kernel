@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
+import pytest
 from conftest import tool_binding
 
 from native_agent_runner.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
@@ -430,6 +432,31 @@ def test_loader_reads_markdown_directory(tmp_path: Path) -> None:
     assert "careful reviewer" in rev.prompt.persona_segments[0]
     assert defs["brancher"].context == "fork"
     assert defs["brancher"].tools is None  # omitted -> inherit
+
+
+def test_loader_duplicate_id_warns_and_first_wins(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from native_agent_runner.subagent_loader import load_subagent_definitions
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "a.md").write_text(
+        "---\nname: dup\ndescription: first\n---\nbody a\n", encoding="utf-8"
+    )
+    (agents / "b.md").write_text(
+        "---\nname: dup\ndescription: second\n---\nbody b\n", encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="native_agent_runner.subagent_loader"):
+        defs = load_subagent_definitions(agents)
+
+    # sorted path order: a.md before b.md, so "first" wins...
+    assert defs["dup"].description == "first"
+    # ...and the dropped file is logged, not silently skipped.
+    assert any(
+        "duplicate subagent id" in r.message and "dup" in r.message for r in caplog.records
+    ), caplog.text
 
 
 class InstructionAdapter:

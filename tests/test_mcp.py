@@ -106,6 +106,202 @@ def test_mcp_provider_lists_and_proxies_tools() -> None:
             assert not failed.ok and failed.error_code == "mcp_tool_error" and "kaboom" in failed.error
 
 
+def _paginated_handler() -> type[BaseHTTPRequestHandler]:
+    """A server that splits tools/list across two pages keyed by ``cursor``/``nextCursor``."""
+    page1 = [_TOOLS[0]]  # echo
+    page2 = [_TOOLS[1]]  # boom
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            return None
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._send(200, b'{"ok":true}')
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            message = json.loads(self.rfile.read(length) or b"{}")
+            method, rid = message.get("method"), message.get("id")
+            if method == "notifications/initialized":
+                self._send(202, b"")
+            elif method == "initialize":
+                self._result(rid, {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}, session_id="sess-1")
+            elif method == "tools/list":
+                cursor = (message.get("params") or {}).get("cursor")
+                if cursor is None:
+                    self._result(rid, {"tools": page1, "nextCursor": "c2"})
+                elif cursor == "c2":
+                    self._result(rid, {"tools": page2})  # last page: no nextCursor
+                else:
+                    self._error(rid, -32602, f"bad cursor: {cursor}")
+            else:
+                self._error(rid, -32601, "method not found")
+
+        def _result(self, rid: Any, result: dict[str, Any], *, session_id: str | None = None) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode("utf-8")
+            self._send(200, body, session_id=session_id)
+
+        def _error(self, rid: Any, code: int, msg: str) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}).encode("utf-8")
+            self._send(200, body)
+
+        def _send(self, status: int, body: bytes, *, session_id: str | None = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            if session_id:
+                self.send_header("Mcp-Session-Id", session_id)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def test_mcp_list_tools_follows_pagination() -> None:
+    # A server that paginates tools/list must not be truncated to page one.
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _paginated_handler())
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
+            ids = {s.id for s in mcp.get_tools()}
+            assert ids == {"mcp.t.echo", "mcp.t.boom"}  # both pages surfaced
+
+
+def _expiring_handler(state: dict[str, int]) -> type[BaseHTTPRequestHandler]:
+    """A server whose session expires once: the first tools/call after init returns 404, forcing
+    the client to re-initialize and retry. ``state`` records init/call counts for assertions."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            return None
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._send(200, b'{"ok":true}')
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            message = json.loads(self.rfile.read(length) or b"{}")
+            method, rid = message.get("method"), message.get("id")
+            if method == "notifications/initialized":
+                self._send(202, b"")
+            elif method == "initialize":
+                state["inits"] += 1
+                self._result(rid, {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}, session_id=f"sess-{state['inits']}")
+            elif method == "tools/list":
+                self._result(rid, {"tools": _TOOLS})
+            elif method == "tools/call":
+                state["calls"] += 1
+                if state["calls"] == 1:  # pretend the session expired on the first call
+                    self._send(404, b'{"error":"session expired"}')
+                    return
+                args = (message.get("params") or {}).get("arguments") or {}
+                self._result(rid, {"content": [{"type": "text", "text": f"echo: {args.get('text')}"}]})
+            else:
+                self._error(rid, -32601, "method not found")
+
+        def _result(self, rid: Any, result: dict[str, Any], *, session_id: str | None = None) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode("utf-8")
+            self._send(200, body, session_id=session_id)
+
+        def _error(self, rid: Any, code: int, msg: str) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}).encode("utf-8")
+            self._send(200, body)
+
+        def _send(self, status: int, body: bytes, *, session_id: str | None = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            if session_id:
+                self.send_header("Mcp-Session-Id", session_id)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def test_mcp_call_tool_reconnects_after_session_expiry() -> None:
+    # A benign 404 session expiry should reconnect + retry transparently, not raise.
+    state = {"inits": 0, "calls": 0}
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _expiring_handler(state))
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
+            specs = {s.id: s for s in mcp.get_tools()}
+            result = specs["mcp.t.echo"].handler(None, {"text": "hi"})
+
+    assert result.ok and result.content["text"] == "echo: hi"
+    assert state["inits"] == 2  # re-initialized once after the expiry
+    assert state["calls"] == 2  # first call 404'd, retried after reconnect
+
+
+def _expiring_paginated_handler(state: dict[str, int]) -> type[BaseHTTPRequestHandler]:
+    """A paginating server that expires the session the first time a *cursor-bearing* page is
+    requested. The cursor ``c2`` is session-scoped: replaying it under a fresh session must NOT
+    happen — the client should restart pagination from page one after reconnecting."""
+    page1 = [_TOOLS[0]]  # echo
+    page2 = [_TOOLS[1]]  # boom
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            return None
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._send(200, b'{"ok":true}')
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            message = json.loads(self.rfile.read(length) or b"{}")
+            method, rid = message.get("method"), message.get("id")
+            if method == "notifications/initialized":
+                self._send(202, b"")
+            elif method == "initialize":
+                state["inits"] += 1
+                self._result(rid, {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}, session_id=f"sess-{state['inits']}")
+            elif method == "tools/list":
+                cursor = (message.get("params") or {}).get("cursor")
+                if cursor is None:
+                    self._result(rid, {"tools": page1, "nextCursor": "c2"})
+                elif cursor == "c2" and not state["expired"]:
+                    state["expired"] = 1  # session dies exactly when the cursor page is fetched
+                    self._send(404, b'{"error":"session expired"}')
+                elif cursor == "c2":
+                    self._result(rid, {"tools": page2})  # served cleanly under the fresh session
+                else:
+                    self._error(rid, -32602, f"bad cursor: {cursor}")
+            else:
+                self._error(rid, -32601, "method not found")
+
+        def _result(self, rid: Any, result: dict[str, Any], *, session_id: str | None = None) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode("utf-8")
+            self._send(200, body, session_id=session_id)
+
+        def _error(self, rid: Any, code: int, msg: str) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}).encode("utf-8")
+            self._send(200, body)
+
+        def _send(self, status: int, body: bytes, *, session_id: str | None = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            if session_id:
+                self.send_header("Mcp-Session-Id", session_id)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def test_mcp_list_tools_restarts_pagination_after_session_expiry() -> None:
+    # Expiring mid-pagination must reconnect and restart from page one (not replay the stale,
+    # session-scoped cursor) — and surface every tool exactly once, no duplicates.
+    state = {"inits": 0, "expired": 0}
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _expiring_paginated_handler(state))
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
+            ids = [s.id for s in mcp.get_tools()]
+
+    assert sorted(ids) == ["mcp.t.boom", "mcp.t.echo"]  # both pages, no dupes despite the restart
+    assert state["inits"] == 2  # re-initialized once after the expiry
+
+
 def test_mcp_tool_bindings_and_filter() -> None:
     with serving(_server()) as base_url:
         with McpToolProvider(f"{base_url}/mcp", server="t", blocked_tools=("boom",)) as mcp:

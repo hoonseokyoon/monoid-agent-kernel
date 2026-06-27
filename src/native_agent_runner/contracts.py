@@ -117,9 +117,11 @@ from native_agent_runner.core.agents import (
     ToolBinding,
     ToolSearchConfig,
     coerce_runtime_config_provider,
+    collect_runtime_config_issues,
     compile_bound_tool_catalog,
     generated_tool_bindings,
     static_runtime_config,
+    validate_runtime_config,
 )
 from native_agent_runner.core.tool_surface import (
     DefaultToolSurfaceResolver,
@@ -167,6 +169,8 @@ from native_agent_runner.tools.base import (
     ToolSpec,
 )
 from native_agent_runner.tools.decorator import tool
+from native_agent_runner.tools import tool_ids
+from native_agent_runner.tools.tool_ids import list_builtin_tools
 
 # Event contract
 from native_agent_runner.core.events import (
@@ -198,6 +202,27 @@ from native_agent_runner.tools.builtin import agent_spawn_tool
 
 # Agent Skills (progressive disclosure) — context + tool provider, plus file discovery
 from native_agent_runner.skills import SkillDefinition, SkillProvider, load_skill_definitions
+
+
+class core:  # noqa: N801 - intentional lowercase: a curated namespace, not a class to instantiate
+    """The must-know contracts, curated. Import this instead of wading through the full ~130-name
+    surface::
+
+        from native_agent_runner.contracts import core
+        loop = core.AgentLoop.from_tools(spec, adapter, [my_tool])
+
+    Everything here is also exported at the top level; this is the short list to learn first."""
+
+    AgentLoop = AgentLoop
+    AgentRunSpec = AgentRunSpec
+    AgentRuntimeConfig = AgentRuntimeConfig
+    ModelAdapter = ModelAdapter
+    ToolSpec = ToolSpec
+    tool = tool
+    EventSink = EventSink
+    Workspace = Workspace
+    PermissionPolicy = PermissionPolicy
+
 
 __all__ = [
     # engine entry / result
@@ -318,6 +343,14 @@ __all__ = [
     "ToolSideEffect",
     "ToolSpec",
     "tool",
+    "tool_ids",
+    "list_builtin_tools",
+    # config validation
+    "validate_runtime_config",
+    "collect_runtime_config_issues",
+    # NOTE: the curated `core` namespace is intentionally NOT in __all__ — re-exporting it would
+    # shadow the `native_agent_runner.core` package at the root. Reach it via
+    # `from native_agent_runner.contracts import core`.
     # event contract
     "EVENT_SCHEMA_VERSION",
     "AgentEvent",

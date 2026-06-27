@@ -96,7 +96,13 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         required=("status",),
     ),
     "run.failed": _data_schema(
-        {"error": _STR, "error_code": _STR, "type": _STR},
+        {
+            "error": _STR,
+            "error_code": _STR,
+            "type": _STR,
+            "provider_error_code": _STR,
+            "http_status": {"type": ["integer", "null"]},
+        },
         required=("error_code",),
     ),
     "run.waiting": _data_schema(

@@ -193,30 +193,66 @@ class OpenAIModelAdapter:
         return payload
 
 
+# Provider error codes (from the error body's ``code``/``type``) we can map to an HTTP status when
+# the exception itself carries none — the streaming path raises a bare ``APIError`` with no
+# ``status_code`` but a populated ``body``. retryable=False for these means "retrying won't help".
+_PROVIDER_CODE_STATUS: dict[str, int] = {
+    "insufficient_quota": 429,
+    "rate_limit_exceeded": 429,
+    "rate_limited": 429,
+    "model_not_found": 404,
+    "invalid_model": 404,
+    "context_length_exceeded": 400,
+    "invalid_request_error": 400,
+}
+# Of the mapped codes, the ones a retry could actually clear (a true transient rate limit). A
+# quota/billing failure (``insufficient_quota``) is NOT here — retrying it is futile.
+_RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded", "rate_limited"})
+
+
 def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
-    """Classify an OpenAI SDK exception into a ModelAdapterError carrying the provider HTTP
-    status, so downstream (gateway HTTP mapping, runner classification, core recoverability)
-    can reason about it. Uses a synthetic, body-free message to avoid leaking prompt/PII."""
+    """Classify an OpenAI SDK exception into a ModelAdapterError carrying the provider HTTP status
+    and error code, so downstream (gateway HTTP mapping, runner classification, core recoverability,
+    the UI) can reason about it. Uses a synthetic, body-free message to avoid leaking prompt/PII."""
     status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        # The streaming path raises a bare APIError whose status lives on .response (or nowhere).
+        status = getattr(getattr(exc, "response", None), "status_code", None)
     body = getattr(exc, "body", None)
-    code = body.get("code") if isinstance(body, dict) else None
+    code = (body.get("code") or body.get("type")) if isinstance(body, dict) else None
+    code = str(code) if code else ""
+
     if isinstance(status, int) and 400 <= status < 500:
         return ModelAdapterError(
             f"provider rejected the request (HTTP {status})",
             error_code="model_error",
-            provider_error_code=str(code or ""),
-            retryable=(status == 429),
+            provider_error_code=code,
+            retryable=(status == 429 and code not in {"insufficient_quota"}),
             http_status=status,
         )
     if isinstance(status, int) and 500 <= status < 600:
         return ModelAdapterError(
             f"provider server error (HTTP {status})",
             error_code="model_error",
-            provider_error_code=str(code or ""),
+            provider_error_code=code,
             retryable=True,
             http_status=status,
         )
-    return ModelAdapterError("provider call failed", error_code="model_error")
+    # No usable HTTP status. Recover what we can from the body code so the failure isn't masked as
+    # a generic "provider call failed" (e.g. a streaming 429 insufficient_quota with no status_code).
+    if code:
+        return ModelAdapterError(
+            f"provider error: {code}",
+            error_code="model_error",
+            provider_error_code=code,
+            retryable=(code in _RETRYABLE_PROVIDER_CODES),
+            http_status=_PROVIDER_CODE_STATUS.get(code),
+        )
+    return ModelAdapterError(
+        f"provider call failed ({type(exc).__name__})",
+        error_code="model_error",
+        provider_error_code="unclassified_provider_error",
+    )
 
 
 def _openai_tool_schema(tool: Any) -> dict[str, Any]:

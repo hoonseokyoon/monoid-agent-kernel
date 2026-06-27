@@ -82,6 +82,18 @@ _IMAGE_EXTS = {
 }
 _IMAGE_VIEW_MAX_BYTES = 8 * 1024 * 1024  # raw-image preview cap
 
+# Vendored static assets (e.g. the locally-bundled KaTeX) served under /vendor/<path>. Content
+# types for the extensions we actually ship; anything else falls back to octet-stream.
+_VENDOR_DIR = _WEB_DIR / "vendor"
+_VENDOR_CONTENT_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".ttf": "font/ttf",
+    ".map": "application/json",
+}
+
 
 # Obvious destructive command prefixes the shell binding refuses outright (a binding-level
 # safety gate, enforced regardless of approval mode). Matched as command.strip().startswith.
@@ -136,36 +148,32 @@ _SUBAGENT_DEFINITIONS = {
 
 
 def _capability_bindings(capability: str) -> tuple[ToolBinding, ...]:
+    # ToolBinding.for_tool derives binding_id + model_name from the tool id; only the shell
+    # binding needs extra scope/runtime, which pass through as keyword arguments.
     if capability == "read":
-        return (ToolBinding(binding_id="fs.read", model_name="fs_read", ref=RegistryToolRef("fs.read")),)
+        return (ToolBinding.for_tool("fs.read"),)
     if capability == "write":
-        return (ToolBinding(binding_id="fs.write", model_name="fs_write", ref=RegistryToolRef("fs.write")),)
+        return (ToolBinding.for_tool("fs.write"),)
     if capability == "hitl":
-        return (
-            ToolBinding(binding_id="hitl.request", model_name="hitl_request", ref=RegistryToolRef("hitl.request")),
-        )
+        return (ToolBinding.for_tool("hitl.request"),)
     if capability == "shell":
         return (
-            ToolBinding(
-                binding_id="shell.exec",
-                model_name="shell_exec",
-                ref=RegistryToolRef("shell.exec"),
+            ToolBinding.for_tool(
+                "shell.exec",
                 scope=ToolScope(command_deny_prefixes=_SHELL_DENY_PREFIXES),
                 runtime={"shell": {"approval_mode": "auto-approve"}},
             ),
         )
     if capability == "web":
         return (
-            ToolBinding(binding_id="web.search", model_name="web_search", ref=RegistryToolRef("web.search")),
-            ToolBinding(binding_id="web.fetch", model_name="web_fetch", ref=RegistryToolRef("web.fetch")),
-            ToolBinding(binding_id="web.context", model_name="web_context", ref=RegistryToolRef("web.context")),
+            ToolBinding.for_tool("web.search"),
+            ToolBinding.for_tool("web.fetch"),
+            ToolBinding.for_tool("web.context"),
         )
     if capability == "delegate":
         # Only effective when the backend carries subagent_definitions (the loop bootstrap
         # registers agent.spawn then); studio always does.
-        return (
-            ToolBinding(binding_id="agent.spawn", model_name="agent_spawn", ref=RegistryToolRef("agent.spawn")),
-        )
+        return (ToolBinding.for_tool("agent.spawn"),)
     return ()
 
 
@@ -206,7 +214,7 @@ def _ensure_otel_provider(endpoint: str) -> None:
     except ImportError as exc:
         raise NativeAgentError(
             "OTel tracing needs the opentelemetry SDK + OTLP/HTTP exporter "
-            "(pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http)"
+            "(pip install 'native-agent-runner[otel-export]')"
         ) from exc
     provider = TracerProvider(resource=Resource.create({"service.name": "agent-studio"}))
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
@@ -1153,6 +1161,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 from_seq = int((query.get("from") or ["0"])[0] or 0)
                 self._write_json(studio.subagent_events(child_run_id, from_seq))
                 return
+            if parsed.path.startswith("/vendor/"):
+                self._serve_vendor(parsed.path[len("/vendor/"):])
+                return
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
         # --- POST --------------------------------------------------------------------
@@ -1316,6 +1327,21 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _serve_vendor(self, rel: str) -> None:
+            """Serve a vendored static asset from web/vendor/, guarding against path traversal."""
+            base = _VENDOR_DIR.resolve()
+            try:
+                target = (base / rel).resolve()
+                target.relative_to(base)
+            except (ValueError, OSError):
+                self.send_error(HTTPStatus.FORBIDDEN, "forbidden")
+                return
+            if not target.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND, "not found")
+                return
+            content_type = _VENDOR_CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
+            self._serve_file(target, content_type)
 
         def _serve_file(self, path: Path, content_type: str, *, download_name: str = "") -> None:
             try:

@@ -7,7 +7,7 @@ import inspect
 import json
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any
 
@@ -54,7 +54,9 @@ from native_agent_runner.core.agents import (
     ToolBinding,
     ToolSearchConfig,
     coerce_runtime_config_provider,
+    collect_runtime_config_issues,
     compile_bound_tool_catalog,
+    generated_tool_bindings,
     runtime_config_diff,
     transcript_config_snapshot,
     validate_runtime_config,
@@ -140,6 +142,7 @@ from native_agent_runner.tools.base import (
     ToolResult,
     ToolSpec,
 )
+from native_agent_runner.tool_loader import FunctionToolProvider
 from native_agent_runner.tools.builtin import agent_spawn_tool, builtin_tools
 from native_agent_runner.web import WebGatewayClient, domain_allowed, domain_from_url
 from native_agent_runner.core.workspace import Workspace
@@ -638,6 +641,74 @@ class AgentLoop:
         """
         return cls(spec, model_adapter, runtime_config_provider=runtime_config, **kwargs)
 
+    @classmethod
+    def from_tools(
+        cls,
+        spec: AgentRunSpec,
+        model_adapter: ModelAdapter,
+        tools: Iterable[ToolSpec],
+        *,
+        definition_id: str = "custom-agent",
+        model: ModelConfig | None = None,
+        prompt: PromptSpec | None = None,
+        **kwargs: Any,
+    ) -> AgentLoop:
+        """One call to run with custom tools — no hand-wrapped provider or bindings.
+
+        ``tools`` are ``@tool``-decorated functions or raw :class:`ToolSpec` objects. They are
+        registered for the run AND exposed to the model via auto-generated :class:`ToolBinding`
+        entries (binding_id/model_name derived from each tool's id). Optional seams
+        (``event_sinks``, ``checkpoint_store``, extra ``tool_providers``, …) pass through::
+
+            @tool(id="skill.word_count", side_effect="run")
+            def word_count(text: str) -> dict: ...
+
+            AgentLoop.from_tools(spec, adapter, [word_count]).run_once("count the words")
+        """
+        specs = tuple(tools)
+        provider = FunctionToolProvider(lambda _ctx: specs)
+        config = AgentRuntimeConfig(
+            definition_id=definition_id,
+            model=model,
+            prompt=prompt or PromptSpec(),
+            tools=generated_tool_bindings(specs),
+        )
+        existing = tuple(kwargs.pop("tool_providers", ()))
+        return cls.from_config(
+            spec, model_adapter, config, tool_providers=(provider, *existing), **kwargs
+        )
+
+    @staticmethod
+    def validate(
+        config: AgentRuntimeConfig,
+        *,
+        tools: Iterable[ToolSpec] = (),
+        registry: ToolRegistry | None = None,
+    ) -> list[str]:
+        """Check a runtime config before a run and return all problems as readable messages
+        (``[]`` == valid). Unlike the internal raising validator, this collects every issue —
+        unknown tool ids, duplicate binding_ids/model_names, invalid runtime — in one pass, so a
+        backend can surface them together instead of failing at bootstrap.
+
+        Validates against the builtin tools plus any ``tools`` you'll bind (or an explicit
+        ``registry``). The run ``spec`` is not needed — tool validation doesn't depend on it."""
+        issues: list[str] = []
+        if registry is None:
+            registry = ToolRegistry()
+            registry.register_many(builtin_tools(None))  # type: ignore[arg-type]
+            # agent.spawn is registered only when a run supplies subagent_definitions; include it
+            # here so a valid delegation config (e.g. Studio's `delegate` capability) isn't
+            # false-rejected as an unknown tool.
+            registry.register(agent_spawn_tool())
+            # Register the caller's tools one-by-one so a bad spec (id/exported-name collision)
+            # is collected rather than raised — keeping the list-returning preflight contract.
+            for spec in tools:
+                try:
+                    registry.register(spec)
+                except ValueError as exc:
+                    issues.append(str(exc))
+        return issues + collect_runtime_config_issues(config, registry)
+
     def open(self) -> None:
         """Bootstrap the run and leave it idle, ready to accept submit().
 
@@ -1018,7 +1089,12 @@ class AgentLoop:
         ``run.failed``) and mark the session terminal, without having to duplicate the loop's
         terminal bookkeeping. The driver then closes the run as usual."""
         session = self._require_open()
-        self._record_failure(session.state, session.res, ModelAdapterError(message, error_code=error_code))
+        self._record_failure(
+            session.state,
+            session.res,
+            ModelAdapterError(message, error_code=error_code),
+            inherit_provider_detail=True,  # promotion of the prior turn.failed — keep its detail
+        )
         session.terminal = True
         self._persist_checkpoint(session)
 
@@ -1238,13 +1314,33 @@ class AgentLoop:
                 await aclose()
         return assemble_streamed_turn(chunks)
 
-    def _record_failure(self, state: RunState, res: _RunResources, exc: Exception) -> None:
+    def _record_failure(
+        self,
+        state: RunState,
+        res: _RunResources,
+        exc: Exception,
+        *,
+        inherit_provider_detail: bool = False,
+    ) -> None:
         state.status = "failed"
         state.error = str(exc)
         state.error_code = error_code_for_exception(exc)
-        if isinstance(exc, ModelAdapterError):
-            state.provider_error_code = exc.provider_error_code
-            state.provider_http_status = exc.http_status
+        if inherit_provider_detail and isinstance(exc, ModelAdapterError):
+            # Promotion of a recoverable turn.failed (fail_recoverable): keep the provider detail
+            # that turn recorded, adopting the synthetic wrapper's fields only if it carries them.
+            if exc.provider_error_code:
+                state.provider_error_code = exc.provider_error_code
+            if exc.http_status is not None:
+                state.provider_http_status = exc.http_status
+        else:
+            # A fresh terminal failure reflects THIS exception — clearing any stale provider detail
+            # an earlier, unrelated recoverable turn.failed may have left on the state.
+            if isinstance(exc, ModelAdapterError):
+                state.provider_error_code = exc.provider_error_code
+                state.provider_http_status = exc.http_status
+            else:
+                state.provider_error_code = ""
+                state.provider_http_status = None
         state.final_text = ""
         res.recorder.emit(
             "run.failed",
@@ -1252,6 +1348,10 @@ class AgentLoop:
                 "error": public_error_message(state.error),
                 "error_code": state.error_code,
                 "type": type(exc).__name__,
+                # Provider failure detail (codes/status, never the raw body) — mirrors turn.failed
+                # so the real cause (e.g. insufficient_quota / HTTP 429) reaches logs and the UI.
+                "provider_error_code": state.provider_error_code,
+                "http_status": state.provider_http_status,
             },
             level="error",
         )

@@ -93,9 +93,38 @@ class McpHttpClient:
     # -- operations --------------------------------------------------------------------
 
     def list_tools(self) -> list[dict[str, Any]]:
-        result, _ = self._post("tools/list")
-        tools = result.get("tools")
-        return list(tools) if isinstance(tools, list) else []
+        """Return every tool the server exposes, following ``nextCursor`` pagination (spec rev
+        2025-06-18). A large server splits ``tools/list`` across pages; reading only the first
+        would silently drop tools the caller declared bindings for."""
+        tools: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        restarted = False
+        for _ in range(1000):  # bound against a server that never stops handing out cursors
+            params = {"cursor": cursor} if cursor is not None else None
+            # A cursor is opaque state the *current* session issued; a server that scopes cursors
+            # to sessions will reject one minted by an expired session. So for cursor-bearing
+            # pages we disable _post's transparent replay (which would resend the stale cursor)
+            # and instead restart pagination from the top once after reconnecting.
+            try:
+                result, _ = self._post("tools/list", params, _allow_reconnect=cursor is None)
+            except McpError as exc:
+                if exc.code == 404 and cursor is not None and not restarted:
+                    restarted = True
+                    self.initialize()  # re-handshake (the prior _post already dropped the session)
+                    tools.clear()
+                    seen.clear()
+                    cursor = None
+                    continue
+                raise
+            page = result.get("tools")
+            if isinstance(page, list):
+                tools.extend(page)
+            cursor = result.get("nextCursor")
+            if not cursor or not isinstance(cursor, str) or cursor in seen:
+                break  # done, or a malformed/repeating cursor — stop rather than loop forever
+            seen.add(cursor)
+        return tools
 
     def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         result, _ = self._post("tools/call", {"name": name, "arguments": arguments or {}})
@@ -103,7 +132,9 @@ class McpHttpClient:
 
     # -- transport ---------------------------------------------------------------------
 
-    def _post(self, method: str, params: Any = None, *, notify: bool = False) -> tuple[dict[str, Any], Any]:
+    def _post(
+        self, method: str, params: Any = None, *, notify: bool = False, _allow_reconnect: bool = True
+    ) -> tuple[dict[str, Any], Any]:
         message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if not notify:
             message["id"] = next(self._ids)
@@ -120,9 +151,14 @@ class McpHttpClient:
         except self._httpx.HTTPError as exc:
             raise McpError(f"MCP request failed: {exc}") from exc
         if response.status_code == 404 and self._session_id is not None:
-            # The session expired; surface clearly (v1 has no auto-reconnect).
+            # The session expired. Drop the stale session and, for a normal operation, reconnect
+            # once and retry transparently — a benign expiry shouldn't surface as a hard error.
             self._session_id = None
             self._initialized = False
+            handshake = method in ("initialize", "notifications/initialized")
+            if _allow_reconnect and not handshake:
+                self.initialize()  # re-handshakes under _lock; idempotent
+                return self._post(method, params, notify=notify, _allow_reconnect=False)
             raise McpError("MCP session expired (HTTP 404); reconnect required", code=404)
         if response.status_code >= 400:
             raise McpError(f"MCP returned HTTP {response.status_code}: {response.text[:200]}")

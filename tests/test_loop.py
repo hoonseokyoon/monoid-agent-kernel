@@ -525,7 +525,9 @@ def test_turn_failed_is_idempotent_on_reentry(tmp_path: Path) -> None:
 
 
 def test_non_recoverable_model_error_is_terminal(tmp_path: Path) -> None:
-    adapter = _ScriptedAdapter([ModelAdapterError("server boom", http_status=500)])
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("server boom", http_status=500, provider_error_code="server_error")]
+    )
     loop, sink, run_root = _loop_with(tmp_path, adapter)
     loop.open()
     try:
@@ -533,7 +535,12 @@ def test_non_recoverable_model_error_is_terminal(tmp_path: Path) -> None:
         assert susp.reason == "terminal"
         assert susp.status == "failed"
         assert loop._session is not None and loop._session.terminal is True
-        assert "run.failed" in [e.type for e in sink.events]
+        failed = [e for e in sink.events if e.type == "run.failed"]
+        assert failed, "run.failed event emitted"
+        # The public failure event carries the provider detail (not just a generic message), so
+        # logs and the UI can see the real cause.
+        assert failed[0].data["provider_error_code"] == "server_error"
+        assert failed[0].data["http_status"] == 500
         assert list(run_root.rglob("failure.json"))
     finally:
         loop.close()
@@ -584,6 +591,47 @@ def test_fail_recoverable_promotes_to_terminal(tmp_path: Path) -> None:
         assert loop._session is not None and loop._session.terminal is True
         assert "run.failed" in [e.type for e in sink.events]
         assert list(run_root.rglob("failure.json"))
+    finally:
+        loop.close()
+
+
+def test_promotion_preserves_provider_details_from_turn_failed(tmp_path: Path) -> None:
+    # A recoverable provider failure records provider detail on the turn.failed; promoting it with
+    # fail_recoverable() (a fresh error with no provider fields) must NOT blank that detail.
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad request", http_status=400, provider_error_code="invalid_request_error")]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hi").reason == "turn_failed"
+        loop.fail_recoverable("gave up after retries", error_code="model_error")
+        failed = [e for e in sink.events if e.type == "run.failed"]
+        assert failed, "run.failed emitted"
+        assert failed[0].data["provider_error_code"] == "invalid_request_error"
+        assert failed[0].data["http_status"] == 400
+    finally:
+        loop.close()
+
+
+def test_fresh_terminal_failure_clears_stale_provider_details(tmp_path: Path) -> None:
+    # A recoverable turn.failed records provider detail; if the re-issued turn then fails terminally
+    # for an UNRELATED reason, run.failed must reflect that new cause, not the stale detail.
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError("rate limited", http_status=429, provider_error_code="rate_limit_exceeded", retryable=True),
+            ModelAdapterError("server boom", http_status=500),  # terminal, no provider code
+        ]
+    )
+    loop, sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hi").reason == "turn_failed"
+        assert loop.run_until_suspended(None).reason == "terminal"
+        failed = [e for e in sink.events if e.type == "run.failed"]
+        assert failed, "run.failed emitted"
+        assert failed[0].data["http_status"] == 500
+        assert failed[0].data["provider_error_code"] == ""  # not the stale rate_limit_exceeded
     finally:
         loop.close()
 
@@ -750,3 +798,36 @@ def test_interrupt_aborts_stream_mid_generation(tmp_path: Path) -> None:
         assert "turn.interrupted" in [e.type for e in sink.events]
     finally:
         loop.close()
+
+
+def test_from_tools_wires_a_custom_tool_end_to_end(tmp_path: Path) -> None:
+    from native_agent_runner.tools.decorator import tool
+
+    @tool(id="custom.echo", side_effect="read")
+    def echo(text: str) -> dict:
+        """Echo the input text."""
+        return {"echoed": text}
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_echo", {"text": "hello"}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="done"),
+        ]
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop.from_tools(spec, adapter, [echo]).run_once("echo hello")
+
+    assert result.status == "completed"
+    assert result.final_text == "done"
+    # The custom tool was exposed to the model under its derived exported name...
+    exported = {t.exported_name for t in adapter.requests[0].tools}
+    assert "custom_echo" in exported
+    # ...and its result came back as an observation.
+    observations = [obs for req in adapter.requests for obs in req.observations]
+    assert any(obs.output.get("result") == {"echoed": "hello"} for obs in observations)

@@ -157,6 +157,45 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     assert projection["changed_paths"] == ["SUMMARY.md"]
 
 
+def test_otel_event_sink_emits_genai_span_tree(tmp_path: Path) -> None:
+    """OtelEventSink turns the run event tree into invoke_agent / chat / execute_tool spans.
+    A local in-memory exporter keeps this off any global provider or network."""
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from native_agent_runner import OtelEventSink
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("rough notes\n", encoding="utf-8")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_write", {"path": "OUT.md", "content": "hi\n"}, "c1"),),
+            ),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=_provider("fs.write", "run.finish"),
+        event_sinks=(OtelEventSink(tracer_provider=provider),),
+    ).run_once("Write OUT.md.")
+
+    names = [span.name for span in exporter.get_finished_spans()]
+    assert "invoke_agent" in names
+    assert any(n.startswith("chat") for n in names)
+    assert any(n.startswith("execute_tool") for n in names)
+
+
 def test_public_events_redact_tool_arguments_and_policy_redacted_paths(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

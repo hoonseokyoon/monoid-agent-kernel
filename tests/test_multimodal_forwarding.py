@@ -198,9 +198,32 @@ def test_fs_read_media_returns_image_part(tmp_path: Path) -> None:
     assert result.media[0].mime_type == "image/png"
     assert result.content["mime_type"] == "image/png"
 
-    # fs.read is unchanged — still rejects the binary as non-text.
+    # fs.read with no media capability (context None) still rejects the binary.
     with pytest.raises(WorkspaceError):
         tools["fs.read"].handler(None, {"path": "img.png"})  # type: ignore[arg-type]
+
+
+def test_fs_read_binary_points_at_read_media(tmp_path: Path) -> None:
+    workspace = LocalWorkspaceBackend(_workspace_with_image(tmp_path))
+    tools = {tool.id: tool for tool in builtin_tools(workspace)}
+
+    # Binary/non-utf8 → an actionable error naming fs.read_media (which enforces its own scope,
+    # quota, and authorization), not a bare reject and not media read under fs.read's binding.
+    with pytest.raises(WorkspaceError, match="fs.read_media"):
+        tools["fs.read"].handler(None, {"path": "img.png"})  # type: ignore[arg-type]
+
+
+def test_fs_read_text_is_unchanged(tmp_path: Path) -> None:
+    ws_dir = tmp_path / "workspace"
+    ws_dir.mkdir()
+    ws_dir.joinpath("a.txt").write_text("hello world\n", encoding="utf-8")
+    workspace = LocalWorkspaceBackend(ws_dir)
+    tools = {tool.id: tool for tool in builtin_tools(workspace)}
+
+    result = tools["fs.read"].handler(None, {"path": "a.txt"})  # type: ignore[arg-type]
+    assert result.ok
+    assert "hello world" in result.content["content"]
+    assert result.media == ()
 
 
 def test_tool_media_observation_round_trips() -> None:
