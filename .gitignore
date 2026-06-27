@@ -41,3 +41,6 @@ Thumbs.db
 
 # Internal developer journal (not distributed)
 docs/dx-notes/
+
+# Local Claude Code workspace settings (not distributed)
+.claude/
