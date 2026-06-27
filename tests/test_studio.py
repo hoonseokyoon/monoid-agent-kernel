@@ -117,6 +117,8 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
     assert "#onboarding" in html  # the empty-state styles ship in the page
     assert "function showOnboarding" in html  # the panel is built on a fresh chat
     assert "function sendPrompt" in html  # suggested-prompt buttons call it
+    # A failed run surfaces the provider error detail (not just a generic message).
+    assert "provider_error_code" in html
 
 
 def test_offline_chat_produces_assistant_reply(studio: StudioServer) -> None:

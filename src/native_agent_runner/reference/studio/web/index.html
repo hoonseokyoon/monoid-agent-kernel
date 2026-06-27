@@ -602,7 +602,12 @@ function handleEvent(ev) {
     hideTyping();
     setGenerating(false);
     finalizeStream("");
-    bubble("error", data.error || data.message || "the run failed");
+    let msg = data.error || data.message || "the run failed";
+    // Surface the real provider failure (e.g. insufficient_quota / HTTP 429) when present.
+    const detail = [data.provider_error_code, data.http_status ? "HTTP " + data.http_status : ""]
+      .filter(Boolean).join(" · ");
+    if (detail) msg += " — " + detail;
+    bubble("error", msg);
     return;
   }
   if (type === "studio.stream.end") { hideTyping(); setGenerating(false); return; }
