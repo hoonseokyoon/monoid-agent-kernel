@@ -7,9 +7,7 @@ from pathlib import Path
 import pytest
 from conftest import runtime_config, runtime_provider
 
-from native_agent_runner.core.agents import AgentRuntimeConfig, ToolBinding
 from native_agent_runner.core.content import AudioPart, DocumentPart, ImagePart, TextPart
-from native_agent_runner.core.media import MEDIA_INPUT_CAPABILITY
 from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from native_agent_runner.errors import WorkspaceError
 from native_agent_runner.loop import AgentLoop
@@ -205,136 +203,14 @@ def test_fs_read_media_returns_image_part(tmp_path: Path) -> None:
         tools["fs.read"].handler(None, {"path": "img.png"})  # type: ignore[arg-type]
 
 
-class _MediaGrantedContext:
-    """Minimal ToolContext stub where the media.input capability is available (and nothing else)."""
-
-    def capability_available(self, capability: str) -> bool:
-        return capability == MEDIA_INPUT_CAPABILITY
-
-
-def test_fs_read_falls_back_to_media_when_capability_granted(tmp_path: Path) -> None:
-    """When the run holds media.input, fs.read on an image returns a by-reference ImagePart
-    instead of dead-ending — the standing _text_from_bytes TODO, resolved."""
+def test_fs_read_binary_points_at_read_media(tmp_path: Path) -> None:
     workspace = LocalWorkspaceBackend(_workspace_with_image(tmp_path))
     tools = {tool.id: tool for tool in builtin_tools(workspace)}
 
-    result = tools["fs.read"].handler(_MediaGrantedContext(), {"path": "img.png"})  # type: ignore[arg-type]
-    assert result.ok
-    assert len(result.media) == 1
-    assert isinstance(result.media[0], ImagePart)
-    assert result.media[0].source_ref == "img.png"
-    assert result.content["mime_type"] == "image/png"
-
-
-def test_fs_read_falls_back_to_document_for_pdf(tmp_path: Path) -> None:
-    workspace = LocalWorkspaceBackend(_workspace_with_pdf(tmp_path))
-    tools = {tool.id: tool for tool in builtin_tools(workspace)}
-
-    result = tools["fs.read"].handler(_MediaGrantedContext(), {"path": "doc.pdf"})  # type: ignore[arg-type]
-    assert result.ok
-    assert isinstance(result.media[0], DocumentPart)
-    assert result.content["mime_type"] == "application/pdf"
-
-
-def test_fs_read_binary_without_capability_points_at_read_media(tmp_path: Path) -> None:
-    workspace = LocalWorkspaceBackend(_workspace_with_image(tmp_path))
-    tools = {tool.id: tool for tool in builtin_tools(workspace)}
-
-    # No media capability → an actionable error naming fs.read_media, not a bare reject.
+    # Binary/non-utf8 → an actionable error naming fs.read_media (which enforces its own scope,
+    # quota, and authorization), not a bare reject and not media read under fs.read's binding.
     with pytest.raises(WorkspaceError, match="fs.read_media"):
         tools["fs.read"].handler(None, {"path": "img.png"})  # type: ignore[arg-type]
-
-
-def test_fs_read_media_fallback_fires_when_read_media_is_bound_no_broker(tmp_path: Path) -> None:
-    """End-to-end: a run that binds fs.read + fs.read_media (no broker/lease) takes the media
-    fallback when the model reads an image via fs.read — capability_available is True because
-    fs.read_media is bound. (Without this, the fallback was dead outside a broker config.)"""
-    workspace = _workspace_with_image(tmp_path)
-    adapter = FakeModelAdapter(
-        turns=[
-            ModelTurn(
-                response_id="r1",
-                tool_calls=(fake_tool_call("fs_read", {"path": "img.png"}, "c1"),),
-            ),
-            ModelTurn(response_id="r2", final_text="done"),
-        ]
-    )
-    loop = AgentLoop(
-        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
-        model_adapter=adapter,
-        runtime_config_provider=runtime_provider(runtime_config("fs.read", "fs.read_media")),
-    )
-    result = loop.run_once("read the image")
-
-    assert result.status == "completed"
-    obs = [o for req in adapter.requests for o in req.observations]
-    # The fs.read call returned media metadata (took the fallback) instead of an error.
-    assert any("image/png" in json.dumps(o.output) for o in obs), [o.output for o in obs]
-
-
-def test_fs_read_media_fallback_blocked_when_read_media_is_hidden(tmp_path: Path) -> None:
-    """P1: a bound-but-hidden fs.read_media must NOT make media available — fs.read falls back only
-    when media access is on the authorized immediate surface, not merely in the bound catalog."""
-    workspace = _workspace_with_image(tmp_path)
-    adapter = FakeModelAdapter(
-        turns=[
-            ModelTurn(
-                response_id="r1",
-                tool_calls=(fake_tool_call("fs_read", {"path": "img.png"}, "c1"),),
-            ),
-            ModelTurn(response_id="r2", final_text="done"),
-        ]
-    )
-    config = AgentRuntimeConfig(
-        definition_id="t",
-        tools=(
-            ToolBinding.for_tool("fs.read"),
-            ToolBinding.for_tool("fs.read_media", exposure="hidden"),  # bound but not available
-        ),
-    )
-    loop = AgentLoop(
-        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
-        model_adapter=adapter,
-        runtime_config_provider=runtime_provider(config),
-    )
-    loop.run_once("read the image")
-
-    obs = [o for req in adapter.requests for o in req.observations]
-    # fs.read did NOT forward media; it returned the actionable error pointing at fs.read_media.
-    assert not any("image/png" in json.dumps(o.output) for o in obs), [o.output for o in obs]
-    assert any("fs.read_media" in json.dumps(o.output) for o in obs), [o.output for o in obs]
-
-
-def test_fs_read_media_fallback_blocked_when_read_media_needs_approval(tmp_path: Path) -> None:
-    """P1: an approval-gated (authorization='ask') fs.read_media must NOT make media available —
-    otherwise fs.read could return media bypassing the per-call HITL approval and its scopes."""
-    workspace = _workspace_with_image(tmp_path)
-    adapter = FakeModelAdapter(
-        turns=[
-            ModelTurn(
-                response_id="r1",
-                tool_calls=(fake_tool_call("fs_read", {"path": "img.png"}, "c1"),),
-            ),
-            ModelTurn(response_id="r2", final_text="done"),
-        ]
-    )
-    config = AgentRuntimeConfig(
-        definition_id="t",
-        tools=(
-            ToolBinding.for_tool("fs.read"),
-            ToolBinding.for_tool("fs.read_media", authorization="ask"),  # immediate but approval-gated
-        ),
-    )
-    loop = AgentLoop(
-        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
-        model_adapter=adapter,
-        runtime_config_provider=runtime_provider(config),
-    )
-    loop.run_once("read the image")
-
-    obs = [o for req in adapter.requests for o in req.observations]
-    assert not any("image/png" in json.dumps(o.output) for o in obs), [o.output for o in obs]
-    assert any("fs.read_media" in json.dumps(o.output) for o in obs), [o.output for o in obs]
 
 
 def test_fs_read_text_is_unchanged(tmp_path: Path) -> None:

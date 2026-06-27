@@ -235,10 +235,6 @@ class AgentToolContext(ToolContext):
     skills_activated: list[str] = field(default_factory=list)
     _requested_tool_loads: list[str] = field(default_factory=list)
     _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
-    # Capabilities reachable on this turn's AUTHORIZED IMMEDIATE surface (not the whole bound
-    # catalog — hidden/searchable/denied tools are excluded) — lets a handler detect available
-    # access (e.g. fs.read falling back to media when fs.read_media is actually available).
-    _current_available_capabilities: frozenset[str] = field(default_factory=frozenset)
 
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
@@ -400,16 +396,6 @@ class AgentToolContext(ToolContext):
         if self.capability_vault is None:
             return None
         return self.capability_vault.token_for(capability, now=time.time())
-
-    def capability_available(self, capability: str) -> bool:
-        """True if the run holds ``capability`` this turn — either a broker lease was acquired for
-        it OR a tool declaring it is on the authorized immediate surface. Lets a handler offer
-        behavior gated on a capability (e.g. fs.read falling back to media when fs.read_media is
-        actually available) in the common no-broker config, without forwarding access the run
-        wasn't granted (hidden/searchable/denied tools don't count)."""
-        if self.capability_token(capability) is not None:
-            return True
-        return capability in self._current_available_capabilities
 
     def emit_outbox(
         self,
@@ -3273,11 +3259,6 @@ class AgentLoop:
         started_event: AgentEvent | None = None
         surface_decision = ""
         surface_reason = ""
-        # Expose the capabilities reachable on the authorized immediate surface (allow-decision
-        # immediate tools only — not the whole bound catalog, and not approval-gated 'ask' tools),
-        # so a handler can detect available access without bypassing exposure/approval. Leases are
-        # still honored separately in capability_available.
-        context._current_available_capabilities = _available_capabilities(surface_snapshot)
         try:
             if _is_tool_search_call(call_name, bound_catalog):
                 binding_id = bound_catalog.tool_search.binding_id
@@ -3765,21 +3746,6 @@ def _surface_spec_for_binding(snapshot: ToolSurfaceSnapshot, binding_id: str) ->
         if tool.id == binding_id or str(tool.annotations.get("binding_id") or "") == binding_id:
             return tool
     return None
-
-
-def _available_capabilities(snapshot: ToolSurfaceSnapshot) -> frozenset[str]:
-    """Capabilities reachable on the authorized immediate surface — immediate tools whose
-    authorization decision is ``allow``. Excludes hidden/searchable/denied tools AND approval-gated
-    (``ask``) ones, so a handler can't use ``capability_available`` to bypass a per-call approval
-    (e.g. fs.read returning media when fs.read_media requires HITL approval)."""
-    caps: set[str] = set()
-    for tool in snapshot.immediate_tools:
-        if not tool.capability:
-            continue
-        auth = snapshot.authorization_for(str(tool.annotations.get("binding_id") or ""))
-        if auth is not None and auth.decision == "allow":
-            caps.add(tool.capability)
-    return frozenset(caps)
 
 
 def _urls_from_args(arguments: dict[str, Any]) -> tuple[str, ...]:

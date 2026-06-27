@@ -36,9 +36,9 @@ out in commit messages and here.
 - OpenAI adapter: classify provider errors from the response body when the SDK
   exception carries no status — a streaming `429 insufficient_quota` was being
   masked as a generic `502 gateway_bad_response`.
-- `fs.read`: graceful binary→media fallback (delegates to `fs.read_media` when media
-  input is available — `fs.read_media` bound or a broker lease; otherwise an actionable
-  error) instead of a hard reject.
+- `fs.read`: on a binary/non-utf8 file, returns an actionable error pointing at
+  `fs.read_media` (which reads images/PDFs under its own scope and authorization) instead
+  of a bare "binary file" reject.
 - Subagent/skill loaders warn on a duplicate id instead of silently dropping it.
 - `[otel]` extra was api-only (a no-op); the Studio OTel toggle now has a working
   install path via `[otel-export]`.

@@ -194,20 +194,17 @@ def _fs_stat(workspace: Workspace) -> ToolSpec:
 
 
 def _fs_read(workspace: Workspace) -> ToolSpec:
-    def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
+    def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
         max_bytes = int(args.get("max_bytes", workspace.max_bytes_read))
         data, digest = workspace.read_bytes(path, max_bytes=max_bytes)
         text = _decode_text_or_none(data)
         if text is None:
-            # Binary / non-utf8. When the run has media input available (fs.read_media bound, or a
-            # broker lease) and this is a supported image/PDF, fall back to the media path so the
-            # model can still view it instead of dead-ending; otherwise point at fs.read_media.
-            if context is not None and context.capability_available(MEDIA_INPUT_CAPABILITY):
-                return _media_result(workspace, path, data, digest)
+            # Binary / non-utf8: point the model at fs.read_media rather than reading media here.
+            # fs.read_media enforces its own scope, quota, and authorization for the path; fs.read
+            # has no way to honor those, so it must not return media under its own (broader) binding.
             raise WorkspaceError(
-                f"{path!r} is not UTF-8 text; use fs.read_media to read images or PDFs "
-                f"(requires the {MEDIA_INPUT_CAPABILITY} capability)."
+                f"{path!r} is not UTF-8 text; use fs.read_media to read images or PDFs."
             )
         lines = text.splitlines()
         start_line = args.get("start_line")

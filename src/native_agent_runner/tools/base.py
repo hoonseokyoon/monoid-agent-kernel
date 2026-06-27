@@ -102,13 +102,6 @@ class ToolContext(Protocol):
         to the real secret at the edge (gateway), never in the core."""
         ...
 
-    def capability_available(self, capability: str) -> bool:
-        """Whether the run holds ``capability`` this turn — a broker lease was acquired for it OR a
-        tool declaring it is bound. Use this (not ``capability_token``) to gate optional handler
-        behavior that should work in the common no-broker config, e.g. ``fs.read`` falling back to
-        the media path when ``fs.read_media`` (``media.input``) is bound."""
-        ...
-
     def emit_outbox(
         self,
         destination: str,
