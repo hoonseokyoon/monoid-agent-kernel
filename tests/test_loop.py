@@ -614,6 +614,28 @@ def test_promotion_preserves_provider_details_from_turn_failed(tmp_path: Path) -
         loop.close()
 
 
+def test_fresh_terminal_failure_clears_stale_provider_details(tmp_path: Path) -> None:
+    # A recoverable turn.failed records provider detail; if the re-issued turn then fails terminally
+    # for an UNRELATED reason, run.failed must reflect that new cause, not the stale detail.
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError("rate limited", http_status=429, provider_error_code="rate_limit_exceeded", retryable=True),
+            ModelAdapterError("server boom", http_status=500),  # terminal, no provider code
+        ]
+    )
+    loop, sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hi").reason == "turn_failed"
+        assert loop.run_until_suspended(None).reason == "terminal"
+        failed = [e for e in sink.events if e.type == "run.failed"]
+        assert failed, "run.failed emitted"
+        assert failed[0].data["http_status"] == 500
+        assert failed[0].data["provider_error_code"] == ""  # not the stale rate_limit_exceeded
+    finally:
+        loop.close()
+
+
 # --- DX-9: turn-level interrupt (a "stop" that keeps the session alive) -----------------
 
 

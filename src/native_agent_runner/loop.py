@@ -1085,7 +1085,12 @@ class AgentLoop:
         ``run.failed``) and mark the session terminal, without having to duplicate the loop's
         terminal bookkeeping. The driver then closes the run as usual."""
         session = self._require_open()
-        self._record_failure(session.state, session.res, ModelAdapterError(message, error_code=error_code))
+        self._record_failure(
+            session.state,
+            session.res,
+            ModelAdapterError(message, error_code=error_code),
+            inherit_provider_detail=True,  # promotion of the prior turn.failed — keep its detail
+        )
         session.terminal = True
         self._persist_checkpoint(session)
 
@@ -1305,18 +1310,33 @@ class AgentLoop:
                 await aclose()
         return assemble_streamed_turn(chunks)
 
-    def _record_failure(self, state: RunState, res: _RunResources, exc: Exception) -> None:
+    def _record_failure(
+        self,
+        state: RunState,
+        res: _RunResources,
+        exc: Exception,
+        *,
+        inherit_provider_detail: bool = False,
+    ) -> None:
         state.status = "failed"
         state.error = str(exc)
         state.error_code = error_code_for_exception(exc)
-        if isinstance(exc, ModelAdapterError):
-            # Only adopt the exception's provider detail when it carries it: a promotion wrapper
-            # (fail_recoverable / retry budget exhausted) may be a fresh ModelAdapterError with the
-            # fields empty, and must not blank what the preceding turn.failed already recorded.
+        if inherit_provider_detail and isinstance(exc, ModelAdapterError):
+            # Promotion of a recoverable turn.failed (fail_recoverable): keep the provider detail
+            # that turn recorded, adopting the synthetic wrapper's fields only if it carries them.
             if exc.provider_error_code:
                 state.provider_error_code = exc.provider_error_code
             if exc.http_status is not None:
                 state.provider_http_status = exc.http_status
+        else:
+            # A fresh terminal failure reflects THIS exception — clearing any stale provider detail
+            # an earlier, unrelated recoverable turn.failed may have left on the state.
+            if isinstance(exc, ModelAdapterError):
+                state.provider_error_code = exc.provider_error_code
+                state.provider_http_status = exc.http_status
+            else:
+                state.provider_error_code = ""
+                state.provider_http_status = None
         state.final_text = ""
         res.recorder.emit(
             "run.failed",
