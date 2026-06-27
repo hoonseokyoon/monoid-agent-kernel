@@ -205,10 +205,10 @@ def test_fs_read_media_returns_image_part(tmp_path: Path) -> None:
 
 
 class _MediaGrantedContext:
-    """Minimal ToolContext stub that grants the media.input capability (and nothing else)."""
+    """Minimal ToolContext stub where the media.input capability is available (and nothing else)."""
 
-    def capability_token(self, capability: str) -> str | None:
-        return "tok-media" if capability == MEDIA_INPUT_CAPABILITY else None
+    def capability_available(self, capability: str) -> bool:
+        return capability == MEDIA_INPUT_CAPABILITY
 
 
 def test_fs_read_falls_back_to_media_when_capability_granted(tmp_path: Path) -> None:
@@ -242,6 +242,33 @@ def test_fs_read_binary_without_capability_points_at_read_media(tmp_path: Path) 
     # No media capability → an actionable error naming fs.read_media, not a bare reject.
     with pytest.raises(WorkspaceError, match="fs.read_media"):
         tools["fs.read"].handler(None, {"path": "img.png"})  # type: ignore[arg-type]
+
+
+def test_fs_read_media_fallback_fires_when_read_media_is_bound_no_broker(tmp_path: Path) -> None:
+    """End-to-end: a run that binds fs.read + fs.read_media (no broker/lease) takes the media
+    fallback when the model reads an image via fs.read — capability_available is True because
+    fs.read_media is bound. (Without this, the fallback was dead outside a broker config.)"""
+    workspace = _workspace_with_image(tmp_path)
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_read", {"path": "img.png"}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="done"),
+        ]
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("fs.read", "fs.read_media")),
+    )
+    result = loop.run_once("read the image")
+
+    assert result.status == "completed"
+    obs = [o for req in adapter.requests for o in req.observations]
+    # The fs.read call returned media metadata (took the fallback) instead of an error.
+    assert any("image/png" in json.dumps(o.output) for o in obs), [o.output for o in obs]
 
 
 def test_fs_read_text_is_unchanged(tmp_path: Path) -> None:

@@ -200,10 +200,10 @@ def _fs_read(workspace: Workspace) -> ToolSpec:
         data, digest = workspace.read_bytes(path, max_bytes=max_bytes)
         text = _decode_text_or_none(data)
         if text is None:
-            # Binary / non-utf8. When the run holds the media.input capability and this is a
-            # supported image/PDF, fall back to the media path so the model can still view it
-            # instead of dead-ending; otherwise return an actionable pointer to fs.read_media.
-            if context is not None and context.capability_token(MEDIA_INPUT_CAPABILITY) is not None:
+            # Binary / non-utf8. When the run has media input available (fs.read_media bound, or a
+            # broker lease) and this is a supported image/PDF, fall back to the media path so the
+            # model can still view it instead of dead-ending; otherwise point at fs.read_media.
+            if context is not None and context.capability_available(MEDIA_INPUT_CAPABILITY):
                 return _media_result(workspace, path, data, digest)
             raise WorkspaceError(
                 f"{path!r} is not UTF-8 text; use fs.read_media to read images or PDFs "
