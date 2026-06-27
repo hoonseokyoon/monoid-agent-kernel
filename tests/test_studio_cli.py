@@ -68,6 +68,29 @@ def test_dir_writable_does_not_clobber_existing_files(tmp_path: Path) -> None:
     assert [p.name for p in d.iterdir()] == [".nar-doctor-probe"]
 
 
+def test_openai_sdk_probe_rejects_legacy_sdk_without_responses_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A bare `import openai` succeeds on versions that predate the Responses API the adapter
+    # calls (client.responses.create). The probe must reject those, not report a false pass.
+    import sys
+    import types
+
+    from native_agent_runner.reference.studio.cli import _openai_sdk_importable
+
+    legacy = types.ModuleType("openai")
+    legacy.OpenAI = type("OpenAI", (), {})  # no `responses` attribute → too old
+    legacy.AsyncOpenAI = type("AsyncOpenAI", (), {})
+    monkeypatch.setitem(sys.modules, "openai", legacy)
+    assert _openai_sdk_importable() is False
+
+    modern = types.ModuleType("openai")
+    modern.OpenAI = type("OpenAI", (), {"responses": property(lambda self: None)})
+    modern.AsyncOpenAI = type("AsyncOpenAI", (), {"responses": property(lambda self: None)})
+    monkeypatch.setitem(sys.modules, "openai", modern)
+    assert _openai_sdk_importable() is True
+
+
 def test_doctor_missing_chromium_is_warning_not_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

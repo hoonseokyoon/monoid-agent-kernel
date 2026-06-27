@@ -99,9 +99,24 @@ class McpHttpClient:
         tools: list[dict[str, Any]] = []
         cursor: str | None = None
         seen: set[str] = set()
+        restarted = False
         for _ in range(1000):  # bound against a server that never stops handing out cursors
             params = {"cursor": cursor} if cursor is not None else None
-            result, _ = self._post("tools/list", params)
+            # A cursor is opaque state the *current* session issued; a server that scopes cursors
+            # to sessions will reject one minted by an expired session. So for cursor-bearing
+            # pages we disable _post's transparent replay (which would resend the stale cursor)
+            # and instead restart pagination from the top once after reconnecting.
+            try:
+                result, _ = self._post("tools/list", params, _allow_reconnect=cursor is None)
+            except McpError as exc:
+                if exc.code == 404 and cursor is not None and not restarted:
+                    restarted = True
+                    self.initialize()  # re-handshake (the prior _post already dropped the session)
+                    tools.clear()
+                    seen.clear()
+                    cursor = None
+                    continue
+                raise
             page = result.get("tools")
             if isinstance(page, list):
                 tools.extend(page)

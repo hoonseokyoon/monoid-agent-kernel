@@ -230,13 +230,17 @@ def _otel_export_importable() -> bool:
 
 
 def _openai_sdk_importable() -> bool:
-    """True if the optional ``openai`` SDK (the ``[openai]`` extra) is installed — the gateway's
-    OpenAIModelAdapter needs it for ``--provider openai`` and otherwise fails on the first turn."""
+    """True if the installed ``openai`` SDK exposes the exact surface OpenAIModelAdapter uses:
+    the ``OpenAI``/``AsyncOpenAI`` clients and the Responses API (``client.responses.create``).
+    A bare ``import openai`` succeeds on legacy versions that predate the Responses API, so the
+    adapter would still fail on the first turn — probe the real symbols, not just the package.
+    ``responses`` is a ``cached_property`` on the client class, so ``hasattr`` on the class sees
+    it without needing an API key to instantiate."""
     try:
-        import openai  # noqa: F401
+        from openai import AsyncOpenAI, OpenAI
     except ImportError:
         return False
-    return True
+    return hasattr(OpenAI, "responses") and hasattr(AsyncOpenAI, "responses")
 
 
 @studio.command("doctor")
