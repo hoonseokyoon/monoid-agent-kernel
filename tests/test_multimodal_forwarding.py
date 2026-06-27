@@ -8,6 +8,7 @@ import pytest
 from conftest import runtime_config, runtime_provider
 
 from native_agent_runner.core.content import AudioPart, DocumentPart, ImagePart, TextPart
+from native_agent_runner.core.media import MEDIA_INPUT_CAPABILITY
 from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from native_agent_runner.errors import WorkspaceError
 from native_agent_runner.loop import AgentLoop
@@ -198,9 +199,62 @@ def test_fs_read_media_returns_image_part(tmp_path: Path) -> None:
     assert result.media[0].mime_type == "image/png"
     assert result.content["mime_type"] == "image/png"
 
-    # fs.read is unchanged — still rejects the binary as non-text.
+    # fs.read with no media capability (context None) still rejects the binary.
     with pytest.raises(WorkspaceError):
         tools["fs.read"].handler(None, {"path": "img.png"})  # type: ignore[arg-type]
+
+
+class _MediaGrantedContext:
+    """Minimal ToolContext stub that grants the media.input capability (and nothing else)."""
+
+    def capability_token(self, capability: str) -> str | None:
+        return "tok-media" if capability == MEDIA_INPUT_CAPABILITY else None
+
+
+def test_fs_read_falls_back_to_media_when_capability_granted(tmp_path: Path) -> None:
+    """When the run holds media.input, fs.read on an image returns a by-reference ImagePart
+    instead of dead-ending — the standing _text_from_bytes TODO, resolved."""
+    workspace = LocalWorkspaceBackend(_workspace_with_image(tmp_path))
+    tools = {tool.id: tool for tool in builtin_tools(workspace)}
+
+    result = tools["fs.read"].handler(_MediaGrantedContext(), {"path": "img.png"})  # type: ignore[arg-type]
+    assert result.ok
+    assert len(result.media) == 1
+    assert isinstance(result.media[0], ImagePart)
+    assert result.media[0].source_ref == "img.png"
+    assert result.content["mime_type"] == "image/png"
+
+
+def test_fs_read_falls_back_to_document_for_pdf(tmp_path: Path) -> None:
+    workspace = LocalWorkspaceBackend(_workspace_with_pdf(tmp_path))
+    tools = {tool.id: tool for tool in builtin_tools(workspace)}
+
+    result = tools["fs.read"].handler(_MediaGrantedContext(), {"path": "doc.pdf"})  # type: ignore[arg-type]
+    assert result.ok
+    assert isinstance(result.media[0], DocumentPart)
+    assert result.content["mime_type"] == "application/pdf"
+
+
+def test_fs_read_binary_without_capability_points_at_read_media(tmp_path: Path) -> None:
+    workspace = LocalWorkspaceBackend(_workspace_with_image(tmp_path))
+    tools = {tool.id: tool for tool in builtin_tools(workspace)}
+
+    # No media capability → an actionable error naming fs.read_media, not a bare reject.
+    with pytest.raises(WorkspaceError, match="fs.read_media"):
+        tools["fs.read"].handler(None, {"path": "img.png"})  # type: ignore[arg-type]
+
+
+def test_fs_read_text_is_unchanged(tmp_path: Path) -> None:
+    ws_dir = tmp_path / "workspace"
+    ws_dir.mkdir()
+    ws_dir.joinpath("a.txt").write_text("hello world\n", encoding="utf-8")
+    workspace = LocalWorkspaceBackend(ws_dir)
+    tools = {tool.id: tool for tool in builtin_tools(workspace)}
+
+    result = tools["fs.read"].handler(None, {"path": "a.txt"})  # type: ignore[arg-type]
+    assert result.ok
+    assert "hello world" in result.content["content"]
+    assert result.media == ()
 
 
 def test_tool_media_observation_round_trips() -> None:

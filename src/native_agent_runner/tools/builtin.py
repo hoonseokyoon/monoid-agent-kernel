@@ -54,17 +54,26 @@ def _object_schema(properties: dict[str, Any], *, required: list[str] | None = N
     }
 
 
-def _text_from_bytes(data: bytes, path: str) -> str:
-    # TODO(multimodal): when the `media.input`/read capability is granted and a
-    # provider advertises multimodal support, return a typed content part
-    # (ImagePart/DocumentPart from core/content.py) here instead of rejecting
-    # binary/non-utf8 files. Contract is defined; extraction is deferred.
+def _decode_text_or_none(data: bytes) -> str | None:
+    """Decode bytes as UTF-8 text, or ``None`` when they're binary (a NUL byte) or not valid
+    UTF-8 — a branchable signal so callers can fall back instead of always raising."""
     if b"\x00" in data:
-        raise WorkspaceError(f"binary file cannot be read as text: {path}")
+        return None
     try:
         return data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise WorkspaceError(f"file is not utf-8 text: {path}") from exc
+    except UnicodeDecodeError:
+        return None
+
+
+def _text_from_bytes(data: bytes, path: str) -> str:
+    # Reject binary/non-utf8 for the plain-text read tools (fs.read_lines / fs.read_many). The
+    # primary fs.read tool falls back to the media path instead (see _fs_read); this stays strict.
+    text = _decode_text_or_none(data)
+    if text is not None:
+        return text
+    if b"\x00" in data:
+        raise WorkspaceError(f"binary file cannot be read as text: {path}")
+    raise WorkspaceError(f"file is not utf-8 text: {path}")
 
 
 def _tool_search() -> ToolSpec:
@@ -185,11 +194,21 @@ def _fs_stat(workspace: Workspace) -> ToolSpec:
 
 
 def _fs_read(workspace: Workspace) -> ToolSpec:
-    def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
+    def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
         max_bytes = int(args.get("max_bytes", workspace.max_bytes_read))
         data, digest = workspace.read_bytes(path, max_bytes=max_bytes)
-        text = _text_from_bytes(data, path)
+        text = _decode_text_or_none(data)
+        if text is None:
+            # Binary / non-utf8. When the run holds the media.input capability and this is a
+            # supported image/PDF, fall back to the media path so the model can still view it
+            # instead of dead-ending; otherwise return an actionable pointer to fs.read_media.
+            if context is not None and context.capability_token(MEDIA_INPUT_CAPABILITY) is not None:
+                return _media_result(workspace, path, data, digest)
+            raise WorkspaceError(
+                f"{path!r} is not UTF-8 text; use fs.read_media to read images or PDFs "
+                f"(requires the {MEDIA_INPUT_CAPABILITY} capability)."
+            )
         lines = text.splitlines()
         start_line = args.get("start_line")
         end_line = args.get("end_line")
@@ -238,37 +257,44 @@ def _sniff_media_mime(data: bytes) -> str | None:
     return None
 
 
+def _media_result(workspace: Workspace, path: str, data: bytes, digest: str) -> ToolResult:
+    """Build a by-reference media ToolResult (ImagePart/DocumentPart) for an image or PDF. Shared
+    by fs.read_media and fs.read's binary fallback. Raises WorkspaceError if the bytes are
+    oversized for the run's wire-build cap or are not a supported media type."""
+    # Eager guard (gap 2b): the media is forwarded by reference and re-read at wire-build under
+    # the run's max_bytes_read. Reject here — adjacent to the cause — if it would not fit then,
+    # so the run never produces a media reference doomed to fail mid-turn. Same threshold as the
+    # wire-build read (single source of truth), with an actionable remedy.
+    if len(data) > workspace.max_bytes_read:
+        raise WorkspaceError(
+            f"media {path!r} is {len(data)} bytes, over the run's max_bytes_read "
+            f"({workspace.max_bytes_read}); it cannot be forwarded to the model. "
+            f"Raise max_bytes_read or downsample the media."
+        )
+    mime = _sniff_media_mime(data)
+    if mime is None:
+        raise WorkspaceError(f"not a supported image or PDF file: {path}")
+    normalized = workspace.normalize(path)
+    # Media travels by reference (source_ref); the runner resolves + forwards it so the
+    # model can view it. The text content carries metadata only.
+    part: ImagePart | DocumentPart = (
+        DocumentPart(source_ref=normalized, mime_type=mime)
+        if mime == "application/pdf"
+        else ImagePart(source_ref=normalized, mime_type=mime)
+    )
+    return ToolResult(
+        ok=True,
+        content={"path": normalized, "mime_type": mime, "sha256": digest, "size": len(data)},
+        media=(part,),
+    )
+
+
 def _fs_read_media(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
         max_bytes = int(args.get("max_bytes", workspace.max_bytes_read))
         data, digest = workspace.read_bytes(path, max_bytes=max_bytes)
-        # Eager guard (gap 2b): the media is forwarded by reference and re-read at wire-build under
-        # the run's max_bytes_read. Reject here — adjacent to the cause — if it would not fit then,
-        # so the run never produces a media reference doomed to fail mid-turn. Same threshold as the
-        # wire-build read (single source of truth), with an actionable remedy.
-        if len(data) > workspace.max_bytes_read:
-            raise WorkspaceError(
-                f"media {path!r} is {len(data)} bytes, over the run's max_bytes_read "
-                f"({workspace.max_bytes_read}); it cannot be forwarded to the model. "
-                f"Raise max_bytes_read or downsample the media."
-            )
-        mime = _sniff_media_mime(data)
-        if mime is None:
-            raise WorkspaceError(f"not a supported image or PDF file: {path}")
-        normalized = workspace.normalize(path)
-        # Media travels by reference (source_ref); the runner resolves + forwards it so the
-        # model can view it. The text content carries metadata only.
-        part: ImagePart | DocumentPart = (
-            DocumentPart(source_ref=normalized, mime_type=mime)
-            if mime == "application/pdf"
-            else ImagePart(source_ref=normalized, mime_type=mime)
-        )
-        return ToolResult(
-            ok=True,
-            content={"path": normalized, "mime_type": mime, "sha256": digest, "size": len(data)},
-            media=(part,),
-        )
+        return _media_result(workspace, path, data, digest)
 
     return ToolSpec(
         id="fs.read_media",
