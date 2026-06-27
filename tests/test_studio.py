@@ -107,6 +107,18 @@ def test_vendor_route_serves_katex_offline(studio: StudioServer) -> None:
         raise AssertionError("missing vendor asset should 404")
 
 
+def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
+    # The served UI includes the first-run onboarding empty-state + the sendPrompt hook its
+    # suggested-prompt buttons call.
+    import urllib.request
+
+    with urllib.request.urlopen(f"{studio.base_url}/") as resp:
+        html = resp.read().decode("utf-8")
+    assert "#onboarding" in html  # the empty-state styles ship in the page
+    assert "function showOnboarding" in html  # the panel is built on a fresh chat
+    assert "function sendPrompt" in html  # suggested-prompt buttons call it
+
+
 def test_offline_chat_produces_assistant_reply(studio: StudioServer) -> None:
     result = studio.start_chat("summarize the workspace")
     run_id = result["run_id"]

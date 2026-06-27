@@ -192,6 +192,16 @@
   #trace-tree li { padding: 2px 0; color: var(--muted); }
   #trace-tree .tt-type { color: var(--text); }
   #trace-tree li.err .tt-type { color: var(--err); }
+  /* First-run onboarding empty-state (removed as soon as the first message renders). */
+  #onboarding { color: var(--muted); max-width: 640px; margin: 24px auto; line-height: 1.5; }
+  #onboarding h2 { color: var(--text); font-size: 16px; margin: 0 0 8px; }
+  #onboarding .ob-prompts { display: flex; flex-direction: column; gap: 8px; margin: 14px 0; }
+  #onboarding .ob-prompt {
+    text-align: left; cursor: pointer; padding: 8px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text); font: inherit;
+  }
+  #onboarding .ob-prompt:hover { border-color: var(--accent); }
+  #onboarding .ob-note { font-size: 12px; color: var(--warn); margin-top: 12px; }
 </style>
 <!-- Optional math rendering: KaTeX auto-render. Vendored locally (woff2 fonts only) so Studio
      keeps its no-network promise; if these assets are missing the chat shows raw LaTeX. -->
@@ -416,6 +426,8 @@ function typesetMath(el) {
 window.addEventListener("load", () => typesetMath(log));
 
 function bubble(cls, text) {
+  const ob = document.getElementById("onboarding");
+  if (ob) ob.remove();  // first real message clears the first-run empty-state
   const el = document.createElement("div");
   el.className = "msg " + cls;
   el.innerHTML = renderMarkdown(text);
@@ -423,6 +435,40 @@ function bubble(cls, text) {
   log.appendChild(el);
   log.scrollTop = log.scrollHeight;
   return el;
+}
+
+// Send a suggested prompt as if the user typed it (used by the onboarding panel).
+function sendPrompt(text) {
+  input.value = text;
+  form.requestSubmit();
+}
+
+// First-run empty-state: an intro + a few one-click prompts. Shown only when the chat is empty
+// (no active session); removed by bubble() on the first message.
+function showOnboarding(offline) {
+  if (runId || log.children.length || document.getElementById("onboarding")) return;
+  const prompts = [
+    "List the files in the workspace and suggest a README outline.",
+    "Read notes.md and write a clearer SUMMARY.md.",
+    "What can you do in this workspace?",
+  ];
+  const el = document.createElement("div");
+  el.id = "onboarding";
+  const buttons = prompts
+    .map((p) => `<button class="ob-prompt" type="button">${p}</button>`)
+    .join("");
+  el.innerHTML =
+    "<h2>Welcome to Agent Studio</h2>" +
+    "<div>This is a real agent. Type a request below, or try one of these:</div>" +
+    `<div class="ob-prompts">${buttons}</div>` +
+    (offline
+      ? '<div class="ob-note">Offline mode uses a keyless echo model — it replies but does not ' +
+        'reason or run tools. Launch with <code>--provider openai</code> for a live agent.</div>'
+      : "");
+  el.querySelectorAll(".ob-prompt").forEach((btn, i) => {
+    btn.addEventListener("click", () => sendPrompt(prompts[i]));
+  });
+  log.appendChild(el);
 }
 
 // Live token streaming: append model.output.delta fragments into one assistant bubble.
@@ -1236,8 +1282,10 @@ traceBtn.addEventListener("click", (e) => {
 });
 
 (async function init() {
+  let offline = false;
   try {
     const cfg = await (await fetch("/api/config")).json();
+    offline = !!cfg.offline;
     const wsPath = cfg.workspace || "";
     // Show only the workspace folder name in the header (the full path is private/long and
     // unflattering in screenshots); the full path is on hover + the copy button.
@@ -1272,6 +1320,8 @@ traceBtn.addEventListener("click", (e) => {
     }
     const fileParam = params.get("file");
     if (fileParam) setTimeout(() => openFile(fileParam), 1600);
+  } else {
+    showOnboarding(offline);  // fresh chat → first-run empty-state
   }
 })();
 </script>
