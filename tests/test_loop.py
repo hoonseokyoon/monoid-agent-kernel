@@ -525,7 +525,9 @@ def test_turn_failed_is_idempotent_on_reentry(tmp_path: Path) -> None:
 
 
 def test_non_recoverable_model_error_is_terminal(tmp_path: Path) -> None:
-    adapter = _ScriptedAdapter([ModelAdapterError("server boom", http_status=500)])
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("server boom", http_status=500, provider_error_code="server_error")]
+    )
     loop, sink, run_root = _loop_with(tmp_path, adapter)
     loop.open()
     try:
@@ -533,7 +535,12 @@ def test_non_recoverable_model_error_is_terminal(tmp_path: Path) -> None:
         assert susp.reason == "terminal"
         assert susp.status == "failed"
         assert loop._session is not None and loop._session.terminal is True
-        assert "run.failed" in [e.type for e in sink.events]
+        failed = [e for e in sink.events if e.type == "run.failed"]
+        assert failed, "run.failed event emitted"
+        # The public failure event carries the provider detail (not just a generic message), so
+        # logs and the UI can see the real cause.
+        assert failed[0].data["provider_error_code"] == "server_error"
+        assert failed[0].data["http_status"] == 500
         assert list(run_root.rglob("failure.json"))
     finally:
         loop.close()

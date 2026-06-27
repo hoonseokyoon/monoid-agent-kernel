@@ -1312,6 +1312,10 @@ class AgentLoop:
                 "error": public_error_message(state.error),
                 "error_code": state.error_code,
                 "type": type(exc).__name__,
+                # Provider failure detail (codes/status, never the raw body) — mirrors turn.failed
+                # so the real cause (e.g. insufficient_quota / HTTP 429) reaches logs and the UI.
+                "provider_error_code": state.provider_error_code,
+                "http_status": state.provider_http_status,
             },
             level="error",
         )
