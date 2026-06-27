@@ -750,3 +750,36 @@ def test_interrupt_aborts_stream_mid_generation(tmp_path: Path) -> None:
         assert "turn.interrupted" in [e.type for e in sink.events]
     finally:
         loop.close()
+
+
+def test_from_tools_wires_a_custom_tool_end_to_end(tmp_path: Path) -> None:
+    from native_agent_runner.tools.decorator import tool
+
+    @tool(id="custom.echo", side_effect="read")
+    def echo(text: str) -> dict:
+        """Echo the input text."""
+        return {"echoed": text}
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_echo", {"text": "hello"}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="done"),
+        ]
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop.from_tools(spec, adapter, [echo]).run_once("echo hello")
+
+    assert result.status == "completed"
+    assert result.final_text == "done"
+    # The custom tool was exposed to the model under its derived exported name...
+    exported = {t.exported_name for t in adapter.requests[0].tools}
+    assert "custom_echo" in exported
+    # ...and its result came back as an observation.
+    observations = [obs for req in adapter.requests for obs in req.observations]
+    assert any(obs.output.get("result") == {"echoed": "hello"} for obs in observations)

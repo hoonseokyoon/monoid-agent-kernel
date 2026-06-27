@@ -33,7 +33,10 @@ def _load(rel: str):
 
 # Self-contained offline programs: each ``main()`` uses an internal TemporaryDirectory and a
 # scripted/echo adapter, so it neither touches the network nor pollutes the cwd.
-@pytest.mark.parametrize("rel", ["minimal_quickstart.py", "custom_model_adapter.py", "otel_tracing.py"])
+@pytest.mark.parametrize(
+    "rel",
+    ["minimal_quickstart.py", "custom_model_adapter.py", "otel_tracing.py", "custom_tool_quickstart.py"],
+)
 def test_example_main_runs_offline(rel: str, capsys: pytest.CaptureFixture[str]) -> None:
     module = _load(rel)
     module.main()

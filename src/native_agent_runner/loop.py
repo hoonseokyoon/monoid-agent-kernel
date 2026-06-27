@@ -7,7 +7,7 @@ import inspect
 import json
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any
 
@@ -55,6 +55,7 @@ from native_agent_runner.core.agents import (
     ToolSearchConfig,
     coerce_runtime_config_provider,
     compile_bound_tool_catalog,
+    generated_tool_bindings,
     runtime_config_diff,
     transcript_config_snapshot,
     validate_runtime_config,
@@ -140,6 +141,7 @@ from native_agent_runner.tools.base import (
     ToolResult,
     ToolSpec,
 )
+from native_agent_runner.tool_loader import FunctionToolProvider
 from native_agent_runner.tools.builtin import agent_spawn_tool, builtin_tools
 from native_agent_runner.web import WebGatewayClient, domain_allowed, domain_from_url
 from native_agent_runner.core.workspace import Workspace
@@ -637,6 +639,43 @@ class AgentLoop:
             AgentLoop.from_config(spec, adapter, config).run_once("do the thing")
         """
         return cls(spec, model_adapter, runtime_config_provider=runtime_config, **kwargs)
+
+    @classmethod
+    def from_tools(
+        cls,
+        spec: AgentRunSpec,
+        model_adapter: ModelAdapter,
+        tools: Iterable[ToolSpec],
+        *,
+        definition_id: str = "custom-agent",
+        model: ModelConfig | None = None,
+        prompt: PromptSpec | None = None,
+        **kwargs: Any,
+    ) -> AgentLoop:
+        """One call to run with custom tools — no hand-wrapped provider or bindings.
+
+        ``tools`` are ``@tool``-decorated functions or raw :class:`ToolSpec` objects. They are
+        registered for the run AND exposed to the model via auto-generated :class:`ToolBinding`
+        entries (binding_id/model_name derived from each tool's id). Optional seams
+        (``event_sinks``, ``checkpoint_store``, extra ``tool_providers``, …) pass through::
+
+            @tool(id="skill.word_count", side_effect="run")
+            def word_count(text: str) -> dict: ...
+
+            AgentLoop.from_tools(spec, adapter, [word_count]).run_once("count the words")
+        """
+        specs = tuple(tools)
+        provider = FunctionToolProvider(lambda _ctx: specs)
+        config = AgentRuntimeConfig(
+            definition_id=definition_id,
+            model=model,
+            prompt=prompt or PromptSpec(),
+            tools=generated_tool_bindings(specs),
+        )
+        existing = tuple(kwargs.pop("tool_providers", ()))
+        return cls.from_config(
+            spec, model_adapter, config, tool_providers=(provider, *existing), **kwargs
+        )
 
     def open(self) -> None:
         """Bootstrap the run and leave it idle, ready to accept submit().
