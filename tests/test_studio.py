@@ -80,6 +80,33 @@ def test_echo_adapter_replies_with_latest_user_text() -> None:
     assert turn.usage["total_tokens"] > 0
 
 
+def test_vendor_route_serves_katex_offline(studio: StudioServer) -> None:
+    import urllib.error
+    import urllib.request
+
+    base = studio.base_url
+    # The locally-vendored KaTeX CSS is served (no CDN) with a css content-type and still
+    # references the woff2 fonts that ship alongside it.
+    with urllib.request.urlopen(f"{base}/vendor/katex/katex.min.css") as resp:
+        assert resp.status == 200
+        assert "text/css" in resp.headers["Content-Type"]
+        css = resp.read()
+    assert b"@font-face" in css and b".woff2" in css
+
+    # A woff2 font asset resolves too, with a font content-type.
+    with urllib.request.urlopen(f"{base}/vendor/katex/fonts/KaTeX_Main-Regular.woff2") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "font/woff2"
+
+    # Unknown vendor paths 404 rather than leaking a stack trace or other files.
+    try:
+        urllib.request.urlopen(f"{base}/vendor/katex/nope.js")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 404
+    else:
+        raise AssertionError("missing vendor asset should 404")
+
+
 def test_offline_chat_produces_assistant_reply(studio: StudioServer) -> None:
     result = studio.start_chat("summarize the workspace")
     run_id = result["run_id"]

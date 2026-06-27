@@ -193,11 +193,11 @@
   #trace-tree .tt-type { color: var(--text); }
   #trace-tree li.err .tt-type { color: var(--err); }
 </style>
-<!-- Optional math rendering: KaTeX auto-render. Loaded from a CDN with graceful fallback —
-     offline (no CDN) the chat simply shows the raw LaTeX, exactly as before. -->
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous" />
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" crossorigin="anonymous"></script>
+<!-- Optional math rendering: KaTeX auto-render. Vendored locally (woff2 fonts only) so Studio
+     keeps its no-network promise; if these assets are missing the chat shows raw LaTeX. -->
+<link rel="stylesheet" href="/vendor/katex/katex.min.css" />
+<script defer src="/vendor/katex/katex.min.js"></script>
+<script defer src="/vendor/katex/auto-render.min.js"></script>
 </head>
 <body>
   <header>

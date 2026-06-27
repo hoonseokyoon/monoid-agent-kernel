@@ -49,10 +49,17 @@ http-async = [
     "httpx>=0.27",
 ]
 # OpenTelemetry tracing (OtelEventSink). Only opentelemetry-api is needed (a no-op without
-# an SDK/exporter); the import is lazy, so the package imports without it. The application
-# installs opentelemetry-sdk + an exporter to actually emit spans.
+# an SDK/exporter); the import is lazy, so the package imports without it. This extra is for
+# the library code path — emitting spans needs the SDK + an exporter (see otel-export).
 otel = [
     "opentelemetry-api>=1.20",
+]
+# Actually emit spans: the SDK + OTLP/HTTP exporter. Required for the Studio OTel toggle and
+# any app that wants real export (the bare [otel] api-only extra is a no-op without these).
+otel-export = [
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
 ]
 # MCP (Model Context Protocol) client. JSON-RPC over Streamable HTTP, hand-rolled on httpx
 # (the official `mcp` SDK is async-only and pulls a full server ASGI stack). The import is

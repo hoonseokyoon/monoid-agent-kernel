@@ -82,6 +82,18 @@ _IMAGE_EXTS = {
 }
 _IMAGE_VIEW_MAX_BYTES = 8 * 1024 * 1024  # raw-image preview cap
 
+# Vendored static assets (e.g. the locally-bundled KaTeX) served under /vendor/<path>. Content
+# types for the extensions we actually ship; anything else falls back to octet-stream.
+_VENDOR_DIR = _WEB_DIR / "vendor"
+_VENDOR_CONTENT_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".ttf": "font/ttf",
+    ".map": "application/json",
+}
+
 
 # Obvious destructive command prefixes the shell binding refuses outright (a binding-level
 # safety gate, enforced regardless of approval mode). Matched as command.strip().startswith.
@@ -206,7 +218,7 @@ def _ensure_otel_provider(endpoint: str) -> None:
     except ImportError as exc:
         raise NativeAgentError(
             "OTel tracing needs the opentelemetry SDK + OTLP/HTTP exporter "
-            "(pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http)"
+            "(pip install 'native-agent-runner[otel-export]')"
         ) from exc
     provider = TracerProvider(resource=Resource.create({"service.name": "agent-studio"}))
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
@@ -1153,6 +1165,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 from_seq = int((query.get("from") or ["0"])[0] or 0)
                 self._write_json(studio.subagent_events(child_run_id, from_seq))
                 return
+            if parsed.path.startswith("/vendor/"):
+                self._serve_vendor(parsed.path[len("/vendor/"):])
+                return
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
         # --- POST --------------------------------------------------------------------
@@ -1316,6 +1331,21 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _serve_vendor(self, rel: str) -> None:
+            """Serve a vendored static asset from web/vendor/, guarding against path traversal."""
+            base = _VENDOR_DIR.resolve()
+            try:
+                target = (base / rel).resolve()
+                target.relative_to(base)
+            except (ValueError, OSError):
+                self.send_error(HTTPStatus.FORBIDDEN, "forbidden")
+                return
+            if not target.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND, "not found")
+                return
+            content_type = _VENDOR_CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
+            self._serve_file(target, content_type)
 
         def _serve_file(self, path: Path, content_type: str, *, download_name: str = "") -> None:
             try:

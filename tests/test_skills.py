@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -91,14 +92,19 @@ def test_loader_name_falls_back_to_directory_name(tmp_path: Path) -> None:
     assert definitions["my-skill"].description == "d"
 
 
-def test_loader_duplicate_name_first_wins(tmp_path: Path) -> None:
+def test_loader_duplicate_name_first_wins(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     _write_skill(tmp_path / "a", "dup", description="first")
     _write_skill(tmp_path / "b", "dup", description="second")
 
-    definitions = load_skill_definitions(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="native_agent_runner.skills.loader"):
+        definitions = load_skill_definitions(tmp_path)
 
     # sorted path order: a/ before b/, so "first" wins.
     assert definitions["dup"].description == "first"
+    # ...and the dropped file is no longer silent — a WARNING names the collision.
+    assert any(
+        "duplicate skill name" in r.message and "dup" in r.message for r in caplog.records
+    ), caplog.text
 
 
 def test_from_frontmatter_allowed_tools_inline_list() -> None:

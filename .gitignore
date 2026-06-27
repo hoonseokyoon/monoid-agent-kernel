@@ -38,3 +38,6 @@ Thumbs.db
 
 # Crash dumps
 *.stackdump
+
+# Internal developer journal (not distributed)
+docs/dx-notes/
