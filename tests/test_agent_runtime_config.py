@@ -288,6 +288,17 @@ def test_validate_collects_all_issues_not_just_first(tmp_path: Path) -> None:
     assert len(issues) >= 2  # collected, not first-and-raise
 
 
+def test_validate_collects_empty_model_name_instead_of_raising() -> None:
+    # A directly-constructed binding with a whitespace model_name makes _resolved_model_name raise;
+    # validate() must collect it, not throw (the whole point of the collect-all preflight).
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(ToolBinding(binding_id="rd", ref=RegistryToolRef("fs.read"), model_name="   "),),
+    )
+    issues = AgentLoop.validate(config)
+    assert any("empty model name" in m for m in issues), issues
+
+
 def test_contracts_core_curated_namespace() -> None:
     from native_agent_runner.contracts import core
 

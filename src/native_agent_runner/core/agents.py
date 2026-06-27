@@ -716,7 +716,12 @@ def collect_runtime_config_issues(
         if spec is None:
             issues.append(_unknown_tool_message(binding.ref.tool_id, specs.keys()))
             continue
-        model_name = _resolved_model_name(binding, spec)
+        try:
+            model_name = _resolved_model_name(binding, spec)
+        except AgentConfigError as exc:
+            # e.g. an empty/whitespace model_name — collect it instead of letting validate() throw.
+            issues.append(str(exc))
+            continue
         search_model_clash = (
             config.tool_search.enabled and model_name == config.tool_search.model_name
         )
