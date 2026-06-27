@@ -239,7 +239,7 @@ def test_tool_binding_for_tool_derives_binding_id_and_ref() -> None:
     b = ToolBinding.for_tool("fs.read")
     assert b.binding_id == "fs.read"
     assert b.ref == RegistryToolRef("fs.read")
-    assert b.model_name is None  # left for the catalog to derive (fs_read)
+    assert b.model_name == "fs_read"  # derived: dots -> underscores
 
 
 def test_tool_binding_for_tool_forwards_overrides() -> None:

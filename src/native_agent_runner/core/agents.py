@@ -111,13 +111,14 @@ class ToolBinding:
     ) -> ToolBinding:
         """One-token binding for a registry tool: ``ToolBinding.for_tool("fs.read")``.
 
-        Defaults ``binding_id`` to ``tool_id`` and leaves ``model_name`` for the catalog to
-        derive (``binding_id`` with dots → underscores). Extra binding fields (scope, runtime,
-        exposure, …) pass through as keyword arguments."""
+        Defaults ``binding_id`` to ``tool_id`` and derives ``model_name`` from it (dots →
+        underscores), matching :func:`generated_tool_bindings`. Extra binding fields (scope,
+        runtime, exposure, …) pass through as keyword arguments."""
+        resolved_binding_id = binding_id or tool_id
         return cls(
-            binding_id=binding_id or tool_id,
+            binding_id=resolved_binding_id,
             ref=RegistryToolRef(tool_id),
-            model_name=model_name,
+            model_name=model_name or resolved_binding_id.replace(".", "_"),
             **kwargs,
         )
 
