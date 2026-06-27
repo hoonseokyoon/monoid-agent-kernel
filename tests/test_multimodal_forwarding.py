@@ -305,6 +305,38 @@ def test_fs_read_media_fallback_blocked_when_read_media_is_hidden(tmp_path: Path
     assert any("fs.read_media" in json.dumps(o.output) for o in obs), [o.output for o in obs]
 
 
+def test_fs_read_media_fallback_blocked_when_read_media_needs_approval(tmp_path: Path) -> None:
+    """P1: an approval-gated (authorization='ask') fs.read_media must NOT make media available —
+    otherwise fs.read could return media bypassing the per-call HITL approval and its scopes."""
+    workspace = _workspace_with_image(tmp_path)
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_read", {"path": "img.png"}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="done"),
+        ]
+    )
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(
+            ToolBinding.for_tool("fs.read"),
+            ToolBinding.for_tool("fs.read_media", authorization="ask"),  # immediate but approval-gated
+        ),
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+    )
+    loop.run_once("read the image")
+
+    obs = [o for req in adapter.requests for o in req.observations]
+    assert not any("image/png" in json.dumps(o.output) for o in obs), [o.output for o in obs]
+    assert any("fs.read_media" in json.dumps(o.output) for o in obs), [o.output for o in obs]
+
+
 def test_fs_read_text_is_unchanged(tmp_path: Path) -> None:
     ws_dir = tmp_path / "workspace"
     ws_dir.mkdir()

@@ -3268,13 +3268,11 @@ class AgentLoop:
         started_event: AgentEvent | None = None
         surface_decision = ""
         surface_reason = ""
-        # Expose the capabilities reachable on the authorized immediate surface (NOT the whole
-        # bound catalog — that would also count hidden/searchable/denied tools, letting fs.read
-        # fall back to media even when fs.read_media wasn't actually available). Leases are still
-        # honored separately in capability_available.
-        context._current_available_capabilities = frozenset(
-            spec.capability for spec in surface_snapshot.immediate_tools if spec.capability
-        )
+        # Expose the capabilities reachable on the authorized immediate surface (allow-decision
+        # immediate tools only — not the whole bound catalog, and not approval-gated 'ask' tools),
+        # so a handler can detect available access without bypassing exposure/approval. Leases are
+        # still honored separately in capability_available.
+        context._current_available_capabilities = _available_capabilities(surface_snapshot)
         try:
             if _is_tool_search_call(call_name, bound_catalog):
                 binding_id = bound_catalog.tool_search.binding_id
@@ -3762,6 +3760,21 @@ def _surface_spec_for_binding(snapshot: ToolSurfaceSnapshot, binding_id: str) ->
         if tool.id == binding_id or str(tool.annotations.get("binding_id") or "") == binding_id:
             return tool
     return None
+
+
+def _available_capabilities(snapshot: ToolSurfaceSnapshot) -> frozenset[str]:
+    """Capabilities reachable on the authorized immediate surface — immediate tools whose
+    authorization decision is ``allow``. Excludes hidden/searchable/denied tools AND approval-gated
+    (``ask``) ones, so a handler can't use ``capability_available`` to bypass a per-call approval
+    (e.g. fs.read returning media when fs.read_media requires HITL approval)."""
+    caps: set[str] = set()
+    for tool in snapshot.immediate_tools:
+        if not tool.capability:
+            continue
+        auth = snapshot.authorization_for(str(tool.annotations.get("binding_id") or ""))
+        if auth is not None and auth.decision == "allow":
+            caps.add(tool.capability)
+    return frozenset(caps)
 
 
 def _urls_from_args(arguments: dict[str, Any]) -> tuple[str, ...]:
