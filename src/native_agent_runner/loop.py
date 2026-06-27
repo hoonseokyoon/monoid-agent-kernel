@@ -54,6 +54,7 @@ from native_agent_runner.core.agents import (
     ToolBinding,
     ToolSearchConfig,
     coerce_runtime_config_provider,
+    collect_runtime_config_issues,
     compile_bound_tool_catalog,
     generated_tool_bindings,
     runtime_config_diff,
@@ -676,6 +677,26 @@ class AgentLoop:
         return cls.from_config(
             spec, model_adapter, config, tool_providers=(provider, *existing), **kwargs
         )
+
+    @staticmethod
+    def validate(
+        config: AgentRuntimeConfig,
+        *,
+        tools: Iterable[ToolSpec] = (),
+        registry: ToolRegistry | None = None,
+    ) -> list[str]:
+        """Check a runtime config before a run and return all problems as readable messages
+        (``[]`` == valid). Unlike the internal raising validator, this collects every issue —
+        unknown tool ids, duplicate binding_ids/model_names, invalid runtime — in one pass, so a
+        backend can surface them together instead of failing at bootstrap.
+
+        Validates against the builtin tools plus any ``tools`` you'll bind (or an explicit
+        ``registry``). The run ``spec`` is not needed — tool validation doesn't depend on it."""
+        if registry is None:
+            registry = ToolRegistry()
+            registry.register_many(builtin_tools(None))  # type: ignore[arg-type]
+            registry.register_many(tools)
+        return collect_runtime_config_issues(config, registry)
 
     def open(self) -> None:
         """Bootstrap the run and leave it idle, ready to accept submit().

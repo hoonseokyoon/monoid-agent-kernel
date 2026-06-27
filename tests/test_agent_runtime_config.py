@@ -260,3 +260,40 @@ def test_tool_binding_for_tool_round_trips() -> None:
     b = ToolBinding.for_tool("fs.read")
     restored = ToolBinding.from_json(json.loads(json.dumps(b.to_json())))
     assert restored == b
+
+
+def test_validate_returns_empty_for_valid_config(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register_many(builtin_tools(LocalWorkspaceBackend(_workspace(tmp_path))))
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(ToolBinding.for_tool("fs.read"), ToolBinding.for_tool("fs.write")),
+    )
+    assert AgentLoop.validate(config, registry=registry) == []
+
+
+def test_validate_collects_all_issues_not_just_first(tmp_path: Path) -> None:
+    # An unknown tool AND a duplicate binding_id — both must be reported in one call.
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(
+            ToolBinding.for_tool("fs.read"),
+            ToolBinding.for_tool("fs.read"),  # duplicate binding_id
+            ToolBinding.for_tool("does.not.exist"),  # unknown tool id
+        ),
+    )
+    issues = AgentLoop.validate(config)  # builtins-only registry
+    assert any("duplicate tool binding_id: fs.read" in m for m in issues)
+    assert any("does.not.exist" in m for m in issues)
+    assert len(issues) >= 2  # collected, not first-and-raise
+
+
+def test_contracts_core_curated_namespace() -> None:
+    from native_agent_runner.contracts import core
+
+    assert core.AgentLoop is AgentLoop
+    names = {n for n in vars(core) if not n.startswith("_")}
+    assert names == {
+        "AgentLoop", "AgentRunSpec", "AgentRuntimeConfig", "ModelAdapter",
+        "ToolSpec", "tool", "EventSink", "Workspace", "PermissionPolicy",
+    }

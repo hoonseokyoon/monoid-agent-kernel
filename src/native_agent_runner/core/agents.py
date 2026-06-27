@@ -672,6 +672,65 @@ def validate_runtime_config(config: AgentRuntimeConfig, registry_or_specs: ToolR
     compile_bound_tool_catalog(config, registry)
 
 
+def collect_runtime_config_issues(
+    config: AgentRuntimeConfig, registry_or_specs: ToolRegistry | Iterable[ToolSpec]
+) -> list[str]:
+    """Validate a runtime config against a tool registry, collecting **all** problems as readable
+    messages instead of raising on the first (the accumulating sibling of
+    :func:`validate_runtime_config`). Returns an empty list when the config is valid. Mirrors the
+    same checks as :func:`compile_bound_tool_catalog`: unknown tool id, duplicate binding_id /
+    model_name / call name, and invalid binding runtime."""
+    if isinstance(registry_or_specs, ToolRegistry):
+        registry = registry_or_specs
+    else:
+        registry = ToolRegistry()
+        registry.register_many(registry_or_specs)
+    specs = {tool.id: tool for tool in registry.specs()}
+    issues: list[str] = []
+    seen_binding_ids: set[str] = set()
+    seen_model_names: set[str] = set()
+    seen_call_names: dict[str, str] = {}
+
+    def reserve_call_name(name: str, owner: str) -> None:
+        previous = seen_call_names.get(name)
+        if previous is not None and previous != owner:
+            issues.append(f"duplicate tool call name: {name}")
+        else:
+            seen_call_names[name] = owner
+
+    if config.tool_search.enabled:
+        reserve_call_name(config.tool_search.binding_id, "tool_search")
+        reserve_call_name(config.tool_search.model_name, "tool_search")
+
+    for binding in config.tools:
+        search_binding_clash = (
+            config.tool_search.enabled and binding.binding_id == config.tool_search.binding_id
+        )
+        if binding.binding_id in seen_binding_ids or search_binding_clash:
+            issues.append(f"duplicate tool binding_id: {binding.binding_id}")
+        else:
+            seen_binding_ids.add(binding.binding_id)
+            reserve_call_name(binding.binding_id, binding.binding_id)
+        spec = specs.get(binding.ref.tool_id)
+        if spec is None:
+            issues.append(_unknown_tool_message(binding.ref.tool_id, specs.keys()))
+            continue
+        model_name = _resolved_model_name(binding, spec)
+        search_model_clash = (
+            config.tool_search.enabled and model_name == config.tool_search.model_name
+        )
+        if model_name in seen_model_names or search_model_clash:
+            issues.append(f"duplicate tool model_name: {model_name}")
+        else:
+            seen_model_names.add(model_name)
+            reserve_call_name(model_name, binding.binding_id)
+        try:
+            _validate_binding_runtime(binding)
+        except AgentConfigError as exc:
+            issues.append(str(exc))
+    return issues
+
+
 def runtime_config_diff(
     previous: AgentRuntimeConfig | None,
     current: AgentRuntimeConfig,
