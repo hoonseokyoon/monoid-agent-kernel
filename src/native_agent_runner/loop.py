@@ -235,9 +235,10 @@ class AgentToolContext(ToolContext):
     skills_activated: list[str] = field(default_factory=list)
     _requested_tool_loads: list[str] = field(default_factory=list)
     _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
-    # Capabilities the tools bound this turn declare — lets a handler detect available access
-    # (e.g. fs.read falling back to media when fs.read_media is bound) without a broker/lease.
-    _current_bound_capabilities: frozenset[str] = field(default_factory=frozenset)
+    # Capabilities reachable on this turn's AUTHORIZED IMMEDIATE surface (not the whole bound
+    # catalog — hidden/searchable/denied tools are excluded) — lets a handler detect available
+    # access (e.g. fs.read falling back to media when fs.read_media is actually available).
+    _current_available_capabilities: frozenset[str] = field(default_factory=frozenset)
 
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
@@ -402,12 +403,13 @@ class AgentToolContext(ToolContext):
 
     def capability_available(self, capability: str) -> bool:
         """True if the run holds ``capability`` this turn — either a broker lease was acquired for
-        it OR a tool declaring it is bound. Lets a handler offer behavior gated on a capability
-        (e.g. fs.read falling back to media when fs.read_media is bound) in the common no-broker
-        config, without ever forwarding access the run wasn't granted."""
+        it OR a tool declaring it is on the authorized immediate surface. Lets a handler offer
+        behavior gated on a capability (e.g. fs.read falling back to media when fs.read_media is
+        actually available) in the common no-broker config, without forwarding access the run
+        wasn't granted (hidden/searchable/denied tools don't count)."""
         if self.capability_token(capability) is not None:
             return True
-        return capability in self._current_bound_capabilities
+        return capability in self._current_available_capabilities
 
     def emit_outbox(
         self,
@@ -3266,10 +3268,12 @@ class AgentLoop:
         started_event: AgentEvent | None = None
         surface_decision = ""
         surface_reason = ""
-        # Expose this turn's bound capabilities so a handler can detect available access
-        # (capability_available) regardless of whether a broker issued a lease.
-        context._current_bound_capabilities = frozenset(
-            tool.base_spec.capability for tool in bound_catalog.tools
+        # Expose the capabilities reachable on the authorized immediate surface (NOT the whole
+        # bound catalog — that would also count hidden/searchable/denied tools, letting fs.read
+        # fall back to media even when fs.read_media wasn't actually available). Leases are still
+        # honored separately in capability_available.
+        context._current_available_capabilities = frozenset(
+            spec.capability for spec in surface_snapshot.immediate_tools if spec.capability
         )
         try:
             if _is_tool_search_call(call_name, bound_catalog):

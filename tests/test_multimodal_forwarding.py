@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from conftest import runtime_config, runtime_provider
 
+from native_agent_runner.core.agents import AgentRuntimeConfig, ToolBinding
 from native_agent_runner.core.content import AudioPart, DocumentPart, ImagePart, TextPart
 from native_agent_runner.core.media import MEDIA_INPUT_CAPABILITY
 from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits
@@ -269,6 +270,39 @@ def test_fs_read_media_fallback_fires_when_read_media_is_bound_no_broker(tmp_pat
     obs = [o for req in adapter.requests for o in req.observations]
     # The fs.read call returned media metadata (took the fallback) instead of an error.
     assert any("image/png" in json.dumps(o.output) for o in obs), [o.output for o in obs]
+
+
+def test_fs_read_media_fallback_blocked_when_read_media_is_hidden(tmp_path: Path) -> None:
+    """P1: a bound-but-hidden fs.read_media must NOT make media available — fs.read falls back only
+    when media access is on the authorized immediate surface, not merely in the bound catalog."""
+    workspace = _workspace_with_image(tmp_path)
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_read", {"path": "img.png"}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="done"),
+        ]
+    )
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(
+            ToolBinding.for_tool("fs.read"),
+            ToolBinding.for_tool("fs.read_media", exposure="hidden"),  # bound but not available
+        ),
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+    )
+    loop.run_once("read the image")
+
+    obs = [o for req in adapter.requests for o in req.observations]
+    # fs.read did NOT forward media; it returned the actionable error pointing at fs.read_media.
+    assert not any("image/png" in json.dumps(o.output) for o in obs), [o.output for o in obs]
+    assert any("fs.read_media" in json.dumps(o.output) for o in obs), [o.output for o in obs]
 
 
 def test_fs_read_text_is_unchanged(tmp_path: Path) -> None:
