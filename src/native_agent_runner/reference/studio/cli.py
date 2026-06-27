@@ -227,6 +227,16 @@ def _otel_export_importable() -> bool:
     return True
 
 
+def _openai_sdk_importable() -> bool:
+    """True if the optional ``openai`` SDK (the ``[openai]`` extra) is installed — the gateway's
+    OpenAIModelAdapter needs it for ``--provider openai`` and otherwise fails on the first turn."""
+    try:
+        import openai  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 @studio.command("doctor")
 @_common_server_options
 def studio_doctor(
@@ -272,6 +282,15 @@ def studio_doctor(
         else:
             hard_failures += 1
             report(False, "OPENAI_API_KEY is not set", "export OPENAI_API_KEY=... or use --provider offline")
+        if _openai_sdk_importable():
+            report(True, "the openai SDK is installed")
+        else:
+            hard_failures += 1
+            report(
+                False,
+                "the openai SDK is not installed",
+                "pip install 'native-agent-runner[openai]' or use --provider offline",
+            )
     else:
         report(True, "provider 'offline' (no API key needed)")
 

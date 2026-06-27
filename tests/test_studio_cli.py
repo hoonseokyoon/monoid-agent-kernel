@@ -41,6 +41,19 @@ def test_doctor_openai_without_key_fails(tmp_path: Path, monkeypatch: pytest.Mon
     assert "OPENAI_API_KEY" in result.output
 
 
+def test_doctor_openai_without_sdk_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Key present but the optional [openai] extra not installed → the first turn would fail, so
+    # doctor must report it instead of passing.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(
+        "native_agent_runner.reference.studio.cli._openai_sdk_importable", lambda: False
+    )
+    result = _invoke(tmp_path, "--provider", "openai")
+    assert result.exit_code == 1
+    assert "[FAIL]" in result.output
+    assert "openai SDK" in result.output
+
+
 def test_doctor_missing_chromium_is_warning_not_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
