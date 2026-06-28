@@ -280,6 +280,33 @@ class AgentDefinition:
 
 
 @dataclass(frozen=True)
+class OutputValidatorBinding:
+    """Per-run opt-out / override for an output validator registered on the ``AgentLoop``.
+
+    The seam registers validator *objects* (code); a registered validator runs **by default**.
+    This binding (data) is only needed to turn one OFF for a run (``enabled=False``) — a per-run
+    override. A validator is not a tool, so this is deliberately distinct from :class:`ToolBinding`.
+    """
+
+    validator_id: str
+    enabled: bool = True
+
+    @classmethod
+    def from_json(cls, payload: dict[str, Any]) -> OutputValidatorBinding:
+        if isinstance(payload, OutputValidatorBinding):
+            return payload
+        if not isinstance(payload, dict):
+            raise ValueError("output validator binding must be an object")
+        return cls(
+            validator_id=str(payload.get("validator_id") or payload.get("id") or ""),
+            enabled=bool(payload.get("enabled", True)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {"validator_id": self.validator_id, "enabled": self.enabled}
+
+
+@dataclass(frozen=True)
 class AgentRuntimeConfig:
     """Effective configuration for a single run turn: *what* the agent is right now.
 
@@ -298,6 +325,8 @@ class AgentRuntimeConfig:
     prompt: PromptSpec = field(default_factory=PromptSpec)
     tools: tuple[ToolBinding, ...] = ()
     tool_search: ToolSearchConfig = field(default_factory=ToolSearchConfig)
+    # Per-run gates for output validators registered on the AgentLoop (default off).
+    output_validators: tuple[OutputValidatorBinding, ...] = ()
     metadata: dict[str, object] = field(default_factory=dict)
 
     @classmethod
@@ -314,6 +343,9 @@ class AgentRuntimeConfig:
             prompt=PromptSpec.from_json(payload.get("prompt")),
             tools=tuple(ToolBinding.from_json(item) for item in payload.get("tools") or ()),
             tool_search=ToolSearchConfig.from_json(payload.get("tool_search")),
+            output_validators=tuple(
+                OutputValidatorBinding.from_json(item) for item in payload.get("output_validators") or ()
+            ),
             metadata=dict(payload.get("metadata") or {}),
         )
 
@@ -351,6 +383,7 @@ class AgentRuntimeConfig:
             "prompt": self.prompt.to_json(),
             "tools": [binding.to_json() for binding in self.tools],
             "tool_search": self.tool_search.to_json(),
+            "output_validators": [binding.to_json() for binding in self.output_validators],
             "metadata": dict(self.metadata),
         }
 

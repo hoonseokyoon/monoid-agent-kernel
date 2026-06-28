@@ -130,6 +130,21 @@ class OtelEventSink:
                     "skill.resource_count": event.data.get("resource_count"),
                 },
             )
+        elif kind == "output.validation.failed":
+            # Output validation runs at settle, AFTER model.turn.finished closes the turn span, so
+            # the failure is recorded as an event on the (still-open) run span rather than the turn.
+            self._run_span_event(
+                "output.validation.failed",
+                {
+                    "output.validation.attempt": event.data.get("attempt"),
+                    "output.validation.reason": event.data.get("reason"),
+                },
+            )
+        elif kind == "output.validator.error":
+            self._run_span_event(
+                "output.validator.error",
+                {"output.validator.id": event.data.get("validator_id")},
+            )
 
     def close(self) -> None:
         # Leak guard: end any spans still open (abnormal termination, missing finish events).
@@ -157,6 +172,14 @@ class OtelEventSink:
         self._spans[event.event_id] = self._tracer.start_span(
             name, context=context, kind=kind, attributes=_clean(attrs)
         )
+
+    def _run_span_event(self, name: str, attrs: dict[str, Any]) -> None:
+        """Add a timestamped event (with attributes) to the still-open run span. Used for
+        run-level point-in-time signals — like output validation — that fire after the relevant
+        child span has already closed. No-op if the run span isn't recording."""
+        span = self._run_span
+        if span is not None and span.is_recording():
+            span.add_event(name, attributes=_clean(attrs))
 
     def _enrich(self, span_event_id: str | None, attrs: dict[str, Any]) -> None:
         """Set attributes on a still-open child span (keyed by the event_id that opened it).

@@ -2,9 +2,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 RunStatus = Literal["completed", "failed", "limited"]
+
+_T = TypeVar("_T")
+
+
+def _coerce_output(value: object, model: type[_T]) -> _T:
+    """Return ``value`` typed as ``model`` for ``AgentRunResult.output_as``. Already-an-instance
+    passes through; a pydantic model is re-validated via ``model_validate``; a mapping is expanded
+    as kwargs (dataclass / simple class). Raises ``TypeError`` if it cannot be coerced. No hard
+    dependency on pydantic — the model_validate path is duck-typed."""
+    if isinstance(value, model):
+        return value
+    validate = getattr(model, "model_validate", None)
+    if callable(validate):
+        return validate(value)
+    if isinstance(value, dict):
+        return model(**value)
+    raise TypeError(
+        f"final_output is {type(value).__name__}, which is not a {model.__name__} "
+        "and cannot be coerced"
+    )
 
 
 @dataclass(frozen=True)
@@ -32,7 +52,14 @@ class AgentTurnResult:
     turn_handle: str | None = None
     error: str = ""
     error_code: str = ""
+    # The validated/parsed value from a successful output validator (its ``ValidationOutcome.value``),
+    # or ``None`` when no validator ran. Process-local — not persisted in the checkpoint.
+    final_output: object = None
     metrics: dict[str, object] = field(default_factory=dict)
+
+    def output_as(self, model: type[_T]) -> _T:
+        """``final_output`` typed as ``model`` — see :meth:`AgentRunResult.output_as`."""
+        return _coerce_output(self.final_output, model)
 
 
 @dataclass(frozen=True)
@@ -85,7 +112,16 @@ class AgentRunResult:
     artifacts: tuple[AgentArtifact, ...] = ()
     final_outputs: tuple[str, ...] = ()
     final_notes: str | None = None
+    # The validated/parsed value from a successful output validator (its ``ValidationOutcome.value``),
+    # or ``None`` when no validator ran. Process-local — not persisted in the checkpoint.
+    final_output: object = None
     metrics: dict[str, object] = field(default_factory=dict)
     error: str = ""
     error_code: str = ""
     final_turn_handle: str | None = None
+
+    def output_as(self, model: type[_T]) -> _T:
+        """``final_output`` typed as ``model`` — restores the static type a validator erased into
+        ``object`` (parity with instructor's typed ``response_model`` return). Already-an-instance
+        passes through; a pydantic model is re-validated; a mapping is expanded as kwargs."""
+        return _coerce_output(self.final_output, model)

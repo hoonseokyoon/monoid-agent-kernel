@@ -103,11 +103,21 @@ from native_agent_runner.core.capability import (
 
 # Context providers (pluggable static + per-turn system context)
 from native_agent_runner.core.context import ContextProvider, TurnContext
+
+# Output validation (post-response conformance; checked at the settle points)
+from native_agent_runner.core.output_validator import (
+    FinalOutputView,
+    OutputRetry,
+    OutputValidator,
+    OutputValidatorError,
+    ValidationOutcome,
+)
 from native_agent_runner.core.agents import (
     AgentDefinition,
     AgentRuntimeConfig,
     BoundTool,
     BoundToolCatalog,
+    OutputValidatorBinding,
     PromptSpec,
     RegistryToolRef,
     RuntimeConfigProvider,
@@ -307,6 +317,12 @@ __all__ = [
     "generated_tool_bindings",
     "ContextProvider",
     "TurnContext",
+    "OutputValidator",
+    "OutputValidatorBinding",
+    "ValidationOutcome",
+    "FinalOutputView",
+    "OutputRetry",
+    "OutputValidatorError",
     "DefaultToolSurfaceResolver",
     "ToolAuthorization",
     "ToolGuidance",

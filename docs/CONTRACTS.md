@@ -39,7 +39,11 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   forwarded to multimodal-capable adapters (the gateway and OpenAI adapters), a
   text-only adapter drops them with a `model.input.degraded` warning, and
   `AudioPart` / `VideoPart` round-trip as a forward-compatible contract but are
-  not yet forwarded.
+  not yet forwarded. Output validation — `OutputValidator` / `ValidationOutcome` /
+  `FinalOutputView` / `OutputRetry` / `OutputValidatorError` (post-response conformance:
+  a validator registered via `AgentLoop(output_validators=...)` runs by default and can be
+  disabled per run with an `OutputValidatorBinding(enabled=False)`; on failure the loop re-prompts
+  up to `RunLimits.max_output_retries`).
 - **Not a contract**: `native_agent_runner.reference.*` (example services).
 
 ## Python Contracts

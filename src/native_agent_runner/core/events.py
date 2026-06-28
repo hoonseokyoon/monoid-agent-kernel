@@ -85,6 +85,10 @@ AgentEventType = Literal[
     "artifact.emitted",
     "plan.updated",
     "metrics.updated",
+    "output.validator.satisfied",
+    "output.validation.failed",
+    "output.validator.skipped",
+    "output.validator.error",
 ]
 
 AgentEventLevel = Literal["debug", "info", "warning", "error"]

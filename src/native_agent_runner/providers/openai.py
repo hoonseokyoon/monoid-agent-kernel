@@ -17,6 +17,7 @@ from native_agent_runner.providers.base import (
     ModelStreamChunk,
     ModelTurn,
     ReasoningDelta,
+    StopReason,
     TextDelta,
     ToolCall,
     ToolCallDelta,
@@ -145,12 +146,15 @@ class OpenAIModelAdapter:
         except Exception as exc:
             raise _model_error_from_openai(exc) from exc
 
+        output_items = final_data.get("output") or []
+        has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
         yield TurnComplete(
             response_id=final_data.get("id"),
             usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
             # encrypted_content lives only on the final response object, so reasoning items
             # are captured here (from response.completed) rather than the per-token deltas.
-            reasoning=_capture_reasoning_items(final_data.get("output") or []),
+            reasoning=_capture_reasoning_items(output_items),
+            stop_reason=_stop_reason_from_response(final_data, tool_calls_present=has_tool_calls),
         )
 
     def _payload(self, request: ModelRequest) -> dict[str, Any]:
@@ -417,6 +421,23 @@ def _capture_reasoning_items(output: list[Any]) -> tuple[dict[str, Any], ...]:
     return tuple(captured) if has_reasoning else ()
 
 
+def _stop_reason_from_response(data: dict[str, Any], *, tool_calls_present: bool) -> StopReason:
+    """Map an OpenAI Responses-API response to the typed :data:`StopReason`. Tool calls win
+    (the turn isn't final); an ``incomplete`` status is a truncation (``content_filter`` → a
+    refusal); a ``refusal`` content part on an otherwise-complete response is a refusal."""
+    if tool_calls_present:
+        return "tool_calls"
+    if data.get("status") == "incomplete":
+        reason = (data.get("incomplete_details") or {}).get("reason")
+        return "refusal" if reason == "content_filter" else "length"
+    for item in data.get("output") or []:
+        if item.get("type") == "message":
+            for part in item.get("content") or []:
+                if part.get("type") == "refusal":
+                    return "refusal"
+    return "stop"
+
+
 def _parse_response(data: dict[str, Any]) -> ModelTurn:
     output = data.get("output") or []
     tool_calls: list[ToolCall] = []
@@ -451,6 +472,7 @@ def _parse_response(data: dict[str, Any]) -> ModelTurn:
         usage=usage_out,
         raw=data,
         reasoning=_capture_reasoning_items(output),
+        stop_reason=_stop_reason_from_response(data, tool_calls_present=bool(tool_calls)),
     )
 
 

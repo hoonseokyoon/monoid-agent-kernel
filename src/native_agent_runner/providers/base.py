@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from native_agent_runner.core.spec import ModelConfig
 from native_agent_runner.errors import ModelAdapterError
 from native_agent_runner.providers._common import normalize_usage
 from native_agent_runner.tools.base import ToolSpec
+
+# Why a model turn ended, promoted from the raw provider payload onto the typed turn surface.
+# ``stop`` = normal completion; ``length`` = truncated (hit max tokens); ``refusal`` = the model
+# declined; ``tool_calls`` = the model wants tools run. ``None`` = the adapter did not report one
+# (back-compat / a test double). The loop branches on this before validating a final response.
+StopReason = Literal["stop", "length", "refusal", "tool_calls"]
 
 
 def format_async_result_text(output: dict[str, Any]) -> str:
@@ -88,6 +94,8 @@ class ModelTurn:
     # adapter that has no reasoning leaves this empty (the neutral seam). See the OpenAI adapter
     # and the loop's assistant-message append for capture + re-injection.
     reasoning: tuple[dict[str, Any], ...] = ()
+    # Why the turn ended (promoted from ``raw``). ``None`` when the adapter does not report one.
+    stop_reason: StopReason | None = None
 
 
 @dataclass(frozen=True)
@@ -222,6 +230,7 @@ class TurnComplete:
     response_id: str | None = None
     usage: dict[str, int] = field(default_factory=dict)
     reasoning: tuple[dict[str, Any], ...] = ()
+    stop_reason: StopReason | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -229,6 +238,7 @@ class TurnComplete:
             "response_id": self.response_id,
             "usage": dict(self.usage),
             "reasoning": [dict(item) for item in self.reasoning],
+            "stop_reason": self.stop_reason,
         }
 
 
@@ -246,6 +256,7 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     response_id: str | None = None
     usage: dict[str, int] = {}
     reasoning: tuple[dict[str, Any], ...] = ()
+    stop_reason: StopReason | None = None
     for chunk in chunks:
         if isinstance(chunk, TextDelta):
             text_parts.append(chunk.text)
@@ -267,6 +278,8 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
                 usage = chunk.usage
             if chunk.reasoning:
                 reasoning = chunk.reasoning
+            if chunk.stop_reason is not None:
+                stop_reason = chunk.stop_reason
     tool_calls: list[ToolCall] = []
     for index in order:
         slot = slots[index]
@@ -284,11 +297,16 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
                 provider_error_code="stream_bad_tool_args",
             )
         tool_calls.append(ToolCall(id=str(slot["id"] or ""), name=str(slot["name"] or ""), arguments=arguments))
+    # No explicit stop_reason streamed (older gateway / a chunk source that omits it): infer the
+    # common cases so the loop's branch still works — tool calls present → tool_calls, else stop.
+    if stop_reason is None:
+        stop_reason = "tool_calls" if tool_calls else "stop"
     return ModelTurn(
         response_id=response_id,
         final_text="".join(text_parts) if text_parts else None,
         tool_calls=tuple(tool_calls),
         usage=normalize_usage(usage) if usage else {},
         reasoning=reasoning,
+        stop_reason=stop_reason,
     )
 
