@@ -581,6 +581,62 @@ def test_backend_executes_provider_tool_through_loop(tmp_path: Path) -> None:
     assert "warm hello" in json.dumps(skill_obs[0].output, default=str)
 
 
+def test_backend_runs_output_validator_with_retry(tmp_path: Path) -> None:
+    # End-to-end (Q3): a validator attached to the backend (the output_validators seam) runs inside
+    # a backend-driven loop — default-on, no config binding needed. It rejects the first (bad) final
+    # response, the loop re-prompts, and the run settles ``completed`` on the corrected answer.
+    from native_agent_runner.core.output_validator import ValidationOutcome
+
+    class ContainsOkValidator:
+        id = "contains.ok"
+        schema = None
+
+        def validate(self, view):
+            if "ok" in view.final_text:
+                return ValidationOutcome(ok=True, value=view.final_text)
+            return ValidationOutcome(ok=False, feedback="answer must contain 'ok'")
+
+    workspace = _workspace(tmp_path)
+    token_manager = _token_manager()
+    adapters: list = []
+
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        adapter = FakeModelAdapter(
+            turns=[
+                ModelTurn(response_id="r1", final_text="nope", stop_reason="stop"),
+                ModelTurn(response_id="r2", final_text="ok done", stop_reason="stop"),
+            ]
+        )
+        adapters.append(adapter)
+        return adapter
+
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+        output_validators=(ContainsOkValidator(),),
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="go",
+            runtime_config=runtime_config("run.finish"),
+        )
+    )
+
+    assert backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
+    # Proof the validator ran through the backend loop: the bad answer was rejected and the model
+    # was re-prompted — two model requests for one user turn.
+    assert sum(len(a.requests) for a in adapters) == 2
+    # The validated value is surfaced through the backend result projection.
+    assert backend.result(submission.run_id, submission.run_token)["final_output"] == "ok done"
+
+
 def test_backend_resume_carries_providers(tmp_path: Path) -> None:
     # A parked run resumed by a fresh backend (simulated restart) must re-attach providers —
     # they are backend-instance fields read at every loop build, including the resume site.
