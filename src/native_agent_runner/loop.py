@@ -1044,8 +1044,10 @@ class AgentLoop:
             state.final_output = None
             state.output_values = {}
             state.output_failure_history = []
-            # A run.finish in a prior submit must not short-circuit this one.
-            res.context.finished = False
+            # A run.finish in a prior submit must not short-circuit this one OR leak its
+            # outputs/notes into this turn's validator view / result (clears finished + final_text
+            # + final_outputs + final_notes).
+            self._clear_finish_metadata(res.context)
             # Drop a stale stop/pause so neither can immediately halt this fresh turn.
             self._interrupt_requested = False
             self._pause_requested = False

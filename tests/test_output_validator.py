@@ -634,6 +634,44 @@ def test_finish_output_logged_when_all_validators_disabled(tmp_path: Path) -> No
     assert tool_idx < user2_idx
 
 
+def test_prior_finish_outputs_not_leaked_into_next_natural_turn(tmp_path: Path) -> None:
+    # Turn A settles via run.finish (with outputs); turn B settles naturally. Turn B's validator
+    # view and result must not carry turn A's finish outputs.
+    seen: list = []
+
+    class _CaptureOutputs:
+        id = "capture"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            seen.append(view.final_outputs)
+            return ValidationOutcome(ok=True, value=None)
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "done", "outputs": ["a.txt"]}, "c1"),),
+            ),
+            _text_turn("plain answer"),
+        ]
+    )
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("capture", tools=("run.finish",)),
+        output_validators=(_CaptureOutputs(),),
+    )
+    loop.open()
+    loop.submit("first")
+    loop.submit("second")
+    run_result = loop.close()
+
+    assert seen[0] == ("a.txt",)  # turn A's finish exposed its own outputs...
+    assert seen[-1] == ()  # ...but turn B (natural) saw none — no stale leak
+    assert run_result.final_outputs == ()
+
+
 def test_successful_finish_tool_output_logged_before_next_user_message(tmp_path: Path) -> None:
     # A validated run.finish in a multi-turn session must log its function_call_output before the
     # run parks, or the next user message interleaves ahead of it (dangling function_call).
