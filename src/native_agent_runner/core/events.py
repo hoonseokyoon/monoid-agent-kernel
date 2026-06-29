@@ -89,6 +89,7 @@ AgentEventType = Literal[
     "output.validation.failed",
     "output.validator.skipped",
     "output.validator.error",
+    "output.validator.exhausted",
 ]
 
 AgentEventLevel = Literal["debug", "info", "warning", "error"]

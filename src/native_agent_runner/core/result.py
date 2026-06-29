@@ -55,6 +55,8 @@ class AgentTurnResult:
     # The validated/parsed value from a successful output validator (its ``ValidationOutcome.value``),
     # or ``None`` when no validator ran. Process-local — not persisted in the checkpoint.
     final_output: object = None
+    # All validators' values keyed by validator id (``final_output`` is the last of these).
+    outputs: dict[str, object] = field(default_factory=dict)
     metrics: dict[str, object] = field(default_factory=dict)
 
     def output_as(self, model: type[_T]) -> _T:
@@ -115,6 +117,8 @@ class AgentRunResult:
     # The validated/parsed value from a successful output validator (its ``ValidationOutcome.value``),
     # or ``None`` when no validator ran. Process-local — not persisted in the checkpoint.
     final_output: object = None
+    # All validators' values keyed by validator id (``final_output`` is the last of these).
+    outputs: dict[str, object] = field(default_factory=dict)
     metrics: dict[str, object] = field(default_factory=dict)
     error: str = ""
     error_code: str = ""

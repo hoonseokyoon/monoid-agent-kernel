@@ -62,6 +62,39 @@ class DefectValidator:
         raise KeyError("a bug in the validator")  # not OutputRetry/ValueError → defect
 
 
+class RequireFoo:
+    id = "require.foo"
+    schema = None
+
+    def validate(self, view: FinalOutputView) -> ValidationOutcome:
+        if "FOO" in view.final_text:
+            return ValidationOutcome(ok=True, value="foo")
+        return ValidationOutcome(ok=False, feedback="must contain FOO")
+
+
+class ForbidFoo:
+    id = "forbid.foo"
+    schema = None
+
+    def validate(self, view: FinalOutputView) -> ValidationOutcome:
+        if "FOO" not in view.final_text:
+            return ValidationOutcome(ok=True, value="no-foo")
+        return ValidationOutcome(ok=False, feedback="must NOT contain FOO")
+
+
+class SlowValidator:
+    """Blocks briefly — exercises the asyncio.to_thread offload (E4) end to end."""
+
+    id = "slow"
+    schema = None
+
+    def validate(self, view: FinalOutputView) -> ValidationOutcome:
+        import time
+
+        time.sleep(0.05)
+        return ValidationOutcome(ok=True, value="slow-ok")
+
+
 # --- harness ------------------------------------------------------------------------------
 
 
@@ -307,6 +340,108 @@ def test_gateway_wire_round_trips_stop_reason() -> None:
     # Older gateway without the field: inferred.
     inferred = _parse_gateway_response({"final_text": "done", "tool_calls": []})
     assert inferred.stop_reason == "stop"
+
+
+# --- E4: validation offloaded to a thread (slow validator still settles) ------------------
+
+
+def test_slow_validator_still_settles(tmp_path: Path) -> None:
+    adapter = FakeModelAdapter(turns=[_text_turn("anything")])
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("slow"),
+        output_validators=(SlowValidator(),),
+    ).run_once("go")
+
+    assert result.status == "completed"
+    assert result.final_output == "slow-ok"
+
+
+# --- E2: contradictory validators exhaust with a diagnosable roll-up -----------------------
+
+
+def test_contradictory_validators_exhaust_with_failure_rollup(tmp_path: Path) -> None:
+    sink = MemoryEventSink()
+    # No text can satisfy both (require FOO and forbid FOO) → deterministic exhaustion.
+    adapter = FakeModelAdapter(turns=[_text_turn("hello"), _text_turn("FOO here")])
+    result = AgentLoop(
+        spec=_spec(tmp_path, limits=RunLimits(max_output_retries=1)),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("require.foo", "forbid.foo"),
+        output_validators=(RequireFoo(), ForbidFoo()),
+        event_sinks=(sink,),
+    ).run_once("go")
+
+    assert result.status == "limited"
+    assert result.error_code == "output_validator_unsatisfied"
+
+    exhausted = [e for e in sink.events if e.type == "output.validator.exhausted"]
+    assert exhausted
+    by_validator = exhausted[-1].data["failures_by_validator"]
+    # Both validators show up as failing across attempts — the contradiction signal.
+    assert by_validator.get("require.foo") and by_validator.get("forbid.foo")
+    # Same roll-up surfaced in the run result metrics.
+    assert set(result.metrics["output_validation"]["failures_by_validator"]) == {"require.foo", "forbid.foo"}
+
+
+# --- E3: per-validator outputs keyed by id -------------------------------------------------
+
+
+def test_outputs_keyed_by_validator_id(tmp_path: Path) -> None:
+    class JsonValue:
+        id = "json.v"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            return ValidationOutcome(ok=True, value=json.loads(view.final_text))
+
+    class LenValue:
+        id = "len.v"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            return ValidationOutcome(ok=True, value=len(view.final_text))
+
+    text = '{"x": 1}'
+    adapter = FakeModelAdapter(turns=[_text_turn(text)])
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("json.v", "len.v"),
+        output_validators=(JsonValue(), LenValue()),
+    ).run_once("go")
+
+    assert result.status == "completed"
+    assert result.outputs["json.v"] == {"x": 1}
+    assert result.outputs["len.v"] == len(text)
+    assert result.final_output == len(text)  # last ok wins (registration order)
+
+
+# --- F3: item B — a repair turn calling a NON-finish tool must not re-settle on a stale flag
+
+
+def test_repair_turn_with_non_finish_tool_does_not_resettle(tmp_path: Path) -> None:
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "bad"}, "c1"),)),
+            ModelTurn(response_id="r2", tool_calls=(fake_tool_call("fs_write", {"path": "note.md", "content": "written"}, "c2"),)),
+            ModelTurn(response_id="r3", tool_calls=(fake_tool_call("run_finish", {"summary": "ok done"}, "c3"),)),
+        ]
+    )
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("contains.ok", tools=("fs.write", "run.finish")),
+        output_validators=(ContainsOkValidator(),),
+    ).run_once("go")
+
+    # Reaching the third turn's "ok done" (not settling on turn 1's "bad" summary) proves
+    # context.finished was cleared: without item B, the fs.write turn would re-settle on the stale
+    # flag and the run would exhaust as `limited` at turn 2, never reaching turn 3.
+    assert result.status == "completed"
+    assert result.final_output == "ok done"
+    assert len(adapter.requests) == 3  # all three turns ran; no premature re-settle
 
 
 # --- turn.settled validation summary ------------------------------------------------------

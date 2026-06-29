@@ -401,6 +401,11 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         {"validator_id": _STR, "error": _STR},
         required=("validator_id",),
     ),
+    "output.validator.exhausted": _data_schema(
+        # Roll-up + per-attempt history of which validators kept failing (diagnose contradictions).
+        {"retries": _INT, "failures_by_validator": _OBJ, "history": _OBJ_ARRAY},
+        additional=True,
+    ),
 }
 
 MANIFEST_SCHEMA: dict[str, Any] = {

@@ -145,6 +145,11 @@ class OtelEventSink:
                 "output.validator.error",
                 {"output.validator.id": event.data.get("validator_id")},
             )
+        elif kind == "output.validator.exhausted":
+            self._run_span_event(
+                "output.validator.exhausted",
+                {"output.validation.retries": event.data.get("retries")},
+            )
 
     def close(self) -> None:
         # Leak guard: end any spans still open (abnormal termination, missing finish events).

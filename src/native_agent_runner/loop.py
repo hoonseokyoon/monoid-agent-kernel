@@ -215,6 +215,46 @@ def _output_repair_message(failures: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _run_output_validators(
+    validators: tuple[OutputValidator, ...], view: FinalOutputView
+) -> tuple[list[tuple[str, str]], list[tuple[str, Any]], tuple[str, BaseException] | None]:
+    """Run the active validators against the view. PURE — no recorder, no state mutation — so it
+    is safe to offload to a thread (validators may block on file reads / heavy regex). Returns
+    ``(failures, ok_values, defect)``: ``failures`` are ``(validator_id, feedback)`` for rejections
+    (``OutputRetry`` / ``ValueError``, incl. ``JSONDecodeError`` / pydantic ``ValidationError``);
+    ``ok_values`` are ``(validator_id, value)`` for passes; ``defect`` is ``(validator_id, exc)`` for
+    the first validator that raised an unexpected exception (a bug the model cannot fix), else None.
+    """
+    failures: list[tuple[str, str]] = []
+    ok_values: list[tuple[str, Any]] = []
+    for validator in validators:
+        try:
+            outcome = validator.validate(view)
+        except OutputRetry as exc:
+            outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
+        except ValueError as exc:
+            outcome = ValidationOutcome(ok=False, feedback=str(exc))
+        except Exception as exc:  # validator defect — stop and report it to the caller (loop thread)
+            return failures, ok_values, (validator.id, exc)
+        if outcome.ok:
+            ok_values.append((validator.id, outcome.value))
+        else:
+            failures.append((validator.id, outcome.feedback))
+    return failures, ok_values, None
+
+
+def _failures_by_validator(history: list[dict[str, Any]]) -> dict[str, int]:
+    """Roll up how many attempts each validator failed across the history. An oscillating
+    contradiction (validators that cannot be jointly satisfied) shows as several ids with equal,
+    non-trivial counts — the signal a developer needs when a run exhausts its retries."""
+    counts: dict[str, int] = {}
+    for attempt in history:
+        for failure in attempt.get("failures", ()):
+            vid = str(failure.get("validator_id", ""))
+            counts[vid] = counts.get(vid, 0) + 1
+    return counts
+
+
 @dataclass
 class AgentToolContext(ToolContext):
     run_id: str
@@ -509,6 +549,13 @@ class RunState:
     # Validated value from a successful output validator (process-local; surfaced as
     # AgentRunResult.final_output, never checkpointed). Only set on a successful settle.
     final_output: Any = None
+    # Validated values keyed by validator id from the last successful settle (process-local;
+    # surfaced as AgentRunResult.outputs, never checkpointed). final_output is the last of these.
+    output_values: dict[str, Any] = field(default_factory=dict)
+    # Per-attempt rejection history for this turn-sequence (transient diagnostics, NOT checkpointed):
+    # each entry {attempt, failures:[{validator_id, feedback}]}. Rolled up into output.validator.exhausted
+    # + run metrics so a jointly-unsatisfiable validator set is diagnosable rather than a silent burn.
+    output_failure_history: list[dict[str, Any]] = field(default_factory=list)
     # How many times an output validator has rejected the final response this turn-sequence and
     # forced a re-prompt. Checkpointed (a mid-repair restart must not re-grant the budget).
     output_retries: int = 0
@@ -997,6 +1044,8 @@ class AgentLoop:
             # A fresh user turn gets a fresh output-validation budget and a clean result value.
             state.output_retries = 0
             state.final_output = None
+            state.output_values = {}
+            state.output_failure_history = []
             # A run.finish in a prior submit must not short-circuit this one.
             res.context.finished = False
             # Drop a stale stop/pause so neither can immediately halt this fresh turn.
@@ -2145,7 +2194,7 @@ class AgentLoop:
                 )
         return active
 
-    def _resolve_final_output(
+    async def _resolve_final_output(
         self,
         state: RunState,
         res: _RunResources,
@@ -2161,6 +2210,9 @@ class AgentLoop:
         on a validator *defect* (terminalized by the loop's broad boundary). Called just before
         each ``Suspension(reason="settled")`` return; the ``run.finish`` site passes
         ``from_finish=True`` so the stale ``context.finished`` flag is cleared before a re-prompt.
+
+        The validators are run off the event loop (``asyncio.to_thread``) so a slow/blocking
+        validator never stalls the loop; all emits + state mutation stay on the loop thread.
         """
         recorder = res.recorder
         # Refusal / truncation: never validate output that is non-conforming by construction.
@@ -2184,50 +2236,50 @@ class AgentLoop:
             return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
 
         view = self._build_final_output_view(state, res, context)
-        failures: list[tuple[str, str]] = []
-        last_value: Any = None
-        for validator in validators:
-            try:
-                outcome = validator.validate(view)
-            except OutputRetry as exc:
-                outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
-            except ValueError as exc:
-                # ValueError covers json.JSONDecodeError and pydantic ValidationError — a
-                # rejection the model can fix, not a defect.
-                outcome = ValidationOutcome(ok=False, feedback=str(exc))
-            except Exception as exc:  # validator defect — the model cannot fix it
-                recorder.emit(
-                    "output.validator.error",
-                    data={"validator_id": validator.id, "error": str(exc)},
-                    level="error",
-                )
-                raise OutputValidatorError(
-                    f"output validator {validator.id!r} raised: {exc}"
-                ) from exc
-            if outcome.ok:
-                last_value = outcome.value
-            else:
-                failures.append((validator.id, outcome.feedback))
+        # Offload validation — validators may block on file reads / heavy regex / I/O, and must not
+        # stall the event loop (concurrent runs + background tasks share it). The helper is pure;
+        # emits, state mutation, and the Suspension all happen below on the loop thread.
+        failures, ok_values, defect = await asyncio.to_thread(_run_output_validators, validators, view)
+
+        if defect is not None:
+            validator_id, exc = defect
+            recorder.emit(
+                "output.validator.error",
+                data={"validator_id": validator_id, "error": str(exc)},
+                level="error",
+            )
+            raise OutputValidatorError(f"output validator {validator_id!r} raised: {exc}") from exc
 
         if not failures:
-            state.final_output = last_value
-            for validator in validators:
-                recorder.emit("output.validator.satisfied", data={"validator_id": validator.id})
+            state.output_values = dict(ok_values)  # keyed by validator id
+            state.final_output = ok_values[-1][1] if ok_values else None  # back-compat: last ok wins
+            for validator_id, _value in ok_values:
+                recorder.emit("output.validator.satisfied", data={"validator_id": validator_id})
             return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
 
         state.output_retries += 1
+        attempt_failures = [{"validator_id": vid, "feedback": fb} for vid, fb in failures]
+        state.output_failure_history.append({"attempt": state.output_retries, "failures": attempt_failures})
         recorder.emit(
             "output.validation.failed",
-            data={
-                "attempt": state.output_retries,
-                "failures": [{"validator_id": vid, "feedback": fb} for vid, fb in failures],
-            },
+            data={"attempt": state.output_retries, "failures": attempt_failures},
             level="warning",
         )
         if state.output_retries > self.spec.limits.max_output_retries:
             state.status = "limited"
             state.final_text = state.final_text or "Stopped: the final response did not satisfy the output contract."
             state.error_code = "output_validator_unsatisfied"
+            # Surface the cross-attempt failure roll-up so a jointly-unsatisfiable validator set is
+            # diagnosable (oscillating ids with equal counts) rather than a silent budget burn.
+            recorder.emit(
+                "output.validator.exhausted",
+                data={
+                    "retries": state.output_retries,
+                    "failures_by_validator": _failures_by_validator(state.output_failure_history),
+                    "history": list(state.output_failure_history),
+                },
+                level="warning",
+            )
             return Suspension(
                 reason="limited", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
             )
@@ -2750,7 +2802,7 @@ class AgentLoop:
                     # The model has consumed the pending observations and settled;
                     # the next submit must not resend them alongside a new message.
                     state.pending_observations = ()
-                    settled = self._resolve_final_output(state, res, context, turn, from_finish=False)
+                    settled = await self._resolve_final_output(state, res, context, turn, from_finish=False)
                     if settled is None:
                         continue  # output validation failed → repair queued, re-pump
                     return settled
@@ -2791,7 +2843,7 @@ class AgentLoop:
 
             if context.finished:
                 state.final_text = context.final_text
-                settled = self._resolve_final_output(state, res, context, turn, from_finish=True)
+                settled = await self._resolve_final_output(state, res, context, turn, from_finish=True)
                 if settled is None:
                     continue  # output validation failed → repair queued, re-pump
                 return settled
@@ -2940,6 +2992,13 @@ class AgentLoop:
         if context.skill_activation_count:
             metrics["skill_activation_count"] = context.skill_activation_count
             metrics["skills_activated"] = list(context.skills_activated)
+        if state.output_failure_history:
+            # Output-validation diagnostics surfaced in the run result: how many re-prompts were
+            # spent and which validators kept failing (a contradiction shows as equal counts).
+            metrics["output_validation"] = {
+                "retries": state.output_retries,
+                "failures_by_validator": _failures_by_validator(state.output_failure_history),
+            }
         if state.provider_error_code:
             metrics["provider_error_code"] = state.provider_error_code
         if state.provider_http_status is not None:
@@ -3000,6 +3059,7 @@ class AgentLoop:
             final_outputs=tuple(context.final_outputs),
             final_notes=context.final_notes,
             final_output=state.final_output,
+            outputs=dict(state.output_values),
             metrics=metrics,
             error=state.error,
             error_code=state.error_code,
@@ -3048,6 +3108,7 @@ class AgentLoop:
             error=state.error,
             error_code=state.error_code,
             final_output=state.final_output,
+            outputs=dict(state.output_values),
             metrics=metrics,
         )
 
