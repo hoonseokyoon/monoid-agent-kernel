@@ -262,6 +262,39 @@ def _failures_by_validator(history: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+_OUTPUT_CONTRACT_STOPPED = "Stopped: the final response did not satisfy the output contract."
+
+
+@dataclass(frozen=True)
+class SettleDecision:
+    """The classified outcome of a settle point, produced by the pure ``_decide_settle`` and applied
+    by the single ``_apply_settle``. ``kind`` discriminates (mirrors ``Suspension.reason``):
+
+    - ``accept``   — settle successfully; ``ok_values`` are the validated (id, value) pairs (empty
+      when no validators ran).
+    - ``reprompt`` — a validator rejected; re-prompt with ``failures`` and continue the pump.
+    - ``exhausted``— rejected with the retry budget spent; terminal ``limited``.
+    - ``terminal`` — refusal/truncation (non-conforming by construction); ``terminal_reason`` keys
+      the ``output.validation.failed`` emit.
+    - ``defect``   — a validator raised an unexpected exception (``defect`` = (id, exc)); apply
+      emits ``output.validator.error`` and raises ``OutputValidatorError``.
+
+    Fields beyond ``kind`` are only meaningful for the kinds that use them. ``new_history_entry``
+    (reprompt|exhausted) is the ``{attempt, failures}`` record that also serves as the
+    ``output.validation.failed`` emit payload.
+    """
+
+    kind: Literal["accept", "reprompt", "exhausted", "terminal", "defect"]
+    reason: str = "settled"  # Suspension reason: "settled" | "limited"
+    status: str = "completed"
+    error_code: str = ""
+    ok_values: tuple[tuple[str, Any], ...] = ()
+    failures: tuple[tuple[str, str], ...] = ()
+    new_history_entry: dict[str, Any] | None = None
+    terminal_reason: str | None = None
+    defect: tuple[str, BaseException] | None = None
+
+
 @dataclass(frozen=True)
 class FinishResult:
     """The final answer a successful ``run.finish`` produced — one value, not four loose fields.
@@ -2248,61 +2281,80 @@ class AgentLoop:
             state.messages.append(_observation_message(observation, state.media_blobs))
         state.pending_observations = ()
 
-    async def _resolve_final_output(
+    async def _decide_settle(
         self,
         state: RunState,
         res: _RunResources,
         context: AgentToolContext,
         turn: ModelTurn,
         runtime_config: AgentRuntimeConfig,
-        *,
-        from_finish: bool,
-    ) -> Suspension | None:
-        """Apply the active output validators at a settle point.
-
-        Returns the ``Suspension`` to settle on (success / refusal / truncation / exhaustion), or
-        ``None`` to continue the pump (a re-prompt has been queued). Raises ``OutputValidatorError``
-        on a validator *defect* (terminalized by the loop's broad boundary). Called just before
-        each ``Suspension(reason="settled")`` return; the ``run.finish`` site passes
-        ``from_finish=True`` so the stale ``pending_finish`` is cleared before a re-prompt.
-
-        The validators are run off the event loop (``asyncio.to_thread``) so a slow/blocking
-        validator never stalls the loop; all emits + state mutation stay on the loop thread.
+    ) -> SettleDecision:
+        """Classify a settle point into a :class:`SettleDecision` — PURE: no recorder, no ``state``
+        mutation. It reads ``state.output_retries``/``output_failure_history`` and the retry limit
+        read-only to pick ``reprompt`` vs ``exhausted``; all side effects happen in
+        :meth:`_apply_settle`. Validators run off the event loop (``asyncio.to_thread``) so a
+        slow/blocking validator never stalls the loop.
         """
-        recorder = res.recorder
         # Refusal / truncation: never validate output that is non-conforming by construction.
         if turn.stop_reason == "refusal":
-            state.status = "failed"
-            state.error_code = "output_refused"
-            recorder.emit("output.validation.failed", data={"reason": "refusal"}, level="warning")
-            return Suspension(
-                reason="settled", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
+            return SettleDecision(
+                kind="terminal", reason="settled", status="failed",
+                error_code="output_refused", terminal_reason="refusal",
             )
         if turn.stop_reason == "length":
-            state.status = "limited"
-            state.error_code = "output_truncated"
-            recorder.emit("output.validation.failed", data={"reason": "truncation"}, level="warning")
-            return Suspension(
-                reason="limited", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
+            return SettleDecision(
+                kind="terminal", reason="limited", status="limited",
+                error_code="output_truncated", terminal_reason="truncation",
             )
 
         validators = self._active_output_validators(runtime_config)  # per-turn (honors hot-swap)
         if not validators:
-            # No validator runs (none registered, or all disabled for this turn), but a run.finish
-            # still produced a tool output that must be logged before parking — same bookkeeping as
-            # a validated finish, so a multi-turn by-value continuation isn't left dangling.
-            if from_finish:
-                self._log_finish_observations(state)
-            return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
+            # None registered, or all disabled this turn. An accept with no values: the result keeps
+            # its reset final_output=None / outputs={}, and a run.finish's tool output is still logged
+            # by apply (the from_finish bookkeeping) so a by-value continuation isn't left dangling.
+            return SettleDecision(kind="accept")
 
         view = self._build_final_output_view(state, res, context)
-        # Offload validation — validators may block on file reads / heavy regex / I/O, and must not
-        # stall the event loop (concurrent runs + background tasks share it). The helper is pure;
-        # emits, state mutation, and the Suspension all happen below on the loop thread.
         failures, ok_values, defect = await asyncio.to_thread(_run_output_validators, validators, view)
-
         if defect is not None:
-            validator_id, exc = defect
+            return SettleDecision(kind="defect", defect=defect)
+        if not failures:
+            return SettleDecision(kind="accept", ok_values=tuple(ok_values))
+
+        # A failed attempt. The entry doubles as the ``output.validation.failed`` emit payload.
+        attempt = len(state.output_failure_history) + 1
+        entry = {
+            "attempt": attempt,
+            "failures": [{"validator_id": vid, "feedback": fb} for vid, fb in failures],
+        }
+        if state.output_retries >= self.spec.limits.max_output_retries:
+            return SettleDecision(
+                kind="exhausted", reason="limited", status="limited",
+                error_code="output_validator_unsatisfied", new_history_entry=entry,
+            )
+        return SettleDecision(kind="reprompt", failures=tuple(failures), new_history_entry=entry)
+
+    def _apply_settle(
+        self,
+        decision: SettleDecision,
+        state: RunState,
+        res: _RunResources,
+        context: AgentToolContext,
+        *,
+        from_finish: bool,
+    ) -> Suspension | None:
+        """The SINGLE place that applies a :class:`SettleDecision`: all ``state`` mutation, all
+        recorder emits, the finish bookkeeping, and the ``Suspension``. Returns the ``Suspension``
+        to settle on, or ``None`` to continue the pump (a re-prompt was queued). Raises
+        ``OutputValidatorError`` on a validator *defect* (terminalized by the loop's broad boundary).
+
+        Centralizing the finish bookkeeping here is the point: a new outcome cannot forget to clear
+        ``pending_finish`` / log the finish observations, because exactly one branch does it.
+        """
+        recorder = res.recorder
+
+        if decision.kind == "defect":
+            validator_id, exc = decision.defect  # type: ignore[misc]
             recorder.emit(
                 "output.validator.error",
                 data={"validator_id": validator_id, "error": str(exc)},
@@ -2310,33 +2362,28 @@ class AgentLoop:
             )
             raise OutputValidatorError(f"output validator {validator_id!r} raised: {exc}") from exc
 
-        if not failures:
-            state.output_values = dict(ok_values)  # keyed by validator id
-            state.final_output = ok_values[-1][1] if ok_values else None  # back-compat: last ok wins
-            if from_finish:
-                # The validated run.finish is the real answer — keep its metadata, but log its
-                # tool output before the run parks (multi-turn continuation needs it).
-                self._log_finish_observations(state)
-            for validator_id, _value in ok_values:
-                recorder.emit("output.validator.satisfied", data={"validator_id": validator_id})
-            return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
+        # Record the failed attempt FIRST (reprompt + exhausted), so the exhausted roll-up and the
+        # validation.failed emit see the same history ordering as before the split.
+        if decision.new_history_entry is not None:
+            state.output_failure_history.append(decision.new_history_entry)
+            recorder.emit("output.validation.failed", data=decision.new_history_entry, level="warning")
 
-        attempt = len(state.output_failure_history) + 1
-        attempt_failures = [{"validator_id": vid, "feedback": fb} for vid, fb in failures]
-        state.output_failure_history.append({"attempt": attempt, "failures": attempt_failures})
-        recorder.emit(
-            "output.validation.failed",
-            data={"attempt": attempt, "failures": attempt_failures},
-            level="warning",
-        )
-        if state.output_retries >= self.spec.limits.max_output_retries:
-            # Exhausted: every allowed re-prompt has been issued. output_retries counts the
-            # re-prompts actually made — not this terminal failed attempt (``attempt`` does that).
-            state.status = "limited"
-            state.final_text = state.final_text or "Stopped: the final response did not satisfy the output contract."
-            state.error_code = "output_validator_unsatisfied"
-            # Surface the cross-attempt failure roll-up so a jointly-unsatisfiable validator set is
-            # diagnosable (oscillating ids with equal counts) rather than a silent budget burn.
+        # Per-kind state mutation + kind-specific emits.
+        if decision.kind == "accept":
+            state.output_values = dict(decision.ok_values)  # keyed by validator id
+            state.final_output = decision.ok_values[-1][1] if decision.ok_values else None  # last ok wins
+            for validator_id, _value in decision.ok_values:
+                recorder.emit("output.validator.satisfied", data={"validator_id": validator_id})
+        elif decision.kind == "terminal":
+            state.status = decision.status  # type: ignore[assignment]
+            state.error_code = decision.error_code
+            recorder.emit("output.validation.failed", data={"reason": decision.terminal_reason}, level="warning")
+        elif decision.kind == "exhausted":
+            # output_retries counts re-prompts actually made — NOT this terminal failed attempt, so
+            # the emit reports it un-incremented (the history length records the total attempts).
+            state.status = decision.status  # type: ignore[assignment]
+            state.final_text = state.final_text or _OUTPUT_CONTRACT_STOPPED
+            state.error_code = decision.error_code
             recorder.emit(
                 "output.validator.exhausted",
                 data={
@@ -2346,28 +2393,30 @@ class AgentLoop:
                 },
                 level="warning",
             )
-            if from_finish:
-                # Exhausted on a rejected run.finish: clear its metadata (else close() reports the
-                # rejected outputs/notes) and log its tool output (the by-value log may continue).
-                self._clear_finish_metadata(context)
-                self._log_finish_observations(state)
-            return Suspension(
-                reason="limited", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
-            )
+        elif decision.kind == "reprompt":
+            state.output_retries += 1  # an actual re-prompt is about to be queued
 
-        state.output_retries += 1  # an actual re-prompt is about to be queued
-
-        # Re-prompt: queue feedback and continue the pump.
+        # Finish bookkeeping — the ONE place. When the settle came from run.finish: always log its
+        # tool output (a by-value continuation must not carry a dangling function_call), and clear
+        # pending_finish IFF the finish was rejected (reprompt|exhausted) so its outputs/notes don't
+        # leak into close() or re-settle the next turn; on a reprompt also blank the rejected summary.
         if from_finish:
-            # Rejected run.finish: clear its metadata, then log its tool output BEFORE the repair
-            # user message so a by-value adapter never sends a dangling function_call. (The natural
-            # settle path has no pending observations: they were cleared at the call site.)
-            self._clear_finish_metadata(context)
-            state.final_text = ""
+            if decision.kind in ("reprompt", "exhausted"):
+                self._clear_finish_metadata(context)
+                if decision.kind == "reprompt":
+                    state.final_text = ""
             self._log_finish_observations(state)
-        state.pending_observations = ()
-        state.messages.append({"role": "user", "content": _output_repair_message(failures)})
-        return None
+
+        if decision.kind == "reprompt":
+            state.pending_observations = ()
+            state.messages.append({"role": "user", "content": _output_repair_message(list(decision.failures))})
+            return None
+
+        if decision.kind == "accept":
+            return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
+        return Suspension(
+            reason=decision.reason, status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
+        )
 
     def _build_final_output_view(
         self, state: RunState, res: _RunResources, context: AgentToolContext
@@ -2883,9 +2932,8 @@ class AgentLoop:
                     # The model has consumed the pending observations and settled;
                     # the next submit must not resend them alongside a new message.
                     state.pending_observations = ()
-                    settled = await self._resolve_final_output(
-                        state, res, context, turn, runtime_config, from_finish=False
-                    )
+                    decision = await self._decide_settle(state, res, context, turn, runtime_config)
+                    settled = self._apply_settle(decision, state, res, context, from_finish=False)
                     if settled is None:
                         continue  # output validation failed → repair queued, re-pump
                     return settled
@@ -2926,9 +2974,8 @@ class AgentLoop:
 
             if context.pending_finish is not None:
                 state.final_text = context.pending_finish.summary
-                settled = await self._resolve_final_output(
-                    state, res, context, turn, runtime_config, from_finish=True
-                )
+                decision = await self._decide_settle(state, res, context, turn, runtime_config)
+                settled = self._apply_settle(decision, state, res, context, from_finish=True)
                 if settled is None:
                     continue  # output validation failed → repair queued, re-pump
                 return settled
