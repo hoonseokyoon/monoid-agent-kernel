@@ -120,7 +120,14 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         required=("state",),
     ),
     "turn.settled": _data_schema(
-        {"status": _STR, "final_text": _STR, "error_code": _STR, "changed_paths": _STR_ARRAY},
+        {
+            "status": _STR,
+            "final_text": _STR,
+            "error_code": _STR,
+            "changed_paths": _STR_ARRAY,
+            "output_validators": _INT,
+            "output_retries": _INT,
+        },
         required=("status",),
     ),
     "checkpoint.committed": _data_schema(
@@ -376,6 +383,28 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     "plan.updated": _data_schema(
         {"items": _OBJ_ARRAY},
         required=("items",),
+    ),
+    "output.validator.satisfied": _data_schema(
+        {"validator_id": _STR},
+        required=("validator_id",),
+    ),
+    "output.validation.failed": _data_schema(
+        # Carries either a refusal/truncation ``reason`` or a validator ``attempt`` + ``failures``.
+        {"reason": _STR, "attempt": _INT, "failures": _OBJ_ARRAY},
+        additional=True,
+    ),
+    "output.validator.skipped": _data_schema(
+        {"validator_id": _STR, "reason": _STR},
+        required=("validator_id",),
+    ),
+    "output.validator.error": _data_schema(
+        {"validator_id": _STR, "error": _STR},
+        required=("validator_id",),
+    ),
+    "output.validator.exhausted": _data_schema(
+        # Roll-up + per-attempt history of which validators kept failing (diagnose contradictions).
+        {"retries": _INT, "failures_by_validator": _OBJ, "history": _OBJ_ARRAY},
+        additional=True,
     ),
 }
 

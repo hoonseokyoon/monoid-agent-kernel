@@ -74,6 +74,24 @@ def _atomic_replace(src: Path, dst: Path, *, attempts: int = 10, backoff_s: floa
             time.sleep(backoff_s)
 
 
+def read_text_resilient(path: Path, *, attempts: int = 10, backoff_s: float = 0.01) -> str:
+    """``Path.read_text`` with a bounded retry for the Windows replace-vs-reader race.
+
+    The symmetric counterpart of :func:`_atomic_replace`: that flips a destination via
+    ``os.replace``; on Windows a reader that opens the destination mid-replace fails with
+    ``PermissionError`` (sharing violation). A polling status/checkpoint reader is exactly that
+    reader, so it needs the same short retry the writer already has. POSIX never reaches the
+    retry path (replacing an open file is atomic there)."""
+    for attempt in range(attempts):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(backoff_s)
+    raise AssertionError("unreachable")  # the loop returns or raises
+
+
 @contextmanager
 def file_lock(lock_path: Path, *, timeout_s: float = 10.0, stale_s: float = 30.0) -> Iterator[None]:
     """Best-effort cross-process advisory lock via an ``O_EXCL`` lock file.

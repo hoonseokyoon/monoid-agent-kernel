@@ -163,6 +163,10 @@ class RunLimits:
     # spawn time in ``SubagentTaskExecutor``; the depth Claude Code uses is 5.
     max_subagents: int = 8
     max_subagent_depth: int = 5
+    # How many times the loop re-prompts after a failed output-validator check before settling
+    # the run ``limited`` (``output_validator_unsatisfied``). A repair turn may call tools and
+    # shares the global step/tool/token budget, so this bounds settle attempts, not total cost.
+    max_output_retries: int = 1
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> RunLimits:
@@ -191,6 +195,7 @@ class RunLimits:
             max_total_tokens=_optional_int(payload, "max_total_tokens", defaults.max_total_tokens),
             max_subagents=int(payload.get("max_subagents", defaults.max_subagents)),
             max_subagent_depth=int(payload.get("max_subagent_depth", defaults.max_subagent_depth)),
+            max_output_retries=int(payload.get("max_output_retries", defaults.max_output_retries)),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -209,6 +214,7 @@ class RunLimits:
             "max_total_tokens": self.max_total_tokens,
             "max_subagents": self.max_subagents,
             "max_subagent_depth": self.max_subagent_depth,
+            "max_output_retries": self.max_output_retries,
         }
 
 

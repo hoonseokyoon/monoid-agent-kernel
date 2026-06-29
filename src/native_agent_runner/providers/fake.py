@@ -23,7 +23,7 @@ class FakeModelAdapter:
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         self.requests.append(request)
         if not self.turns:
-            return ModelTurn(final_text="fake model completed")
+            return ModelTurn(final_text="fake model completed", stop_reason="stop")
         return self.turns.pop(0)
 
 
@@ -40,7 +40,7 @@ class FakeMultimodalModelAdapter:
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         self.requests.append(request)
         if not self.turns:
-            return ModelTurn(final_text="fake model completed")
+            return ModelTurn(final_text="fake model completed", stop_reason="stop")
         return self.turns.pop(0)
 
 

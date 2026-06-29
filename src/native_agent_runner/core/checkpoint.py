@@ -61,6 +61,10 @@ class RunCheckpoint:
     tool_call_counts: dict[str, int] = field(default_factory=dict)
     previous_runtime_config: dict[str, Any] | None = None
     total_tool_calls: int = 0
+    # Output-validator re-prompt counter, persisted so a mid-repair restart does not re-grant
+    # the retry budget. (``final_output`` is NOT persisted — it is only set on success, after
+    # which the run closes, so it never needs to survive a restart.)
+    output_retries: int = 0
     total_usage: dict[str, int] = field(default_factory=dict)
     # By-value conversation log (vendor-independent continuation). Provider-neutral
     # user/assistant/tool messages; the system prompt is NOT here (regenerated each turn).

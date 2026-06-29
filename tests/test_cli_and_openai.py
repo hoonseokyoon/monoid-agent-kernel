@@ -333,6 +333,45 @@ def test_openai_astream_yields_reasoning_delta_then_text(monkeypatch: pytest.Mon
     assert isinstance(chunks[-1], TurnComplete)
 
 
+def test_openai_astream_captures_incomplete_stop_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("openai")
+    # A stream that ends with response.incomplete (max_output_tokens) must surface stop_reason
+    # "length", not a normal "stop" — else a validator would re-prompt a truncated partial answer.
+    class _IncompleteResp:
+        def model_dump(self) -> dict:
+            return {
+                "id": "r1",
+                "usage": {},
+                "output": [],
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            }
+
+    events = [
+        _Ev("response.output_text.delta", delta="partial"),
+        _Ev("response.incomplete", response=_IncompleteResp()),
+    ]
+
+    class _Responses:
+        async def create(self, **kwargs):  # noqa: ANN003, ANN202
+            return _AsyncStream(events)
+
+    class _AsyncClient:
+        def __init__(self, **kwargs) -> None:  # noqa: ANN003
+            self.responses = _Responses()
+
+    monkeypatch.setattr("openai.AsyncOpenAI", _AsyncClient)
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"), api_key="test", allow_direct_provider_api=True)
+    request = ModelRequest(instruction="hi", system_prompt="", tools=())
+
+    async def _drain() -> list:
+        return [chunk async for chunk in adapter.astream_turn(request)]
+
+    chunks = asyncio.run(_drain())
+    assert isinstance(chunks[-1], TurnComplete)
+    assert chunks[-1].stop_reason == "length"
+
+
 def test_openai_capture_strips_output_only_status() -> None:
     # The Responses *input* schema rejects the output-only `status` field
     # (Unknown parameter: input[..].status), so it must be dropped on capture.

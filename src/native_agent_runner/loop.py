@@ -63,7 +63,14 @@ from native_agent_runner.core.agents import (
 )
 from native_agent_runner.core.manifest import build_run_manifest
 from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
-from native_agent_runner.core.result import AgentRunResult, AgentTurnResult, Suspension
+from native_agent_runner.core.result import AgentArtifact, AgentRunResult, AgentTurnResult, Suspension
+from native_agent_runner.core.output_validator import (
+    FinalOutputView,
+    OutputRetry,
+    OutputValidator,
+    OutputValidatorError,
+    ValidationOutcome,
+)
 from native_agent_runner.core.streaming import QueueEventSink, RunStream
 from native_agent_runner.core.spec import (
     AgentRunSpec,
@@ -194,6 +201,65 @@ def _failure_result(exc: Exception, *, error_code: str | None = None) -> ToolRes
         retryable=bool(retryable),
         category=str(category),
     )
+
+
+def _output_repair_message(failures: list[tuple[str, str]]) -> str:
+    """The user-role message re-prompted to the model after a failed output validation. Combines
+    every failing validator's feedback so the model can fix them all in one re-prompt."""
+    lines = [
+        "Your final response did not satisfy the required output format. "
+        "Correct it and respond again:"
+    ]
+    for validator_id, feedback in failures:
+        lines.append(f"- ({validator_id}) {feedback}" if feedback else f"- ({validator_id}) invalid output")
+    return "\n".join(lines)
+
+
+def _run_output_validators(
+    validators: tuple[OutputValidator, ...], view: FinalOutputView
+) -> tuple[list[tuple[str, str]], list[tuple[str, Any]], tuple[str, BaseException] | None]:
+    """Run the active validators against the view. PURE — no recorder, no state mutation — so it
+    is safe to offload to a thread (validators may block on file reads / heavy regex). Returns
+    ``(failures, ok_values, defect)``: ``failures`` are ``(validator_id, feedback)`` for rejections
+    (``OutputRetry`` / ``ValueError``, incl. ``JSONDecodeError`` / pydantic ``ValidationError``);
+    ``ok_values`` are ``(validator_id, value)`` for passes; ``defect`` is ``(validator_id, exc)`` for
+    the first validator that raised an unexpected exception (a bug the model cannot fix), else None.
+    """
+    failures: list[tuple[str, str]] = []
+    ok_values: list[tuple[str, Any]] = []
+    for validator in validators:
+        try:
+            outcome = validator.validate(view)
+            # Guard the return shape INSIDE the try so a validator that returns None / a malformed
+            # object (no ``ok``/``feedback``) is classified as a defect with the validator id, not
+            # an uncaught AttributeError downstream that surfaces as a generic internal error.
+            if not isinstance(outcome, ValidationOutcome):
+                raise TypeError(
+                    f"validate() must return a ValidationOutcome, got {type(outcome).__name__}"
+                )
+        except OutputRetry as exc:
+            outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
+        except ValueError as exc:
+            outcome = ValidationOutcome(ok=False, feedback=str(exc))
+        except Exception as exc:  # validator defect — stop and report it to the caller (loop thread)
+            return failures, ok_values, (validator.id, exc)
+        if outcome.ok:
+            ok_values.append((validator.id, outcome.value))
+        else:
+            failures.append((validator.id, outcome.feedback))
+    return failures, ok_values, None
+
+
+def _failures_by_validator(history: list[dict[str, Any]]) -> dict[str, int]:
+    """Roll up how many attempts each validator failed across the history. An oscillating
+    contradiction (validators that cannot be jointly satisfied) shows as several ids with equal,
+    non-trivial counts — the signal a developer needs when a run exhausts its retries."""
+    counts: dict[str, int] = {}
+    for attempt in history:
+        for failure in attempt.get("failures", ()):
+            vid = str(failure.get("validator_id", ""))
+            counts[vid] = counts.get(vid, 0) + 1
+    return counts
 
 
 @dataclass
@@ -487,6 +553,19 @@ class RunState:
     provider_error_code: str = ""
     provider_http_status: int | None = None
     final_text: str = ""
+    # Validated value from a successful output validator (process-local; surfaced as
+    # AgentRunResult.final_output, never checkpointed). Only set on a successful settle.
+    final_output: Any = None
+    # Validated values keyed by validator id from the last successful settle (process-local;
+    # surfaced as AgentRunResult.outputs, never checkpointed). final_output is the last of these.
+    output_values: dict[str, Any] = field(default_factory=dict)
+    # Per-attempt rejection history for this turn-sequence (transient diagnostics, NOT checkpointed):
+    # each entry {attempt, failures:[{validator_id, feedback}]}. Rolled up into output.validator.exhausted
+    # + run metrics so a jointly-unsatisfiable validator set is diagnosable rather than a silent burn.
+    output_failure_history: list[dict[str, Any]] = field(default_factory=list)
+    # How many times an output validator has rejected the final response this turn-sequence and
+    # forced a re-prompt. Checkpointed (a mid-repair restart must not re-grant the budget).
+    output_retries: int = 0
     previous_turn_handle: str | None = None
     pending_user_input: tuple[ContentPart, ...] | None = None
     pending_observations: tuple[ToolObservation, ...] = ()
@@ -563,6 +642,11 @@ class AgentLoop:
     web_gateway_client: WebGatewayClient | None = None
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
     context_providers: tuple[ContextProvider, ...] = ()
+    # Output validators (post-response conformance). Registered here (code) and run by default;
+    # a run may disable one via an OutputValidatorBinding(enabled=False) in its runtime config. On a
+    # failed validation the loop re-prompts with the validator's feedback, bounded by
+    # RunLimits.max_output_retries, settling ``limited`` (output_validator_unsatisfied) on exhaustion.
+    output_validators: tuple[OutputValidator, ...] = ()
     inject_workspace_index: bool = False
     # Agent-as-tool delegation: a map of subagent id -> SubagentDefinition. When non-empty
     # the bootstrap registers the ``agent.spawn`` tool and the ``subagent`` task executor; a
@@ -684,6 +768,7 @@ class AgentLoop:
         *,
         tools: Iterable[ToolSpec] = (),
         registry: ToolRegistry | None = None,
+        output_validators: Iterable[OutputValidator] = (),
     ) -> list[str]:
         """Check a runtime config before a run and return all problems as readable messages
         (``[]`` == valid). Unlike the internal raising validator, this collects every issue —
@@ -707,6 +792,16 @@ class AgentLoop:
                     registry.register(spec)
                 except ValueError as exc:
                     issues.append(str(exc))
+        # Output-validator bindings are opt-outs (default-on). A binding whose ``validator_id``
+        # matches no registered validator is a no-op (commonly a typo) — flag it so it is not
+        # silently ignored. Pass ``output_validators`` (the AgentLoop's registry) to enable this.
+        registered_validator_ids = {validator.id for validator in output_validators}
+        for binding in config.output_validators:
+            if binding.validator_id not in registered_validator_ids:
+                issues.append(
+                    f"output validator binding references unknown validator_id "
+                    f"{binding.validator_id!r}; no registered validator has that id (no-op)"
+                )
         return issues + collect_runtime_config_issues(config, registry)
 
     def open(self) -> None:
@@ -951,8 +1046,15 @@ class AgentLoop:
             state.provider_error_code = ""
             state.provider_http_status = None
             state.final_text = ""
-            # A run.finish in a prior submit must not short-circuit this one.
-            res.context.finished = False
+            # A fresh user turn gets a fresh output-validation budget and a clean result value.
+            state.output_retries = 0
+            state.final_output = None
+            state.output_values = {}
+            state.output_failure_history = []
+            # A run.finish in a prior submit must not short-circuit this one OR leak its
+            # outputs/notes into this turn's validator view / result (clears finished + final_text
+            # + final_outputs + final_notes).
+            self._clear_finish_metadata(res.context)
             # Drop a stale stop/pause so neither can immediately halt this fresh turn.
             self._interrupt_requested = False
             self._pause_requested = False
@@ -1449,6 +1551,7 @@ class AgentLoop:
                 else None
             ),
             total_tool_calls=state.total_tool_calls,
+            output_retries=state.output_retries,
             total_usage=dict(state.total_usage),
             messages=list(state.messages),
             session_step=session.session_step,
@@ -1594,6 +1697,7 @@ class AgentLoop:
                 else None
             ),
             total_tool_calls=cp.total_tool_calls,
+            output_retries=cp.output_retries,
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
@@ -2069,6 +2173,7 @@ class AgentLoop:
                     "agent_config_hash": initial_runtime_config.config_hash,
                 },
             )
+        self._emit_bootstrap_validator_skips(initial_runtime_config, recorder)
         return _RunResources(
             workspace=workspace,
             recorder=recorder,
@@ -2077,6 +2182,211 @@ class AgentLoop:
             started=started,
             deadline=deadline,
             static_segments=tuple(static_segments),
+        )
+
+    def _active_output_validators(
+        self, config: AgentRuntimeConfig | None
+    ) -> tuple[OutputValidator, ...]:
+        """Validators that run this settle: every registered validator EXCEPT those a config
+        binding disables (**default on**). Resolved from the *per-turn* config so a mid-run hot-swap
+        (``replace_runtime_config`` adding ``OutputValidatorBinding(enabled=False)``) takes effect.
+        ``config is None`` (pre-bootstrap) → all registered. Pure — no events/state."""
+        if config is None:
+            return self.output_validators
+        disabled_ids = {b.validator_id for b in config.output_validators if not b.enabled}
+        return tuple(v for v in self.output_validators if v.id not in disabled_ids)
+
+    def _emit_bootstrap_validator_skips(
+        self, config: AgentRuntimeConfig, recorder: AgentRecorder
+    ) -> None:
+        """One-time discoverability at bootstrap: ``output.validator.skipped`` for each registered
+        validator a config binding disables (``reason=disabled``), and for each binding referencing
+        an unregistered validator (``reason=unknown_binding`` at warning level — a no-op opt-out,
+        commonly a typo). The reference backend validates configs via ``validate_runtime_config``,
+        not ``AgentLoop.validate``, so this bootstrap emission is the universal signal. Per-turn
+        gating re-resolves via ``_active_output_validators``, so a later config change is honored."""
+        registered_ids = {v.id for v in self.output_validators}
+        active_ids = {v.id for v in self._active_output_validators(config)}
+        for validator in self.output_validators:
+            if validator.id not in active_ids:
+                recorder.emit(
+                    "output.validator.skipped",
+                    data={"validator_id": validator.id, "reason": "disabled"},
+                    level="debug",
+                )
+        for binding in config.output_validators:
+            if binding.validator_id not in registered_ids:
+                recorder.emit(
+                    "output.validator.skipped",
+                    data={"validator_id": binding.validator_id, "reason": "unknown_binding"},
+                    level="warning",
+                )
+
+    @staticmethod
+    def _clear_finish_metadata(context: AgentToolContext) -> None:
+        """Reset the metadata a run.finish populated, so a REJECTED finish can't leak its
+        outputs/notes into close() or re-settle the next turn on a stale flag."""
+        context.finished = False
+        context.final_text = ""
+        context.final_outputs = []
+        context.final_notes = None
+
+    @staticmethod
+    def _log_finish_observations(state: RunState) -> None:
+        """Append this turn's pending tool outputs (the run.finish function_call_output, plus any
+        siblings) to the by-value log and clear them — so a by-value continuation never carries a
+        dangling function_call (no user/repair message can slip in ahead of the output)."""
+        for observation in state.pending_observations:
+            state.messages.append(_observation_message(observation, state.media_blobs))
+        state.pending_observations = ()
+
+    async def _resolve_final_output(
+        self,
+        state: RunState,
+        res: _RunResources,
+        context: AgentToolContext,
+        turn: ModelTurn,
+        runtime_config: AgentRuntimeConfig,
+        *,
+        from_finish: bool,
+    ) -> Suspension | None:
+        """Apply the active output validators at a settle point.
+
+        Returns the ``Suspension`` to settle on (success / refusal / truncation / exhaustion), or
+        ``None`` to continue the pump (a re-prompt has been queued). Raises ``OutputValidatorError``
+        on a validator *defect* (terminalized by the loop's broad boundary). Called just before
+        each ``Suspension(reason="settled")`` return; the ``run.finish`` site passes
+        ``from_finish=True`` so the stale ``context.finished`` flag is cleared before a re-prompt.
+
+        The validators are run off the event loop (``asyncio.to_thread``) so a slow/blocking
+        validator never stalls the loop; all emits + state mutation stay on the loop thread.
+        """
+        recorder = res.recorder
+        # Refusal / truncation: never validate output that is non-conforming by construction.
+        if turn.stop_reason == "refusal":
+            state.status = "failed"
+            state.error_code = "output_refused"
+            recorder.emit("output.validation.failed", data={"reason": "refusal"}, level="warning")
+            return Suspension(
+                reason="settled", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
+            )
+        if turn.stop_reason == "length":
+            state.status = "limited"
+            state.error_code = "output_truncated"
+            recorder.emit("output.validation.failed", data={"reason": "truncation"}, level="warning")
+            return Suspension(
+                reason="limited", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
+            )
+
+        validators = self._active_output_validators(runtime_config)  # per-turn (honors hot-swap)
+        if not validators:
+            # No validator runs (none registered, or all disabled for this turn), but a run.finish
+            # still produced a tool output that must be logged before parking — same bookkeeping as
+            # a validated finish, so a multi-turn by-value continuation isn't left dangling.
+            if from_finish:
+                self._log_finish_observations(state)
+            return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
+
+        view = self._build_final_output_view(state, res, context)
+        # Offload validation — validators may block on file reads / heavy regex / I/O, and must not
+        # stall the event loop (concurrent runs + background tasks share it). The helper is pure;
+        # emits, state mutation, and the Suspension all happen below on the loop thread.
+        failures, ok_values, defect = await asyncio.to_thread(_run_output_validators, validators, view)
+
+        if defect is not None:
+            validator_id, exc = defect
+            recorder.emit(
+                "output.validator.error",
+                data={"validator_id": validator_id, "error": str(exc)},
+                level="error",
+            )
+            raise OutputValidatorError(f"output validator {validator_id!r} raised: {exc}") from exc
+
+        if not failures:
+            state.output_values = dict(ok_values)  # keyed by validator id
+            state.final_output = ok_values[-1][1] if ok_values else None  # back-compat: last ok wins
+            if from_finish:
+                # The validated run.finish is the real answer — keep its metadata, but log its
+                # tool output before the run parks (multi-turn continuation needs it).
+                self._log_finish_observations(state)
+            for validator_id, _value in ok_values:
+                recorder.emit("output.validator.satisfied", data={"validator_id": validator_id})
+            return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
+
+        attempt = len(state.output_failure_history) + 1
+        attempt_failures = [{"validator_id": vid, "feedback": fb} for vid, fb in failures]
+        state.output_failure_history.append({"attempt": attempt, "failures": attempt_failures})
+        recorder.emit(
+            "output.validation.failed",
+            data={"attempt": attempt, "failures": attempt_failures},
+            level="warning",
+        )
+        if state.output_retries >= self.spec.limits.max_output_retries:
+            # Exhausted: every allowed re-prompt has been issued. output_retries counts the
+            # re-prompts actually made — not this terminal failed attempt (``attempt`` does that).
+            state.status = "limited"
+            state.final_text = state.final_text or "Stopped: the final response did not satisfy the output contract."
+            state.error_code = "output_validator_unsatisfied"
+            # Surface the cross-attempt failure roll-up so a jointly-unsatisfiable validator set is
+            # diagnosable (oscillating ids with equal counts) rather than a silent budget burn.
+            recorder.emit(
+                "output.validator.exhausted",
+                data={
+                    "retries": state.output_retries,
+                    "failures_by_validator": _failures_by_validator(state.output_failure_history),
+                    "history": list(state.output_failure_history),
+                },
+                level="warning",
+            )
+            if from_finish:
+                # Exhausted on a rejected run.finish: clear its metadata (else close() reports the
+                # rejected outputs/notes) and log its tool output (the by-value log may continue).
+                self._clear_finish_metadata(context)
+                self._log_finish_observations(state)
+            return Suspension(
+                reason="limited", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
+            )
+
+        state.output_retries += 1  # an actual re-prompt is about to be queued
+
+        # Re-prompt: queue feedback and continue the pump.
+        if from_finish:
+            # Rejected run.finish: clear its metadata, then log its tool output BEFORE the repair
+            # user message so a by-value adapter never sends a dangling function_call. (The natural
+            # settle path has no pending observations: they were cleared at the call site.)
+            self._clear_finish_metadata(context)
+            state.final_text = ""
+            self._log_finish_observations(state)
+        state.pending_observations = ()
+        state.messages.append({"role": "user", "content": _output_repair_message(failures)})
+        return None
+
+    def _build_final_output_view(
+        self, state: RunState, res: _RunResources, context: AgentToolContext
+    ) -> FinalOutputView:
+        """The read-only composite (text + files) handed to a validator. ``read_bytes`` goes
+        through ``workspace.read_bytes`` so it inherits the path jail + ``max_bytes_read`` cap;
+        a validator may pass ``max_bytes`` to raise the cap for a legit large artifact."""
+        workspace = res.workspace
+
+        def _read(path: str, *, max_bytes: int | None = None) -> bytes:
+            data, _digest = workspace.read_bytes(path, max_bytes=max_bytes)
+            return data
+
+        artifacts = tuple(
+            AgentArtifact(
+                artifact_id=getattr(a, "artifact_id", ""),
+                path=getattr(a, "path", ""),
+                kind=getattr(a, "kind", ""),
+                label=getattr(a, "label", None),
+            )
+            for a in res.recorder.artifacts
+        )
+        return FinalOutputView(
+            final_text=state.final_text,
+            artifacts=artifacts,
+            final_outputs=tuple(context.final_outputs),
+            read_bytes=_read,
         )
 
     def _warn_on_unforwarded_multimodal(
@@ -2555,12 +2865,22 @@ class AgentLoop:
                         awaiting_task_ids=tuple(external),
                         has_external=bool(external),
                     )
-                if turn.final_text:
-                    state.final_text = turn.final_text
+                # Settle on final text — OR on a refusal/truncation even when the model emitted no
+                # text (an OpenAI ``refusal`` content part yields stop_reason="refusal" with
+                # final_text=None; a zero-token cap yields "length"). Those must reach the
+                # refusal/truncation branch (output_refused / output_truncated), not the
+                # "neither text nor tool calls" error below.
+                if turn.final_text or turn.stop_reason in ("refusal", "length"):
+                    state.final_text = turn.final_text or ""
                     # The model has consumed the pending observations and settled;
                     # the next submit must not resend them alongside a new message.
                     state.pending_observations = ()
-                    return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
+                    settled = await self._resolve_final_output(
+                        state, res, context, turn, runtime_config, from_finish=False
+                    )
+                    if settled is None:
+                        continue  # output validation failed → repair queued, re-pump
+                    return settled
                 raise ModelAdapterError("model returned neither final text nor tool calls")
 
             observations: list[ToolObservation] = []
@@ -2598,7 +2918,12 @@ class AgentLoop:
 
             if context.finished:
                 state.final_text = context.final_text
-                return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
+                settled = await self._resolve_final_output(
+                    state, res, context, turn, runtime_config, from_finish=True
+                )
+                if settled is None:
+                    continue  # output validation failed → repair queued, re-pump
+                return settled
             if state.status == "limited":
                 return Suspension(
                     reason="limited",
@@ -2744,6 +3069,13 @@ class AgentLoop:
         if context.skill_activation_count:
             metrics["skill_activation_count"] = context.skill_activation_count
             metrics["skills_activated"] = list(context.skills_activated)
+        if state.output_failure_history:
+            # Output-validation diagnostics surfaced in the run result: how many re-prompts were
+            # spent and which validators kept failing (a contradiction shows as equal counts).
+            metrics["output_validation"] = {
+                "retries": state.output_retries,
+                "failures_by_validator": _failures_by_validator(state.output_failure_history),
+            }
         if state.provider_error_code:
             metrics["provider_error_code"] = state.provider_error_code
         if state.provider_http_status is not None:
@@ -2803,6 +3135,8 @@ class AgentLoop:
             artifacts=artifacts,
             final_outputs=tuple(context.final_outputs),
             final_notes=context.final_notes,
+            final_output=state.final_output,
+            outputs=dict(state.output_values),
             metrics=metrics,
             error=state.error,
             error_code=state.error_code,
@@ -2835,6 +3169,10 @@ class AgentLoop:
                 "final_text": state.final_text,
                 "error_code": state.error_code,
                 "changed_paths": public_changed,
+                # Output-validation summary for this settle: how many validators were active and
+                # how many re-prompts the run spent satisfying them (0 when none ran).
+                "output_validators": len(self._active_output_validators(state.previous_runtime_config)),
+                "output_retries": state.output_retries,
             },
         )
         return AgentTurnResult(
@@ -2846,6 +3184,8 @@ class AgentLoop:
             turn_handle=state.previous_turn_handle,
             error=state.error,
             error_code=state.error_code,
+            final_output=state.final_output,
+            outputs=dict(state.output_values),
             metrics=metrics,
         )
 

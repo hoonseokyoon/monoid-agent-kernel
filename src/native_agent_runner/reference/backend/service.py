@@ -12,7 +12,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -42,7 +42,7 @@ from native_agent_runner.core.packages import (
     write_apply_result,
     write_approval,
 )
-from native_agent_runner.core._util import write_json_atomic
+from native_agent_runner.core._util import read_text_resilient, write_json_atomic
 from native_agent_runner.core.checkpoint import (
     CheckpointRecord,
     CheckpointStore,
@@ -206,6 +206,17 @@ class _PreparedRun:
     web_gateway_token: str
 
 
+def _json_safe(value: Any) -> Any:
+    """Render an output validator's value safe for a JSON wire projection **at any nesting depth**.
+    Round-trips through json with a ``repr`` fallback so a non-serializable value — a Pydantic
+    model, dataclass, or bytes, even nested inside a dict/list — can never 500 the HTTP response
+    when the edge later ``json.dumps`` it."""
+    try:
+        return json.loads(json.dumps(value, default=repr))
+    except (TypeError, ValueError):
+        return repr(value)
+
+
 @dataclass
 class BackendRunRecord:
     run_id: str
@@ -223,6 +234,10 @@ class BackendRunRecord:
     error: str = ""
     error_code: str = ""
     result: AgentRunResult | None = None
+    # Latest settled turn's validated output (AgentTurnResult.final_output), captured per park so a
+    # live multi-turn run can expose it via status() before the run closes (result() carries the
+    # final one). Process-local — not persisted. None when no output validator produced a value.
+    last_final_output: Any = None
     last_event_seq: int = 0
     last_event_type: str = ""
     cancellation_token: CancellationToken = field(default_factory=CancellationToken)
@@ -502,6 +517,11 @@ class RunnerBackend:
     # config validation — see _backend_builtin_tool_specs. Empty → no providers.
     tool_providers: tuple[Any, ...] = ()
     context_providers: tuple[Any, ...] = ()
+    # Output validators attached to every run the backend builds. Default-on: each runs unless a
+    # run's config disables it via OutputValidatorBinding(enabled=False). Read at loop-build time
+    # so a parked run re-attaches them on resume/restart, exactly like tool/context providers.
+    # Empty → no validators.
+    output_validators: tuple[Any, ...] = ()
     # Per-run capability broker factory: ``(request) -> CapabilityBroker | None``. Called at
     # loop-build time so a broker can be scoped to the run's identity (tenant/user/run id) — e.g.
     # a GatewayCapabilityBroker minting per-tenant tokens. None (or a None return) leaves capability
@@ -778,7 +798,10 @@ class RunnerBackend:
         status_file = run_dir / "status.json"
         status_payload: dict[str, Any] | None = None
         if status_file.exists():
-            status_payload = json.loads(status_file.read_text(encoding="utf-8"))
+            # Resilient read: the run is concurrently flipping status.json via an atomic
+            # os.replace; on Windows a plain read mid-replace hits a sharing violation. Mirror
+            # the writer's retry (write_json_atomic / _atomic_replace) so the poll closes the race.
+            status_payload = json.loads(read_text_resilient(status_file))
         with self._lock:
             record = self._records.get(run_id)
         if record is None:
@@ -802,6 +825,14 @@ class RunnerBackend:
             "last_event_type": record.last_event_type,
             "error": record.error,
             "error_code": record.error_code,
+            # Prefer the live park-point capture; fall back to the terminal result for
+            # stream-driven runs (astream_run) that record an AgentRunResult without ever
+            # passing through _drive_open_session, where last_final_output stays None.
+            "final_output": _json_safe(
+                record.last_final_output
+                if record.last_final_output is not None
+                else (record.result.final_output if record.result is not None else None)
+            ),
             "status_file": status_payload,
         }
 
@@ -826,6 +857,7 @@ class RunnerBackend:
             "status": result.status,
             "ready": True,
             "final_text": result.final_text,
+            "final_output": _json_safe(result.final_output),
             "error": result.error,
             "error_code": result.error_code,
             "run_dir": str(result.run_dir),
@@ -1219,15 +1251,10 @@ class RunnerBackend:
                     f"runtime config version mismatch: expected {expected_version}, current {current_version}"
                 )
             if config.config_version <= current_version:
-                config = AgentRuntimeConfig(
-                    definition_id=config.definition_id,
-                    config_version=current_version + 1,
-                    model=config.model,
-                    prompt=config.prompt,
-                    tools=config.tools,
-                    tool_search=config.tool_search,
-                    metadata=config.metadata,
-                )
+                # Auto-bump the version, preserving every other field (incl. output_validators).
+                # replace() copies all fields, so a new config field can't be silently dropped on
+                # hot-swap (an enumerated rebuild here previously dropped output-validator opt-outs).
+                config = replace(config, config_version=current_version + 1)
             record.runtime_config = config
             record.runtime_config_issuer = issuer
             record.runtime_config_reason = reason
@@ -1634,6 +1661,9 @@ class RunnerBackend:
             # Keep the authoritative FSM state on the record current with each park, so a
             # concurrent control inspect/health reports the live state.
             record.session_state = state_from_suspension(suspension)
+            if suspension.turn is not None:
+                # Capture the settled turn's validated output so status() can surface it live.
+                record.last_final_output = suspension.turn.final_output
             if suspension.reason in {"terminal", "limited"}:
                 break
             if suspension.reason == "awaiting_tasks":
@@ -1960,6 +1990,7 @@ class RunnerBackend:
             subagent_definitions=self.subagent_definitions,
             tool_providers=self.tool_providers,
             context_providers=self.context_providers,
+            output_validators=self.output_validators,
             capability_broker=self._capability_broker_for(request),
         )
 
@@ -2437,6 +2468,7 @@ class RunnerBackend:
             subagent_definitions=self.subagent_definitions,
             tool_providers=self.tool_providers,
             context_providers=self.context_providers,
+            output_validators=self.output_validators,
             capability_broker=self._capability_broker_for(request),
         )
         # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
@@ -2609,7 +2641,7 @@ class RunnerBackend:
                 status_path = run_dir / "status.json"
                 if status_path.exists():
                     try:
-                        status = json.loads(status_path.read_text(encoding="utf-8")).get("status", "ended")
+                        status = json.loads(read_text_resilient(status_path)).get("status", "ended")
                     except (ValueError, OSError):
                         pass
             recoverable = False

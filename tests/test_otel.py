@@ -110,3 +110,74 @@ def test_otel_sink_marks_failed_tool_span(tmp_path: Path) -> None:
     failed = tool_spans[0]
     assert failed.status.status_code == StatusCode.ERROR
     assert failed.attributes.get("error.type")
+
+
+def test_otel_records_output_validation_failure_on_run_span(tmp_path: Path) -> None:
+    from native_agent_runner.core.output_validator import ValidationOutcome
+
+    class _RequireDone:
+        id = "otel.requires_done"
+        schema = None
+
+        def validate(self, view) -> ValidationOutcome:
+            if "DONE" in view.final_text:
+                return ValidationOutcome(ok=True, value=None)
+            return ValidationOutcome(ok=False, feedback="must contain DONE")
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(response_id="r1", final_text="nope", stop_reason="stop"),
+            ModelTurn(response_id="r2", final_text="DONE now", stop_reason="stop"),
+        ]
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs", limits=RunLimits(max_steps=4)),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+        output_validators=(_RequireDone(),),
+        event_sinks=(OtelEventSink(tracer_provider=provider),),
+    )
+    result = asyncio.run(loop.arun_once("go"))
+    assert result.status == "completed"
+
+    root = next(s for s in exporter.get_finished_spans() if s.name == "invoke_agent")
+    assert "output.validation.failed" in [e.name for e in root.events]
+
+
+def test_otel_records_output_validator_exhausted_on_run_span(tmp_path: Path) -> None:
+    from native_agent_runner.core.output_validator import ValidationOutcome
+
+    class _AlwaysFail:
+        id = "otel.always_fail"
+        schema = None
+
+        def validate(self, view) -> ValidationOutcome:
+            return ValidationOutcome(ok=False, feedback="nope")
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x", stop_reason="stop")])
+    loop = AgentLoop(
+        spec=AgentRunSpec(
+            workspace_root=workspace,
+            run_root=tmp_path / "runs",
+            limits=RunLimits(max_steps=4, max_output_retries=0),
+        ),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+        output_validators=(_AlwaysFail(),),
+        event_sinks=(OtelEventSink(tracer_provider=provider),),
+    )
+    result = asyncio.run(loop.arun_once("go"))
+    assert result.status == "limited"
+
+    root = next(s for s in exporter.get_finished_spans() if s.name == "invoke_agent")
+    assert "output.validator.exhausted" in [e.name for e in root.events]

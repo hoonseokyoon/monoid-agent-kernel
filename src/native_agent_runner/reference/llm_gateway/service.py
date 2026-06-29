@@ -121,6 +121,7 @@ class LlmGatewayBackend:
                 for call in turn.tool_calls
             ],
             "usage": turn.usage,
+            "stop_reason": turn.stop_reason,
         }
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -184,14 +185,21 @@ class LlmGatewayBackend:
                 )
                 collected.append(chunk)
                 yield _chunk_to_frame(chunk)
-            collected.append(TurnComplete(response_id=turn.response_id, usage=turn.usage))
+            collected.append(
+                TurnComplete(response_id=turn.response_id, usage=turn.usage, stop_reason=turn.stop_reason)
+            )
         # Assemble once: the same usage drives both the meter and the outgoing frame, and the
         # assembled response id is what the opaque turn_handle maps to for continuation.
         turn = assemble_streamed_turn(collected)
         turn_handle = self._record_turn(claims, request, turn)
         with self._lock:
             self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(turn.usage)
-        yield {"type": "turn_complete", "turn_handle": turn_handle, "usage": turn.usage}
+        yield {
+            "type": "turn_complete",
+            "turn_handle": turn_handle,
+            "usage": turn.usage,
+            "stop_reason": turn.stop_reason,
+        }
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
         with self._lock:

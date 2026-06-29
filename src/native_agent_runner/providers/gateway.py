@@ -309,12 +309,18 @@ def _parse_gateway_response(data: dict[str, Any]) -> ModelTurn:
             )
         )
 
+    # stop_reason rides the gateway wire (added by the gateway server). Older gateways omit it;
+    # infer the common cases so the loop's branch still works.
+    stop_reason = data.get("stop_reason")
+    if stop_reason is None:
+        stop_reason = "tool_calls" if tool_calls else "stop"
     return ModelTurn(
         response_id=data.get("response_id") or data.get("turn_handle"),
         final_text=data.get("final_text"),
         tool_calls=tuple(tool_calls),
         usage=normalize_usage(data.get("usage")),
         raw=data,
+        stop_reason=stop_reason,
     )
 
 
@@ -369,6 +375,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
         return TurnComplete(
             response_id=event.get("turn_handle") or event.get("response_id"),
             usage=normalize_usage(event.get("usage")),
+            stop_reason=event.get("stop_reason"),
         )
     if event_type == "error":
         raise ModelAdapterError(

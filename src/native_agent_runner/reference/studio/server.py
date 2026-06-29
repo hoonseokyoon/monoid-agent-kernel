@@ -886,8 +886,8 @@ class StudioServer:
 
     def capabilities_catalog(self) -> dict[str, Any]:
         """Read-only catalog of the attached providers' offerings, for a UI list: the available
-        Agent Skills (name + description) and the connected MCP server's tools (id + description).
-        Both empty when their provider isn't attached."""
+        Agent Skills (name + description), the connected MCP server's tools (id + description), and
+        the output validators registered on the backend (id). Each empty when none is attached."""
         skills = self._skill_provider.catalog() if self._skill_provider is not None else []
         mcp_tools: list[dict[str, str]] = []
         if self._mcp_provider is not None:
@@ -895,7 +895,11 @@ class StudioServer:
                 {"id": spec.id, "description": spec.description}
                 for spec in self._mcp_provider.get_tools()
             ]
-        return {"skills": skills, "mcp_tools": mcp_tools}
+        output_validators = [
+            {"id": validator.id}
+            for validator in (self._backend.output_validators if self._backend is not None else ())
+        ]
+        return {"skills": skills, "mcp_tools": mcp_tools, "output_validators": output_validators}
 
     def update_settings(
         self,
