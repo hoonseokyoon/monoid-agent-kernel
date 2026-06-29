@@ -230,6 +230,13 @@ def _run_output_validators(
     for validator in validators:
         try:
             outcome = validator.validate(view)
+            # Guard the return shape INSIDE the try so a validator that returns None / a malformed
+            # object (no ``ok``/``feedback``) is classified as a defect with the validator id, not
+            # an uncaught AttributeError downstream that surfaces as a generic internal error.
+            if not isinstance(outcome, ValidationOutcome):
+                raise TypeError(
+                    f"validate() must return a ValidationOutcome, got {type(outcome).__name__}"
+                )
         except OutputRetry as exc:
             outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
         except ValueError as exc:

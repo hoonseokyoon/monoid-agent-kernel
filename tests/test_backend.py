@@ -674,6 +674,15 @@ def test_backend_runs_output_validator_with_retry(tmp_path: Path) -> None:
     assert sum(len(a.requests) for a in adapters) == 2
     # The validated value is surfaced through the backend result projection.
     assert backend.result(submission.run_id, submission.run_token)["final_output"] == "ok done"
+    # ...and through the status projection.
+    assert backend.status(submission.run_id, submission.run_token)["final_output"] == "ok done"
+
+    # Stream-driven runs (astream_run) record an AgentRunResult without ever passing through
+    # _drive_open_session, so last_final_output stays None. status() must then fall back to the
+    # terminal result's final_output rather than reporting null.
+    record = backend._records[submission.run_id]
+    record.last_final_output = None
+    assert backend.status(submission.run_id, submission.run_token)["final_output"] == "ok done"
 
 
 def test_json_safe_sanitizes_nested_non_json() -> None:

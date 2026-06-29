@@ -62,6 +62,17 @@ class DefectValidator:
         raise KeyError("a bug in the validator")  # not OutputRetry/ValueError → defect
 
 
+class MalformedReturnValidator:
+    """Returns None instead of a ValidationOutcome — a validator bug. Must be classified as a
+    defect (output_validator_error) with the validator id, not an uncaught AttributeError."""
+
+    id = "malformed"
+    schema = None
+
+    def validate(self, view: FinalOutputView):  # type: ignore[override]
+        return None  # noqa: RET501 - intentional bug under test
+
+
 class RequireFoo:
     id = "require.foo"
     schema = None
@@ -173,6 +184,22 @@ def test_validator_defect_terminalizes(tmp_path: Path) -> None:
         model_adapter=adapter,
         runtime_config_provider=_provider("defect"),
         output_validators=(DefectValidator(),),
+    ).run_once("go")
+
+    assert result.status == "failed"
+    assert result.error_code == "output_validator_error"
+
+
+def test_malformed_validator_return_terminalizes_as_defect(tmp_path: Path) -> None:
+    # A validator that returns None (no ok/feedback) is a bug the model cannot fix; the AttributeError
+    # it would otherwise trigger downstream must be classified as output_validator_error, not a
+    # generic internal error.
+    adapter = FakeModelAdapter(turns=[_text_turn("anything")])
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("malformed"),
+        output_validators=(MalformedReturnValidator(),),
     ).run_once("go")
 
     assert result.status == "failed"

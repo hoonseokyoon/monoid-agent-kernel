@@ -825,7 +825,14 @@ class RunnerBackend:
             "last_event_type": record.last_event_type,
             "error": record.error,
             "error_code": record.error_code,
-            "final_output": _json_safe(record.last_final_output),
+            # Prefer the live park-point capture; fall back to the terminal result for
+            # stream-driven runs (astream_run) that record an AgentRunResult without ever
+            # passing through _drive_open_session, where last_final_output stays None.
+            "final_output": _json_safe(
+                record.last_final_output
+                if record.last_final_output is not None
+                else (record.result.final_output if record.result is not None else None)
+            ),
             "status_file": status_payload,
         }
 
