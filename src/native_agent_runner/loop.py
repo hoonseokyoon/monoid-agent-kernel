@@ -2190,9 +2190,13 @@ class AgentLoop:
     def _emit_bootstrap_validator_skips(
         self, config: AgentRuntimeConfig, recorder: AgentRecorder
     ) -> None:
-        """One-time discoverability at bootstrap: emit ``output.validator.skipped`` for each
-        registered validator a config binding disables. Per-turn gating re-resolves via
-        ``_active_output_validators`` so a later config change is honored."""
+        """One-time discoverability at bootstrap: ``output.validator.skipped`` for each registered
+        validator a config binding disables (``reason=disabled``), and for each binding referencing
+        an unregistered validator (``reason=unknown_binding`` at warning level — a no-op opt-out,
+        commonly a typo). The reference backend validates configs via ``validate_runtime_config``,
+        not ``AgentLoop.validate``, so this bootstrap emission is the universal signal. Per-turn
+        gating re-resolves via ``_active_output_validators``, so a later config change is honored."""
+        registered_ids = {v.id for v in self.output_validators}
         active_ids = {v.id for v in self._active_output_validators(config)}
         for validator in self.output_validators:
             if validator.id not in active_ids:
@@ -2201,6 +2205,31 @@ class AgentLoop:
                     data={"validator_id": validator.id, "reason": "disabled"},
                     level="debug",
                 )
+        for binding in config.output_validators:
+            if binding.validator_id not in registered_ids:
+                recorder.emit(
+                    "output.validator.skipped",
+                    data={"validator_id": binding.validator_id, "reason": "unknown_binding"},
+                    level="warning",
+                )
+
+    @staticmethod
+    def _clear_finish_metadata(context: AgentToolContext) -> None:
+        """Reset the metadata a run.finish populated, so a REJECTED finish can't leak its
+        outputs/notes into close() or re-settle the next turn on a stale flag."""
+        context.finished = False
+        context.final_text = ""
+        context.final_outputs = []
+        context.final_notes = None
+
+    @staticmethod
+    def _log_finish_observations(state: RunState) -> None:
+        """Append this turn's pending tool outputs (the run.finish function_call_output, plus any
+        siblings) to the by-value log and clear them — so a by-value continuation never carries a
+        dangling function_call (no user/repair message can slip in ahead of the output)."""
+        for observation in state.pending_observations:
+            state.messages.append(_observation_message(observation, state.media_blobs))
+        state.pending_observations = ()
 
     async def _resolve_final_output(
         self,
@@ -2263,12 +2292,9 @@ class AgentLoop:
             state.output_values = dict(ok_values)  # keyed by validator id
             state.final_output = ok_values[-1][1] if ok_values else None  # back-compat: last ok wins
             if from_finish:
-                # Symmetric with the rejected path: log the run.finish (and any sibling) tool
-                # outputs now, so a multi-turn by-value continuation doesn't interleave the next
-                # user message before the function_call_output (which would dangle the call).
-                for observation in state.pending_observations:
-                    state.messages.append(_observation_message(observation, state.media_blobs))
-                state.pending_observations = ()
+                # The validated run.finish is the real answer — keep its metadata, but log its
+                # tool output before the run parks (multi-turn continuation needs it).
+                self._log_finish_observations(state)
             for validator_id, _value in ok_values:
                 recorder.emit("output.validator.satisfied", data={"validator_id": validator_id})
             return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
@@ -2298,6 +2324,11 @@ class AgentLoop:
                 },
                 level="warning",
             )
+            if from_finish:
+                # Exhausted on a rejected run.finish: clear its metadata (else close() reports the
+                # rejected outputs/notes) and log its tool output (the by-value log may continue).
+                self._clear_finish_metadata(context)
+                self._log_finish_observations(state)
             return Suspension(
                 reason="limited", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
             )
@@ -2306,20 +2337,12 @@ class AgentLoop:
 
         # Re-prompt: queue feedback and continue the pump.
         if from_finish:
-            # Clear ALL rejected-finish metadata, not just the flag — otherwise close() surfaces the
-            # rejected finish's outputs/notes even when the repair settles via plain final text, and
-            # the next turn would re-settle on the stale flag/text.
-            context.finished = False
-            context.final_text = ""
-            context.final_outputs = []
-            context.final_notes = None
-            state.final_text = ""
-            # The run.finish (and any sibling tool) calls are already recorded as assistant
-            # function_calls; log their matching function_call_outputs NOW — before the repair user
-            # message — so a by-value adapter never sends a dangling function_call. (The natural
+            # Rejected run.finish: clear its metadata, then log its tool output BEFORE the repair
+            # user message so a by-value adapter never sends a dangling function_call. (The natural
             # settle path has no pending observations: they were cleared at the call site.)
-            for observation in state.pending_observations:
-                state.messages.append(_observation_message(observation, state.media_blobs))
+            self._clear_finish_metadata(context)
+            state.final_text = ""
+            self._log_finish_observations(state)
         state.pending_observations = ()
         state.messages.append({"role": "user", "content": _output_repair_message(failures)})
         return None

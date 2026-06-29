@@ -551,6 +551,54 @@ def test_rejected_finish_tool_output_preserved_in_messages(tmp_path: Path) -> No
     assert tool_idx < user_repair_idx
 
 
+def test_exhausted_rejected_finish_metadata_cleared(tmp_path: Path) -> None:
+    # A run.finish rejected to exhaustion (max_output_retries=0) must not surface its outputs.
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"),),
+            ),
+        ]
+    )
+    result = AgentLoop(
+        spec=_spec(tmp_path, limits=RunLimits(max_output_retries=0)),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
+        output_validators=(ContainsOkValidator(),),
+    ).run_once("go")
+
+    assert result.status == "limited"
+    assert result.error_code == "output_validator_unsatisfied"
+    assert result.final_outputs == ()  # rejected finish's "stale.txt" must not leak
+
+
+def test_unknown_opt_out_binding_warns_at_bootstrap(tmp_path: Path) -> None:
+    sink = MemoryEventSink()
+    # A misspelled disable-binding ("json.stirct") matches no registered validator → it must be
+    # surfaced (not silently ignored), and the real validator ("json.strict") still runs.
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(),
+        output_validators=(OutputValidatorBinding(validator_id="json.stirct", enabled=False),),
+    )
+    adapter = FakeModelAdapter(turns=[_text_turn('{"summary": "ok"}')])
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        output_validators=(StrictJsonValidator(),),
+        event_sinks=(sink,),
+    ).run_once("go")
+
+    assert result.status == "completed"  # the real validator still ran (and passed)
+    skipped = [e for e in sink.events if e.type == "output.validator.skipped"]
+    assert any(
+        e.data.get("validator_id") == "json.stirct" and e.data.get("reason") == "unknown_binding"
+        for e in skipped
+    )
+
+
 def test_successful_finish_tool_output_logged_before_next_user_message(tmp_path: Path) -> None:
     # A validated run.finish in a multi-turn session must log its function_call_output before the
     # run parks, or the next user message interleaves ahead of it (dangling function_call).
