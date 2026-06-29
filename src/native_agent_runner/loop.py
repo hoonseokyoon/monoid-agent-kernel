@@ -262,6 +262,20 @@ def _failures_by_validator(history: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+@dataclass(frozen=True)
+class FinishResult:
+    """The final answer a successful ``run.finish`` produced — one value, not four loose fields.
+
+    Modelling the finish as a single optional value (``AgentToolContext.pending_finish``) makes the
+    lifecycle atomic: setting it = the run.finish tool fired; clearing it = ``pending_finish = None``.
+    A *partial* clear (the round-8 bug: reset the flag but leak the outputs) is no longer expressible.
+    """
+
+    summary: str
+    outputs: tuple[str, ...] = ()
+    notes: str | None = None
+
+
 @dataclass
 class AgentToolContext(ToolContext):
     run_id: str
@@ -271,10 +285,10 @@ class AgentToolContext(ToolContext):
     shell_service: ShellService
     web_service: WebService
     jobs_service: JobsService
-    final_text: str = ""
-    final_outputs: list[str] = field(default_factory=list)
-    final_notes: str | None = None
-    finished: bool = False
+    # The final answer, set by ``run.finish`` (None until then). Cleared (back to None) when a
+    # finish is REJECTED by an output validator. The four former fields (final_text/final_outputs/
+    # final_notes/finished) collapsed into this one value so the clear is all-or-nothing.
+    pending_finish: FinishResult | None = None
     plan: list[dict[str, Any]] = field(default_factory=list)
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     # Per-run capability leases (handles only). A tool handler reads ``capability_token`` to get
@@ -340,10 +354,7 @@ class AgentToolContext(ToolContext):
         self.recorder.emit("plan.updated", data={"items": items})
 
     def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
-        self.final_text = summary
-        self.final_outputs = list(outputs)
-        self.final_notes = notes
-        self.finished = True
+        self.pending_finish = FinishResult(summary, tuple(outputs), notes)
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.shell_service.execute(args, self._current_call)
@@ -1052,8 +1063,7 @@ class AgentLoop:
             state.output_values = {}
             state.output_failure_history = []
             # A run.finish in a prior submit must not short-circuit this one OR leak its
-            # outputs/notes into this turn's validator view / result (clears finished + final_text
-            # + final_outputs + final_notes).
+            # outputs/notes into this turn's validator view / result (drops pending_finish).
             self._clear_finish_metadata(res.context)
             # Drop a stale stop/pause so neither can immediately halt this fresh turn.
             self._interrupt_requested = False
@@ -2224,12 +2234,10 @@ class AgentLoop:
 
     @staticmethod
     def _clear_finish_metadata(context: AgentToolContext) -> None:
-        """Reset the metadata a run.finish populated, so a REJECTED finish can't leak its
-        outputs/notes into close() or re-settle the next turn on a stale flag."""
-        context.finished = False
-        context.final_text = ""
-        context.final_outputs = []
-        context.final_notes = None
+        """Drop the answer a run.finish populated, so a REJECTED finish can't leak its
+        outputs/notes into close() or re-settle the next turn on a stale flag. One assignment —
+        the four former fields are now a single value, so a partial clear is impossible."""
+        context.pending_finish = None
 
     @staticmethod
     def _log_finish_observations(state: RunState) -> None:
@@ -2256,7 +2264,7 @@ class AgentLoop:
         ``None`` to continue the pump (a re-prompt has been queued). Raises ``OutputValidatorError``
         on a validator *defect* (terminalized by the loop's broad boundary). Called just before
         each ``Suspension(reason="settled")`` return; the ``run.finish`` site passes
-        ``from_finish=True`` so the stale ``context.finished`` flag is cleared before a re-prompt.
+        ``from_finish=True`` so the stale ``pending_finish`` is cleared before a re-prompt.
 
         The validators are run off the event loop (``asyncio.to_thread``) so a slow/blocking
         validator never stalls the loop; all emits + state mutation stay on the loop thread.
@@ -2385,7 +2393,7 @@ class AgentLoop:
         return FinalOutputView(
             final_text=state.final_text,
             artifacts=artifacts,
-            final_outputs=tuple(context.final_outputs),
+            final_outputs=(context.pending_finish.outputs if context.pending_finish else ()),
             read_bytes=_read,
         )
 
@@ -2916,8 +2924,8 @@ class AgentLoop:
             )
             state.pending_observations = tuple(observations)
 
-            if context.finished:
-                state.final_text = context.final_text
+            if context.pending_finish is not None:
+                state.final_text = context.pending_finish.summary
                 settled = await self._resolve_final_output(
                     state, res, context, turn, runtime_config, from_finish=True
                 )
@@ -3133,8 +3141,8 @@ class AgentLoop:
             diff_path=diff_path,
             proposal_path=run_dir / "proposal.json",
             artifacts=artifacts,
-            final_outputs=tuple(context.final_outputs),
-            final_notes=context.final_notes,
+            final_outputs=(context.pending_finish.outputs if context.pending_finish else ()),
+            final_notes=(context.pending_finish.notes if context.pending_finish else None),
             final_output=state.final_output,
             outputs=dict(state.output_values),
             metrics=metrics,
