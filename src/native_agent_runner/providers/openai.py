@@ -137,7 +137,11 @@ class OpenAIModelAdapter:
                             index=int(getattr(event, "output_index", 0) or 0),
                             arguments_fragment=frag,
                         )
-                elif etype == "response.completed":
+                elif etype in ("response.completed", "response.incomplete"):
+                    # Capture the terminal response for BOTH outcomes: ``response.incomplete``
+                    # (max_output_tokens / content_filter) carries status="incomplete" +
+                    # incomplete_details, which _stop_reason_from_response maps to length/refusal.
+                    # Without it a truncated/refused stream would report a normal "stop".
                     response = getattr(event, "response", None)
                     if response is not None and hasattr(response, "model_dump"):
                         final_data = response.model_dump()
