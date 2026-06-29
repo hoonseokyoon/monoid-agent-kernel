@@ -179,6 +179,59 @@ def test_validator_defect_terminalizes(tmp_path: Path) -> None:
     assert result.error_code == "output_validator_error"
 
 
+# --- textless refusal / truncation (review fix ①) -----------------------------------------
+
+
+def test_textless_refusal_settles_output_refused(tmp_path: Path) -> None:
+    # An OpenAI refusal content part yields stop_reason="refusal" with NO final text — it must
+    # still settle output_refused, not the "neither text nor tool calls" model error.
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text=None, stop_reason="refusal")])
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("json.strict"),
+        output_validators=(StrictJsonValidator(),),
+    ).run_once("go")
+
+    assert result.status == "failed"
+    assert result.error_code == "output_refused"
+
+
+def test_textless_truncation_settles_output_truncated(tmp_path: Path) -> None:
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text=None, stop_reason="length")])
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("json.strict"),
+        output_validators=(StrictJsonValidator(),),
+    ).run_once("go")
+
+    assert result.status == "limited"
+    assert result.error_code == "output_truncated"
+
+
+# --- per-turn validator gating honors a config hot-swap (review fix ②) ---------------------
+
+
+def test_active_validators_resolve_from_per_turn_config(tmp_path: Path) -> None:
+    # Gating resolves from the *given* config, so a mid-run replace_runtime_config that adds a
+    # disabling binding takes effect (vs the old bootstrap-frozen tuple).
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=FakeModelAdapter(),
+        runtime_config_provider=_provider("json.strict"),
+        output_validators=(StrictJsonValidator(),),
+    )
+    enabled = AgentRuntimeConfig(definition_id="t", tools=())  # default-on, no binding
+    disabled = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(),
+        output_validators=(OutputValidatorBinding(validator_id="json.strict", enabled=False),),
+    )
+    assert len(loop._active_output_validators(enabled)) == 1
+    assert loop._active_output_validators(disabled) == ()
+
+
 # --- refusal / truncation (item A) --------------------------------------------------------
 
 

@@ -596,8 +596,6 @@ class _RunResources:
     started: float
     deadline: float | None
     static_segments: tuple[str, ...]
-    # Output validators active for this run (registered ∩ enabled-in-config), resolved at bootstrap.
-    active_output_validators: tuple[OutputValidator, ...] = ()
 
 
 @dataclass
@@ -2166,6 +2164,7 @@ class AgentLoop:
                     "agent_config_hash": initial_runtime_config.config_hash,
                 },
             )
+        self._emit_bootstrap_validator_skips(initial_runtime_config, recorder)
         return _RunResources(
             workspace=workspace,
             recorder=recorder,
@@ -2174,25 +2173,34 @@ class AgentLoop:
             started=started,
             deadline=deadline,
             static_segments=tuple(static_segments),
-            active_output_validators=self._resolve_active_validators(initial_runtime_config, recorder),
         )
 
-    def _resolve_active_validators(
-        self, config: AgentRuntimeConfig, recorder: AgentRecorder
+    def _active_output_validators(
+        self, config: AgentRuntimeConfig | None
     ) -> tuple[OutputValidator, ...]:
-        """Active set = every registered validator EXCEPT those a config binding explicitly
-        disables (**default on**). A binding is a per-run opt-out / override: ``enabled=False``
-        turns a validator off and emits ``output.validator.skipped`` (reason ``disabled``)."""
+        """Validators that run this settle: every registered validator EXCEPT those a config
+        binding disables (**default on**). Resolved from the *per-turn* config so a mid-run hot-swap
+        (``replace_runtime_config`` adding ``OutputValidatorBinding(enabled=False)``) takes effect.
+        ``config is None`` (pre-bootstrap) → all registered. Pure — no events/state."""
+        if config is None:
+            return self.output_validators
         disabled_ids = {b.validator_id for b in config.output_validators if not b.enabled}
-        active = tuple(v for v in self.output_validators if v.id not in disabled_ids)
+        return tuple(v for v in self.output_validators if v.id not in disabled_ids)
+
+    def _emit_bootstrap_validator_skips(
+        self, config: AgentRuntimeConfig, recorder: AgentRecorder
+    ) -> None:
+        """One-time discoverability at bootstrap: emit ``output.validator.skipped`` for each
+        registered validator a config binding disables. Per-turn gating re-resolves via
+        ``_active_output_validators`` so a later config change is honored."""
+        active_ids = {v.id for v in self._active_output_validators(config)}
         for validator in self.output_validators:
-            if validator.id in disabled_ids:
+            if validator.id not in active_ids:
                 recorder.emit(
                     "output.validator.skipped",
                     data={"validator_id": validator.id, "reason": "disabled"},
                     level="debug",
                 )
-        return active
 
     async def _resolve_final_output(
         self,
@@ -2200,6 +2208,7 @@ class AgentLoop:
         res: _RunResources,
         context: AgentToolContext,
         turn: ModelTurn,
+        runtime_config: AgentRuntimeConfig,
         *,
         from_finish: bool,
     ) -> Suspension | None:
@@ -2231,7 +2240,7 @@ class AgentLoop:
                 reason="limited", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
             )
 
-        validators = res.active_output_validators
+        validators = self._active_output_validators(runtime_config)  # per-turn (honors hot-swap)
         if not validators:
             return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
 
@@ -2797,12 +2806,19 @@ class AgentLoop:
                         awaiting_task_ids=tuple(external),
                         has_external=bool(external),
                     )
-                if turn.final_text:
-                    state.final_text = turn.final_text
+                # Settle on final text — OR on a refusal/truncation even when the model emitted no
+                # text (an OpenAI ``refusal`` content part yields stop_reason="refusal" with
+                # final_text=None; a zero-token cap yields "length"). Those must reach the
+                # refusal/truncation branch (output_refused / output_truncated), not the
+                # "neither text nor tool calls" error below.
+                if turn.final_text or turn.stop_reason in ("refusal", "length"):
+                    state.final_text = turn.final_text or ""
                     # The model has consumed the pending observations and settled;
                     # the next submit must not resend them alongside a new message.
                     state.pending_observations = ()
-                    settled = await self._resolve_final_output(state, res, context, turn, from_finish=False)
+                    settled = await self._resolve_final_output(
+                        state, res, context, turn, runtime_config, from_finish=False
+                    )
                     if settled is None:
                         continue  # output validation failed → repair queued, re-pump
                     return settled
@@ -2843,7 +2859,9 @@ class AgentLoop:
 
             if context.finished:
                 state.final_text = context.final_text
-                settled = await self._resolve_final_output(state, res, context, turn, from_finish=True)
+                settled = await self._resolve_final_output(
+                    state, res, context, turn, runtime_config, from_finish=True
+                )
                 if settled is None:
                     continue  # output validation failed → repair queued, re-pump
                 return settled
@@ -3094,7 +3112,7 @@ class AgentLoop:
                 "changed_paths": public_changed,
                 # Output-validation summary for this settle: how many validators were active and
                 # how many re-prompts the run spent satisfying them (0 when none ran).
-                "output_validators": len(res.active_output_validators),
+                "output_validators": len(self._active_output_validators(state.previous_runtime_config)),
                 "output_retries": state.output_retries,
             },
         )

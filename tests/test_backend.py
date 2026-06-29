@@ -637,6 +637,21 @@ def test_backend_runs_output_validator_with_retry(tmp_path: Path) -> None:
     assert backend.result(submission.run_id, submission.run_token)["final_output"] == "ok done"
 
 
+def test_json_safe_sanitizes_nested_non_json() -> None:
+    # A validator value nested inside a dict/list that isn't JSON-serializable must not 500 the
+    # status/result projection (review fix ③: _json_safe is deep, not shallow).
+    from native_agent_runner.reference.backend.service import _json_safe
+
+    class _Model:
+        def __repr__(self) -> str:
+            return "Model()"
+
+    out = _json_safe({"a": [_Model()], "b": {"c": _Model()}})
+    json.dumps(out)  # must not raise — proves the whole structure is JSON-safe
+    assert out["a"][0] == "Model()"
+    assert out["b"]["c"] == "Model()"
+
+
 def test_backend_resume_carries_providers(tmp_path: Path) -> None:
     # A parked run resumed by a fresh backend (simulated restart) must re-attach providers —
     # they are backend-instance fields read at every loop build, including the resume site.

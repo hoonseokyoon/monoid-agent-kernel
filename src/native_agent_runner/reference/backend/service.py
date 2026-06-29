@@ -207,12 +207,14 @@ class _PreparedRun:
 
 
 def _json_safe(value: Any) -> Any:
-    """Render an output validator's value safe for a JSON wire projection. Primitive/container
-    JSON types pass through; anything else (a Pydantic model, a dataclass, bytes) is stringified,
-    so a non-serializable ``final_output`` can never break the HTTP response."""
-    if value is None or isinstance(value, (str, int, float, bool, dict, list)):
-        return value
-    return repr(value)
+    """Render an output validator's value safe for a JSON wire projection **at any nesting depth**.
+    Round-trips through json with a ``repr`` fallback so a non-serializable value — a Pydantic
+    model, dataclass, or bytes, even nested inside a dict/list — can never 500 the HTTP response
+    when the edge later ``json.dumps`` it."""
+    try:
+        return json.loads(json.dumps(value, default=repr))
+    except (TypeError, ValueError):
+        return repr(value)
 
 
 @dataclass
