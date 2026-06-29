@@ -2293,11 +2293,22 @@ class AgentLoop:
                 reason="limited", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
             )
 
-        # Re-prompt: queue feedback and continue the pump. Per-site cleanup — the run.finish settle
-        # sets context.finished + final_text, which must be cleared or the next turn re-settles stale.
+        # Re-prompt: queue feedback and continue the pump.
         if from_finish:
+            # Clear ALL rejected-finish metadata, not just the flag — otherwise close() surfaces the
+            # rejected finish's outputs/notes even when the repair settles via plain final text, and
+            # the next turn would re-settle on the stale flag/text.
             context.finished = False
+            context.final_text = ""
+            context.final_outputs = []
+            context.final_notes = None
             state.final_text = ""
+            # The run.finish (and any sibling tool) calls are already recorded as assistant
+            # function_calls; log their matching function_call_outputs NOW — before the repair user
+            # message — so a by-value adapter never sends a dangling function_call. (The natural
+            # settle path has no pending observations: they were cleared at the call site.)
+            for observation in state.pending_observations:
+                state.messages.append(_observation_message(observation, state.media_blobs))
         state.pending_observations = ()
         state.messages.append({"role": "user", "content": _output_repair_message(failures)})
         return None

@@ -497,6 +497,60 @@ def test_repair_turn_with_non_finish_tool_does_not_resettle(tmp_path: Path) -> N
     assert len(adapter.requests) == 3  # all three turns ran; no premature re-settle
 
 
+# --- run.finish repair: don't leak rejected-finish metadata / drop its tool output (re-review) -
+
+
+def test_rejected_finish_metadata_cleared_on_natural_repair(tmp_path: Path) -> None:
+    # A rejected run.finish (with outputs) repaired by a plain final-text answer must NOT surface
+    # the rejected finish's outputs at close().
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"),),
+            ),
+            _text_turn("ok now"),
+        ]
+    )
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
+        output_validators=(ContainsOkValidator(),),
+    ).run_once("go")
+
+    assert result.status == "completed"
+    assert result.final_output == "ok now"
+    assert result.final_outputs == ()  # the rejected finish's "stale.txt" must not leak
+
+
+def test_rejected_finish_tool_output_preserved_in_messages(tmp_path: Path) -> None:
+    # The repair turn must carry the run.finish function_call_output (tool message) BEFORE the
+    # validator-feedback user message — else a by-value adapter sees a dangling function_call.
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "bad"}, "c1"),)),
+            _text_turn("ok now"),
+        ]
+    )
+    AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
+        output_validators=(ContainsOkValidator(),),
+    ).run_once("go")
+
+    repair_msgs = adapter.requests[1].messages or ()
+    tool_idx = next(
+        i for i, m in enumerate(repair_msgs) if m.get("role") == "tool" and m.get("call_id") == "c1"
+    )
+    user_repair_idx = next(
+        i for i, m in enumerate(repair_msgs)
+        if m.get("role") == "user" and "did not satisfy" in str(m.get("content", ""))
+    )
+    assert tool_idx < user_repair_idx
+
+
 # --- turn.settled validation summary ------------------------------------------------------
 
 
