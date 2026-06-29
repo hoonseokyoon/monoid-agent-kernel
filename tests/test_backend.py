@@ -13,6 +13,7 @@ import pytest
 from conftest import http_json, runtime_config, tool_binding, wait_http_ready
 
 from native_agent_runner.core._util import write_json_atomic
+from native_agent_runner.core.agents import AgentRuntimeConfig, OutputValidatorBinding
 from native_agent_runner.core.checkpoint import RunCheckpoint
 from native_agent_runner.core.tool_surface import ToolScope
 from native_agent_runner.core.spec import ModelRetryConfig
@@ -544,6 +545,44 @@ def test_backend_replace_runtime_config_accepts_provider_tool(tmp_path: Path) ->
         config=runtime_config("fs.read", "fs.write", "run.finish", "skill"),
     )
     assert result["config_version"] > current.config_version
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_replace_runtime_config_preserves_output_validators(tmp_path: Path) -> None:
+    # A hot-swap whose version isn't greater triggers an auto-bump rebuild; that rebuild must NOT
+    # drop the output_validators opt-out (else a disabled validator keeps running).
+    workspace = _workspace(tmp_path)
+    token_manager = _token_manager()
+    backend = _provider_backend(
+        tmp_path / "runs", token_manager, workspace, turns=[ModelTurn(response_id="r1", final_text="first")]
+    )
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hi",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert _wait_for(lambda: backend._record(run_id).status == "awaiting_input")
+
+    current = backend.current_runtime_config(run_id)
+    binding = OutputValidatorBinding(validator_id="x", enabled=False)
+    new_cfg = AgentRuntimeConfig(
+        definition_id="t",
+        config_version=current.config_version,  # not greater → auto-bump rebuild path
+        tools=(tool_binding("fs.read"), tool_binding("fs.write"), tool_binding("run.finish")),
+        output_validators=(binding,),
+    )
+    backend.replace_runtime_config(
+        run_id, token, expected_version=current.config_version, issuer="test", reason="opt out", config=new_cfg
+    )
+    assert backend._record(run_id).runtime_config.output_validators == (binding,)
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)
 

@@ -12,7 +12,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -1244,15 +1244,10 @@ class RunnerBackend:
                     f"runtime config version mismatch: expected {expected_version}, current {current_version}"
                 )
             if config.config_version <= current_version:
-                config = AgentRuntimeConfig(
-                    definition_id=config.definition_id,
-                    config_version=current_version + 1,
-                    model=config.model,
-                    prompt=config.prompt,
-                    tools=config.tools,
-                    tool_search=config.tool_search,
-                    metadata=config.metadata,
-                )
+                # Auto-bump the version, preserving every other field (incl. output_validators).
+                # replace() copies all fields, so a new config field can't be silently dropped on
+                # hot-swap (an enumerated rebuild here previously dropped output-validator opt-outs).
+                config = replace(config, config_version=current_version + 1)
             record.runtime_config = config
             record.runtime_config_issuer = issuer
             record.runtime_config_reason = reason
