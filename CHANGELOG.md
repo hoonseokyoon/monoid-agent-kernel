@@ -7,6 +7,33 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-29
+
+### Added
+- **OutputValidator** — developer-supplied validation of the final response with a
+  bounded re-prompt loop. Register via `AgentLoop(output_validators=...)`; validators
+  run **default-on**, opt out per-run with `OutputValidatorBinding(enabled=False)`. A
+  rejection re-prompts the model with the validator's feedback, bounded by the new
+  `RunLimits.max_output_retries`. Adds `AgentRunResult.final_output` /
+  `outputs[validator_id]` / `output_as(Model)`, the `output.validator.*` event family
+  (satisfied / validation.failed / exhausted / error / skipped), OTel span events, and
+  a Studio + backend (`RunnerBackend(output_validators=...)`) seam.
+- `ModelTurn.stop_reason` promotion: a provider refusal or truncation now settles as
+  `output_refused` / `output_truncated` instead of a generic "neither text nor tool
+  calls" model error.
+
+### Changed
+- The settle path is now a pure `_decide_settle` (classification) plus a single
+  `_apply_settle` (state mutation + events + Suspension), and the four run.finish
+  metadata fields collapsed into one `pending_finish` value — a behavior-preserving
+  refactor that makes the validation lifecycle a single atomic transition.
+
+### Fixed
+- OpenAI adapter: capture `response.incomplete` in the streamed turn so truncations and
+  refusals carry the correct `stop_reason`.
+- Backend: `status()` falls back to the terminal result's `final_output` for
+  stream-driven runs; resilient `status.json` reads under a concurrent atomic replace.
+
 ## [0.12.0] - 2026-06-27
 
 ### Added
