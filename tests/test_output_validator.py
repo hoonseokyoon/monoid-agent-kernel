@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 from conftest import runtime_provider, tool_binding
 
 from native_agent_runner.core.agents import AgentRuntimeConfig, OutputValidatorBinding
@@ -824,3 +826,104 @@ def test_validate_flags_unknown_validator_binding() -> None:
         output_validators=(OutputValidatorBinding(validator_id="json.strict", enabled=False),),
     )
     assert not any("validator_id" in issue for issue in AgentLoop.validate(good, output_validators=(StrictJsonValidator(),)))
+
+
+# --- settle-FSM refactor: lifecycle matrix + decide/apply purity --------------------------
+
+
+@pytest.mark.parametrize("case", ["no_validators", "accepted", "reprompt_then_natural", "exhausted"])
+def test_finish_metadata_lifecycle_matrix(tmp_path: Path, case: str) -> None:
+    """One place that pins the run.finish metadata lifecycle — the bug class behind 5 review
+    rounds. Invariant: a finish's outputs survive to the result IFF that finish was accepted; a
+    rejected/exhausted finish leaks nothing. Each row also confirms the final_text outcome."""
+    finish_outputs = ["keep.txt"]
+    if case == "no_validators":
+        # No validators: the finish is accepted as-is and keeps its outputs.
+        adapter = FakeModelAdapter(turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "all good", "outputs": finish_outputs}, "c1"),)),
+        ])
+        result = AgentLoop(
+            spec=_spec(tmp_path), model_adapter=adapter,
+            runtime_config_provider=_provider(tools=("run.finish",)), output_validators=(),
+        ).run_once("go")
+        assert result.status == "completed"
+        assert result.final_outputs == ("keep.txt",)  # accepted finish keeps its outputs
+        assert result.final_text == "all good"
+    elif case == "accepted":
+        adapter = FakeModelAdapter(turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "ok done", "outputs": finish_outputs}, "c1"),)),
+        ])
+        result = AgentLoop(
+            spec=_spec(tmp_path), model_adapter=adapter,
+            runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
+            output_validators=(ContainsOkValidator(),),
+        ).run_once("go")
+        assert result.status == "completed"
+        assert result.final_outputs == ("keep.txt",)  # validated finish keeps its outputs
+        assert result.final_output == "ok done"
+    elif case == "reprompt_then_natural":
+        # A rejected finish (with outputs) repaired by a natural answer: the finish's outputs are
+        # cleared and must not leak; the final settle is a plain text answer (no outputs).
+        adapter = FakeModelAdapter(turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"),)),
+            _text_turn("ok now"),
+        ])
+        result = AgentLoop(
+            spec=_spec(tmp_path), model_adapter=adapter,
+            runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
+            output_validators=(ContainsOkValidator(),),
+        ).run_once("go")
+        assert result.status == "completed"
+        assert result.final_outputs == ()  # rejected finish's outputs cleared
+        assert result.final_output == "ok now"
+    else:  # exhausted
+        adapter = FakeModelAdapter(turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"),)),
+        ])
+        result = AgentLoop(
+            spec=_spec(tmp_path, limits=RunLimits(max_output_retries=0)), model_adapter=adapter,
+            runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
+            output_validators=(ContainsOkValidator(),),
+        ).run_once("go")
+        assert result.status == "limited"
+        assert result.error_code == "output_validator_unsatisfied"
+        assert result.final_outputs == ()  # rejected finish's OUTPUTS cleared (the leak that mattered)
+        # An exhausted finish keeps its summary as final_text (the "Stopped…" fallback only fills an
+        # EMPTY final_text); only the outputs/notes are dropped. This pins the existing contract.
+        assert result.final_text == "bad"
+
+
+def test_decide_settle_is_pure(tmp_path: Path) -> None:
+    # _decide_settle classifies WITHOUT mutating state or emitting — the contract that lets it run
+    # off the event loop (asyncio.to_thread) and keeps every side effect in _apply_settle. Calling
+    # it twice on the same inputs must be idempotent: no retry-budget bump, no history growth, no events.
+    sink = MemoryEventSink()
+    adapter = FakeModelAdapter(turns=[_text_turn("placeholder")])
+    loop = AgentLoop(
+        spec=_spec(tmp_path), model_adapter=adapter,
+        runtime_config_provider=_provider("contains.ok"),
+        output_validators=(ContainsOkValidator(),),
+        event_sinks=(sink,),
+    )
+    loop.open()
+    try:
+        session = loop._session
+        assert session is not None
+        state, res = session.state, session.res
+        state.final_text = "bad"  # ContainsOkValidator rejects (no "ok") → a reprompt decision
+        config = AgentRuntimeConfig(definition_id="t", tools=(), output_validators=())
+        turn = _text_turn("bad")
+
+        before_retries = state.output_retries
+        before_history = list(state.output_failure_history)
+        before_events = len(sink.events)
+
+        d1 = asyncio.run(loop._decide_settle(state, res, res.context, turn, config))
+        d2 = asyncio.run(loop._decide_settle(state, res, res.context, turn, config))
+
+        assert d1.kind == "reprompt" and d2.kind == "reprompt"
+        assert state.output_retries == before_retries  # no budget bump in decide
+        assert state.output_failure_history == before_history  # no history append in decide
+        assert len(sink.events) == before_events  # decide emits nothing
+    finally:
+        loop.close()
