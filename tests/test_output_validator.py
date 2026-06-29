@@ -599,6 +599,41 @@ def test_unknown_opt_out_binding_warns_at_bootstrap(tmp_path: Path) -> None:
     )
 
 
+def test_finish_output_logged_when_all_validators_disabled(tmp_path: Path) -> None:
+    # Validators registered but all disabled → a run.finish still logs its tool output before the
+    # run parks (the no-active-validator fast path must not skip the finish bookkeeping).
+    config = AgentRuntimeConfig(
+        definition_id="t",
+        tools=(tool_binding("run.finish"),),
+        output_validators=(OutputValidatorBinding(validator_id="contains.ok", enabled=False),),
+    )
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "anything"}, "c1"),)),
+            _text_turn("second answer"),
+        ]
+    )
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        output_validators=(ContainsOkValidator(),),
+    )
+    loop.open()
+    loop.submit("first")
+    loop.submit("second")
+    loop.close()
+
+    second_msgs = adapter.requests[1].messages or ()
+    tool_idx = next(
+        i for i, m in enumerate(second_msgs) if m.get("role") == "tool" and m.get("call_id") == "c1"
+    )
+    user2_idx = next(
+        i for i, m in enumerate(second_msgs) if m.get("role") == "user" and "second" in str(m.get("content", ""))
+    )
+    assert tool_idx < user2_idx
+
+
 def test_successful_finish_tool_output_logged_before_next_user_message(tmp_path: Path) -> None:
     # A validated run.finish in a multi-turn session must log its function_call_output before the
     # run parks, or the next user message interleaves ahead of it (dangling function_call).

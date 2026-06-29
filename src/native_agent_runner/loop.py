@@ -2271,6 +2271,11 @@ class AgentLoop:
 
         validators = self._active_output_validators(runtime_config)  # per-turn (honors hot-swap)
         if not validators:
+            # No validator runs (none registered, or all disabled for this turn), but a run.finish
+            # still produced a tool output that must be logged before parking — same bookkeeping as
+            # a validated finish, so a multi-turn by-value continuation isn't left dangling.
+            if from_finish:
+                self._log_finish_observations(state)
             return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
 
         view = self._build_final_output_view(state, res, context)
