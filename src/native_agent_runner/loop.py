@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import Any
+from typing import Any, Literal
 
 from native_agent_runner.core._util import sha256_bytes
 from native_agent_runner.core.cancellation import CancellationToken
