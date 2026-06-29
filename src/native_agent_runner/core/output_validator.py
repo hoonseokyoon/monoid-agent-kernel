@@ -61,8 +61,9 @@ class FinalOutputView:
 class OutputValidator(Protocol):
     """A developer-supplied check on a run's final response.
 
-    Register validators via ``AgentLoop(output_validators=...)`` and enable them per run with an
-    ``OutputValidatorBinding`` in the runtime config (default off). ``validate`` returns a
+    Register validators via ``AgentLoop(output_validators=...)``; a registered validator runs **by
+    default** and a per-run ``OutputValidatorBinding(enabled=False)`` in the runtime config disables
+    it (default on — the binding is an opt-out, not an opt-in). ``validate`` returns a
     :class:`ValidationOutcome`; it may instead ``raise OutputRetry(feedback)`` (sugar for a
     rejection). A ``ValueError``/``pydantic.ValidationError`` raised from ``validate`` is also
     treated as a rejection (feedback = the message); any *other* exception is a validator defect

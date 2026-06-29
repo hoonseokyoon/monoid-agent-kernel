@@ -2262,19 +2262,28 @@ class AgentLoop:
         if not failures:
             state.output_values = dict(ok_values)  # keyed by validator id
             state.final_output = ok_values[-1][1] if ok_values else None  # back-compat: last ok wins
+            if from_finish:
+                # Symmetric with the rejected path: log the run.finish (and any sibling) tool
+                # outputs now, so a multi-turn by-value continuation doesn't interleave the next
+                # user message before the function_call_output (which would dangle the call).
+                for observation in state.pending_observations:
+                    state.messages.append(_observation_message(observation, state.media_blobs))
+                state.pending_observations = ()
             for validator_id, _value in ok_values:
                 recorder.emit("output.validator.satisfied", data={"validator_id": validator_id})
             return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
 
-        state.output_retries += 1
+        attempt = len(state.output_failure_history) + 1
         attempt_failures = [{"validator_id": vid, "feedback": fb} for vid, fb in failures]
-        state.output_failure_history.append({"attempt": state.output_retries, "failures": attempt_failures})
+        state.output_failure_history.append({"attempt": attempt, "failures": attempt_failures})
         recorder.emit(
             "output.validation.failed",
-            data={"attempt": state.output_retries, "failures": attempt_failures},
+            data={"attempt": attempt, "failures": attempt_failures},
             level="warning",
         )
-        if state.output_retries > self.spec.limits.max_output_retries:
+        if state.output_retries >= self.spec.limits.max_output_retries:
+            # Exhausted: every allowed re-prompt has been issued. output_retries counts the
+            # re-prompts actually made — not this terminal failed attempt (``attempt`` does that).
             state.status = "limited"
             state.final_text = state.final_text or "Stopped: the final response did not satisfy the output contract."
             state.error_code = "output_validator_unsatisfied"
@@ -2292,6 +2301,8 @@ class AgentLoop:
             return Suspension(
                 reason="limited", status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
             )
+
+        state.output_retries += 1  # an actual re-prompt is about to be queued
 
         # Re-prompt: queue feedback and continue the pump.
         if from_finish:

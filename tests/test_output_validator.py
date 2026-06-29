@@ -551,6 +551,71 @@ def test_rejected_finish_tool_output_preserved_in_messages(tmp_path: Path) -> No
     assert tool_idx < user_repair_idx
 
 
+def test_successful_finish_tool_output_logged_before_next_user_message(tmp_path: Path) -> None:
+    # A validated run.finish in a multi-turn session must log its function_call_output before the
+    # run parks, or the next user message interleaves ahead of it (dangling function_call).
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "ok done"}, "c1"),)),
+            _text_turn("ok bye"),
+        ]
+    )
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
+        output_validators=(ContainsOkValidator(),),
+    )
+    loop.open()
+    loop.submit("first")
+    loop.submit("second")
+    loop.close()
+
+    second_msgs = adapter.requests[1].messages or ()
+    tool_idx = next(
+        i for i, m in enumerate(second_msgs) if m.get("role") == "tool" and m.get("call_id") == "c1"
+    )
+    user2_idx = next(
+        i for i, m in enumerate(second_msgs) if m.get("role") == "user" and "second" in str(m.get("content", ""))
+    )
+    assert tool_idx < user2_idx
+
+
+# --- output_retries counts re-prompts, not failed attempts (review fix ⑤) -----------------
+
+
+def test_output_retries_counts_reprompts_not_failed_attempts(tmp_path: Path) -> None:
+    sink = MemoryEventSink()
+    adapter = FakeModelAdapter(turns=[_text_turn("bad one"), _text_turn("bad two")])
+    result = AgentLoop(
+        spec=_spec(tmp_path, limits=RunLimits(max_output_retries=1)),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("json.strict"),
+        output_validators=(StrictJsonValidator(),),
+        event_sinks=(sink,),
+    ).run_once("go")
+
+    assert result.status == "limited"
+    exhausted = [e for e in sink.events if e.type == "output.validator.exhausted"][-1]
+    assert exhausted.data["retries"] == 1  # exactly one re-prompt issued...
+    assert len(exhausted.data["history"]) == 2  # ...though two attempts failed
+    assert result.metrics["output_validation"]["retries"] == 1
+
+
+def test_zero_retries_exhausts_with_zero_count(tmp_path: Path) -> None:
+    adapter = FakeModelAdapter(turns=[_text_turn("bad")])
+    result = AgentLoop(
+        spec=_spec(tmp_path, limits=RunLimits(max_output_retries=0)),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("json.strict"),
+        output_validators=(StrictJsonValidator(),),
+    ).run_once("go")
+
+    assert result.status == "limited"
+    assert result.metrics["output_validation"]["retries"] == 0  # no re-prompt occurred
+    assert len(adapter.requests) == 1  # single attempt, no re-prompt turn
+
+
 # --- turn.settled validation summary ------------------------------------------------------
 
 
