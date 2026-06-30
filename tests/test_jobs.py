@@ -14,12 +14,12 @@ from typing import Any
 
 import pytest
 
-from native_agent_runner.core.events import AgentEvent
-from native_agent_runner.tasks import BackgroundJob, TaskManager
-from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.recorder import AgentRecorder
-from native_agent_runner.shell import ShellExecutionOptions
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel.core.events import AgentEvent
+from monoid_agent_kernel.tasks import BackgroundJob, TaskManager
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.recorder import AgentRecorder
+from monoid_agent_kernel.shell import ShellExecutionOptions
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 from support.process import python_command as _python_command
 
 pytestmark = pytest.mark.integration

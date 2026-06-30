@@ -9,13 +9,13 @@ from urllib.request import Request, urlopen
 
 from support.http import http_get_json as _json_get
 
-from native_agent_runner.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
-from native_agent_runner.core.tool_surface import ToolGuidance
-from native_agent_runner.providers.base import ModelRequest, ModelTurn
-from native_agent_runner.providers.fake import fake_tool_call
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.reference.backend.http import create_backend_server
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
+from monoid_agent_kernel.core.tool_surface import ToolGuidance
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
+from monoid_agent_kernel.providers.fake import fake_tool_call
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.backend.http import create_backend_server
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 
 
 def _workspace(tmp_path: Path) -> Path:

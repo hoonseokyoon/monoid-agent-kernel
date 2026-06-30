@@ -13,11 +13,11 @@ from click.testing import CliRunner
 from support.http import http_get_json as _json_get, http_json
 from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.reference.backend.http import create_backend_server
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.cli import main
-from native_agent_runner.core.packages import (
+from monoid_agent_kernel.reference.backend.http import create_backend_server
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.cli import main
+from monoid_agent_kernel.core.packages import (
     apply_package,
     create_approval,
     export_package,
@@ -25,12 +25,12 @@ from native_agent_runner.core.packages import (
     verify_package,
     write_approval,
 )
-from native_agent_runner.core.schemas import validate_run_dir
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.errors import PermissionDenied, WorkspaceError
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.core.schemas import validate_run_dir
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.errors import PermissionDenied, WorkspaceError
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 def _provider(*tool_ids: str):

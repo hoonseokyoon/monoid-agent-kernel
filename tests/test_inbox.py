@@ -8,16 +8,16 @@ from typing import Any
 from support.runtime import runtime_config
 from support.waiting import eventually
 
-from native_agent_runner.core.checkpoint import RunCheckpoint
-from native_agent_runner.core.inbox import (
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+from monoid_agent_kernel.core.inbox import (
     INBOX_PROTOCOL_VERSION,
     InboxMessage,
     is_inbox_envelope,
 )
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.reference.backend.service import (
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.backend.service import (
     BackendRunRequest,
     RunnerBackend,
     _queued_message_to_loop_input,

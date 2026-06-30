@@ -10,20 +10,20 @@ import pytest
 from support.process import python_command as _python_command
 from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.checkpoint import (
+from monoid_agent_kernel.core.checkpoint import (
     SCHEMA_VERSION,
     LocalFsCheckpointStore,
     RunCheckpoint,
     read_checkpoint,
     write_checkpoint,
 )
-from native_agent_runner.core.spec import AgentRunSpec, RunLimits
-from native_agent_runner.errors import NativeAgentError
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn, ToolObservation
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.shell import ShellExecutionOptions
-from native_agent_runner.tasks import HostedTask
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn, ToolObservation
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.shell import ShellExecutionOptions
+from monoid_agent_kernel.tasks import HostedTask
 
 
 def _latest_checkpoint(spec: AgentRunSpec) -> RunCheckpoint | None:
@@ -434,7 +434,7 @@ def test_failed_turn_appends_no_assistant_message(tmp_path: Path) -> None:
         provider_name = "openai"
 
         def next_turn(self, request):  # noqa: ANN001, ANN201
-            from native_agent_runner.errors import ModelAdapterError
+            from monoid_agent_kernel.errors import ModelAdapterError
 
             raise ModelAdapterError("boom", error_code="provider_unavailable")
 
@@ -456,7 +456,7 @@ def test_failed_turn_appends_no_assistant_message(tmp_path: Path) -> None:
 def test_failed_run_writes_failure_bundle_and_keeps_checkpoint(tmp_path: Path) -> None:
     class _RaisingAdapter:
         def next_turn(self, request):  # noqa: ANN001, ANN201
-            from native_agent_runner.errors import ModelAdapterError
+            from monoid_agent_kernel.errors import ModelAdapterError
 
             raise ModelAdapterError("boom", error_code="provider_unavailable")
 

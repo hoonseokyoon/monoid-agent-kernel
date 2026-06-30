@@ -1,4 +1,4 @@
-"""CLI-level tests for `native-agent studio doctor` — the preflight that turns late, cryptic
+"""CLI-level tests for `monoid studio doctor` — the preflight that turns late, cryptic
 setup failures (busy port, unwritable dir, missing key, no browser) into an upfront checklist.
 """
 
@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from native_agent_runner.reference.studio.cli import studio
+from monoid_agent_kernel.reference.studio.cli import studio
 
 
 def _invoke(tmp_path: Path, *extra: str):
@@ -25,7 +25,7 @@ def _invoke(tmp_path: Path, *extra: str):
 
 def test_doctor_offline_all_good(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "native_agent_runner.reference.studio.window.find_chromium", lambda: "/usr/bin/chromium"
+        "monoid_agent_kernel.reference.studio.window.find_chromium", lambda: "/usr/bin/chromium"
     )
     result = _invoke(tmp_path)
     assert result.exit_code == 0, result.output
@@ -46,7 +46,7 @@ def test_doctor_openai_without_sdk_fails(tmp_path: Path, monkeypatch: pytest.Mon
     # doctor must report it instead of passing.
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setattr(
-        "native_agent_runner.reference.studio.cli._openai_sdk_importable", lambda: False
+        "monoid_agent_kernel.reference.studio.cli._openai_sdk_importable", lambda: False
     )
     result = _invoke(tmp_path, "--provider", "openai")
     assert result.exit_code == 1
@@ -55,7 +55,7 @@ def test_doctor_openai_without_sdk_fails(tmp_path: Path, monkeypatch: pytest.Mon
 
 
 def test_dir_writable_does_not_clobber_existing_files(tmp_path: Path) -> None:
-    from native_agent_runner.reference.studio.cli import _dir_writable
+    from monoid_agent_kernel.reference.studio.cli import _dir_writable
 
     d = tmp_path / "ws"
     d.mkdir()
@@ -76,7 +76,7 @@ def test_openai_sdk_probe_rejects_legacy_sdk_without_responses_api(
     import sys
     import types
 
-    from native_agent_runner.reference.studio.cli import _openai_sdk_importable
+    from monoid_agent_kernel.reference.studio.cli import _openai_sdk_importable
 
     legacy = types.ModuleType("openai")
     legacy.OpenAI = type("OpenAI", (), {})  # no `responses` attribute → too old
@@ -95,7 +95,7 @@ def test_doctor_missing_chromium_is_warning_not_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "native_agent_runner.reference.studio.window.find_chromium", lambda: None
+        "monoid_agent_kernel.reference.studio.window.find_chromium", lambda: None
     )
     result = _invoke(tmp_path)
     # No browser is a WARN, not a hard failure — serve still works headless.

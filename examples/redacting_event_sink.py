@@ -10,7 +10,7 @@ heuristic that used to live (always-on, unconfigurable) in the core as opt-in in
 
 Use it from the CLI:
 
-    native-agent run --workspace . --instruction "..." \
+    monoid run --workspace . --instruction "..." \
         --runtime-config-file examples/runtime-config.json \
         --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
         --event-sink-module examples/redacting_event_sink.py:make_sink
@@ -26,8 +26,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-from native_agent_runner.contracts import AgentEvent, EventSink
-from native_agent_runner.recorder import StdoutJsonlSink
+from monoid_agent_kernel.contracts import AgentEvent, EventSink
+from monoid_agent_kernel.recorder import StdoutJsonlSink
 
 # Tune these to your environment; this is your policy, not the runner's.
 SENSITIVE_KEY_FRAGMENTS = (

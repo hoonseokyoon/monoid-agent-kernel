@@ -6,13 +6,13 @@ from typing import Any
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
-from native_agent_runner.core.agents import compile_bound_tool_catalog
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.core.tool_surface import DefaultToolSurfaceResolver, ToolQuota
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.tools.base import ToolContext, ToolRegistry, ToolResult, ToolSpec
+from monoid_agent_kernel.core.agents import compile_bound_tool_catalog
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.tool_surface import DefaultToolSurfaceResolver, ToolQuota
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.tools.base import ToolContext, ToolRegistry, ToolResult, ToolSpec
 
 
 def _simple_tool(tool_id: str) -> ToolSpec:

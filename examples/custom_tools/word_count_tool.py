@@ -10,8 +10,8 @@ doesn't express.
 
 from __future__ import annotations
 
-from native_agent_runner import tool
-from native_agent_runner.tools.base import ToolContext, ToolResult, ToolSpec
+from monoid_agent_kernel import tool
+from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 
 # --- Recommended: @tool derives input_schema from the signature --------------------------

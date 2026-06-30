@@ -1,8 +1,8 @@
-# Native Agent Runner
+# Monoid Agent Kernel
 
 *A provider-neutral, permission-aware agent runtime for safe, structured file work — secrets stay outside the engine, and every seam (model, tools, workspace, checkpoint store) is replaceable.*
 
-[![CI](https://github.com/hoonseokyoon/modular-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/hoonseokyoon/modular-agent-kernel/actions/workflows/ci.yml)
+[![CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 
@@ -19,7 +19,7 @@ integration is a later adapter layer.
 
 ## See it run
 
-The bundled **Agent Studio** reference app (`native-agent studio serve`) drives the runner
+The bundled **Agent Studio** reference app (`monoid studio serve`) drives the runner
 through its Python API behind a single-page UI.
 
 ![Agent Studio: an agent reasons, runs Python, and produces a result in the workspace](docs/img/hero.png)
@@ -37,15 +37,15 @@ events are visible in the trace on the right.*
 
 The package is layered in three tiers:
 
-- **contracts** — the stable integration surface, collected in `native_agent_runner.contracts`
-  and re-exported from the top-level `native_agent_runner`. These are the specs and protocols you
+- **contracts** — the stable integration surface, collected in `monoid_agent_kernel.contracts`
+  and re-exported from the top-level `monoid_agent_kernel`. These are the specs and protocols you
   depend on and implement: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig`, `ModelAdapter`,
   `ToolSpec` / `@tool`, `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest. See
   [docs/CONTRACTS.md](docs/CONTRACTS.md) for the Python and HTTP wire contracts.
 - **core** — the engine that implements those contracts: the default, batteries-included runner
   (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). This is the supported
   implementation you actually run.
-- **reference** — example services under `native_agent_runner.reference` (`backend`,
+- **reference** — example services under `monoid_agent_kernel.reference` (`backend`,
   `llm_gateway`, `web_gateway`, `stores`). **Not** part of the supported surface: core never
   imports them, and real integrators are expected to build their own services against the
   contracts.
@@ -56,14 +56,14 @@ For the dynamic binding-based tool surface, see
 ## Install
 
 ```bash
-pip install native-agent-runner
+pip install monoid-agent-kernel
 ```
 
 Core has no provider SDK dependency. The direct OpenAI adapter (local smoke tests only;
 container/hosted runs use `GatewayModelAdapter`) is an optional extra:
 
 ```bash
-pip install "native-agent-runner[openai]"
+pip install "monoid-agent-kernel[openai]"
 ```
 
 ## Quickstart (no servers)
@@ -73,9 +73,9 @@ config — and `from_config` wires them in one call. `FakeModelAdapter` (a scrip
 makes the first turn run offline, with no gateway or API key:
 
 ```python
-from native_agent_runner import AgentLoop, AgentRunSpec, AgentRuntimeConfig, FakeModelAdapter
-from native_agent_runner import RegistryToolRef, ToolBinding
-from native_agent_runner.providers.base import ModelTurn
+from monoid_agent_kernel import AgentLoop, AgentRunSpec, AgentRuntimeConfig, FakeModelAdapter
+from monoid_agent_kernel import RegistryToolRef, ToolBinding
+from monoid_agent_kernel.providers.base import ModelTurn
 
 spec = AgentRunSpec(workspace_root="./workspace", mode="apply")
 config = AgentRuntimeConfig(
@@ -103,7 +103,7 @@ breaking changes are called out in commit messages and this README.
 - **Stable** — the core engine and the contracts it implements: `AgentLoop`, `AgentRunSpec`,
   `AgentRuntimeConfig` / `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `@tool`,
   `EventSink`, `CheckpointStore`, `Workspace` / `workspace_factory`, `PermissionPolicy`, and
-  the rest of `native_agent_runner.contracts`.
+  the rest of `monoid_agent_kernel.contracts`.
 - **Experimental** — surfaces still settling: the async-task seams (`TaskExecutor`,
   `ResultInjector`, `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
   `LoopSession`, `SessionState`, `ControlCommand` / `ControlDispatcher`); capability leases
@@ -113,7 +113,7 @@ breaking changes are called out in commit messages and this README.
   adapters); a text-only adapter drops them with a `model.input.degraded` warning.
   `AudioPart` / `VideoPart` round-trip as a forward-compatible contract but are not yet
   forwarded.
-- **Not a contract** — everything under `native_agent_runner.reference.*` is an example
+- **Not a contract** — everything under `monoid_agent_kernel.reference.*` is an example
   implementation; build your own services against the contracts instead.
 
 Agent configuration is centered on `AgentDefinition` (the reusable blueprint) and the
@@ -123,7 +123,7 @@ runtime config mid-run; the runner applies it at the next turn boundary.
 ## Run
 
 ```bash
-native-agent run \
+monoid run \
   --workspace examples/workspaces/edit_markdown_notes \
   --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
   --runtime-config-file examples/runtime-config.json \
@@ -139,7 +139,7 @@ web runtime values. You can pass a run spec JSON file with a runtime config
 file:
 
 ```bash
-native-agent run \
+monoid run \
   --spec examples/run-spec.json \
   --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
   --runtime-config-file examples/runtime-config.json
@@ -164,14 +164,14 @@ Use `--mode apply` for local direct workspace writes.
 ### Custom workspace backend
 
 The runner never touches the filesystem directly — it works through a `Workspace`
-(the file-storage surface in `native_agent_runner.contracts`). `AgentLoop` builds one
+(the file-storage surface in `monoid_agent_kernel.contracts`). `AgentLoop` builds one
 per run with `workspace_factory(spec)`, defaulting to `default_local_workspace_factory`,
 which returns the local-filesystem backend. Supply your own factory to back a run with a
 different store — a git worktree, an object store, a remote or in-memory filesystem —
 without changing the engine:
 
 ```python
-from native_agent_runner import AgentLoop, Workspace
+from monoid_agent_kernel import AgentLoop, Workspace
 
 def my_workspace_factory(spec) -> Workspace:
     return MyWorkspace(spec.workspace_root, mode=spec.mode)
@@ -204,7 +204,7 @@ normal workspace file, including dotfiles and keys. Backends can explicitly deny
 paths per run:
 
 ```bash
-native-agent run \
+monoid run \
   --workspace examples/workspaces/edit_markdown_notes \
   --instruction "Inspect this workspace." \
   --runtime-config-file examples/runtime-config.json \
@@ -230,7 +230,7 @@ arguments or shell commands is the backend's responsibility (see [Event Sinks](#
 
 ### Subagents, Skills, and capability gating
 
-Three optional features on `native-agent run`, each off unless its flag is set:
+Three optional features on `monoid run`, each off unless its flag is set:
 
 - `--agents-directory DIR` — load subagent definitions (`*.md` with frontmatter) from
   `DIR`, enabling the `agent.spawn` tool so the model can delegate to isolated child runs.
@@ -244,7 +244,7 @@ Three optional features on `native-agent run`, each off unless its flag is set:
 For machine-readable real-time progress:
 
 ```bash
-native-agent run \
+monoid run \
   --workspace examples/workspaces/edit_markdown_notes \
   --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
   --runtime-config-file examples/runtime-config.json \
@@ -260,8 +260,8 @@ status output goes to stderr in this mode.
 Replay or follow a run's public event stream:
 
 ```bash
-native-agent watch <run_id> --run-root ./runs --from-start --json
-native-agent watch <run_id> --run-root ./runs --follow
+monoid watch <run_id> --run-root ./runs --from-start --json
+monoid watch <run_id> --run-root ./runs --follow
 ```
 
 `--json` prints raw JSONL events. The default watch output is a compact human
@@ -270,22 +270,22 @@ view.
 Inspect the current proposed output snapshot:
 
 ```bash
-native-agent proposal <run_id> --run-root ./runs
-native-agent proposal <run_id> --run-root ./runs --file SUMMARY.md --json
+monoid proposal <run_id> --run-root ./runs
+monoid proposal <run_id> --run-root ./runs --file SUMMARY.md --json
 ```
 
 Inspect background shell jobs and logs:
 
 ```bash
-native-agent jobs <run_id> --run-root ./runs
-native-agent job status <job_id> --run <run_id> --run-root ./runs --json
-native-agent job logs <job_id> --run <run_id> --stream stdout --tail-bytes 4096
-native-agent job cancel <job_id> --run <run_id>
+monoid jobs <run_id> --run-root ./runs
+monoid job status <job_id> --run <run_id> --run-root ./runs --json
+monoid job logs <job_id> --run <run_id> --stream stdout --tail-bytes 4096
+monoid job cancel <job_id> --run <run_id>
 ```
 
 ## Backend (reference)
 
-> Reference example (`native_agent_runner.reference.backend`). Not part of the supported public
+> Reference example (`monoid_agent_kernel.reference.backend`). Not part of the supported public
 > surface — build your own backend against the contracts in [docs/CONTRACTS.md](docs/CONTRACTS.md).
 
 The standalone backend issues run tokens, starts runner jobs, and exposes status,
@@ -299,7 +299,7 @@ export NAR_BACKEND_ADMIN_TOKEN="admin-dev-token"
 export NAR_LLM_GATEWAY_ADMIN_TOKEN="llm-admin-dev-token"
 export NAR_BACKEND_TOKEN_SECRET="replace-with-32-plus-random-bytes"
 
-native-agent llm-gateway serve \
+monoid llm-gateway serve \
   --host 127.0.0.1 \
   --port 8080
 ```
@@ -308,7 +308,7 @@ Start the runner backend in another process. It shares the token signing secret
 with the LLM and Web gateways so it can issue scoped gateway tokens:
 
 ```bash
-native-agent backend serve \
+monoid backend serve \
   --workspace-root /workspaces \
   --run-root ./runs \
   --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
@@ -320,7 +320,7 @@ For local contract testing, start the reference fake WebGateway:
 ```bash
 export NAR_WEB_GATEWAY_ADMIN_TOKEN="web-admin-dev-token"
 
-native-agent web-gateway serve \
+monoid web-gateway serve \
   --host 127.0.0.1 \
   --port 8090 \
   --provider fake
@@ -336,7 +336,7 @@ runner:
 ```bash
 export BRAVE_SEARCH_API_KEY="..."
 
-native-agent web-gateway serve \
+monoid web-gateway serve \
   --host 127.0.0.1 \
   --port 8090 \
   --provider brave-http \
@@ -465,7 +465,7 @@ Programmatic callers can pass sinks to
 CLI callers can load sinks with:
 
 ```bash
-native-agent run \
+monoid run \
   --workspace . \
   --instruction "Inspect this workspace." \
   --runtime-config-file examples/runtime-config.json \
@@ -480,7 +480,7 @@ secret-looking values before forwarding — the recommended place to add secret
 redaction now that the core no longer guesses at secrets (see above):
 
 ```bash
-native-agent run \
+monoid run \
   --workspace . \
   --instruction "Inspect this workspace." \
   --runtime-config-file examples/runtime-config.json \
@@ -507,7 +507,7 @@ not nested), and spans carry GenAI attributes (`gen_ai.operation.name`, `gen_ai.
 `gen_ai.tool.name`, token usage). Wire it in with one line:
 
 ```python
-from native_agent_runner import AgentLoop, OtelEventSink
+from monoid_agent_kernel import AgentLoop, OtelEventSink
 
 loop = AgentLoop.from_config(spec, adapter, config, event_sinks=(OtelEventSink(),))
 ```
@@ -517,7 +517,7 @@ exporter). To actually export spans, install the SDK and an OTLP exporter and co
 `TracerProvider`:
 
 ```bash
-pip install "native-agent-runner[otel-export]"
+pip install "monoid-agent-kernel[otel-export]"
 ```
 
 [`examples/otel_tracing.py`](examples/otel_tracing.py) is a runnable, offline demo: it prints the

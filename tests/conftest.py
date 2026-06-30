@@ -30,7 +30,7 @@ if _HANG_TIMEOUT_S > 0:
     faulthandler.dump_traceback_later(_HANG_TIMEOUT_S, exit=True)
 
 
-from native_agent_runner.reference.backend.service import RunnerBackend
+from monoid_agent_kernel.reference.backend.service import RunnerBackend
 from support.studio_harness import studio as studio
 
 _ACTIVE_BACKENDS: list[RunnerBackend] = []

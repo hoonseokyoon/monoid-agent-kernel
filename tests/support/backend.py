@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from native_agent_runner.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
 
 
 def token_manager() -> TokenManager:

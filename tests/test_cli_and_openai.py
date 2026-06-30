@@ -10,10 +10,10 @@ from click.testing import CliRunner
 
 from support.runtime import runtime_config, tool_binding
 
-from native_agent_runner.cli import main
-from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
-from native_agent_runner.errors import ModelAdapterError
-from native_agent_runner.providers.base import (
+from monoid_agent_kernel.cli import main
+from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
+from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
     ReasoningDelta,
@@ -21,8 +21,8 @@ from native_agent_runner.providers.base import (
     TurnComplete,
     assemble_streamed_turn,
 )
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.providers.openai import (
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.providers.openai import (
     OpenAIModelAdapter,
     _capture_reasoning_items,
     _parse_response,
@@ -60,7 +60,7 @@ def test_cli_run_accepts_runtime_config_file(monkeypatch: pytest.MonkeyPatch, tm
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
-    monkeypatch.setattr("native_agent_runner.cli._model_adapter", lambda *_args, **_kwargs: adapter)
+    monkeypatch.setattr("monoid_agent_kernel.cli._model_adapter", lambda *_args, **_kwargs: adapter)
     config_file = _write_config(tmp_path / "runtime.json", "fs.read", "run.finish")
 
     result = CliRunner().invoke(
@@ -95,7 +95,7 @@ def test_cli_auto_grant_capabilities_gates_tool(monkeypatch: pytest.MonkeyPatch,
             ModelTurn(response_id="r2", final_text="done"),
         ]
     )
-    monkeypatch.setattr("native_agent_runner.cli._model_adapter", lambda *_a, **_k: adapter)
+    monkeypatch.setattr("monoid_agent_kernel.cli._model_adapter", lambda *_a, **_k: adapter)
     binding = tool_binding("fs.read", runtime={"requires_lease": True})
     config_file = tmp_path / "runtime.json"
     config_file.write_text(
@@ -122,7 +122,7 @@ def test_cli_capability_flags_are_mutually_exclusive(monkeypatch: pytest.MonkeyP
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setattr(
-        "native_agent_runner.cli._model_adapter",
+        "monoid_agent_kernel.cli._model_adapter",
         lambda *_a, **_k: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
     )
     config_file = _write_config(tmp_path / "runtime.json", "run.finish")
@@ -148,7 +148,7 @@ def test_cli_spec_file_pairs_with_runtime_config(monkeypatch: pytest.MonkeyPatch
     )
     config_file = _write_config(tmp_path / "runtime.json", "run.finish")
     adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
-    monkeypatch.setattr("native_agent_runner.cli._model_adapter", lambda *_args, **_kwargs: adapter)
+    monkeypatch.setattr("monoid_agent_kernel.cli._model_adapter", lambda *_args, **_kwargs: adapter)
 
     result = CliRunner().invoke(
         main,
@@ -163,7 +163,7 @@ def test_cli_permission_policy_flags_remain_run_boundary(monkeypatch: pytest.Mon
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
-    monkeypatch.setattr("native_agent_runner.cli._model_adapter", lambda *_args, **_kwargs: adapter)
+    monkeypatch.setattr("monoid_agent_kernel.cli._model_adapter", lambda *_args, **_kwargs: adapter)
     config_file = _write_config(tmp_path / "runtime.json", "run.finish")
 
     result = CliRunner().invoke(
@@ -198,7 +198,7 @@ def test_cli_requires_web_gateway_for_web_bindings(monkeypatch: pytest.MonkeyPat
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
-    monkeypatch.setattr("native_agent_runner.cli._model_adapter", lambda *_args, **_kwargs: adapter)
+    monkeypatch.setattr("monoid_agent_kernel.cli._model_adapter", lambda *_args, **_kwargs: adapter)
     config_file = _write_config(tmp_path / "runtime.json", "web.search", "run.finish")
 
     result = CliRunner().invoke(

@@ -13,10 +13,10 @@ from pathlib import Path
 
 from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 def _build_loop(tmp_path: Path, adapter: FakeModelAdapter) -> AgentLoop:

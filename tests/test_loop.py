@@ -5,20 +5,20 @@ from pathlib import Path
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
-from native_agent_runner.core.cancellation import CancellationToken
-from native_agent_runner.core.schemas import validate_run_dir
-from native_agent_runner.core.spec import AgentRunSpec, RunLimits
-from native_agent_runner.core.tool_surface import ToolQuota
-from native_agent_runner.errors import ModelAdapterError
-from native_agent_runner.loop import AgentLoop, _recoverable_turn_error
-from native_agent_runner.providers.base import ModelTurn, ReasoningDelta, TextDelta, TurnComplete
-from native_agent_runner.providers.fake import (
+from monoid_agent_kernel.core.cancellation import CancellationToken
+from monoid_agent_kernel.core.schemas import validate_run_dir
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.core.tool_surface import ToolQuota
+from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.loop import AgentLoop, _recoverable_turn_error
+from monoid_agent_kernel.providers.base import ModelTurn, ReasoningDelta, TextDelta, TurnComplete
+from monoid_agent_kernel.providers.fake import (
     FakeModelAdapter,
     FakeStreamingModelAdapter,
     fake_tool_call,
 )
-from native_agent_runner.recorder import MemoryEventSink
-from native_agent_runner.workspace.local import default_local_workspace_factory, sha256_bytes
+from monoid_agent_kernel.recorder import MemoryEventSink
+from monoid_agent_kernel.workspace.local import default_local_workspace_factory, sha256_bytes
 from support.process import python_command as _python_command
 
 
@@ -106,7 +106,7 @@ def test_workspace_delta_cap_settles_run_as_limited(tmp_path: Path) -> None:
 
 
 def test_default_system_prompt_is_composed_base(tmp_path: Path) -> None:
-    from native_agent_runner.core.prompt import compose_system_prompt
+    from monoid_agent_kernel.core.prompt import compose_system_prompt
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -798,7 +798,7 @@ def test_interrupt_aborts_stream_mid_generation(tmp_path: Path) -> None:
 
 
 def test_from_tools_wires_a_custom_tool_end_to_end(tmp_path: Path) -> None:
-    from native_agent_runner.tools.decorator import tool
+    from monoid_agent_kernel.tools.decorator import tool
 
     @tool(id="custom.echo", side_effect="read")
     def echo(text: str) -> dict:

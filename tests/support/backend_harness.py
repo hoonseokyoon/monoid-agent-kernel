@@ -19,29 +19,29 @@ from support.process import python_command as _python_command
 from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
 
-from native_agent_runner.core._util import write_json_atomic
-from native_agent_runner.core.agents import AgentRuntimeConfig, OutputValidatorBinding
-from native_agent_runner.core.checkpoint import RunCheckpoint
-from native_agent_runner.core.tool_surface import ToolScope
-from native_agent_runner.core.spec import ModelRetryConfig
-from native_agent_runner.errors import AgentConfigError, ModelAdapterError, PermissionDenied
-from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.core.content import ImagePart, TextPart
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import (
+from monoid_agent_kernel.core._util import write_json_atomic
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, OutputValidatorBinding
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.core.spec import ModelRetryConfig
+from monoid_agent_kernel.errors import AgentConfigError, ModelAdapterError, PermissionDenied
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.core.content import ImagePart, TextPart
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import (
     FakeModelAdapter,
     FakeMultimodalModelAdapter,
     fake_tool_call,
 )
-from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
-from native_agent_runner.skills import SkillDefinition, SkillProvider
-from native_agent_runner.reference.backend.http import create_backend_server
-from native_agent_runner.reference.backend.service import (
+from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManager
+from monoid_agent_kernel.skills import SkillDefinition, SkillProvider
+from monoid_agent_kernel.reference.backend.http import create_backend_server
+from monoid_agent_kernel.reference.backend.service import (
     _RUN_META_SCHEMA_VERSION,
     BackendRunRequest,
     RunnerBackend,
 )
-from native_agent_runner.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
+from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 
 __all__ = [
     'AgentConfigError',

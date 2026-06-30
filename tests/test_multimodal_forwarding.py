@@ -7,20 +7,20 @@ from pathlib import Path
 import pytest
 from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.content import AudioPart, DocumentPart, ImagePart, TextPart
-from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits
-from native_agent_runner.errors import WorkspaceError
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolObservation
-from native_agent_runner.providers.fake import (
+from monoid_agent_kernel.core.content import AudioPart, DocumentPart, ImagePart, TextPart
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
+from monoid_agent_kernel.errors import WorkspaceError
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, ToolObservation
+from monoid_agent_kernel.providers.fake import (
     FakeModelAdapter,
     FakeMultimodalModelAdapter,
     fake_tool_call,
 )
-from native_agent_runner.providers.gateway import GatewayModelAdapter
-from native_agent_runner.providers.openai import _message_to_input_items
-from native_agent_runner.tools.builtin import builtin_tools
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+from monoid_agent_kernel.providers.openai import _message_to_input_items
+from monoid_agent_kernel.tools.builtin import builtin_tools
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
 # Includes a NUL byte (as real PDFs do in stream data) so fs.read rejects it as non-text,
@@ -480,7 +480,7 @@ def test_audio_degrades_even_on_multimodal_adapter(tmp_path: Path) -> None:
 
 
 def test_normalize_inline_media_part_and_blob_resolver(tmp_path: Path) -> None:
-    from native_agent_runner.core.media import (
+    from monoid_agent_kernel.core.media import (
         WorkspaceMediaResolver,
         blob_shas_in_messages,
         normalize_inline_media_part,
@@ -568,7 +568,7 @@ def test_inline_media_ingested_to_blob_survives_restore(tmp_path: Path) -> None:
 
 
 def test_resolver_blob_reader_fallback(tmp_path: Path) -> None:
-    from native_agent_runner.core.media import WorkspaceMediaResolver
+    from monoid_agent_kernel.core.media import WorkspaceMediaResolver
 
     (tmp_path / "workspace").mkdir()
     workspace = LocalWorkspaceBackend(tmp_path / "workspace")
@@ -587,8 +587,8 @@ def test_resolver_blob_reader_fallback(tmp_path: Path) -> None:
 def test_observation_message_normalizes_inline_tool_media() -> None:
     # A tool that returns inline (data:) media gets it normalized to a durable blob — symmetric
     # with user-input media (gap: tool-result inline media).
-    from native_agent_runner.loop import _observation_message
-    from native_agent_runner.providers.base import ToolObservation
+    from monoid_agent_kernel.loop import _observation_message
+    from monoid_agent_kernel.providers.base import ToolObservation
 
     data_uri = "data:image/png;base64," + base64.b64encode(_PNG_BYTES).decode()
     obs = ToolObservation(

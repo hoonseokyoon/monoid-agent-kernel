@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner import _proc
-from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.shell import ShellExecutionOptions, execute_shell
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel import _proc
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.shell import ShellExecutionOptions, execute_shell
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 from support.process import python_command as _python_command
 
 pytestmark = pytest.mark.integration

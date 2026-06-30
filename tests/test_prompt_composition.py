@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from native_agent_runner.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
+from monoid_agent_kernel.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
 
 
 def test_no_segments_returns_base() -> None:

@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.errors import PermissionDenied, WorkspaceError
-from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel.errors import PermissionDenied, WorkspaceError
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 
 
 def test_normalizes_and_blocks_parent_escape(tmp_path: Path) -> None:

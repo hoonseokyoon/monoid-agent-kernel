@@ -16,10 +16,10 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.core._util import sha256_bytes
-from native_agent_runner.core.workspace import ChangedEntry, FileEntry, Workspace
-from native_agent_runner.errors import WorkspaceError
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel.core._util import sha256_bytes
+from monoid_agent_kernel.core.workspace import ChangedEntry, FileEntry, Workspace
+from monoid_agent_kernel.errors import WorkspaceError
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 
 WorkspaceFactory = Callable[[Path], Workspace]
 

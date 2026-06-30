@@ -7,7 +7,7 @@ generic "provider call failed". It must never echo the body's prose (PII/prompt 
 
 from __future__ import annotations
 
-from native_agent_runner.providers.openai import _model_error_from_openai
+from monoid_agent_kernel.providers.openai import _model_error_from_openai
 
 
 class _FakeApiError(Exception):

@@ -11,17 +11,17 @@ from support.http import http_json, serving
 from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
 
-from native_agent_runner.core.capability import AutoGrantBroker
-from native_agent_runner.core.control import ControlCommand
-from native_agent_runner.core.lifecycle import SessionState
-from native_agent_runner.core.tool_surface import ToolScope
-from native_agent_runner.errors import PermissionDenied
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.reference.backend.http import create_backend_server
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.tools.base import ToolContext, ToolResult, ToolSpec
+from monoid_agent_kernel.core.capability import AutoGrantBroker
+from monoid_agent_kernel.core.control import ControlCommand
+from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.backend.http import create_backend_server
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 
 def _token_manager() -> TokenManager:

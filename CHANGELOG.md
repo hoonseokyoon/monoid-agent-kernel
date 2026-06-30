@@ -44,9 +44,9 @@ out in commit messages and here.
   validation that collects **all** problems as readable messages instead of raising
   on the first.
 - Curated `contracts.core` namespace (the ~9 must-know names), a
-  `native_agent_runner.tool_ids` constants module, and `list_builtin_tools()`.
+  `monoid_agent_kernel.tool_ids` constants module, and `list_builtin_tools()`.
 - `ToolBinding.for_tool("fs.read")` one-token bindings and bare-string `ref`.
-- `native-agent studio doctor` preflight (port / writability / API key / browser /
+- `monoid studio doctor` preflight (port / writability / API key / browser /
   OTel checks), a Studio README, and a first-run onboarding panel.
 - `otel-export` extra (OTel SDK + OTLP exporter) so Studio's OTel toggle actually
   exports; a README "Observability" section, `examples/otel_tracing.py`, and a

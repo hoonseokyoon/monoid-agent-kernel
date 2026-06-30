@@ -17,12 +17,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from native_agent_runner import (  # noqa: E402
+from monoid_agent_kernel import (  # noqa: E402
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
 )
-from native_agent_runner.providers.base import ModelRequest, ModelTurn  # noqa: E402
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn  # noqa: E402
 
 
 class EchoModelAdapter:

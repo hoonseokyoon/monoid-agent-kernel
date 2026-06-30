@@ -7,11 +7,11 @@ import pytest
 
 from support.runtime import runtime_config, tool_binding
 
-from native_agent_runner.core.agents import AgentRuntimeConfig, PromptSpec, ToolSearchConfig
-from native_agent_runner.core.content import DocumentPart, ImagePart, TextPart
-from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, ReasoningConfig, RunLimits
-from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.tools.base import ToolResult, ToolSpec
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, ToolSearchConfig
+from monoid_agent_kernel.core.content import DocumentPart, ImagePart, TextPart
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ReasoningConfig, RunLimits
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
 
 pytestmark = pytest.mark.unit
 
@@ -91,7 +91,7 @@ def test_runtime_config_rejects_duplicate_binding_ids() -> None:
     )
 
     try:
-        from native_agent_runner.core.agents import validate_runtime_config
+        from monoid_agent_kernel.core.agents import validate_runtime_config
 
         validate_runtime_config(
             config,

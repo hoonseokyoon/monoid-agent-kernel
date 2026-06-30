@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from native_agent_runner.core.agents import (
+from monoid_agent_kernel.core.agents import (
     AgentDefinition,
     AgentRuntimeConfig,
     PromptSpec,
@@ -13,15 +13,15 @@ from native_agent_runner.core.agents import (
     generated_tool_bindings,
     validate_runtime_config,
 )
-from native_agent_runner.core.schemas import validate_run_dir
-from native_agent_runner.core.tool_surface import ToolGuidance
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.tools.builtin import builtin_tools
-from native_agent_runner.tools.base import ToolRegistry
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel.core.schemas import validate_run_dir
+from monoid_agent_kernel.core.tool_surface import ToolGuidance
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.tools.builtin import builtin_tools
+from monoid_agent_kernel.tools.base import ToolRegistry
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 
 
 class _RuntimeProvider:
@@ -312,7 +312,7 @@ def test_validate_accepts_agent_spawn_delegation_binding() -> None:
 def test_validate_collects_tool_registration_collision() -> None:
     # A custom tool that shadows a builtin id must be collected by validate(), not raised — the
     # registration happens inside the preflight, which advertises returning a list.
-    from native_agent_runner import tool
+    from monoid_agent_kernel import tool
 
     @tool(id="fs.read", side_effect="read")  # collides with the builtin fs.read
     def clash(text: str) -> dict:
@@ -326,11 +326,11 @@ def test_validate_collects_tool_registration_collision() -> None:
 def test_contracts_core_curated_namespace() -> None:
     import types
 
-    import native_agent_runner as nar
-    from native_agent_runner.contracts import core
+    import monoid_agent_kernel as nar
+    from monoid_agent_kernel.contracts import core
 
     assert core.AgentLoop is AgentLoop
-    # The curated namespace must NOT shadow the native_agent_runner.core package at the root.
+    # The curated namespace must NOT shadow the monoid_agent_kernel.core package at the root.
     assert isinstance(nar.core, types.ModuleType) and hasattr(nar.core, "agents")
     assert "core" not in nar.contracts.__all__
     names = {n for n in vars(core) if not n.startswith("_")}

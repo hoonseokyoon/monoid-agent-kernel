@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from native_agent_runner.core.frontmatter import parse_frontmatter, parse_scalar
+from monoid_agent_kernel.core.frontmatter import parse_frontmatter, parse_scalar
 
 
 def test_no_frontmatter_returns_body_unchanged() -> None:

@@ -166,7 +166,7 @@ def test_backend_runs_output_validator_with_retry(tmp_path: Path) -> None:
     # End-to-end (Q3): a validator attached to the backend (the output_validators seam) runs inside
     # a backend-driven loop — default-on, no config binding needed. It rejects the first (bad) final
     # response, the loop re-prompts, and the run settles ``completed`` on the corrected answer.
-    from native_agent_runner.core.output_validator import ValidationOutcome
+    from monoid_agent_kernel.core.output_validator import ValidationOutcome
 
     class ContainsOkValidator:
         id = "contains.ok"
@@ -230,7 +230,7 @@ def test_backend_runs_output_validator_with_retry(tmp_path: Path) -> None:
 def test_json_safe_sanitizes_nested_non_json() -> None:
     # A validator value nested inside a dict/list that isn't JSON-serializable must not 500 the
     # status/result projection (review fix ③: _json_safe is deep, not shallow).
-    from native_agent_runner.reference.backend.service import _json_safe
+    from monoid_agent_kernel.reference.backend.service import _json_safe
 
     class _Model:
         def __repr__(self) -> str:

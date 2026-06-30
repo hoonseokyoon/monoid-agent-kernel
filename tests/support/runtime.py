@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from native_agent_runner.core.agents import (
+from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     RegistryToolRef,
     StaticRuntimeConfigProvider,
     ToolBinding,
 )
-from native_agent_runner.core.spec import ModelConfig
-from native_agent_runner.core.tool_surface import (
+from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.tool_surface import (
     ToolAuthorizationDecision,
     ToolExposure,
     ToolGuidance,

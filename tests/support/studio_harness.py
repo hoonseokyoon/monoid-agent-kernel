@@ -14,16 +14,16 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.errors import ModelAdapterError, NativeAgentError
-from native_agent_runner.providers.base import ModelRequest, ModelTurn, TextDelta, TurnComplete
-from native_agent_runner.providers.fake import (
+from monoid_agent_kernel.errors import ModelAdapterError, NativeAgentError
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, TextDelta, TurnComplete
+from monoid_agent_kernel.providers.fake import (
     FakeModelAdapter,
     FakeStreamingModelAdapter,
     fake_tool_call,
 )
-from native_agent_runner.reference.llm_gateway.providers import EchoModelAdapter
-from native_agent_runner.reference.studio.activity import describe_event
-from native_agent_runner.reference.studio.server import (
+from monoid_agent_kernel.reference.llm_gateway.providers import EchoModelAdapter
+from monoid_agent_kernel.reference.studio.activity import describe_event
+from monoid_agent_kernel.reference.studio.server import (
     _ALL_CAPABILITIES,
     StudioConfig,
     StudioServer,

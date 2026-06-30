@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.core.checkpoint import CheckpointStore, LocalFsCheckpointStore, RunCheckpoint
-from native_agent_runner.reference.stores.sqlite import SqliteCheckpointStore
+from monoid_agent_kernel.core.checkpoint import CheckpointStore, LocalFsCheckpointStore, RunCheckpoint
+from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore
 
 StoreFactory = Callable[[Path], CheckpointStore]
 

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
-from native_agent_runner.core.capability import (
+from monoid_agent_kernel.core.capability import (
     AutoGrantBroker,
     CapabilityDenial,
     CapabilityGrant,
@@ -18,19 +18,19 @@ from native_agent_runner.core.capability import (
     CapabilityVault,
     scope_within,
 )
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.core.tool_surface import ToolScope
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.reference.capability import (
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.capability import (
     DenyAllBroker,
     GatewayCapabilityBroker,
     HumanEscalationBroker,
 )
-from native_agent_runner.tools.base import ToolContext, ToolResult, ToolSpec
+from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 
 def test_scope_within_list_subset_and_scalar_equality() -> None:
@@ -323,7 +323,7 @@ def test_denied_capability_skips_replay(tmp_path: Path) -> None:
 
 
 def test_human_escalation_broker_returns_pending() -> None:
-    from native_agent_runner.core.capability import CapabilityPending
+    from monoid_agent_kernel.core.capability import CapabilityPending
 
     broker = HumanEscalationBroker()
     grant = broker.request(CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]}))

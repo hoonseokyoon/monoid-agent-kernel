@@ -15,7 +15,7 @@ from collections.abc import Callable
 
 import pytest
 
-from native_agent_runner.core.capability import (
+from monoid_agent_kernel.core.capability import (
     AutoGrantBroker,
     CapabilityBroker,
     CapabilityDenial,
@@ -24,8 +24,8 @@ from native_agent_runner.core.capability import (
     CapabilityRequest,
     scope_within,
 )
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.reference.capability import (
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.capability import (
     DenyAllBroker,
     GatewayCapabilityBroker,
     HumanEscalationBroker,

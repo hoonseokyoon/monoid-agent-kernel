@@ -142,7 +142,7 @@ def test_mcp_tool_call_flows_end_to_end(tmp_path: Path) -> None:
 
 def test_mcp_discovery_failure_degrades_to_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # If the MCP server can't be reached at boot, studio must come up Skills-only — never crash.
-    import native_agent_runner.reference.studio.server as server_mod
+    import monoid_agent_kernel.reference.studio.server as server_mod
 
     def _never_ready(_base_url: str, *, timeout_s: float = 10.0) -> None:
         raise TimeoutError("simulated: MCP server never became ready")

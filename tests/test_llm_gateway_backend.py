@@ -15,15 +15,15 @@ from support.http import (
 )
 from support.runtime import runtime_config
 
-from native_agent_runner.reference.backend.http import create_backend_server
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.errors import ModelAdapterError, PermissionDenied
-from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
-from native_agent_runner.reference.llm_gateway.providers import offline_provider_factory
-from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
-from native_agent_runner.providers.base import ModelTurn, ToolCall
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.reference.backend.http import create_backend_server
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
+from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
+from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
+from monoid_agent_kernel.providers.base import ModelTurn, ToolCall
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 def _token_manager() -> TokenManager:

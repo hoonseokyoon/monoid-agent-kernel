@@ -19,12 +19,12 @@ import pytest
 from support.http import serving
 from support.runtime import runtime_config
 
-from native_agent_runner.errors import ModelAdapterError
-from native_agent_runner.providers.base import ModelRequest, ModelStreamChunk, TextDelta, TurnComplete
-from native_agent_runner.providers.fake import FakeStreamingModelAdapter
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.reference.backend.http import create_backend_server
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.providers.base import ModelRequest, ModelStreamChunk, TextDelta, TurnComplete
+from monoid_agent_kernel.providers.fake import FakeStreamingModelAdapter
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.backend.http import create_backend_server
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 
 
 def _token_manager() -> TokenManager:

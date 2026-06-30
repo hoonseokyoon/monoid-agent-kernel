@@ -9,16 +9,16 @@ from typing import Any
 from support.runtime import runtime_config, runtime_provider, tool_binding
 from support.waiting import eventually
 
-from native_agent_runner.core.capability import AutoGrantBroker
-from native_agent_runner.core.outbox import Outbox, OutboxReceipt, OutboxRequest
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.core.tool_surface import ToolScope
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.reference.outbox import (
+from monoid_agent_kernel.core.capability import AutoGrantBroker
+from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.outbox import (
     FailingOutboxSender,
     InboxRoutingOutboxSender,
     OutboxToolProvider,
@@ -127,7 +127,7 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(tmp_path: Path)
 
     # The request carried a W3C trace from staging; the dispatched event surfaces it, and the edge
     # sender attached a *child* span (same trace-id, new span-id) for the actual outbound call.
-    from native_agent_runner.core.trace_context import parse_traceparent
+    from monoid_agent_kernel.core.trace_context import parse_traceparent
 
     tp = sender.sent[0].traceparent
     assert parse_traceparent(tp) is not None
@@ -138,7 +138,7 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(tmp_path: Path)
 
 
 def test_outbox_not_staged_when_capability_denied(tmp_path: Path) -> None:
-    from native_agent_runner.reference.capability import DenyAllBroker
+    from monoid_agent_kernel.reference.capability import DenyAllBroker
 
     sender = RecordingOutboxSender()
     backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=DenyAllBroker())
@@ -290,7 +290,7 @@ def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None
 
 
 def test_outbox_ack_delivered_to_run_inbox_and_consumed(tmp_path: Path) -> None:
-    from native_agent_runner.core.inbox import is_inbox_envelope
+    from monoid_agent_kernel.core.inbox import is_inbox_envelope
 
     sender = RecordingOutboxSender()
     backend, workspace = _outbox_backend(tmp_path, [_SEND_ACK, _DONE, _DONE], sender=sender, broker=AutoGrantBroker())

@@ -4,12 +4,12 @@ from pathlib import Path
 
 from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.context import TurnContext
-from native_agent_runner.core.prompt import compose_system_prompt
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.core.context import TurnContext
+from monoid_agent_kernel.core.prompt import compose_system_prompt
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 class _MarkerProvider:

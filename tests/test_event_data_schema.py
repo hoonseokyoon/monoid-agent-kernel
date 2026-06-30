@@ -13,8 +13,8 @@ from typing import get_args
 
 from jsonschema import Draft202012Validator
 
-from native_agent_runner.core.events import AgentEventType
-from native_agent_runner.core.schemas import EVENT_DATA_SCHEMAS
+from monoid_agent_kernel.core.events import AgentEventType
+from monoid_agent_kernel.core.schemas import EVENT_DATA_SCHEMAS
 
 
 def test_every_event_type_has_a_data_schema() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from native_agent_runner.narration import EventNarration, narrate_event
+from monoid_agent_kernel.narration import EventNarration, narrate_event
 
 
 def test_narrate_tool_started_read() -> None:

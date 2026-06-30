@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in improving Native Agent Runner. This is a pre-1.0
+Thanks for your interest in improving Monoid Agent Kernel. This is a pre-1.0
 (`0.x`) research package, so the public surface may still change — but
 contributions, issues, and design feedback are very welcome.
 
@@ -10,8 +10,8 @@ contributions, issues, and design feedback are very welcome.
 - By contributing, you agree your contributions are licensed under the project's
   license (see `LICENSE`).
 - Keep the layering intact: **core never imports `reference`**. New example
-  services belong under `native_agent_runner.reference.*`; the supported surface is
-  `native_agent_runner.contracts`.
+  services belong under `monoid_agent_kernel.reference.*`; the supported surface is
+  `monoid_agent_kernel.contracts`.
 
 ## Development setup
 

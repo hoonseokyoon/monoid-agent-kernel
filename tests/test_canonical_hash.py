@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-from native_agent_runner.core._util import canonical_sha256
+from monoid_agent_kernel.core._util import canonical_sha256
 
 
 def _reference(payload: dict, drop: tuple[str, ...] = ()) -> str:

@@ -214,7 +214,7 @@ def test_start_chat_attaches_image_and_forwards_resolved_block(tmp_path: Path) -
     # adapter as a resolved base64 block (the loop resolves the by-reference source_ref).
     import base64
 
-    from native_agent_runner.providers.fake import FakeMultimodalModelAdapter
+    from monoid_agent_kernel.providers.fake import FakeMultimodalModelAdapter
 
     png_1x1 = base64.b64encode(
         base64.b64decode(

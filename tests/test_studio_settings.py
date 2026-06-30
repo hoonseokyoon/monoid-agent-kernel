@@ -88,8 +88,8 @@ def test_settings_reasoning_summary_visibility(studio: StudioServer) -> None:
 def test_otel_toggle_attaches_per_run_sink_factory(studio: StudioServer, monkeypatch: pytest.MonkeyPatch) -> None:
     # Tier-3: toggling OTel attaches a per-run OtelEventSink FACTORY (not a shared instance) on
     # the backend; toggling off detaches it. Provider setup is stubbed (real SDK = Jaeger live test).
-    import native_agent_runner.reference.studio.server as srv
-    from native_agent_runner.observability.otel import OtelEventSink
+    import monoid_agent_kernel.reference.studio.server as srv
+    from monoid_agent_kernel.observability.otel import OtelEventSink
 
     monkeypatch.setattr(srv, "_ensure_otel_provider", lambda endpoint: None)
     assert studio.settings()["otel"] is False

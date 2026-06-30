@@ -150,8 +150,8 @@ def test_send_message_inline_media_is_blobified_before_queue(tmp_path: Path) -> 
 
 def test_queued_multimodal_message_round_trips_through_checkpoint() -> None:
     # The queue + checkpoint stay JSON-native, so a parked multimodal message survives a restart.
-    from native_agent_runner.core.checkpoint import RunCheckpoint
-    from native_agent_runner.reference.backend.service import (
+    from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+    from monoid_agent_kernel.reference.backend.service import (
         _normalize_inbound_message,
         _queued_message_to_loop_input,
     )

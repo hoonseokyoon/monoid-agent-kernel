@@ -1,8 +1,8 @@
 # Integration Contracts
 
-This document defines the supported integration surface for native-agent-runner.
-Import Python contracts from `native_agent_runner.contracts`. Treat
-`native_agent_runner.reference.*` as runnable examples for backend, LLM gateway,
+This document defines the supported integration surface for Monoid Agent Kernel.
+Import Python contracts from `monoid_agent_kernel.contracts`. Treat
+`monoid_agent_kernel.reference.*` as runnable examples for backend, LLM gateway,
 and web gateway integration.
 
 ## Boundary
@@ -10,15 +10,15 @@ and web gateway integration.
 The package is layered in three tiers:
 
 - **contracts** — the stable integration surface, collected in
-  `native_agent_runner.contracts` (and re-exported from the top-level
-  `native_agent_runner`). These are the specs and protocols you depend on and
+  `monoid_agent_kernel.contracts` (and re-exported from the top-level
+  `monoid_agent_kernel`). These are the specs and protocols you depend on and
   implement. This document defines them.
 - **core** — the engine that implements those contracts: the default supported
   runner (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, permission,
   shell execution, and web gateway client modules).
-- **reference** — example services under `native_agent_runner.reference`
+- **reference** — example services under `monoid_agent_kernel.reference`
   (`backend`, `llm_gateway`, `web_gateway`, `stores`). Not part of the supported
-  surface; core has no dependency on `native_agent_runner.reference`.
+  surface; core has no dependency on `monoid_agent_kernel.reference`.
 
 Agent configuration enters the engine through `AgentRuntimeConfig`. Legacy
 tool/shell/web policy inputs have left the core, backend, and CLI execution
@@ -44,7 +44,7 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   a validator registered via `AgentLoop(output_validators=...)` runs by default and can be
   disabled per run with an `OutputValidatorBinding(enabled=False)`; on failure the loop re-prompts
   up to `RunLimits.max_output_retries`).
-- **Not a contract**: `native_agent_runner.reference.*` (example services).
+- **Not a contract**: `monoid_agent_kernel.reference.*` (example services).
 
 ## Python Contracts
 
@@ -579,7 +579,7 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
   per-run vault holds handles only and durable (approved) leases are checkpointed as handles, while
   ephemeral sync grants are re-brokered on restart. Any `CapabilityBroker` can be verified against
   these invariants with the parametrized `tests/test_capability_broker_contract.py` suite.
-- **CLI**: `native-agent run --auto-grant-capabilities` wires the built-in `AutoGrantBroker` (local
+- **CLI**: `monoid run --auto-grant-capabilities` wires the built-in `AutoGrantBroker` (local
   dev), or `--capability-broker path.py:factory` loads a custom broker (`factory()` returns it).
 - **Async approval (escalation)**: a broker may return `CapabilityPending` instead of granting
   synchronously — the loop then parks the run on a `capability` hosted-task (carrying the request
