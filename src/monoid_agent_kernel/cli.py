@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -56,6 +55,7 @@ from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
 from monoid_agent_kernel.subagent_loader import load_subagent_definitions
 from monoid_agent_kernel.tool_loader import load_capability_broker, load_tool_provider
 from monoid_agent_kernel.core.capability import AutoGrantBroker
+from monoid_agent_kernel.env import env_name_for_error, getenv
 from monoid_agent_kernel.web import WebGatewayClient
 from monoid_agent_kernel.reference.web_gateway.http import create_web_gateway_server
 from monoid_agent_kernel.reference.web_gateway.providers import (
@@ -71,7 +71,7 @@ from monoid_agent_kernel.reference.studio.cli import studio as studio_group
 
 @click.group()
 def main() -> None:
-    """Run a standalone native agent harness."""
+    """Run Monoid Agent Kernel."""
 
 
 main.add_command(studio_group)
@@ -99,7 +99,7 @@ main.add_command(studio_group)
 @click.option(
     "--llm-gateway-token-env",
     type=str,
-    default="NAR_LLM_GATEWAY_TOKEN",
+    default="MONOID_LLM_GATEWAY_TOKEN",
     show_default=True,
     help="Environment variable containing a short-lived gateway token.",
 )
@@ -163,7 +163,7 @@ main.add_command(studio_group)
 @click.option(
     "--web-gateway-token-env",
     type=str,
-    default="NAR_WEB_GATEWAY_TOKEN",
+    default="MONOID_WEB_GATEWAY_TOKEN",
     show_default=True,
     help="Environment variable containing a short-lived WebGateway token.",
 )
@@ -768,7 +768,7 @@ def package_apply(
 
 @main.group()
 def backend() -> None:
-    """Run the standalone runner backend."""
+    """Run the reference Monoid backend."""
 
 
 @backend.command("serve")
@@ -793,14 +793,14 @@ def backend() -> None:
 @click.option(
     "--admin-token-env",
     type=str,
-    default="NAR_BACKEND_ADMIN_TOKEN",
+    default="MONOID_BACKEND_ADMIN_TOKEN",
     show_default=True,
     help="Environment variable containing the backend admin token.",
 )
 @click.option(
     "--token-secret-env",
     type=str,
-    default="NAR_BACKEND_TOKEN_SECRET",
+    default="MONOID_BACKEND_TOKEN_SECRET",
     show_default=True,
     help="Environment variable containing a 32+ byte HMAC signing secret.",
 )
@@ -823,16 +823,16 @@ def backend_serve(
     ephemeral_token_secret: bool,
 ) -> None:
     """Serve token issuance, run submission, status, result, and events APIs."""
-    admin_token = os.environ.get(admin_token_env)
+    admin_token = getenv(admin_token_env)
     if not admin_token:
-        raise click.ClickException(f"{admin_token_env} is required")
+        raise click.ClickException(f"{env_name_for_error(admin_token_env)} is required")
     if ephemeral_token_secret:
         token_manager = TokenManager.ephemeral()
     else:
-        signing_secret = os.environ.get(token_secret_env)
+        signing_secret = getenv(token_secret_env)
         if not signing_secret:
             raise click.ClickException(
-                f"{token_secret_env} is required, or pass --ephemeral-token-secret for local development"
+                f"{env_name_for_error(token_secret_env)} is required, or pass --ephemeral-token-secret for local development"
             )
         token_manager = TokenManager.from_secret(signing_secret)
 
@@ -845,14 +845,14 @@ def backend_serve(
         web_gateway_url=web_gateway_url,
     )
     server = create_backend_server(runner_backend, host=host, port=port, admin_token=admin_token)
-    click.echo(f"runner backend listening on http://{host}:{port}")
+    click.echo(f"Monoid backend listening on http://{host}:{port}")
     click.echo(f"allowed workspace roots: {', '.join(str(path.resolve()) for path in workspace_root)}")
     if apply_root:
         click.echo(f"allowed apply roots: {', '.join(str(path.resolve()) for path in apply_root)}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        click.echo("runner backend stopped")
+        click.echo("Monoid backend stopped")
     finally:
         server.server_close()
         runner_backend.shutdown()  # stop the shared run loop + watchdog
@@ -869,14 +869,14 @@ def llm_gateway() -> None:
 @click.option(
     "--admin-token-env",
     type=str,
-    default="NAR_LLM_GATEWAY_ADMIN_TOKEN",
+    default="MONOID_LLM_GATEWAY_ADMIN_TOKEN",
     show_default=True,
     help="Environment variable containing the LLM gateway admin token.",
 )
 @click.option(
     "--token-secret-env",
     type=str,
-    default="NAR_BACKEND_TOKEN_SECRET",
+    default="MONOID_BACKEND_TOKEN_SECRET",
     show_default=True,
     help="Environment variable containing the shared 32+ byte HMAC signing secret.",
 )
@@ -903,16 +903,16 @@ def llm_gateway_serve(
     provider: str,
 ) -> None:
     """Serve the internal LLM turn API consumed by GatewayModelAdapter."""
-    admin_token = os.environ.get(admin_token_env)
+    admin_token = getenv(admin_token_env)
     if not admin_token:
-        raise click.ClickException(f"{admin_token_env} is required")
+        raise click.ClickException(f"{env_name_for_error(admin_token_env)} is required")
     if ephemeral_token_secret:
         token_manager = TokenManager.ephemeral()
     else:
-        signing_secret = os.environ.get(token_secret_env)
+        signing_secret = getenv(token_secret_env)
         if not signing_secret:
             raise click.ClickException(
-                f"{token_secret_env} is required, or pass --ephemeral-token-secret for local development"
+                f"{env_name_for_error(token_secret_env)} is required, or pass --ephemeral-token-secret for local development"
             )
         token_manager = TokenManager.from_secret(signing_secret)
 
@@ -973,14 +973,14 @@ def web_gateway() -> None:
 @click.option(
     "--admin-token-env",
     type=str,
-    default="NAR_WEB_GATEWAY_ADMIN_TOKEN",
+    default="MONOID_WEB_GATEWAY_ADMIN_TOKEN",
     show_default=True,
     help="Environment variable containing the WebGateway admin token.",
 )
 @click.option(
     "--token-secret-env",
     type=str,
-    default="NAR_BACKEND_TOKEN_SECRET",
+    default="MONOID_BACKEND_TOKEN_SECRET",
     show_default=True,
     help="Environment variable containing the shared 32+ byte HMAC signing secret.",
 )
@@ -1008,16 +1008,16 @@ def web_gateway_serve(
     ephemeral_token_secret: bool,
 ) -> None:
     """Serve the internal web.search/web.fetch/web.context API consumed by WebGatewayClient."""
-    admin_token = os.environ.get(admin_token_env)
+    admin_token = getenv(admin_token_env)
     if not admin_token:
-        raise click.ClickException(f"{admin_token_env} is required")
+        raise click.ClickException(f"{env_name_for_error(admin_token_env)} is required")
     if ephemeral_token_secret:
         token_manager = TokenManager.ephemeral()
     else:
-        signing_secret = os.environ.get(token_secret_env)
+        signing_secret = getenv(token_secret_env)
         if not signing_secret:
             raise click.ClickException(
-                f"{token_secret_env} is required, or pass --ephemeral-token-secret for local development"
+                f"{env_name_for_error(token_secret_env)} is required, or pass --ephemeral-token-secret for local development"
             )
         token_manager = TokenManager.from_secret(signing_secret)
 

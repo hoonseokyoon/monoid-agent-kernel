@@ -1,12 +1,12 @@
 """Reference capability brokers.
 
 These show how the `CapabilityBroker` contract is satisfied by real strategies. They are
-examples, not part of the supported surface (like the other `reference.*` services).
+reference examples like the other `reference.*` services.
 
 - `GatewayCapabilityBroker` — mints a scoped, short-lived gateway token as the lease's
-  ``token_ref``. This is the "absorb the gateway" path: the LLM/web gateway tokens the runner
+  ``token_ref``. This is the "absorb the gateway" path: the LLM/web gateway tokens the kernel
   already uses ARE capability leases; this broker issues the same kind of token for any
-  capability, so the proven "secret behind a gateway, runner holds a scoped token" pattern
+  capability, so the proven "secret behind a gateway, kernel holds a scoped token" pattern
   generalizes under one contract. The gateway (not the core) resolves the token to the secret.
 - `DenyAllBroker` — refuses everything (useful as a safe default / for tests).
 """
@@ -26,7 +26,7 @@ from monoid_agent_kernel.core.capability import (
 from monoid_agent_kernel.reference._shared.tokens import TokenKind, TokenManager
 
 # Capabilities whose lease token must be accepted by an EXISTING gateway (not the generic capability
-# gateway): the runner's web tools post to the web gateway, which verifies a ``web_gateway``/``csp.web-
+# gateway): the kernel's web tools post to the web gateway, which verifies a ``web_gateway``/``csp.web-
 # gateway`` token. Minting that exact token as the lease handle is the "the gateway token IS a
 # capability lease" absorption, made concrete — the web path needs no separate credential.
 _GATEWAY_TOKEN_KINDS: dict[str, tuple[TokenKind, str]] = {

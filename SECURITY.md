@@ -14,21 +14,19 @@ window to address the issue before public disclosure.
 
 ## Scope and design notes
 
-This project is a **pre-1.0 research package** (`0.x`). Treat it as a building
-block, not a hardened product, and review the security model before deploying it.
+This project is a **pre-1.0 agent kernel** (`0.x`). Treat it as a building
+block and review the security model before deploying it.
 
 Key boundaries the design relies on (see `README.md` and `docs/CONTRACTS.md`):
 
-- **Provider credentials stay outside the runner.** The default `GatewayModelAdapter`
-  talks to a gateway you operate; the runner does not receive OpenAI/Anthropic/Brave keys.
+- **Provider credentials stay outside the kernel.** The default `GatewayModelAdapter`
+  talks to a gateway you operate; OpenAI/Anthropic/Brave keys stay in that gateway.
 - **Secrets never enter the core.** Capability leases carry handles (`token_ref`),
   never raw secrets; the edge resolves them.
-- **Public event streams are not heuristically scrubbed.** The core keeps file
-  contents out of the public stream and honors `redact_patterns`, but redacting
-  secret-bearing tool arguments or shell commands is the integrator's responsibility
-  (see the Event Sinks section of the README).
-- **`reference/*` is example code, not a supported/hardened surface.** Build your own
-  services against the contracts for production use.
+- **Public event streams keep file contents out by design.** The core honors
+  `redact_patterns`; integrators own extra redaction for secret-bearing tool arguments
+  or shell commands (see the Event Sinks section of the README).
+- **`reference/*` is example code.** Build production services against the contracts.
 
 If you are evaluating this for a sensitive deployment and have questions about the
 trust boundaries, reach out via the contact above.

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import random
 import time
 from collections.abc import AsyncIterator, Callable
@@ -12,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.env import env_name_for_error, getenv
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.providers._common import (
@@ -31,8 +31,8 @@ from monoid_agent_kernel.providers.base import (
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
-DEFAULT_GATEWAY_URL_ENV = "NAR_LLM_GATEWAY_URL"
-DEFAULT_GATEWAY_TOKEN_ENV = "NAR_LLM_GATEWAY_TOKEN"
+DEFAULT_GATEWAY_URL_ENV = "MONOID_LLM_GATEWAY_URL"
+DEFAULT_GATEWAY_TOKEN_ENV = "MONOID_LLM_GATEWAY_TOKEN"
 
 GATEWAY_TIMEOUT = "gateway_timeout"
 GATEWAY_NETWORK_ERROR = "gateway_network_error"
@@ -193,10 +193,10 @@ class GatewayModelAdapter:
         raise ModelAdapterError("LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR)
 
     def _resolve_gateway_url(self, config: ModelConfig) -> str:
-        url = self.gateway_url or config.gateway_url or self.config.gateway_url or os.environ.get(DEFAULT_GATEWAY_URL_ENV)
+        url = self.gateway_url or config.gateway_url or self.config.gateway_url or getenv(DEFAULT_GATEWAY_URL_ENV)
         if not url:
             raise ModelAdapterError(
-                f"LLM gateway URL is required via --llm-gateway-url or {DEFAULT_GATEWAY_URL_ENV}"
+                f"LLM gateway URL is required via --llm-gateway-url or {env_name_for_error(DEFAULT_GATEWAY_URL_ENV)}"
             )
         return url
 
@@ -218,7 +218,7 @@ class GatewayModelAdapter:
             return self.token
         if self.token_file is not None:
             return self.token_file.read_text(encoding="utf-8").strip()
-        return os.environ.get(self.token_env)
+        return getenv(self.token_env)
 
     def _payload(self, request: ModelRequest) -> dict[str, Any]:
         config = request.model or self.config

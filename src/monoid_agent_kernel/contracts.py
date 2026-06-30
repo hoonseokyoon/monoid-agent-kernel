@@ -4,9 +4,9 @@ This module is the single, stable surface an integrating system should depend on
 Import the engine entry point, the data specs, and the protocols you must implement
 (model adapter, tools, event sink) from here.
 
-The ``monoid_agent_kernel.reference`` package (backend, llm_gateway, web_gateway) is a
-*reference implementation* of these contracts, not part of the supported surface — real
-integrators are expected to build their own services against the types exported here.
+The ``monoid_agent_kernel.reference`` package (backend, llm_gateway, web_gateway)
+contains reference implementations of these contracts. Real integrators build their
+own services against the types exported here.
 
 See ``docs/CONTRACTS.md`` for the full Python and HTTP wire contracts.
 """

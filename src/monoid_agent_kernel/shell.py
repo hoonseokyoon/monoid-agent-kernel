@@ -411,7 +411,7 @@ def execute_shell(
             execution_workspace=resolved_execution_workspace,
         )
 
-    with tempfile.TemporaryDirectory(prefix="native-agent-shell-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="monoid-shell-") as tmp:
         tmp_root = Path(tmp)
         before = materialize_workspace(workspace, tmp_root, permission_policy)
         cwd_abs = (tmp_root / cwd_rel).resolve()
@@ -590,8 +590,8 @@ def _run_subprocess(
     max_output_bytes: int,
 ) -> dict[str, Any]:
     started = time.time()
-    stdout_file = tempfile.NamedTemporaryFile(prefix="native-agent-shell-stdout-", delete=False)
-    stderr_file = tempfile.NamedTemporaryFile(prefix="native-agent-shell-stderr-", delete=False)
+    stdout_file = tempfile.NamedTemporaryFile(prefix="monoid-shell-stdout-", delete=False)
+    stderr_file = tempfile.NamedTemporaryFile(prefix="monoid-shell-stderr-", delete=False)
     stdout_path = Path(stdout_file.name)
     stderr_path = Path(stderr_file.name)
     stdout_file.close()

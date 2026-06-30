@@ -40,10 +40,10 @@ DEFAULT_FAKE_CORPUS: tuple[dict[str, str], ...] = (
     {
         "url": "https://docs.example.test/monoid-agent-kernel/web",
         "title": "Monoid Agent Kernel Web Tools",
-        "content": (
-            "Monoid Agent Kernel exposes web.search and web.fetch through a WebGateway. "
-            "The runner never receives provider API keys."
-        ),
+            "content": (
+                "Monoid Agent Kernel exposes web.search and web.fetch through a WebGateway. "
+                "The kernel never receives provider API keys."
+            ),
     },
     {
         "url": "https://docs.example.test/monoid-agent-kernel/policy",

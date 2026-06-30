@@ -1,4 +1,4 @@
-"""Map the runner's event tree to OpenTelemetry GenAI spans (opt-in ``[otel]`` extra).
+"""Map the kernel's event tree to OpenTelemetry GenAI spans (opt-in ``[otel]`` extra).
 
 ``OtelEventSink`` is an :class:`~monoid_agent_kernel.core.events.EventSink` — the same seam
 ``JsonlEventSink`` uses — that turns the ``run -> model.turn -> tool.call`` event tree into a

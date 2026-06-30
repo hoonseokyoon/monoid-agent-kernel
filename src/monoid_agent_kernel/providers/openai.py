@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers._common import (
     build_reasoning_payload,
@@ -45,7 +46,7 @@ class OpenAIModelAdapter:
     provider_name: ClassVar[str] = "openai"
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
-        if not self.allow_direct_provider_api and os.environ.get("NAR_ALLOW_DIRECT_PROVIDER_API") != "1":
+        if not self.allow_direct_provider_api and getenv("MONOID_ALLOW_DIRECT_PROVIDER_API") != "1":
             raise ModelAdapterError(
                 "direct provider API access is disabled; use GatewayModelAdapter for container runs"
             )
@@ -71,7 +72,7 @@ class OpenAIModelAdapter:
         except Exception as exc:
             # Map provider API errors (e.g. a 400 for an unsupported reasoning effort) to a
             # classified ModelAdapterError so the gateway returns the real status (4xx, not a
-            # generic 500) and the runner can treat it as recoverable. Never echo the raw body.
+            # generic 500) and the kernel can treat it as recoverable. Never echo the raw body.
             raise _model_error_from_openai(exc) from exc
         data = response.model_dump() if hasattr(response, "model_dump") else _coerce_response(response)
         return _parse_response(data)
@@ -82,7 +83,7 @@ class OpenAIModelAdapter:
         private-loop pump and the loop's async drive can consume it; the sync ``next_turn``
         path is unaffected. Provider errors map to a classified ``ModelAdapterError`` (no body
         leak), exactly like ``next_turn``."""
-        if not self.allow_direct_provider_api and os.environ.get("NAR_ALLOW_DIRECT_PROVIDER_API") != "1":
+        if not self.allow_direct_provider_api and getenv("MONOID_ALLOW_DIRECT_PROVIDER_API") != "1":
             raise ModelAdapterError(
                 "direct provider API access is disabled; use GatewayModelAdapter for container runs"
             )
@@ -220,7 +221,7 @@ _RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded", "rate_limited"})
 
 def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
     """Classify an OpenAI SDK exception into a ModelAdapterError carrying the provider HTTP status
-    and error code, so downstream (gateway HTTP mapping, runner classification, core recoverability,
+    and error code, so downstream (gateway HTTP mapping, kernel classification, core recoverability,
     the UI) can reason about it. Uses a synthetic, body-free message to avoid leaking prompt/PII."""
     status = getattr(exc, "status_code", None)
     if not isinstance(status, int):

@@ -111,6 +111,24 @@ def test_gateway_adapter_prefers_token_provider_and_reresolves() -> None:
     assert plain._headers()["Authorization"] == "Bearer static"
 
 
+def test_gateway_adapter_prefers_monoid_env_and_accepts_legacy_alias(monkeypatch) -> None:
+    monkeypatch.setenv("MONOID_LLM_GATEWAY_URL", "https://monoid-gateway.internal/v1/turns")
+    monkeypatch.setenv("MONOID_LLM_GATEWAY_TOKEN", "monoid-token")
+    monkeypatch.setenv("NAR_LLM_GATEWAY_URL", "https://legacy-gateway.internal/v1/turns")
+    monkeypatch.setenv("NAR_LLM_GATEWAY_TOKEN", "legacy-token")
+
+    adapter = GatewayModelAdapter(ModelConfig())
+
+    assert adapter._resolve_gateway_url(ModelConfig()) == "https://monoid-gateway.internal/v1/turns"
+    assert adapter._headers()["Authorization"] == "Bearer monoid-token"
+
+    monkeypatch.delenv("MONOID_LLM_GATEWAY_URL")
+    monkeypatch.delenv("MONOID_LLM_GATEWAY_TOKEN")
+
+    assert adapter._resolve_gateway_url(ModelConfig()) == "https://legacy-gateway.internal/v1/turns"
+    assert adapter._headers()["Authorization"] == "Bearer legacy-token"
+
+
 def test_gateway_token_source_remints_near_expiry(monkeypatch) -> None:
     from monoid_agent_kernel.reference._shared.tokens import TokenManager
     from monoid_agent_kernel.reference.backend import service as svc

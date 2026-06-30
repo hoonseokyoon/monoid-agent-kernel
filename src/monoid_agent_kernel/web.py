@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,8 +11,9 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.env import getenv
 
-DEFAULT_WEB_GATEWAY_TOKEN_ENV = "NAR_WEB_GATEWAY_TOKEN"
+DEFAULT_WEB_GATEWAY_TOKEN_ENV = "MONOID_WEB_GATEWAY_TOKEN"
 
 
 class WebGatewayError(NativeAgentError):
@@ -87,7 +87,7 @@ class WebGatewayClient:
             return self.token
         if self.token_file is not None:
             return self.token_file.read_text(encoding="utf-8").strip()
-        return os.environ.get(self.token_env)
+        return getenv(self.token_env)
 
 
 def public_query_preview(query: str) -> dict[str, Any]:

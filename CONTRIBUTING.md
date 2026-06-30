@@ -1,8 +1,8 @@
 # Contributing
 
 Thanks for your interest in improving Monoid Agent Kernel. This is a pre-1.0
-(`0.x`) research package, so the public surface may still change — but
-contributions, issues, and design feedback are very welcome.
+(`0.x`) agent kernel, so the public surface may still change. Contributions,
+issues, and design feedback are welcome.
 
 ## Ground rules
 

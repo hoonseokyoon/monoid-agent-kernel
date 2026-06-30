@@ -1,6 +1,6 @@
 """Durable run checkpoint: a state-snapshot taken at a pump park point.
 
-The harness is already half-durable — the provider holds the conversation by
+The kernel is already half-durable — the provider holds the conversation by
 reference (``turn_handle``), the workspace truth is on disk, and events/transcript
 are append-only. The only volatile state worth persisting is the small mutable
 ``RunState`` (handle + counters + pending observations) plus the hosted tasks a run

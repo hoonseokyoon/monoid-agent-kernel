@@ -1,11 +1,11 @@
 """Reference: redact secrets from the public event stream at the integration boundary.
 
-The runner core deliberately does NOT guess at secrets by argument name — it only keeps
+The kernel deliberately does not guess at secrets by argument name. It keeps
 file-content fields out of public events and masks ``PermissionPolicy.redact_patterns`` paths
 (see docs/CONTRACTS.md). Secret redaction beyond that is the integrating backend's job, and an
 ``EventSink`` is the seam to add it: wrap the sink that actually leaves your trust boundary.
 
-This module is an EXAMPLE you copy and own, not part of the supported surface. It re-homes the
+This module is an example you copy and own. It re-homes the
 heuristic that used to live (always-on, unconfigurable) in the core as opt-in integrator code.
 
 Use it from the CLI:
@@ -29,7 +29,7 @@ from typing import Any
 from monoid_agent_kernel.contracts import AgentEvent, EventSink
 from monoid_agent_kernel.recorder import StdoutJsonlSink
 
-# Tune these to your environment; this is your policy, not the runner's.
+# Tune these to your environment; this is your policy, not the kernel's.
 SENSITIVE_KEY_FRAGMENTS = (
     "token",
     "secret",

@@ -7,7 +7,7 @@ LLM-side counterpart of ``reference/web_gateway/providers.py`` (``FakeWebProvide
 fake``): :func:`offline_provider_factory` lets the gateway answer turns with **zero credentials**,
 so the whole stack — chat, streaming, multi-turn — works offline for local dev and tests.
 
-Reference example, not part of the supported surface.
+Reference example.
 """
 
 from __future__ import annotations

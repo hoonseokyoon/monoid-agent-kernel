@@ -1,12 +1,12 @@
 # Agent Studio (reference app)
 
-Agent Studio is the bundled "installable agent app" — it boots the reference LLM gateway, runner
+Agent Studio is the bundled "installable agent app" — it boots the reference LLM gateway, Monoid
 backend, and a single-page UI in one process, so you can watch a real agent plan, run code in a
-workspace, and report back. It drives the runner through its Python API behind a thin
+workspace, and report back. It drives the kernel through its Python API behind a thin
 backend-for-frontend (BFF); the browser never sees a provider key.
 
-> **Reference, not a contract.** Studio is an example under `monoid_agent_kernel.reference.*`.
-> Core never imports it; build your own app against the contracts in
+> **Reference example.** Studio lives under `monoid_agent_kernel.reference.*`.
+> Core never imports it; build production apps against the contracts in
 > [docs/CONTRACTS.md](../../../../docs/CONTRACTS.md).
 
 ## Launch

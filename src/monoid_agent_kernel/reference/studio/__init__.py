@@ -1,8 +1,8 @@
-"""Agent Studio — a bundled reference agent app (LLM gateway + runner backend + UI/BFF).
+"""Agent Studio — a bundled reference agent app (LLM gateway + Monoid backend + UI/BFF).
 
-EXAMPLE, not part of the supported public surface. It is built only against the contracts and
-the other reference services, to pressure-test "can an integrator stand up a chat + agentic app
-from the surface alone?" — and to surface DX gaps in the core (see ``DX_NOTES.md``).
+Reference example. It is built only against the contracts and the other reference services,
+to pressure-test "can an integrator stand up a chat + agentic app from the surface alone?"
+and to surface DX gaps in the core (see ``DX_NOTES.md``).
 """
 
 # The offline echo provider lives with the gateway it plugs into (the LLM-side counterpart of

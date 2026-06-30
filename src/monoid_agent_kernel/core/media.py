@@ -1,9 +1,9 @@
-"""Runner-side resolution of multimodal ``source_ref`` references to bytes.
+"""Kernel-side resolution of multimodal ``source_ref`` references to bytes.
 
 A multimodal part (``ImagePart``/``DocumentPart``) carries only a symbolic
 ``source_ref`` + ``mime_type`` — never bytes. The durable message log and the
-checkpoint stay by-reference (small, resumable). Only the runner can read the
-workspace, so the reference is resolved to bytes **runner-side, at wire-build
+checkpoint stay by-reference (small, resumable). Only the kernel can read the
+workspace, so the reference is resolved to bytes **kernel-side, at wire-build
 time**, by a ``MediaResolver``; the provider adapter then maps the resolved bytes
 to its wire shape (base64 in v1).
 

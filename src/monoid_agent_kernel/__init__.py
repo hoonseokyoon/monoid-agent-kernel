@@ -4,11 +4,11 @@ The package is layered in three tiers (see ``docs/CONTRACTS.md`` and the README)
 
 - **contracts** — the stable integration surface (``monoid_agent_kernel.contracts``): the specs
   and protocols you depend on and implement.
-- **core** — the engine that implements those contracts (``AgentLoop`` and friends), the default
-  supported runner.
+- **core** — the engine that implements those contracts (``AgentLoop`` and friends), the supported
+  kernel.
 - **reference** — example services under ``monoid_agent_kernel.reference``, reached explicitly,
   e.g. ``from monoid_agent_kernel.reference.backend import RunnerBackend``. They are examples,
-  not part of the supported public surface.
+  and production services build against the contracts.
 
 Importing this package exposes the contracts plus the core conveniences.
 """
@@ -16,7 +16,7 @@ Importing this package exposes the contracts plus the core conveniences.
 from monoid_agent_kernel import contracts as contracts
 from monoid_agent_kernel.contracts import *  # noqa: F401,F403
 
-# Core conveniences (not contract types, but part of the core runner surface).
+# Core conveniences (not contract types, but part of the supported kernel surface).
 from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, FakeStreamingModelAdapter
 from monoid_agent_kernel.providers.openai import OpenAIModelAdapter

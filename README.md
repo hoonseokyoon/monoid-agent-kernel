@@ -1,25 +1,25 @@
 # Monoid Agent Kernel
 
-*A provider-neutral, permission-aware agent runtime for safe, structured file work — secrets stay outside the engine, and every seam (model, tools, workspace, checkpoint store) is replaceable.*
+*A lightweight durable agent kernel for embedding product-grade agents anywhere: contract-first, observable, permission-aware, and replaceable at every seam.*
 
 [![CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 
-Standalone API-backed agent harness for safe, structured file work in a
-workspace. The workspace is a pluggable seam: the engine ships with a
-local-filesystem backend and accepts your own implementation (see
-[Custom workspace backend](#custom-workspace-backend)). This research package
-intentionally has no dependency on host-platform runtime modules. Platform
-integration is a later adapter layer.
+Monoid is the small runtime core you put inside a larger product when you need
+agents to run reliably. It owns the loop, durable artifacts, tool execution,
+permissions, observability, subagents, skills, and gateway contracts while leaving
+deployment choices to your platform. Models, tools, workspace storage, checkpoint
+stores, event sinks, capability brokers, memory, and gateway services are all
+replaceable contracts.
 
 > Throughout these docs, **"your gateway" / "your backend platform"** refers to the
 > backend you operate — the credential boundary that hosts the LLM and Web gateways. The
-> runner itself never holds provider keys; it calls your gateway with a short-lived, scoped token.
+> kernel never holds provider keys; it calls your gateway with a short-lived, scoped token.
 
 ## See it run
 
-The bundled **Agent Studio** reference app (`monoid studio serve`) drives the runner
+The bundled **Agent Studio** reference app (`monoid studio serve`) drives the kernel
 through its Python API behind a single-page UI.
 
 ![Agent Studio: an agent reasons, runs Python, and produces a result in the workspace](docs/img/hero.png)
@@ -33,7 +33,7 @@ observable, and generated output (here, a plot) previews inline.*
 messages over a durable, capability-gated **outbox→inbox** fabric — the capability and outbox
 events are visible in the trace on the right.*
 
-## Boundary: contracts / core / reference
+## Architecture: contracts / core / reference
 
 The package is layered in three tiers:
 
@@ -42,13 +42,13 @@ The package is layered in three tiers:
   depend on and implement: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig`, `ModelAdapter`,
   `ToolSpec` / `@tool`, `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest. See
   [docs/CONTRACTS.md](docs/CONTRACTS.md) for the Python and HTTP wire contracts.
-- **core** — the engine that implements those contracts: the default, batteries-included runner
+- **core** — the engine that implements those contracts: the default, batteries-included kernel
   (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). This is the supported
   implementation you actually run.
 - **reference** — example services under `monoid_agent_kernel.reference` (`backend`,
-  `llm_gateway`, `web_gateway`, `stores`). **Not** part of the supported surface: core never
-  imports them, and real integrators are expected to build their own services against the
-  contracts.
+  `llm_gateway`, `web_gateway`, `stores`). These examples live outside the supported public
+  surface. Core never imports them, and real integrators build their own services against
+  the contracts.
 
 For the dynamic binding-based tool surface, see
 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md).
@@ -59,8 +59,8 @@ For the dynamic binding-based tool surface, see
 pip install monoid-agent-kernel
 ```
 
-Core has no provider SDK dependency. The direct OpenAI adapter (local smoke tests only;
-container/hosted runs use `GatewayModelAdapter`) is an optional extra:
+Core has no provider SDK dependency. The direct OpenAI adapter is for local smoke tests;
+hosted/product runs use `GatewayModelAdapter` through your gateway:
 
 ```bash
 pip install "monoid-agent-kernel[openai]"
@@ -68,7 +68,7 @@ pip install "monoid-agent-kernel[openai]"
 
 ## Quickstart (no servers)
 
-The smallest run needs three of your objects — a spec, a model adapter, and a runtime
+The smallest kernel run needs three of your objects — a spec, a model adapter, and a runtime
 config — and `from_config` wires them in one call. `FakeModelAdapter` (a scripted model)
 makes the first turn run offline, with no gateway or API key:
 
@@ -113,12 +113,12 @@ breaking changes are called out in commit messages and this README.
   adapters); a text-only adapter drops them with a `model.input.degraded` warning.
   `AudioPart` / `VideoPart` round-trip as a forward-compatible contract but are not yet
   forwarded.
-- **Not a contract** — everything under `monoid_agent_kernel.reference.*` is an example
-  implementation; build your own services against the contracts instead.
+- **Reference examples** — everything under `monoid_agent_kernel.reference.*` is example
+  implementation code; build production services against the contracts.
 
 Agent configuration is centered on `AgentDefinition` (the reusable blueprint) and the
 mutable `AgentRuntimeConfig` (the current prompt and `ToolBinding` set). Backends can replace
-runtime config mid-run; the runner applies it at the next turn boundary.
+runtime config mid-run; the kernel applies it at the next turn boundary.
 
 ## Run
 
@@ -152,18 +152,18 @@ text with no tool calls; the workspace and model continuation thread across
 submits. `commit_checkpoint()` re-baselines the proposal between turns when you
 want incremental apply.
 
-The default mode is `propose`, which means the runner creates a proposal package
+The default mode is `propose`, which means the kernel creates a proposal package
 without committing to tenant source-of-truth storage. Local CLI runs default to
 `--workspace-backend overlay`, so writes are staged in an overlay and emitted as
 `runs/<run_id>/diff.patch` and `runs/<run_id>/proposal.json` without modifying
 the workspace. Container/hosted runs can use `--workspace-backend staging`,
-where tools and shell write directly to a staging workspace and the runner
+where tools and shell write directly to a staging workspace and the kernel
 compares that workspace with `workspace.base.json` to generate the proposal.
 Use `--mode apply` for local direct workspace writes.
 
 ### Custom workspace backend
 
-The runner never touches the filesystem directly — it works through a `Workspace`
+Monoid never touches the filesystem directly — it works through a `Workspace`
 (the file-storage surface in `monoid_agent_kernel.contracts`). `AgentLoop` builds one
 per run with `workspace_factory(spec)`, defaulting to `default_local_workspace_factory`,
 which returns the local-filesystem backend. Supply your own factory to back a run with a
@@ -183,23 +183,23 @@ A custom backend must honor the `Workspace` contract suite
 (`tests/test_workspace_contract.py`) to be a drop-in: add one `pytest.param` for your
 factory and the existing invariants run against it.
 
-The default model provider is `gateway`. Container runs should call an internal
-LLM gateway with a short-lived run token. The runner should not receive
+The default model provider is `gateway`. Hosted runs should call an internal
+LLM gateway with a short-lived run token. The kernel should not receive
 OpenAI, Anthropic, or other provider API keys.
 
 Web tools are also gateway-backed. `web.search`, `web.fetch`, and `web.context`
-are available when runtime config binds those registry tools. The runner calls
-your WebGateway with a short-lived `web_gateway` token. The runner does not
+are available when runtime config binds those registry tools. The kernel calls
+your WebGateway with a short-lived `web_gateway` token. The kernel does not
 perform direct web egress and does not receive search-provider credentials.
 `web.context` returns
 LLM-ready grounding context through a provider-neutral ContextProvider contract.
 
 Shell is available when runtime config binds `shell.exec`, which supports foreground
 commands and run-scoped background jobs. A background call returns a `job_id` immediately;
-the runner feeds the job's result back to the model when it finishes (inspect jobs with the
+the kernel feeds the job's result back to the model when it finishes (inspect jobs with the
 `jobs` / `job` CLI commands below).
 
-Path permission defaults are permissive: the runner treats every root-contained file as a
+Path permission defaults are permissive: the kernel treats every root-contained file as a
 normal workspace file, including dotfiles and keys. Backends can explicitly deny or redact
 paths per run:
 
@@ -224,9 +224,9 @@ monoid run \
 `deny_patterns` blocks tool and shell access. `redact_patterns` masks paths in the public
 event/status stream only; private run artifacts keep real paths and contents.
 
-Public events are not heuristically scrubbed for secrets: the runner keeps file-content out
-of the public stream and masks `redact_patterns` paths, but redacting secret-bearing tool
-arguments or shell commands is the backend's responsibility (see [Event Sinks](#event-sinks)).
+Public events keep file content out of the stream and mask `redact_patterns` paths.
+Your backend owns any extra redaction for secret-bearing tool arguments or shell commands
+(see [Event Sinks](#event-sinks)).
 
 ### Subagents, Skills, and capability gating
 
@@ -285,26 +285,26 @@ monoid job cancel <job_id> --run <run_id>
 
 ## Backend (reference)
 
-> Reference example (`monoid_agent_kernel.reference.backend`). Not part of the supported public
-> surface — build your own backend against the contracts in [docs/CONTRACTS.md](docs/CONTRACTS.md).
+> Reference example (`monoid_agent_kernel.reference.backend`). Build production backends against
+> the contracts in [docs/CONTRACTS.md](docs/CONTRACTS.md).
 
-The standalone backend issues run tokens, starts runner jobs, and exposes status,
+The reference backend issues run tokens, starts kernel runs, and exposes status,
 result, event, and tenant usage APIs. It still uses the keyless gateway model
-provider. Provider API keys stay outside the runner backend.
+provider. Provider API keys stay outside the Monoid backend.
 
 Start a local LLM gateway. This process is the provider-credential boundary:
 
 ```bash
-export NAR_BACKEND_ADMIN_TOKEN="admin-dev-token"
-export NAR_LLM_GATEWAY_ADMIN_TOKEN="llm-admin-dev-token"
-export NAR_BACKEND_TOKEN_SECRET="replace-with-32-plus-random-bytes"
+export MONOID_BACKEND_ADMIN_TOKEN="admin-dev-token"
+export MONOID_LLM_GATEWAY_ADMIN_TOKEN="llm-admin-dev-token"
+export MONOID_BACKEND_TOKEN_SECRET="replace-with-32-plus-random-bytes"
 
 monoid llm-gateway serve \
   --host 127.0.0.1 \
   --port 8080
 ```
 
-Start the runner backend in another process. It shares the token signing secret
+Start the Monoid backend in another process. It shares the token signing secret
 with the LLM and Web gateways so it can issue scoped gateway tokens:
 
 ```bash
@@ -318,7 +318,7 @@ monoid backend serve \
 For local contract testing, start the reference fake WebGateway:
 
 ```bash
-export NAR_WEB_GATEWAY_ADMIN_TOKEN="web-admin-dev-token"
+export MONOID_WEB_GATEWAY_ADMIN_TOKEN="web-admin-dev-token"
 
 monoid web-gateway serve \
   --host 127.0.0.1 \
@@ -330,8 +330,7 @@ For a real search smoke, use Brave Search for `web.search` and the gateway's
 direct HTTP fetcher for `web.fetch`. Add `--context-provider brave-llm` to use
 Brave's LLM Context endpoint for `web.context`, or `--context-provider
 search-fetch` to build context from the configured search/fetch providers.
-Provider credentials stay in the WebGateway process and are never passed to the
-runner:
+Provider credentials stay in the WebGateway process and are never passed to Monoid:
 
 ```bash
 export BRAVE_SEARCH_API_KEY="..."
@@ -348,7 +347,7 @@ Create a run:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8765/v1/runs \
-  -H "Authorization: Bearer $NAR_BACKEND_ADMIN_TOKEN" \
+  -H "Authorization: Bearer $MONOID_BACKEND_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "tenant_id": "tenant_a",
@@ -391,7 +390,7 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
 curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/runtime-config
 
-# POST replaces the run's config (optimistic concurrency via expected_version); the runner
+# POST replaces the run's config (optimistic concurrency via expected_version); the kernel
 # applies it at the next turn boundary. See docs/CONTRACTS.md for the request schema.
 curl -sS -X POST http://127.0.0.1:8765/v1/runs/$RUN_ID/runtime-config \
   -H "Authorization: Bearer $RUN_TOKEN" \
@@ -408,23 +407,23 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
 Tenant usage is admin-scoped:
 
 ```bash
-curl -H "Authorization: Bearer $NAR_BACKEND_ADMIN_TOKEN" \
+curl -H "Authorization: Bearer $MONOID_BACKEND_ADMIN_TOKEN" \
   http://127.0.0.1:8765/v1/tenants/tenant_a/usage
 ```
 
-The backend generates a separate `llm_gateway` token for the runner-to-gateway
+The backend generates a separate `llm_gateway` token for the kernel-to-gateway
 call. That token is passed only to `GatewayModelAdapter` and is not returned from
 the run APIs. For web-enabled runs, it also generates a separate `web_gateway`
 token for `WebGatewayClient`.
 
 The LLM gateway validates `llm_gateway` tokens, calls the provider adapter, and returns only
-opaque `turn_handle` values to the runner. The default by-value `messages` request is
+opaque `turn_handle` values to the kernel. The default by-value `messages` request is
 forwarded statelessly; for handle-based continuation it stores provider continuation ids
 server-side. The turn request carries the effective model from runtime config. Its usage endpoint is
 admin-scoped:
 
 ```bash
-curl -H "Authorization: Bearer $NAR_LLM_GATEWAY_ADMIN_TOKEN" \
+curl -H "Authorization: Bearer $MONOID_LLM_GATEWAY_ADMIN_TOKEN" \
   http://127.0.0.1:8080/internal/llm/tenants/tenant_a/usage
 ```
 
@@ -432,10 +431,10 @@ The WebGateway validates `web_gateway` tokens, enforces per-request binding
 constraints, calls a web provider adapter, and reports tenant usage. The reference ships a
 deterministic fake provider plus Brave-backed search/fetch/context providers behind the
 provider-neutral `ContextProvider` seam, so the search backend can be swapped without
-changing runner tools.
+changing kernel tools.
 
 ```bash
-curl -H "Authorization: Bearer $NAR_WEB_GATEWAY_ADMIN_TOKEN" \
+curl -H "Authorization: Bearer $MONOID_WEB_GATEWAY_ADMIN_TOKEN" \
   http://127.0.0.1:8090/internal/web/tenants/tenant_a/usage
 ```
 
@@ -542,7 +541,7 @@ See also the design docs under [`docs/`](docs/README.md): `SUBAGENT_DESIGN.md` a
 
 `GatewayModelAdapter` is the default path. It sends normalized model-turn
 requests to your LLM gateway and can authenticate with
-`NAR_LLM_GATEWAY_TOKEN` or `--llm-gateway-token-file`. Provider credentials stay
+`MONOID_LLM_GATEWAY_TOKEN` or `--llm-gateway-token-file`. Provider credentials stay
 inside your backend platform, where tenant usage, budgets, and rate limits
 can be enforced.
 

@@ -33,7 +33,7 @@ def make_llm_gateway_handler(
     admin_token: str | None,
 ) -> type[BaseHTTPRequestHandler]:
     class LlmGatewayHttpHandler(BaseHTTPRequestHandler):
-        server_version = "NativeAgentRunnerLlmGateway/0.2"
+        server_version = "MonoidLlmGateway/0.2"
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)

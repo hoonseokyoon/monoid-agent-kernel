@@ -8,7 +8,7 @@ Let a run delegate a focused task to a **child run** that works in an isolated
 context window and returns only its final message to the parent. This is the
 **agent-as-tool** pattern (Claude Code `Agent`/`Task`, OpenAI `agent.as_tool()`,
 Google ADK `AgentTool`). It is the lowest-risk of the three canonical delegation
-patterns for this runner because it needs **no shared cross-agent state bus**:
+patterns for Monoid because it needs **no shared cross-agent state bus**:
 
 | Pattern | Context | New plumbing here |
 |---|---|---|

@@ -1,7 +1,7 @@
 """Internal shared utilities for core modules (timestamps, atomic JSON writes).
 
-Core-internal only; not part of the supported public surface and intentionally
-not re-exported from ``monoid_agent_kernel.contracts`` or the package root.
+Core-internal only. The supported public surface is exported from
+``monoid_agent_kernel.contracts`` and the package root.
 """
 
 from __future__ import annotations

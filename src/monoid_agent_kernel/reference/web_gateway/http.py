@@ -27,7 +27,7 @@ def make_web_gateway_handler(
     admin_token: str | None,
 ) -> type[BaseHTTPRequestHandler]:
     class WebGatewayHttpHandler(BaseHTTPRequestHandler):
-        server_version = "NativeAgentRunnerWebGateway/0.9"
+        server_version = "MonoidWebGateway/0.9"
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)

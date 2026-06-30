@@ -338,7 +338,7 @@ def _materialize_source(source: Path) -> Iterator[_PackageSource]:
     if source.is_dir():
         yield _PackageSource(source, "run_dir")
         return
-    with tempfile.TemporaryDirectory(prefix="native-agent-package-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="monoid-package-") as tmp:
         root = Path(tmp)
         _extract_tar_safely(source, root)
         yield _PackageSource(root, "tar")

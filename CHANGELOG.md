@@ -7,6 +7,12 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed
+- Project branding now centers on **Monoid Agent Kernel**: a lightweight,
+  durable, contract-first kernel for embedding agents in product runtimes.
+- Environment variables now prefer `MONOID_*` names. Existing `NAR_*` names are
+  accepted during migration.
+
 ## [0.13.0] - 2026-06-29
 
 ### Added

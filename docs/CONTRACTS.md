@@ -1,9 +1,10 @@
 # Integration Contracts
 
-This document defines the supported integration surface for Monoid Agent Kernel.
-Import Python contracts from `monoid_agent_kernel.contracts`. Treat
-`monoid_agent_kernel.reference.*` as runnable examples for backend, LLM gateway,
-and web gateway integration.
+This document defines the supported integration surface for Monoid Agent Kernel:
+a lightweight agent kernel designed to embed into many products, runtimes, and
+deployment models. Import Python contracts from `monoid_agent_kernel.contracts`.
+Treat `monoid_agent_kernel.reference.*` as runnable examples for backend, LLM
+gateway, and web gateway integration.
 
 ## Boundary
 
@@ -13,12 +14,12 @@ The package is layered in three tiers:
   `monoid_agent_kernel.contracts` (and re-exported from the top-level
   `monoid_agent_kernel`). These are the specs and protocols you depend on and
   implement. This document defines them.
-- **core** — the engine that implements those contracts: the default supported
-  runner (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, permission,
+- **core** — the engine that implements those contracts: the supported kernel runtime
+  (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, permission,
   shell execution, and web gateway client modules).
 - **reference** — example services under `monoid_agent_kernel.reference`
-  (`backend`, `llm_gateway`, `web_gateway`, `stores`). Not part of the supported
-  surface; core has no dependency on `monoid_agent_kernel.reference`.
+  (`backend`, `llm_gateway`, `web_gateway`, `stores`). These examples live outside
+  the supported public surface; core has no dependency on `monoid_agent_kernel.reference`.
 
 Agent configuration enters the engine through `AgentRuntimeConfig`. Legacy
 tool/shell/web policy inputs have left the core, backend, and CLI execution
@@ -44,7 +45,7 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   a validator registered via `AgentLoop(output_validators=...)` runs by default and can be
   disabled per run with an `OutputValidatorBinding(enabled=False)`; on failure the loop re-prompts
   up to `RunLimits.max_output_retries`).
-- **Not a contract**: `monoid_agent_kernel.reference.*` (example services).
+- **Reference examples**: `monoid_agent_kernel.reference.*` services.
 
 ## Identifier Namespace
 
@@ -370,9 +371,9 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
 
 - **Enable**: build a `SkillProvider(definitions)` and register the one instance in both
   `AgentLoop(context_providers=(provider,), tool_providers=(provider,))`. Provider tools
-  are not auto-bound — merge `provider.tool_bindings()` into the runtime config so the
-  `skill` tools reach the model (mirrors the MCP provider). The CLI `--skills-directory`
-  does all of this.
+  require explicit bindings; merge `provider.tool_bindings()` into the runtime config so
+  the `skill` tools reach the model (mirrors the MCP provider). The CLI
+  `--skills-directory` does all of this.
 - **Definition** (`SkillDefinition`): `name`, `description` (both advertised at L1),
   `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (**advisory** for
   inline skills — a hint, not enforced; **enforced** for fork skills, see below), `context`
@@ -400,7 +401,7 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
     bundled file (`path` relative to the skill directory, as listed in `resources`), or
     `skill.run_script(name, path, args?)` to **execute** a bundled script and get back only
     its `{exit_code, stdout, stderr, ...}` — the script source never enters context. The
-    interpreter is chosen by extension (`.py` → the runner's Python, `.sh` → bash, `.js` →
+    interpreter is chosen by extension (`.py` → the kernel's Python, `.sh` → bash, `.js` →
     node, `.rb` → ruby, `.ps1` → powershell); `args` are passed to the script **verbatim as
     argv, never through a shell**, so they cannot be re-parsed/injected. The script runs in
     the workspace through the same machinery as `shell.exec` (`side_effect: "shell"`):
@@ -675,7 +676,7 @@ bindings.
 }
 ```
 
-The runner sends one of two request styles. **By-value `messages` is the default**: the
+The kernel sends one of two request styles. **By-value `messages` is the default**: the
 full provider-neutral conversation log (`messages`, a list of `{role, content}` user /
 assistant / tool entries) travels on every turn, and the gateway forwards it statelessly —
 `previous_turn_handle` and `observations` are not consulted. The conversation is
@@ -692,7 +693,7 @@ carries no `messages`. It has three shapes, selected by `previous_turn_handle` a
   top of an existing continuation handle; `observations` is empty).
 
 Either style lets one run accept multiple user turns: with `messages` the new user message
-is appended to the log; with a handle the runner threads the last `turn_handle` into the
+is appended to the log; with a handle the kernel threads the last `turn_handle` into the
 next user message.
 
 Successful response:
@@ -712,7 +713,7 @@ Successful response:
 `usage` always carries `input_tokens` / `output_tokens` / `total_tokens`. It MAY
 additionally carry optional priced sub-counts when the provider reports them —
 `cache_read_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `audio_tokens` —
-which the runner sums into per-run totals and checks against the token budget. These
+which the kernel sums into per-run totals and checks against the token budget. These
 fields are additive; a consumer that ignores them stays correct.
 
 The reference LLM gateway token authenticates run identity. The request model
@@ -720,7 +721,7 @@ selects the turn model.
 
 ### Web Gateway
 
-The runner calls:
+The kernel calls:
 
 - `POST /internal/web/search`
 - `POST /internal/web/fetch`
@@ -732,7 +733,7 @@ Every request includes binding constraints:
 {
   "protocol": "monoid.web-search.v1",
   "binding_id": "search_docs",
-  "query": "native runtime config",
+  "query": "monoid runtime config",
   "max_results": 5,
   "max_calls": 20,
   "allowed_domains": ["docs.example.test"],
@@ -957,7 +958,7 @@ stores, which is the "shared board" that lets a worker on another process/host r
 crashed peer's run across the instance boundary (a per-host `lease.json` cannot):
 
 ```python
-db = "/shared/runner.db"
+db = "/shared/monoid.db"
 backend = RunnerBackend(
     ...,
     checkpoint_store=SqliteCheckpointStore(db),

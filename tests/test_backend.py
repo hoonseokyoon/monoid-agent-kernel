@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+
 from support.backend_harness import (
     BackendRunRequest,
     FakeModelAdapter,
@@ -260,6 +262,23 @@ def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
         manager.verify(token, kind="llm_gateway", audience="csp.llm-gateway")
     with pytest.raises(TokenError):
         manager.verify(token, kind="run_access", audience="monoid.backend", run_id="other")
+
+
+def test_token_manager_emits_monoid_header_type() -> None:
+    manager = _token_manager()
+    token = manager.issue(
+        kind="run_access",
+        audience="monoid.backend",
+        run_id="run_1",
+        tenant_id="tenant_a",
+        user_id="user_a",
+        ttl_s=60,
+    )
+    header_raw = token.split(".", 1)[0]
+    padded = header_raw + "=" * (-len(header_raw) % 4)
+    header = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+
+    assert header["typ"] == "MAK"
 
 
 def test_token_manager_accepts_legacy_issuer_and_audience_for_migration() -> None:

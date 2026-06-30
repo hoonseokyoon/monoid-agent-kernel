@@ -1,7 +1,8 @@
-# Documentation index
+# Monoid Documentation
 
-Start with the top-level [README](../README.md) for install, quickstart, and the run model.
-These docs go deeper on specific surfaces:
+Start with the top-level [README](../README.md) for the product position,
+install, quickstart, and run model. These docs go deeper on the contracts that
+make Monoid embeddable in different products and runtimes:
 
 | Doc | What it covers |
 |-----|----------------|

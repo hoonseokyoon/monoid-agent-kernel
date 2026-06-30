@@ -91,7 +91,7 @@ def _studio_config(
 
 @click.group("studio")
 def studio() -> None:
-    """Run the bundled Studio reference app (LLM gateway + runner backend + UI)."""
+    """Run the bundled Studio reference app (LLM gateway + Monoid backend + UI)."""
 
 
 @studio.command("serve")

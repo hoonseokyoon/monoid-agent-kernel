@@ -2313,7 +2313,7 @@ class RunnerBackend:
         self._watchdog_stop.clear()
         thread = threading.Thread(
             target=self._watchdog_loop,
-            name=f"native-agent-watchdog-{self._worker_id[:8]}",
+            name=f"monoid-watchdog-{self._worker_id[:8]}",
             daemon=True,
         )
         self._watchdog_thread = thread

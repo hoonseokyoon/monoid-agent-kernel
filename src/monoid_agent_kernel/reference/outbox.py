@@ -1,8 +1,8 @@
 """Reference outbox senders + a generic ``outbox.send`` tool.
 
 These show how the ``OutboxSender`` contract is satisfied at the edge (where the IO and the secret
-live) and how a tool stages a durable send. Examples, not part of the supported surface (like the
-other ``reference.*`` services).
+live) and how a tool stages a durable send. They are reference examples like the other
+``reference.*`` services.
 
 - ``RecordingOutboxSender`` — records every dispatched request and returns success; a no-IO sender
   for local dev / tests (lets a caller assert what was sent and that the lease handle rode along).

@@ -46,7 +46,7 @@ def _drain_to_sentinel(q: queue.Queue, *, deadline_s: float = 15.0) -> None:
 
 def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> type[BaseHTTPRequestHandler]:
     class BackendHttpHandler(BaseHTTPRequestHandler):
-        server_version = "NativeAgentRunnerBackend/0.2"
+        server_version = "MonoidBackend/0.2"
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)

@@ -14,6 +14,9 @@ from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.identifiers import LEGACY_TOKEN_ISSUER, TOKEN_ISSUER, normalize_audiences
 
 TokenKind = Literal["run_access", "llm_gateway", "web_gateway", "task_callback", "capability"]
+TOKEN_HEADER_TYPE = "MAK"
+LEGACY_TOKEN_HEADER_TYPE = "NAR"
+ACCEPTED_TOKEN_HEADER_TYPES = (TOKEN_HEADER_TYPE, LEGACY_TOKEN_HEADER_TYPE)
 
 
 class TokenError(NativeAgentError):
@@ -98,7 +101,7 @@ class TokenManager:
             expires_at=now + ttl_s,
             metadata=dict(metadata or {}),
         )
-        header = {"alg": "HS256", "typ": "NAR"}
+        header = {"alg": "HS256", "typ": TOKEN_HEADER_TYPE}
         signing_input = ".".join(
             (
                 _b64_json(header),
@@ -125,7 +128,7 @@ class TokenManager:
         if not hmac.compare_digest(signature, expected):
             raise TokenError("invalid token signature")
         header = _json_b64(header_raw)
-        if header.get("alg") != "HS256" or header.get("typ") != "NAR":
+        if header.get("alg") != "HS256" or header.get("typ") not in ACCEPTED_TOKEN_HEADER_TYPES:
             raise TokenError("invalid token header")
         payload = _json_b64(payload_raw)
         if payload.get("iss") not in (self.issuer, *self.accepted_issuers):

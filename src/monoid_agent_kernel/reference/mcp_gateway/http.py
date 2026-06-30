@@ -36,7 +36,7 @@ def make_mcp_handler(
     admin_token: str | None,
 ) -> type[BaseHTTPRequestHandler]:
     class McpGatewayHttpHandler(BaseHTTPRequestHandler):
-        server_version = "NativeAgentRunnerMcpGateway/0.1"
+        server_version = "MonoidMcpGateway/0.1"
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)

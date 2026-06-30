@@ -1,7 +1,7 @@
 """Shared coercion helpers for execution-boundary dataclasses.
 
 Used by permission and runtime execution parsers to keep JSON array handling
-consistent. Internal only; not part of the supported public surface.
+consistent. Internal helper.
 """
 
 from __future__ import annotations

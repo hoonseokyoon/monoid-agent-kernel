@@ -1,2 +1,1 @@
-"""Core contracts for the native agent runner."""
-
+"""Core contracts for Monoid Agent Kernel."""

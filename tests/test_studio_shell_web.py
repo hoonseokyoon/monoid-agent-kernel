@@ -126,7 +126,7 @@ def test_shell_background_job_is_listed(tmp_path: Path) -> None:
 def test_web_search_runs_through_the_gateway(tmp_path: Path) -> None:
     fake = FakeModelAdapter(
         turns=[
-            ModelTurn(tool_calls=(fake_tool_call("web_search", {"query": "native agent runner"}, "c1"),)),
+            ModelTurn(tool_calls=(fake_tool_call("web_search", {"query": "monoid agent kernel"}, "c1"),)),
             ModelTurn(final_text="searched the web"),
         ]
     )

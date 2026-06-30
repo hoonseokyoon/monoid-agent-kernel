@@ -5,11 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "monoid-agent-kernel"
 version = "0.13.0"
-description = "Standalone lightweight API-backed agent harness for safe file work"
+description = "Lightweight durable agent kernel for product integrations"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Hoonseok Yoon", email = "yoonhs9dev@gmail.com" }]
-keywords = ["agent", "llm", "ai", "runtime", "tools", "harness", "openai", "mcp"]
+keywords = ["agent", "llm", "ai", "runtime", "kernel", "tools", "observability", "mcp"]
 license = { text = "Apache-2.0" }
 classifiers = [
     "Development Status :: 4 - Beta",

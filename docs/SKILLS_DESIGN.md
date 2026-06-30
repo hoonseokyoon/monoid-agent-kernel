@@ -10,7 +10,7 @@ specific task) delivered to the model by **progressive disclosure**, the Anthrop
 until a skill is actually relevant, then reveal exactly as much as is needed.
 
 Skills are the **knowledge layer**, complementary to the two delegation features
-already in the runner:
+already in the kernel:
 
 | Layer | Feature | What it provides |
 |---|---|---|
@@ -101,7 +101,7 @@ out of scope here.
 
 `--skills-directory` → `load_skill_definitions` → one `SkillProvider` → registered in
 both `context_providers` and `tool_providers`, with `provider.tool_bindings()` merged
-into the runtime config (provider tools are not auto-bound, same as MCP).
+into the runtime config. Provider tools require explicit bindings, same as MCP.
 
 ## Observability (P2)
 
@@ -142,7 +142,7 @@ Design decisions (reusing the shell machinery, not re-implementing process handl
   approval gating, env scrubbing, timeout, output-byte limits, `changed_paths`, and the
   `shell.exec.*` events. `side_effect: "shell"` gives it `shell.exec`'s run-mode/approval
   gating. Foreground-only; cwd = workspace root.
-- **Interpreter by extension:** `.py` → the runner's `sys.executable`, `.sh`/`.bash` → bash,
+- **Interpreter by extension:** `.py` → the kernel's `sys.executable`, `.sh`/`.bash` → bash,
   `.js`/`.mjs` → node, `.rb` → ruby, `.ps1` → powershell; unknown → `skill_script_unsupported`.
 - **Security stance.** Skills are operator-provisioned via `--skills-directory` — the same
   trust boundary as `--tool-module` — so no new sandbox is introduced; load skills only from
@@ -178,7 +178,7 @@ agent-as-tool machine, so there is almost no new plumbing.
   all of the parent's tools — no narrowing.) So "I want this skill restricted to certain tools"
   is answered by making
   it a fork skill, which is why a separate enforced-gating mechanism for inline skills is not
-  worth building. (For a fork skill, write `allowed-tools` in the runner's tool-id namespace,
+  worth building. (For a fork skill, write `allowed-tools` in the kernel's tool-id namespace,
   e.g. `fs.read shell.exec`, since it is matched by fnmatch against tool ids.)
 
 ## Scope

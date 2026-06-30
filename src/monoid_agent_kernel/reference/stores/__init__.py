@@ -1,4 +1,4 @@
-"""Reference durable stores for the runner backend.
+"""Reference durable stores for the Monoid backend.
 
 The core defines the seams (``CheckpointStore``; the backend defines ``LeaseStore``); these
 are integrator implementations of the HOW. ``SqliteCheckpointStore``/``SqliteLeaseStore``

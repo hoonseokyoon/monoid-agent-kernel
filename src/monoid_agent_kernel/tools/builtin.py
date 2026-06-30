@@ -272,7 +272,7 @@ def _media_result(workspace: Workspace, path: str, data: bytes, digest: str) -> 
     if mime is None:
         raise WorkspaceError(f"not a supported image or PDF file: {path}")
     normalized = workspace.normalize(path)
-    # Media travels by reference (source_ref); the runner resolves + forwards it so the
+    # Media travels by reference (source_ref); the kernel resolves + forwards it so the
     # model can view it. The text content carries metadata only.
     part: ImagePart | DocumentPart = (
         DocumentPart(source_ref=normalized, mime_type=mime)

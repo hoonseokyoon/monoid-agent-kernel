@@ -335,7 +335,7 @@ class ShellTaskExecutor:
                 raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
             return cwd_abs, None, None
 
-        tmp_root = Path(tempfile.mkdtemp(prefix="native-agent-shell-job-")).resolve()
+        tmp_root = Path(tempfile.mkdtemp(prefix="monoid-shell-job-")).resolve()
         before = shell_runtime.materialize_workspace(manager.workspace, tmp_root, manager.permission_policy)
         cwd_abs = (tmp_root / cwd_rel).resolve()
         if not is_within(tmp_root, cwd_abs):
@@ -486,7 +486,7 @@ class ShellResultInjector:
 @dataclass
 class HostedTask:
     """A hosted task (human-in-the-loop or automation): work delegated outside the
-    runner and parked until an external reporter calls ``report_result``. No
+    kernel and parked until an external reporter calls ``report_result``. No
     in-process monitor — the reporter (operator/external system) is the only
     completion writer. Carries ``job_id`` so it flows through the manager's generic
     queue alongside shell ``BackgroundJob``s."""

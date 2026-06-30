@@ -1,4 +1,4 @@
-"""Studio all-in-one server: LLM gateway + runner backend + UI/BFF in one process.
+"""Studio all-in-one server: LLM gateway + Monoid backend + UI/BFF in one process.
 
 This is the reference "installable agent app" — it boots the reference ``LlmGatewayBackend`` and
 ``RunnerBackend`` behind a shared signing secret, then serves a single-page UI plus a thin
@@ -9,7 +9,7 @@ Topology inside one process:
 
     browser ── HTTP ──> Studio BFF ──(Python calls)──> RunnerBackend ──(loopback HTTP)──> LLM gateway
 
-The runner is driven via its Python API (not its own HTTP surface), which is the most
+The kernel is driven via its Python API (not its own HTTP surface), which is the most
 representative path for an embedder bundling the engine into an app.
 
 Not part of the supported surface — a reference example you copy and own.
@@ -20,7 +20,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import secrets
 import threading
 import time
@@ -39,6 +38,7 @@ from monoid_agent_kernel.core.agents import (
     SubagentDefinition,
     ToolBinding,
 )
+from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.content import ContentPart, DocumentPart, ImagePart, TextPart
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
@@ -62,7 +62,7 @@ _LOGGER = logging.getLogger("monoid_agent_kernel.studio")
 
 _WEB_DIR = Path(__file__).parent / "web"
 # Per-attachment cap. An attachment rides a base64 ``data:`` URI inside the JSON body (handed to
-# the runner by value; the core normalizes it to a content-addressed blob), so the HTTP body limit
+# the kernel by value; the core normalizes it to a content-addressed blob), so the HTTP body limit
 # is sized to clear one inflated image plus the JSON envelope.
 _MAX_ATTACH_BYTES = 8 * 1024 * 1024
 _MAX_BODY_BYTES = _MAX_ATTACH_BYTES + 2 * 1024 * 1024  # room for base64 inflation + JSON envelope
@@ -195,7 +195,7 @@ _SUMMARY_CHOICES = ("off", "auto", "detailed")
 # OTel tracing (Tier-3): when toggled on, runs emit GenAI spans via OtelEventSink to an OTLP
 # collector (default = a local Jaeger's OTLP/HTTP port). The exporter + global provider are set
 # up once, lazily; the sink is a no-op until then.
-_OTEL_ENDPOINT = os.environ.get("NAR_OTEL_ENDPOINT", "http://localhost:4318/v1/traces")
+_OTEL_ENDPOINT = getenv("MONOID_OTEL_ENDPOINT") or "http://localhost:4318/v1/traces"
 _otel_provider_ready = False
 
 
@@ -557,7 +557,7 @@ class StudioServer:
         """Build the multimodal content parts for a user message. Each attachment is
         ``{name, mime, data_b64}``; ``image/*`` becomes an ``ImagePart``, anything else (e.g.
         ``application/pdf``) a ``DocumentPart``. The bytes are handed in **by value** as a ``data:``
-        URI — the runner core normalizes that to a durable content-addressed blob at ingestion, so
+        URI — the kernel normalizes that to a durable content-addressed blob at ingestion, so
         the studio manages no attachment files and the image survives restart/re-provisioning.
         Returns ``()`` when there are no attachments (the caller uses the plain-text path)."""
         if not attachments:
@@ -1045,7 +1045,7 @@ _TERMINAL = {"completed", "failed", "limited"}
 
 def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
     class StudioHandler(BaseHTTPRequestHandler):
-        server_version = "NativeAgentRunnerStudio/0.1"
+        server_version = "MonoidStudio/0.1"
         protocol_version = "HTTP/1.1"
 
         def log_message(self, *args: Any) -> None:  # quiet by default

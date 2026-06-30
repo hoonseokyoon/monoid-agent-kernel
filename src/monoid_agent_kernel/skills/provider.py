@@ -38,7 +38,7 @@ _MAX_RESOURCE_FILES = 100
 _MAX_RESOURCE_BYTES = 1_000_000
 
 # Map a bundled script's extension to the argv prefix that runs it. ``sys.executable`` (the
-# runner's own Python) backs ``.py`` so a Python script always has an interpreter on hand;
+# kernel's own Python) backs ``.py`` so a Python script always has an interpreter on hand;
 # the rest rely on the interpreter being on PATH. Scripts are run by argv — never through a
 # shell — so the source never enters context and the args are never re-parsed by a shell.
 _INTERPRETERS: dict[str, list[str]] = {
