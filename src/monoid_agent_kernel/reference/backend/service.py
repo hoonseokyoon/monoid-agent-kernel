@@ -153,6 +153,17 @@ def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
     return payload
 
 
+def _runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
+    config_payload = meta.get("runtime_config")
+    if not isinstance(config_payload, dict):
+        raise ValueError("run metadata is missing runtime_config")
+    config = AgentRuntimeConfig.from_json(config_payload)
+    expected_hash = str(meta.get("runtime_config_hash") or config_payload.get("config_hash") or "")
+    if expected_hash and expected_hash != config.config_hash:
+        raise ValueError("runtime config hash mismatch in run metadata")
+    return config
+
+
 @dataclass(frozen=True)
 class BackendRunRequest:
     tenant_id: str
@@ -253,6 +264,7 @@ class BackendRunRecord:
     runtime_config: AgentRuntimeConfig | None = None
     runtime_config_issuer: str = ""
     runtime_config_reason: str = ""
+    runtime_config_committed_at: float = 0.0
     # Authoritative lifecycle FSM state, updated by the session driver as it observes each
     # suspension. The control protocol's inspect/health read this (a throwaway LoopSession is
     # seeded with it) since the backend drives the loop directly, not through a facade.
@@ -737,6 +749,7 @@ class RunnerBackend:
                 ttl_s=self.web_gateway_token_ttl_s,
                 metadata={"agent_config_hash": initial_runtime_config.config_hash},
             )
+        created_at = time.time()
         record = BackendRunRecord(
             run_id=run_id,
             tenant_id=request.tenant_id,
@@ -744,14 +757,16 @@ class RunnerBackend:
             workspace_root=workspace_root,
             run_dir=run_dir,
             status="queued",
-            created_at=time.time(),
+            created_at=created_at,
             run_token_sha256=TokenManager.token_sha256(run_token),
             llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
             web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
             runtime_config=initial_runtime_config,
             runtime_config_issuer=runtime_config_issuer,
             runtime_config_reason=runtime_config_reason,
+            runtime_config_committed_at=created_at,
         )
+        self._write_run_meta(record, request)
         with self._lock:
             self._records[run_id] = record
         return _PreparedRun(
@@ -1224,6 +1239,7 @@ class RunnerBackend:
                     "config_hash": "",
                     "issuer": record.runtime_config_issuer,
                     "reason": record.runtime_config_reason,
+                    "committed_at": record.runtime_config_committed_at,
                 }
             return {
                 "run_id": record.run_id,
@@ -1231,6 +1247,7 @@ class RunnerBackend:
                 "ready": True,
                 "issuer": record.runtime_config_issuer,
                 "reason": record.runtime_config_reason,
+                "committed_at": record.runtime_config_committed_at,
                 "config": config.to_json(),
                 "config_version": config.config_version,
                 "config_hash": config.config_hash,
@@ -1264,15 +1281,25 @@ class RunnerBackend:
                 # replace() copies all fields, so a new config field can't be silently dropped on
                 # hot-swap (an enumerated rebuild here previously dropped output-validator opt-outs).
                 config = replace(config, config_version=current_version + 1)
+            committed_at = time.time()
+            self._write_runtime_config_run_meta(
+                record,
+                config,
+                issuer=issuer,
+                reason=reason,
+                committed_at=committed_at,
+            )
             record.runtime_config = config
             record.runtime_config_issuer = issuer
             record.runtime_config_reason = reason
+            record.runtime_config_committed_at = committed_at
             return {
                 "run_id": record.run_id,
                 "tenant_id": record.tenant_id,
                 "ready": True,
                 "issuer": issuer,
                 "reason": reason,
+                "committed_at": committed_at,
                 "config": config.to_json(),
                 "config_version": config.config_version,
                 "config_hash": config.config_hash,
@@ -2177,8 +2204,10 @@ class RunnerBackend:
         """Write run.json — the durable recovery descriptor. Holds everything
         ``recover_runs`` needs to rebuild a run that was parked when the process died:
         identity, workspace, limits, policy, and the resolved runtime config (gateway
-        tokens are re-issued on recovery, not stored). A mid-run runtime-config change
-        is not re-persisted here, so recovery uses the config as of run start."""
+        tokens are re-issued on recovery, not stored). Runtime-config changes update this
+        descriptor, so recovery uses the latest committed config instead of the run-start config."""
+        config = record.runtime_config
+        committed_at = record.runtime_config_committed_at or time.time()
         meta = {
             "schema_version": _RUN_META_SCHEMA_VERSION,
             "run_id": record.run_id,
@@ -2189,7 +2218,7 @@ class RunnerBackend:
             "workspace_backend": request.workspace_backend,
             "multi_turn": request.multi_turn,
             # For history listing (DX-12): a created-at stamp + a short title (first instruction).
-            "created_at": time.time(),
+            "created_at": record.created_at,
             "title": " ".join((request.instruction or "").split())[:80],
             "limits": {
                 "max_steps": request.max_steps,
@@ -2198,9 +2227,34 @@ class RunnerBackend:
                 "max_duration_s": request.max_duration_s,
             },
             "permission_policy": request.permission_policy.to_json(),
-            "runtime_config": record.runtime_config.to_json() if record.runtime_config else None,
+            "runtime_config": config.to_json() if config else None,
+            "runtime_config_version": config.config_version if config else 0,
+            "runtime_config_hash": config.config_hash if config else "",
+            "runtime_config_issuer": record.runtime_config_issuer,
+            "runtime_config_reason": record.runtime_config_reason,
+            "runtime_config_committed_at": committed_at,
         }
         record.run_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(record.run_dir / "run.json", meta)
+
+    def _write_runtime_config_run_meta(
+        self,
+        record: BackendRunRecord,
+        config: AgentRuntimeConfig,
+        *,
+        issuer: str,
+        reason: str,
+        committed_at: float,
+    ) -> None:
+        meta = _read_run_meta(record.run_dir)
+        if meta is None:
+            raise ValueError("run metadata is not ready")
+        meta["runtime_config"] = config.to_json()
+        meta["runtime_config_version"] = config.config_version
+        meta["runtime_config_hash"] = config.config_hash
+        meta["runtime_config_issuer"] = issuer
+        meta["runtime_config_reason"] = reason
+        meta["runtime_config_committed_at"] = committed_at
         write_json_atomic(record.run_dir / "run.json", meta)
 
     def recover_runs(self) -> list[str]:
@@ -2399,7 +2453,7 @@ class RunnerBackend:
         checkpoint = stored.checkpoint
         run_id = checkpoint.run_id
         run_dir = self.run_root / run_id
-        runtime_config = AgentRuntimeConfig.from_json(meta["runtime_config"])
+        runtime_config = _runtime_config_from_meta(meta)
         limits = meta.get("limits") or {}
         request = BackendRunRequest(
             tenant_id=str(meta["tenant_id"]),
@@ -2451,8 +2505,9 @@ class RunnerBackend:
             llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
             web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
             runtime_config=runtime_config,
-            runtime_config_issuer="recover_runs",
-            runtime_config_reason="resumed from checkpoint",
+            runtime_config_issuer=str(meta.get("runtime_config_issuer") or "recover_runs"),
+            runtime_config_reason=str(meta.get("runtime_config_reason") or "resumed from checkpoint"),
+            runtime_config_committed_at=float(meta.get("runtime_config_committed_at") or time.time()),
         )
         with self._lock:
             self._records[run_id] = record

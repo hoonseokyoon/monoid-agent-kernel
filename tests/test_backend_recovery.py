@@ -27,6 +27,7 @@ from support.backend_harness import (
     runtime_config,
     threading,
     time,
+    tool_binding,
     write_json_atomic,
 )
 from monoid_agent_kernel.reference.backend.service import _read_run_meta
@@ -186,6 +187,74 @@ def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> No
     backend1.cancel_run(run_id, token)  # stop the defunct first-process worker
 
 
+def test_resume_run_uses_latest_runtime_config_after_hotswap(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+
+    backend1 = _recoverable_backend(
+        run_root,
+        token_manager,
+        workspace,
+        [],
+        turns=[ModelTurn(response_id="r1", final_text="first")],
+    )
+    backend1.idle_timeout_s = 30.0
+    initial = runtime_config(
+        bindings=(tool_binding("fs.read", guidance="initial read"), tool_binding("run.finish")),
+    )
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=initial,
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
+    assert eventually(lambda: backend1._record(run_id).status == "awaiting_input")
+
+    replacement = runtime_config(
+        version=2,
+        bindings=(tool_binding("fs.read", guidance="replacement read"), tool_binding("run.finish")),
+    )
+    updated = backend1.replace_runtime_config(
+        run_id,
+        token,
+        expected_version=1,
+        issuer="operator",
+        reason="replace before restart",
+        config=replacement,
+    )
+    assert updated["config_hash"] == replacement.config_hash
+
+    resumed: list = []
+    backend2 = _recoverable_backend(
+        run_root,
+        token_manager,
+        workspace,
+        resumed,
+        turns=[ModelTurn(response_id="r2", final_text="second")],
+    )
+    backend2.idle_timeout_s = 30.0
+    backend2.max_recover_attempts = 10_000
+
+    assert backend2.resume_run(run_id, token)["resumed"] is True
+    assert backend2.runtime_config(run_id, token)["config_hash"] == replacement.config_hash
+    backend2.send_message(run_id, token, "again")
+    assert eventually(lambda: any(adapter.requests for adapter in resumed))
+
+    read_tool = next(tool for tool in resumed[0].requests[0].tools if tool.id == "fs.read")
+    assert "replacement read" in read_tool.description
+
+    backend2.cancel_run(run_id, token)
+    backend2.wait_for_run(run_id, timeout_s=20)
+    backend1.cancel_run(run_id, token)
+
+
 def test_recover_runs_skips_terminal_and_metaless_checkpoints(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     run_root = tmp_path / "runs"
@@ -269,6 +338,32 @@ def test_recover_runs_marks_unrecoverable_after_max_attempts(tmp_path: Path, mon
 
     # Now permanently skipped: failure.json is the terminal mark.
     assert backend.recover_runs() == []
+
+
+def test_recover_runs_rejects_runtime_config_hash_mismatch(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend = _recoverable_backend(run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")])
+    backend.max_recover_attempts = 1
+
+    run_id = "run_bad_config_hash"
+    run_dir = run_root / run_id
+    run_dir.mkdir(parents=True)
+    backend.checkpoint_store.put(RunCheckpoint(run_id=run_id, seq=1, terminal=False))
+    write_json_atomic(
+        run_dir / "run.json",
+        {
+            "schema_version": _RUN_META_SCHEMA_VERSION,
+            "run_id": run_id,
+            "runtime_config": _default_config().to_json(),
+            "runtime_config_hash": "not-the-config-hash",
+        },
+    )
+
+    assert backend.recover_runs() == []
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_code"] == "unrecoverable"
+    assert "runtime config hash mismatch" in failure["error"]
 
 
 def test_watchdog_reclaims_stale_lease_run(tmp_path: Path, monkeypatch) -> None:

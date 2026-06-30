@@ -876,11 +876,14 @@ recovery is the integrator's call.
   (`{error, error_code, type, last_good_seq, restore_hint}`) — fail loud, name the
   checkpoint to restore from. No auto-recovery.
 - The reference backend writes `run_dir/run.json` (recovery descriptor: identity,
-  workspace, limits, policy, resolved runtime config) and exposes `recover_runs()`,
-  which scans `run_root`, skips terminal checkpoints and failed runs, rebuilds each
-  run (re-issuing gateway tokens from the signing key, **re-provisioning the base
-  workspace** is the deployment's job), `restore()`s the loop with the store's blobs,
-  re-enqueues durably-saved follow-up messages, and resumes.
+  workspace, limits, policy, and the authoritative resolved runtime config). Runtime-config
+  hot-swaps update this descriptor with `runtime_config_version`, `runtime_config_hash`,
+  `runtime_config_issuer`, `runtime_config_reason`, and `runtime_config_committed_at`; recovery
+  verifies the hash before rebuilding providers or gateway token sources. `recover_runs()` scans
+  `run_root`, skips terminal checkpoints and failed runs, rebuilds each run (re-issuing gateway
+  tokens from the signing key, **re-provisioning the base workspace** is the deployment's job),
+  `restore()`s the loop with the store's blobs, re-enqueues durably-saved follow-up messages, and
+  resumes.
 
 **Assumption (workspace):** the agent workspace is not durable; on restore the
 deployment re-provisions the base (re-clone/re-mount) and the checkpoint re-applies
