@@ -640,9 +640,9 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
   resurrect it), per `lease_id`, and an issued-before `before` watermark (a bulk cohort kill). Because
   a lease is only a handle the tool re-fetches per call, revocation just refuses to hand the handle
   back — instant, with no distributed secret clawback. Revocation state is checkpointed so a
-  revoked capability stays dead across a restart. Emits `capability.revoked`. (Edge enforcement —
-  the gateway refusing a revoked token too — is a deferred defense-in-depth follow-up; a tool that
-  cached a resolved secret past revocation is bounded only by the short TTL.)
+  revoked capability stays dead across a restart. Emits `capability.revoked`. The shared
+  `TokenManager` also supports gateway-edge revocation by token id (`jti`) or issued-before
+  watermark when the deployment propagates that revocation state to the gateway verifier.
 - **Rotation** (`AgentLoop.capability_rotate_skew_seconds`, default `0.0` = off): a cached lease
   within `skew` seconds of expiry is re-brokered on use — the handle/expiry refresh under a stable
   contract without a model retry or a re-prompt. Bounded by `CapabilityLease.max_expires_at`, an
@@ -745,8 +745,11 @@ additionally carry optional priced sub-counts when the provider reports them —
 which the kernel sums into per-run totals and checks against the token budget. These
 fields are additive; a consumer that ignores them stays correct.
 
-The reference LLM gateway token authenticates run identity. The request model
-selects the turn model.
+The reference gateway tokens authenticate run identity. New tokens include a `kid` header. A
+`TokenManager` can be built from a keyring, rotated to a new active key, and configured to accept
+retired keys only until a grace-window deadline. Verification also rejects revoked token ids and
+issued-before cohorts before any gateway action proceeds. The LLM request model still selects the
+turn model.
 
 ### Web Gateway
 
@@ -770,9 +773,9 @@ Every request includes binding constraints:
 }
 ```
 
-The reference gateway enforces per-run/binding call counters and the
-per-request domain/limit constraints. Web gateway tokens authenticate run
-identity.
+The reference gateway enforces per-run/binding call counters and signed token scope. Brokered web
+tokens carry `metadata.scope`; payload domain, binding, and numeric limit constraints can narrow
+that scope and cannot widen it. Scope violations fail before the provider adapter is called.
 
 ### Reference Backend
 

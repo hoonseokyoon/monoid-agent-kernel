@@ -308,6 +308,9 @@ monoid llm-gateway serve \
 Start the Monoid backend in another process. It shares the token signing secret
 with the LLM and Web gateways so it can issue scoped gateway tokens:
 
+Reference gateway tokens include a `kid` header. The shared `TokenManager` supports keyring-based
+rotation with a grace window plus token-id and issued-before revocation checks.
+
 ```bash
 monoid backend serve \
   --workspace-root /workspaces \
