@@ -11,7 +11,7 @@ import importlib.machinery
 import importlib.util
 import sys
 import warnings
-from types import ModuleType
+from types import CodeType, ModuleType
 
 _ALIAS_PACKAGE = __name__
 _TARGET_PACKAGE = "monoid_agent_kernel"
@@ -29,6 +29,19 @@ class _AliasLoader(importlib.abc.Loader):
 
     def exec_module(self, module: ModuleType) -> None:
         sys.modules[self._alias_name] = module
+
+    def get_code(self, fullname: str) -> CodeType | None:
+        if fullname != self._alias_name:
+            raise ImportError(f"{fullname!r} is not handled by this alias loader")
+
+        target_spec = importlib.util.find_spec(self._target_name)
+        if target_spec is None or target_spec.loader is None:
+            raise ImportError(f"cannot find target module {self._target_name!r}")
+
+        get_code = getattr(target_spec.loader, "get_code", None)
+        if get_code is None:
+            return None
+        return get_code(self._target_name)
 
 
 class _AliasFinder(importlib.abc.MetaPathFinder):
