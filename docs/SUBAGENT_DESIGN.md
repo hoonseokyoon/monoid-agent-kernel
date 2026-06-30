@@ -111,7 +111,7 @@ Instead the parent emits two summary events on its own stream:
 
 - `subagent.started` — `parent_id` = the spawn tool-call event id, so it nests under
   that tool call; data carries `root_run_id`, `parent_run_id`, `child_run_id`,
-  `task_id`, `definition_id`, `depth`, `subagent_type`, and `background`.
+  `task_id`, `definition_id`, `depth`, `traceparent`, `subagent_type`, and `background`.
 - `subagent.finished` / `subagent.failed` — `parent_id` = the `subagent.started`
   event id (close pairing); data carries the same identity fields plus `status`,
   `usage` (the child's token totals, for delegated-cost attribution), and

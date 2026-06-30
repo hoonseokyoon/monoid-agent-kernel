@@ -337,11 +337,12 @@ Task seams above via a `subagent` task kind (`SubagentTaskExecutor`); see
   depth cap has the `agent.spawn` binding stripped (the tool is absent, not just an
   error at call time).
 - **Result shape** (`subagent_result`): `{status, final_text, message, root_run_id,
-  parent_run_id, child_run_id, task_id, definition_id, depth, subagent_type, usage, error}`.
+  parent_run_id, child_run_id, task_id, definition_id, depth, traceparent, subagent_type, usage,
+  error}`.
 - **Events**: the parent stream carries `subagent.started` (`parent_id` = the spawn
   tool-call event) and `subagent.finished`/`subagent.failed` (`parent_id` = the
   `subagent.started` event), each carrying `root_run_id`, `parent_run_id`,
-  `child_run_id`, `task_id`, `definition_id`, and `depth`; finish events also carry
+  `child_run_id`, `task_id`, `definition_id`, `depth`, and `traceparent`; finish events also carry
   the child's `usage`. The child's full event stream goes to its own run dir; external
   `event_sinks` are not shared with children (stateful sinks like OTel/StatusJson are per-run).
 - **Usage reporting**: the parent's run metrics carry `subagent_count` and

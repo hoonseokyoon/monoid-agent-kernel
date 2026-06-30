@@ -10,6 +10,7 @@ from support.runtime import tool_binding
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
+from monoid_agent_kernel.core.trace_context import trace_id_of
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 from monoid_agent_kernel.providers.fake import fake_tool_call
@@ -242,9 +243,15 @@ def test_subagent_events_correlate_to_spawn_call(tmp_path: Path) -> None:
     assert started.data["task_id"]
     assert started.data["definition_id"] == "child"
     assert started.data["depth"] == 1
+    traceparent = str(started.data["traceparent"])
+    assert trace_id_of(traceparent)
     assert finished.data["root_run_id"] == started.run_id
     assert finished.data["parent_run_id"] == started.run_id
     assert finished.data["task_id"] == started.data["task_id"]
+    assert finished.data["traceparent"] == traceparent
+    task_path = tmp_path / "runs" / started.run_id / "artifacts" / "tasks" / started.data["task_id"] / "task.json"
+    subagent_result = json.loads(task_path.read_text(encoding="utf-8"))["result"]
+    assert subagent_result["traceparent"] == traceparent
 
 
 # --- Claude-parity permissions (P2.5) ----------------------------------------------
