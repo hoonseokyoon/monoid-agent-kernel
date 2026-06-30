@@ -28,7 +28,7 @@ from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.outbox import OutboxReceipt
-from monoid_agent_kernel.core.trace_context import new_traceparent
+from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
 from monoid_agent_kernel.core.lifecycle import (
     LoopSession,
     SessionState,
@@ -187,6 +187,60 @@ def _read_event_page(events_path: Path, *, from_seq: int, limit: int | None) -> 
                 events.append(event)
                 next_seq = seq + 1
     return {"events": events, "next_seq": next_seq, "has_more": has_more}
+
+
+_DIAGNOSTIC_EVENT_DATA_KEYS = {
+    "attempts",
+    "binding_id",
+    "call_id",
+    "capability",
+    "child_run_id",
+    "command",
+    "command_id",
+    "error",
+    "error_code",
+    "job_id",
+    "reason",
+    "request_id",
+    "run_id",
+    "state",
+    "status",
+    "target_run_id",
+    "task_id",
+    "tool",
+    "traceparent",
+}
+
+
+def _read_optional_json(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _diagnostic_event_summary(event: dict[str, Any]) -> dict[str, Any]:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    return {
+        "seq": event.get("seq"),
+        "type": event.get("type"),
+        "timestamp": event.get("timestamp"),
+        "level": event.get("level"),
+        "turn_id": event.get("turn_id"),
+        "parent_id": event.get("parent_id"),
+        "data": {key: data[key] for key in sorted(_DIAGNOSTIC_EVENT_DATA_KEYS) if key in data},
+    }
+
+
+def _trace_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
+    trace_ids: set[str] = set()
+    for event in events:
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        trace_id = trace_id_of(str(data.get("traceparent") or ""))
+        if trace_id:
+            trace_ids.add(trace_id)
+    return sorted(trace_ids)
 
 
 @dataclass(frozen=True)
@@ -1665,6 +1719,41 @@ class RunnerBackend:
         events_path = self._authorized_run_dir(run_id, token) / "events.jsonl"
         page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
         return {"run_id": run_id, **page}
+
+    def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
+        if event_limit < 1:
+            raise ValueError("event_limit must be positive")
+        run_dir = self._authorized_run_dir(run_id, token)
+        status = self.status(run_id, token)
+        status_file = status.get("status_file") if isinstance(status.get("status_file"), dict) else {}
+        last_event_seq = int(status.get("last_event_seq") or status_file.get("last_event_seq") or 0)
+        from_seq = max(0, last_event_seq - event_limit + 1) if last_event_seq else 0
+        event_page = _read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=event_limit)
+        event_summaries = [_diagnostic_event_summary(event) for event in event_page["events"]]
+        control_events = [
+            event for event in event_summaries if str(event.get("type") or "").startswith("control.command.")
+        ]
+        failure = _read_optional_json(run_dir / "failure.json")
+        recover_attempts = self._read_recover_attempts(run_dir)
+        return {
+            "run_id": run_id,
+            "status": status,
+            "failure": failure,
+            "recovery": {
+                "attempts": recover_attempts,
+                "max_attempts": self.max_recover_attempts,
+                "failure_marked": failure is not None,
+                "unrecoverable": bool(failure and failure.get("error_code") == "unrecoverable"),
+            },
+            "events": {
+                "from_seq": from_seq,
+                "next_seq": event_page["next_seq"],
+                "has_more": event_page["has_more"],
+                "items": event_summaries,
+            },
+            "control": {"events": control_events},
+            "trace_ids": _trace_ids_from_events(event_page["events"]),
+        }
 
     def descendant_events(
         self,
