@@ -447,6 +447,7 @@ class AgentToolContext(ToolContext):
                 # Correlation so subagent.* events nest under this spawn tool call.
                 "parent_event_id": call.tool_event_id,
                 "turn_id": call.turn_id,
+                "traceparent": new_traceparent(),
             },
         )
         if background:
@@ -1929,6 +1930,7 @@ class AgentLoop:
         child_run_id = f"{self.spec.run_id}.sub.{task.job_id}"
         child_depth = depth + 1
         root_run_id = str(self.spec.metadata.get("root_run_id") or self.spec.run_id)
+        traceparent = str(task.request.get("traceparent") or new_traceparent())
         identity = {
             "root_run_id": root_run_id,
             "parent_run_id": self.spec.run_id,
@@ -1936,6 +1938,7 @@ class AgentLoop:
             "task_id": task.job_id,
             "definition_id": definition_id,
             "depth": child_depth,
+            "traceparent": traceparent,
         }
         # At the depth cap the child must not delegate further: the resolver drops any
         # agent.spawn binding and we give it no definitions, so the tool is simply absent
