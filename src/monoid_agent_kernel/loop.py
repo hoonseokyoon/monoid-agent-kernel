@@ -3879,7 +3879,7 @@ class AgentLoop:
                 f"capability broker required for {capability}",
                 error_code="capability_broker_required",
             )
-        scope = {key: value for key, value in bound_tool.binding.scope.to_json().items() if value}
+        scope = self._capability_scope_for_tool(bound_tool)
         now = time.time()
         binding_id = bound_tool.binding_id
         parent_id = started_event.event_id if started_event else None
@@ -4009,6 +4009,54 @@ class AgentLoop:
             },
         )
         return None
+
+    def _capability_scope_for_tool(self, bound_tool: BoundTool) -> dict[str, Any]:
+        scope = {key: value for key, value in bound_tool.binding.scope.to_json().items() if value}
+        capability = bound_tool.base_spec.capability or ""
+        if capability not in {"web.search", "web.fetch", "web.context"}:
+            return scope
+        scope.setdefault("binding_id", bound_tool.binding_id)
+        runtime = bound_tool.binding.runtime or {}
+        web_runtime = runtime.get("web", runtime) if isinstance(runtime, dict) else {}
+        web_runtime = web_runtime if isinstance(web_runtime, dict) else {}
+        feature = capability.rsplit(".", 1)[-1]
+        defaults = {
+            "search": {"max_calls": 20, "max_results": 10},
+            "fetch": {"max_calls": 50, "max_bytes": 1_000_000, "timeout_s": 60},
+            "context": {
+                "max_calls": 10,
+                "max_tokens": 32_768,
+                "max_urls": 20,
+                "max_snippets": 256,
+            },
+        }[feature]
+        max_calls = web_runtime.get("max_calls", web_runtime.get(f"max_{feature}_calls", defaults["max_calls"]))
+        scope.setdefault("max_calls", max(0, int(max_calls)))
+        if feature == "search":
+            scope.setdefault("max_results", max(1, int(web_runtime.get("max_results", defaults["max_results"]))))
+        elif feature == "fetch":
+            scope.setdefault(
+                "max_bytes",
+                max(1, int(web_runtime.get("max_response_bytes", web_runtime.get("max_bytes", defaults["max_bytes"])))),
+            )
+            scope.setdefault(
+                "timeout_s",
+                max(1, int(web_runtime.get("max_timeout_s", web_runtime.get("timeout_s", defaults["timeout_s"])))),
+            )
+        else:
+            scope.setdefault(
+                "max_tokens",
+                max(1, int(web_runtime.get("max_context_tokens", web_runtime.get("max_tokens", defaults["max_tokens"])))),
+            )
+            scope.setdefault(
+                "max_urls",
+                max(1, int(web_runtime.get("max_context_urls", web_runtime.get("max_urls", defaults["max_urls"])))),
+            )
+            scope.setdefault(
+                "max_snippets",
+                max(1, int(web_runtime.get("max_context_snippets", web_runtime.get("max_snippets", defaults["max_snippets"])))),
+            )
+        return scope
 
     def _rotate_capability_lease(
         self,

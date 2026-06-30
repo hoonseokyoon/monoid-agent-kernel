@@ -656,9 +656,13 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
   context → `WebService` → `WebGatewayClient` as a per-call credential override; absent a lease, the
   client uses its static run-start token — back-compat). The reference `GatewayCapabilityBroker`
   mints a **web-gateway-compatible** token (`kind=web_gateway`/`aud=csp.web-gateway`) for `web.*` so
-  the existing web gateway accepts it unchanged. Net effect: web access inherits rotation +
-  revocation (an operator can `revoke_capability("web.search")` to kill a live run's web access
-  without cancelling it). The LLM path is deliberately NOT routed this way.
+  the existing web gateway accepts it unchanged. Brokered web tokens carry a signed `metadata.scope`
+  containing the binding id, domain scope, and web runtime caps such as `max_calls`; the web gateway
+  applies that signed scope before provider invocation. Payload constraints can narrow the signed
+  scope, and requests that widen `allowed_domains`, `binding_id`, or numeric caps fail with
+  `web_scope_denied`. Net effect: web access inherits rotation + revocation (an operator can
+  `revoke_capability("web.search")` to kill a live run's web access without cancelling it). The LLM
+  path is deliberately NOT routed this way.
 - **Gateway model-token refresh** (separate from capabilities): `GatewayModelAdapter.token_provider`
   is an optional per-request token source; the reference backend wires a source that re-mints the
   `llm_gateway` token near expiry, so a run outliving the token TTL keeps LLM access without a

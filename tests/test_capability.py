@@ -127,9 +127,11 @@ class _CountingBroker:
     def __init__(self, inner: object) -> None:
         self.inner = inner
         self.requests = 0
+        self.last_request: CapabilityRequest | None = None
 
     def request(self, req: CapabilityRequest) -> CapabilityGrant:
         self.requests += 1
+        self.last_request = req
         return self.inner.request(req)  # type: ignore[attr-defined]
 
 
@@ -746,6 +748,21 @@ def test_web_tool_uses_lease_token_when_required(tmp_path: Path) -> None:
     assert client.tokens == ["auto:web.search"]
 
 
+def test_web_capability_request_scope_includes_signed_gateway_constraints(tmp_path: Path) -> None:
+    client = _RecordingWebClient()
+    broker = _CountingBroker(AutoGrantBroker())
+    loop = _web_loop(tmp_path, client, broker, requires_lease=True)
+
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert broker.last_request is not None
+    assert broker.last_request.scope["binding_id"] == "web.search"
+    assert broker.last_request.scope["max_calls"] == 20
+    assert broker.last_request.scope["max_results"] == 10
+    assert broker.last_request.scope["allowed_domains"] == ["a.edu"]
+
+
 def test_web_tool_falls_back_to_static_credential_when_not_gated(tmp_path: Path) -> None:
     client = _RecordingWebClient()
     # No requires_lease, no broker -> no lease; the per-call override is None and the client uses
@@ -759,11 +776,23 @@ def test_web_tool_falls_back_to_static_credential_when_not_gated(tmp_path: Path)
 def test_gateway_broker_mints_web_gateway_token_for_web_capabilities() -> None:
     manager = TokenManager.from_secret("x" * 32)
     broker = GatewayCapabilityBroker(token_manager=manager, tenant_id="t", user_id="u")
-    web = broker.request(CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]}, run_id="run_1"))
+    web = broker.request(
+        CapabilityRequest(
+            capability="web.search",
+            scope={"allowed_domains": ["a.edu"], "max_calls": 2},
+            run_id="run_1",
+            binding_id="search_docs",
+        )
+    )
     assert isinstance(web, CapabilityLease)
     # The web lease's token_ref IS a web-gateway token the existing web gateway already accepts.
     claims = manager.verify(web.token_ref, kind="web_gateway", audience="csp.web-gateway", run_id="run_1")
     assert claims.metadata["capability"] == "web.search"
+    assert claims.metadata["scope"] == {
+        "allowed_domains": ["a.edu"],
+        "binding_id": "search_docs",
+        "max_calls": 2,
+    }
     # A non-web capability still mints the generic capability-kind token.
     other = broker.request(CapabilityRequest(capability="email.send", run_id="run_1"))
     assert isinstance(other, CapabilityLease)

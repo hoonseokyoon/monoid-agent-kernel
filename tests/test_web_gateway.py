@@ -35,7 +35,7 @@ from monoid_agent_kernel.reference.web_gateway.providers import (
     HttpFetchProvider,
     SearchFetchContextProvider,
 )
-from monoid_agent_kernel.reference.web_gateway.service import WebGatewayBackend
+from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.web import WebGatewayClient
 
 pytestmark = pytest.mark.integration
@@ -54,6 +54,25 @@ def _web_token(manager: TokenManager, *, run_id: str = "run_1", tenant_id: str =
         user_id="user_a",
         ttl_s=600,
         metadata={"agent_config_hash": "test"},
+    )
+
+
+def _scoped_web_token(
+    manager: TokenManager,
+    *,
+    scope: dict[str, Any],
+    capability: str = "web.search",
+    run_id: str = "run_1",
+    tenant_id: str = "tenant_a",
+) -> str:
+    return manager.issue(
+        kind="web_gateway",
+        audience="csp.web-gateway",
+        run_id=run_id,
+        tenant_id=tenant_id,
+        user_id="user_a",
+        ttl_s=600,
+        metadata={"capability": capability, "scope": scope},
     )
 
 
@@ -86,6 +105,76 @@ def test_web_gateway_enforces_binding_constraints_usage_and_domains() -> None:
         )
     with pytest.raises(TokenError):
         manager.verify(token, kind="llm_gateway", audience="csp.llm-gateway")
+
+
+def test_web_gateway_rejects_payload_domain_escalation_before_provider() -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(
+        manager,
+        scope={
+            "binding_id": "search_docs",
+            "max_calls": 2,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    with pytest.raises(Exception, match="allowed_domains exceeds signed token scope"):
+        gateway.handle_search(
+            token,
+            {
+                "binding_id": "search_docs",
+                "query": "binding",
+                "allowed_domains": ["blog.example.test"],
+            },
+        )
+
+    assert provider.search_calls == 0
+    assert gateway.tenant_usage("tenant_a")["search_calls"] == 0
+
+
+def test_web_gateway_applies_signed_scope_when_payload_omits_constraints() -> None:
+    manager = _token_manager()
+    gateway = WebGatewayBackend(token_manager=manager)
+    token = _scoped_web_token(
+        manager,
+        scope={
+            "binding_id": "search_docs",
+            "max_calls": 1,
+            "allowed_domains": ["docs.example.test"],
+            "blocked_domains": ["blog.example.test"],
+        },
+    )
+
+    search = gateway.handle_search(token, {"query": "binding", "max_results": 5})
+
+    assert search["result_count"] >= 1
+    assert {result["domain"] for result in search["results"]} == {"docs.example.test"}
+    with pytest.raises(Exception, match="limit exceeded"):
+        gateway.handle_search(token, {"query": "binding"})
+
+
+def test_web_gateway_rejects_signed_binding_and_numeric_escalation() -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(
+        manager,
+        scope={
+            "binding_id": "search_docs",
+            "max_calls": 1,
+            "max_results": 1,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    with pytest.raises(Exception, match="binding_id exceeds signed token scope"):
+        gateway.handle_search(token, {"binding_id": "other", "query": "binding"})
+    with pytest.raises(Exception, match="max_results exceeds signed token scope"):
+        gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "max_results": 2})
+
+    assert provider.search_calls == 0
 
 
 def test_web_gateway_client_retries_transient_connection_error(monkeypatch) -> None:
@@ -393,3 +482,43 @@ class _FakeUpstreamServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+
+
+class _CountingWebProvider:
+    def __init__(self) -> None:
+        self.delegate = FakeWebProvider()
+        self.search_calls = 0
+        self.fetch_calls = 0
+        self.context_calls = 0
+
+    def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
+        self.search_calls += 1
+        return self.delegate.search(query, max_results=max_results)
+
+    def fetch(self, url: str, *, format: str) -> dict[str, Any]:
+        self.fetch_calls += 1
+        return self.delegate.fetch(url, format=format)
+
+    def context(
+        self,
+        query: str,
+        *,
+        max_tokens: int,
+        max_urls: int,
+        max_snippets: int,
+        locale: str | None,
+        freshness: str | None,
+        allowed_domains: tuple[str, ...],
+        blocked_domains: tuple[str, ...],
+    ) -> dict[str, Any]:
+        self.context_calls += 1
+        return self.delegate.context(
+            query,
+            max_tokens=max_tokens,
+            max_urls=max_urls,
+            max_snippets=max_snippets,
+            locale=locale,
+            freshness=freshness,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
+        )

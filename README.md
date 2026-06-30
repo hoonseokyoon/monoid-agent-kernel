@@ -434,8 +434,9 @@ curl -H "Authorization: Bearer $MONOID_LLM_GATEWAY_ADMIN_TOKEN" \
   http://127.0.0.1:8080/internal/llm/tenants/tenant_a/usage
 ```
 
-The WebGateway validates `web_gateway` tokens, enforces per-request binding
-constraints, calls a web provider adapter, and reports tenant usage. The reference ships a
+The WebGateway validates `web_gateway` tokens, enforces signed token scope for brokered web
+capabilities before calling a provider, and reports tenant usage. Payload-level domain, binding,
+and call-limit values can narrow the signed scope; they cannot widen it. The reference ships a
 deterministic fake provider plus Brave-backed search/fetch/context providers behind the
 provider-neutral `ContextProvider` seam, so the search backend can be swapped without
 changing kernel tools.

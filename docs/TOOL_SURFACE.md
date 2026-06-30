@@ -102,6 +102,11 @@ Scope is declarative enforcement input:
 - `command_allow_prefixes`, `command_deny_prefixes`
 - `env_allowlist`
 
+For brokered web bindings (`runtime.requires_lease`), the loop includes `binding_id`,
+domain filters, and web runtime caps such as `max_calls` in the capability request scope. The
+reference gateway broker signs that scope into the `web_gateway` token, and the web gateway rejects
+payloads that try to widen it before any provider call.
+
 Runtime holds implementation options. Shell bindings read `runtime.shell`.
 Web bindings read `runtime.web`. `runtime.requires_lease=true` declares that the binding's
 tool needs a capability lease before it runs (the capability name comes from the tool's
