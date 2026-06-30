@@ -7,11 +7,24 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-30
+
+### Added
+- Compatibility imports through `native_agent_runner` and the legacy `native-agent`
+  CLI alias, so existing local integrations can migrate incrementally.
+- Central identifier and environment helpers for the Monoid namespace migration.
+
 ### Changed
-- Project branding now centers on **Monoid Agent Kernel**: a lightweight,
-  durable, contract-first kernel for embedding agents in product runtimes.
+- Project, package, repository, docs, and examples now use **Monoid Agent Kernel**
+  branding.
+- Python distribution name is now `monoid-agent-kernel`; import new code from
+  `monoid_agent_kernel`.
+- Current wire and durable artifact identifiers now emit `monoid.*` values.
+  Readers and validators continue to accept legacy `native-agent-runner.*` values.
 - Environment variables now prefer `MONOID_*` names. Existing `NAR_*` names are
   accepted during migration.
+- Token issuer, audience, and header values now use Monoid identifiers while
+  accepting legacy values during migration.
 
 ## [0.13.0] - 2026-06-29
 
