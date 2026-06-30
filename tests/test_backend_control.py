@@ -152,17 +152,26 @@ def test_dispatch_emits_control_audit_events_without_token_leak(tmp_path: Path) 
     assert received["actor"] == "operator_a"
     assert received["reason"] == "check run"
     assert received["token_sha256"] == TokenManager.token_sha256(token)
+    assert received["idempotency_key"] == "cmd_status"
     assert received["args_keys"] == []
-    assert by_id[("control.command.completed", "cmd_status")]["status"] == "ok"
+    completed = by_id[("control.command.completed", "cmd_status")]
+    assert completed["status"] == "ok"
+    assert completed["idempotency_key"] == "cmd_status"
+    assert completed["result_code"] == "ok"
+    assert completed["token_sha256"] == TokenManager.token_sha256(token)
 
     failed = by_id[("control.command.failed", "cmd_bad_replace")]
     assert failed["command"] == "replace_runtime_config"
     assert failed["status"] == "error"
     assert failed["error_code"] == "control_error"
+    assert failed["failure_code"] == "control_error"
+    assert failed["idempotency_key"] == "cmd_bad_replace"
 
     auth_failed = by_id[("control.command.failed", "cmd_bad_auth")]
     assert auth_failed["command"] == "inspect"
     assert auth_failed["error_code"] == "permission_denied"
+    assert auth_failed["failure_code"] == "permission_denied"
+    assert auth_failed["idempotency_key"] == "cmd_bad_auth"
 
     serialized_events = "\n".join(json.dumps(event, sort_keys=True) for event in events)
     assert token not in serialized_events
@@ -285,6 +294,67 @@ def test_capability_task_kind_creates_and_resolves(tmp_path: Path) -> None:
         result={"granted": True, "token_ref": "secret-ref://lease-1"},
     )
     assert resolved.get("delivered") is True
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_dispatch_approve_and_deny_are_audited_task_decisions(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    approve_task = backend.create_task(
+        run_id,
+        token,
+        kind="hitl",
+        request={"prompt": "Approve this action?", "choices": ("Approve", "Deny")},
+    )
+    approved = backend.dispatch(
+        ControlCommand(
+            type="approve",
+            run_id=run_id,
+            args={"token": token, "task_id": approve_task["task_id"]},
+            issuer="operator_a",
+            reason="approved by reviewer",
+            command_id="cmd_approve",
+        )
+    )
+    assert approved.status == "ok"
+    assert approved.data["delivered"] is True
+
+    deny_task = backend.create_task(
+        run_id,
+        token,
+        kind="hitl",
+        request={"prompt": "Approve this second action?", "choices": ("Approve", "Deny")},
+    )
+    denied = backend.dispatch(
+        ControlCommand(
+            type="deny",
+            run_id=run_id,
+            args={"token": token, "task_id": deny_task["task_id"]},
+            issuer="operator_a",
+            reason="policy denied",
+            command_id="cmd_deny",
+        )
+    )
+    assert denied.status == "ok"
+    assert denied.data["delivered"] is True
+
+    events = [event for event in _events(backend, run_id) if event["type"].startswith("control.command.")]
+    by_id = {(event["type"], event["data"]["command_id"]): event["data"] for event in events}
+    assert by_id[("control.command.received", "cmd_approve")]["command"] == "approve"
+    assert by_id[("control.command.completed", "cmd_approve")]["result_code"] == "ok"
+    assert by_id[("control.command.received", "cmd_deny")]["command"] == "deny"
+    assert by_id[("control.command.completed", "cmd_deny")]["idempotency_key"] == "cmd_deny"
+
+    tasks_dir = backend._record(run_id).run_dir / "artifacts" / "tasks"
+    approved_job = json.loads((tasks_dir / approve_task["task_id"] / "task.json").read_text(encoding="utf-8"))
+    denied_job = json.loads((tasks_dir / deny_task["task_id"] / "task.json").read_text(encoding="utf-8"))
+    assert approved_job["result"]["approved"] is True
+    assert denied_job["result"]["approved"] is False
+    assert denied_job["result"]["granted"] is False
 
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)

@@ -463,9 +463,11 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   `unsupported` / `error`). `ControlDispatcher.dispatch(command) -> ControlResult` is the contract;
   `RunnerBackend.dispatch` is the reference impl, routing each command to the in-process method it
   already exposes.
-- Command types: `pause`, `resume`, `cancel`, `interrupt`, `inspect`, `health`, `send_message`,
-  `runtime_config`, `replace_runtime_config`, `create_task`, `report_task_result`, `status`,
-  `revoke_capability`. An unknown type returns `unsupported` (the wire vocabulary stays
+- Command types: `pause`, `resume`, `cancel`, `approve`, `deny`, `interrupt`, `inspect`,
+  `health`, `send_message`, `runtime_config`, `replace_runtime_config`, `create_task`,
+  `report_task_result`, `status`, `revoke_capability`. `approve` and `deny` are explicit
+  hosted-task decision aliases over `report_task_result`. An unknown type returns `unsupported`
+  (the wire vocabulary stays
   forward-compatible).
 - HTTP: `POST /v1/runs/{run_id}/control` with `{"type": ..., "args": {...}, "issuer": ...,
   "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
@@ -473,9 +475,10 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
 - Audit: `RunnerBackend.dispatch` appends `control.command.received` and then either
   `control.command.completed` or `control.command.failed` to the run event log. Events include
-  `command_id`, command type, target run, `issuer` as actor, reason, result status/error, duration,
-  and a safe `token_sha256` reference on receipt — never the bearer token itself. A control
-  `send_message` uses the command id as its inbox idempotency key.
+  `command_id`, command type, target run, `issuer` as actor, reason, idempotency key,
+  result/failure code, result status/error, duration, and a safe `token_sha256` reference — never
+  the bearer token itself. A control `send_message` uses the command id as its inbox idempotency
+  key.
 
 ### Event Reads
 

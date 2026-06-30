@@ -191,6 +191,7 @@ def _read_event_page(events_path: Path, *, from_seq: int, limit: int | None) -> 
 
 _DIAGNOSTIC_EVENT_DATA_KEYS = {
     "attempts",
+    "actor",
     "binding_id",
     "call_id",
     "capability",
@@ -199,9 +200,12 @@ _DIAGNOSTIC_EVENT_DATA_KEYS = {
     "command_id",
     "error",
     "error_code",
+    "failure_code",
+    "idempotency_key",
     "job_id",
     "reason",
     "request_id",
+    "result_code",
     "run_id",
     "state",
     "status",
@@ -1132,6 +1136,8 @@ class RunnerBackend:
         run_id = command.run_id
         ctype = command.type
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
+        idempotency_key = command.command_id or command_id
+        token_sha256 = TokenManager.token_sha256(token) if token else ""
         started = time.time()
 
         self._emit_control_audit_event(
@@ -1143,8 +1149,8 @@ class RunnerBackend:
                 "target_run_id": run_id,
                 "actor": command.issuer,
                 "reason": command.reason,
-                "token_sha256": TokenManager.token_sha256(token) if token else "",
-                "idempotency_key": command.command_id,
+                "token_sha256": token_sha256,
+                "idempotency_key": idempotency_key,
                 "args_keys": sorted(key for key in command.args if key != "token"),
             },
         )
@@ -1165,9 +1171,12 @@ class RunnerBackend:
                     "command": ctype,
                     "target_run_id": run_id,
                     "actor": command.issuer,
+                    "idempotency_key": idempotency_key,
+                    "token_sha256": token_sha256,
                     "status": "error",
                     "error": str(exc),
                     "error_code": getattr(exc, "error_code", "permission_denied"),
+                    "failure_code": getattr(exc, "error_code", "permission_denied"),
                     "duration_ms": (time.time() - started) * 1000,
                 },
                 level="warning",
@@ -1196,7 +1205,10 @@ class RunnerBackend:
                     "command": ctype,
                     "target_run_id": run_id,
                     "actor": command.issuer,
+                    "idempotency_key": idempotency_key,
+                    "token_sha256": token_sha256,
                     "status": result.status,
+                    "result_code": result.error_code or result.status,
                     "state": result.state,
                     "duration_ms": duration_ms,
                 },
@@ -1210,9 +1222,12 @@ class RunnerBackend:
                     "command": ctype,
                     "target_run_id": run_id,
                     "actor": command.issuer,
+                    "idempotency_key": idempotency_key,
+                    "token_sha256": token_sha256,
                     "status": result.status,
                     "error": result.error,
                     "error_code": result.error_code,
+                    "failure_code": result.error_code,
                     "duration_ms": duration_ms,
                 },
                 level="warning",
@@ -1241,6 +1256,26 @@ class RunnerBackend:
             return ok(self.signal_resume(run_id, token) if live else self.resume_run(run_id, token))
         if ctype == "cancel":
             return ok(self.cancel_run(run_id, token))
+        if ctype in {"approve", "deny"}:
+            result = args.get("result") if isinstance(args.get("result"), dict) else {}
+            approval_result = dict(result)
+            if ctype == "approve":
+                approval_result.setdefault("answer", str(args.get("answer") or "Approve"))
+                approval_result.setdefault("approved", True)
+            else:
+                approval_result.setdefault("answer", str(args.get("answer") or "Deny"))
+                approval_result.setdefault("approved", False)
+                approval_result.setdefault("granted", False)
+                approval_result.setdefault("reason", command.reason or str(args.get("reason") or "denied"))
+            return ok(
+                self.report_task_result(
+                    run_id,
+                    token,
+                    task_id=str(args.get("task_id") or ""),
+                    result=approval_result,
+                    status=str(args.get("status") or "answered"),
+                )
+            )
         if ctype == "interrupt":
             return ok(self.interrupt_turn(run_id, token))
         if ctype in {"inspect", "health"}:
