@@ -336,10 +336,10 @@ class AgentToolContext(ToolContext):
     # Depth of this run in the subagent tree (0 = top-level). Threaded into spawned
     # children as ``depth`` so the executor can enforce the nesting cap.
     subagent_depth: int = 0
-    # Report-only roll-up of delegated work: how many subagents this run spawned and their
-    # combined token usage. Kept SEPARATE from total_usage on purpose — total_usage also
-    # tracks this run's remaining context budget, which a child's isolated tokens must not
-    # inflate. Surfaced in the run metrics for cost visibility.
+    # Roll-up of delegated work: how many subagents this run spawned and their combined token
+    # usage. The same child usage is also added to RunState.total_usage so root token budgets and
+    # tenant accounting see descendant spend; this separate field keeps the delegated portion
+    # visible in metrics.
     subagent_count: int = 0
     subagent_usage: dict[str, int] = field(default_factory=dict)
     # Report-only roll-up of skill activations (a skill's L2 instructions being loaded via
@@ -1928,6 +1928,15 @@ class AgentLoop:
         is_fork = definition.context == "fork"
         child_run_id = f"{self.spec.run_id}.sub.{task.job_id}"
         child_depth = depth + 1
+        root_run_id = str(self.spec.metadata.get("root_run_id") or self.spec.run_id)
+        identity = {
+            "root_run_id": root_run_id,
+            "parent_run_id": self.spec.run_id,
+            "child_run_id": child_run_id,
+            "task_id": task.job_id,
+            "definition_id": definition_id,
+            "depth": child_depth,
+        }
         # At the depth cap the child must not delegate further: the resolver drops any
         # agent.spawn binding and we give it no definitions, so the tool is simply absent
         # rather than erroring at call time.
@@ -1956,9 +1965,8 @@ class AgentLoop:
             turn_id=turn_id,
             parent_id=parent_event_id,
             data={
+                **identity,
                 "subagent_type": definition_id,
-                "child_run_id": child_run_id,
-                "depth": child_depth,
                 "background": background,
             },
         )
@@ -1972,6 +1980,8 @@ class AgentLoop:
             limits=self.spec.limits if is_fork else (definition.limits or self.spec.limits),
             permission_policy=self.spec.permission_policy,
             metadata={
+                **identity,
+                # Legacy aliases kept for existing readers.
                 "parent_run_id": self.spec.run_id,
                 "parent_task_id": task.job_id,
                 "subagent_definition_id": definition_id,
@@ -1993,11 +2003,13 @@ class AgentLoop:
             workspace_factory=self.workspace_factory,
             checkpoint_store=self.checkpoint_store,
             subagent_definitions=child_definitions,
+            capability_broker=self.capability_broker,
             status_file=False,
             # Inherit token streaming so a child's work streams into its own events.jsonl too
             # (an observer can tail run_root/<child_run_id>/events.jsonl for live subagent output).
             emit_output_deltas=self.emit_output_deltas,
         )
+        child._capability_vault = self._capability_vault
         result = await child.arun_once(
             task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
         )
@@ -2011,9 +2023,12 @@ class AgentLoop:
             parent_ctx = self._session.res.context
             parent_ctx.subagent_count += 1
             for key, value in usage.items():
-                parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + int(value)
+                amount = int(value)
+                parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + amount
+                self._session.state.total_usage[key] = self._session.state.total_usage.get(key, 0) + amount
         task.result = {
             "type": "subagent_result",
+            **identity,
             "task_id": task.job_id,
             "subagent_type": definition_id,
             "child_run_id": child_run_id,
@@ -2032,8 +2047,8 @@ class AgentLoop:
             parent_id=started.event_id,
             level="error" if result.status == "failed" else "info",
             data={
+                **identity,
                 "subagent_type": definition_id,
-                "child_run_id": child_run_id,
                 "status": result.status,
                 "usage": usage,
                 "error": result.error,

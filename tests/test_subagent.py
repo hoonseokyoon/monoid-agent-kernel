@@ -8,6 +8,7 @@ import pytest
 from support.runtime import tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
+from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
@@ -87,6 +88,7 @@ def _loop(
     child: SubagentDefinition | None = None,
     event_sinks: tuple = (),
     tool_providers: tuple = (),
+    capability_broker: object | None = None,
 ) -> AgentLoop:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
@@ -101,6 +103,7 @@ def _loop(
         subagent_definitions={"child": child or _child_def()},
         event_sinks=event_sinks,
         tool_providers=tool_providers,
+        capability_broker=capability_broker,  # type: ignore[arg-type]
     )
 
 
@@ -234,6 +237,14 @@ def test_subagent_events_correlate_to_spawn_call(tmp_path: Path) -> None:
     assert "usage" in finished.data
     child_run_id = started.data["child_run_id"]
     assert all(e.run_id != child_run_id for e in sink.events)
+    assert started.data["root_run_id"] == started.run_id
+    assert started.data["parent_run_id"] == started.run_id
+    assert started.data["task_id"]
+    assert started.data["definition_id"] == "child"
+    assert started.data["depth"] == 1
+    assert finished.data["root_run_id"] == started.run_id
+    assert finished.data["parent_run_id"] == started.run_id
+    assert finished.data["task_id"] == started.data["task_id"]
 
 
 # --- Claude-parity permissions (P2.5) ----------------------------------------------
@@ -344,6 +355,28 @@ class _DemoToolProvider:
         ]
 
 
+class _GatedToolProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_tools(self, context: ToolContext):
+        def handler(ctx: ToolContext, args: dict) -> ToolResult:
+            del ctx, args
+            self.calls += 1
+            return ToolResult(ok=True, content={"ran": True})
+
+        return [
+            ToolSpec(
+                id="mcp.demo.gated",
+                description="demo gated tool",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+                capability="mcp.demo.gated",
+                side_effect="read",
+                handler=handler,
+            )
+        ]
+
+
 def test_mcp_custom_provider_tools_inherited_by_child(tmp_path: Path) -> None:
     adapter = RoutingAdapter(
         parent=[_spawn_call("use mcp"), ModelTurn(final_text="parent done")],
@@ -363,6 +396,42 @@ def test_mcp_custom_provider_tools_inherited_by_child(tmp_path: Path) -> None:
 
     assert result.status == "completed"
     assert "mcp.demo.ping" in _child_tool_ids(adapter)
+
+
+def test_parent_capability_revoke_blocks_child_gated_tool(tmp_path: Path) -> None:
+    provider = _GatedToolProvider()
+    adapter = RoutingAdapter(
+        parent=[_spawn_call("use gated child tool"), ModelTurn(final_text="parent done")],
+        child=[
+            ModelTurn(tool_calls=(fake_tool_call("mcp_demo_gated", {}, "g1"),)),
+            ModelTurn(final_text="child done"),
+        ],
+    )
+    parent = AgentRuntimeConfig(
+        definition_id="parent",
+        prompt=PromptSpec(persona_segments=(PARENT_MARK,)),
+        tools=(
+            tool_binding("agent.spawn"),
+            tool_binding("mcp.demo.gated", runtime={"requires_lease": True}),
+        ),
+    )
+    loop = _loop(
+        tmp_path,
+        adapter,
+        parent,
+        child=_child_def(tools=("mcp.demo.gated",)),
+        tool_providers=(provider,),
+        capability_broker=AutoGrantBroker(),
+    )
+    loop.open()
+    loop.revoke_capability(capability="mcp.demo.gated")
+
+    result = loop.run_until_suspended("go")
+
+    assert result.status == "completed"
+    assert provider.calls == 0
+    assert "capability_revoked" in json.dumps(_all_observation_outputs(adapter))
+    loop.close()
 
 
 def test_child_model_inherits_and_overrides(tmp_path: Path) -> None:
@@ -531,5 +600,20 @@ def test_metrics_report_subagent_usage_separately(tmp_path: Path) -> None:
 
     assert result.metrics["subagent_count"] == 1
     assert result.metrics["subagent_usage"]["total_tokens"] == 10
-    # The child's tokens must NOT inflate the parent's own usage (context accounting).
-    assert result.metrics.get("total_tokens", 0) == 0
+    # Descendant tokens count against the root run's budget/accounting.
+    assert result.metrics["total_tokens"] == 10
+
+
+def test_subagent_usage_counts_against_parent_token_budget(tmp_path: Path) -> None:
+    adapter = RoutingAdapter(
+        parent=[_spawn_call("do X"), ModelTurn(final_text="should not be called")],
+        child=[ModelTurn(final_text="child done", usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})],
+    )
+    loop = _loop(tmp_path, adapter, _parent_config(), limits=RunLimits(max_total_tokens=5))
+
+    result = loop.run_once("go")
+
+    assert result.status == "limited"
+    assert result.error_code == "total_tokens_exceeded"
+    parent_requests = [request for request in adapter.requests if PARENT_MARK in request.system_prompt]
+    assert len(parent_requests) == 1

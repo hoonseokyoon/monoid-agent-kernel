@@ -92,8 +92,12 @@ final message (the parent does not see intermediate edits). This matches Claude'
   run, enforced in the executor.
 - **Cancellation**: the parent's `cancellation_token` is shared with the child, so
   cancelling the parent settles the child and unblocks a foreground `wait()`.
-- **Usage**: the child's token usage is returned in `task.result["usage"]` so the
-  parent (and accounting) can attribute it.
+- **Usage**: the child's token usage is returned in `task.result["usage"]`, surfaced
+  as `subagent_usage`, and added to the root run's `total_usage` so token budget and
+  tenant accounting include descendant spend.
+- **Capability revocation**: the child shares the parent's capability vault and broker
+  reference. A parent-level `revoke_capability` blocks child gated tools before they
+  can broker or call the edge.
 
 ## Observability (correlation + usage)
 
@@ -106,10 +110,12 @@ one status doc), so a shared instance would be clobbered by the child's
 Instead the parent emits two summary events on its own stream:
 
 - `subagent.started` — `parent_id` = the spawn tool-call event id, so it nests under
-  that tool call; data carries `subagent_type`, `child_run_id`, `depth`, `background`.
+  that tool call; data carries `root_run_id`, `parent_run_id`, `child_run_id`,
+  `task_id`, `definition_id`, `depth`, `subagent_type`, and `background`.
 - `subagent.finished` / `subagent.failed` — `parent_id` = the `subagent.started`
-  event id (close pairing); data carries `status`, `usage` (the child's token
-  totals, for delegated-cost attribution), and `error`/`error_code`.
+  event id (close pairing); data carries the same identity fields plus `status`,
+  `usage` (the child's token totals, for delegated-cost attribution), and
+  `error`/`error_code`.
 
 `OtelEventSink` maps this pair to an `execute_subagent {type}` span nested under the
 spawn tool span (foreground) or under the run span (background, whose tool span has
@@ -187,8 +193,7 @@ the parent's directive over the inherited history.
   `agent.spawn` tool.
 - **P3** (done): directory discovery (`--agents-directory` + `core/frontmatter.py`),
   context fork (`context: "fork"` — inherits parent conversation + prompt/tools/model),
-  report-only usage roll-up (`subagent_count`/`subagent_usage` in metrics, kept out of
-  `total_usage` to preserve context accounting).
+  usage roll-up (`subagent_count`/`subagent_usage` in metrics, also included in root
+  `total_usage` for budget and tenant accounting).
 - **Deferred**: Skills `context: fork` wiring (needs the Skills feature), ADK-style
-  state copy-in/delta-back, parent token-budget *enforcement* across the tree (only
-  AutoGen does this; we report rather than enforce to keep context accounting clean).
+  state copy-in/delta-back.

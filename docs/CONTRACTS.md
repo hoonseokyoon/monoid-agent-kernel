@@ -336,17 +336,21 @@ Task seams above via a `subagent` task kind (`SubagentTaskExecutor`); see
   `max_subagent_depth` (nesting, default 5). Enforced in the executor; a child at the
   depth cap has the `agent.spawn` binding stripped (the tool is absent, not just an
   error at call time).
-- **Result shape** (`subagent_result`): `{status, final_text, message, child_run_id,
-  subagent_type, usage, error}`.
+- **Result shape** (`subagent_result`): `{status, final_text, message, root_run_id,
+  parent_run_id, child_run_id, task_id, definition_id, depth, subagent_type, usage, error}`.
 - **Events**: the parent stream carries `subagent.started` (`parent_id` = the spawn
   tool-call event) and `subagent.finished`/`subagent.failed` (`parent_id` = the
-  `subagent.started` event), the latter carrying the child's `usage`. The child's
-  full event stream goes to its own run dir; external `event_sinks` are not shared
-  with children (stateful sinks like OTel/StatusJson are per-run).
+  `subagent.started` event), each carrying `root_run_id`, `parent_run_id`,
+  `child_run_id`, `task_id`, `definition_id`, and `depth`; finish events also carry
+  the child's `usage`. The child's full event stream goes to its own run dir; external
+  `event_sinks` are not shared with children (stateful sinks like OTel/StatusJson are per-run).
 - **Usage reporting**: the parent's run metrics carry `subagent_count` and
-  `subagent_usage` (the children's combined token totals). These are kept SEPARATE
-  from the parent's own `total_usage` on purpose — `total_usage` also reflects the
-  parent's remaining context budget, which a child's isolated tokens must not inflate.
+  `subagent_usage` (the children's combined token totals). Descendant usage is also
+  added to root `total_usage`, so run token budgets and backend tenant usage include
+  delegated work.
+- **Capability boundary**: child loops inherit the parent's broker and share the parent's
+  capability vault. A parent-level capability revoke is visible to child gated tools before
+  a broker request or gateway call can happen.
 - **Context fork** (`SubagentDefinition.context = "fork"`): instead of a fresh
   isolated context, the child inherits a snapshot of the parent's conversation AND the
   parent's prompt / tools / model (the definition's own prompt/tools/model are ignored)
