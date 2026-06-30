@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from conftest import runtime_config, tool_binding
+from support.runtime import runtime_config, tool_binding
 
 from native_agent_runner.cli import main
 from native_agent_runner.core.spec import ModelConfig, ReasoningConfig

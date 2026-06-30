@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from conftest import runtime_config, runtime_provider, tool_binding
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from native_agent_runner.core.cancellation import CancellationToken
 from native_agent_runner.core.schemas import validate_run_dir
@@ -19,6 +19,7 @@ from native_agent_runner.providers.fake import (
 )
 from native_agent_runner.recorder import MemoryEventSink
 from native_agent_runner.workspace.local import default_local_workspace_factory, sha256_bytes
+from support.process import python_command as _python_command
 
 
 DEFAULT_TOOLS = (
@@ -38,10 +39,6 @@ DEFAULT_TOOLS = (
 
 def _provider(*tool_ids: str):
     return runtime_provider(runtime_config(*(tool_ids or DEFAULT_TOOLS)))
-
-
-def _python_command(code: str) -> str:
-    return f'python -c "{code.replace(chr(34), chr(92) + chr(34))}"'
 
 
 def _finish_only_adapter() -> FakeModelAdapter:

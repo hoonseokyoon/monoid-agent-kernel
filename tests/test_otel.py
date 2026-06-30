@@ -19,7 +19,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from conftest import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider
 
 from native_agent_runner.core.spec import AgentRunSpec, RunLimits
 from native_agent_runner.loop import AgentLoop

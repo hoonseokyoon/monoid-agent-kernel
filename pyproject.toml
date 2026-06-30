@@ -31,6 +31,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2",
+    "pytest-xdist>=3.6",
     "httpx>=0.27",
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
@@ -87,6 +88,13 @@ force-include = { "src/native_agent_runner/py.typed" = "native_agent_runner/py.t
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "unit: fast in-process tests with no external service dependency",
+    "integration: multi-component tests that exercise reference services or threaded servers",
+    "slow: tests that intentionally wait for subprocess, timeout, or multi-service behavior",
+    "live: tests that require external credentials or network-backed providers",
+    "serial: tests that must not run concurrently under pytest-xdist",
+]
 
 [tool.ruff]
 line-length = 100

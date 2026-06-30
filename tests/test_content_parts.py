@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider
 
 from native_agent_runner.core.content import (
     AudioPart,

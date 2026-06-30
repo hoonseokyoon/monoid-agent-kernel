@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from conftest import runtime_config, runtime_provider, tool_binding
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from native_agent_runner.core.agents import compile_bound_tool_catalog
 from native_agent_runner.core.spec import AgentRunSpec

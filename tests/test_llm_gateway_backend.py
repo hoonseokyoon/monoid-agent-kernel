@@ -8,7 +8,12 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from conftest import http_json, runtime_config, wait_http_ready
+from support.http import (
+    http_get_json as _json_get,
+    http_json,
+    wait_http_ready as _wait_http_ready,
+)
+from support.runtime import runtime_config
 
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
@@ -351,14 +356,6 @@ def test_fake_full_stack_contract_propose_proposal_usage_and_auth(tmp_path: Path
 
 def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
     return http_json(url, payload, token=token)
-
-
-def _json_get(url: str, *, token: str) -> dict:
-    return http_json(url, token=token, method="GET")
-
-
-def _wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
-    wait_http_ready(base_url, timeout_s=timeout_s)
 
 
 def test_llm_gateway_offline_provider_answers_without_a_key() -> None:

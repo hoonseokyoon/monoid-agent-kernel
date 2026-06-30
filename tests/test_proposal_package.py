@@ -10,7 +10,8 @@ from urllib.error import HTTPError
 import pytest
 from click.testing import CliRunner
 
-from conftest import http_json, runtime_config, runtime_provider
+from support.http import http_get_json as _json_get, http_json
+from support.runtime import runtime_config, runtime_provider
 
 from native_agent_runner.reference.backend.http import create_backend_server
 from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
@@ -504,10 +505,6 @@ def test_backend_package_apply_endpoint_handles_deletion_package(tmp_path: Path)
 
 def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
     return http_json(url, payload, token=token)
-
-
-def _json_get(url: str, *, token: str) -> dict:
-    return http_json(url, token=token, method="GET")
 
 
 class _BytesReader:

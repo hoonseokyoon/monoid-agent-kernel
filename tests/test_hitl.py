@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from conftest import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider
 
 from native_agent_runner.core.spec import AgentRunSpec
 from native_agent_runner.loop import AgentLoop

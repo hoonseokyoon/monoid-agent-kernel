@@ -10,6 +10,9 @@ from native_agent_runner import _proc
 from native_agent_runner.permissions import PermissionPolicy
 from native_agent_runner.shell import ShellExecutionOptions, execute_shell
 from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from support.process import python_command as _python_command
+
+pytestmark = pytest.mark.integration
 
 
 def test_terminate_process_falls_back_to_kill_when_group_kill_stalls(
@@ -39,11 +42,6 @@ def test_terminate_process_falls_back_to_kill_when_group_kill_stalls(
     _proc.terminate_process(_FakeProcess())  # type: ignore[arg-type]
 
     assert killed == [True]
-
-
-def _python_command(code: str) -> str:
-    escaped = code.replace('"', '\\"')
-    return f'python -c "{escaped}"'
 
 
 def test_shell_policy_defaults_json_and_manifest() -> None:
@@ -256,6 +254,7 @@ def test_shell_rejects_bad_cwd_and_explicitly_denied_output_path(tmp_path: Path)
         )
 
 
+@pytest.mark.slow
 def test_shell_timeout_and_output_cap(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()

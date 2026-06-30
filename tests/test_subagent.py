@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 import pytest
-from conftest import tool_binding
+from support.runtime import tool_binding
 
 from native_agent_runner.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
 from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits

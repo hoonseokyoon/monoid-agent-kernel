@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from conftest import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider
 
 from native_agent_runner.core.context import TurnContext
 from native_agent_runner.core.prompt import compose_system_prompt

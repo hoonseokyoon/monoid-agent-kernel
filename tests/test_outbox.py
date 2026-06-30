@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Any
 
-from conftest import runtime_config, runtime_provider, tool_binding
+from support.runtime import runtime_config, runtime_provider, tool_binding
+from support.waiting import eventually
 
 from native_agent_runner.core.capability import AutoGrantBroker
 from native_agent_runner.core.outbox import Outbox, OutboxReceipt, OutboxRequest
@@ -56,14 +56,6 @@ def test_outbox_holder_pending_mark_export_import() -> None:
 
 
 # --- backend e2e: capability-gated staging + edge drain -----------------------------------
-
-
-def _wait(predicate: Any, tries: int = 1000) -> bool:
-    for _ in range(tries):
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return False
 
 
 def _outbox_backend(
@@ -282,12 +274,12 @@ def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None
     backend.outbox_retry_base_s = 0.0  # next_attempt_at == now -> immediately due on redrive
     backend.watchdog_interval_s = 0.05
     run_id, token = _run(backend, workspace, multi_turn=True)
-    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
-    assert _wait(lambda: sender.calls >= 1)  # the park-time drain attempted (and failed) once
+    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: sender.calls >= 1)  # the park-time drain attempted (and failed) once
 
     backend.start_watchdog()
     # Redrive resends the now-due request while the run sits idle (no turn drove this).
-    assert _wait(lambda: sender.calls >= 2)
+    assert eventually(lambda: sender.calls >= 2)
     backend.stop_watchdog()
 
     backend.cancel_run(run_id, token)
@@ -325,9 +317,9 @@ def test_outbox_ack_delivered_to_run_inbox_and_consumed(tmp_path: Path) -> None:
     backend._stage_outbox_ack = stage_spy  # type: ignore[method-assign]
 
     run_id, token = _run(backend, workspace, multi_turn=True)
-    request_id = sender.sent[0].id if _wait(lambda: sender.sent) else ""
+    request_id = sender.sent[0].id if eventually(lambda: sender.sent) else ""
     # The ack is delivered and *consumed* (the run takes a turn on it) — its id lands in the seen-set.
-    assert _wait(lambda: f"ack_{request_id}" in backend._record(run_id).seen_inbox_ids)
+    assert eventually(lambda: f"ack_{request_id}" in backend._record(run_id).seen_inbox_ids)
 
     assert captured, "no outbox_ack envelope was staged"
     ack = captured[0]
@@ -425,7 +417,7 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
     try:
         worker_id = spawn("stand by for planner")
         directory["worker"] = worker_id
-        assert _wait(lambda: backend.status(worker_id, tokens[worker_id]).get("status") == "awaiting_input")
+        assert eventually(lambda: backend.status(worker_id, tokens[worker_id]).get("status") == "awaiting_input")
         planner_id = spawn("collaborate with worker")
         directory["planner"] = planner_id
 
@@ -438,12 +430,12 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
                 e["type"] == "outbox.dispatched" and e["data"].get("destination") == dest for e in events
             )
 
-        assert _wait(lambda: dispatched_to(planner_id, "worker"))   # A -> B
-        assert _wait(lambda: dispatched_to(worker_id, "planner"))   # B -> A (so B received A's message)
+        assert eventually(lambda: dispatched_to(planner_id, "worker"))   # A -> B
+        assert eventually(lambda: dispatched_to(worker_id, "planner"))   # B -> A (so B received A's message)
 
         # The inbox is idempotent: once a message id has been processed, re-delivering it is a no-op.
         assert backend.send_message(worker_id, tokens[worker_id], "dup", message_id="m-dup")["status"] == "queued"
-        assert _wait(lambda: "m-dup" in backend._record(worker_id).seen_inbox_ids)
+        assert eventually(lambda: "m-dup" in backend._record(worker_id).seen_inbox_ids)
         again = backend.send_message(worker_id, tokens[worker_id], "dup", message_id="m-dup")
         assert again["status"] == "duplicate"
     finally:

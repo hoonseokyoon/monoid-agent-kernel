@@ -9,7 +9,8 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
-from conftest import runtime_config, runtime_provider, serving
+from support.http import serving
+from support.runtime import runtime_config, runtime_provider
 
 from native_agent_runner.core.spec import AgentRunSpec, RunLimits
 from native_agent_runner.loop import AgentLoop

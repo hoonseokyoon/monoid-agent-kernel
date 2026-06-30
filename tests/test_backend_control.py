@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import http_json, runtime_config, serving, tool_binding
+from support.http import http_json, serving
+from support.runtime import runtime_config, tool_binding
+from support.waiting import eventually
 
 from native_agent_runner.core.capability import AutoGrantBroker
 from native_agent_runner.core.control import ControlCommand
@@ -54,14 +55,6 @@ def _backend(tmp_path: Path, workspace: Path, turns: list[ModelTurn]) -> RunnerB
     return backend
 
 
-def _wait(predicate: Any, tries: int = 1000) -> bool:
-    for _ in range(tries):
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return False
-
-
 def _parked_multi_turn_run(backend: RunnerBackend, workspace: Path) -> tuple[str, str]:
     submission = backend.submit_run(
         BackendRunRequest(
@@ -74,7 +67,7 @@ def _parked_multi_turn_run(backend: RunnerBackend, workspace: Path) -> tuple[str
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
     return run_id, token
 
 
@@ -180,7 +173,7 @@ def test_http_control_route_dispatches_inspect(tmp_path: Path) -> None:
             token="admin",
         )
         run_id, run_token = created["run_id"], created["run_token"]
-        assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+        assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
 
         result = http_json(
             f"{base_url}/v1/runs/{run_id}/control",
@@ -313,7 +306,7 @@ def test_dispatch_revoke_capability_blocks_subsequent_call(tmp_path: Path) -> No
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
     assert provider.calls == 1  # the tool ran on the granted lease
 
     revoke = _dispatch(backend, run_id, token, "revoke_capability", capability="web.search")
@@ -323,7 +316,7 @@ def test_dispatch_revoke_capability_blocks_subsequent_call(tmp_path: Path) -> No
 
     # A follow-up message re-issues the gated call; revocation refuses it (no re-broker).
     backend.send_message(run_id, token, content="again")
-    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
     assert provider.calls == 1  # still 1 — the gated tool stayed blocked after revocation
 
     backend.cancel_run(run_id, token)
@@ -369,13 +362,13 @@ def test_driver_pauses_mid_turn_then_resumes_to_settle(tmp_path: Path) -> None:
     release.set()
 
     # The loop hits the next step boundary, raises TurnPaused; the driver parks the run PAUSED.
-    assert _wait(lambda: backend._record(run_id).session_state == SessionState.PAUSED)
+    assert eventually(lambda: backend._record(run_id).session_state == SessionState.PAUSED)
     inspect = _dispatch(backend, run_id, token, "inspect")
     assert inspect.state == "paused"
 
     # Resume re-pumps the SAME turn (the gate observation is re-sent) to settle.
     assert _dispatch(backend, run_id, token, "resume").data["resumed"] is True
-    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
 
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)

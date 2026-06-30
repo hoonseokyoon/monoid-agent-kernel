@@ -2,18 +2,15 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 
-import contextlib
 import faulthandler
-import json
 import os
 import sys
-import threading
 import time
-from collections.abc import Iterator
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -33,135 +30,57 @@ if _HANG_TIMEOUT_S > 0:
     faulthandler.dump_traceback_later(_HANG_TIMEOUT_S, exit=True)
 
 
+from native_agent_runner.reference.backend.service import RunnerBackend
+from support.studio_harness import studio as studio
+
+_ACTIVE_BACKENDS: list[RunnerBackend] = []
+_BACKEND_FUTURES: dict[int, list[Any]] = {}
+_ORIGINAL_BACKEND_POST_INIT = RunnerBackend.__post_init__
+_ORIGINAL_BACKEND_SPAWN = RunnerBackend._spawn
+
+
+def _tracked_backend_post_init(self: RunnerBackend) -> None:
+    _ORIGINAL_BACKEND_POST_INIT(self)
+    _ACTIVE_BACKENDS.append(self)
+    _BACKEND_FUTURES.setdefault(id(self), [])
+
+
+def _tracked_backend_spawn(self: RunnerBackend, coro: Any) -> Any:
+    future = _ORIGINAL_BACKEND_SPAWN(self, coro)
+    _BACKEND_FUTURES.setdefault(id(self), []).append(future)
+    return future
+
+
+RunnerBackend.__post_init__ = _tracked_backend_post_init
+RunnerBackend._spawn = _tracked_backend_spawn
+
+
+@pytest.fixture(autouse=True)
+def _drain_runner_backends_after_test() -> Any:
+    yield
+    try:
+        for backend in list(_ACTIVE_BACKENDS):
+            backend.shutdown(drain=True, drain_timeout_s=5.0)
+        for backend in list(_ACTIVE_BACKENDS):
+            for future in _BACKEND_FUTURES.get(id(backend), []):
+                try:
+                    future.result(timeout=0.5)
+                except FutureTimeoutError:
+                    future.cancel()
+                    time.sleep(0.05)
+                    try:
+                        future.result(timeout=1.0)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+    finally:
+        _BACKEND_FUTURES.clear()
+        _ACTIVE_BACKENDS.clear()
+
+
 def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
     del session, exitstatus
     # The run completed within the deadline — disarm so the watchdog can't fire during a
     # (bounded) interpreter shutdown and turn a green run red.
     faulthandler.cancel_dump_traceback_later()
-
-from native_agent_runner.core.agents import (
-    AgentRuntimeConfig,
-    RegistryToolRef,
-    StaticRuntimeConfigProvider,
-    ToolBinding,
-)
-from native_agent_runner.core.spec import ModelConfig
-from native_agent_runner.core.tool_surface import ToolAuthorizationDecision, ToolExposure, ToolGuidance, ToolQuota, ToolScope
-
-__all__ = ["StaticRuntimeConfigProvider"]
-
-
-def tool_binding(
-    tool_id: str,
-    *,
-    binding_id: str | None = None,
-    model_name: str | None = None,
-    exposure: ToolExposure = "immediate",
-    authorization: ToolAuthorizationDecision = "allow",
-    guidance: str = "",
-    scope: ToolScope | None = None,
-    quota: ToolQuota | None = None,
-    runtime: dict | None = None,
-) -> ToolBinding:
-    resolved_binding_id = binding_id or tool_id
-    return ToolBinding(
-        binding_id=resolved_binding_id,
-        model_name=model_name or resolved_binding_id.replace(".", "_"),
-        ref=RegistryToolRef(tool_id),
-        exposure=exposure,
-        authorization=authorization,
-        guidance=ToolGuidance(summary=guidance),
-        scope=scope or ToolScope(),
-        quota=quota or ToolQuota(),
-        runtime=runtime or {},
-    )
-
-
-def runtime_config(
-    *tool_ids: str,
-    definition_id: str = "test-agent",
-    version: int = 1,
-    model: ModelConfig | None = None,
-    bindings: tuple[ToolBinding, ...] | None = None,
-) -> AgentRuntimeConfig:
-    return AgentRuntimeConfig(
-        definition_id=definition_id,
-        config_version=version,
-        model=model,
-        tools=bindings if bindings is not None else tuple(tool_binding(tool_id) for tool_id in tool_ids),
-    )
-
-
-def runtime_provider(config: AgentRuntimeConfig) -> StaticRuntimeConfigProvider:
-    return StaticRuntimeConfigProvider(config)
-
-
-# --- Shared HTTP test harness (graceful server lifecycle + load-resilient client) --------
-
-
-def wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
-    """Poll /healthz until the server answers. The generous timeout tolerates a server
-    thread that starts slowly when the full suite's background threads contend for CPU."""
-    deadline = time.time() + timeout_s
-    last_error: Exception | None = None
-    while time.time() < deadline:
-        try:
-            with urlopen(Request(f"{base_url}/healthz"), timeout=2) as response:
-                response.read()
-            return
-        except Exception as exc:  # noqa: BLE001 - any failure means not-yet-ready
-            last_error = exc
-            time.sleep(0.02)
-    raise TimeoutError(f"server did not become ready: {last_error}")
-
-
-@contextlib.contextmanager
-def serving(server: Any) -> Iterator[str]:
-    """Run an HTTP server on a thread and shut it down gracefully on exit. Yields the base
-    URL once the server is ready. Centralizes the start/ready/shutdown/close/join dance so
-    every HTTP test tears down cleanly (no abandoned handler threads racing a closing
-    socket — the source of the suite's intermittent connection-abort failures)."""
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_address[1]}"
-    try:
-        wait_http_ready(base_url)
-        yield base_url
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=10)
-
-
-def http_json(
-    url: str,
-    payload: dict[str, Any] | None = None,
-    *,
-    token: str | None = None,
-    method: str | None = None,
-    retries: int = 5,
-) -> dict[str, Any]:
-    """JSON request helper that is resilient to transient connection-level errors under
-    load (reset/refused/disconnect), retrying with a short backoff. It NEVER retries an
-    ``HTTPError`` — a 4xx/5xx response is a real result and propagates immediately so tests
-    still assert real server behavior."""
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    headers: dict[str, str] = {}
-    if data is not None:
-        headers["Content-Type"] = "application/json"
-    if token is not None:
-        headers["Authorization"] = f"Bearer {token}"
-    resolved_method = method or ("POST" if data is not None else "GET")
-    last_error: Exception | None = None
-    for attempt in range(retries):
-        try:
-            request = Request(url, data=data, headers=headers, method=resolved_method)
-            with urlopen(request, timeout=5) as response:
-                body = response.read().decode("utf-8")
-                return json.loads(body) if body else {}
-        except HTTPError:
-            raise  # a real HTTP response — never retry
-        except (URLError, ConnectionError, OSError) as exc:
-            last_error = exc
-            time.sleep(0.05 * (attempt + 1))
-    raise last_error if last_error is not None else RuntimeError("http_json failed without an error")

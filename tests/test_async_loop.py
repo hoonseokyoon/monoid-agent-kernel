@@ -11,7 +11,8 @@ import asyncio
 import json
 from pathlib import Path
 
-from conftest import runtime_config, runtime_provider, tool_binding
+from support.process import python_command as _python_command
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from native_agent_runner.core.events import AgentEvent
 from native_agent_runner.core.spec import AgentRunSpec, RunLimits
@@ -120,11 +121,6 @@ def test_async_and_sync_paths_agree(tmp_path: Path) -> None:
 
     assert sync_result.status == async_result.status == "completed"
     assert sync_result.final_text == async_result.final_text == "settled"
-
-
-def _python_command(code: str) -> str:
-    escaped = code.replace('"', '\\"')
-    return f'python -c "{escaped}"'
 
 
 def test_background_shell_job_completes_on_run_loop_and_reenters(tmp_path: Path) -> None:

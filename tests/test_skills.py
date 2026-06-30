@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 import pytest
-from conftest import runtime_config, runtime_provider, tool_binding
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from native_agent_runner.core.context import TurnContext
 from native_agent_runner.core.spec import AgentRunSpec

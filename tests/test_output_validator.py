@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from conftest import runtime_provider, tool_binding
+from support.runtime import runtime_provider, tool_binding
 
 from native_agent_runner.core.agents import AgentRuntimeConfig, OutputValidatorBinding
 from native_agent_runner.core.checkpoint import RunCheckpoint, read_checkpoint, write_checkpoint

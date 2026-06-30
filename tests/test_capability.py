@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import runtime_config, runtime_provider, tool_binding
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from native_agent_runner.core.capability import (
     AutoGrantBroker,

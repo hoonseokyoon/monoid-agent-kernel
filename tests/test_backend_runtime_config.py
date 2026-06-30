@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from conftest import http_json
+from support.http import http_get_json as _json_get
 
 from native_agent_runner.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
 from native_agent_runner.core.tool_surface import ToolGuidance
@@ -194,10 +194,6 @@ def test_backend_http_runtime_config_get_post_and_version_mismatch(tmp_path: Pat
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
-
-
-def _json_get(url: str, *, token: str) -> dict:
-    return http_json(url, token=token, method="GET")
 
 
 def _json_post(url: str, payload: dict, *, token: str) -> dict:

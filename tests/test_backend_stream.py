@@ -16,7 +16,8 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from conftest import runtime_config, serving
+from support.http import serving
+from support.runtime import runtime_config
 
 from native_agent_runner.errors import ModelAdapterError
 from native_agent_runner.providers.base import ModelRequest, ModelStreamChunk, TextDelta, TurnComplete

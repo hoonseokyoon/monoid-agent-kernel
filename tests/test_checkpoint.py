@@ -7,7 +7,8 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import runtime_config, runtime_provider
+from support.process import python_command as _python_command
+from support.runtime import runtime_config, runtime_provider
 
 from native_agent_runner.core.checkpoint import (
     SCHEMA_VERSION,
@@ -29,10 +30,6 @@ def _latest_checkpoint(spec: AgentRunSpec) -> RunCheckpoint | None:
     """Read the loop's last durably-committed checkpoint via the default store."""
     record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
     return record.checkpoint if record is not None else None
-
-
-def _python_command(code: str) -> str:
-    return f'python -c "{code.replace(chr(34), chr(92) + chr(34))}"'
 
 
 def _hitl_parked_loop(spec: AgentRunSpec) -> tuple[AgentLoop, str, Path, Path]:

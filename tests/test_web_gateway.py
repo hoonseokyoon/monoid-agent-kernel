@@ -13,7 +13,12 @@ from native_agent_runner.reference._shared.http_util import HardenedThreadingHTT
 
 import pytest
 
-from conftest import http_json, runtime_config, runtime_provider, tool_binding, wait_http_ready
+from support.http import (
+    http_get_json as _json_get,
+    http_json,
+    wait_http_ready as _wait_http_ready,
+)
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from native_agent_runner.core.schemas import validate_run_dir
 from native_agent_runner.core.spec import AgentRunSpec
@@ -32,6 +37,8 @@ from native_agent_runner.reference.web_gateway.providers import (
 )
 from native_agent_runner.reference.web_gateway.service import WebGatewayBackend
 from native_agent_runner.web import WebGatewayClient
+
+pytestmark = pytest.mark.integration
 
 
 def _token_manager() -> TokenManager:
@@ -269,6 +276,7 @@ def test_brave_llm_context_provider_contract() -> None:
         upstream.stop()
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not os.environ.get("BRAVE_SEARCH_API_KEY"), reason="BRAVE_SEARCH_API_KEY is required")
 def test_brave_search_provider_live_smoke() -> None:
     assert BraveSearchProvider.from_env(timeout_s=10).search("native agent runner web tools", max_results=2)
@@ -276,14 +284,6 @@ def test_brave_search_provider_live_smoke() -> None:
 
 def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
     return http_json(url, payload, token=token)
-
-
-def _json_get(url: str, *, token: str) -> dict:
-    return http_json(url, token=token, method="GET")
-
-
-def _wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
-    wait_http_ready(base_url, timeout_s=timeout_s)
 
 
 class _FakeUpstreamServer:

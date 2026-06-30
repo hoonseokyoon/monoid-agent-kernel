@@ -17,7 +17,8 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from conftest import runtime_config, runtime_provider, serving
+from support.http import serving
+from support.runtime import runtime_config, runtime_provider
 
 from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from native_agent_runner.errors import ModelAdapterError
