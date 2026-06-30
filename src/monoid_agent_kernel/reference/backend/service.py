@@ -164,6 +164,31 @@ def _runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
     return config
 
 
+def _read_event_page(events_path: Path, *, from_seq: int, limit: int | None) -> dict[str, Any]:
+    if from_seq < 0:
+        raise ValueError("from_seq must be non-negative")
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
+    events: list[dict[str, Any]] = []
+    next_seq = from_seq
+    has_more = False
+    if events_path.exists():
+        with events_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                seq = int(event.get("seq") or 0)
+                if seq < from_seq:
+                    continue
+                if limit is not None and len(events) >= limit:
+                    has_more = True
+                    break
+                events.append(event)
+                next_seq = seq + 1
+    return {"events": events, "next_seq": next_seq, "has_more": has_more}
+
+
 @dataclass(frozen=True)
 class BackendRunRequest:
     tenant_id: str
@@ -1634,20 +1659,21 @@ class RunnerBackend:
         )
         return result.to_json()
 
-    def events(self, run_id: str, token: str, *, from_seq: int = 0) -> dict[str, Any]:
+    def events(
+        self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
+    ) -> dict[str, Any]:
         events_path = self._authorized_run_dir(run_id, token) / "events.jsonl"
-        events: list[dict[str, Any]] = []
-        if events_path.exists():
-            for line in events_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                if int(event.get("seq") or 0) >= from_seq:
-                    events.append(event)
-        return {"run_id": run_id, "events": events}
+        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
+        return {"run_id": run_id, **page}
 
     def descendant_events(
-        self, run_id: str, token: str, descendant_run_id: str, *, from_seq: int = 0
+        self,
+        run_id: str,
+        token: str,
+        descendant_run_id: str,
+        *,
+        from_seq: int = 0,
+        limit: int | None = None,
     ) -> dict[str, Any]:
         """Stream a descendant (subagent) run's events, authorized via the ancestor's run token.
 
@@ -1663,15 +1689,8 @@ class RunnerBackend:
         if any(sep in descendant_run_id for sep in ("/", "\\")) or ".." in descendant_run_id:
             raise PermissionDenied("invalid descendant run id")
         events_path = self.run_root / descendant_run_id / "events.jsonl"
-        events: list[dict[str, Any]] = []
-        if events_path.exists():
-            for line in events_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                if int(event.get("seq") or 0) >= from_seq:
-                    events.append(event)
-        return {"run_id": descendant_run_id, "events": events}
+        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
+        return {"run_id": descendant_run_id, **page}
 
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)

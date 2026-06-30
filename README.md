@@ -383,6 +383,9 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/events
 
 curl -H "Authorization: Bearer $RUN_TOKEN" \
+  "http://127.0.0.1:8765/v1/runs/$RUN_ID/events?from_seq=1&limit=100"
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/proposal
 
 curl -H "Authorization: Bearer $RUN_TOKEN" \

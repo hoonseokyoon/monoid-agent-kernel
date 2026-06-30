@@ -171,6 +171,13 @@ def test_backend_descendant_events_reads_child_and_checks_lineage(tmp_path: Path
         # from_seq filters
         tail = backend.descendant_events(run_id, token, child_id, from_seq=1)
         assert [e["seq"] for e in tail["events"]] == [1]
+        page = backend.descendant_events(run_id, token, child_id, from_seq=0, limit=1)
+        assert [e["seq"] for e in page["events"]] == [0]
+        assert page["next_seq"] == 1
+        assert page["has_more"] is True
+        next_page = backend.descendant_events(run_id, token, child_id, from_seq=page["next_seq"], limit=1)
+        assert [e["seq"] for e in next_page["events"]] == [1]
+        assert next_page["next_seq"] == 2
         # a non-descendant id is rejected even with a valid token
         with pytest.raises(PermissionDenied):
             backend.descendant_events(run_id, token, "some.other.run")
