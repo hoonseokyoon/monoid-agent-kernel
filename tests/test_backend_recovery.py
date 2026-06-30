@@ -305,6 +305,13 @@ def test_backend_worker_failure_writes_failure_bundle(tmp_path: Path) -> None:
     assert failure["schema_version"] == "monoid.failure.v1"
     assert failure["type"] == "RuntimeError"
     assert "last_good_seq" in failure
+    diagnostics = backend.diagnostics(run_id, submission.run_token)
+    assert diagnostics["status"]["status"] == "failed"
+    assert diagnostics["failure"]["type"] == "RuntimeError"
+    assert diagnostics["recovery"]["failure_marked"] is True
+    assert diagnostics["events"]["items"] == []
+    with pytest.raises(PermissionDenied):
+        backend.diagnostics(run_id, "bad-token")
 
 
 def test_recover_runs_marks_unrecoverable_after_max_attempts(tmp_path: Path, monkeypatch) -> None:

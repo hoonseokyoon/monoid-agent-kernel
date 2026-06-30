@@ -110,6 +110,12 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
             token=run_token,
         )
         assert page2["events"][0]["seq"] == 3
+        diagnostics = _json_get(f"{base_url}/v1/runs/{run_id}/diagnostics?event_limit=3", token=run_token)
+        assert diagnostics["status"]["status"] == "completed"
+        assert len(diagnostics["events"]["items"]) <= 3
+        assert diagnostics["events"]["next_seq"] >= diagnostics["events"]["from_seq"]
+        assert diagnostics["failure"] is None
+        assert diagnostics["recovery"]["attempts"] == 0
         usage = _json_get(f"{base_url}/v1/tenants/tenant_a/usage", token="admin")
         assert usage["total_tokens"] == 10
     finally:

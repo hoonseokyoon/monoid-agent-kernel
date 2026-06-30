@@ -480,6 +480,14 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
 with `from_seq=next_seq` to avoid duplicates; omitting `limit` preserves the historical "return all
 events from N" behavior. `RunnerBackend.descendant_events(...)` uses the same pagination contract
 for subagent event streams authorized through an ancestor run token.
+
+### Diagnostics
+
+`GET /v1/runs/{run_id}/diagnostics?event_limit=N` returns one token-scoped operational aggregate:
+`status`, `failure` (`failure.json` when present), `recovery` attempt state, bounded recent event
+summaries, control-command audit summaries, and trace ids found in recent events. Diagnostics uses
+event summaries rather than raw event payloads so model text, tool arguments, bearer tokens, and
+lease material do not get a new broad read surface.
 ### Inbox Message Envelope
 
 `monoid.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a
