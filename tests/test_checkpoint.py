@@ -126,6 +126,22 @@ def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
     assert read_checkpoint(tmp_path) is None
 
 
+def test_read_checkpoint_accepts_legacy_schema_version(tmp_path: Path) -> None:
+    cp = RunCheckpoint(run_id="run_1")
+    write_checkpoint(tmp_path, cp)
+    path = tmp_path / "checkpoint.json"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "native-agent-runner.checkpoint.v1"),
+        encoding="utf-8",
+    )
+
+    restored = read_checkpoint(tmp_path)
+
+    assert restored is not None
+    assert restored.run_id == "run_1"
+    assert restored.schema_version == "native-agent-runner.checkpoint.v1"
+
+
 def test_local_fs_store_latest_ignores_uncommitted_seq(tmp_path: Path) -> None:
     # A manifest written for a higher seq WITHOUT flipping LATEST (a crash mid-commit)
     # must be ignored — latest() returns the last fully-committed checkpoint.

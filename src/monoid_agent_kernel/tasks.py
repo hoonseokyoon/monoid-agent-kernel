@@ -17,6 +17,7 @@ from typing import Any, Literal, Protocol
 from monoid_agent_kernel._proc import file_size, proc_group_kwargs, terminate_process
 from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.errors import ToolExecutionError, WorkspaceError
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ToolObservation
 from monoid_agent_kernel.public_view import public_path
@@ -140,7 +141,7 @@ class BackgroundJob:
 
     def to_json(self, run_dir: Path) -> dict[str, Any]:
         return {
-            "schema_version": "native-agent-runner.background-job.v1",
+            "schema_version": namespaced_id("background-job.v1"),
             "job_id": self.job_id,
             "command": self.command,
             "command_preview": self.command_preview,
@@ -513,7 +514,7 @@ class HostedTask:
     def to_json(self, run_dir: Path) -> dict[str, Any]:
         del run_dir
         return {
-            "schema_version": "native-agent-runner.task.v1",
+            "schema_version": namespaced_id("task.v1"),
             "task_id": self.job_id,
             "kind": self.kind,
             "status": self.status,

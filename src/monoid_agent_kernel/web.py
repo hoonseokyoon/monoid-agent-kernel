@@ -73,7 +73,7 @@ class WebGatewayClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "native-agent-runner/0.11",
+            "User-Agent": "monoid-agent-kernel/0.13",
         }
         # A per-call capability lease handle (when web tools are routed through the capability gate)
         # overrides the static run-start credential; otherwise fall back to the configured token.

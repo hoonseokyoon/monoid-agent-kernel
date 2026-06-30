@@ -170,7 +170,7 @@ def test_agent_loop_web_bindings_events_metrics_and_private_transcript(tmp_path:
                     tool_calls=(
                         fake_tool_call(
                             "web_fetch",
-                            {"url": "https://docs.example.test/native-agent-runner/web", "max_bytes": 120},
+                            {"url": "https://docs.example.test/monoid-agent-kernel/web", "max_bytes": 120},
                             "fetch_1",
                         ),
                     ),
@@ -328,11 +328,11 @@ class _FakeUpstreamServer:
                     self._write_json(
                         {
                             "context": "LLM-ready Brave context for native agent runner.",
-                            "sources": [{"title": "Native Agent Docs", "url": "https://docs.example.test/native-agent-runner/web"}],
+                            "sources": [{"title": "Native Agent Docs", "url": "https://docs.example.test/monoid-agent-kernel/web"}],
                             "chunks": [
                                 {
                                     "title": "Native Agent Docs",
-                                    "url": "https://docs.example.test/native-agent-runner/web",
+                                    "url": "https://docs.example.test/monoid-agent-kernel/web",
                                     "text": "LLM-ready Brave context for native agent runner.",
                                 }
                             ],

@@ -29,8 +29,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from monoid_agent_kernel.core._util import file_lock, sha256_bytes, write_json_atomic
+from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
-SCHEMA_VERSION = "native-agent-runner.checkpoint.v1"
+SCHEMA_VERSION = namespaced_id("checkpoint.v1")
+ACCEPTED_SCHEMA_VERSIONS = accepted_namespaced_ids("checkpoint.v1")
 
 CHECKPOINT_FILENAME = "checkpoint.json"
 
@@ -125,7 +127,7 @@ class RunCheckpoint:
         unreadable checkpoint as "no checkpoint" and skips recovery."""
         if not isinstance(payload, dict):
             return None
-        if payload.get("schema_version") != SCHEMA_VERSION:
+        if payload.get("schema_version") not in ACCEPTED_SCHEMA_VERSIONS:
             return None
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in payload.items() if k in known})

@@ -126,7 +126,7 @@ def test_job_artifact_layout_and_schema(tmp_path: Path) -> None:
     assert job.stdout_path.exists()
 
     data: dict[str, Any] = json.loads(job.job_path.read_text(encoding="utf-8"))
-    assert data["schema_version"] == "native-agent-runner.background-job.v1"
+    assert data["schema_version"] == "monoid.background-job.v1"
     assert data["job_id"] == job.job_id
     assert data["status"] == "exited"
     assert data["stdout_path"] == f"artifacts/jobs/{job.job_id}/stdout.log"

@@ -6,10 +6,12 @@ import hmac
 import json
 import secrets
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.identifiers import LEGACY_TOKEN_ISSUER, TOKEN_ISSUER, normalize_audiences
 
 TokenKind = Literal["run_access", "llm_gateway", "web_gateway", "task_callback", "capability"]
 
@@ -61,7 +63,8 @@ class TokenClaims:
 @dataclass(frozen=True)
 class TokenManager:
     secret: bytes
-    issuer: str = "native-agent-runner"
+    issuer: str = TOKEN_ISSUER
+    accepted_issuers: tuple[str, ...] = (LEGACY_TOKEN_ISSUER,)
 
     @classmethod
     def ephemeral(cls) -> TokenManager:
@@ -110,7 +113,7 @@ class TokenManager:
         token: str,
         *,
         kind: TokenKind,
-        audience: str,
+        audience: str | Iterable[str],
         run_id: str | None = None,
     ) -> TokenClaims:
         try:
@@ -125,12 +128,12 @@ class TokenManager:
         if header.get("alg") != "HS256" or header.get("typ") != "NAR":
             raise TokenError("invalid token header")
         payload = _json_b64(payload_raw)
-        if payload.get("iss") != self.issuer:
+        if payload.get("iss") not in (self.issuer, *self.accepted_issuers):
             raise TokenError("invalid token issuer")
         claims = TokenClaims.from_json(payload)
         if claims.kind != kind:
             raise TokenError("invalid token kind")
-        if claims.audience != audience:
+        if claims.audience not in normalize_audiences(audience):
             raise TokenError("invalid token audience")
         if run_id is not None and claims.run_id != run_id:
             raise TokenError("token run mismatch")

@@ -86,9 +86,9 @@ def test_vault_admit_rejects_scope_widening() -> None:
 
 def test_request_and_lease_round_trip_json() -> None:
     req = CapabilityRequest(capability="email.send", scope={"to": ["x@example.edu"]}, reason="reply")
-    assert req.to_json()["protocol"] == "native-agent-runner.capability-request.v1"
+    assert req.to_json()["protocol"] == "monoid.capability-request.v1"
     lease = CapabilityLease(capability="email.send", token_ref="secret-ref://l", expires_at=1.0)
-    assert lease.to_json()["protocol"] == "native-agent-runner.capability-lease.v1"
+    assert lease.to_json()["protocol"] == "monoid.capability-lease.v1"
     assert CapabilityDenial(capability="email.send", reason="nope").to_json()["reason"] == "nope"
 
 

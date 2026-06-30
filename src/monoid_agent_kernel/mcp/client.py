@@ -41,7 +41,7 @@ class McpHttpClient:
         url: str,
         token: str | None = None,
         *,
-        client_info: tuple[str, str] = ("native-agent-runner", "0.11"),
+        client_info: tuple[str, str] = ("monoid-agent-kernel", "0.13"),
         timeout_s: float = 30.0,
     ) -> None:
         try:

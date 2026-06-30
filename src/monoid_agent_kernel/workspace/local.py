@@ -11,6 +11,7 @@ from monoid_agent_kernel.core._util import sha256_bytes, utc_timestamp
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunMode, WorkspaceBackendKind
 from monoid_agent_kernel.core.workspace import ChangedEntry, FileEntry, Workspace
 from monoid_agent_kernel.errors import WorkspaceError
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.workspace.paths import is_within, normalize_workspace_path
 
 # Re-exported from core so existing ``workspace.local`` import sites keep working.
@@ -22,7 +23,7 @@ __all__ = [
     "sha256_bytes",
 ]
 
-WORKSPACE_BASE_SCHEMA_VERSION = "native-agent-runner.workspace-base.v1"
+WORKSPACE_BASE_SCHEMA_VERSION = namespaced_id("workspace-base.v1")
 
 
 def _glob_matches(path: str, pattern: str) -> bool:

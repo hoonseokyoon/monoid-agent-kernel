@@ -9,6 +9,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.identifiers import schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
 
@@ -16,7 +17,7 @@ EVENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["schema_version", "event_id", "seq", "run_id", "timestamp", "type", "level", "data"],
     "properties": {
-        "schema_version": {"const": "native-agent-runner.event.v1"},
+        "schema_version": schema_version_property("event.v1"),
         "event_id": {"type": "string", "minLength": 1},
         "seq": {"type": "integer", "minimum": 1},
         "run_id": {"type": "string", "minLength": 1},
@@ -430,7 +431,7 @@ MANIFEST_SCHEMA: dict[str, Any] = {
         "workspace_index_path",
     ],
     "properties": {
-        "schema_version": {"const": "native-agent-runner.manifest.v1"},
+        "schema_version": schema_version_property("manifest.v1"),
         "run_id": {"type": "string", "minLength": 1},
         "created_at": {"type": "string", "pattern": "Z$"},
         "mode": {"enum": ["read-only", "propose", "apply"]},
@@ -463,7 +464,7 @@ WORKSPACE_BASE_SCHEMA: dict[str, Any] = {
         "excluded",
     ],
     "properties": {
-        "schema_version": {"const": "native-agent-runner.workspace-base.v1"},
+        "schema_version": schema_version_property("workspace-base.v1"),
         "run_id": {"type": "string", "minLength": 1},
         "created_at": {"type": "string", "pattern": "Z$"},
         "workspace_root": {"type": "string"},
@@ -512,7 +513,7 @@ WORKSPACE_INDEX_SCHEMA: dict[str, Any] = {
         "excluded",
     ],
     "properties": {
-        "schema_version": {"const": "native-agent-runner.workspace-index.v1"},
+        "schema_version": schema_version_property("workspace-index.v1"),
         "run_id": {"type": "string", "minLength": 1},
         "generated_at": {"type": "string", "pattern": "Z$"},
         "workspace_root": {"type": "string"},
@@ -666,7 +667,7 @@ PROPOSAL_SCHEMA: dict[str, Any] = {
         "files",
     ],
     "properties": {
-        "schema_version": {"const": "native-agent-runner.proposal.v2"},
+        "schema_version": schema_version_property("proposal.v2"),
         "run_id": {"type": "string", "minLength": 1},
         "updated_at": {"type": "number"},
         "mode": {"enum": ["read-only", "propose", "apply"]},
@@ -748,7 +749,7 @@ JOB_SCHEMA: dict[str, Any] = {
         "resume_on_exit",
     ],
     "properties": {
-        "schema_version": {"const": "native-agent-runner.background-job.v1"},
+        "schema_version": schema_version_property("background-job.v1"),
         "job_id": {"type": "string", "minLength": 1},
         "command": {"type": "string"},
         "command_preview": {"type": "string"},
@@ -790,7 +791,7 @@ PACKAGE_SCHEMA: dict[str, Any] = {
         "package_hash",
     ],
     "properties": {
-        "schema_version": {"const": "native-agent-runner.proposal-package.v1"},
+        "schema_version": schema_version_property("proposal-package.v1"),
         "run_id": {"type": "string", "minLength": 1},
         "created_at": {"type": "string"},
         "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -831,7 +832,7 @@ APPROVAL_SCHEMA: dict[str, Any] = {
         "approval_hash",
     ],
     "properties": {
-        "schema_version": {"const": "native-agent-runner.approval.v1"},
+        "schema_version": schema_version_property("approval.v1"),
         "approval_id": {"type": "string"},
         "decision": {"enum": ["approved", "rejected"]},
         "package_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -859,7 +860,7 @@ APPLY_RESULT_SCHEMA: dict[str, Any] = {
         "apply_hash",
     ],
     "properties": {
-        "schema_version": {"const": "native-agent-runner.apply-result.v1"},
+        "schema_version": schema_version_property("apply-result.v1"),
         "status": {"enum": ["dry_run", "applied", "conflict", "rejected"]},
         "applied_paths": {"type": "array", "items": {"type": "string"}},
         "skipped_paths": {"type": "array", "items": {"type": "string"}},

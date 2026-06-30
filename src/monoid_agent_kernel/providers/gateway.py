@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.providers._common import (
     build_reasoning_payload,
     normalize_usage,
@@ -203,7 +204,7 @@ class GatewayModelAdapter:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "native-agent-runner/0.2",
+            "User-Agent": "monoid-agent-kernel/0.13",
         }
         token = self._resolve_gateway_token()
         if token:
@@ -222,7 +223,7 @@ class GatewayModelAdapter:
     def _payload(self, request: ModelRequest) -> dict[str, Any]:
         config = request.model or self.config
         payload: dict[str, Any] = {
-            "protocol": "native-agent-runner.llm-turn.v1",
+            "protocol": namespaced_id("llm-turn.v1"),
             "model": config.model,
             "system_prompt": request.system_prompt,
             "tools": [_gateway_tool_schema(tool) for tool in request.tools],

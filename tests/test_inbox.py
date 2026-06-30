@@ -14,6 +14,7 @@ from monoid_agent_kernel.core.inbox import (
     InboxMessage,
     is_inbox_envelope,
 )
+from monoid_agent_kernel.identifiers import LEGACY_NAMESPACE
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -43,6 +44,13 @@ def test_is_inbox_envelope_discriminates() -> None:
     assert not is_inbox_envelope("raw text")  # legacy raw str
     assert not is_inbox_envelope([{"type": "text", "text": "x"}])  # legacy raw parts
     assert not is_inbox_envelope({"foo": "bar"})  # an unrelated dict
+
+
+def test_is_inbox_envelope_accepts_legacy_protocol_during_migration() -> None:
+    payload = InboxMessage(content="x").to_json()
+    payload["protocol"] = f"{LEGACY_NAMESPACE}.inbox-message.v1"
+
+    assert is_inbox_envelope(payload)
 
 
 def test_queued_message_unwraps_envelope_and_passes_legacy_through() -> None:

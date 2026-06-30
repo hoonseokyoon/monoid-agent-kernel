@@ -12,6 +12,7 @@ from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes, write
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
 from monoid_agent_kernel.core.manifest import RunManifest
 from monoid_agent_kernel.core.result import AgentArtifact
+from monoid_agent_kernel.identifiers import namespaced_id
 
 if TYPE_CHECKING:
     from monoid_agent_kernel.core.workspace import ChangedEntry, Workspace
@@ -262,7 +263,7 @@ class AgentRecorder:
         diff_data = diff_path.read_bytes() if diff_path.exists() else b""
         diff_bytes = diff_path.stat().st_size if diff_path.exists() else 0
         payload: dict[str, Any] = {
-            "schema_version": "native-agent-runner.proposal.v2",
+            "schema_version": namespaced_id("proposal.v2"),
             "run_id": self.run_id,
             "updated_at": time.time(),
             "mode": workspace.mode,

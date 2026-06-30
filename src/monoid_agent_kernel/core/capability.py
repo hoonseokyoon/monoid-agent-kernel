@@ -9,7 +9,7 @@ capability can use, and makes acquisition on-demand and brokered (auto-grant, po
 human escalation) rather than only statically provisioned at run start.
 
 Protocols:
-  ``native-agent-runner.capability-request.v1`` / ``...capability-lease.v1``
+  ``monoid.capability-request.v1`` / ``...capability-lease.v1``
 
 Security invariants the core enforces (see ``CapabilityVault.admit``):
   - the secret never enters the core (a lease carries ``token_ref``, a handle);
@@ -25,8 +25,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-CAPABILITY_REQUEST_VERSION = "native-agent-runner.capability-request.v1"
-CAPABILITY_LEASE_VERSION = "native-agent-runner.capability-lease.v1"
+from monoid_agent_kernel.identifiers import namespaced_id
+
+CAPABILITY_REQUEST_VERSION = namespaced_id("capability-request.v1")
+CAPABILITY_LEASE_VERSION = namespaced_id("capability-lease.v1")
 
 
 @dataclass(frozen=True)

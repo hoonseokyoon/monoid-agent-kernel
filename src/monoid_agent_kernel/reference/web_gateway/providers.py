@@ -14,7 +14,7 @@ from monoid_agent_kernel.web import WebGatewayError, domain_from_url
 
 DEFAULT_BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 DEFAULT_BRAVE_LLM_CONTEXT_ENDPOINT = "https://api.search.brave.com/res/v1/llm/context"
-DEFAULT_HTTP_USER_AGENT = "native-agent-runner-webgateway/0.11"
+DEFAULT_HTTP_USER_AGENT = "monoid-agent-kernel-webgateway/0.13"
 
 
 class SearchProvider(Protocol):

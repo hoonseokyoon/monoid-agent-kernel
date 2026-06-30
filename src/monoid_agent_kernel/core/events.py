@@ -6,8 +6,9 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel.core._util import utc_timestamp
+from monoid_agent_kernel.identifiers import namespaced_id
 
-EVENT_SCHEMA_VERSION = "native-agent-runner.event.v1"
+EVENT_SCHEMA_VERSION = namespaced_id("event.v1")
 
 AgentEventType = Literal[
     "run.started",

@@ -29,8 +29,23 @@ from support.backend_harness import (
     time,
     write_json_atomic,
 )
+from monoid_agent_kernel.reference.backend.service import _read_run_meta
 
 pytestmark = pytest.mark.integration
+
+
+def test_read_run_meta_accepts_legacy_schema_version(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_1"
+    run_dir.mkdir()
+    write_json_atomic(
+        run_dir / "run.json",
+        {"schema_version": "native-agent-runner.backend-run.v1", "run_id": "run_1"},
+    )
+
+    assert _read_run_meta(run_dir) == {
+        "schema_version": "native-agent-runner.backend-run.v1",
+        "run_id": "run_1",
+    }
 
 
 @pytest.mark.slow
@@ -218,7 +233,7 @@ def test_backend_worker_failure_writes_failure_bundle(tmp_path: Path) -> None:
     failure_path = run_root / run_id / "failure.json"
     assert failure_path.exists()
     failure = json.loads(failure_path.read_text(encoding="utf-8"))
-    assert failure["schema_version"] == "native-agent-runner.failure.v1"
+    assert failure["schema_version"] == "monoid.failure.v1"
     assert failure["type"] == "RuntimeError"
     assert "last_good_seq" in failure
 
@@ -456,7 +471,7 @@ def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) 
     with pytest.raises(PermissionDenied):
         backend2.events(run_id, "not-a-token")
     traversal = backend2.token_manager.issue(
-        kind="run_access", audience="native-agent-runner.backend",
+        kind="run_access", audience="monoid.backend",
         run_id="../escape", tenant_id="tenant_a", user_id="user_a", ttl_s=60,
     )
     with pytest.raises(PermissionDenied):

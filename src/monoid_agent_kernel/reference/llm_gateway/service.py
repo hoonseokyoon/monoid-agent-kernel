@@ -12,6 +12,7 @@ from typing import Any
 from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenError, TokenManager
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
+from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 from monoid_agent_kernel.providers.base import (
     ModelAdapter,
     ModelRequest,
@@ -113,7 +114,7 @@ class LlmGatewayBackend:
         with self._lock:
             self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(turn.usage)
         return {
-            "protocol": "native-agent-runner.llm-turn-result.v1",
+            "protocol": namespaced_id("llm-turn-result.v1"),
             "turn_handle": turn_handle,
             "final_text": turn.final_text,
             "tool_calls": [
@@ -325,8 +326,12 @@ def _chunk_to_frame(chunk: ModelStreamChunk) -> dict[str, Any] | None:
     return None
 
 
+LLM_TURN_PROTOCOL_VERSION = namespaced_id("llm-turn.v1")
+ACCEPTED_LLM_TURN_PROTOCOL_VERSIONS = accepted_namespaced_ids("llm-turn.v1")
+
+
 def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
-    if payload.get("protocol") != "native-agent-runner.llm-turn.v1":
+    if payload.get("protocol") not in ACCEPTED_LLM_TURN_PROTOCOL_VERSIONS:
         raise ValueError("unsupported LLM gateway protocol")
     reasoning_raw = dict(payload.get("reasoning") or {})
     previous_turn_handle = payload.get("previous_turn_handle")
@@ -337,7 +342,7 @@ def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
     if messages is None and previous_turn_handle is None and not instruction.strip():
         raise ValueError("instruction is required for the first LLM turn")
     return LlmGatewayTurnRequest(
-        protocol="native-agent-runner.llm-turn.v1",
+        protocol=LLM_TURN_PROTOCOL_VERSION,
         model=str(payload["model"]),
         system_prompt=str(payload["system_prompt"]),
         tools=tuple(_parse_tool(item) for item in payload.get("tools") or ()),

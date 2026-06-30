@@ -6,9 +6,10 @@ from typing import Any
 
 from monoid_agent_kernel.core._util import sha256_bytes, utc_timestamp
 from monoid_agent_kernel.core.workspace import Workspace
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.workspace.paths import is_within
 
-WORKSPACE_INDEX_SCHEMA_VERSION = "native-agent-runner.workspace-index.v1"
+WORKSPACE_INDEX_SCHEMA_VERSION = namespaced_id("workspace-index.v1")
 
 
 def build_workspace_index(

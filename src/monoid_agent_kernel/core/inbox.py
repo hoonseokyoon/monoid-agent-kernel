@@ -1,4 +1,4 @@
-"""Inbox message envelope (``native-agent-runner.inbox-message.v1``).
+"""Inbox message envelope (``monoid.inbox-message.v1``).
 
 A message entering a run (a user follow-up, a control-plane send, …) is wrapped in this envelope
 so it carries **provenance** (who sent it, which logical flow) and a stable **`id`** that makes
@@ -21,7 +21,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-INBOX_PROTOCOL_VERSION = "native-agent-runner.inbox-message.v1"
+from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
+
+INBOX_PROTOCOL_VERSION = namespaced_id("inbox-message.v1")
+ACCEPTED_INBOX_PROTOCOL_VERSIONS = accepted_namespaced_ids("inbox-message.v1")
 
 
 @dataclass(frozen=True)
@@ -88,4 +91,4 @@ def is_inbox_envelope(obj: Any) -> bool:
     """True if ``obj`` is a serialized :class:`InboxMessage` (vs. a legacy raw ``str``/``list``
     queue entry or a queue sentinel). The discriminator the queue/checkpoint use to decide whether
     to unwrap an envelope or pass content through unchanged."""
-    return isinstance(obj, dict) and obj.get("protocol") == INBOX_PROTOCOL_VERSION
+    return isinstance(obj, dict) and obj.get("protocol") in ACCEPTED_INBOX_PROTOCOL_VERSIONS

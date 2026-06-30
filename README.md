@@ -550,8 +550,10 @@ can be enforced.
 `runtime_config.model.provider="openai"` and `--allow-direct-provider-api`.
 
 To target your own LLM gateway, implement the `ModelAdapter` protocol or the
-`native-agent-runner.llm-turn.v1` HTTP contract documented in
-[docs/CONTRACTS.md](docs/CONTRACTS.md).
+`monoid.llm-turn.v1` HTTP contract documented in
+[docs/CONTRACTS.md](docs/CONTRACTS.md). Current protocol and schema identifiers
+use `monoid.*`; `native-agent-runner.*` identifiers are accepted during migration
+for existing durable artifacts and gateway requests.
 
 ## Defaults
 

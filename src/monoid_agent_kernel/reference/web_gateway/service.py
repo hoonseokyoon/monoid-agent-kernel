@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenError, TokenManager
 from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.web import (
     WebGatewayError,
     domain_allowed,
@@ -37,7 +38,7 @@ class WebProvider(Protocol):
 
 DEFAULT_FAKE_CORPUS: tuple[dict[str, str], ...] = (
     {
-        "url": "https://docs.example.test/native-agent-runner/web",
+        "url": "https://docs.example.test/monoid-agent-kernel/web",
         "title": "Monoid Agent Kernel Web Tools",
         "content": (
             "Monoid Agent Kernel exposes web.search and web.fetch through a WebGateway. "
@@ -45,7 +46,7 @@ DEFAULT_FAKE_CORPUS: tuple[dict[str, str], ...] = (
         ),
     },
     {
-        "url": "https://docs.example.test/native-agent-runner/policy",
+        "url": "https://docs.example.test/monoid-agent-kernel/policy",
         "title": "Web Policy and Tenant Usage",
         "content": (
             "Tool bindings carry allowed domains, blocked domains, call limits, result limits, "
@@ -229,7 +230,7 @@ class WebGatewayBackend:
             usage.search_calls += 1
             usage.result_count += len(results)
         return {
-            "protocol": "native-agent-runner.web-search-result.v1",
+            "protocol": namespaced_id("web-search-result.v1"),
             "query": query,
             "results": results,
             "result_count": len(results),
@@ -263,7 +264,7 @@ class WebGatewayBackend:
             content = encoded.decode("utf-8", errors="ignore")
         content_bytes = len(encoded)
         response = {
-            "protocol": "native-agent-runner.web-fetch-result.v1",
+            "protocol": namespaced_id("web-fetch-result.v1"),
             "url": url,
             "final_url": str(fetched.get("final_url") or url),
             "domain": domain_from_url(str(fetched.get("final_url") or url)),
@@ -315,7 +316,7 @@ class WebGatewayBackend:
         sources = filtered.get("sources") if isinstance(filtered.get("sources"), list) else []
         chunks = filtered.get("chunks") if isinstance(filtered.get("chunks"), list) else []
         response = {
-            "protocol": "native-agent-runner.web-context-result.v1",
+            "protocol": namespaced_id("web-context-result.v1"),
             "query": query,
             "context": context,
             "sources": sources,

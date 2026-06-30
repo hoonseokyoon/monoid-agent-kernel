@@ -5,10 +5,11 @@ from typing import Any
 
 from monoid_agent_kernel.core._util import utc_timestamp
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.tools.base import ToolSpec
 
-MANIFEST_SCHEMA_VERSION = "native-agent-runner.manifest.v1"
+MANIFEST_SCHEMA_VERSION = namespaced_id("manifest.v1")
 
 
 @dataclass(frozen=True)

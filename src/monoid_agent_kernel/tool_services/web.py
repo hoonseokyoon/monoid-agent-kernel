@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from monoid_agent_kernel.errors import ToolExecutionError, error_code_for_exception
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.public_view import public_error_message
 from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.tool_services.base import CallContext
@@ -161,7 +162,7 @@ class WebService:
             "binding_id": call.binding_id,
         }
         payload = {
-            "protocol": "native-agent-runner.web-search.v1",
+            "protocol": namespaced_id("web-search.v1"),
             "binding_id": call.binding_id,
             "max_calls": max_calls,
             "query": query,
@@ -225,7 +226,7 @@ class WebService:
             "binding_id": call.binding_id,
         }
         payload = {
-            "protocol": "native-agent-runner.web-fetch.v1",
+            "protocol": namespaced_id("web-fetch.v1"),
             "binding_id": call.binding_id,
             "max_calls": max_calls,
             "url": url,
@@ -305,7 +306,7 @@ class WebService:
             "binding_id": call.binding_id,
         }
         payload = {
-            "protocol": "native-agent-runner.web-context.v1",
+            "protocol": namespaced_id("web-context.v1"),
             "binding_id": call.binding_id,
             "max_calls": max_calls,
             "query": query,

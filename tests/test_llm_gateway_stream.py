@@ -56,7 +56,7 @@ def _llm_token(manager: TokenManager, *, run_id: str = "run_1", tenant_id: str =
 
 def _turn_payload() -> dict[str, Any]:
     return {
-        "protocol": "native-agent-runner.llm-turn.v1",
+        "protocol": "monoid.llm-turn.v1",
         "model": "gpt-5.5",
         "system_prompt": "sys",
         "reasoning": {"effort": "low"},

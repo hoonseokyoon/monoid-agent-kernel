@@ -54,7 +54,7 @@ def test_gateway_payload_is_provider_keyless_and_uses_opaque_turn_handle(tmp_pat
     payload = adapter._payload(request)
     headers = adapter._headers()
 
-    assert payload["protocol"] == "native-agent-runner.llm-turn.v1"
+    assert payload["protocol"] == "monoid.llm-turn.v1"
     assert payload["model"] == "gpt-5.5"
     assert payload["reasoning"] == {"effort": "low", "summary": "auto"}
     assert payload["tools"][0]["name"] == "fs_read"

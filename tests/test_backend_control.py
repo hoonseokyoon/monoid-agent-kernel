@@ -182,7 +182,7 @@ def test_http_control_route_dispatches_inspect(tmp_path: Path) -> None:
         )
         assert result["status"] == "ok"
         assert result["state"] == "awaiting_input"
-        assert result["protocol"] == "native-agent-runner.control-command.v1"
+        assert result["protocol"] == "monoid.control-command.v1"
 
         backend.cancel_run(run_id, run_token)
         backend.wait_for_run(run_id, timeout_s=20)

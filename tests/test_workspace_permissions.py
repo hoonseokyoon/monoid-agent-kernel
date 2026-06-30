@@ -72,7 +72,7 @@ def test_workspace_base_snapshot_includes_secret_looking_paths_by_default(tmp_pa
     workspace = LocalWorkspaceBackend(tmp_path, mode="propose")
     payload = workspace.workspace_base_payload("run_1")
 
-    assert payload["schema_version"] == "native-agent-runner.workspace-base.v1"
+    assert payload["schema_version"] == "monoid.workspace-base.v1"
     assert payload["workspace_backend"] == "overlay"
     assert any(entry["path"] == "notes.md" and entry["sha256"] for entry in payload["entries"])
     assert any(entry["path"] == ".env" and entry["sha256"] for entry in payload["entries"])

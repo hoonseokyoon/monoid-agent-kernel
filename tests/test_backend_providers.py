@@ -336,7 +336,7 @@ def test_resume_run_rejects_terminal_and_unknown(tmp_path: Path) -> None:
 
     # An unknown run id (no run.json) is rejected even with a syntactically valid token.
     bogus = token_manager.issue(
-        kind="run_access", audience="native-agent-runner.backend",
+        kind="run_access", audience="monoid.backend",
         run_id="run_missing", tenant_id="tenant_a", user_id="user_a", ttl_s=300,
     )
     with pytest.raises(KeyError):

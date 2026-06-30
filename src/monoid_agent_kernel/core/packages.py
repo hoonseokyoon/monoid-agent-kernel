@@ -13,11 +13,14 @@ from typing import Any, Iterator, Literal
 
 from monoid_agent_kernel.core._util import canonical_sha256, utc_timestamp, write_json_atomic
 from monoid_agent_kernel.errors import PermissionDenied, WorkspaceError
+from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 from monoid_agent_kernel.workspace.paths import is_within, normalize_workspace_path
 
-PACKAGE_SCHEMA_VERSION = "native-agent-runner.proposal-package.v1"
-APPROVAL_SCHEMA_VERSION = "native-agent-runner.approval.v1"
-APPLY_RESULT_SCHEMA_VERSION = "native-agent-runner.apply-result.v1"
+PACKAGE_SCHEMA_VERSION = namespaced_id("proposal-package.v1")
+APPROVAL_SCHEMA_VERSION = namespaced_id("approval.v1")
+APPLY_RESULT_SCHEMA_VERSION = namespaced_id("apply-result.v1")
+ACCEPTED_PACKAGE_SCHEMA_VERSIONS = accepted_namespaced_ids("proposal-package.v1")
+ACCEPTED_APPROVAL_SCHEMA_VERSIONS = accepted_namespaced_ids("approval.v1")
 
 PackageSourceKind = Literal["run_dir", "tar"]
 ApprovalDecision = Literal["approved", "rejected"]
@@ -363,7 +366,7 @@ def _verify_materialized_source(package_source: _PackageSource) -> PackageVerifi
 
 
 def _verify_package_payload(root: Path, package: dict[str, Any], issues: list[str]) -> None:
-    if package.get("schema_version") != PACKAGE_SCHEMA_VERSION:
+    if package.get("schema_version") not in ACCEPTED_PACKAGE_SCHEMA_VERSIONS:
         issues.append("unsupported package schema")
     expected_hash = canonical_sha256(package, drop=("package_hash",))
     if package.get("package_hash") != expected_hash:
@@ -513,7 +516,7 @@ def _write_snapshot(root: Path, file_info: dict[str, Any], target_path: Path) ->
 
 
 def _verify_approval_for_package(approval: dict[str, Any], package: dict[str, Any]) -> None:
-    if approval.get("schema_version") != APPROVAL_SCHEMA_VERSION:
+    if approval.get("schema_version") not in ACCEPTED_APPROVAL_SCHEMA_VERSIONS:
         raise WorkspaceError("unsupported approval schema")
     expected_hash = canonical_sha256(approval, drop=("approval_hash",))
     if approval.get("approval_hash") != expected_hash:

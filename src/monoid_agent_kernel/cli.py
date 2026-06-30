@@ -1082,7 +1082,7 @@ def _build_web_provider(
         fetch_provider = HttpFetchProvider(
             timeout_s=fetch_timeout_s,
             max_raw_bytes=fetch_max_raw_bytes,
-                user_agent=fetch_user_agent or "native-agent-runner-webgateway/0.11",
+                user_agent=fetch_user_agent or "monoid-agent-kernel-webgateway/0.13",
         )
         selected_context_provider = None
         if context_provider == "search-fetch":

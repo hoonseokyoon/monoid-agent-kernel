@@ -22,7 +22,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
-OUTBOX_REQUEST_VERSION = "native-agent-runner.outbox-request.v1"
+from monoid_agent_kernel.identifiers import namespaced_id
+
+OUTBOX_REQUEST_VERSION = namespaced_id("outbox-request.v1")
 
 OutboxStatus = Literal["pending", "dispatched", "failed"]
 

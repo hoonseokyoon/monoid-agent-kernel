@@ -32,7 +32,7 @@ from monoid_agent_kernel.reference.outbox import (
 def test_outbox_request_round_trips() -> None:
     req = OutboxRequest(destination="email", payload={"to": "x@a.edu"}, capability="outbox.send", token_ref="auto:outbox.send")
     payload = req.to_json()
-    assert payload["protocol"] == "native-agent-runner.outbox-request.v1"
+    assert payload["protocol"] == "monoid.outbox-request.v1"
     assert payload["idempotency_key"] == req.id  # defaults to the request id
     back = OutboxRequest.from_json(payload)
     assert back.destination == "email"

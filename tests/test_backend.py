@@ -9,6 +9,7 @@ from support.backend_harness import (
     PermissionPolicy,
     RunnerBackend,
     TokenError,
+    TokenManager,
     ToolScope,
     _BlockingAdapter,
     _backend,
@@ -246,6 +247,26 @@ def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
     manager = _token_manager()
     token = manager.issue(
         kind="run_access",
+        audience="monoid.backend",
+        run_id="run_1",
+        tenant_id="tenant_a",
+        user_id="user_a",
+        ttl_s=60,
+    )
+
+    claims = manager.verify(token, kind="run_access", audience="monoid.backend", run_id="run_1")
+    assert claims.tenant_id == "tenant_a"
+    with pytest.raises(TokenError):
+        manager.verify(token, kind="llm_gateway", audience="csp.llm-gateway")
+    with pytest.raises(TokenError):
+        manager.verify(token, kind="run_access", audience="monoid.backend", run_id="other")
+
+
+def test_token_manager_accepts_legacy_issuer_and_audience_for_migration() -> None:
+    legacy_manager = TokenManager.from_secret("x" * 32)
+    legacy_manager = TokenManager(secret=legacy_manager.secret, issuer="native-agent-runner")
+    token = legacy_manager.issue(
+        kind="run_access",
         audience="native-agent-runner.backend",
         run_id="run_1",
         tenant_id="tenant_a",
@@ -253,12 +274,17 @@ def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
         ttl_s=60,
     )
 
-    claims = manager.verify(token, kind="run_access", audience="native-agent-runner.backend", run_id="run_1")
-    assert claims.tenant_id == "tenant_a"
+    current_manager = TokenManager(secret=legacy_manager.secret)
+    claims = current_manager.verify(
+        token,
+        kind="run_access",
+        audience=("monoid.backend", "native-agent-runner.backend"),
+        run_id="run_1",
+    )
+
+    assert claims.audience == "native-agent-runner.backend"
     with pytest.raises(TokenError):
-        manager.verify(token, kind="llm_gateway", audience="csp.llm-gateway")
-    with pytest.raises(TokenError):
-        manager.verify(token, kind="run_access", audience="native-agent-runner.backend", run_id="other")
+        current_manager.verify(token, kind="run_access", audience="monoid.backend", run_id="run_1")
 
 
 def test_backend_requires_runtime_config() -> None:

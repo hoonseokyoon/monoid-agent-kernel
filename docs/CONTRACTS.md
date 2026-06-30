@@ -46,6 +46,16 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   up to `RunLimits.max_output_retries`).
 - **Not a contract**: `monoid_agent_kernel.reference.*` (example services).
 
+## Identifier Namespace
+
+Current wire and artifact identifiers use the `monoid.*` namespace. The runtime emits new
+schema versions, protocol ids, token issuers, and service audiences with `monoid.*` values,
+including `monoid.backend` and `monoid.task-callback`.
+
+Readers, validators, and gateway parsers accept the pre-rename `native-agent-runner.*`
+identifiers during migration so existing durable run artifacts and gateway clients continue
+to load.
+
 ## Python Contracts
 
 ### AgentLoop
@@ -440,7 +450,7 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
 
 ### Control Protocol
 
-`native-agent-runner.control-command.v1` is a transport-independent envelope + a single
+`monoid.control-command.v1` is a transport-independent envelope + a single
 `dispatch` seam, so a Daemon drives a session through one entry point instead of a route per op:
 
 - `ControlCommand(type, run_id, args, issuer, reason, command_id)` and `ControlResult(run_id,
@@ -458,7 +468,7 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
 ### Inbox Message Envelope
 
-`native-agent-runner.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a
+`monoid.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a
 run so it carries **provenance** and an idempotency key. Like the control protocol it is an
 edge/transport contract — the reference `RunnerBackend` wraps inbound content into it; the engine
 (`AgentLoop`) never sees the envelope (it still receives unwrapped `content` via `submit`).
@@ -488,7 +498,7 @@ edge/transport contract — the reference `RunnerBackend` wraps inbound content 
 
 ### Outbox Request
 
-`native-agent-runner.outbox-request.v1` (`core/outbox.py`, `OutboxRequest`): a tool **stages** an
+`monoid.outbox-request.v1` (`core/outbox.py`, `OutboxRequest`): a tool **stages** an
 external side-effect (send an email, call a webhook) durably in the per-run `Outbox` instead of doing
 the IO inline. The request is checkpointed, so it survives a restart; the engine never performs the
 send.
@@ -647,7 +657,7 @@ bindings.
 
 ```json
 {
-  "protocol": "native-agent-runner.llm-turn.v1",
+  "protocol": "monoid.llm-turn.v1",
   "model": "gpt-5.5",
   "system_prompt": "...",
   "tools": [
@@ -689,7 +699,7 @@ Successful response:
 
 ```json
 {
-  "protocol": "native-agent-runner.llm-turn-result.v1",
+  "protocol": "monoid.llm-turn-result.v1",
   "turn_handle": "turn_...",
   "final_text": null,
   "tool_calls": [
@@ -720,7 +730,7 @@ Every request includes binding constraints:
 
 ```json
 {
-  "protocol": "native-agent-runner.web-search.v1",
+  "protocol": "monoid.web-search.v1",
   "binding_id": "search_docs",
   "query": "native runtime config",
   "max_results": 5,
@@ -888,7 +898,7 @@ the active watchdog lives only in the reference backend (the operational layer).
 
 - **Failure bundle on every failure.** Beyond the core's own `failure.json`, the reference
   backend's `_record_run_failure` also writes `run_dir/failure.json`
-  (`native-agent-runner.failure.v1`: `error, error_code, type, last_good_seq, restore_hint,
+  (`monoid.failure.v1`: `error, error_code, type, last_good_seq, restore_hint,
   failed_at`) — the durable mark is written *before* the in-memory terminal status, so a
   worker crash that bypassed the loop's own bundle still leaves a mark and a restart never
   resumes a crashed run into a loop.

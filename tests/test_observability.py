@@ -67,7 +67,7 @@ def test_event_bus_schema_sequence_and_memory_sink() -> None:
     assert first.timestamp.endswith("Z")
     assert memory.events == [first, second]
     payload = first.to_json()
-    assert payload["schema_version"] == "native-agent-runner.event.v1"
+    assert payload["schema_version"] == "monoid.event.v1"
     assert payload["type"] == "run.started"
     assert "kind" not in payload
 
@@ -149,7 +149,7 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     assert proposal["proposal_hash"]
     assert status["manifest_path"] == "manifest.json"
     workspace_index = json.loads(result.run_dir.joinpath("workspace.index.json").read_text(encoding="utf-8"))
-    assert workspace_index["schema_version"] == "native-agent-runner.workspace-index.v1"
+    assert workspace_index["schema_version"] == "monoid.workspace-index.v1"
     assert any(entry["path"] == "notes.md" for entry in workspace_index["entries"])
     projection = project_run_status(result.run_dir)
     assert projection["status"] == "completed"

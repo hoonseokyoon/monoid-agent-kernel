@@ -1,4 +1,4 @@
-"""Transport-independent control protocol (``native-agent-runner.control-command.v1``).
+"""Transport-independent control protocol (``monoid.control-command.v1``).
 
 An external control plane (an Agent Daemon) drives a running session through ONE envelope
 + ONE seam (``ControlDispatcher.dispatch``) instead of importing engine internals or wiring
@@ -21,7 +21,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
-CONTROL_PROTOCOL_VERSION = "native-agent-runner.control-command.v1"
+from monoid_agent_kernel.identifiers import namespaced_id
+
+CONTROL_PROTOCOL_VERSION = namespaced_id("control-command.v1")
 
 #: The command vocabulary. Lifecycle ops (pause/resume/cancel/interrupt/inspect/health) plus the
 #: pre-existing session ops (message/config/task/status) unified under one envelope.

@@ -101,6 +101,7 @@ from monoid_agent_kernel.errors import (
     TurnPaused,
     error_code_for_exception,
 )
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.core.capability import (
     CapabilityBroker,
     CapabilityDenial,
@@ -1507,7 +1508,7 @@ class AgentLoop:
         last_good_seq = self._session.checkpoint_seq if self._session is not None else 0
         res.recorder.write_failure(
             {
-                "schema_version": "native-agent-runner.failure.v1",
+                "schema_version": namespaced_id("failure.v1"),
                 "run_id": self.spec.run_id,
                 "error": public_error_message(state.error),
                 "error_code": state.error_code,

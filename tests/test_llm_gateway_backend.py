@@ -44,7 +44,7 @@ def _llm_token(manager: TokenManager, *, run_id: str = "run_1", tenant_id: str =
 
 def _payload(*, previous_turn_handle: str | None = None) -> dict:
     payload = {
-        "protocol": "native-agent-runner.llm-turn.v1",
+        "protocol": "monoid.llm-turn.v1",
         "model": "gpt-5.5",
         "system_prompt": "sys",
         "reasoning": {"effort": "low"},
@@ -107,6 +107,23 @@ def test_llm_gateway_validates_token_and_returns_opaque_turn_handle() -> None:
     other_model = _payload()
     other_model["model"] = "other-model"
     assert gateway.handle_turn(token, other_model)["turn_handle"].startswith("turn_")
+
+
+def test_llm_gateway_accepts_legacy_turn_protocol_during_migration() -> None:
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
+            turns=[ModelTurn(response_id="provider_1", final_text="done")]
+        ),
+    )
+    payload = _payload()
+    payload["protocol"] = "native-agent-runner.llm-turn.v1"
+
+    result = gateway.handle_turn(_llm_token(manager), payload)
+
+    assert result["protocol"] == "monoid.llm-turn-result.v1"
+    assert result["final_text"] == "done"
 
 
 def test_llm_gateway_rejects_cross_run_turn_handle() -> None:

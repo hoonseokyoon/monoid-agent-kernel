@@ -77,6 +77,14 @@ from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelAdapter
 from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+from monoid_agent_kernel.identifiers import (
+    BACKEND_AUDIENCE,
+    BACKEND_AUDIENCES,
+    TASK_CALLBACK_AUDIENCE,
+    TASK_CALLBACK_AUDIENCES,
+    accepted_namespaced_ids,
+    namespaced_id,
+)
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
 from monoid_agent_kernel.recorder import append_event_to_run
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
@@ -128,7 +136,8 @@ def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]
     return message  # str
 
 # Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
-_RUN_META_SCHEMA_VERSION = "native-agent-runner.backend-run.v1"
+_RUN_META_SCHEMA_VERSION = namespaced_id("backend-run.v1")
+_ACCEPTED_RUN_META_SCHEMA_VERSIONS = accepted_namespaced_ids("backend-run.v1")
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.backend")
 
@@ -139,7 +148,7 @@ def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
         payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return None
-    if not isinstance(payload, dict) or payload.get("schema_version") != _RUN_META_SCHEMA_VERSION:
+    if not isinstance(payload, dict) or payload.get("schema_version") not in _ACCEPTED_RUN_META_SCHEMA_VERSIONS:
         return None
     return payload
 
@@ -690,7 +699,7 @@ class RunnerBackend:
         run_dir = self.run_root / run_id
         run_token = self.token_manager.issue(
             kind="run_access",
-            audience="native-agent-runner.backend",
+            audience=BACKEND_AUDIENCE,
             run_id=run_id,
             tenant_id=request.tenant_id,
             user_id=request.user_id,
@@ -1301,7 +1310,7 @@ class RunnerBackend:
         task_id = loop.create_task(kind, request)
         callback_token = self.token_manager.issue(
             kind="task_callback",
-            audience="native-agent-runner.task-callback",
+            audience=TASK_CALLBACK_AUDIENCE,
             run_id=run_id,
             tenant_id=record.tenant_id,
             user_id=record.user_id,
@@ -1323,7 +1332,7 @@ class RunnerBackend:
         run+task) or the run token (operator). Try the scoped token first."""
         try:
             claims = self.token_manager.verify(
-                token, kind="task_callback", audience="native-agent-runner.task-callback", run_id=run_id
+                token, kind="task_callback", audience=TASK_CALLBACK_AUDIENCES, run_id=run_id
             )
             if str(claims.metadata.get("task_id") or "") != task_id:
                 raise PermissionDenied("callback token does not match this task")
@@ -2128,7 +2137,7 @@ class RunnerBackend:
             except Exception:  # pragma: no cover - last-good lookup must never mask the failure
                 last_good_seq = 0
         bundle = {
-            "schema_version": "native-agent-runner.failure.v1",
+            "schema_version": namespaced_id("failure.v1"),
             "run_id": run_id,
             "error": error,
             "error_code": error_code,
@@ -2581,7 +2590,7 @@ class RunnerBackend:
         its claims. Does NOT require an in-memory record — the signed token is the capability."""
         try:
             return self.token_manager.verify(
-                token, kind="run_access", audience="native-agent-runner.backend", run_id=run_id
+                token, kind="run_access", audience=BACKEND_AUDIENCES, run_id=run_id
             )
         except TokenError as exc:
             raise PermissionDenied(str(exc)) from exc
@@ -2659,7 +2668,7 @@ class RunnerBackend:
                     "recoverable": recoverable,
                     "read_token": self.token_manager.issue(
                         kind="run_access",
-                        audience="native-agent-runner.backend",
+                        audience=BACKEND_AUDIENCE,
                         run_id=run_id,
                         tenant_id=tenant_id,
                         user_id=run_user,

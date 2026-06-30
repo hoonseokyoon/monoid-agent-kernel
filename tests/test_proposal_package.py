@@ -17,6 +17,7 @@ from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.cli import main
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.packages import (
     apply_package,
     create_approval,
@@ -27,6 +28,7 @@ from monoid_agent_kernel.core.packages import (
 )
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.identifiers import LEGACY_NAMESPACE
 from monoid_agent_kernel.errors import PermissionDenied, WorkspaceError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
@@ -93,6 +95,62 @@ def test_package_export_verify_stable_and_tamper_detection(tmp_path: Path) -> No
     tampered = verify_package(run_dir)
     assert tampered.ok is False
     assert any("hash mismatch" in issue for issue in tampered.issues)
+
+
+def test_validate_run_dir_accepts_legacy_schema_namespace(tmp_path: Path) -> None:
+    _workspace, run_dir = _run_with_created_and_modified_files(tmp_path)
+
+    for path in (
+        run_dir / "manifest.json",
+        run_dir / "workspace.index.json",
+        run_dir / "workspace.base.json",
+        run_dir / "proposal.json",
+    ):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema_version"] = payload["schema_version"].replace("monoid.", f"{LEGACY_NAMESPACE}.")
+        if path.name == "proposal.json":
+            payload["proposal_hash"] = canonical_sha256(payload, drop=("proposal_hash", "updated_at"))
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    events = []
+    for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines():
+        payload = json.loads(line)
+        payload["schema_version"] = payload["schema_version"].replace("monoid.", f"{LEGACY_NAMESPACE}.")
+        events.append(json.dumps(payload))
+    (run_dir / "events.jsonl").write_text("\n".join(events) + "\n", encoding="utf-8")
+
+    assert validate_run_dir(run_dir) == []
+
+
+def test_verify_package_accepts_legacy_package_schema_namespace(tmp_path: Path) -> None:
+    _workspace, run_dir = _run_with_created_and_modified_files(tmp_path)
+    export_package(run_dir, tmp_path / "proposal.tar")
+
+    package_path = run_dir / "proposal.package.json"
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    package["schema_version"] = package["schema_version"].replace("monoid.", f"{LEGACY_NAMESPACE}.")
+    package["package_hash"] = canonical_sha256(package, drop=("package_hash",))
+    package_path.write_text(json.dumps(package), encoding="utf-8")
+
+    assert verify_package(run_dir).ok is True
+
+
+def test_apply_package_accepts_legacy_approval_schema_namespace(tmp_path: Path) -> None:
+    workspace, run_dir = _run_with_created_and_modified_files(tmp_path)
+    export_package(run_dir, tmp_path / "proposal.tar")
+    approval = create_approval(
+        run_dir,
+        approver_id="user_a",
+        approved_at="2026-06-14T00:00:00Z",
+    )
+    approval["schema_version"] = approval["schema_version"].replace("monoid.", f"{LEGACY_NAMESPACE}.")
+    approval["approval_hash"] = canonical_sha256(approval, drop=("approval_hash",))
+
+    target = tmp_path / "target"
+    shutil.copytree(workspace, target)
+    result = apply_package(run_dir, approval=approval, target=target)
+
+    assert result.status == "applied"
 
 
 def test_package_import_roundtrip_and_path_traversal_rejection(tmp_path: Path) -> None:
