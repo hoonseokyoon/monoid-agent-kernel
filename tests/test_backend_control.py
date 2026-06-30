@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,11 @@ def _dispatch(backend: RunnerBackend, run_id: str, token: str, ctype: str, **arg
     return backend.dispatch(ControlCommand(type=ctype, run_id=run_id, args={"token": token, **args}))  # type: ignore[arg-type]
 
 
+def _events(backend: RunnerBackend, run_id: str) -> list[dict[str, Any]]:
+    events_path = backend._record(run_id).run_dir / "events.jsonl"
+    return [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+
+
 def test_dispatch_inspect_and_health_report_live_state(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
@@ -92,6 +98,75 @@ def test_dispatch_inspect_and_health_report_live_state(tmp_path: Path) -> None:
     assert health.state == "awaiting_input"
     assert health.data["alive"] is True
     assert health.data["can_accept_input"] is True
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_dispatch_emits_control_audit_events_without_token_leak(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    status = backend.dispatch(
+        ControlCommand(
+            type="status",
+            run_id=run_id,
+            args={"token": token},
+            issuer="operator_a",
+            reason="check run",
+            command_id="cmd_status",
+        )
+    )
+    assert status.status == "ok"
+
+    bad_replace = backend.dispatch(
+        ControlCommand(
+            type="replace_runtime_config",
+            run_id=run_id,
+            args={"token": token, "expected_version": 99, "config": _config().to_json()},
+            issuer="operator_a",
+            reason="bad version",
+            command_id="cmd_bad_replace",
+        )
+    )
+    assert bad_replace.status == "error"
+
+    with pytest.raises(PermissionDenied):
+        backend.dispatch(
+            ControlCommand(
+                type="inspect",
+                run_id=run_id,
+                args={"token": "bad-token"},
+                issuer="operator_b",
+                reason="bad auth",
+                command_id="cmd_bad_auth",
+            )
+        )
+
+    events = [event for event in _events(backend, run_id) if event["type"].startswith("control.command.")]
+    by_id = {(event["type"], event["data"]["command_id"]): event["data"] for event in events}
+
+    received = by_id[("control.command.received", "cmd_status")]
+    assert received["command"] == "status"
+    assert received["actor"] == "operator_a"
+    assert received["reason"] == "check run"
+    assert received["token_sha256"] == TokenManager.token_sha256(token)
+    assert received["args_keys"] == []
+    assert by_id[("control.command.completed", "cmd_status")]["status"] == "ok"
+
+    failed = by_id[("control.command.failed", "cmd_bad_replace")]
+    assert failed["command"] == "replace_runtime_config"
+    assert failed["status"] == "error"
+    assert failed["error_code"] == "control_error"
+
+    auth_failed = by_id[("control.command.failed", "cmd_bad_auth")]
+    assert auth_failed["command"] == "inspect"
+    assert auth_failed["error_code"] == "permission_denied"
+
+    serialized_events = "\n".join(json.dumps(event, sort_keys=True) for event in events)
+    assert token not in serialized_events
+    assert "bad-token" not in serialized_events
 
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)

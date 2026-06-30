@@ -467,6 +467,11 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
   envelope stays credential-free). `resume` on a *live* paused run wakes it; on a run not in
   memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
+- Audit: `RunnerBackend.dispatch` appends `control.command.received` and then either
+  `control.command.completed` or `control.command.failed` to the run event log. Events include
+  `command_id`, command type, target run, `issuer` as actor, reason, result status/error, duration,
+  and a safe `token_sha256` reference on receipt — never the bearer token itself. A control
+  `send_message` uses the command id as its inbox idempotency key.
 ### Inbox Message Envelope
 
 `monoid.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a
