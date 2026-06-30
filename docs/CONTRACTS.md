@@ -472,6 +472,14 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   `command_id`, command type, target run, `issuer` as actor, reason, result status/error, duration,
   and a safe `token_sha256` reference on receipt — never the bearer token itself. A control
   `send_message` uses the command id as its inbox idempotency key.
+
+### Event Reads
+
+`GET /v1/runs/{run_id}/events?from_seq=N&limit=M` returns `{run_id, events, next_seq, has_more}`.
+`from_seq` remains inclusive for backward compatibility. When `limit` is present, callers resume
+with `from_seq=next_seq` to avoid duplicates; omitting `limit` preserves the historical "return all
+events from N" behavior. `RunnerBackend.descendant_events(...)` uses the same pagination contract
+for subagent event streams authorized through an ancestor run token.
 ### Inbox Message Envelope
 
 `monoid.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a

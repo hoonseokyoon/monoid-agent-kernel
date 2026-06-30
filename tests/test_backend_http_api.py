@@ -101,6 +101,15 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
         assert result["final_text"] == "done"
         events = _json_get(f"{base_url}/v1/runs/{run_id}/events?from_seq=1", token=run_token)
         assert events["events"][0]["seq"] == 1
+        page1 = _json_get(f"{base_url}/v1/runs/{run_id}/events?from_seq=1&limit=2", token=run_token)
+        assert [event["seq"] for event in page1["events"]] == [1, 2]
+        assert page1["next_seq"] == 3
+        assert page1["has_more"] is True
+        page2 = _json_get(
+            f"{base_url}/v1/runs/{run_id}/events?from_seq={page1['next_seq']}&limit=2",
+            token=run_token,
+        )
+        assert page2["events"][0]["seq"] == 3
         usage = _json_get(f"{base_url}/v1/tenants/tenant_a/usage", token="admin")
         assert usage["total_tokens"] == 10
     finally:
