@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Any
 
-from conftest import runtime_config, runtime_provider, tool_binding
+from support.runtime import runtime_config, runtime_provider, tool_binding
+from support.waiting import eventually
 
-from native_agent_runner.core.capability import AutoGrantBroker
-from native_agent_runner.core.outbox import Outbox, OutboxReceipt, OutboxRequest
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.core.tool_surface import ToolScope
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.reference.outbox import (
+from monoid_agent_kernel.core.capability import AutoGrantBroker
+from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.outbox import (
     FailingOutboxSender,
     InboxRoutingOutboxSender,
     OutboxToolProvider,
@@ -32,7 +32,7 @@ from native_agent_runner.reference.outbox import (
 def test_outbox_request_round_trips() -> None:
     req = OutboxRequest(destination="email", payload={"to": "x@a.edu"}, capability="outbox.send", token_ref="auto:outbox.send")
     payload = req.to_json()
-    assert payload["protocol"] == "native-agent-runner.outbox-request.v1"
+    assert payload["protocol"] == "monoid.outbox-request.v1"
     assert payload["idempotency_key"] == req.id  # defaults to the request id
     back = OutboxRequest.from_json(payload)
     assert back.destination == "email"
@@ -56,14 +56,6 @@ def test_outbox_holder_pending_mark_export_import() -> None:
 
 
 # --- backend e2e: capability-gated staging + edge drain -----------------------------------
-
-
-def _wait(predicate: Any, tries: int = 1000) -> bool:
-    for _ in range(tries):
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return False
 
 
 def _outbox_backend(
@@ -135,7 +127,7 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(tmp_path: Path)
 
     # The request carried a W3C trace from staging; the dispatched event surfaces it, and the edge
     # sender attached a *child* span (same trace-id, new span-id) for the actual outbound call.
-    from native_agent_runner.core.trace_context import parse_traceparent
+    from monoid_agent_kernel.core.trace_context import parse_traceparent
 
     tp = sender.sent[0].traceparent
     assert parse_traceparent(tp) is not None
@@ -146,7 +138,7 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(tmp_path: Path)
 
 
 def test_outbox_not_staged_when_capability_denied(tmp_path: Path) -> None:
-    from native_agent_runner.reference.capability import DenyAllBroker
+    from monoid_agent_kernel.reference.capability import DenyAllBroker
 
     sender = RecordingOutboxSender()
     backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=DenyAllBroker())
@@ -282,12 +274,12 @@ def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None
     backend.outbox_retry_base_s = 0.0  # next_attempt_at == now -> immediately due on redrive
     backend.watchdog_interval_s = 0.05
     run_id, token = _run(backend, workspace, multi_turn=True)
-    assert _wait(lambda: backend._record(run_id).status == "awaiting_input")
-    assert _wait(lambda: sender.calls >= 1)  # the park-time drain attempted (and failed) once
+    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: sender.calls >= 1)  # the park-time drain attempted (and failed) once
 
     backend.start_watchdog()
     # Redrive resends the now-due request while the run sits idle (no turn drove this).
-    assert _wait(lambda: sender.calls >= 2)
+    assert eventually(lambda: sender.calls >= 2)
     backend.stop_watchdog()
 
     backend.cancel_run(run_id, token)
@@ -298,7 +290,7 @@ def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None
 
 
 def test_outbox_ack_delivered_to_run_inbox_and_consumed(tmp_path: Path) -> None:
-    from native_agent_runner.core.inbox import is_inbox_envelope
+    from monoid_agent_kernel.core.inbox import is_inbox_envelope
 
     sender = RecordingOutboxSender()
     backend, workspace = _outbox_backend(tmp_path, [_SEND_ACK, _DONE, _DONE], sender=sender, broker=AutoGrantBroker())
@@ -325,9 +317,9 @@ def test_outbox_ack_delivered_to_run_inbox_and_consumed(tmp_path: Path) -> None:
     backend._stage_outbox_ack = stage_spy  # type: ignore[method-assign]
 
     run_id, token = _run(backend, workspace, multi_turn=True)
-    request_id = sender.sent[0].id if _wait(lambda: sender.sent) else ""
+    request_id = sender.sent[0].id if eventually(lambda: sender.sent) else ""
     # The ack is delivered and *consumed* (the run takes a turn on it) — its id lands in the seen-set.
-    assert _wait(lambda: f"ack_{request_id}" in backend._record(run_id).seen_inbox_ids)
+    assert eventually(lambda: f"ack_{request_id}" in backend._record(run_id).seen_inbox_ids)
 
     assert captured, "no outbox_ack envelope was staged"
     ack = captured[0]
@@ -425,7 +417,7 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
     try:
         worker_id = spawn("stand by for planner")
         directory["worker"] = worker_id
-        assert _wait(lambda: backend.status(worker_id, tokens[worker_id]).get("status") == "awaiting_input")
+        assert eventually(lambda: backend.status(worker_id, tokens[worker_id]).get("status") == "awaiting_input")
         planner_id = spawn("collaborate with worker")
         directory["planner"] = planner_id
 
@@ -438,12 +430,12 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
                 e["type"] == "outbox.dispatched" and e["data"].get("destination") == dest for e in events
             )
 
-        assert _wait(lambda: dispatched_to(planner_id, "worker"))   # A -> B
-        assert _wait(lambda: dispatched_to(worker_id, "planner"))   # B -> A (so B received A's message)
+        assert eventually(lambda: dispatched_to(planner_id, "worker"))   # A -> B
+        assert eventually(lambda: dispatched_to(worker_id, "planner"))   # B -> A (so B received A's message)
 
         # The inbox is idempotent: once a message id has been processed, re-delivering it is a no-op.
         assert backend.send_message(worker_id, tokens[worker_id], "dup", message_id="m-dup")["status"] == "queued"
-        assert _wait(lambda: "m-dup" in backend._record(worker_id).seen_inbox_ids)
+        assert eventually(lambda: "m-dup" in backend._record(worker_id).seen_inbox_ids)
         again = backend.send_message(worker_id, tokens[worker_id], "dup", message_id="m-dup")
         assert again["status"] == "duplicate"
     finally:

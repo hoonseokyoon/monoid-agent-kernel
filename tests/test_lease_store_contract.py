@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.reference.stores.lease import LeaseStore, LocalFsLeaseStore
-from native_agent_runner.reference.stores.sqlite import SqliteLeaseStore
+from monoid_agent_kernel.reference.stores.lease import LeaseStore, LocalFsLeaseStore
+from monoid_agent_kernel.reference.stores.sqlite import SqliteLeaseStore
 
 LeaseFactory = Callable[[Path], LeaseStore]
 

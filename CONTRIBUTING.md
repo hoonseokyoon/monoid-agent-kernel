@@ -1,8 +1,8 @@
 # Contributing
 
-Thanks for your interest in improving Native Agent Runner. This is a pre-1.0
-(`0.x`) research package, so the public surface may still change — but
-contributions, issues, and design feedback are very welcome.
+Thanks for your interest in improving Monoid Agent Kernel. This is a pre-1.0
+(`0.x`) agent kernel, so the public surface may still change. Contributions,
+issues, and design feedback are welcome.
 
 ## Ground rules
 
@@ -10,8 +10,8 @@ contributions, issues, and design feedback are very welcome.
 - By contributing, you agree your contributions are licensed under the project's
   license (see `LICENSE`).
 - Keep the layering intact: **core never imports `reference`**. New example
-  services belong under `native_agent_runner.reference.*`; the supported surface is
-  `native_agent_runner.contracts`.
+  services belong under `monoid_agent_kernel.reference.*`; the supported surface is
+  `monoid_agent_kernel.contracts`.
 
 ## Development setup
 
@@ -27,12 +27,18 @@ pip install ruff                                     # linter (configured in pyp
 
 ```bash
 ruff check src tests       # lint (line-length 100, target py311)
-pytest -q                  # full suite
+python -m pytest -n 4 -q   # fast local suite
+python -m pytest -q        # serial compatibility suite
 ```
 
 - Add or update tests for any behavior change. Custom adapters/workspaces/stores
   should plug into the existing parametrized contract suites in `tests/`
   (e.g. `test_workspace_contract.py`, `test_checkpoint_store_contract.py`).
+- Use `python -m pytest --durations=30` when a change could affect suite runtime.
+- Mark deliberate timeout or live-provider coverage with `slow` or `live` so the
+  fast local path stays clear.
+- To profile without unrelated pytest plugins, run
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -p xdist -n 4 -q -m "not slow and not live"`.
 - Match the surrounding code style: typed, small functions, comment density and
   naming consistent with the file you are editing.
 - Keep changes focused; note any breaking change to the public surface in the PR

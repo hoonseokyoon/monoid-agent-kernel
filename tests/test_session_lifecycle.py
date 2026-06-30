@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.lifecycle import (
+from monoid_agent_kernel.core.lifecycle import (
     LEGAL_TRANSITIONS,
     REASON_TO_STATE,
     TERMINAL_STATES,
@@ -20,12 +20,12 @@ from native_agent_runner.core.lifecycle import (
     state_from_suspension,
     to_session_state,
 )
-from native_agent_runner.core.checkpoint import LocalFsCheckpointStore
-from native_agent_runner.core.result import Suspension
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.core.result import Suspension
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 # The non-terminal Suspension.reason values the loop can return (see core/result.py).
 _NON_TERMINAL_REASONS = ("settled", "awaiting_tasks", "limited", "interrupted", "turn_failed")

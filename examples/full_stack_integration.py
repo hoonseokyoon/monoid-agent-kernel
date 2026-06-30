@@ -21,13 +21,13 @@ from urllib.request import Request, urlopen
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_ROOT / "src"))
 
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.reference._shared.tokens import TokenClaims, TokenManager
-from native_agent_runner.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
-from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
-from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
-from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
-from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolCall
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenManager
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
+from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
+from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, ToolCall
 
 
 DEFAULT_INSTRUCTION = """Read notes.md and create SUMMARY.md.
@@ -249,13 +249,13 @@ def _start_real_gateway_subprocess(
     env = os.environ.copy()
     env.pop("OPENAI_API_KEY", None)
     env["OPENAI_API_KEY"] = openai_api_key
-    env["NAR_BACKEND_TOKEN_SECRET"] = token_secret
-    env["NAR_LLM_GATEWAY_ADMIN_TOKEN"] = admin_token
+    env["MONOID_BACKEND_TOKEN_SECRET"] = token_secret
+    env["MONOID_LLM_GATEWAY_ADMIN_TOKEN"] = admin_token
     env["PYTHONPATH"] = str(PACKAGE_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
     command = [
         sys.executable,
         "-m",
-        "native_agent_runner.cli",
+        "monoid_agent_kernel.cli",
         "llm-gateway",
         "serve",
         "--host",
@@ -366,9 +366,9 @@ def _preview(text: str, limit: int = 500) -> str:
 
 
 def _notes_fixture() -> str:
-    return """# Agent Runner Notes
+    return """# Monoid Integration Notes
 
-The runner must keep provider credentials outside the agent container.
+Monoid must keep provider credentials outside the agent container.
 LLM calls should go through a gateway that validates short-lived run-scoped tokens.
 Every run must be attributable to a tenant for usage tracking.
 In propose mode, the agent can stage file changes without mutating the base workspace.
@@ -384,13 +384,13 @@ TODO:
 def _summary_fixture() -> str:
     return """# Summary
 
-- Provider credentials stay inside the LLM gateway, not the agent runner.
+- Provider credentials stay inside the LLM gateway, not the agent kernel.
 - Run-scoped gateway tokens let the backend bind LLM calls to tenant and user identity.
 - Propose mode stages changes as observable snapshots without mutating the workspace.
 
 ## Security boundaries
 
-- The runner receives only a short-lived `llm_gateway` token.
+- Monoid receives only a short-lived `llm_gateway` token.
 - The provider API key remains in the gateway process.
 - Public events avoid file contents and credential-looking payloads.
 

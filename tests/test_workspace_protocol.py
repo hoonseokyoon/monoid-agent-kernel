@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from native_agent_runner.core.workspace import Workspace
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel.core.workspace import Workspace
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 
 # The members the engine relies on. Kept explicit so removing or renaming a
 # surface member trips this test rather than silently breaking integrators.

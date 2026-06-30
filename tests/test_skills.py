@@ -5,16 +5,16 @@ import logging
 from pathlib import Path
 
 import pytest
-from conftest import runtime_config, runtime_provider, tool_binding
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
-from native_agent_runner.core.context import TurnContext
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.recorder import MemoryEventSink
-from native_agent_runner.skills import SkillDefinition, SkillProvider, load_skill_definitions
-from native_agent_runner.skills.definition import SKILL_FILENAME
+from monoid_agent_kernel.core.context import TurnContext
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.recorder import MemoryEventSink
+from monoid_agent_kernel.skills import SkillDefinition, SkillProvider, load_skill_definitions
+from monoid_agent_kernel.skills.definition import SKILL_FILENAME
 
 
 # --- fixtures / helpers ------------------------------------------------------------
@@ -96,7 +96,7 @@ def test_loader_duplicate_name_first_wins(tmp_path: Path, caplog: pytest.LogCapt
     _write_skill(tmp_path / "a", "dup", description="first")
     _write_skill(tmp_path / "b", "dup", description="second")
 
-    with caplog.at_level(logging.WARNING, logger="native_agent_runner.skills.loader"):
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.skills.loader"):
         definitions = load_skill_definitions(tmp_path)
 
     # sorted path order: a/ before b/, so "first" wins.
@@ -542,7 +542,7 @@ def test_otel_skill_tool_span_enriched(tmp_path: Path) -> None:
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-    from native_agent_runner.observability.otel import OtelEventSink
+    from monoid_agent_kernel.observability.otel import OtelEventSink
 
     exporter = InMemorySpanExporter()
     tracer_provider = TracerProvider()

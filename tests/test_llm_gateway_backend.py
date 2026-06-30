@@ -8,17 +8,22 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from conftest import http_json, runtime_config, wait_http_ready
+from support.http import (
+    http_get_json as _json_get,
+    http_json,
+    wait_http_ready as _wait_http_ready,
+)
+from support.runtime import runtime_config
 
-from native_agent_runner.reference.backend.http import create_backend_server
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.errors import ModelAdapterError, PermissionDenied
-from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
-from native_agent_runner.reference.llm_gateway.providers import offline_provider_factory
-from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
-from native_agent_runner.providers.base import ModelTurn, ToolCall
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.reference.backend.http import create_backend_server
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
+from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
+from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
+from monoid_agent_kernel.providers.base import ModelTurn, ToolCall
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 def _token_manager() -> TokenManager:
@@ -39,7 +44,7 @@ def _llm_token(manager: TokenManager, *, run_id: str = "run_1", tenant_id: str =
 
 def _payload(*, previous_turn_handle: str | None = None) -> dict:
     payload = {
-        "protocol": "native-agent-runner.llm-turn.v1",
+        "protocol": "monoid.llm-turn.v1",
         "model": "gpt-5.5",
         "system_prompt": "sys",
         "reasoning": {"effort": "low"},
@@ -102,6 +107,23 @@ def test_llm_gateway_validates_token_and_returns_opaque_turn_handle() -> None:
     other_model = _payload()
     other_model["model"] = "other-model"
     assert gateway.handle_turn(token, other_model)["turn_handle"].startswith("turn_")
+
+
+def test_llm_gateway_accepts_legacy_turn_protocol_during_migration() -> None:
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
+            turns=[ModelTurn(response_id="provider_1", final_text="done")]
+        ),
+    )
+    payload = _payload()
+    payload["protocol"] = "native-agent-runner.llm-turn.v1"
+
+    result = gateway.handle_turn(_llm_token(manager), payload)
+
+    assert result["protocol"] == "monoid.llm-turn-result.v1"
+    assert result["final_text"] == "done"
 
 
 def test_llm_gateway_rejects_cross_run_turn_handle() -> None:
@@ -351,14 +373,6 @@ def test_fake_full_stack_contract_propose_proposal_usage_and_auth(tmp_path: Path
 
 def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
     return http_json(url, payload, token=token)
-
-
-def _json_get(url: str, *, token: str) -> dict:
-    return http_json(url, token=token, method="GET")
-
-
-def _wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
-    wait_http_ready(base_url, timeout_s=timeout_s)
 
 
 def test_llm_gateway_offline_provider_answers_without_a_key() -> None:

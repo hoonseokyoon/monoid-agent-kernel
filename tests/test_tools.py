@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.errors import ToolExecutionError, WorkspaceError
-from native_agent_runner.tools.base import ToolRegistry
-from native_agent_runner.tools.builtin import builtin_tools
-from native_agent_runner.workspace.local import LocalWorkspaceBackend, sha256_bytes
+from monoid_agent_kernel.errors import ToolExecutionError, WorkspaceError
+from monoid_agent_kernel.tools.base import ToolRegistry
+from monoid_agent_kernel.tools.builtin import builtin_tools
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend, sha256_bytes
 
 
 class DummyContext:

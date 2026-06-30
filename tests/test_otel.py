@@ -19,13 +19,13 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from conftest import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.spec import AgentRunSpec, RunLimits
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.observability.otel import OtelEventSink
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.observability.otel import OtelEventSink
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 def _spans_and_run(tmp_path: Path, adapter: FakeModelAdapter, *tool_ids: str):
@@ -113,7 +113,7 @@ def test_otel_sink_marks_failed_tool_span(tmp_path: Path) -> None:
 
 
 def test_otel_records_output_validation_failure_on_run_span(tmp_path: Path) -> None:
-    from native_agent_runner.core.output_validator import ValidationOutcome
+    from monoid_agent_kernel.core.output_validator import ValidationOutcome
 
     class _RequireDone:
         id = "otel.requires_done"
@@ -150,7 +150,7 @@ def test_otel_records_output_validation_failure_on_run_span(tmp_path: Path) -> N
 
 
 def test_otel_records_output_validator_exhausted_on_run_span(tmp_path: Path) -> None:
-    from native_agent_runner.core.output_validator import ValidationOutcome
+    from monoid_agent_kernel.core.output_validator import ValidationOutcome
 
     class _AlwaysFail:
         id = "otel.always_fail"

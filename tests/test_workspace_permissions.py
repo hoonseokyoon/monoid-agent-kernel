@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from native_agent_runner.errors import PermissionDenied, WorkspaceError
-from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel.errors import PermissionDenied, WorkspaceError
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 
 
 def test_normalizes_and_blocks_parent_escape(tmp_path: Path) -> None:
@@ -72,7 +72,7 @@ def test_workspace_base_snapshot_includes_secret_looking_paths_by_default(tmp_pa
     workspace = LocalWorkspaceBackend(tmp_path, mode="propose")
     payload = workspace.workspace_base_payload("run_1")
 
-    assert payload["schema_version"] == "native-agent-runner.workspace-base.v1"
+    assert payload["schema_version"] == "monoid.workspace-base.v1"
     assert payload["workspace_backend"] == "overlay"
     assert any(entry["path"] == "notes.md" and entry["sha256"] for entry in payload["entries"])
     assert any(entry["path"] == ".env" and entry["sha256"] for entry in payload["entries"])

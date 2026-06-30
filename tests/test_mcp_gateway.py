@@ -10,11 +10,11 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from conftest import serving
+from support.http import serving
 
-from native_agent_runner.mcp import McpToolProvider
-from native_agent_runner.reference._shared.http_util import wait_http_ready
-from native_agent_runner.reference.mcp_gateway import FakeMcpServer, create_mcp_server
+from monoid_agent_kernel.mcp import McpToolProvider
+from monoid_agent_kernel.reference._shared.http_util import wait_http_ready
+from monoid_agent_kernel.reference.mcp_gateway import FakeMcpServer, create_mcp_server
 
 
 def _server(admin_token: str | None = None):

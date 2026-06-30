@@ -17,12 +17,13 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from conftest import runtime_config, runtime_provider, serving
+from support.http import serving
+from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits
-from native_agent_runner.errors import ModelAdapterError
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import (
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
+from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
     TextDelta,
@@ -30,11 +31,11 @@ from native_agent_runner.providers.base import (
     TurnComplete,
     assemble_streamed_turn,
 )
-from native_agent_runner.providers.fake import FakeModelAdapter, FakeStreamingModelAdapter
-from native_agent_runner.providers.gateway import GatewayModelAdapter
-from native_agent_runner.reference._shared.tokens import TokenManager
-from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
-from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, FakeStreamingModelAdapter
+from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 
 
 def _token_manager() -> TokenManager:
@@ -55,7 +56,7 @@ def _llm_token(manager: TokenManager, *, run_id: str = "run_1", tenant_id: str =
 
 def _turn_payload() -> dict[str, Any]:
     return {
-        "protocol": "native-agent-runner.llm-turn.v1",
+        "protocol": "monoid.llm-turn.v1",
         "model": "gpt-5.5",
         "system_prompt": "sys",
         "reasoning": {"effort": "low"},

@@ -7,15 +7,15 @@ from urllib.error import HTTPError
 
 from click.testing import CliRunner
 
-from conftest import runtime_config
+from support.runtime import runtime_config
 
-from native_agent_runner.cli import main
-from native_agent_runner.core.spec import ModelConfig, ModelRetryConfig, ReasoningConfig
-from native_agent_runner.errors import ModelAdapterError
-from native_agent_runner.providers.base import ModelRequest, ToolObservation
-from native_agent_runner.providers.gateway import GatewayModelAdapter, _parse_gateway_response
-from native_agent_runner.providers.openai import OpenAIModelAdapter
-from native_agent_runner.tools.base import ToolResult, ToolSpec
+from monoid_agent_kernel.cli import main
+from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig, ReasoningConfig
+from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.providers.base import ModelRequest, ToolObservation
+from monoid_agent_kernel.providers.gateway import GatewayModelAdapter, _parse_gateway_response
+from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
+from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
 
 
 def _tool() -> ToolSpec:
@@ -54,7 +54,7 @@ def test_gateway_payload_is_provider_keyless_and_uses_opaque_turn_handle(tmp_pat
     payload = adapter._payload(request)
     headers = adapter._headers()
 
-    assert payload["protocol"] == "native-agent-runner.llm-turn.v1"
+    assert payload["protocol"] == "monoid.llm-turn.v1"
     assert payload["model"] == "gpt-5.5"
     assert payload["reasoning"] == {"effort": "low", "summary": "auto"}
     assert payload["tools"][0]["name"] == "fs_read"
@@ -111,9 +111,27 @@ def test_gateway_adapter_prefers_token_provider_and_reresolves() -> None:
     assert plain._headers()["Authorization"] == "Bearer static"
 
 
+def test_gateway_adapter_prefers_monoid_env_and_accepts_legacy_alias(monkeypatch) -> None:
+    monkeypatch.setenv("MONOID_LLM_GATEWAY_URL", "https://monoid-gateway.internal/v1/turns")
+    monkeypatch.setenv("MONOID_LLM_GATEWAY_TOKEN", "monoid-token")
+    monkeypatch.setenv("NAR_LLM_GATEWAY_URL", "https://legacy-gateway.internal/v1/turns")
+    monkeypatch.setenv("NAR_LLM_GATEWAY_TOKEN", "legacy-token")
+
+    adapter = GatewayModelAdapter(ModelConfig())
+
+    assert adapter._resolve_gateway_url(ModelConfig()) == "https://monoid-gateway.internal/v1/turns"
+    assert adapter._headers()["Authorization"] == "Bearer monoid-token"
+
+    monkeypatch.delenv("MONOID_LLM_GATEWAY_URL")
+    monkeypatch.delenv("MONOID_LLM_GATEWAY_TOKEN")
+
+    assert adapter._resolve_gateway_url(ModelConfig()) == "https://legacy-gateway.internal/v1/turns"
+    assert adapter._headers()["Authorization"] == "Bearer legacy-token"
+
+
 def test_gateway_token_source_remints_near_expiry(monkeypatch) -> None:
-    from native_agent_runner.reference._shared.tokens import TokenManager
-    from native_agent_runner.reference.backend import service as svc
+    from monoid_agent_kernel.reference._shared.tokens import TokenManager
+    from monoid_agent_kernel.reference.backend import service as svc
 
     clock = {"t": 1000.0}
     monkeypatch.setattr(svc.time, "time", lambda: clock["t"])
@@ -185,8 +203,8 @@ def test_gateway_retries_retryable_http_error_then_succeeds(monkeypatch) -> None
             )
         return Response()
 
-    monkeypatch.setattr("native_agent_runner.providers.gateway.urlopen", fake_urlopen)
-    monkeypatch.setattr("native_agent_runner.providers.gateway.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.time.sleep", lambda _delay: None)
     adapter = GatewayModelAdapter(
         ModelConfig(
             gateway_url="http://gateway.local/internal/llm/turns",
@@ -224,8 +242,8 @@ def test_gateway_retries_transient_connection_error_then_succeeds(monkeypatch) -
             raise ConnectionResetError("connection reset by peer")
         return Response()
 
-    monkeypatch.setattr("native_agent_runner.providers.gateway.urlopen", fake_urlopen)
-    monkeypatch.setattr("native_agent_runner.providers.gateway.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.time.sleep", lambda _delay: None)
     adapter = GatewayModelAdapter(
         ModelConfig(
             gateway_url="http://gateway.local/internal/llm/turns",
@@ -255,7 +273,7 @@ def test_gateway_does_not_retry_auth_error(monkeypatch) -> None:
             io.BytesIO(b'{"error":"bad token","error_code":"gateway_auth_error","retryable":false}'),
         )
 
-    monkeypatch.setattr("native_agent_runner.providers.gateway.urlopen", fake_urlopen)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
     adapter = GatewayModelAdapter(
         ModelConfig(
             gateway_url="http://gateway.local/internal/llm/turns",

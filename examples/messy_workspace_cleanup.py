@@ -22,20 +22,20 @@ from urllib.request import Request, urlopen
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_ROOT / "src"))
 
-from native_agent_runner.reference.backend.service import BackendRunRequest, RunnerBackend
-from native_agent_runner.reference._shared.tokens import TokenClaims, TokenManager
-from native_agent_runner.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
-from native_agent_runner.core.packages import (
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenManager
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
+from monoid_agent_kernel.core.packages import (
     apply_package,
     create_approval,
     export_package,
     verify_package,
     write_approval,
 )
-from native_agent_runner.core.spec import ModelConfig, ReasoningConfig
-from native_agent_runner.reference.llm_gateway.http import create_llm_gateway_server
-from native_agent_runner.reference.llm_gateway.service import LlmGatewayBackend
-from native_agent_runner.providers.base import ModelRequest, ModelTurn, ToolCall
+from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
+from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, ToolCall
 
 
 def score_messy_workspace_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -358,14 +358,14 @@ def _start_real_gateway_subprocess(
     env = os.environ.copy()
     env.pop("OPENAI_API_KEY", None)
     env["OPENAI_API_KEY"] = openai_api_key
-    env["NAR_BACKEND_TOKEN_SECRET"] = token_secret
-    env["NAR_LLM_GATEWAY_ADMIN_TOKEN"] = admin_token
+    env["MONOID_BACKEND_TOKEN_SECRET"] = token_secret
+    env["MONOID_LLM_GATEWAY_ADMIN_TOKEN"] = admin_token
     env["PYTHONPATH"] = str(PACKAGE_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
     process = subprocess.Popen(
         [
             sys.executable,
             "-m",
-            "native_agent_runner.cli",
+            "monoid_agent_kernel.cli",
             "llm-gateway",
             "serve",
             "--host",
@@ -515,7 +515,7 @@ def _readme_fixture() -> str:
 def _kickoff_fixture() -> str:
     return """# Kickoff Meeting
 
-- Goal: launch a lightweight agent runner for general file work.
+- Goal: launch a lightweight agent kernel for general file work.
 - Default mode should avoid mutating the source workspace.
 - Users need a readable summary and a reviewable proposal before apply.
 - Risk: ambiguous notes might mix confirmed decisions with guesses.
@@ -526,7 +526,7 @@ def _followup_fixture() -> str:
     return """# Follow-up Meeting
 
 - Decided to keep API keys inside the LLM gateway.
-- Runner should receive only short-lived run-scoped gateway tokens.
+- Monoid should receive only short-lived run-scoped gateway tokens.
 - Proposal packages need hashes, approval records, and conflict detection.
 - Needs confirmation: exact host-platform ResourceAdapter mapping for wiki pages.
 """
@@ -553,7 +553,7 @@ TODO buckets:
 def _old_summary_fixture() -> str:
     return """# Old Summary Draft
 
-The runner can read files, propose changes, and leave artifacts. This draft predates package approval.
+Monoid can read files, propose changes, and leave artifacts. This draft predates package approval.
 """
 
 
@@ -564,12 +564,12 @@ def _screenshot_notes_fixture() -> str:
 def _summary_output() -> str:
     return """# Project Summary
 
-The workspace describes a lightweight native agent runner for general file work. The strongest confirmed decisions are propose-first execution, gateway-owned provider credentials, and reviewable proposal packages before apply.
+The workspace describes a lightweight agent kernel for general file work. The strongest confirmed decisions are propose-first execution, gateway-owned provider credentials, and reviewable proposal packages before apply.
 
 ## Confirmed decisions
 
-- The agent runner should stage changes in propose mode instead of mutating the source workspace.
-- Provider API keys stay inside the LLM gateway; the runner receives only short-lived gateway tokens.
+- The agent kernel should stage changes in propose mode instead of mutating the source workspace.
+- Provider API keys stay inside the LLM gateway; Monoid receives only short-lived gateway tokens.
 - Proposal packages need hashes, approval records, partial approval, and conflict detection.
 - Shell and network tools remain disabled for this phase.
 
@@ -605,7 +605,7 @@ def _todo_output() -> str:
 def _readme_status_section() -> str:
     return """## Current status
 
-The runner research is centered on propose-first file work. Current priorities are proposal review, approval records, conflict-safe apply, and host-platform ResourceAdapter mapping.
+The Monoid kernel is centered on propose-first file work. Current priorities are proposal review, approval records, conflict-safe apply, and host-platform ResourceAdapter mapping.
 """
 
 

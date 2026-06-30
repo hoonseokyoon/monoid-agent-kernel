@@ -11,13 +11,14 @@ import asyncio
 import json
 from pathlib import Path
 
-from conftest import runtime_config, runtime_provider, tool_binding
+from support.process import python_command as _python_command
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
-from native_agent_runner.core.events import AgentEvent
-from native_agent_runner.core.spec import AgentRunSpec, RunLimits
-from native_agent_runner.errors import NativeAgentError
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import (
+from monoid_agent_kernel.core.events import AgentEvent
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
     TextDelta,
@@ -26,7 +27,7 @@ from native_agent_runner.providers.base import (
     TurnComplete,
     assemble_streamed_turn,
 )
-from native_agent_runner.providers.fake import (
+from monoid_agent_kernel.providers.fake import (
     FakeModelAdapter,
     FakeStreamingModelAdapter,
     fake_tool_call,
@@ -120,11 +121,6 @@ def test_async_and_sync_paths_agree(tmp_path: Path) -> None:
 
     assert sync_result.status == async_result.status == "completed"
     assert sync_result.final_text == async_result.final_text == "settled"
-
-
-def _python_command(code: str) -> str:
-    escaped = code.replace('"', '\\"')
-    return f'python -c "{escaped}"'
 
 
 def test_background_shell_job_completes_on_run_loop_and_reenters(tmp_path: Path) -> None:

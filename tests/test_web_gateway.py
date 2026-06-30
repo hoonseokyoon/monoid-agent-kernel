@@ -9,29 +9,36 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 
-from native_agent_runner.reference._shared.http_util import HardenedThreadingHTTPServer
+from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer
 
 import pytest
 
-from conftest import http_json, runtime_config, runtime_provider, tool_binding, wait_http_ready
+from support.http import (
+    http_get_json as _json_get,
+    http_json,
+    wait_http_ready as _wait_http_ready,
+)
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
-from native_agent_runner.core.schemas import validate_run_dir
-from native_agent_runner.core.spec import AgentRunSpec
-from native_agent_runner.core.tool_surface import ToolScope
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.reference._shared.tokens import TokenError, TokenManager
-from native_agent_runner.reference.web_gateway.http import create_web_gateway_server
-from native_agent_runner.reference.web_gateway.providers import (
+from monoid_agent_kernel.core.schemas import validate_run_dir
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManager
+from monoid_agent_kernel.reference.web_gateway.http import create_web_gateway_server
+from monoid_agent_kernel.reference.web_gateway.providers import (
     BraveLlmContextProvider,
     BraveSearchProvider,
     CompositeWebProvider,
     HttpFetchProvider,
     SearchFetchContextProvider,
 )
-from native_agent_runner.reference.web_gateway.service import WebGatewayBackend
-from native_agent_runner.web import WebGatewayClient
+from monoid_agent_kernel.reference.web_gateway.service import WebGatewayBackend
+from monoid_agent_kernel.web import WebGatewayClient
+
+pytestmark = pytest.mark.integration
 
 
 def _token_manager() -> TokenManager:
@@ -104,14 +111,27 @@ def test_web_gateway_client_retries_transient_connection_error(monkeypatch) -> N
             raise ConnectionResetError("connection reset by peer")
         return _Resp()
 
-    monkeypatch.setattr("native_agent_runner.web.urlopen", fake_urlopen)
-    monkeypatch.setattr("native_agent_runner.web.time.sleep", lambda _d: None)
+    monkeypatch.setattr("monoid_agent_kernel.web.urlopen", fake_urlopen)
+    monkeypatch.setattr("monoid_agent_kernel.web.time.sleep", lambda _d: None)
     client = WebGatewayClient("http://gateway.local", token="t")
 
     result = client.search({"binding_id": "b", "query": "q"})
 
     assert calls == 2
     assert result["result_count"] == 0
+
+
+def test_web_gateway_client_prefers_monoid_env_and_accepts_legacy_alias(monkeypatch) -> None:
+    monkeypatch.setenv("MONOID_WEB_GATEWAY_TOKEN", "monoid-web-token")
+    monkeypatch.setenv("NAR_WEB_GATEWAY_TOKEN", "legacy-web-token")
+
+    client = WebGatewayClient("http://gateway.local")
+
+    assert client._headers()["Authorization"] == "Bearer monoid-web-token"
+
+    monkeypatch.delenv("MONOID_WEB_GATEWAY_TOKEN")
+
+    assert client._headers()["Authorization"] == "Bearer legacy-web-token"
 
 
 def test_web_gateway_http_client_and_usage() -> None:
@@ -163,7 +183,7 @@ def test_agent_loop_web_bindings_events_metrics_and_private_transcript(tmp_path:
                     tool_calls=(
                         fake_tool_call(
                             "web_fetch",
-                            {"url": "https://docs.example.test/native-agent-runner/web", "max_bytes": 120},
+                            {"url": "https://docs.example.test/monoid-agent-kernel/web", "max_bytes": 120},
                             "fetch_1",
                         ),
                     ),
@@ -269,21 +289,14 @@ def test_brave_llm_context_provider_contract() -> None:
         upstream.stop()
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not os.environ.get("BRAVE_SEARCH_API_KEY"), reason="BRAVE_SEARCH_API_KEY is required")
 def test_brave_search_provider_live_smoke() -> None:
-    assert BraveSearchProvider.from_env(timeout_s=10).search("native agent runner web tools", max_results=2)
+    assert BraveSearchProvider.from_env(timeout_s=10).search("monoid agent kernel web tools", max_results=2)
 
 
 def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
     return http_json(url, payload, token=token)
-
-
-def _json_get(url: str, *, token: str) -> dict:
-    return http_json(url, token=token, method="GET")
-
-
-def _wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
-    wait_http_ready(base_url, timeout_s=timeout_s)
 
 
 class _FakeUpstreamServer:
@@ -305,8 +318,8 @@ class _FakeUpstreamServer:
                             "web": {
                                 "results": [
                                     {
-                                        "title": "Native Agent Docs",
-                                        "url": f"http://127.0.0.1:{outer.port}/docs/native-agent",
+                                        "title": "Monoid Docs",
+                                        "url": f"http://127.0.0.1:{outer.port}/docs/monoid",
                                         "description": f"Result for {query}",
                                     }
                                 ]
@@ -314,10 +327,10 @@ class _FakeUpstreamServer:
                         }
                     )
                     return
-                if parsed.path == "/docs/native-agent":
+                if parsed.path == "/docs/monoid":
                     self._write_html(
-                        "<html><head><title>Native Agent Docs</title></head>"
-                        "<body><main><p>Brave search result body for the runner.</p></main></body></html>"
+                        "<html><head><title>Monoid Docs</title></head>"
+                        "<body><main><p>Brave search result body for the kernel.</p></main></body></html>"
                     )
                     return
                 self.send_response(404)
@@ -327,13 +340,13 @@ class _FakeUpstreamServer:
                 if urlparse(self.path).path == "/brave/context":
                     self._write_json(
                         {
-                            "context": "LLM-ready Brave context for native agent runner.",
-                            "sources": [{"title": "Native Agent Docs", "url": "https://docs.example.test/native-agent-runner/web"}],
+                            "context": "LLM-ready Brave context for Monoid Agent Kernel.",
+                            "sources": [{"title": "Monoid Docs", "url": "https://docs.example.test/monoid-agent-kernel/web"}],
                             "chunks": [
                                 {
-                                    "title": "Native Agent Docs",
-                                    "url": "https://docs.example.test/native-agent-runner/web",
-                                    "text": "LLM-ready Brave context for native agent runner.",
+                                    "title": "Monoid Docs",
+                                    "url": "https://docs.example.test/monoid-agent-kernel/web",
+                                    "text": "LLM-ready Brave context for Monoid Agent Kernel.",
                                 }
                             ],
                         }

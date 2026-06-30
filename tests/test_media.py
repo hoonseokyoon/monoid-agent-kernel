@@ -7,7 +7,7 @@ import pytest
 
 import struct
 
-from native_agent_runner.core.media import (
+from monoid_agent_kernel.core.media import (
     NATIVE_IMAGE_TOKEN_CAP_DEFAULT,
     NATIVE_IMAGE_TOKEN_CAP_HIGH_RES,
     MediaResolveError,
@@ -19,7 +19,7 @@ from native_agent_runner.core.media import (
     image_dimensions,
     native_image_token_cap,
 )
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 
 # A tiny PNG header + NUL bytes — binary content fs.read would reject as non-text.
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"

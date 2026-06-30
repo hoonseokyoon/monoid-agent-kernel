@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from native_agent_runner.core.inbox import InboxMessage
-from native_agent_runner.core.outbox import OutboxRequest
-from native_agent_runner.core.trace_context import (
+from monoid_agent_kernel.core.inbox import InboxMessage
+from monoid_agent_kernel.core.outbox import OutboxRequest
+from monoid_agent_kernel.core.trace_context import (
     child_traceparent,
     new_traceparent,
     parse_traceparent,

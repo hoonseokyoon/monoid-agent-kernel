@@ -7,6 +7,25 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-30
+
+### Added
+- Compatibility imports through `native_agent_runner` and the legacy `native-agent`
+  CLI alias, so existing local integrations can migrate incrementally.
+- Central identifier and environment helpers for the Monoid namespace migration.
+
+### Changed
+- Project, package, repository, docs, and examples now use **Monoid Agent Kernel**
+  branding.
+- Python distribution name is now `monoid-agent-kernel`; import new code from
+  `monoid_agent_kernel`.
+- Current wire and durable artifact identifiers now emit `monoid.*` values.
+  Readers and validators continue to accept legacy `native-agent-runner.*` values.
+- Environment variables now prefer `MONOID_*` names. Existing `NAR_*` names are
+  accepted during migration.
+- Token issuer, audience, and header values now use Monoid identifiers while
+  accepting legacy values during migration.
+
 ## [0.13.0] - 2026-06-29
 
 ### Added
@@ -44,9 +63,9 @@ out in commit messages and here.
   validation that collects **all** problems as readable messages instead of raising
   on the first.
 - Curated `contracts.core` namespace (the ~9 must-know names), a
-  `native_agent_runner.tool_ids` constants module, and `list_builtin_tools()`.
+  `monoid_agent_kernel.tool_ids` constants module, and `list_builtin_tools()`.
 - `ToolBinding.for_tool("fs.read")` one-token bindings and bare-string `ref`.
-- `native-agent studio doctor` preflight (port / writability / API key / browser /
+- `monoid studio doctor` preflight (port / writability / API key / browser /
   OTel checks), a Studio README, and a first-run onboarding panel.
 - `otel-export` extra (OTel SDK + OTLP exporter) so Studio's OTel toggle actually
   exports; a README "Observability" section, `examples/otel_tracing.py`, and a

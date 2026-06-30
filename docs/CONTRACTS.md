@@ -1,24 +1,25 @@
 # Integration Contracts
 
-This document defines the supported integration surface for native-agent-runner.
-Import Python contracts from `native_agent_runner.contracts`. Treat
-`native_agent_runner.reference.*` as runnable examples for backend, LLM gateway,
-and web gateway integration.
+This document defines the supported integration surface for Monoid Agent Kernel:
+a lightweight agent kernel designed to embed into many products, runtimes, and
+deployment models. Import Python contracts from `monoid_agent_kernel.contracts`.
+Treat `monoid_agent_kernel.reference.*` as runnable examples for backend, LLM
+gateway, and web gateway integration.
 
 ## Boundary
 
 The package is layered in three tiers:
 
 - **contracts** — the stable integration surface, collected in
-  `native_agent_runner.contracts` (and re-exported from the top-level
-  `native_agent_runner`). These are the specs and protocols you depend on and
+  `monoid_agent_kernel.contracts` (and re-exported from the top-level
+  `monoid_agent_kernel`). These are the specs and protocols you depend on and
   implement. This document defines them.
-- **core** — the engine that implements those contracts: the default supported
-  runner (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, permission,
+- **core** — the engine that implements those contracts: the supported kernel runtime
+  (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, permission,
   shell execution, and web gateway client modules).
-- **reference** — example services under `native_agent_runner.reference`
-  (`backend`, `llm_gateway`, `web_gateway`, `stores`). Not part of the supported
-  surface; core has no dependency on `native_agent_runner.reference`.
+- **reference** — example services under `monoid_agent_kernel.reference`
+  (`backend`, `llm_gateway`, `web_gateway`, `stores`). These examples live outside
+  the supported public surface; core has no dependency on `monoid_agent_kernel.reference`.
 
 Agent configuration enters the engine through `AgentRuntimeConfig`. Legacy
 tool/shell/web policy inputs have left the core, backend, and CLI execution
@@ -44,7 +45,17 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   a validator registered via `AgentLoop(output_validators=...)` runs by default and can be
   disabled per run with an `OutputValidatorBinding(enabled=False)`; on failure the loop re-prompts
   up to `RunLimits.max_output_retries`).
-- **Not a contract**: `native_agent_runner.reference.*` (example services).
+- **Reference examples**: `monoid_agent_kernel.reference.*` services.
+
+## Identifier Namespace
+
+Current wire and artifact identifiers use the `monoid.*` namespace. The runtime emits new
+schema versions, protocol ids, token issuers, and service audiences with `monoid.*` values,
+including `monoid.backend` and `monoid.task-callback`.
+
+Readers, validators, and gateway parsers accept the pre-rename `native-agent-runner.*`
+identifiers during migration so existing durable run artifacts and gateway clients continue
+to load.
 
 ## Python Contracts
 
@@ -360,9 +371,9 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
 
 - **Enable**: build a `SkillProvider(definitions)` and register the one instance in both
   `AgentLoop(context_providers=(provider,), tool_providers=(provider,))`. Provider tools
-  are not auto-bound — merge `provider.tool_bindings()` into the runtime config so the
-  `skill` tools reach the model (mirrors the MCP provider). The CLI `--skills-directory`
-  does all of this.
+  require explicit bindings; merge `provider.tool_bindings()` into the runtime config so
+  the `skill` tools reach the model (mirrors the MCP provider). The CLI
+  `--skills-directory` does all of this.
 - **Definition** (`SkillDefinition`): `name`, `description` (both advertised at L1),
   `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (**advisory** for
   inline skills — a hint, not enforced; **enforced** for fork skills, see below), `context`
@@ -390,7 +401,7 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
     bundled file (`path` relative to the skill directory, as listed in `resources`), or
     `skill.run_script(name, path, args?)` to **execute** a bundled script and get back only
     its `{exit_code, stdout, stderr, ...}` — the script source never enters context. The
-    interpreter is chosen by extension (`.py` → the runner's Python, `.sh` → bash, `.js` →
+    interpreter is chosen by extension (`.py` → the kernel's Python, `.sh` → bash, `.js` →
     node, `.rb` → ruby, `.ps1` → powershell); `args` are passed to the script **verbatim as
     argv, never through a shell**, so they cannot be re-parsed/injected. The script runs in
     the workspace through the same machinery as `shell.exec` (`side_effect: "shell"`):
@@ -440,7 +451,7 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
 
 ### Control Protocol
 
-`native-agent-runner.control-command.v1` is a transport-independent envelope + a single
+`monoid.control-command.v1` is a transport-independent envelope + a single
 `dispatch` seam, so a Daemon drives a session through one entry point instead of a route per op:
 
 - `ControlCommand(type, run_id, args, issuer, reason, command_id)` and `ControlResult(run_id,
@@ -458,7 +469,7 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
 ### Inbox Message Envelope
 
-`native-agent-runner.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a
+`monoid.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a
 run so it carries **provenance** and an idempotency key. Like the control protocol it is an
 edge/transport contract — the reference `RunnerBackend` wraps inbound content into it; the engine
 (`AgentLoop`) never sees the envelope (it still receives unwrapped `content` via `submit`).
@@ -488,7 +499,7 @@ edge/transport contract — the reference `RunnerBackend` wraps inbound content 
 
 ### Outbox Request
 
-`native-agent-runner.outbox-request.v1` (`core/outbox.py`, `OutboxRequest`): a tool **stages** an
+`monoid.outbox-request.v1` (`core/outbox.py`, `OutboxRequest`): a tool **stages** an
 external side-effect (send an email, call a webhook) durably in the per-run `Outbox` instead of doing
 the IO inline. The request is checkpointed, so it survives a restart; the engine never performs the
 send.
@@ -579,7 +590,7 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
   per-run vault holds handles only and durable (approved) leases are checkpointed as handles, while
   ephemeral sync grants are re-brokered on restart. Any `CapabilityBroker` can be verified against
   these invariants with the parametrized `tests/test_capability_broker_contract.py` suite.
-- **CLI**: `native-agent run --auto-grant-capabilities` wires the built-in `AutoGrantBroker` (local
+- **CLI**: `monoid run --auto-grant-capabilities` wires the built-in `AutoGrantBroker` (local
   dev), or `--capability-broker path.py:factory` loads a custom broker (`factory()` returns it).
 - **Async approval (escalation)**: a broker may return `CapabilityPending` instead of granting
   synchronously — the loop then parks the run on a `capability` hosted-task (carrying the request
@@ -647,7 +658,7 @@ bindings.
 
 ```json
 {
-  "protocol": "native-agent-runner.llm-turn.v1",
+  "protocol": "monoid.llm-turn.v1",
   "model": "gpt-5.5",
   "system_prompt": "...",
   "tools": [
@@ -665,7 +676,7 @@ bindings.
 }
 ```
 
-The runner sends one of two request styles. **By-value `messages` is the default**: the
+The kernel sends one of two request styles. **By-value `messages` is the default**: the
 full provider-neutral conversation log (`messages`, a list of `{role, content}` user /
 assistant / tool entries) travels on every turn, and the gateway forwards it statelessly —
 `previous_turn_handle` and `observations` are not consulted. The conversation is
@@ -682,14 +693,14 @@ carries no `messages`. It has three shapes, selected by `previous_turn_handle` a
   top of an existing continuation handle; `observations` is empty).
 
 Either style lets one run accept multiple user turns: with `messages` the new user message
-is appended to the log; with a handle the runner threads the last `turn_handle` into the
+is appended to the log; with a handle the kernel threads the last `turn_handle` into the
 next user message.
 
 Successful response:
 
 ```json
 {
-  "protocol": "native-agent-runner.llm-turn-result.v1",
+  "protocol": "monoid.llm-turn-result.v1",
   "turn_handle": "turn_...",
   "final_text": null,
   "tool_calls": [
@@ -702,7 +713,7 @@ Successful response:
 `usage` always carries `input_tokens` / `output_tokens` / `total_tokens`. It MAY
 additionally carry optional priced sub-counts when the provider reports them —
 `cache_read_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `audio_tokens` —
-which the runner sums into per-run totals and checks against the token budget. These
+which the kernel sums into per-run totals and checks against the token budget. These
 fields are additive; a consumer that ignores them stays correct.
 
 The reference LLM gateway token authenticates run identity. The request model
@@ -710,7 +721,7 @@ selects the turn model.
 
 ### Web Gateway
 
-The runner calls:
+The kernel calls:
 
 - `POST /internal/web/search`
 - `POST /internal/web/fetch`
@@ -720,9 +731,9 @@ Every request includes binding constraints:
 
 ```json
 {
-  "protocol": "native-agent-runner.web-search.v1",
+  "protocol": "monoid.web-search.v1",
   "binding_id": "search_docs",
-  "query": "native runtime config",
+  "query": "monoid runtime config",
   "max_results": 5,
   "max_calls": 20,
   "allowed_domains": ["docs.example.test"],
@@ -888,7 +899,7 @@ the active watchdog lives only in the reference backend (the operational layer).
 
 - **Failure bundle on every failure.** Beyond the core's own `failure.json`, the reference
   backend's `_record_run_failure` also writes `run_dir/failure.json`
-  (`native-agent-runner.failure.v1`: `error, error_code, type, last_good_seq, restore_hint,
+  (`monoid.failure.v1`: `error, error_code, type, last_good_seq, restore_hint,
   failed_at`) — the durable mark is written *before* the in-memory terminal status, so a
   worker crash that bypassed the loop's own bundle still leaves a mark and a restart never
   resumes a crashed run into a loop.
@@ -947,7 +958,7 @@ stores, which is the "shared board" that lets a worker on another process/host r
 crashed peer's run across the instance boundary (a per-host `lease.json` cannot):
 
 ```python
-db = "/shared/runner.db"
+db = "/shared/monoid.db"
 backend = RunnerBackend(
     ...,
     checkpoint_store=SqliteCheckpointStore(db),

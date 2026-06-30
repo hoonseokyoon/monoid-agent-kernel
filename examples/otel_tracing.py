@@ -8,7 +8,7 @@ collector:
     ├── chat {model}          (one per model turn)
     └── execute_tool {tool}   (one per tool call)
 
-Needs the SDK + exporter for *output*; install with: pip install 'native-agent-runner[otel-export]'.
+Needs the SDK + exporter for *output*; install with: pip install 'monoid-agent-kernel[otel-export]'.
 In a real app you'd install a global TracerProvider with an OTLP exporter instead and just pass
 ``event_sinks=(OtelEventSink(),)`` — here we build a local provider and hand it to the sink so the
 example never touches global process state.
@@ -23,7 +23,7 @@ from pathlib import Path
 # Make the example runnable from a checkout without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from native_agent_runner import (  # noqa: E402
+from monoid_agent_kernel import (  # noqa: E402
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
@@ -33,8 +33,8 @@ from native_agent_runner import (  # noqa: E402
     ToolBinding,
     tool_ids,
 )
-from native_agent_runner.providers.base import ModelTurn  # noqa: E402
-from native_agent_runner.providers.fake import fake_tool_call  # noqa: E402
+from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
+from monoid_agent_kernel.providers.fake import fake_tool_call  # noqa: E402
 
 
 def _console_tracer_provider():

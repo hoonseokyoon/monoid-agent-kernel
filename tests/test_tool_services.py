@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from native_agent_runner.tool_services import CallContext, JobsService, ShellService, WebService
+from monoid_agent_kernel.tool_services import CallContext, JobsService, ShellService, WebService
 
 
 def test_call_context_holds_in_flight_ids() -> None:

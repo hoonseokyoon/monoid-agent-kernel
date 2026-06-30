@@ -12,17 +12,17 @@ import json
 from pathlib import Path
 from typing import Any
 
-from native_agent_runner.core.events import AgentEvent
-from native_agent_runner.tasks import BackgroundJob, TaskManager
-from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.recorder import AgentRecorder
-from native_agent_runner.shell import ShellExecutionOptions
-from native_agent_runner.workspace.local import LocalWorkspaceBackend
+import pytest
 
+from monoid_agent_kernel.core.events import AgentEvent
+from monoid_agent_kernel.tasks import BackgroundJob, TaskManager
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.recorder import AgentRecorder
+from monoid_agent_kernel.shell import ShellExecutionOptions
+from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
+from support.process import python_command as _python_command
 
-def _python_command(code: str) -> str:
-    escaped = code.replace('"', '\\"')
-    return f'python -c "{escaped}"'
+pytestmark = pytest.mark.integration
 
 
 class _CaptureSink:
@@ -126,7 +126,7 @@ def test_job_artifact_layout_and_schema(tmp_path: Path) -> None:
     assert job.stdout_path.exists()
 
     data: dict[str, Any] = json.loads(job.job_path.read_text(encoding="utf-8"))
-    assert data["schema_version"] == "native-agent-runner.background-job.v1"
+    assert data["schema_version"] == "monoid.background-job.v1"
     assert data["job_id"] == job.job_id
     assert data["status"] == "exited"
     assert data["stdout_path"] == f"artifacts/jobs/{job.job_id}/stdout.log"
@@ -173,6 +173,7 @@ def test_terminal_event_emitted_on_completion(tmp_path: Path) -> None:
     assert "command" not in finished[0].data
 
 
+@pytest.mark.slow
 def test_timeout_transitions_to_timed_out(tmp_path: Path) -> None:
     manager, recorder, _sink = _manager(tmp_path)
     job = _start(manager, _python_command("import time; time.sleep(5)"), timeout_s=1)
@@ -184,6 +185,7 @@ def test_timeout_transitions_to_timed_out(tmp_path: Path) -> None:
     assert obs["status"] == "timed_out"
 
 
+@pytest.mark.slow
 def test_cancel_transitions_to_cancelled(tmp_path: Path) -> None:
     manager, _recorder, _sink = _manager(tmp_path)
     job = _start(manager, _python_command("import time; time.sleep(5)"), timeout_s=10)

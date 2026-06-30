@@ -3,13 +3,13 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "native-agent-runner"
-version = "0.13.0"
-description = "Standalone lightweight API-backed agent harness for safe file work"
+name = "monoid-agent-kernel"
+version = "0.14.0"
+description = "Lightweight durable agent kernel for product integrations"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Hoonseok Yoon", email = "yoonhs9dev@gmail.com" }]
-keywords = ["agent", "llm", "ai", "runtime", "tools", "harness", "openai", "mcp"]
+keywords = ["agent", "llm", "ai", "runtime", "kernel", "tools", "observability", "mcp"]
 license = { text = "Apache-2.0" }
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -31,6 +31,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2",
+    "pytest-xdist>=3.6",
     "httpx>=0.27",
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
@@ -69,24 +70,32 @@ mcp = [
 ]
 
 [project.scripts]
-native-agent = "native_agent_runner.cli:main"
+monoid = "monoid_agent_kernel.cli:main"
+native-agent = "monoid_agent_kernel.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/hoonseokyoon/modular-agent-kernel"
-Repository = "https://github.com/hoonseokyoon/modular-agent-kernel"
-Issues = "https://github.com/hoonseokyoon/modular-agent-kernel/issues"
-Changelog = "https://github.com/hoonseokyoon/modular-agent-kernel/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/hoonseokyoon/monoid-agent-kernel"
+Repository = "https://github.com/hoonseokyoon/monoid-agent-kernel"
+Issues = "https://github.com/hoonseokyoon/monoid-agent-kernel/issues"
+Changelog = "https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/native_agent_runner"]
+packages = ["src/monoid_agent_kernel", "src/native_agent_runner"]
 # Internal developer journal — kept in the repo, excluded from the distributed wheel.
 exclude = ["**/DX_NOTES.md"]
 # Ship the PEP 561 marker so downstream type-checkers honor our inline type hints.
-force-include = { "src/native_agent_runner/py.typed" = "native_agent_runner/py.typed" }
+force-include = { "src/monoid_agent_kernel/py.typed" = "monoid_agent_kernel/py.typed", "src/native_agent_runner/py.typed" = "native_agent_runner/py.typed" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "unit: fast in-process tests with no external service dependency",
+    "integration: multi-component tests that exercise reference services or threaded servers",
+    "slow: tests that intentionally wait for subprocess, timeout, or multi-service behavior",
+    "live: tests that require external credentials or network-backed providers",
+    "serial: tests that must not run concurrently under pytest-xdist",
+]
 
 [tool.ruff]
 line-length = 100

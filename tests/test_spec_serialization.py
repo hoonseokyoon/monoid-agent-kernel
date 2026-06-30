@@ -3,12 +3,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from conftest import runtime_config, tool_binding
+import pytest
 
-from native_agent_runner.core.agents import AgentRuntimeConfig, PromptSpec, ToolSearchConfig
-from native_agent_runner.core.content import DocumentPart, ImagePart, TextPart
-from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, ReasoningConfig, RunLimits
-from native_agent_runner.permissions import PermissionPolicy
+from support.runtime import runtime_config, tool_binding
+
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, ToolSearchConfig
+from monoid_agent_kernel.core.content import DocumentPart, ImagePart, TextPart
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ReasoningConfig, RunLimits
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
+
+pytestmark = pytest.mark.unit
+
+
+def _ok_tool(*_args: object) -> ToolResult:
+    return ToolResult(ok=True)
 
 
 def test_agent_run_spec_round_trip_is_run_specific() -> None:
@@ -82,14 +91,21 @@ def test_runtime_config_rejects_duplicate_binding_ids() -> None:
     )
 
     try:
-        from native_agent_runner.core.agents import validate_runtime_config
-        from native_agent_runner.tools.base import ToolRegistry
-        from native_agent_runner.tools.builtin import builtin_tools
-        from native_agent_runner.workspace.local import LocalWorkspaceBackend
+        from monoid_agent_kernel.core.agents import validate_runtime_config
 
-        registry = ToolRegistry()
-        registry.register_many(builtin_tools(LocalWorkspaceBackend(Path("."))))
-        validate_runtime_config(config, registry)
+        validate_runtime_config(
+            config,
+            (
+                ToolSpec(
+                    id="fs.read",
+                    description="minimal read spec",
+                    input_schema={"type": "object"},
+                    capability="workspace.read",
+                    side_effect="read",
+                    handler=_ok_tool,
+                ),
+            ),
+        )
     except Exception as exc:
         assert "duplicate tool binding_id" in str(exc)
     else:  # pragma: no cover

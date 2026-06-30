@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from native_agent_runner.errors import (
+from monoid_agent_kernel.errors import (
     PermissionDenied,
     ToolExecutionError,
     WorkspaceError,
 )
-from native_agent_runner.loop import _failure_result
-from native_agent_runner.tools.base import ToolResult
+from monoid_agent_kernel.loop import _failure_result
+from monoid_agent_kernel.tools.base import ToolResult
 
 
 def test_success_envelope_keeps_content_under_result_no_collision() -> None:

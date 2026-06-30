@@ -6,18 +6,18 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from conftest import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.cli import main
-from native_agent_runner.core.events import EventBus
-from native_agent_runner.core.projections import project_run_status
-from native_agent_runner.core.spec import AgentRunSpec, RunLimits
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.permissions import PermissionPolicy
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.public_view import args_preview
-from native_agent_runner.recorder import JsonlEventSink, MemoryEventSink, StatusJsonSink
+from monoid_agent_kernel.cli import main
+from monoid_agent_kernel.core.events import EventBus
+from monoid_agent_kernel.core.projections import project_run_status
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.public_view import args_preview
+from monoid_agent_kernel.recorder import JsonlEventSink, MemoryEventSink, StatusJsonSink
 
 
 DEFAULT_TOOLS = (
@@ -67,7 +67,7 @@ def test_event_bus_schema_sequence_and_memory_sink() -> None:
     assert first.timestamp.endswith("Z")
     assert memory.events == [first, second]
     payload = first.to_json()
-    assert payload["schema_version"] == "native-agent-runner.event.v1"
+    assert payload["schema_version"] == "monoid.event.v1"
     assert payload["type"] == "run.started"
     assert "kind" not in payload
 
@@ -149,7 +149,7 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     assert proposal["proposal_hash"]
     assert status["manifest_path"] == "manifest.json"
     workspace_index = json.loads(result.run_dir.joinpath("workspace.index.json").read_text(encoding="utf-8"))
-    assert workspace_index["schema_version"] == "native-agent-runner.workspace-index.v1"
+    assert workspace_index["schema_version"] == "monoid.workspace-index.v1"
     assert any(entry["path"] == "notes.md" for entry in workspace_index["entries"])
     projection = project_run_status(result.run_dir)
     assert projection["status"] == "completed"
@@ -164,7 +164,7 @@ def test_otel_event_sink_emits_genai_span_tree(tmp_path: Path) -> None:
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-    from native_agent_runner import OtelEventSink
+    from monoid_agent_kernel import OtelEventSink
 
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -429,7 +429,7 @@ def make_sink():
         def next_turn(self, request):
             return self._adapter.next_turn(request)
 
-    monkeypatch.setattr("native_agent_runner.cli.GatewayModelAdapter", FakeCliGatewayAdapter)
+    monkeypatch.setattr("monoid_agent_kernel.cli.GatewayModelAdapter", FakeCliGatewayAdapter)
     monkeypatch.setenv("NAR_TEST_SINK_PATH", str(sink_output))
     runner, has_separate_stderr = _isolated_cli_runner()
     run_root = tmp_path / "runs"
@@ -504,7 +504,7 @@ def test_cli_normal_mode_prints_run_identity_before_completion(tmp_path: Path, m
         def next_turn(self, request):
             return self._adapter.next_turn(request)
 
-    monkeypatch.setattr("native_agent_runner.cli.GatewayModelAdapter", FakeCliGatewayAdapter)
+    monkeypatch.setattr("monoid_agent_kernel.cli.GatewayModelAdapter", FakeCliGatewayAdapter)
     runner = CliRunner()
     config_file = _runtime_config_file(tmp_path, "run.finish")
     result = runner.invoke(

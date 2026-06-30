@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from conftest import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.spec import AgentRunSpec, RunLimits
-from native_agent_runner.loop import AgentLoop, _accumulate_usage
-from native_agent_runner.providers._common import normalize_usage
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.loop import AgentLoop, _accumulate_usage
+from monoid_agent_kernel.providers._common import normalize_usage
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 # ---- A: usage detail preservation -------------------------------------------------

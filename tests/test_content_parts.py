@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from conftest import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.content import (
+from monoid_agent_kernel.core.content import (
     AudioPart,
     DocumentPart,
     ImagePart,
@@ -17,11 +17,11 @@ from native_agent_runner.core.content import (
     content_part_to_json,
     non_text_part_types,
 )
-from native_agent_runner.core.checkpoint import LocalFsCheckpointStore
-from native_agent_runner.core.spec import AgentRunSpec, text_from_parts
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.core.spec import AgentRunSpec, text_from_parts
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 def _provider():

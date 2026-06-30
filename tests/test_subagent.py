@@ -5,15 +5,15 @@ import logging
 from pathlib import Path
 
 import pytest
-from conftest import tool_binding
+from support.runtime import tool_binding
 
-from native_agent_runner.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
-from native_agent_runner.core.spec import AgentRunSpec, ModelConfig, RunLimits
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelRequest, ModelTurn
-from native_agent_runner.providers.fake import fake_tool_call
-from native_agent_runner.recorder import MemoryEventSink
-from native_agent_runner.tools.base import ToolContext, ToolResult, ToolSpec
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
+from monoid_agent_kernel.providers.fake import fake_tool_call
+from monoid_agent_kernel.recorder import MemoryEventSink
+from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 # Routing fake adapter: parent and child runs share one adapter (the child inherits
 # ``model_adapter``), so we route by a marker baked into each config's persona segment
@@ -401,7 +401,7 @@ def test_child_model_inherits_and_overrides(tmp_path: Path) -> None:
 
 
 def test_loader_reads_markdown_directory(tmp_path: Path) -> None:
-    from native_agent_runner.subagent_loader import load_subagent_definitions
+    from monoid_agent_kernel.subagent_loader import load_subagent_definitions
 
     agents = tmp_path / "agents"
     agents.mkdir()
@@ -437,7 +437,7 @@ def test_loader_reads_markdown_directory(tmp_path: Path) -> None:
 def test_loader_duplicate_id_warns_and_first_wins(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from native_agent_runner.subagent_loader import load_subagent_definitions
+    from monoid_agent_kernel.subagent_loader import load_subagent_definitions
 
     agents = tmp_path / "agents"
     agents.mkdir()
@@ -448,7 +448,7 @@ def test_loader_duplicate_id_warns_and_first_wins(
         "---\nname: dup\ndescription: second\n---\nbody b\n", encoding="utf-8"
     )
 
-    with caplog.at_level(logging.WARNING, logger="native_agent_runner.subagent_loader"):
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.subagent_loader"):
         defs = load_subagent_definitions(agents)
 
     # sorted path order: a.md before b.md, so "first" wins...

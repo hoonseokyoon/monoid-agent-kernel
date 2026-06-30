@@ -9,14 +9,15 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
-from conftest import runtime_config, runtime_provider, serving
+from support.http import serving
+from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.spec import AgentRunSpec, RunLimits
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.mcp import McpToolProvider
-from native_agent_runner.providers.base import ModelTurn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.reference._shared.http_util import HardenedThreadingHTTPServer
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.mcp import McpToolProvider
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer
 
 _TOOLS = [
     {

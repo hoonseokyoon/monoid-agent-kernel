@@ -18,7 +18,7 @@ from pathlib import Path
 # Make the example runnable from a checkout without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from native_agent_runner import (  # noqa: E402
+from monoid_agent_kernel import (  # noqa: E402
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
@@ -26,8 +26,8 @@ from native_agent_runner import (  # noqa: E402
     ToolBinding,
     tool_ids,
 )
-from native_agent_runner.providers.base import ModelTurn  # noqa: E402
-from native_agent_runner.providers.fake import fake_tool_call  # noqa: E402
+from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
+from monoid_agent_kernel.providers.fake import fake_tool_call  # noqa: E402
 
 
 def main() -> None:

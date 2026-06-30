@@ -1,7 +1,7 @@
 # Tool Surface
 
 The tool surface is the tool interface exposed to the model within a single turn.
-In the native runtime model, the list of `ToolBinding`s in `AgentRuntimeConfig.tools`
+In the Monoid runtime model, the list of `ToolBinding`s in `AgentRuntimeConfig.tools`
 is the only public input to the surface.
 
 ## Flow
@@ -16,7 +16,7 @@ AgentRuntimeConfig
   -> model_name -> BoundTool -> base ToolSpec.handler
 ```
 
-The runner keeps every builtin and custom tool in the registry. A registry tool is
+The kernel keeps every builtin and custom tool in the registry. A registry tool is
 the implementation. A `ToolBinding` is the public unit that exposes an implementation
 as an agent-facing tool.
 
@@ -66,8 +66,8 @@ produces:
 
 The model sees `model_spec`. Execution uses `base_spec.handler`.
 
-Unbound registry tools stay outside the catalog. Runner does not create hidden
-deny rules for unbound tools.
+Unbound registry tools stay outside the catalog. The kernel leaves unbound tools
+unrepresented instead of creating hidden deny rules.
 
 ## Exposure
 
@@ -212,7 +212,7 @@ record. The current turn continues with its existing `BoundToolCatalog` and
 `ToolSurfaceSnapshot`.
 
 This gives backend-driven mutation a clear rule: config replacement is accepted
-immediately by the backend and observed by the runner at the next turn boundary.
+immediately by the backend and observed by the kernel at the next turn boundary.
 
 ## Replay
 

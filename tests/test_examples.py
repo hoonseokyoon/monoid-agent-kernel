@@ -77,7 +77,7 @@ def test_redacting_event_sink_example() -> None:
 def test_full_stack_integration_fake_scenario(tmp_path: Path) -> None:
     module = _load("full_stack_integration.py")
     result = module.run_scenario(mode="fake", model="gpt-5.5", reasoning_effort="low", root=tmp_path)
-    # The whole reference stack (token manager → fake LLM gateway → runner backend) ran
+    # The whole reference stack (token manager → fake LLM gateway → Monoid backend) ran
     # end-to-end: a result exists, events were emitted, and nothing leaked.
     assert result["result_ready"] is True, result.get("status")
     assert result["event_types"], "no events emitted"

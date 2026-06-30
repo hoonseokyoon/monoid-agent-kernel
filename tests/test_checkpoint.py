@@ -7,32 +7,29 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import runtime_config, runtime_provider
+from support.process import python_command as _python_command
+from support.runtime import runtime_config, runtime_provider
 
-from native_agent_runner.core.checkpoint import (
+from monoid_agent_kernel.core.checkpoint import (
     SCHEMA_VERSION,
     LocalFsCheckpointStore,
     RunCheckpoint,
     read_checkpoint,
     write_checkpoint,
 )
-from native_agent_runner.core.spec import AgentRunSpec, RunLimits
-from native_agent_runner.errors import NativeAgentError
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn, ToolObservation
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.shell import ShellExecutionOptions
-from native_agent_runner.tasks import HostedTask
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn, ToolObservation
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.shell import ShellExecutionOptions
+from monoid_agent_kernel.tasks import HostedTask
 
 
 def _latest_checkpoint(spec: AgentRunSpec) -> RunCheckpoint | None:
     """Read the loop's last durably-committed checkpoint via the default store."""
     record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
     return record.checkpoint if record is not None else None
-
-
-def _python_command(code: str) -> str:
-    return f'python -c "{code.replace(chr(34), chr(92) + chr(34))}"'
 
 
 def _hitl_parked_loop(spec: AgentRunSpec) -> tuple[AgentLoop, str, Path, Path]:
@@ -127,6 +124,22 @@ def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
     path = tmp_path / "checkpoint.json"
     path.write_text(path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "bogus.v0"), encoding="utf-8")
     assert read_checkpoint(tmp_path) is None
+
+
+def test_read_checkpoint_accepts_legacy_schema_version(tmp_path: Path) -> None:
+    cp = RunCheckpoint(run_id="run_1")
+    write_checkpoint(tmp_path, cp)
+    path = tmp_path / "checkpoint.json"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "native-agent-runner.checkpoint.v1"),
+        encoding="utf-8",
+    )
+
+    restored = read_checkpoint(tmp_path)
+
+    assert restored is not None
+    assert restored.run_id == "run_1"
+    assert restored.schema_version == "native-agent-runner.checkpoint.v1"
 
 
 def test_local_fs_store_latest_ignores_uncommitted_seq(tmp_path: Path) -> None:
@@ -437,7 +450,7 @@ def test_failed_turn_appends_no_assistant_message(tmp_path: Path) -> None:
         provider_name = "openai"
 
         def next_turn(self, request):  # noqa: ANN001, ANN201
-            from native_agent_runner.errors import ModelAdapterError
+            from monoid_agent_kernel.errors import ModelAdapterError
 
             raise ModelAdapterError("boom", error_code="provider_unavailable")
 
@@ -459,7 +472,7 @@ def test_failed_turn_appends_no_assistant_message(tmp_path: Path) -> None:
 def test_failed_run_writes_failure_bundle_and_keeps_checkpoint(tmp_path: Path) -> None:
     class _RaisingAdapter:
         def next_turn(self, request):  # noqa: ANN001, ANN201
-            from native_agent_runner.errors import ModelAdapterError
+            from monoid_agent_kernel.errors import ModelAdapterError
 
             raise ModelAdapterError("boom", error_code="provider_unavailable")
 

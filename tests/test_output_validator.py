@@ -8,22 +8,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from conftest import runtime_provider, tool_binding
+from support.runtime import runtime_provider, tool_binding
 
-from native_agent_runner.core.agents import AgentRuntimeConfig, OutputValidatorBinding
-from native_agent_runner.core.checkpoint import RunCheckpoint, read_checkpoint, write_checkpoint
-from native_agent_runner.core.output_validator import (
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, OutputValidatorBinding
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint, read_checkpoint, write_checkpoint
+from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
     OutputRetry,
     ValidationOutcome,
 )
-from native_agent_runner.core.spec import AgentRunSpec, RunLimits
-from native_agent_runner.loop import AgentLoop
-from native_agent_runner.providers.base import ModelTurn, TextDelta, assemble_streamed_turn
-from native_agent_runner.providers.fake import FakeModelAdapter, fake_tool_call
-from native_agent_runner.providers.gateway import _parse_gateway_response
-from native_agent_runner.providers.openai import _parse_response, _stop_reason_from_response
-from native_agent_runner.recorder import MemoryEventSink
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn, TextDelta, assemble_streamed_turn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+from monoid_agent_kernel.providers.openai import _parse_response, _stop_reason_from_response
+from monoid_agent_kernel.recorder import MemoryEventSink
 
 
 # --- validators ---------------------------------------------------------------------------
