@@ -903,15 +903,18 @@ recovery is the integrator's call.
 - **Failure bundle:** on failure the core writes `run_dir/failure.json`
   (`{error, error_code, type, last_good_seq, restore_hint}`) — fail loud, name the
   checkpoint to restore from. No auto-recovery.
-- The reference backend writes `run_dir/run.json` (recovery descriptor: identity,
-  workspace, limits, policy, and the authoritative resolved runtime config). Runtime-config
-  hot-swaps update this descriptor with `runtime_config_version`, `runtime_config_hash`,
-  `runtime_config_issuer`, `runtime_config_reason`, and `runtime_config_committed_at`; recovery
-  verifies the hash before rebuilding providers or gateway token sources. `recover_runs()` scans
-  `run_root`, skips terminal checkpoints and failed runs, rebuilds each run (re-issuing gateway
-  tokens from the signing key, **re-provisioning the base workspace** is the deployment's job),
-  `restore()`s the loop with the store's blobs, re-enqueues durably-saved follow-up messages, and
-  resumes.
+- The reference backend writes `run_dir/run.json` and stores the same recovery descriptor in the
+  configured `CheckpointStore`: identity, workspace, limits, policy, and the authoritative resolved
+  runtime config. Runtime-config hot-swaps update both copies with `runtime_config_version`,
+  `runtime_config_hash`, `runtime_config_issuer`, `runtime_config_reason`, and
+  `runtime_config_committed_at`; recovery verifies the hash before rebuilding providers or gateway
+  token sources. A backend that never hosted the run can reclaim it from a shared lease/checkpoint
+  store, read the shared descriptor when local `run.json` is absent, materialize a local copy, then
+  resume. `recover_runs()` scans `run_root`; the active watchdog discovers cross-instance orphaned
+  runs from the shared lease store. Recovery skips terminal checkpoints and failed runs, rebuilds
+  each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
+  is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved
+  follow-up messages, and resumes.
 
 **Assumption (workspace):** the agent workspace is not durable; on restore the
 deployment re-provisions the base (re-clone/re-mount) and the checkpoint re-applies
@@ -982,15 +985,17 @@ Two seams make durability and multi-node recovery pluggable without touching the
 
 Every store must pass the parametrized contract suites (`tests/test_checkpoint_store_contract.py`,
 `tests/test_lease_store_contract.py`): atomic last-good commit, monotonic `latest`, write-once
-blob dedup, and a single-winner `try_claim`. Passing them makes a backend a drop-in.
+blob dedup, run metadata round-trip, and a single-winner `try_claim`. Passing them makes a backend
+a drop-in.
 
 **SQLite reference stores** (`reference/stores/`, stdlib `sqlite3`, zero dependencies):
 `SqliteCheckpointStore` and `SqliteLeaseStore`. A DB transaction supplies the invariants —
 `put` commits atomically (a crash rolls back, so `latest` never sees a torn checkpoint), the
 latest pointer advances monotonically via a conditional UPSERT, blobs are write-once, and
-`try_claim` is a transactional CAS under `BEGIN IMMEDIATE`. One shared db can host **both**
-stores, which is the "shared board" that lets a worker on another process/host reclaim a
-crashed peer's run across the instance boundary (a per-host `lease.json` cannot):
+`try_claim` is a transactional CAS under `BEGIN IMMEDIATE`. `SqliteCheckpointStore` also stores the
+backend run descriptor beside checkpoints, so one shared db can host **both** stores and the
+recovery metadata needed to reclaim and resume a crashed peer's run across the instance boundary
+(a per-host `lease.json` cannot):
 
 ```python
 db = "/shared/monoid.db"
