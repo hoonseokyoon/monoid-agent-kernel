@@ -1052,110 +1052,213 @@ class RunnerBackend:
         token = str(args.pop("token", "") or "")
         run_id = command.run_id
         ctype = command.type
+        command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
+        started = time.time()
 
-        def ok(data: dict[str, Any], *, state: str | None = None) -> ControlResult:
-            return ControlResult(run_id=run_id, type=ctype, status="ok", state=state, data=dict(data))
+        self._emit_control_audit_event(
+            run_id,
+            "control.command.received",
+            {
+                "command_id": command_id,
+                "command": ctype,
+                "target_run_id": run_id,
+                "actor": command.issuer,
+                "reason": command.reason,
+                "token_sha256": TokenManager.token_sha256(token) if token else "",
+                "idempotency_key": command.command_id,
+                "args_keys": sorted(key for key in command.args if key != "token"),
+            },
+        )
 
         try:
-            if ctype == "pause":
-                return ok(self.pause_run(run_id, token))
-            if ctype == "resume":
-                with self._lock:
-                    live = run_id in self._records
-                return ok(self.signal_resume(run_id, token) if live else self.resume_run(run_id, token))
-            if ctype == "cancel":
-                return ok(self.cancel_run(run_id, token))
-            if ctype == "interrupt":
-                return ok(self.interrupt_turn(run_id, token))
-            if ctype in {"inspect", "health"}:
-                loop = self._authorize_active_loop(run_id, token)
-                # Seed the throwaway facade with the record's authoritative FSM state (the backend
-                # drives the loop directly, so the facade's own cache never tracked this run).
-                session = LoopSession(loop, _state=self._record(run_id).session_state)
-                if ctype == "inspect":
-                    inspection = session.inspect()
-                    return ok(inspection.to_json(), state=inspection.state.value)
-                health = session.health()
-                return ok(health.to_json(), state=health.state.value)
-            if ctype == "status":
-                return ok(self.status(run_id, token))
-            if ctype == "runtime_config":
-                return ok(self.runtime_config(run_id, token))
-            if ctype == "replace_runtime_config":
-                return ok(
-                    self.replace_runtime_config(
-                        run_id,
-                        token,
-                        expected_version=int(args.get("expected_version", 0)),
-                        issuer=command.issuer,
-                        reason=command.reason,
-                        config=AgentRuntimeConfig.from_json(args["config"]),
-                    )
-                )
-            if ctype == "send_message":
-                # A control command carries its own id (command_id) — use it as the inbox dedup key
-                # so a redelivered control send is processed once.
-                return ok(
-                    self.send_message(
-                        run_id,
-                        token,
-                        content=args.get("content") or "",
-                        message_id=command.command_id,
-                        source="control",
-                    )
-                )
-            if ctype == "create_task":
-                return ok(
-                    self.create_task(
-                        run_id,
-                        token,
-                        kind=str(args.get("kind") or ""),
-                        request=dict(args.get("request") or {}),
-                    )
-                )
-            if ctype == "report_task_result":
-                return ok(
-                    self.report_task_result(
-                        run_id,
-                        token,
-                        task_id=str(args.get("task_id") or ""),
-                        result=dict(args.get("result") or {}),
-                        status=str(args.get("status") or "answered"),
-                    )
-                )
-            if ctype == "revoke_capability":
-                before = args.get("before")
-                return ok(
-                    self.revoke_capability(
-                        run_id,
-                        token,
-                        capability=(str(args["capability"]) if args.get("capability") else None),
-                        lease_id=(str(args["lease_id"]) if args.get("lease_id") else None),
-                        before=(float(before) if before is not None else None),
-                        reason=command.reason,
-                    )
-                )
-            return ControlResult(
-                run_id=run_id,
-                type=ctype,
-                status="unsupported",
-                error=f"unknown control command type: {ctype}",
-                error_code="unknown_control_command",
+            result = self._dispatch_control_command(
+                command,
+                args=args,
+                token=token,
+                command_id=command_id,
             )
-        except PermissionDenied:
+        except PermissionDenied as exc:
+            self._emit_control_audit_event(
+                run_id,
+                "control.command.failed",
+                {
+                    "command_id": command_id,
+                    "command": ctype,
+                    "target_run_id": run_id,
+                    "actor": command.issuer,
+                    "status": "error",
+                    "error": str(exc),
+                    "error_code": getattr(exc, "error_code", "permission_denied"),
+                    "duration_ms": (time.time() - started) * 1000,
+                },
+                level="warning",
+            )
             raise  # auth failures map to HTTP 401 in the route layer
         except KeyError as exc:
-            return ControlResult(
+            result = ControlResult(
                 run_id=run_id, type=ctype, status="unsupported", error=str(exc), error_code="run_not_found"
             )
         except (ValueError, NativeAgentError) as exc:
-            return ControlResult(
+            result = ControlResult(
                 run_id=run_id,
                 type=ctype,
                 status="error",
                 error=str(exc),
                 error_code=getattr(exc, "error_code", "control_error"),
             )
+
+        duration_ms = (time.time() - started) * 1000
+        if result.status == "ok":
+            self._emit_control_audit_event(
+                run_id,
+                "control.command.completed",
+                {
+                    "command_id": command_id,
+                    "command": ctype,
+                    "target_run_id": run_id,
+                    "actor": command.issuer,
+                    "status": result.status,
+                    "state": result.state,
+                    "duration_ms": duration_ms,
+                },
+            )
+        else:
+            self._emit_control_audit_event(
+                run_id,
+                "control.command.failed",
+                {
+                    "command_id": command_id,
+                    "command": ctype,
+                    "target_run_id": run_id,
+                    "actor": command.issuer,
+                    "status": result.status,
+                    "error": result.error,
+                    "error_code": result.error_code,
+                    "duration_ms": duration_ms,
+                },
+                level="warning",
+            )
+        return result
+
+    def _dispatch_control_command(
+        self,
+        command: ControlCommand,
+        *,
+        args: dict[str, Any],
+        token: str,
+        command_id: str,
+    ) -> ControlResult:
+        run_id = command.run_id
+        ctype = command.type
+
+        def ok(data: dict[str, Any], *, state: str | None = None) -> ControlResult:
+            return ControlResult(run_id=run_id, type=ctype, status="ok", state=state, data=dict(data))
+
+        if ctype == "pause":
+            return ok(self.pause_run(run_id, token))
+        if ctype == "resume":
+            with self._lock:
+                live = run_id in self._records
+            return ok(self.signal_resume(run_id, token) if live else self.resume_run(run_id, token))
+        if ctype == "cancel":
+            return ok(self.cancel_run(run_id, token))
+        if ctype == "interrupt":
+            return ok(self.interrupt_turn(run_id, token))
+        if ctype in {"inspect", "health"}:
+            loop = self._authorize_active_loop(run_id, token)
+            # Seed the throwaway facade with the record's authoritative FSM state (the backend
+            # drives the loop directly, so the facade's own cache never tracked this run).
+            session = LoopSession(loop, _state=self._record(run_id).session_state)
+            if ctype == "inspect":
+                inspection = session.inspect()
+                return ok(inspection.to_json(), state=inspection.state.value)
+            health = session.health()
+            return ok(health.to_json(), state=health.state.value)
+        if ctype == "status":
+            return ok(self.status(run_id, token))
+        if ctype == "runtime_config":
+            return ok(self.runtime_config(run_id, token))
+        if ctype == "replace_runtime_config":
+            return ok(
+                self.replace_runtime_config(
+                    run_id,
+                    token,
+                    expected_version=int(args.get("expected_version", 0)),
+                    issuer=command.issuer,
+                    reason=command.reason,
+                    config=AgentRuntimeConfig.from_json(args["config"]),
+                )
+            )
+        if ctype == "send_message":
+            # A control command carries its own id (command_id) — use it as the inbox dedup key
+            # so a redelivered control send is processed once.
+            return ok(
+                self.send_message(
+                    run_id,
+                    token,
+                    content=args.get("content") or "",
+                    message_id=command_id,
+                    source="control",
+                )
+            )
+        if ctype == "create_task":
+            return ok(
+                self.create_task(
+                    run_id,
+                    token,
+                    kind=str(args.get("kind") or ""),
+                    request=dict(args.get("request") or {}),
+                )
+            )
+        if ctype == "report_task_result":
+            return ok(
+                self.report_task_result(
+                    run_id,
+                    token,
+                    task_id=str(args.get("task_id") or ""),
+                    result=dict(args.get("result") or {}),
+                    status=str(args.get("status") or "answered"),
+                )
+            )
+        if ctype == "revoke_capability":
+            before = args.get("before")
+            return ok(
+                self.revoke_capability(
+                    run_id,
+                    token,
+                    capability=(str(args["capability"]) if args.get("capability") else None),
+                    lease_id=(str(args["lease_id"]) if args.get("lease_id") else None),
+                    before=(float(before) if before is not None else None),
+                    reason=command.reason,
+                )
+            )
+        return ControlResult(
+            run_id=run_id,
+            type=ctype,
+            status="unsupported",
+            error=f"unknown control command type: {ctype}",
+            error_code="unknown_control_command",
+        )
+
+    def _emit_control_audit_event(
+        self,
+        run_id: str,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        level: str = "info",
+    ) -> None:
+        if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
+            return
+        with self._lock:
+            record = self._records.get(run_id)
+            run_dir = record.run_dir if record is not None else self.run_root / run_id
+        if not run_dir.exists():
+            return
+        try:
+            append_event_to_run(run_dir, event_type, data=data, level=level)
+        except OSError:
+            _LOGGER.debug("control audit event write skipped", exc_info=True)
 
     def send_message(
         self,
