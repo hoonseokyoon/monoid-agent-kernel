@@ -199,6 +199,18 @@ class CheckpointStore(Protocol):
         """Read a content-addressed blob by its sha256 digest. Raises ``KeyError`` if absent."""
         ...
 
+    def put_run_metadata(self, run_id: str, metadata: Mapping[str, Any]) -> None:
+        """Store backend-owned run recovery metadata in the same durable store as checkpoints.
+
+        This lets another backend instance rebuild a run from a shared store even when it has no
+        local ``run.json`` file from the original host.
+        """
+        ...
+
+    def run_metadata(self, run_id: str) -> dict[str, Any] | None:
+        """Return backend-owned recovery metadata for ``run_id`` if this store has it."""
+        ...
+
 
 @dataclass
 class LocalFsCheckpointStore:
@@ -270,6 +282,18 @@ class LocalFsCheckpointStore:
             return (self._dir(run_id) / "blobs" / sha256).read_bytes()
         except OSError as exc:
             raise KeyError(sha256) from exc
+
+    def put_run_metadata(self, run_id: str, metadata: Mapping[str, Any]) -> None:
+        cdir = self._dir(run_id)
+        cdir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(cdir / "run_meta.json", dict(metadata))
+
+    def run_metadata(self, run_id: str) -> dict[str, Any] | None:
+        try:
+            payload = json.loads((self._dir(run_id) / "run_meta.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+        return dict(payload) if isinstance(payload, dict) else None
 
     def _read_latest_seq(self, cdir: Path) -> int:
         try:

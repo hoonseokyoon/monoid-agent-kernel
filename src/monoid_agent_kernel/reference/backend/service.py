@@ -2447,6 +2447,7 @@ class RunnerBackend:
         }
         record.run_dir.mkdir(parents=True, exist_ok=True)
         write_json_atomic(record.run_dir / "run.json", meta)
+        self._store_run_meta(record.run_id, meta)
 
     def _write_runtime_config_run_meta(
         self,
@@ -2467,6 +2468,22 @@ class RunnerBackend:
         meta["runtime_config_reason"] = reason
         meta["runtime_config_committed_at"] = committed_at
         write_json_atomic(record.run_dir / "run.json", meta)
+        self._store_run_meta(record.run_id, meta)
+
+    def _store_run_meta(self, run_id: str, meta: Mapping[str, Any]) -> None:
+        if self.checkpoint_store is None:
+            return
+        self.checkpoint_store.put_run_metadata(run_id, meta)
+
+    def _read_recovery_meta(self, run_dir: Path, run_id: str) -> dict[str, Any] | None:
+        meta = _read_run_meta(run_dir)
+        if meta is None and self.checkpoint_store is not None:
+            stored = self.checkpoint_store.run_metadata(run_id)
+            if stored is not None:
+                meta = dict(stored)
+                run_dir.mkdir(parents=True, exist_ok=True)
+                write_json_atomic(run_dir / "run.json", meta)
+        return meta
 
     def recover_runs(self) -> list[str]:
         """Scan ``run_root`` for runs left parked by a previous process and resume each
@@ -2501,7 +2518,7 @@ class RunnerBackend:
         stored = self.checkpoint_store.latest(run_id)
         if stored is None or stored.checkpoint.terminal:
             return False
-        meta = _read_run_meta(run_dir)
+        meta = self._read_recovery_meta(run_dir, run_id)
         if meta is None:
             return False
         try:
@@ -2551,7 +2568,7 @@ class RunnerBackend:
         if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
             raise PermissionDenied("invalid run id")
         run_dir = self.run_root / run_id
-        meta = _read_run_meta(run_dir)
+        meta = self._read_recovery_meta(run_dir, run_id)
         if meta is None:
             raise KeyError(f"unknown run: {run_id}")
         if claims.tenant_id != (meta.get("tenant_id") or "") or claims.user_id != (meta.get("user_id") or ""):

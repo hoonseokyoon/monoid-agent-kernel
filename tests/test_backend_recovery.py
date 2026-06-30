@@ -6,6 +6,7 @@ from support.backend_harness import (
     ModelTurn,
     Path,
     PermissionDenied,
+    PermissionPolicy,
     RunCheckpoint,
     RunnerBackend,
     SqliteCheckpointStore,
@@ -494,6 +495,82 @@ def test_multinode_reclaim_over_shared_sqlite(tmp_path: Path, monkeypatch) -> No
     assert reclaimed == [run_id]  # B found A's orphan through the shared db
     assert resumed == [run_id]  # and invoked resume across the instance boundary
     assert backend_b.lease_store.owner(run_id) == backend_b._worker_id  # CAS flipped ownership to B
+
+
+def test_multinode_reclaim_resumes_from_shared_metadata_without_local_run_json(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    db = tmp_path / "shared.db"
+    shared_checkpoints = SqliteCheckpointStore(db)
+    shared_leases = SqliteLeaseStore(db)
+    token_manager = _token_manager()
+    run_id = "run_shared_meta"
+    config = _default_config()
+    meta = {
+        "schema_version": _RUN_META_SCHEMA_VERSION,
+        "run_id": run_id,
+        "tenant_id": "tenant_a",
+        "user_id": "user_a",
+        "workspace_root": str(workspace),
+        "mode": "propose",
+        "workspace_backend": "overlay",
+        "multi_turn": True,
+        "created_at": time.time(),
+        "title": "shared metadata resume",
+        "limits": {
+            "max_steps": 30,
+            "max_tool_calls": 100,
+            "max_bytes_read": 1_000_000,
+            "max_duration_s": 900,
+        },
+        "permission_policy": PermissionPolicy().to_json(),
+        "runtime_config": config.to_json(),
+        "runtime_config_version": config.config_version,
+        "runtime_config_hash": config.config_hash,
+        "runtime_config_issuer": "test",
+        "runtime_config_reason": "shared metadata fixture",
+        "runtime_config_committed_at": time.time(),
+    }
+    shared_checkpoints.put_run_metadata(run_id, meta)
+    shared_checkpoints.put(
+        RunCheckpoint(
+            run_id=run_id,
+            seq=1,
+            status="completed",
+            previous_turn_handle="r1",
+            terminal=False,
+        )
+    )
+    shared_leases.heartbeat(run_id, "worker_a", ttl_s=0.0)
+    time.sleep(0.02)
+
+    local_run_root = tmp_path / "b_runs"
+    adapters: list[FakeModelAdapter] = []
+
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="recovered")])
+        adapters.append(adapter)
+        return adapter
+
+    backend_b = RunnerBackend(
+        run_root=local_run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+        checkpoint_store=shared_checkpoints,
+        lease_store=shared_leases,
+    )
+
+    assert not (local_run_root / run_id / "run.json").exists()
+    reclaimed = backend_b._reclaim_stale_runs()
+
+    assert reclaimed == [run_id]
+    assert run_id in backend_b._records
+    assert (local_run_root / run_id / "run.json").exists()
+    assert _read_run_meta(local_run_root / run_id)["runtime_config_hash"] == config.config_hash
+    assert backend_b.lease_store.owner(run_id) == backend_b._worker_id
+    backend_b.shutdown(drain=True)
 
 
 def test_sqlite_lease_concurrent_claim_across_instances(tmp_path: Path) -> None:
