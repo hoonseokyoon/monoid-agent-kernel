@@ -136,15 +136,18 @@ class _CountingBroker:
 def _cap_loop(
     tmp_path: Path,
     provider: _CapToolProvider,
-    broker: object,
+    broker: object | None,
     turns: list[ModelTurn],
     *,
     rotate_skew: float = 0.0,
+    requires_lease: bool | str = True,
 ) -> AgentLoop:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     binding = tool_binding(
-        "ext.fetch", runtime={"requires_lease": True}, scope=ToolScope(allowed_domains=("a.edu",))
+        "ext.fetch",
+        runtime={"requires_lease": requires_lease},
+        scope=ToolScope(allowed_domains=("a.edu",)),
     )
     return AgentLoop(
         spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
@@ -190,6 +193,38 @@ def test_loop_denied_capability_blocks_tool(tmp_path: Path) -> None:
     assert provider.calls == 0  # the tool never executed
     events = _events(result.run_dir)
     assert any(e["type"] == "capability.denied" and e["data"]["capability"] == "web.search" for e in events)
+
+
+def test_loop_requires_lease_without_broker_fails_closed(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    loop = _cap_loop(tmp_path, provider, None, [_FETCH, _DONE])
+    result = loop.run_once("go")
+
+    # The run can continue after the model sees the tool error, but the protected handler never ran.
+    assert result.status == "completed"
+    assert provider.calls == 0
+    events = _events(result.run_dir)
+    assert any(
+        e["type"] == "capability.denied"
+        and e["data"]["capability"] == "web.search"
+        and e["data"]["reason"] == "capability broker required"
+        for e in events
+    )
+    assert any(
+        e["type"] == "tool.call.failed"
+        and e["data"]["error_code"] == "capability_broker_required"
+        for e in events
+    )
+
+
+def test_loop_requires_lease_optional_without_broker_keeps_dev_bypass(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    loop = _cap_loop(tmp_path, provider, None, [_FETCH, _DONE], requires_lease="optional")
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert provider.calls == 1
+    assert provider.seen_tokens == [None]
 
 
 def test_loop_caches_lease_across_calls(tmp_path: Path) -> None:
@@ -478,13 +513,20 @@ def test_backend_denies_capability_via_factory(tmp_path: Path) -> None:
     assert provider.calls == 0  # the tool never executed
 
 
-def test_backend_no_factory_leaves_gating_off(tmp_path: Path) -> None:
+def test_backend_no_factory_fails_requires_lease_closed(tmp_path: Path) -> None:
     provider = _CapToolProvider()
     backend, workspace = _cap_backend(tmp_path, provider, None)
     assert _run_cap_backend(backend, workspace) == "completed"
-    # No broker -> requires_lease is a no-op; the tool runs and sees no token.
-    assert provider.calls == 1
-    assert provider.seen_tokens == [None]
+    # No broker -> required lease fails closed; the model gets an error observation, and the
+    # protected handler never runs.
+    assert provider.calls == 0
+    run_id = next(iter(backend._records))
+    events = _events(backend._record(run_id).run_dir)
+    assert any(
+        e["type"] == "tool.call.failed"
+        and e["data"]["error_code"] == "capability_broker_required"
+        for e in events
+    )
 
 
 # --- revocation: the vault's fail-closed read path + the operator kill switch --------------

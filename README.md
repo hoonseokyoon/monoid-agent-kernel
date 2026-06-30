@@ -237,9 +237,10 @@ Three optional features on `monoid run`, each off unless its flag is set:
 - `--skills-directory DIR` — load Agent Skills (`SKILL.md` with frontmatter) from `DIR`,
   enabling the progressive-disclosure skill tools.
 - `--capability-broker path.py:factory` — load a `CapabilityBroker` that gates any tool
-  declaring `runtime.requires_lease` behind a scoped, short-lived lease. For local dev,
-  `--auto-grant-capabilities` uses the built-in `AutoGrantBroker` (grants every request,
-  scoped to its binding) instead. Pass at most one of the two.
+  declaring `runtime.requires_lease` behind a scoped, short-lived lease. Required leases fail
+  closed when no broker is configured. For local dev, `--auto-grant-capabilities` uses the built-in
+  `AutoGrantBroker` (grants every request, scoped to its binding) instead. Pass at most one of the
+  two.
 
 For machine-readable real-time progress:
 

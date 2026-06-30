@@ -578,13 +578,17 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
 - **Implicit, binding-declared**: a `ToolBinding` with `runtime.requires_lease` declares its tool's
   `capability` needs a lease; the agent just calls the tool. `AgentLoop(capability_broker=...)`
   gates the call: a cache miss requests a lease (scoped to the binding) and on grant proceeds; a
-  denial raises so the call never runs and the model gets an actionable error. Events
-  `capability.requested` / `capability.granted` / `capability.denied` give the audit trail.
+  denial raises so the call never runs and the model gets an actionable error. If no broker is
+  configured, a required lease fails closed with `capability_broker_required`. For local development
+  only, `runtime.requires_lease="optional"` preserves best-effort gating and lets the tool run
+  without a broker. Events `capability.requested` / `capability.granted` / `capability.denied` give
+  the audit trail.
 - **Using the lease**: the granted handle reaches the running tool via
   `ToolContext.capability_token(capability) -> token_ref | None` (the handle, resolved at the
   edge). The reference backend provisions a per-run broker with
   `RunnerBackend(capability_broker_factory=lambda request: ...)` — scoped to the run's identity
-  (e.g. a `GatewayCapabilityBroker` per tenant); `None` leaves gating off for that run.
+  (e.g. a `GatewayCapabilityBroker` per tenant). `None` is only safe for bindings without required
+  leases, or bindings that explicitly opt into `runtime.requires_lease="optional"`.
 - **Security invariants the core enforces**: a grant may only NARROW the requested scope, never
   widen it (`CapabilityVault.admit` is fail-closed); a lease is expiry-checked before reuse; the
   per-run vault holds handles only and durable (approved) leases are checkpointed as handles, while

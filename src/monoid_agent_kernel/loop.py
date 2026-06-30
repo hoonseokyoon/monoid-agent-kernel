@@ -703,9 +703,11 @@ class AgentLoop:
     # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
     # Defaults to a local-fs store under the run root; a backend injects a durable one.
     checkpoint_store: CheckpointStore | None = None
-    # Optional capability broker: when set, a bound tool that declares ``runtime.requires_lease``
+    # Optional capability broker: a bound tool that declares ``runtime.requires_lease=True``
     # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
-    # Secrets stay in the broker; the core only gates on the lease. None = capability gating off.
+    # Secrets stay in the broker; the core only gates on the lease. If no broker is configured,
+    # required leases fail closed; use ``runtime.requires_lease="optional"`` for explicit dev-only
+    # best-effort gating.
     capability_broker: CapabilityBroker | None = None
     # When True (default), after a gated tool's capability is granted the loop auto-executes the
     # gated call (no model retry); see ⑤ auto-redispatch. When False, the model must retry the tool
@@ -3842,15 +3844,41 @@ class AgentLoop:
         cached or was granted synchronously), or a *pending* ``ToolResult`` when the broker
         escalated the request (the run will park on a ``capability`` task and the model retries the
         tool once granted). A denial — or a scope-widening grant — raises ``PermissionDenied`` so the
-        call never runs. A no-op unless a broker is configured AND the binding declares
-        ``runtime.requires_lease``. Secrets never enter the core — a lease carries only a handle."""
+        call never runs. A no-op unless the binding declares ``runtime.requires_lease``. Required
+        leases fail closed when no broker is configured; ``"optional"`` keeps the old dev-only
+        best-effort behavior. Secrets never enter the core — a lease carries only a handle."""
         broker = self.capability_broker
         runtime = bound_tool.binding.runtime or {}
-        if broker is None or not runtime.get("requires_lease"):
+        lease_requirement = runtime.get("requires_lease")
+        if not lease_requirement:
             return None
         capability = bound_tool.base_spec.capability
         if not capability:
-            return None
+            raise PermissionDenied(
+                f"tool binding {bound_tool.binding_id!r} requires a capability lease, "
+                "but its tool declares no capability",
+                error_code="capability_required",
+            )
+        if broker is None:
+            if lease_requirement == "optional":
+                return None
+            parent_id = started_event.event_id if started_event else None
+            recorder.emit(
+                "capability.denied",
+                turn_id=turn_id,
+                parent_id=parent_id,
+                level="warning",
+                data={
+                    "capability": capability,
+                    "binding_id": bound_tool.binding_id,
+                    "reason": "capability broker required",
+                    "retryable": False,
+                },
+            )
+            raise PermissionDenied(
+                f"capability broker required for {capability}",
+                error_code="capability_broker_required",
+            )
         scope = {key: value for key, value in bound_tool.binding.scope.to_json().items() if value}
         now = time.time()
         binding_id = bound_tool.binding_id
