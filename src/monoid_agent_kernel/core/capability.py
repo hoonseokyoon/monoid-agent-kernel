@@ -29,6 +29,17 @@ from monoid_agent_kernel.identifiers import namespaced_id
 
 CAPABILITY_REQUEST_VERSION = namespaced_id("capability-request.v1")
 CAPABILITY_LEASE_VERSION = namespaced_id("capability-lease.v1")
+_NUMERIC_SCOPE_CAP_KEYS = frozenset(
+    {
+        "max_calls",
+        "max_results",
+        "max_bytes",
+        "timeout_s",
+        "max_tokens",
+        "max_urls",
+        "max_snippets",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -173,8 +184,9 @@ class CapabilityBroker(Protocol):
 def scope_within(inner: dict[str, Any], outer: dict[str, Any]) -> bool:
     """True if ``inner`` scope is no broader than ``outer`` — the least-privilege check the core
     applies to a grant (grant.scope must be ⊆ request.scope). List-valued constraints (e.g.
-    ``allowed_domains``) must be a subset; scalar constraints must be equal; a key absent from
-    ``outer`` means *unconstrained* there, so any ``inner`` value is within."""
+    ``allowed_domains``) must be a subset; numeric cap constraints may be lower; other scalar
+    constraints must be equal. A key absent from ``outer`` means *unconstrained* there, so any
+    ``inner`` value is within."""
     for key, inner_val in inner.items():
         if key not in outer:
             continue  # outer is unconstrained on this key -> inner is within
@@ -182,9 +194,27 @@ def scope_within(inner: dict[str, Any], outer: dict[str, Any]) -> bool:
         if isinstance(inner_val, (list, tuple, set)) and isinstance(outer_val, (list, tuple, set)):
             if not set(inner_val) <= set(outer_val):
                 return False
+        elif key in _NUMERIC_SCOPE_CAP_KEYS and _numeric_cap_within(inner_val, outer_val):
+            continue
         elif inner_val != outer_val:
             return False
     return True
+
+
+def _numeric_cap_within(inner_val: Any, outer_val: Any) -> bool:
+    if isinstance(inner_val, bool) or isinstance(outer_val, bool):
+        return False
+    if not isinstance(inner_val, int | float) or not isinstance(outer_val, int | float):
+        return False
+    return float(inner_val) <= float(outer_val)
+
+
+@dataclass
+class CapabilityRevocationState:
+    lease_ids: set[str] = field(default_factory=set)
+    capabilities: set[str] = field(default_factory=set)
+    before: float = 0.0
+    all_revoked: bool = False
 
 
 @dataclass
@@ -203,13 +233,44 @@ class CapabilityVault:
     permissive broker."""
 
     _leases: dict[str, CapabilityLease] = field(default_factory=dict)
-    _revoked_lease_ids: set[str] = field(default_factory=set)
-    _revoked_capabilities: set[str] = field(default_factory=set)
-    _revoked_before: float = 0.0
+    _revocations: CapabilityRevocationState = field(default_factory=CapabilityRevocationState)
+
+    @property
+    def _revoked_lease_ids(self) -> set[str]:
+        return self._revocations.lease_ids
+
+    @_revoked_lease_ids.setter
+    def _revoked_lease_ids(self, value: set[str]) -> None:
+        self._revocations.lease_ids = value
+
+    @property
+    def _revoked_capabilities(self) -> set[str]:
+        return self._revocations.capabilities
+
+    @_revoked_capabilities.setter
+    def _revoked_capabilities(self, value: set[str]) -> None:
+        self._revocations.capabilities = value
+
+    @property
+    def _revoked_before(self) -> float:
+        return self._revocations.before
+
+    @_revoked_before.setter
+    def _revoked_before(self, value: float) -> None:
+        self._revocations.before = value
+
+    @property
+    def _revoked_all(self) -> bool:
+        return self._revocations.all_revoked
+
+    @_revoked_all.setter
+    def _revoked_all(self, value: bool) -> None:
+        self._revocations.all_revoked = value
 
     def _is_revoked(self, lease: CapabilityLease) -> bool:
         return (
-            lease.lease_id in self._revoked_lease_ids
+            self._revoked_all
+            or lease.lease_id in self._revoked_lease_ids
             or lease.capability in self._revoked_capabilities
             or lease.issued_at < self._revoked_before
         )
@@ -260,12 +321,12 @@ class CapabilityVault:
           - ``before`` — a watermark: every lease issued before this epoch time is rejected in O(1)
             (a bulk cohort kill).
         Revocation is monotonic and additive — there is no un-revoke (start a fresh lease cohort)."""
-        revoked_caps = sorted(self._leases.keys()) if capability == "*" else []
+        revoked_caps = ["*"] if capability == "*" else []
         if capability and capability != "*":
             self._revoked_capabilities.add(capability)
             revoked_caps = [capability]
         elif capability == "*":
-            self._revoked_capabilities.update(self._leases.keys())
+            self._revoked_all = True
         if lease_id:
             self._revoked_lease_ids.add(lease_id)
         if before is not None:
@@ -279,7 +340,7 @@ class CapabilityVault:
     def is_capability_revoked(self, capability: str) -> bool:
         """True if this capability is under a per-capability revocation — the gate's hard stop that
         refuses to even re-broker (so revocation cannot be undone by a permissive broker)."""
-        return capability in self._revoked_capabilities
+        return self._revoked_all or capability in self._revoked_capabilities
 
     def export_durable(self) -> list[dict[str, Any]]:
         """Serialize the leases marked ``durable`` (e.g. human/policy-approved) for the checkpoint.
@@ -291,11 +352,28 @@ class CapabilityVault:
     def export_revocations(self) -> dict[str, Any]:
         """Serialize the revocation records for the checkpoint, so a revoked durable lease stays
         dead across a restart (the kill switch must not be forgotten when the run resumes)."""
+        capabilities = sorted(self._revoked_capabilities)
+        if self._revoked_all and "*" not in capabilities:
+            capabilities = ["*", *capabilities]
         return {
             "revoked_lease_ids": sorted(self._revoked_lease_ids),
-            "revoked_capabilities": sorted(self._revoked_capabilities),
+            "revoked_capabilities": capabilities,
             "revoked_before": self._revoked_before,
+            "revoked_all": self._revoked_all,
         }
+
+    def fork_for_child(self) -> CapabilityVault:
+        """Create a child-run vault with isolated live lease slots and shared revocations.
+
+        Durable grants are copied into the child so approved access survives delegation, while
+        ephemeral live leases stay local to each run. Revocations share one state object so an
+        operator kill switch in the parent is immediately visible to already-running children.
+        """
+        child = CapabilityVault(_revocations=self._revocations)
+        for lease in self._leases.values():
+            if lease.durable:
+                child.install(lease)
+        return child
 
     def import_revocations(
         self,
@@ -303,11 +381,17 @@ class CapabilityVault:
         lease_ids: list[str] | None = None,
         capabilities: list[str] | None = None,
         before: float = 0.0,
+        all_revoked: bool = False,
     ) -> None:
         """Rehydrate revocation records on restore (paired with :meth:`export_revocations`)."""
         self._revoked_lease_ids.update(lease_ids or ())
-        self._revoked_capabilities.update(capabilities or ())
+        imported_capabilities = set(capabilities or ())
+        if "*" in imported_capabilities:
+            all_revoked = True
+            imported_capabilities.discard("*")
+        self._revoked_capabilities.update(imported_capabilities)
         self._revoked_before = max(self._revoked_before, before)
+        self._revoked_all = self._revoked_all or all_revoked
 
     def install(self, lease: CapabilityLease) -> None:
         """Directly install a lease (no scope re-check) — used on restore to rehydrate durable

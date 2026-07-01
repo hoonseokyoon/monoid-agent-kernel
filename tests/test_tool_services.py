@@ -3,7 +3,55 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.tool_services import CallContext, JobsService, ShellService, WebService
+
+
+@dataclass
+class _RecordedEvent:
+    event_id: str
+
+
+@dataclass
+class _RecordingRecorder:
+    events: list[dict[str, Any]]
+
+    def emit(
+        self,
+        event_type: str,
+        *,
+        turn_id: str | None = None,
+        parent_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        level: str = "info",
+    ) -> _RecordedEvent:
+        event_id = f"event_{len(self.events) + 1}"
+        self.events.append(
+            {
+                "event_id": event_id,
+                "type": event_type,
+                "turn_id": turn_id,
+                "parent_id": parent_id,
+                "data": dict(data or {}),
+                "level": level,
+            }
+        )
+        return _RecordedEvent(event_id)
+
+
+@dataclass
+class _CapturingWebGateway:
+    payloads: list[dict[str, Any]]
+
+    def fetch(self, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
+        del token
+        self.payloads.append(dict(payload))
+        return {
+            "final_url": payload["url"],
+            "content": "ok",
+            "content_bytes": 2,
+            "truncated": False,
+        }
 
 
 def test_call_context_holds_in_flight_ids() -> None:
@@ -39,6 +87,29 @@ def test_web_service_metrics_keys() -> None:
         "web_context_bytes_returned",
     }
     assert all(value == 0 for value in service.metrics().values())
+
+
+def test_web_fetch_payload_carries_binding_domain_constraints() -> None:
+    recorder = _RecordingRecorder(events=[])
+    gateway = _CapturingWebGateway(payloads=[])
+    service = WebService(recorder=recorder, web_gateway_client=gateway)  # type: ignore[arg-type]
+    call = CallContext(
+        tool_call_id="call_1",
+        turn_id="turn_1",
+        tool_event_id="tool_event_1",
+        binding_id="fetch_docs",
+        scope=ToolScope(
+            allowed_domains=("docs.example.test",),
+            blocked_domains=("blog.example.test",),
+        ),
+    )
+
+    service.fetch({"url": "https://docs.example.test/page"}, call)
+
+    assert gateway.payloads[0]["allowed_domains"] == ["docs.example.test"]
+    assert gateway.payloads[0]["blocked_domains"] == ["blog.example.test"]
+    assert recorder.events[0]["data"]["allowed_domains"] == ["docs.example.test"]
+    assert recorder.events[0]["data"]["blocked_domains"] == ["blog.example.test"]
 
 
 @dataclass

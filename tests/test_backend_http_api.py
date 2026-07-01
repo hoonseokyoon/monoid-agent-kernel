@@ -22,6 +22,8 @@ from support.backend_harness import (
     threading,
     urlopen,
 )
+from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
+from monoid_agent_kernel.recorder import append_event_to_run
 
 pytestmark = pytest.mark.integration
 
@@ -101,6 +103,33 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
         assert result["final_text"] == "done"
         events = _json_get(f"{base_url}/v1/runs/{run_id}/events?from_seq=1", token=run_token)
         assert events["events"][0]["seq"] == 1
+        page1 = _json_get(f"{base_url}/v1/runs/{run_id}/events?from_seq=1&limit=2", token=run_token)
+        assert [event["seq"] for event in page1["events"]] == [1, 2]
+        assert page1["next_seq"] == 3
+        assert page1["has_more"] is True
+        page2 = _json_get(
+            f"{base_url}/v1/runs/{run_id}/events?from_seq={page1['next_seq']}&limit=2",
+            token=run_token,
+        )
+        assert page2["events"][0]["seq"] == 3
+        traceparent = new_traceparent()
+        trace_event = append_event_to_run(
+            backend._record(run_id).run_dir,
+            "outbox.requested",
+            data={
+                "request_id": "trace_fixture",
+                "destination": "diagnostics",
+                "capability": "test.trace",
+                "traceparent": traceparent,
+            },
+        )
+        diagnostics = _json_get(f"{base_url}/v1/runs/{run_id}/diagnostics?event_limit=1", token=run_token)
+        assert diagnostics["status"]["status"] == "completed"
+        assert [event["seq"] for event in diagnostics["events"]["items"]] == [trace_event.seq]
+        assert diagnostics["events"]["next_seq"] >= diagnostics["events"]["from_seq"]
+        assert diagnostics["failure"] is None
+        assert diagnostics["recovery"]["attempts"] == 0
+        assert trace_id_of(traceparent) in diagnostics["trace_ids"]
         usage = _json_get(f"{base_url}/v1/tenants/tenant_a/usage", token="admin")
         assert usage["total_tokens"] == 10
     finally:

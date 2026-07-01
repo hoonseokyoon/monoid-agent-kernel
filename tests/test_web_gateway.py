@@ -35,8 +35,8 @@ from monoid_agent_kernel.reference.web_gateway.providers import (
     HttpFetchProvider,
     SearchFetchContextProvider,
 )
-from monoid_agent_kernel.reference.web_gateway.service import WebGatewayBackend
-from monoid_agent_kernel.web import WebGatewayClient
+from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
+from monoid_agent_kernel.web import WebGatewayClient, WebGatewayError
 
 pytestmark = pytest.mark.integration
 
@@ -54,6 +54,25 @@ def _web_token(manager: TokenManager, *, run_id: str = "run_1", tenant_id: str =
         user_id="user_a",
         ttl_s=600,
         metadata={"agent_config_hash": "test"},
+    )
+
+
+def _scoped_web_token(
+    manager: TokenManager,
+    *,
+    scope: dict[str, Any],
+    capability: str = "web.search",
+    run_id: str = "run_1",
+    tenant_id: str = "tenant_a",
+) -> str:
+    return manager.issue(
+        kind="web_gateway",
+        audience="csp.web-gateway",
+        run_id=run_id,
+        tenant_id=tenant_id,
+        user_id="user_a",
+        ttl_s=600,
+        metadata={"capability": capability, "scope": scope},
     )
 
 
@@ -86,6 +105,237 @@ def test_web_gateway_enforces_binding_constraints_usage_and_domains() -> None:
         )
     with pytest.raises(TokenError):
         manager.verify(token, kind="llm_gateway", audience="csp.llm-gateway")
+
+
+def test_web_gateway_rejects_payload_domain_escalation_before_provider() -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(
+        manager,
+        scope={
+            "binding_id": "search_docs",
+            "max_calls": 2,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    with pytest.raises(Exception, match="allowed_domains exceeds signed token scope"):
+        gateway.handle_search(
+            token,
+            {
+                "binding_id": "search_docs",
+                "query": "binding",
+                "allowed_domains": ["blog.example.test"],
+            },
+        )
+
+    assert provider.search_calls == 0
+    assert gateway.tenant_usage("tenant_a")["search_calls"] == 0
+
+
+def test_web_gateway_allows_signed_wildcard_domain_narrowing() -> None:
+    manager = _token_manager()
+    gateway = WebGatewayBackend(token_manager=manager)
+    token = _scoped_web_token(
+        manager,
+        scope={
+            "binding_id": "search_docs",
+            "max_results": 3,
+            "allowed_domains": ["*.example.test"],
+        },
+    )
+
+    search = gateway.handle_search(
+        token,
+        {
+            "binding_id": "search_docs",
+            "query": "agent",
+            "allowed_domains": ["*.docs.example.test"],
+        },
+    )
+
+    assert search["result_count"] >= 1
+    assert {result["domain"] for result in search["results"]} == {"docs.example.test"}
+
+
+def test_web_gateway_applies_signed_scope_when_payload_omits_constraints() -> None:
+    manager = _token_manager()
+    gateway = WebGatewayBackend(token_manager=manager)
+    token = _scoped_web_token(
+        manager,
+        scope={
+            "binding_id": "search_docs",
+            "max_calls": 1,
+            "max_results": 1,
+            "allowed_domains": ["docs.example.test"],
+            "blocked_domains": ["blog.example.test"],
+        },
+    )
+
+    search = gateway.handle_search(token, {"query": "binding"})
+
+    assert search["result_count"] == 1
+    assert search["effective_max_results"] == 1
+    assert {result["domain"] for result in search["results"]} == {"docs.example.test"}
+    with pytest.raises(Exception, match="limit exceeded"):
+        gateway.handle_search(token, {"query": "binding"})
+
+
+def test_web_gateway_applies_signed_fetch_and_context_caps_when_omitted() -> None:
+    class ObservingProvider(FakeWebProvider):
+        last_timeout_s: int | None = None
+        last_max_bytes: int | None = None
+
+        def fetch(
+            self,
+            url: str,
+            *,
+            format: str,
+            allowed_domains: tuple[str, ...] = (),
+            blocked_domains: tuple[str, ...] = (),
+            timeout_s: int | None = None,
+            max_bytes: int | None = None,
+        ) -> dict[str, Any]:
+            self.last_timeout_s = timeout_s
+            self.last_max_bytes = max_bytes
+            return super().fetch(
+                url,
+                format=format,
+                allowed_domains=allowed_domains,
+                blocked_domains=blocked_domains,
+                timeout_s=timeout_s,
+                max_bytes=max_bytes,
+            )
+
+    manager = _token_manager()
+    provider = ObservingProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    fetch_token = _scoped_web_token(
+        manager,
+        capability="web.fetch",
+        scope={
+            "binding_id": "fetch_docs",
+            "max_bytes": 12,
+            "timeout_s": 2,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    fetched = gateway.handle_fetch(
+        fetch_token,
+        {"url": "https://docs.example.test/monoid-agent-kernel/web"},
+    )
+
+    assert fetched["effective_max_bytes"] == 12
+    assert fetched["effective_timeout_s"] == 2
+    assert fetched["truncated"] is True
+    assert fetched["content_bytes"] <= 12
+    assert provider.last_timeout_s == 2
+    assert provider.last_max_bytes == 12
+
+    context_token = _scoped_web_token(
+        manager,
+        capability="web.context",
+        run_id="run_context",
+        scope={
+            "binding_id": "context_docs",
+            "max_tokens": 2,
+            "max_urls": 1,
+            "max_snippets": 1,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    context = gateway.handle_context(context_token, {"query": "binding"})
+
+    assert context["effective_max_tokens"] == 2
+    assert context["effective_max_urls"] == 1
+    assert context["effective_max_snippets"] == 1
+
+
+def test_web_gateway_rejects_scoped_fetch_redirect_to_unscoped_domain() -> None:
+    class RedirectingProvider(FakeWebProvider):
+        def fetch(
+            self,
+            url: str,
+            *,
+            format: str,
+            allowed_domains: tuple[str, ...] = (),
+            blocked_domains: tuple[str, ...] = (),
+            timeout_s: int | None = None,
+            max_bytes: int | None = None,
+        ) -> dict[str, Any]:
+            del url, format, allowed_domains, blocked_domains, timeout_s, max_bytes
+            return {
+                "title": "Redirected",
+                "final_url": "https://blog.example.test/redirected",
+                "content": "redirected content",
+                "source": "test",
+            }
+
+    manager = _token_manager()
+    gateway = WebGatewayBackend(token_manager=manager, provider=RedirectingProvider())
+    token = _scoped_web_token(
+        manager,
+        capability="web.fetch",
+        scope={
+            "binding_id": "fetch_docs",
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    with pytest.raises(Exception, match="final domain is not allowed"):
+        gateway.handle_fetch(token, {"url": "https://docs.example.test/open-redirect"})
+
+    assert gateway.tenant_usage("tenant_a")["fetch_calls"] == 0
+
+
+def test_web_gateway_rejects_scoped_token_for_wrong_endpoint() -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(
+        manager,
+        capability="web.search",
+        scope={
+            "binding_id": "search_docs",
+            "max_calls": 1,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    with pytest.raises(Exception, match="capability does not match endpoint"):
+        gateway.handle_fetch(token, {"url": "https://docs.example.test/monoid-agent-kernel/web"})
+    with pytest.raises(Exception, match="capability does not match endpoint"):
+        gateway.handle_context(token, {"query": "binding"})
+
+    assert provider.fetch_calls == 0
+    assert provider.context_calls == 0
+
+
+def test_web_gateway_rejects_signed_binding_and_numeric_escalation() -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(
+        manager,
+        scope={
+            "binding_id": "search_docs",
+            "max_calls": 1,
+            "max_results": 1,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    with pytest.raises(Exception, match="binding_id exceeds signed token scope"):
+        gateway.handle_search(token, {"binding_id": "other", "query": "binding"})
+    with pytest.raises(Exception, match="max_calls must be positive"):
+        gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "max_calls": 0})
+    with pytest.raises(Exception, match="max_results exceeds signed token scope"):
+        gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "max_results": 2})
+
+    assert provider.search_calls == 0
 
 
 def test_web_gateway_client_retries_transient_connection_error(monkeypatch) -> None:
@@ -264,6 +514,42 @@ def test_web_providers_contract() -> None:
         upstream.stop()
 
 
+def test_http_fetch_provider_rejects_redirect_before_disallowed_request() -> None:
+    upstream = _FakeUpstreamServer()
+    upstream.start()
+    try:
+        fetch_provider = HttpFetchProvider(timeout_s=5, max_raw_bytes=20_000)
+        with pytest.raises(WebGatewayError) as exc_info:
+            fetch_provider.fetch(
+                f"{upstream.base_url}/redirect-to-localhost",
+                format="text",
+                allowed_domains=("127.0.0.1",),
+            )
+
+        assert exc_info.value.error_code == "web_binding_denied"
+        assert upstream.blocked_hits == 0
+    finally:
+        upstream.stop()
+
+
+def test_http_fetch_provider_trims_to_requested_max_bytes() -> None:
+    upstream = _FakeUpstreamServer()
+    upstream.start()
+    try:
+        fetch_provider = HttpFetchProvider(timeout_s=5, max_raw_bytes=20_000)
+        fetched = fetch_provider.fetch(
+            f"{upstream.base_url}/large-text",
+            format="text",
+            allowed_domains=("127.0.0.1",),
+            max_bytes=5,
+        )
+
+        assert fetched["content"] == "abcde"
+        assert len(fetched["content"].encode("utf-8")) == 5
+    finally:
+        upstream.stop()
+
+
 def test_brave_llm_context_provider_contract() -> None:
     upstream = _FakeUpstreamServer()
     upstream.start()
@@ -302,6 +588,7 @@ def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
 class _FakeUpstreamServer:
     def __init__(self) -> None:
         self.last_brave_headers: dict[str, str] = {}
+        self.blocked_hits = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -332,6 +619,18 @@ class _FakeUpstreamServer:
                         "<html><head><title>Monoid Docs</title></head>"
                         "<body><main><p>Brave search result body for the kernel.</p></main></body></html>"
                     )
+                    return
+                if parsed.path == "/large-text":
+                    self._write_text("abcdef")
+                    return
+                if parsed.path == "/redirect-to-localhost":
+                    self.send_response(302)
+                    self.send_header("Location", f"http://localhost:{outer.port}/blocked-target")
+                    self.end_headers()
+                    return
+                if parsed.path == "/blocked-target":
+                    outer.blocked_hits += 1
+                    self._write_html("<html><body>blocked target</body></html>")
                     return
                 self.send_response(404)
                 self.end_headers()
@@ -374,6 +673,14 @@ class _FakeUpstreamServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _write_text(self, text: str) -> None:
+                body = text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
         self.server = HardenedThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever)
 
@@ -393,3 +700,59 @@ class _FakeUpstreamServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+
+
+class _CountingWebProvider:
+    def __init__(self) -> None:
+        self.delegate = FakeWebProvider()
+        self.search_calls = 0
+        self.fetch_calls = 0
+        self.context_calls = 0
+
+    def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
+        self.search_calls += 1
+        return self.delegate.search(query, max_results=max_results)
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        format: str,
+        allowed_domains: tuple[str, ...] = (),
+        blocked_domains: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        max_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        self.fetch_calls += 1
+        return self.delegate.fetch(
+            url,
+            format=format,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
+            timeout_s=timeout_s,
+            max_bytes=max_bytes,
+        )
+
+    def context(
+        self,
+        query: str,
+        *,
+        max_tokens: int,
+        max_urls: int,
+        max_snippets: int,
+        locale: str | None,
+        freshness: str | None,
+        allowed_domains: tuple[str, ...],
+        blocked_domains: tuple[str, ...],
+    ) -> dict[str, Any]:
+        self.context_calls += 1
+        return self.delegate.context(
+            query,
+            max_tokens=max_tokens,
+            max_urls=max_urls,
+            max_snippets=max_snippets,
+            locale=locale,
+            freshness=freshness,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
+        )

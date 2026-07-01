@@ -11,6 +11,7 @@ from monoid_agent_kernel.web import (
     WebGatewayError,
     domain_allowed,
     domain_from_url,
+    domain_matches,
 )
 
 
@@ -18,7 +19,16 @@ class WebProvider(Protocol):
     def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
         ...
 
-    def fetch(self, url: str, *, format: str) -> dict[str, Any]:
+    def fetch(
+        self,
+        url: str,
+        *,
+        format: str,
+        allowed_domains: tuple[str, ...] = (),
+        blocked_domains: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        max_bytes: int | None = None,
+    ) -> dict[str, Any]:
         ...
 
     def context(
@@ -85,8 +95,18 @@ class FakeWebProvider:
             for _score, item in scored[:max_results]
         ]
 
-    def fetch(self, url: str, *, format: str) -> dict[str, Any]:
+    def fetch(
+        self,
+        url: str,
+        *,
+        format: str,
+        allowed_domains: tuple[str, ...] = (),
+        blocked_domains: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        max_bytes: int | None = None,
+    ) -> dict[str, Any]:
         del format
+        del allowed_domains, blocked_domains, timeout_s, max_bytes
         for item in self.corpus:
             if item["url"] == url:
                 return {
@@ -127,7 +147,12 @@ class FakeWebProvider:
         used_chars = 0
         for result in results:
             url = str(result.get("url") or "")
-            page = self.fetch(url, format="markdown")
+            page = self.fetch(
+                url,
+                format="markdown",
+                allowed_domains=allowed_domains,
+                blocked_domains=blocked_domains,
+            )
             content = str(page.get("content") or "")
             if not content:
                 continue
@@ -210,6 +235,7 @@ class WebGatewayBackend:
 
     def handle_search(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = _apply_signed_scope(claims, payload, expected_capability="web.search")
         self._check_binding_limit(claims, payload, error_code="web_search_limit_exceeded")
         query = str(payload.get("query") or "")
         if not query.strip():
@@ -240,6 +266,7 @@ class WebGatewayBackend:
 
     def handle_fetch(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = _apply_signed_scope(claims, payload, expected_capability="web.fetch")
         self._check_binding_limit(claims, payload, error_code="web_fetch_limit_exceeded")
         url = str(payload.get("url") or "")
         if not url.strip():
@@ -255,7 +282,21 @@ class WebGatewayBackend:
         output_format = str(payload.get("format") or "text")
         effective_timeout_s = max(1, int(payload.get("timeout_s") or 30))
         effective_max_bytes = max(1, int(payload.get("max_bytes") or 100_000))
-        fetched = self.provider.fetch(url, format=output_format)
+        fetched = self.provider.fetch(
+            url,
+            format=output_format,
+            allowed_domains=request_allowed,
+            blocked_domains=request_blocked,
+            timeout_s=effective_timeout_s,
+            max_bytes=effective_max_bytes,
+        )
+        final_url = str(fetched.get("final_url") or url)
+        final_domain = domain_from_url(final_url)
+        if not domain_allowed(final_domain, allowed_domains=request_allowed, blocked_domains=request_blocked):
+            raise WebGatewayError(
+                f"final domain is not allowed by binding constraints: {final_domain}",
+                error_code="web_binding_denied",
+            )
         content = str(fetched.get("content") or "")
         encoded = content.encode("utf-8")
         truncated = len(encoded) > effective_max_bytes
@@ -266,8 +307,8 @@ class WebGatewayBackend:
         response = {
             "protocol": namespaced_id("web-fetch-result.v1"),
             "url": url,
-            "final_url": str(fetched.get("final_url") or url),
-            "domain": domain_from_url(str(fetched.get("final_url") or url)),
+            "final_url": final_url,
+            "domain": final_domain,
             "title": str(fetched.get("title") or ""),
             "format": output_format,
             "content": content,
@@ -290,6 +331,7 @@ class WebGatewayBackend:
 
     def handle_context(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = _apply_signed_scope(claims, payload, expected_capability="web.context")
         self._check_binding_limit(claims, payload, error_code="web_context_limit_exceeded")
         query = str(payload.get("query") or "")
         if not query.strip():
@@ -392,6 +434,131 @@ def _domain_tuple(value: Any) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         raise ValueError("domain filters must be arrays")
     return tuple(str(item).strip().lower() for item in value if str(item).strip())
+
+
+def _apply_signed_scope(claims: TokenClaims, payload: dict[str, Any], *, expected_capability: str) -> dict[str, Any]:
+    metadata = claims.metadata or {}
+    scope = metadata.get("scope")
+    capability = str(metadata.get("capability") or "").strip()
+    if capability.startswith("web.") and capability != expected_capability:
+        raise WebGatewayError(
+            "web gateway token capability does not match endpoint",
+            error_code="web_scope_denied",
+        )
+    if scope is None:
+        if capability.startswith("web."):
+            raise WebGatewayError(
+                "web gateway capability token is missing signed scope",
+                error_code="web_scope_required",
+            )
+        return payload
+    if not isinstance(scope, dict):
+        raise WebGatewayError("web gateway token signed scope is invalid", error_code="web_scope_invalid")
+    if capability != expected_capability:
+        raise WebGatewayError(
+            "web gateway scoped token capability does not match endpoint",
+            error_code="web_scope_denied",
+        )
+
+    effective = dict(payload)
+    _enforce_binding_id(scope, effective)
+    _enforce_allowed_domains(scope, effective)
+    _merge_blocked_domains(scope, effective)
+    for key in (
+        "max_calls",
+        "max_results",
+        "max_bytes",
+        "timeout_s",
+        "max_tokens",
+        "max_urls",
+        "max_snippets",
+    ):
+        _enforce_numeric_cap(scope, effective, key)
+    return effective
+
+
+def _enforce_binding_id(scope: dict[str, Any], payload: dict[str, Any]) -> None:
+    signed = str(scope.get("binding_id") or "").strip()
+    if not signed:
+        return
+    requested = str(payload.get("binding_id") or "").strip()
+    if requested and requested != signed:
+        raise WebGatewayError(
+            "web request binding_id exceeds signed token scope",
+            error_code="web_scope_denied",
+        )
+    payload["binding_id"] = signed
+
+
+def _enforce_allowed_domains(scope: dict[str, Any], payload: dict[str, Any]) -> None:
+    if "allowed_domains" not in scope:
+        return
+    signed = _domain_tuple(scope.get("allowed_domains") or ())
+    requested = _domain_tuple(payload.get("allowed_domains") or ())
+    if signed and requested and not _domain_patterns_within(requested, signed):
+        raise WebGatewayError(
+            "web request allowed_domains exceeds signed token scope",
+            error_code="web_scope_denied",
+        )
+    if signed:
+        payload["allowed_domains"] = list(requested or signed)
+
+
+def _merge_blocked_domains(scope: dict[str, Any], payload: dict[str, Any]) -> None:
+    if "blocked_domains" not in scope:
+        return
+    signed = _domain_tuple(scope.get("blocked_domains") or ())
+    requested = _domain_tuple(payload.get("blocked_domains") or ())
+    merged = tuple(dict.fromkeys((*signed, *requested)))
+    payload["blocked_domains"] = list(merged)
+
+
+def _enforce_numeric_cap(
+    scope: dict[str, Any],
+    payload: dict[str, Any],
+    key: str,
+) -> None:
+    if key not in scope or scope.get(key) is None:
+        return
+    signed = int(scope[key])
+    if signed <= 0:
+        raise WebGatewayError(f"web token {key} signed scope must be positive", error_code="web_scope_invalid")
+    requested_raw = payload.get(key)
+    if requested_raw is None:
+        payload[key] = signed
+        return
+    requested = int(requested_raw)
+    if requested <= 0:
+        raise WebGatewayError(f"web request {key} must be positive", error_code="web_scope_denied")
+    if requested > signed:
+        raise WebGatewayError(
+            f"web request {key} exceeds signed token scope",
+            error_code="web_scope_denied",
+        )
+
+
+def _domain_patterns_within(requested: tuple[str, ...], signed: tuple[str, ...]) -> bool:
+    if "*" in signed:
+        return True
+    for pattern in requested:
+        if not any(_domain_pattern_within(pattern, signed_pattern) for signed_pattern in signed):
+            return False
+    return True
+
+
+def _domain_pattern_within(pattern: str, signed_pattern: str) -> bool:
+    pattern = pattern.lower().strip()
+    signed_pattern = signed_pattern.lower().strip()
+    if signed_pattern == "*":
+        return True
+    if pattern == "*":
+        return False
+    if pattern == signed_pattern:
+        return True
+    if pattern.startswith("*."):
+        suffix = pattern[2:].strip(".")
+        return bool(suffix) and signed_pattern.startswith("*.") and domain_matches(suffix, signed_pattern)
+    return domain_matches(pattern, signed_pattern)
 
 
 def _filter_context_result(

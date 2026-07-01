@@ -36,6 +36,8 @@ from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 def test_scope_within_list_subset_and_scalar_equality() -> None:
     assert scope_within({"allowed_domains": ["a.edu"]}, {"allowed_domains": ["a.edu", "b.edu"]})
     assert not scope_within({"allowed_domains": ["c.edu"]}, {"allowed_domains": ["a.edu"]})
+    assert scope_within({"max_results": 5}, {"max_results": 10})
+    assert not scope_within({"max_results": 15}, {"max_results": 10})
     assert scope_within({"region": "us"}, {"region": "us"})
     assert not scope_within({"region": "eu"}, {"region": "us"})
     # A key absent from the outer scope means "unconstrained" there -> inner is within.
@@ -84,6 +86,22 @@ def test_vault_admit_rejects_scope_widening() -> None:
         vault.admit(request, widened)
 
 
+def test_vault_admit_accepts_narrower_numeric_web_caps() -> None:
+    vault = CapabilityVault()
+    request = CapabilityRequest(
+        capability="web.search",
+        scope={"allowed_domains": ["a.edu"], "max_calls": 4, "max_results": 10},
+    )
+    narrowed = CapabilityLease(
+        capability="web.search",
+        token_ref="t",
+        expires_at=2000.0,
+        scope={"allowed_domains": ["a.edu"], "max_calls": 2, "max_results": 5},
+    )
+
+    assert vault.admit(request, narrowed) is narrowed
+
+
 def test_request_and_lease_round_trip_json() -> None:
     req = CapabilityRequest(capability="email.send", scope={"to": ["x@example.edu"]}, reason="reply")
     assert req.to_json()["protocol"] == "monoid.capability-request.v1"
@@ -127,24 +145,29 @@ class _CountingBroker:
     def __init__(self, inner: object) -> None:
         self.inner = inner
         self.requests = 0
+        self.last_request: CapabilityRequest | None = None
 
     def request(self, req: CapabilityRequest) -> CapabilityGrant:
         self.requests += 1
+        self.last_request = req
         return self.inner.request(req)  # type: ignore[attr-defined]
 
 
 def _cap_loop(
     tmp_path: Path,
     provider: _CapToolProvider,
-    broker: object,
+    broker: object | None,
     turns: list[ModelTurn],
     *,
     rotate_skew: float = 0.0,
+    requires_lease: bool | str = True,
 ) -> AgentLoop:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     binding = tool_binding(
-        "ext.fetch", runtime={"requires_lease": True}, scope=ToolScope(allowed_domains=("a.edu",))
+        "ext.fetch",
+        runtime={"requires_lease": requires_lease},
+        scope=ToolScope(allowed_domains=("a.edu",)),
     )
     return AgentLoop(
         spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
@@ -190,6 +213,38 @@ def test_loop_denied_capability_blocks_tool(tmp_path: Path) -> None:
     assert provider.calls == 0  # the tool never executed
     events = _events(result.run_dir)
     assert any(e["type"] == "capability.denied" and e["data"]["capability"] == "web.search" for e in events)
+
+
+def test_loop_requires_lease_without_broker_fails_closed(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    loop = _cap_loop(tmp_path, provider, None, [_FETCH, _DONE])
+    result = loop.run_once("go")
+
+    # The run can continue after the model sees the tool error, but the protected handler never ran.
+    assert result.status == "completed"
+    assert provider.calls == 0
+    events = _events(result.run_dir)
+    assert any(
+        e["type"] == "capability.denied"
+        and e["data"]["capability"] == "web.search"
+        and e["data"]["reason"] == "capability broker required"
+        for e in events
+    )
+    assert any(
+        e["type"] == "tool.call.failed"
+        and e["data"]["error_code"] == "capability_broker_required"
+        for e in events
+    )
+
+
+def test_loop_requires_lease_optional_without_broker_keeps_dev_bypass(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    loop = _cap_loop(tmp_path, provider, None, [_FETCH, _DONE], requires_lease="optional")
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert provider.calls == 1
+    assert provider.seen_tokens == [None]
 
 
 def test_loop_caches_lease_across_calls(tmp_path: Path) -> None:
@@ -300,6 +355,41 @@ def test_auto_redispatch_runs_gated_tool_without_model_retry(tmp_path: Path) -> 
     assert provider.calls == 1  # auto-executed exactly once; the model did NOT retry
     assert provider.seen_tokens == ["approved:web.search"]
     assert _capability_task_count(loop) == 1  # no re-escalation (a single capability task)
+    loop.close()
+
+
+def test_approved_capability_preserves_lease_policy_fields(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    loop = _redispatch_loop(
+        tmp_path,
+        provider,
+        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), ModelTurn(response_id="rd", final_text="done")],
+    )
+    loop.open()
+    parked = loop.run_until_suspended("go")
+    assert parked.reason == "awaiting_tasks"
+    max_expires_at = time.time() + 900
+    issued_at = time.time() - 5
+    lease_id = "lease_policy_ceiling"
+    grant = _grant_lease()
+    grant["lease"].update(
+        {
+            "lease_id": lease_id,
+            "issued_at": issued_at,
+            "max_expires_at": max_expires_at,
+        }
+    )
+
+    loop.report_task_result(parked.awaiting_task_ids[0], grant)
+    resumed = loop.run_until_suspended(None)
+
+    assert resumed.reason == "settled"
+    exported = loop._capability_vault.export_durable()
+    assert len(exported) == 1
+    assert exported[0]["lease_id"] == lease_id
+    assert exported[0]["issued_at"] == issued_at
+    assert exported[0]["max_expires_at"] == max_expires_at
+    assert exported[0]["durable"] is True
     loop.close()
 
 
@@ -478,13 +568,20 @@ def test_backend_denies_capability_via_factory(tmp_path: Path) -> None:
     assert provider.calls == 0  # the tool never executed
 
 
-def test_backend_no_factory_leaves_gating_off(tmp_path: Path) -> None:
+def test_backend_no_factory_fails_requires_lease_closed(tmp_path: Path) -> None:
     provider = _CapToolProvider()
     backend, workspace = _cap_backend(tmp_path, provider, None)
     assert _run_cap_backend(backend, workspace) == "completed"
-    # No broker -> requires_lease is a no-op; the tool runs and sees no token.
-    assert provider.calls == 1
-    assert provider.seen_tokens == [None]
+    # No broker -> required lease fails closed; the model gets an error observation, and the
+    # protected handler never runs.
+    assert provider.calls == 0
+    run_id = next(iter(backend._records))
+    events = _events(backend._record(run_id).run_dir)
+    assert any(
+        e["type"] == "tool.call.failed"
+        and e["data"]["error_code"] == "capability_broker_required"
+        for e in events
+    )
 
 
 # --- revocation: the vault's fail-closed read path + the operator kill switch --------------
@@ -526,16 +623,75 @@ def test_vault_export_import_revocations_roundtrip() -> None:
         "revoked_lease_ids": ["lease_x"],
         "revoked_capabilities": ["web.search"],
         "revoked_before": 42.0,
+        "revoked_all": False,
     }
     fresh = CapabilityVault()
     fresh.import_revocations(**{
         "lease_ids": exported["revoked_lease_ids"],
         "capabilities": exported["revoked_capabilities"],
         "before": exported["revoked_before"],
+        "all_revoked": exported["revoked_all"],
     })
     assert fresh.is_capability_revoked("web.search")
     assert "lease_x" in fresh._revoked_lease_ids
     assert fresh._revoked_before == 42.0
+
+
+def test_vault_fork_for_child_shares_revocations_without_live_lease_slots() -> None:
+    parent = CapabilityVault()
+    parent.admit(
+        CapabilityRequest(capability="web.search", scope={"binding_id": "parent"}),
+        CapabilityLease(
+            capability="web.search",
+            token_ref="parent-token",
+            expires_at=9e9,
+            scope={"binding_id": "parent"},
+        ),
+    )
+    parent.admit(
+        CapabilityRequest(capability="web.fetch", scope={"binding_id": "shared"}),
+        CapabilityLease(
+            capability="web.fetch",
+            token_ref="durable-token",
+            expires_at=9e9,
+            scope={"binding_id": "shared"},
+            durable=True,
+        ),
+    )
+
+    child = parent.fork_for_child()
+    assert child.token_for("web.search", now=0.0) is None
+    assert child.token_for("web.fetch", now=0.0) == "durable-token"
+
+    child.admit(
+        CapabilityRequest(capability="web.search", scope={"binding_id": "child"}),
+        CapabilityLease(
+            capability="web.search",
+            token_ref="child-token",
+            expires_at=9e9,
+            scope={"binding_id": "child"},
+        ),
+    )
+
+    assert parent.token_for("web.search", now=0.0) == "parent-token"
+    assert child.token_for("web.search", now=0.0) == "child-token"
+    parent.revoke(capability="web.search")
+    assert child.token_for("web.search", now=0.0) is None
+
+    child.admit(
+        CapabilityRequest(capability="web.context", scope={"binding_id": "child-only"}),
+        CapabilityLease(
+            capability="web.context",
+            token_ref="child-only-token",
+            expires_at=9e9,
+            scope={"binding_id": "child-only"},
+        ),
+    )
+    assert child.token_for("web.context", now=0.0) == "child-only-token"
+    exported = parent.revoke(capability="*")
+    assert exported["capabilities"] == ["*"]
+    assert child.token_for("web.context", now=0.0) is None
+    assert child.is_capability_revoked("child.only")
 
 
 def test_loop_revoke_blocks_next_call_without_rebrokering(tmp_path: Path) -> None:
@@ -704,6 +860,21 @@ def test_web_tool_uses_lease_token_when_required(tmp_path: Path) -> None:
     assert client.tokens == ["auto:web.search"]
 
 
+def test_web_capability_request_scope_includes_signed_gateway_constraints(tmp_path: Path) -> None:
+    client = _RecordingWebClient()
+    broker = _CountingBroker(AutoGrantBroker())
+    loop = _web_loop(tmp_path, client, broker, requires_lease=True)
+
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert broker.last_request is not None
+    assert broker.last_request.scope["binding_id"] == "web.search"
+    assert broker.last_request.scope["max_calls"] == 20
+    assert broker.last_request.scope["max_results"] == 10
+    assert broker.last_request.scope["allowed_domains"] == ["a.edu"]
+
+
 def test_web_tool_falls_back_to_static_credential_when_not_gated(tmp_path: Path) -> None:
     client = _RecordingWebClient()
     # No requires_lease, no broker -> no lease; the per-call override is None and the client uses
@@ -717,11 +888,23 @@ def test_web_tool_falls_back_to_static_credential_when_not_gated(tmp_path: Path)
 def test_gateway_broker_mints_web_gateway_token_for_web_capabilities() -> None:
     manager = TokenManager.from_secret("x" * 32)
     broker = GatewayCapabilityBroker(token_manager=manager, tenant_id="t", user_id="u")
-    web = broker.request(CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]}, run_id="run_1"))
+    web = broker.request(
+        CapabilityRequest(
+            capability="web.search",
+            scope={"allowed_domains": ["a.edu"], "max_calls": 2},
+            run_id="run_1",
+            binding_id="search_docs",
+        )
+    )
     assert isinstance(web, CapabilityLease)
     # The web lease's token_ref IS a web-gateway token the existing web gateway already accepts.
     claims = manager.verify(web.token_ref, kind="web_gateway", audience="csp.web-gateway", run_id="run_1")
     assert claims.metadata["capability"] == "web.search"
+    assert claims.metadata["scope"] == {
+        "allowed_domains": ["a.edu"],
+        "binding_id": "search_docs",
+        "max_calls": 2,
+    }
     # A non-web capability still mints the generic capability-kind token.
     other = broker.request(CapabilityRequest(capability="email.send", run_id="run_1"))
     assert isinstance(other, CapabilityLease)

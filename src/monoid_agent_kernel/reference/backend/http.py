@@ -67,7 +67,27 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     run_id = parts[2]
                     query = parse_qs(parsed.query)
                     from_seq = int((query.get("from_seq") or ["0"])[0])
-                    self._write_json(backend.events(run_id, self._bearer_token(), from_seq=from_seq))
+                    limit_raw = (query.get("limit") or [None])[0]
+                    self._write_json(
+                        backend.events(
+                            run_id,
+                            self._bearer_token(),
+                            from_seq=from_seq,
+                            limit=None if limit_raw is None else int(limit_raw),
+                        )
+                    )
+                    return
+                if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "diagnostics":
+                    run_id = parts[2]
+                    query = parse_qs(parsed.query)
+                    limit_raw = (query.get("event_limit") or ["50"])[0]
+                    self._write_json(
+                        backend.diagnostics(
+                            run_id,
+                            self._bearer_token(),
+                            event_limit=int(limit_raw),
+                        )
+                    )
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "runtime-config":
                     run_id = parts[2]

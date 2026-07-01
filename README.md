@@ -237,9 +237,10 @@ Three optional features on `monoid run`, each off unless its flag is set:
 - `--skills-directory DIR` — load Agent Skills (`SKILL.md` with frontmatter) from `DIR`,
   enabling the progressive-disclosure skill tools.
 - `--capability-broker path.py:factory` — load a `CapabilityBroker` that gates any tool
-  declaring `runtime.requires_lease` behind a scoped, short-lived lease. For local dev,
-  `--auto-grant-capabilities` uses the built-in `AutoGrantBroker` (grants every request,
-  scoped to its binding) instead. Pass at most one of the two.
+  declaring `runtime.requires_lease` behind a scoped, short-lived lease. Required leases fail
+  closed when no broker is configured. For local dev, `--auto-grant-capabilities` uses the built-in
+  `AutoGrantBroker` (grants every request, scoped to its binding) instead. Pass at most one of the
+  two.
 
 For machine-readable real-time progress:
 
@@ -306,6 +307,9 @@ monoid llm-gateway serve \
 
 Start the Monoid backend in another process. It shares the token signing secret
 with the LLM and Web gateways so it can issue scoped gateway tokens:
+
+Reference gateway tokens include a `kid` header. The shared `TokenManager` supports keyring-based
+rotation with a grace window plus token-id and issued-before revocation checks.
 
 ```bash
 monoid backend serve \
@@ -382,6 +386,12 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/events
 
 curl -H "Authorization: Bearer $RUN_TOKEN" \
+  "http://127.0.0.1:8765/v1/runs/$RUN_ID/events?from_seq=1&limit=100"
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
+  "http://127.0.0.1:8765/v1/runs/$RUN_ID/diagnostics?event_limit=50"
+
+curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/proposal
 
 curl -H "Authorization: Bearer $RUN_TOKEN" \
@@ -427,8 +437,9 @@ curl -H "Authorization: Bearer $MONOID_LLM_GATEWAY_ADMIN_TOKEN" \
   http://127.0.0.1:8080/internal/llm/tenants/tenant_a/usage
 ```
 
-The WebGateway validates `web_gateway` tokens, enforces per-request binding
-constraints, calls a web provider adapter, and reports tenant usage. The reference ships a
+The WebGateway validates `web_gateway` tokens, enforces signed token scope for brokered web
+capabilities before calling a provider, and reports tenant usage. Payload-level domain, binding,
+and call-limit values can narrow the signed scope; they cannot widen it. The reference ships a
 deterministic fake provider plus Brave-backed search/fetch/context providers behind the
 provider-neutral `ContextProvider` seam, so the search backend can be swapped without
 changing kernel tools.

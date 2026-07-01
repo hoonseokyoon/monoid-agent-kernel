@@ -56,6 +56,9 @@ class GatewayCapabilityBroker:
     def request(self, req: CapabilityRequest) -> CapabilityGrant:
         ttl = req.ttl_seconds or 600
         kind, audience = self.gateway_token_kinds.get(req.capability, ("capability", self.audience))
+        scope = dict(req.scope)
+        if req.binding_id and req.capability in self.gateway_token_kinds:
+            scope.setdefault("binding_id", req.binding_id)
         token = self.token_manager.issue(
             kind=kind,
             audience=audience,
@@ -63,13 +66,13 @@ class GatewayCapabilityBroker:
             tenant_id=self.tenant_id,
             user_id=self.user_id,
             ttl_s=ttl,
-            metadata={"capability": req.capability, "scope": dict(req.scope)},
+            metadata={"capability": req.capability, "scope": scope},
         )
         return CapabilityLease(
             capability=req.capability,
             token_ref=token,
             expires_at=time.time() + ttl,
-            scope=dict(req.scope),
+            scope=scope,
         )
 
 

@@ -186,11 +186,13 @@ class AgentRecorder:
         self.artifacts_dir = self.run_dir / "artifacts"
         self.artifacts_dir.mkdir(parents=True, exist_ok=self.reopen)
         self._transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
-        sinks: list[EventSink] = [JsonlEventSink(self.run_dir / "events.jsonl")]
+        events_path = self.run_dir / "events.jsonl"
+        initial_seq = _last_event_seq(events_path)
+        sinks: list[EventSink] = [JsonlEventSink(events_path)]
         if self.status_file:
             sinks.append(StatusJsonSink(self.run_dir / "status.json"))
         sinks.extend(self.extra_event_sinks)
-        self.event_bus = EventBus(self.run_id, tuple(sinks))
+        self.event_bus = EventBus(self.run_id, tuple(sinks), _seq=initial_seq)
 
     def emit(
         self,

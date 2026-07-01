@@ -28,7 +28,7 @@ from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.outbox import OutboxReceipt
-from monoid_agent_kernel.core.trace_context import new_traceparent
+from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
 from monoid_agent_kernel.core.lifecycle import (
     LoopSession,
     SessionState,
@@ -148,9 +148,117 @@ def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
         payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return None
+    return _validate_run_meta(payload)
+
+
+def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
     if not isinstance(payload, dict) or payload.get("schema_version") not in _ACCEPTED_RUN_META_SCHEMA_VERSIONS:
         return None
-    return payload
+    return dict(payload)
+
+
+def _runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
+    config_payload = meta.get("runtime_config")
+    if not isinstance(config_payload, dict):
+        raise ValueError("run metadata is missing runtime_config")
+    config = AgentRuntimeConfig.from_json(config_payload)
+    expected_hash = str(meta.get("runtime_config_hash") or config_payload.get("config_hash") or "")
+    if expected_hash and expected_hash != config.config_hash:
+        raise ValueError("runtime config hash mismatch in run metadata")
+    return config
+
+
+def _read_event_page(events_path: Path, *, from_seq: int, limit: int | None) -> dict[str, Any]:
+    if from_seq < 0:
+        raise ValueError("from_seq must be non-negative")
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
+    events: list[dict[str, Any]] = []
+    next_seq = from_seq
+    has_more = False
+    if events_path.exists():
+        with events_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                seq = int(event.get("seq") or 0)
+                if seq < from_seq:
+                    continue
+                if limit is not None and len(events) >= limit:
+                    has_more = True
+                    break
+                events.append(event)
+                next_seq = seq + 1
+    return {"events": events, "next_seq": next_seq, "has_more": has_more}
+
+
+_DIAGNOSTIC_EVENT_DATA_KEYS = {
+    "attempts",
+    "actor",
+    "binding_id",
+    "call_id",
+    "capability",
+    "child_run_id",
+    "command",
+    "command_id",
+    "error",
+    "error_code",
+    "failure_code",
+    "idempotency_key",
+    "job_id",
+    "reason",
+    "request_id",
+    "result_code",
+    "run_id",
+    "state",
+    "status",
+    "target_run_id",
+    "task_id",
+    "tool",
+    "traceparent",
+}
+
+
+def _read_optional_json(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _diagnostic_event_summary(event: dict[str, Any]) -> dict[str, Any]:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    return {
+        "seq": event.get("seq"),
+        "type": event.get("type"),
+        "timestamp": event.get("timestamp"),
+        "level": event.get("level"),
+        "turn_id": event.get("turn_id"),
+        "parent_id": event.get("parent_id"),
+        "data": {key: data[key] for key in sorted(_DIAGNOSTIC_EVENT_DATA_KEYS) if key in data},
+    }
+
+
+_DIRECT_AUDIT_APPEND_STATUSES = {"completed", "failed", "limited", "ended"}
+
+
+def _run_dir_allows_direct_audit_append(run_dir: Path) -> bool:
+    status = _read_optional_json(run_dir / "status.json")
+    if status is None:
+        return False
+    return str(status.get("status") or "") in _DIRECT_AUDIT_APPEND_STATUSES
+
+
+def _trace_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
+    trace_ids: set[str] = set()
+    for event in events:
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        trace_id = trace_id_of(str(data.get("traceparent") or ""))
+        if trace_id:
+            trace_ids.add(trace_id)
+    return sorted(trace_ids)
 
 
 @dataclass(frozen=True)
@@ -253,6 +361,7 @@ class BackendRunRecord:
     runtime_config: AgentRuntimeConfig | None = None
     runtime_config_issuer: str = ""
     runtime_config_reason: str = ""
+    runtime_config_committed_at: float = 0.0
     # Authoritative lifecycle FSM state, updated by the session driver as it observes each
     # suspension. The control protocol's inspect/health read this (a throwaway LoopSession is
     # seeded with it) since the backend drives the loop directly, not through a facade.
@@ -737,6 +846,7 @@ class RunnerBackend:
                 ttl_s=self.web_gateway_token_ttl_s,
                 metadata={"agent_config_hash": initial_runtime_config.config_hash},
             )
+        created_at = time.time()
         record = BackendRunRecord(
             run_id=run_id,
             tenant_id=request.tenant_id,
@@ -744,14 +854,16 @@ class RunnerBackend:
             workspace_root=workspace_root,
             run_dir=run_dir,
             status="queued",
-            created_at=time.time(),
+            created_at=created_at,
             run_token_sha256=TokenManager.token_sha256(run_token),
             llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
             web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
             runtime_config=initial_runtime_config,
             runtime_config_issuer=runtime_config_issuer,
             runtime_config_reason=runtime_config_reason,
+            runtime_config_committed_at=created_at,
         )
+        self._write_run_meta(record, request)
         with self._lock:
             self._records[run_id] = record
         return _PreparedRun(
@@ -1037,110 +1149,292 @@ class RunnerBackend:
         token = str(args.pop("token", "") or "")
         run_id = command.run_id
         ctype = command.type
+        command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
+        idempotency_key = command.command_id or command_id
+        token_sha256 = TokenManager.token_sha256(token) if token else ""
+        started = time.time()
 
-        def ok(data: dict[str, Any], *, state: str | None = None) -> ControlResult:
-            return ControlResult(run_id=run_id, type=ctype, status="ok", state=state, data=dict(data))
-
+        audit_authorized = False
         try:
-            if ctype == "pause":
-                return ok(self.pause_run(run_id, token))
-            if ctype == "resume":
-                with self._lock:
-                    live = run_id in self._records
-                return ok(self.signal_resume(run_id, token) if live else self.resume_run(run_id, token))
-            if ctype == "cancel":
-                return ok(self.cancel_run(run_id, token))
-            if ctype == "interrupt":
-                return ok(self.interrupt_turn(run_id, token))
-            if ctype in {"inspect", "health"}:
-                loop = self._authorize_active_loop(run_id, token)
-                # Seed the throwaway facade with the record's authoritative FSM state (the backend
-                # drives the loop directly, so the facade's own cache never tracked this run).
-                session = LoopSession(loop, _state=self._record(run_id).session_state)
-                if ctype == "inspect":
-                    inspection = session.inspect()
-                    return ok(inspection.to_json(), state=inspection.state.value)
-                health = session.health()
-                return ok(health.to_json(), state=health.state.value)
-            if ctype == "status":
-                return ok(self.status(run_id, token))
-            if ctype == "runtime_config":
-                return ok(self.runtime_config(run_id, token))
-            if ctype == "replace_runtime_config":
-                return ok(
-                    self.replace_runtime_config(
-                        run_id,
-                        token,
-                        expected_version=int(args.get("expected_version", 0)),
-                        issuer=command.issuer,
-                        reason=command.reason,
-                        config=AgentRuntimeConfig.from_json(args["config"]),
-                    )
-                )
-            if ctype == "send_message":
-                # A control command carries its own id (command_id) — use it as the inbox dedup key
-                # so a redelivered control send is processed once.
-                return ok(
-                    self.send_message(
-                        run_id,
-                        token,
-                        content=args.get("content") or "",
-                        message_id=command.command_id,
-                        source="control",
-                    )
-                )
-            if ctype == "create_task":
-                return ok(
-                    self.create_task(
-                        run_id,
-                        token,
-                        kind=str(args.get("kind") or ""),
-                        request=dict(args.get("request") or {}),
-                    )
-                )
-            if ctype == "report_task_result":
-                return ok(
-                    self.report_task_result(
-                        run_id,
-                        token,
-                        task_id=str(args.get("task_id") or ""),
-                        result=dict(args.get("result") or {}),
-                        status=str(args.get("status") or "answered"),
-                    )
-                )
-            if ctype == "revoke_capability":
-                before = args.get("before")
-                return ok(
-                    self.revoke_capability(
-                        run_id,
-                        token,
-                        capability=(str(args["capability"]) if args.get("capability") else None),
-                        lease_id=(str(args["lease_id"]) if args.get("lease_id") else None),
-                        before=(float(before) if before is not None else None),
-                        reason=command.reason,
-                    )
-                )
-            return ControlResult(
-                run_id=run_id,
-                type=ctype,
-                status="unsupported",
-                error=f"unknown control command type: {ctype}",
-                error_code="unknown_control_command",
+            self._authorize_control_audit_target(run_id, token, command_type=ctype, args=args)
+            audit_authorized = True
+            self._emit_control_audit_event(
+                run_id,
+                "control.command.received",
+                {
+                    "command_id": command_id,
+                    "command": ctype,
+                    "target_run_id": run_id,
+                    "actor": command.issuer,
+                    "reason": command.reason,
+                    "token_sha256": token_sha256,
+                    "idempotency_key": idempotency_key,
+                    "args_keys": sorted(key for key in command.args if key != "token"),
+                },
             )
-        except PermissionDenied:
+            result = self._dispatch_control_command(
+                command,
+                args=args,
+                token=token,
+                command_id=command_id,
+            )
+        except PermissionDenied as exc:
+            if audit_authorized:
+                self._emit_control_audit_event(
+                    run_id,
+                    "control.command.failed",
+                    {
+                        "command_id": command_id,
+                        "command": ctype,
+                        "target_run_id": run_id,
+                        "actor": command.issuer,
+                        "idempotency_key": idempotency_key,
+                        "token_sha256": token_sha256,
+                        "status": "error",
+                        "error": str(exc),
+                        "error_code": getattr(exc, "error_code", "permission_denied"),
+                        "failure_code": getattr(exc, "error_code", "permission_denied"),
+                        "duration_ms": (time.time() - started) * 1000,
+                    },
+                    level="warning",
+                )
             raise  # auth failures map to HTTP 401 in the route layer
         except KeyError as exc:
-            return ControlResult(
+            result = ControlResult(
                 run_id=run_id, type=ctype, status="unsupported", error=str(exc), error_code="run_not_found"
             )
         except (ValueError, NativeAgentError) as exc:
-            return ControlResult(
+            result = ControlResult(
                 run_id=run_id,
                 type=ctype,
                 status="error",
                 error=str(exc),
                 error_code=getattr(exc, "error_code", "control_error"),
             )
+
+        duration_ms = (time.time() - started) * 1000
+        if result.status == "ok":
+            self._emit_control_audit_event(
+                run_id,
+                "control.command.completed",
+                {
+                    "command_id": command_id,
+                    "command": ctype,
+                    "target_run_id": run_id,
+                    "actor": command.issuer,
+                    "idempotency_key": idempotency_key,
+                    "token_sha256": token_sha256,
+                    "status": result.status,
+                    "result_code": result.error_code or result.status,
+                    "state": result.state,
+                    "duration_ms": duration_ms,
+                },
+            )
+        else:
+            self._emit_control_audit_event(
+                run_id,
+                "control.command.failed",
+                {
+                    "command_id": command_id,
+                    "command": ctype,
+                    "target_run_id": run_id,
+                    "actor": command.issuer,
+                    "idempotency_key": idempotency_key,
+                    "token_sha256": token_sha256,
+                    "status": result.status,
+                    "error": result.error,
+                    "error_code": result.error_code,
+                    "failure_code": result.error_code,
+                    "duration_ms": duration_ms,
+                },
+                level="warning",
+            )
+        return result
+
+    def _dispatch_control_command(
+        self,
+        command: ControlCommand,
+        *,
+        args: dict[str, Any],
+        token: str,
+        command_id: str,
+    ) -> ControlResult:
+        run_id = command.run_id
+        ctype = command.type
+
+        def ok(data: dict[str, Any], *, state: str | None = None) -> ControlResult:
+            return ControlResult(run_id=run_id, type=ctype, status="ok", state=state, data=dict(data))
+
+        if ctype == "pause":
+            return ok(self.pause_run(run_id, token))
+        if ctype == "resume":
+            with self._lock:
+                live = run_id in self._records
+            return ok(self.signal_resume(run_id, token) if live else self.resume_run(run_id, token))
+        if ctype == "cancel":
+            return ok(self.cancel_run(run_id, token))
+        if ctype in {"approve", "deny"}:
+            result = args.get("result") if isinstance(args.get("result"), dict) else {}
+            approval_result = dict(result)
+            if ctype == "approve":
+                approval_result["answer"] = str(args.get("answer") or "Approve")
+                approval_result["approved"] = True
+            else:
+                approval_result["answer"] = str(args.get("answer") or "Deny")
+                approval_result["approved"] = False
+                approval_result["granted"] = False
+                approval_result.pop("lease", None)
+                approval_result.pop("token_ref", None)
+                approval_result["reason"] = command.reason or str(
+                    args.get("reason") or approval_result.get("reason") or "denied"
+                )
+            return ok(
+                self.report_task_result(
+                    run_id,
+                    token,
+                    task_id=str(args.get("task_id") or ""),
+                    result=approval_result,
+                    status=str(args.get("status") or "answered"),
+                )
+            )
+        if ctype == "interrupt":
+            return ok(self.interrupt_turn(run_id, token))
+        if ctype in {"inspect", "health"}:
+            loop = self._authorize_active_loop(run_id, token)
+            # Seed the throwaway facade with the record's authoritative FSM state (the backend
+            # drives the loop directly, so the facade's own cache never tracked this run).
+            session = LoopSession(loop, _state=self._record(run_id).session_state)
+            if ctype == "inspect":
+                inspection = session.inspect()
+                return ok(inspection.to_json(), state=inspection.state.value)
+            health = session.health()
+            return ok(health.to_json(), state=health.state.value)
+        if ctype == "status":
+            return ok(self.status(run_id, token))
+        if ctype == "runtime_config":
+            return ok(self.runtime_config(run_id, token))
+        if ctype == "replace_runtime_config":
+            return ok(
+                self.replace_runtime_config(
+                    run_id,
+                    token,
+                    expected_version=int(args.get("expected_version", 0)),
+                    issuer=command.issuer,
+                    reason=command.reason,
+                    config=AgentRuntimeConfig.from_json(args["config"]),
+                )
+            )
+        if ctype == "send_message":
+            # A control command carries its own id (command_id) — use it as the inbox dedup key
+            # so a redelivered control send is processed once.
+            return ok(
+                self.send_message(
+                    run_id,
+                    token,
+                    content=args.get("content") or "",
+                    message_id=command_id,
+                    source="control",
+                )
+            )
+        if ctype == "create_task":
+            return ok(
+                self.create_task(
+                    run_id,
+                    token,
+                    kind=str(args.get("kind") or ""),
+                    request=dict(args.get("request") or {}),
+                )
+            )
+        if ctype == "report_task_result":
+            return ok(
+                self.report_task_result(
+                    run_id,
+                    token,
+                    task_id=str(args.get("task_id") or ""),
+                    result=dict(args.get("result") or {}),
+                    status=str(args.get("status") or "answered"),
+                )
+            )
+        if ctype == "revoke_capability":
+            before = args.get("before")
+            return ok(
+                self.revoke_capability(
+                    run_id,
+                    token,
+                    capability=(str(args["capability"]) if args.get("capability") else None),
+                    lease_id=(str(args["lease_id"]) if args.get("lease_id") else None),
+                    before=(float(before) if before is not None else None),
+                    reason=command.reason,
+                )
+            )
+        return ControlResult(
+            run_id=run_id,
+            type=ctype,
+            status="unsupported",
+            error=f"unknown control command type: {ctype}",
+            error_code="unknown_control_command",
+        )
+
+    def _emit_control_audit_event(
+        self,
+        run_id: str,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        level: str = "info",
+    ) -> None:
+        if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
+            return
+        with self._lock:
+            record = self._records.get(run_id)
+            loop = record.loop if record is not None else None
+            run_dir = record.run_dir if record is not None else self.run_root / run_id
+        direct_append_allowed = False
+        if record is not None:
+            if loop is not None and loop.emit_external_event(event_type, data=data, level=level):
+                return
+            direct_append_allowed = record.status == "queued"
+            if not direct_append_allowed and record.status not in _DIRECT_AUDIT_APPEND_STATUSES:
+                return
+        if not run_dir.exists():
+            return
+        if not direct_append_allowed and not _run_dir_allows_direct_audit_append(run_dir):
+            return
+        try:
+            append_event_to_run(run_dir, event_type, data=data, level=level)
+        except OSError:
+            _LOGGER.debug("control audit event write skipped", exc_info=True)
+
+    def _authorize_control_audit_target(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        command_type: str = "",
+        args: Mapping[str, Any] | None = None,
+    ) -> None:
+        if command_type in {"report_task_result", "approve", "deny"}:
+            try:
+                self._verify_task_callback_token(run_id, token, str((args or {}).get("task_id") or ""))
+                return
+            except TokenError:
+                pass
+        claims = self._verify_run_token(run_id, token)
+        self._authorize_claim_subject(run_id, claims)
+
+    def _authorize_claim_subject(self, run_id: str, claims: Any) -> None:
+        with self._lock:
+            record = self._records.get(run_id)
+        if record is not None and (claims.tenant_id != record.tenant_id or claims.user_id != record.user_id):
+            raise PermissionDenied("token subject mismatch")
+
+    def _verify_task_callback_token(self, run_id: str, token: str, task_id: str) -> None:
+        claims = self.token_manager.verify(
+            token, kind="task_callback", audience=TASK_CALLBACK_AUDIENCES, run_id=run_id
+        )
+        if str(claims.metadata.get("task_id") or "") != task_id:
+            raise PermissionDenied("callback token does not match this task")
+        self._authorize_claim_subject(run_id, claims)
 
     def send_message(
         self,
@@ -1224,6 +1518,7 @@ class RunnerBackend:
                     "config_hash": "",
                     "issuer": record.runtime_config_issuer,
                     "reason": record.runtime_config_reason,
+                    "committed_at": record.runtime_config_committed_at,
                 }
             return {
                 "run_id": record.run_id,
@@ -1231,6 +1526,7 @@ class RunnerBackend:
                 "ready": True,
                 "issuer": record.runtime_config_issuer,
                 "reason": record.runtime_config_reason,
+                "committed_at": record.runtime_config_committed_at,
                 "config": config.to_json(),
                 "config_version": config.config_version,
                 "config_hash": config.config_hash,
@@ -1264,15 +1560,25 @@ class RunnerBackend:
                 # replace() copies all fields, so a new config field can't be silently dropped on
                 # hot-swap (an enumerated rebuild here previously dropped output-validator opt-outs).
                 config = replace(config, config_version=current_version + 1)
+            committed_at = time.time()
+            self._write_runtime_config_run_meta(
+                record,
+                config,
+                issuer=issuer,
+                reason=reason,
+                committed_at=committed_at,
+            )
             record.runtime_config = config
             record.runtime_config_issuer = issuer
             record.runtime_config_reason = reason
+            record.runtime_config_committed_at = committed_at
             return {
                 "run_id": record.run_id,
                 "tenant_id": record.tenant_id,
                 "ready": True,
                 "issuer": issuer,
                 "reason": reason,
+                "committed_at": committed_at,
                 "config": config.to_json(),
                 "config_version": config.config_version,
                 "config_hash": config.config_hash,
@@ -1331,11 +1637,7 @@ class RunnerBackend:
         """A task result may be reported with a per-task callback token (scoped to
         run+task) or the run token (operator). Try the scoped token first."""
         try:
-            claims = self.token_manager.verify(
-                token, kind="task_callback", audience=TASK_CALLBACK_AUDIENCES, run_id=run_id
-            )
-            if str(claims.metadata.get("task_id") or "") != task_id:
-                raise PermissionDenied("callback token does not match this task")
+            self._verify_task_callback_token(run_id, token, task_id)
         except TokenError:
             self._authorize_run(run_id, token)
         return self._active_loop(run_id)
@@ -1504,20 +1806,59 @@ class RunnerBackend:
         )
         return result.to_json()
 
-    def events(self, run_id: str, token: str, *, from_seq: int = 0) -> dict[str, Any]:
+    def events(
+        self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
+    ) -> dict[str, Any]:
         events_path = self._authorized_run_dir(run_id, token) / "events.jsonl"
-        events: list[dict[str, Any]] = []
-        if events_path.exists():
-            for line in events_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                if int(event.get("seq") or 0) >= from_seq:
-                    events.append(event)
-        return {"run_id": run_id, "events": events}
+        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
+        return {"run_id": run_id, **page}
+
+    def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
+        if event_limit < 1:
+            raise ValueError("event_limit must be positive")
+        run_dir = self._authorized_run_dir(run_id, token)
+        status = self.status(run_id, token)
+        status_file = status.get("status_file") if isinstance(status.get("status_file"), dict) else {}
+        last_event_seq = max(
+            int(status.get("last_event_seq") or 0),
+            int(status_file.get("last_event_seq") or 0),
+        )
+        from_seq = max(0, last_event_seq - event_limit + 1) if last_event_seq else 0
+        event_page = _read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=event_limit)
+        event_summaries = [_diagnostic_event_summary(event) for event in event_page["events"]]
+        control_events = [
+            event for event in event_summaries if str(event.get("type") or "").startswith("control.command.")
+        ]
+        failure = _read_optional_json(run_dir / "failure.json")
+        recover_attempts = self._read_recover_attempts(run_dir)
+        return {
+            "run_id": run_id,
+            "status": status,
+            "failure": failure,
+            "recovery": {
+                "attempts": recover_attempts,
+                "max_attempts": self.max_recover_attempts,
+                "failure_marked": failure is not None,
+                "unrecoverable": bool(failure and failure.get("error_code") == "unrecoverable"),
+            },
+            "events": {
+                "from_seq": from_seq,
+                "next_seq": event_page["next_seq"],
+                "has_more": event_page["has_more"],
+                "items": event_summaries,
+            },
+            "control": {"events": control_events},
+            "trace_ids": _trace_ids_from_events(event_page["events"]),
+        }
 
     def descendant_events(
-        self, run_id: str, token: str, descendant_run_id: str, *, from_seq: int = 0
+        self,
+        run_id: str,
+        token: str,
+        descendant_run_id: str,
+        *,
+        from_seq: int = 0,
+        limit: int | None = None,
     ) -> dict[str, Any]:
         """Stream a descendant (subagent) run's events, authorized via the ancestor's run token.
 
@@ -1533,15 +1874,8 @@ class RunnerBackend:
         if any(sep in descendant_run_id for sep in ("/", "\\")) or ".." in descendant_run_id:
             raise PermissionDenied("invalid descendant run id")
         events_path = self.run_root / descendant_run_id / "events.jsonl"
-        events: list[dict[str, Any]] = []
-        if events_path.exists():
-            for line in events_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                if int(event.get("seq") or 0) >= from_seq:
-                    events.append(event)
-        return {"run_id": descendant_run_id, "events": events}
+        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
+        return {"run_id": descendant_run_id, **page}
 
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)
@@ -2177,8 +2511,10 @@ class RunnerBackend:
         """Write run.json — the durable recovery descriptor. Holds everything
         ``recover_runs`` needs to rebuild a run that was parked when the process died:
         identity, workspace, limits, policy, and the resolved runtime config (gateway
-        tokens are re-issued on recovery, not stored). A mid-run runtime-config change
-        is not re-persisted here, so recovery uses the config as of run start."""
+        tokens are re-issued on recovery, not stored). Runtime-config changes update this
+        descriptor, so recovery uses the latest committed config instead of the run-start config."""
+        config = record.runtime_config
+        committed_at = record.runtime_config_committed_at or time.time()
         meta = {
             "schema_version": _RUN_META_SCHEMA_VERSION,
             "run_id": record.run_id,
@@ -2189,7 +2525,7 @@ class RunnerBackend:
             "workspace_backend": request.workspace_backend,
             "multi_turn": request.multi_turn,
             # For history listing (DX-12): a created-at stamp + a short title (first instruction).
-            "created_at": time.time(),
+            "created_at": record.created_at,
             "title": " ".join((request.instruction or "").split())[:80],
             "limits": {
                 "max_steps": request.max_steps,
@@ -2198,10 +2534,56 @@ class RunnerBackend:
                 "max_duration_s": request.max_duration_s,
             },
             "permission_policy": request.permission_policy.to_json(),
-            "runtime_config": record.runtime_config.to_json() if record.runtime_config else None,
+            "runtime_config": config.to_json() if config else None,
+            "runtime_config_version": config.config_version if config else 0,
+            "runtime_config_hash": config.config_hash if config else "",
+            "runtime_config_issuer": record.runtime_config_issuer,
+            "runtime_config_reason": record.runtime_config_reason,
+            "runtime_config_committed_at": committed_at,
         }
         record.run_dir.mkdir(parents=True, exist_ok=True)
         write_json_atomic(record.run_dir / "run.json", meta)
+        self._store_run_meta(record.run_id, meta)
+
+    def _write_runtime_config_run_meta(
+        self,
+        record: BackendRunRecord,
+        config: AgentRuntimeConfig,
+        *,
+        issuer: str,
+        reason: str,
+        committed_at: float,
+    ) -> None:
+        meta = _read_run_meta(record.run_dir)
+        if meta is None:
+            raise ValueError("run metadata is not ready")
+        meta["runtime_config"] = config.to_json()
+        meta["runtime_config_version"] = config.config_version
+        meta["runtime_config_hash"] = config.config_hash
+        meta["runtime_config_issuer"] = issuer
+        meta["runtime_config_reason"] = reason
+        meta["runtime_config_committed_at"] = committed_at
+        self._store_run_meta(record.run_id, meta)
+        write_json_atomic(record.run_dir / "run.json", meta)
+
+    def _store_run_meta(self, run_id: str, meta: Mapping[str, Any]) -> None:
+        if self.checkpoint_store is None:
+            return
+        put_metadata = getattr(self.checkpoint_store, "put_run_metadata", None)
+        if callable(put_metadata):
+            put_metadata(run_id, meta)
+
+    def _read_recovery_meta(self, run_dir: Path, run_id: str) -> dict[str, Any] | None:
+        meta = _read_run_meta(run_dir)
+        if meta is None and self.checkpoint_store is not None:
+            read_metadata = getattr(self.checkpoint_store, "run_metadata", None)
+            stored = read_metadata(run_id) if callable(read_metadata) else None
+            if stored is not None:
+                meta = _validate_run_meta(stored)
+                if meta is not None:
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    write_json_atomic(run_dir / "run.json", meta)
+        return meta
 
     def recover_runs(self) -> list[str]:
         """Scan ``run_root`` for runs left parked by a previous process and resume each
@@ -2236,7 +2618,7 @@ class RunnerBackend:
         stored = self.checkpoint_store.latest(run_id)
         if stored is None or stored.checkpoint.terminal:
             return False
-        meta = _read_run_meta(run_dir)
+        meta = self._read_recovery_meta(run_dir, run_id)
         if meta is None:
             return False
         try:
@@ -2286,7 +2668,7 @@ class RunnerBackend:
         if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
             raise PermissionDenied("invalid run id")
         run_dir = self.run_root / run_id
-        meta = _read_run_meta(run_dir)
+        meta = self._read_recovery_meta(run_dir, run_id)
         if meta is None:
             raise KeyError(f"unknown run: {run_id}")
         if claims.tenant_id != (meta.get("tenant_id") or "") or claims.user_id != (meta.get("user_id") or ""):
@@ -2399,7 +2781,7 @@ class RunnerBackend:
         checkpoint = stored.checkpoint
         run_id = checkpoint.run_id
         run_dir = self.run_root / run_id
-        runtime_config = AgentRuntimeConfig.from_json(meta["runtime_config"])
+        runtime_config = _runtime_config_from_meta(meta)
         limits = meta.get("limits") or {}
         request = BackendRunRequest(
             tenant_id=str(meta["tenant_id"]),
@@ -2451,8 +2833,9 @@ class RunnerBackend:
             llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
             web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
             runtime_config=runtime_config,
-            runtime_config_issuer="recover_runs",
-            runtime_config_reason="resumed from checkpoint",
+            runtime_config_issuer=str(meta.get("runtime_config_issuer") or "recover_runs"),
+            runtime_config_reason=str(meta.get("runtime_config_reason") or "resumed from checkpoint"),
+            runtime_config_committed_at=float(meta.get("runtime_config_committed_at") or time.time()),
         )
         with self._lock:
             self._records[run_id] = record
