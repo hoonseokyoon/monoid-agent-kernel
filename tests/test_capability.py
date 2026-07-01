@@ -36,6 +36,8 @@ from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 def test_scope_within_list_subset_and_scalar_equality() -> None:
     assert scope_within({"allowed_domains": ["a.edu"]}, {"allowed_domains": ["a.edu", "b.edu"]})
     assert not scope_within({"allowed_domains": ["c.edu"]}, {"allowed_domains": ["a.edu"]})
+    assert scope_within({"max_results": 5}, {"max_results": 10})
+    assert not scope_within({"max_results": 15}, {"max_results": 10})
     assert scope_within({"region": "us"}, {"region": "us"})
     assert not scope_within({"region": "eu"}, {"region": "us"})
     # A key absent from the outer scope means "unconstrained" there -> inner is within.
@@ -82,6 +84,22 @@ def test_vault_admit_rejects_scope_widening() -> None:
     )
     with pytest.raises(ValueError):
         vault.admit(request, widened)
+
+
+def test_vault_admit_accepts_narrower_numeric_web_caps() -> None:
+    vault = CapabilityVault()
+    request = CapabilityRequest(
+        capability="web.search",
+        scope={"allowed_domains": ["a.edu"], "max_calls": 4, "max_results": 10},
+    )
+    narrowed = CapabilityLease(
+        capability="web.search",
+        token_ref="t",
+        expires_at=2000.0,
+        scope={"allowed_domains": ["a.edu"], "max_calls": 2, "max_results": 5},
+    )
+
+    assert vault.admit(request, narrowed) is narrowed
 
 
 def test_request_and_lease_round_trip_json() -> None:
