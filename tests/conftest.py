@@ -22,12 +22,27 @@ if str(SRC) not in sys.path:
 # blocked on a timing race. For a backgrounded, output-buffered run that looks like the whole
 # suite silently stalled forever (no output, process alive but idle) — which is exactly what bit
 # us. Arm a process-wide watchdog: if the run wedges past this deadline, dump every thread's
-# stack (pinpointing the deadlock) and abort, instead of hanging indefinitely. The suite
-# finishes well under this; override with NAR_TEST_HANG_TIMEOUT_S=0 to disable, or a custom value.
+# stack (pinpointing the deadlock) and abort. Re-arm it for each test so the timeout catches
+# a wedged test item while healthy full-suite runs can exceed the per-test deadline. Override
+# with NAR_TEST_HANG_TIMEOUT_S=0 to disable, or a custom value.
 faulthandler.enable()
 _HANG_TIMEOUT_S = float(os.environ.get("NAR_TEST_HANG_TIMEOUT_S", "240"))
-if _HANG_TIMEOUT_S > 0:
+
+
+def _arm_hang_watchdog() -> None:
+    if _HANG_TIMEOUT_S <= 0:
+        return
+    faulthandler.cancel_dump_traceback_later()
     faulthandler.dump_traceback_later(_HANG_TIMEOUT_S, exit=True)
+
+
+_arm_hang_watchdog()
+
+
+def pytest_runtest_setup(item: Any) -> None:
+    del item
+    # Keep the watchdog as a per-test hang guard instead of a whole-suite wall clock.
+    _arm_hang_watchdog()
 
 
 from monoid_agent_kernel.reference.backend.service import RunnerBackend
