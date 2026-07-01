@@ -336,10 +336,10 @@ class AgentToolContext(ToolContext):
     # Depth of this run in the subagent tree (0 = top-level). Threaded into spawned
     # children as ``depth`` so the executor can enforce the nesting cap.
     subagent_depth: int = 0
-    # Roll-up of delegated work: how many subagents this run spawned and their combined token
-    # usage. The same child usage is also added to RunState.total_usage so root token budgets and
-    # tenant accounting see descendant spend; this separate field keeps the delegated portion
-    # visible in metrics.
+    # Report-only roll-up of delegated work: how many subagents this run spawned and their
+    # combined token usage. Kept SEPARATE from total_usage on purpose — total_usage also
+    # tracks this run's remaining context budget, which a child's isolated tokens must not
+    # inflate. Surfaced in the run metrics for cost visibility.
     subagent_count: int = 0
     subagent_usage: dict[str, int] = field(default_factory=dict)
     # Report-only roll-up of skill activations (a skill's L2 instructions being loaded via
@@ -447,7 +447,6 @@ class AgentToolContext(ToolContext):
                 # Correlation so subagent.* events nest under this spawn tool call.
                 "parent_event_id": call.tool_event_id,
                 "turn_id": call.turn_id,
-                "traceparent": new_traceparent(),
             },
         )
         if background:
@@ -704,11 +703,9 @@ class AgentLoop:
     # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
     # Defaults to a local-fs store under the run root; a backend injects a durable one.
     checkpoint_store: CheckpointStore | None = None
-    # Optional capability broker: a bound tool that declares ``runtime.requires_lease=True``
+    # Optional capability broker: when set, a bound tool that declares ``runtime.requires_lease``
     # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
-    # Secrets stay in the broker; the core only gates on the lease. If no broker is configured,
-    # required leases fail closed; use ``runtime.requires_lease="optional"`` for explicit dev-only
-    # best-effort gating.
+    # Secrets stay in the broker; the core only gates on the lease. None = capability gating off.
     capability_broker: CapabilityBroker | None = None
     # When True (default), after a gated tool's capability is granted the loop auto-executes the
     # gated call (no model retry); see ⑤ auto-redispatch. When False, the model must retry the tool
@@ -1929,17 +1926,6 @@ class AgentLoop:
         is_fork = definition.context == "fork"
         child_run_id = f"{self.spec.run_id}.sub.{task.job_id}"
         child_depth = depth + 1
-        root_run_id = str(self.spec.metadata.get("root_run_id") or self.spec.run_id)
-        traceparent = str(task.request.get("traceparent") or new_traceparent())
-        identity = {
-            "root_run_id": root_run_id,
-            "parent_run_id": self.spec.run_id,
-            "child_run_id": child_run_id,
-            "task_id": task.job_id,
-            "definition_id": definition_id,
-            "depth": child_depth,
-            "traceparent": traceparent,
-        }
         # At the depth cap the child must not delegate further: the resolver drops any
         # agent.spawn binding and we give it no definitions, so the tool is simply absent
         # rather than erroring at call time.
@@ -1968,8 +1954,9 @@ class AgentLoop:
             turn_id=turn_id,
             parent_id=parent_event_id,
             data={
-                **identity,
                 "subagent_type": definition_id,
+                "child_run_id": child_run_id,
+                "depth": child_depth,
                 "background": background,
             },
         )
@@ -1983,8 +1970,6 @@ class AgentLoop:
             limits=self.spec.limits if is_fork else (definition.limits or self.spec.limits),
             permission_policy=self.spec.permission_policy,
             metadata={
-                **identity,
-                # Legacy aliases kept for existing readers.
                 "parent_run_id": self.spec.run_id,
                 "parent_task_id": task.job_id,
                 "subagent_definition_id": definition_id,
@@ -2006,13 +1991,11 @@ class AgentLoop:
             workspace_factory=self.workspace_factory,
             checkpoint_store=self.checkpoint_store,
             subagent_definitions=child_definitions,
-            capability_broker=self.capability_broker,
             status_file=False,
             # Inherit token streaming so a child's work streams into its own events.jsonl too
             # (an observer can tail run_root/<child_run_id>/events.jsonl for live subagent output).
             emit_output_deltas=self.emit_output_deltas,
         )
-        child._capability_vault = self._capability_vault
         result = await child.arun_once(
             task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
         )
@@ -2026,12 +2009,9 @@ class AgentLoop:
             parent_ctx = self._session.res.context
             parent_ctx.subagent_count += 1
             for key, value in usage.items():
-                amount = int(value)
-                parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + amount
-                self._session.state.total_usage[key] = self._session.state.total_usage.get(key, 0) + amount
+                parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + int(value)
         task.result = {
             "type": "subagent_result",
-            **identity,
             "task_id": task.job_id,
             "subagent_type": definition_id,
             "child_run_id": child_run_id,
@@ -2050,8 +2030,8 @@ class AgentLoop:
             parent_id=started.event_id,
             level="error" if result.status == "failed" else "info",
             data={
-                **identity,
                 "subagent_type": definition_id,
+                "child_run_id": child_run_id,
                 "status": result.status,
                 "usage": usage,
                 "error": result.error,
@@ -3862,42 +3842,16 @@ class AgentLoop:
         cached or was granted synchronously), or a *pending* ``ToolResult`` when the broker
         escalated the request (the run will park on a ``capability`` task and the model retries the
         tool once granted). A denial — or a scope-widening grant — raises ``PermissionDenied`` so the
-        call never runs. A no-op unless the binding declares ``runtime.requires_lease``. Required
-        leases fail closed when no broker is configured; ``"optional"`` keeps the old dev-only
-        best-effort behavior. Secrets never enter the core — a lease carries only a handle."""
+        call never runs. A no-op unless a broker is configured AND the binding declares
+        ``runtime.requires_lease``. Secrets never enter the core — a lease carries only a handle."""
         broker = self.capability_broker
         runtime = bound_tool.binding.runtime or {}
-        lease_requirement = runtime.get("requires_lease")
-        if not lease_requirement:
+        if broker is None or not runtime.get("requires_lease"):
             return None
         capability = bound_tool.base_spec.capability
         if not capability:
-            raise PermissionDenied(
-                f"tool binding {bound_tool.binding_id!r} requires a capability lease, "
-                "but its tool declares no capability",
-                error_code="capability_required",
-            )
-        if broker is None:
-            if lease_requirement == "optional":
-                return None
-            parent_id = started_event.event_id if started_event else None
-            recorder.emit(
-                "capability.denied",
-                turn_id=turn_id,
-                parent_id=parent_id,
-                level="warning",
-                data={
-                    "capability": capability,
-                    "binding_id": bound_tool.binding_id,
-                    "reason": "capability broker required",
-                    "retryable": False,
-                },
-            )
-            raise PermissionDenied(
-                f"capability broker required for {capability}",
-                error_code="capability_broker_required",
-            )
-        scope = self._capability_scope_for_tool(bound_tool)
+            return None
+        scope = {key: value for key, value in bound_tool.binding.scope.to_json().items() if value}
         now = time.time()
         binding_id = bound_tool.binding_id
         parent_id = started_event.event_id if started_event else None
@@ -4027,54 +3981,6 @@ class AgentLoop:
             },
         )
         return None
-
-    def _capability_scope_for_tool(self, bound_tool: BoundTool) -> dict[str, Any]:
-        scope = {key: value for key, value in bound_tool.binding.scope.to_json().items() if value}
-        capability = bound_tool.base_spec.capability or ""
-        if capability not in {"web.search", "web.fetch", "web.context"}:
-            return scope
-        scope.setdefault("binding_id", bound_tool.binding_id)
-        runtime = bound_tool.binding.runtime or {}
-        web_runtime = runtime.get("web", runtime) if isinstance(runtime, dict) else {}
-        web_runtime = web_runtime if isinstance(web_runtime, dict) else {}
-        feature = capability.rsplit(".", 1)[-1]
-        defaults = {
-            "search": {"max_calls": 20, "max_results": 10},
-            "fetch": {"max_calls": 50, "max_bytes": 1_000_000, "timeout_s": 60},
-            "context": {
-                "max_calls": 10,
-                "max_tokens": 32_768,
-                "max_urls": 20,
-                "max_snippets": 256,
-            },
-        }[feature]
-        max_calls = web_runtime.get("max_calls", web_runtime.get(f"max_{feature}_calls", defaults["max_calls"]))
-        scope.setdefault("max_calls", max(0, int(max_calls)))
-        if feature == "search":
-            scope.setdefault("max_results", max(1, int(web_runtime.get("max_results", defaults["max_results"]))))
-        elif feature == "fetch":
-            scope.setdefault(
-                "max_bytes",
-                max(1, int(web_runtime.get("max_response_bytes", web_runtime.get("max_bytes", defaults["max_bytes"])))),
-            )
-            scope.setdefault(
-                "timeout_s",
-                max(1, int(web_runtime.get("max_timeout_s", web_runtime.get("timeout_s", defaults["timeout_s"])))),
-            )
-        else:
-            scope.setdefault(
-                "max_tokens",
-                max(1, int(web_runtime.get("max_context_tokens", web_runtime.get("max_tokens", defaults["max_tokens"])))),
-            )
-            scope.setdefault(
-                "max_urls",
-                max(1, int(web_runtime.get("max_context_urls", web_runtime.get("max_urls", defaults["max_urls"])))),
-            )
-            scope.setdefault(
-                "max_snippets",
-                max(1, int(web_runtime.get("max_context_snippets", web_runtime.get("max_snippets", defaults["max_snippets"])))),
-            )
-        return scope
 
     def _rotate_capability_lease(
         self,

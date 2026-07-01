@@ -96,13 +96,3 @@ def test_put_blob_is_content_addressed_and_readable(store: CheckpointStore) -> N
     # An unknown digest raises KeyError (→ 404 at the API boundary).
     with pytest.raises(KeyError):
         store.get_blob("run_art", "f" * 64)
-
-
-def test_run_metadata_round_trips_and_deletes_with_run(store: CheckpointStore) -> None:
-    assert store.run_metadata("run_1") is None
-
-    store.put_run_metadata("run_1", {"run_id": "run_1", "tenant_id": "tenant_a"})
-
-    assert store.run_metadata("run_1") == {"run_id": "run_1", "tenant_id": "tenant_a"}
-    store.delete("run_1")
-    assert store.run_metadata("run_1") is None

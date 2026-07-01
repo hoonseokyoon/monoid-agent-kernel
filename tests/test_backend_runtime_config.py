@@ -100,13 +100,6 @@ def test_backend_runtime_config_endpoint_updates_next_turn(tmp_path: Path) -> No
     )
     assert updated["config_version"] == 2
     assert updated["config_hash"] == replacement.config_hash
-    assert updated["committed_at"] >= current["committed_at"]
-    run_meta = json.loads((submission.run_dir / "run.json").read_text(encoding="utf-8"))
-    assert run_meta["runtime_config"]["config_version"] == 2
-    assert run_meta["runtime_config_hash"] == replacement.config_hash
-    assert run_meta["runtime_config_issuer"] == "test"
-    assert run_meta["runtime_config_reason"] == "replace guidance"
-    assert run_meta["runtime_config_committed_at"] == updated["committed_at"]
     adapter.allow_first_return.set()
 
     assert backend.wait_for_run(submission.run_id, timeout_s=5) == "completed"

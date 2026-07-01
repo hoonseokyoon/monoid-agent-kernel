@@ -36,10 +36,6 @@ CREATE TABLE IF NOT EXISTS checkpoint_latest (
     run_id TEXT    PRIMARY KEY,
     seq    INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS run_metadata (
-    run_id   TEXT PRIMARY KEY,
-    metadata TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS blobs (
     sha  TEXT PRIMARY KEY,
     data BLOB NOT NULL
@@ -150,34 +146,6 @@ class SqliteCheckpointStore:
         del run_id  # content-addressed lookup; the token already authorized the run
         return self._read_blob(sha256)
 
-    def put_run_metadata(self, run_id: str, metadata: Mapping[str, object]) -> None:
-        payload = json.dumps(dict(metadata), ensure_ascii=False)
-        with self._lock:
-            conn = _connect(self._db_path)
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    "INSERT OR REPLACE INTO run_metadata(run_id, metadata) VALUES (?, ?)",
-                    (run_id, payload),
-                )
-                conn.execute("COMMIT")
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
-            finally:
-                conn.close()
-
-    def run_metadata(self, run_id: str) -> dict[str, object] | None:
-        conn = _connect(self._db_path)
-        try:
-            row = conn.execute("SELECT metadata FROM run_metadata WHERE run_id=?", (run_id,)).fetchone()
-        finally:
-            conn.close()
-        if row is None:
-            return None
-        payload = json.loads(row[0])
-        return dict(payload) if isinstance(payload, dict) else None
-
     def _read_blob(self, sha256: str) -> bytes:
         conn = _connect(self._db_path)
         try:
@@ -195,7 +163,6 @@ class SqliteCheckpointStore:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute("DELETE FROM checkpoints WHERE run_id=?", (run_id,))
                 conn.execute("DELETE FROM checkpoint_latest WHERE run_id=?", (run_id,))
-                conn.execute("DELETE FROM run_metadata WHERE run_id=?", (run_id,))
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
