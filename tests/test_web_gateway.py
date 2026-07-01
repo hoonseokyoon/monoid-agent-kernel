@@ -240,6 +240,8 @@ def test_web_gateway_rejects_signed_binding_and_numeric_escalation() -> None:
 
     with pytest.raises(Exception, match="binding_id exceeds signed token scope"):
         gateway.handle_search(token, {"binding_id": "other", "query": "binding"})
+    with pytest.raises(Exception, match="max_calls must be positive"):
+        gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "max_calls": 0})
     with pytest.raises(Exception, match="max_results exceeds signed token scope"):
         gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "max_results": 2})
 

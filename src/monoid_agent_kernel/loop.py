@@ -1776,6 +1776,7 @@ class AgentLoop:
             lease_ids=cp.revoked_lease_ids,
             capabilities=cp.revoked_capabilities,
             before=cp.revoked_before,
+            all_revoked=cp.revoked_all,
         )
         # Rehydrate inline-ingested media: load every blob:<sha> referenced by the restored log
         # back into the in-memory map so wire-build can resolve it after the restart. A blob

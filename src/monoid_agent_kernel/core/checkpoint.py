@@ -101,6 +101,7 @@ class RunCheckpoint:
     revoked_lease_ids: list[str] = field(default_factory=list)
     revoked_capabilities: list[str] = field(default_factory=list)
     revoked_before: float = 0.0
+    revoked_all: bool = False
 
     # --- run-level bookkeeping ---
     remaining_duration_s: float | None = None

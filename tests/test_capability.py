@@ -570,12 +570,14 @@ def test_vault_export_import_revocations_roundtrip() -> None:
         "revoked_lease_ids": ["lease_x"],
         "revoked_capabilities": ["web.search"],
         "revoked_before": 42.0,
+        "revoked_all": False,
     }
     fresh = CapabilityVault()
     fresh.import_revocations(**{
         "lease_ids": exported["revoked_lease_ids"],
         "capabilities": exported["revoked_capabilities"],
         "before": exported["revoked_before"],
+        "all_revoked": exported["revoked_all"],
     })
     assert fresh.is_capability_revoked("web.search")
     assert "lease_x" in fresh._revoked_lease_ids
@@ -622,6 +624,21 @@ def test_vault_fork_for_child_shares_revocations_without_live_lease_slots() -> N
     assert child.token_for("web.search", now=0.0) == "child-token"
     parent.revoke(capability="web.search")
     assert child.token_for("web.search", now=0.0) is None
+
+    child.admit(
+        CapabilityRequest(capability="web.context", scope={"binding_id": "child-only"}),
+        CapabilityLease(
+            capability="web.context",
+            token_ref="child-only-token",
+            expires_at=9e9,
+            scope={"binding_id": "child-only"},
+        ),
+    )
+    assert child.token_for("web.context", now=0.0) == "child-only-token"
+    exported = parent.revoke(capability="*")
+    assert exported["capabilities"] == ["*"]
+    assert child.token_for("web.context", now=0.0) is None
+    assert child.is_capability_revoked("child.only")
 
 
 def test_loop_revoke_blocks_next_call_without_rebrokering(tmp_path: Path) -> None:

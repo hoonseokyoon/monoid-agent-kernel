@@ -483,11 +483,15 @@ def _enforce_numeric_cap(
     if key not in scope or scope.get(key) is None:
         return
     signed = int(scope[key])
+    if signed <= 0:
+        raise WebGatewayError(f"web token {key} signed scope must be positive", error_code="web_scope_invalid")
     requested_raw = payload.get(key)
     if requested_raw is None:
         payload[key] = signed
         return
     requested = int(requested_raw)
+    if requested <= 0:
+        raise WebGatewayError(f"web request {key} must be positive", error_code="web_scope_denied")
     if requested > signed:
         raise WebGatewayError(
             f"web request {key} exceeds signed token scope",

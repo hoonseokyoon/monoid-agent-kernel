@@ -192,6 +192,7 @@ class CapabilityRevocationState:
     lease_ids: set[str] = field(default_factory=set)
     capabilities: set[str] = field(default_factory=set)
     before: float = 0.0
+    all_revoked: bool = False
 
 
 @dataclass
@@ -236,9 +237,18 @@ class CapabilityVault:
     def _revoked_before(self, value: float) -> None:
         self._revocations.before = value
 
+    @property
+    def _revoked_all(self) -> bool:
+        return self._revocations.all_revoked
+
+    @_revoked_all.setter
+    def _revoked_all(self, value: bool) -> None:
+        self._revocations.all_revoked = value
+
     def _is_revoked(self, lease: CapabilityLease) -> bool:
         return (
-            lease.lease_id in self._revoked_lease_ids
+            self._revoked_all
+            or lease.lease_id in self._revoked_lease_ids
             or lease.capability in self._revoked_capabilities
             or lease.issued_at < self._revoked_before
         )
@@ -289,12 +299,12 @@ class CapabilityVault:
           - ``before`` — a watermark: every lease issued before this epoch time is rejected in O(1)
             (a bulk cohort kill).
         Revocation is monotonic and additive — there is no un-revoke (start a fresh lease cohort)."""
-        revoked_caps = sorted(self._leases.keys()) if capability == "*" else []
+        revoked_caps = ["*"] if capability == "*" else []
         if capability and capability != "*":
             self._revoked_capabilities.add(capability)
             revoked_caps = [capability]
         elif capability == "*":
-            self._revoked_capabilities.update(self._leases.keys())
+            self._revoked_all = True
         if lease_id:
             self._revoked_lease_ids.add(lease_id)
         if before is not None:
@@ -308,7 +318,7 @@ class CapabilityVault:
     def is_capability_revoked(self, capability: str) -> bool:
         """True if this capability is under a per-capability revocation — the gate's hard stop that
         refuses to even re-broker (so revocation cannot be undone by a permissive broker)."""
-        return capability in self._revoked_capabilities
+        return self._revoked_all or capability in self._revoked_capabilities
 
     def export_durable(self) -> list[dict[str, Any]]:
         """Serialize the leases marked ``durable`` (e.g. human/policy-approved) for the checkpoint.
@@ -320,10 +330,14 @@ class CapabilityVault:
     def export_revocations(self) -> dict[str, Any]:
         """Serialize the revocation records for the checkpoint, so a revoked durable lease stays
         dead across a restart (the kill switch must not be forgotten when the run resumes)."""
+        capabilities = sorted(self._revoked_capabilities)
+        if self._revoked_all and "*" not in capabilities:
+            capabilities = ["*", *capabilities]
         return {
             "revoked_lease_ids": sorted(self._revoked_lease_ids),
-            "revoked_capabilities": sorted(self._revoked_capabilities),
+            "revoked_capabilities": capabilities,
             "revoked_before": self._revoked_before,
+            "revoked_all": self._revoked_all,
         }
 
     def fork_for_child(self) -> CapabilityVault:
@@ -345,11 +359,17 @@ class CapabilityVault:
         lease_ids: list[str] | None = None,
         capabilities: list[str] | None = None,
         before: float = 0.0,
+        all_revoked: bool = False,
     ) -> None:
         """Rehydrate revocation records on restore (paired with :meth:`export_revocations`)."""
         self._revoked_lease_ids.update(lease_ids or ())
-        self._revoked_capabilities.update(capabilities or ())
+        imported_capabilities = set(capabilities or ())
+        if "*" in imported_capabilities:
+            all_revoked = True
+            imported_capabilities.discard("*")
+        self._revoked_capabilities.update(imported_capabilities)
         self._revoked_before = max(self._revoked_before, before)
+        self._revoked_all = self._revoked_all or all_revoked
 
     def install(self, lease: CapabilityLease) -> None:
         """Directly install a lease (no scope re-check) — used on restore to rehydrate durable
