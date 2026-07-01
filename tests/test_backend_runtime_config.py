@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+import pytest
 
 from support.http import http_get_json as _json_get
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.tool_surface import ToolGuidance
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 from monoid_agent_kernel.providers.fake import fake_tool_call
@@ -65,6 +70,15 @@ class _BlockingAdapter:
         return ModelTurn(final_text="done")
 
 
+class _FailingRunMetadataStore(LocalFsCheckpointStore):
+    fail_run_metadata = False
+
+    def put_run_metadata(self, run_id: str, metadata: Mapping[str, Any]) -> None:
+        if self.fail_run_metadata:
+            raise OSError("shared metadata unavailable")
+        super().put_run_metadata(run_id, metadata)
+
+
 def test_backend_runtime_config_endpoint_updates_next_turn(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     adapter = _BlockingAdapter()
@@ -112,6 +126,56 @@ def test_backend_runtime_config_endpoint_updates_next_turn(tmp_path: Path) -> No
     assert backend.wait_for_run(submission.run_id, timeout_s=5) == "completed"
     second_read = next(tool for tool in adapter.requests[1].tools if tool.id == "fs.read")
     assert "replacement read" in second_read.description
+
+
+def test_runtime_config_metadata_store_failure_keeps_local_descriptor_unchanged(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    adapter = _BlockingAdapter()
+    run_root = tmp_path / "runs"
+    store = _FailingRunMetadataStore(run_root)
+    backend = RunnerBackend(
+        run_root=run_root,
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _spec, _token: adapter,
+        checkpoint_store=store,
+    )
+    initial = _config(1, _binding("fs.read", guidance="initial read"), _binding("run.finish"))
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Read and finish.",
+            runtime_config=initial,
+        )
+    )
+    assert adapter.first_call_started.wait(timeout=5)
+
+    run_meta_before = json.loads((submission.run_dir / "run.json").read_text(encoding="utf-8"))
+    stored_meta_before = store.run_metadata(submission.run_id)
+    store.fail_run_metadata = True
+    replacement = _config(2, _binding("fs.read", guidance="replacement read"), _binding("run.finish"))
+
+    with pytest.raises(OSError, match="shared metadata unavailable"):
+        backend.replace_runtime_config(
+            submission.run_id,
+            submission.run_token,
+            expected_version=1,
+            issuer="test",
+            reason="replace guidance",
+            config=replacement,
+        )
+
+    assert backend.runtime_config(submission.run_id, submission.run_token)["config_version"] == 1
+    run_meta_after = json.loads((submission.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert run_meta_after == run_meta_before
+    assert store.run_metadata(submission.run_id) == stored_meta_before
+    adapter.allow_first_return.set()
+    assert backend.wait_for_run(submission.run_id, timeout_s=5) == "completed"
 
 
 def test_backend_http_runtime_config_get_post_and_version_mismatch(tmp_path: Path) -> None:

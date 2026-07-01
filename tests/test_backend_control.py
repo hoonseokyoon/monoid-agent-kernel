@@ -81,6 +81,22 @@ def _events(backend: RunnerBackend, run_id: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
 
 
+class _UnopenedLoop:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def emit_external_event(
+        self,
+        event_type: str,
+        *,
+        data: dict[str, Any] | None = None,
+        level: str = "info",
+    ) -> bool:
+        del event_type, data, level
+        self.calls += 1
+        return False
+
+
 def test_dispatch_inspect_and_health_report_live_state(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
@@ -216,6 +232,32 @@ def test_dispatch_skips_run_audit_before_loop_owns_sequence(tmp_path: Path) -> N
         record.loop = loop
 
     assert status.status == "ok"
+    assert _events(backend, run_id) == before
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_control_audit_skips_direct_append_when_loop_is_not_open(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+    record = backend._record(run_id)
+    loop = record.loop
+    unopened = _UnopenedLoop()
+    before = _events(backend, run_id)
+
+    record.loop = unopened  # type: ignore[assignment]
+    try:
+        backend._emit_control_audit_event(
+            run_id,
+            "control.command.received",
+            {"command_id": "cmd_starting", "command": "status"},
+        )
+    finally:
+        record.loop = loop
+
+    assert unopened.calls == 1
     assert _events(backend, run_id) == before
 
     backend.cancel_run(run_id, token)

@@ -1387,13 +1387,13 @@ class RunnerBackend:
             record = self._records.get(run_id)
             loop = record.loop if record is not None else None
             run_dir = record.run_dir if record is not None else self.run_root / run_id
-        if record is not None and loop is None:
-            return
-        if loop is not None and loop.emit_external_event(event_type, data=data, level=level):
+        if record is not None:
+            if loop is not None:
+                loop.emit_external_event(event_type, data=data, level=level)
             return
         if not run_dir.exists():
             return
-        if record is None and not _run_dir_allows_direct_audit_append(run_dir):
+        if not _run_dir_allows_direct_audit_append(run_dir):
             return
         try:
             append_event_to_run(run_dir, event_type, data=data, level=level)
@@ -2558,8 +2558,8 @@ class RunnerBackend:
         meta["runtime_config_issuer"] = issuer
         meta["runtime_config_reason"] = reason
         meta["runtime_config_committed_at"] = committed_at
-        write_json_atomic(record.run_dir / "run.json", meta)
         self._store_run_meta(record.run_id, meta)
+        write_json_atomic(record.run_dir / "run.json", meta)
 
     def _store_run_meta(self, run_id: str, meta: Mapping[str, Any]) -> None:
         if self.checkpoint_store is None:
