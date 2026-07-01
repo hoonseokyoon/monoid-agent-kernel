@@ -1366,7 +1366,10 @@ class RunnerBackend:
             return
         with self._lock:
             record = self._records.get(run_id)
+            loop = record.loop if record is not None else None
             run_dir = record.run_dir if record is not None else self.run_root / run_id
+        if loop is not None and loop.emit_external_event(event_type, data=data, level=level):
+            return
         if not run_dir.exists():
             return
         try:

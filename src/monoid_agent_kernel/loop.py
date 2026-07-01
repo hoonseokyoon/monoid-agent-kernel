@@ -1005,6 +1005,20 @@ class AgentLoop:
             capability=capability, lease_id=lease_id, before=before
         )
 
+    def emit_external_event(
+        self,
+        event_type: str,
+        *,
+        data: dict[str, Any] | None = None,
+        level: str = "info",
+    ) -> bool:
+        """Emit an operator/backend event through the live recorder when a session is open."""
+        session = self._session
+        if session is None:
+            return False
+        session.res.recorder.emit(event_type, data=data, level=level)
+        return True
+
     def pending_outbox(self) -> list[OutboxRequest]:
         """Staged outbox requests awaiting (re)dispatch — the full pending set regardless of retry
         schedule. The edge drains :meth:`due_outbox`; this is for inspection/snapshot. The core never
@@ -2012,7 +2026,7 @@ class AgentLoop:
             # (an observer can tail run_root/<child_run_id>/events.jsonl for live subagent output).
             emit_output_deltas=self.emit_output_deltas,
         )
-        child._capability_vault = self._capability_vault
+        child._capability_vault = self._capability_vault.fork_for_child()
         result = await child.arun_once(
             task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
         )

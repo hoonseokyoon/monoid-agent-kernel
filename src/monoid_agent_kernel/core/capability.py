@@ -188,6 +188,13 @@ def scope_within(inner: dict[str, Any], outer: dict[str, Any]) -> bool:
 
 
 @dataclass
+class CapabilityRevocationState:
+    lease_ids: set[str] = field(default_factory=set)
+    capabilities: set[str] = field(default_factory=set)
+    before: float = 0.0
+
+
+@dataclass
 class CapabilityVault:
     """Per-run, in-memory cache of granted leases. Holds only handles (``token_ref``), never
     secrets. Durable (human/policy-approved) leases are checkpointed; ephemeral sync grants are
@@ -203,9 +210,31 @@ class CapabilityVault:
     permissive broker."""
 
     _leases: dict[str, CapabilityLease] = field(default_factory=dict)
-    _revoked_lease_ids: set[str] = field(default_factory=set)
-    _revoked_capabilities: set[str] = field(default_factory=set)
-    _revoked_before: float = 0.0
+    _revocations: CapabilityRevocationState = field(default_factory=CapabilityRevocationState)
+
+    @property
+    def _revoked_lease_ids(self) -> set[str]:
+        return self._revocations.lease_ids
+
+    @_revoked_lease_ids.setter
+    def _revoked_lease_ids(self, value: set[str]) -> None:
+        self._revocations.lease_ids = value
+
+    @property
+    def _revoked_capabilities(self) -> set[str]:
+        return self._revocations.capabilities
+
+    @_revoked_capabilities.setter
+    def _revoked_capabilities(self, value: set[str]) -> None:
+        self._revocations.capabilities = value
+
+    @property
+    def _revoked_before(self) -> float:
+        return self._revocations.before
+
+    @_revoked_before.setter
+    def _revoked_before(self, value: float) -> None:
+        self._revocations.before = value
 
     def _is_revoked(self, lease: CapabilityLease) -> bool:
         return (
@@ -296,6 +325,19 @@ class CapabilityVault:
             "revoked_capabilities": sorted(self._revoked_capabilities),
             "revoked_before": self._revoked_before,
         }
+
+    def fork_for_child(self) -> CapabilityVault:
+        """Create a child-run vault with isolated live lease slots and shared revocations.
+
+        Durable grants are copied into the child so approved access survives delegation, while
+        ephemeral live leases stay local to each run. Revocations share one state object so an
+        operator kill switch in the parent is immediately visible to already-running children.
+        """
+        child = CapabilityVault(_revocations=self._revocations)
+        for lease in self._leases.values():
+            if lease.durable:
+                child.install(lease)
+        return child
 
     def import_revocations(
         self,

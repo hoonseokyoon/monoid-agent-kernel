@@ -582,6 +582,48 @@ def test_vault_export_import_revocations_roundtrip() -> None:
     assert fresh._revoked_before == 42.0
 
 
+def test_vault_fork_for_child_shares_revocations_without_live_lease_slots() -> None:
+    parent = CapabilityVault()
+    parent.admit(
+        CapabilityRequest(capability="web.search", scope={"binding_id": "parent"}),
+        CapabilityLease(
+            capability="web.search",
+            token_ref="parent-token",
+            expires_at=9e9,
+            scope={"binding_id": "parent"},
+        ),
+    )
+    parent.admit(
+        CapabilityRequest(capability="web.fetch", scope={"binding_id": "shared"}),
+        CapabilityLease(
+            capability="web.fetch",
+            token_ref="durable-token",
+            expires_at=9e9,
+            scope={"binding_id": "shared"},
+            durable=True,
+        ),
+    )
+
+    child = parent.fork_for_child()
+    assert child.token_for("web.search", now=0.0) is None
+    assert child.token_for("web.fetch", now=0.0) == "durable-token"
+
+    child.admit(
+        CapabilityRequest(capability="web.search", scope={"binding_id": "child"}),
+        CapabilityLease(
+            capability="web.search",
+            token_ref="child-token",
+            expires_at=9e9,
+            scope={"binding_id": "child"},
+        ),
+    )
+
+    assert parent.token_for("web.search", now=0.0) == "parent-token"
+    assert child.token_for("web.search", now=0.0) == "child-token"
+    parent.revoke(capability="web.search")
+    assert child.token_for("web.search", now=0.0) is None
+
+
 def test_loop_revoke_blocks_next_call_without_rebrokering(tmp_path: Path) -> None:
     provider = _CapToolProvider()
     broker = _CountingBroker(AutoGrantBroker())

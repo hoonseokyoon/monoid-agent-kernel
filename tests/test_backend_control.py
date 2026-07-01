@@ -181,6 +181,29 @@ def test_dispatch_emits_control_audit_events_without_token_leak(tmp_path: Path) 
     backend.wait_for_run(run_id, timeout_s=20)
 
 
+def test_dispatch_control_audit_uses_live_recorder_sequence(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    status = _dispatch(backend, run_id, token, "status")
+    assert status.status == "ok"
+    record = backend._record(run_id)
+    assert record.loop is not None
+    assert record.loop.emit_external_event("control.test.after_audit", data={"ok": True})
+
+    events = _events(backend, run_id)
+    seqs = [event["seq"] for event in events]
+    assert seqs == sorted(seqs)
+    assert len(seqs) == len(set(seqs))
+    completed_seq = max(event["seq"] for event in events if event["type"] == "control.command.completed")
+    after_seq = next(event["seq"] for event in events if event["type"] == "control.test.after_audit")
+    assert after_seq > completed_seq
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
 def test_dispatch_routes_existing_ops_and_unknown(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
