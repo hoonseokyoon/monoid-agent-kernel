@@ -33,22 +33,23 @@ observable, and generated output (here, a plot) previews inline.*
 messages over a durable, capability-gated **outbox→inbox** fabric — the capability and outbox
 events are visible in the trace on the right.*
 
-## Architecture: contracts / core / reference
+## Architecture: Contract / Conformance Test / Core Helper Kit / Reference
 
-The package is layered in three tiers:
+The package is organized around four roles:
 
-- **contracts** — the stable integration surface, collected in `monoid_agent_kernel.contracts`
+- **Contract** — the stable integration surface, collected in `monoid_agent_kernel.contracts`
   and re-exported from the top-level `monoid_agent_kernel`. These are the specs and protocols you
   depend on and implement: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig`, `ModelAdapter`,
   `ToolSpec` / `@tool`, `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest. See
-  [docs/CONTRACTS.md](docs/CONTRACTS.md) for the Python and HTTP wire contracts.
-- **core** — the engine that implements those contracts: the default, batteries-included kernel
-  (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). This is the supported
-  implementation you actually run.
-- **reference** — example services under `monoid_agent_kernel.reference` (`backend`,
-  `llm_gateway`, `web_gateway`, `stores`). These examples live outside the supported public
-  surface. Core never imports them, and real integrators build their own services against
-  the contracts.
+  [docs/CONTRACTS.md](docs/CONTRACTS.md) for the Python, HTTP, wiring, and operational rules.
+- **Conformance Test** — profile-based tests that check contract behavior for a chosen runtime
+  shape. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the Phase 1S profile model.
+- **Core Helper Kit** — the supported runtime and helper modules that make the contract easy to
+  satisfy (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). See
+  [docs/CORE_HELPER_KIT.md](docs/CORE_HELPER_KIT.md) for the helper boundary.
+- **Reference** — example services under `monoid_agent_kernel.reference` (`backend`,
+  `llm_gateway`, `web_gateway`, `stores`) assembled from the public contract and helper kit. See
+  [docs/REFERENCE.md](docs/REFERENCE.md) for the reference role and smoke targets.
 
 For the dynamic binding-based tool surface, see
 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md).

@@ -8,18 +8,21 @@ gateway, and web gateway integration.
 
 ## Boundary
 
-The package is layered in three tiers:
+The package is organized around four public roles:
 
-- **contracts** — the stable integration surface, collected in
+- **Contract** — the stable integration surface, collected in
   `monoid_agent_kernel.contracts` (and re-exported from the top-level
   `monoid_agent_kernel`). These are the specs and protocols you depend on and
-  implement. This document defines them.
-- **core** — the engine that implements those contracts: the supported kernel runtime
-  (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, permission,
-  shell execution, and web gateway client modules).
-- **reference** — example services under `monoid_agent_kernel.reference`
-  (`backend`, `llm_gateway`, `web_gateway`, `stores`). These examples live outside
-  the supported public surface; core has no dependency on `monoid_agent_kernel.reference`.
+  implement. This document defines the Python, HTTP, wiring, and operational rules.
+- **Conformance Test** — profile-based tests that check contract behavior for a chosen
+  runtime shape. See `docs/CONFORMANCE.md`.
+- **Core Helper Kit** — the supported runtime and helper modules that make the contract
+  easy to satisfy: `loop.py`, `core/`, `providers/`, `tools`, `workspace`,
+  permission, shell execution, and gateway client modules. See `docs/CORE_HELPER_KIT.md`.
+- **Reference** — example services under `monoid_agent_kernel.reference`
+  (`backend`, `llm_gateway`, `web_gateway`, `stores`). These examples are assembled
+  from the public contract and helper kit; core has no dependency on
+  `monoid_agent_kernel.reference`. See `docs/REFERENCE.md`.
 
 Agent configuration enters the engine through `AgentRuntimeConfig`. Legacy
 tool/shell/web policy inputs have left the core, backend, and CLI execution
@@ -46,6 +49,25 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   disabled per run with an `OutputValidatorBinding(enabled=False)`; on failure the loop re-prompts
   up to `RunLimits.max_output_retries`).
 - **Reference examples**: `monoid_agent_kernel.reference.*` services.
+
+## Operational Rules
+
+Phase 1S assigns stable rule ids to the operational semantics that keep agent systems
+durable, observable, and safe across backend and gateway implementations. These rules are
+contract language: a backend may use the Core Helper Kit or its own implementation path, then
+prove the same behavior through conformance profiles.
+
+| Rule ID | Contract rule | Primary profiles | Helper candidates |
+| --- | --- | --- | --- |
+| `PH1S-R1` | Scope relation is defined once: signed scope bounds request scope, request scope bounds grant scope, numeric caps narrow by smaller values, list caps narrow by subset, and wildcard domains narrow by pattern relation. | `capability-security`, `provider-gateway` | `ScopeRelation`, `ProviderGatewayPolicy` |
+| `PH1S-R2` | Capability identity and binding boundaries are preserved through gateway calls, including endpoint capability matching and domain filters for provider and redirect checks. | `provider-gateway`, `capability-security` | `ProviderGatewayPolicy`, `ScopeRelation` |
+| `PH1S-R3` | Lease admission preserves policy fields and decision semantics: approved leases keep `lease_id`, `issued_at`, `expires_at`, `max_expires_at`, and `scope`; denied decisions strip grant material. | `capability-security`, `control-plane` | `LeaseAdmission`, `ControlCommandPolicy` |
+| `PH1S-R4` | Revocation covers time and child-runtime boundaries, including revoke-now watermarks, wildcard revocation, child-held leases, and shared revocation state. | `capability-security`, `multi-agent` | `LeaseAdmission`, `SubagentRuntimeContext` |
+| `PH1S-R5` | Run event sequence ownership follows lifecycle state: live recorders own live sequence, queued direct appends seed later recorders, terminal appends use guarded fallback, and diagnostics use the newest sequence. | `durable-runner`, `control-plane` | `RunEventSequencer`, `LifecycleProjection`, `DiagnosticsBuilder` |
+| `PH1S-R6` | Control audit follows authorization, lifecycle, and ownership policy: valid target authorization gates run-stream audit, failed authorized commands leave failure audit, and callback-token commands are declared. | `control-plane`, `capability-security` | `ControlCommandPolicy`, `RunEventSequencer` |
+| `PH1S-R7` | Durable metadata writes keep API results and recovery results aligned through schema validation, shared-store compatibility, and commit ordering. | `durable-runner`, `control-plane` | `DurableMetadataCommitter`, `LifecycleProjection` |
+| `PH1S-R8` | Provider gateways apply effective caps on request and response paths, including signed caps, request caps, defaults, redirect boundaries, byte caps, and timeout caps. | `provider-gateway` | `ProviderGatewayPolicy` |
+| `PH1S-R9` | Subagent runtime links identity, capability, and trace boundaries: child runs have their own identity/accounting, isolated live lease slots, shared revocation, and parent-child diagnostics linkage. | `multi-agent`, `capability-security`, `durable-runner` | `SubagentRuntimeContext`, `LeaseAdmission`, `DiagnosticsBuilder` |
 
 ## Identifier Namespace
 
