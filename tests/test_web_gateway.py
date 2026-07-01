@@ -36,7 +36,7 @@ from monoid_agent_kernel.reference.web_gateway.providers import (
     SearchFetchContextProvider,
 )
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
-from monoid_agent_kernel.web import WebGatewayClient
+from monoid_agent_kernel.web import WebGatewayClient, WebGatewayError
 
 pytestmark = pytest.mark.integration
 
@@ -203,8 +203,15 @@ def test_web_gateway_applies_signed_fetch_and_context_caps_when_omitted() -> Non
 
 def test_web_gateway_rejects_scoped_fetch_redirect_to_unscoped_domain() -> None:
     class RedirectingProvider(FakeWebProvider):
-        def fetch(self, url: str, *, format: str) -> dict[str, Any]:
-            del url, format
+        def fetch(
+            self,
+            url: str,
+            *,
+            format: str,
+            allowed_domains: tuple[str, ...] = (),
+            blocked_domains: tuple[str, ...] = (),
+        ) -> dict[str, Any]:
+            del url, format, allowed_domains, blocked_domains
             return {
                 "title": "Redirected",
                 "final_url": "https://blog.example.test/redirected",
@@ -452,6 +459,24 @@ def test_web_providers_contract() -> None:
         upstream.stop()
 
 
+def test_http_fetch_provider_rejects_redirect_before_disallowed_request() -> None:
+    upstream = _FakeUpstreamServer()
+    upstream.start()
+    try:
+        fetch_provider = HttpFetchProvider(timeout_s=5, max_raw_bytes=20_000)
+        with pytest.raises(WebGatewayError) as exc_info:
+            fetch_provider.fetch(
+                f"{upstream.base_url}/redirect-to-localhost",
+                format="text",
+                allowed_domains=("127.0.0.1",),
+            )
+
+        assert exc_info.value.error_code == "web_binding_denied"
+        assert upstream.blocked_hits == 0
+    finally:
+        upstream.stop()
+
+
 def test_brave_llm_context_provider_contract() -> None:
     upstream = _FakeUpstreamServer()
     upstream.start()
@@ -490,6 +515,7 @@ def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
 class _FakeUpstreamServer:
     def __init__(self) -> None:
         self.last_brave_headers: dict[str, str] = {}
+        self.blocked_hits = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -520,6 +546,15 @@ class _FakeUpstreamServer:
                         "<html><head><title>Monoid Docs</title></head>"
                         "<body><main><p>Brave search result body for the kernel.</p></main></body></html>"
                     )
+                    return
+                if parsed.path == "/redirect-to-localhost":
+                    self.send_response(302)
+                    self.send_header("Location", f"http://localhost:{outer.port}/blocked-target")
+                    self.end_headers()
+                    return
+                if parsed.path == "/blocked-target":
+                    outer.blocked_hits += 1
+                    self._write_html("<html><body>blocked target</body></html>")
                     return
                 self.send_response(404)
                 self.end_headers()
@@ -594,9 +629,21 @@ class _CountingWebProvider:
         self.search_calls += 1
         return self.delegate.search(query, max_results=max_results)
 
-    def fetch(self, url: str, *, format: str) -> dict[str, Any]:
+    def fetch(
+        self,
+        url: str,
+        *,
+        format: str,
+        allowed_domains: tuple[str, ...] = (),
+        blocked_domains: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
         self.fetch_calls += 1
-        return self.delegate.fetch(url, format=format)
+        return self.delegate.fetch(
+            url,
+            format=format,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
+        )
 
     def context(
         self,

@@ -19,7 +19,14 @@ class WebProvider(Protocol):
     def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
         ...
 
-    def fetch(self, url: str, *, format: str) -> dict[str, Any]:
+    def fetch(
+        self,
+        url: str,
+        *,
+        format: str,
+        allowed_domains: tuple[str, ...] = (),
+        blocked_domains: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
         ...
 
     def context(
@@ -86,8 +93,16 @@ class FakeWebProvider:
             for _score, item in scored[:max_results]
         ]
 
-    def fetch(self, url: str, *, format: str) -> dict[str, Any]:
+    def fetch(
+        self,
+        url: str,
+        *,
+        format: str,
+        allowed_domains: tuple[str, ...] = (),
+        blocked_domains: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
         del format
+        del allowed_domains, blocked_domains
         for item in self.corpus:
             if item["url"] == url:
                 return {
@@ -128,7 +143,12 @@ class FakeWebProvider:
         used_chars = 0
         for result in results:
             url = str(result.get("url") or "")
-            page = self.fetch(url, format="markdown")
+            page = self.fetch(
+                url,
+                format="markdown",
+                allowed_domains=allowed_domains,
+                blocked_domains=blocked_domains,
+            )
             content = str(page.get("content") or "")
             if not content:
                 continue
@@ -258,7 +278,12 @@ class WebGatewayBackend:
         output_format = str(payload.get("format") or "text")
         effective_timeout_s = max(1, int(payload.get("timeout_s") or 30))
         effective_max_bytes = max(1, int(payload.get("max_bytes") or 100_000))
-        fetched = self.provider.fetch(url, format=output_format)
+        fetched = self.provider.fetch(
+            url,
+            format=output_format,
+            allowed_domains=request_allowed,
+            blocked_domains=request_blocked,
+        )
         final_url = str(fetched.get("final_url") or url)
         final_domain = domain_from_url(final_url)
         if not domain_allowed(final_domain, allowed_domains=request_allowed, blocked_domains=request_blocked):

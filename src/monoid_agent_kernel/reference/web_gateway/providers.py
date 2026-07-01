@@ -7,10 +7,10 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any, Protocol
 from urllib.error import HTTPError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urljoin
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
-from monoid_agent_kernel.web import WebGatewayError, domain_from_url
+from monoid_agent_kernel.web import WebGatewayError, domain_allowed, domain_from_url
 
 DEFAULT_BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 DEFAULT_BRAVE_LLM_CONTEXT_ENDPOINT = "https://api.search.brave.com/res/v1/llm/context"
@@ -27,7 +27,14 @@ class SearchProvider(Protocol):
 class FetchProvider(Protocol):
     provider_name: str
 
-    def fetch(self, url: str, *, format: str) -> dict[str, Any]:
+    def fetch(
+        self,
+        url: str,
+        *,
+        format: str,
+        allowed_domains: tuple[str, ...] = (),
+        blocked_domains: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
         ...
 
 
@@ -58,8 +65,20 @@ class CompositeWebProvider:
     def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
         return self.search_provider.search(query, max_results=max_results)
 
-    def fetch(self, url: str, *, format: str) -> dict[str, Any]:
-        return self.fetch_provider.fetch(url, format=format)
+    def fetch(
+        self,
+        url: str,
+        *,
+        format: str,
+        allowed_domains: tuple[str, ...] = (),
+        blocked_domains: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        return self.fetch_provider.fetch(
+            url,
+            format=format,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
+        )
 
     def context(
         self,
@@ -214,17 +233,15 @@ class HttpFetchProvider:
     user_agent: str = DEFAULT_HTTP_USER_AGENT
     provider_name: str = "http"
 
-    def fetch(self, url: str, *, format: str) -> dict[str, Any]:
-        if domain_from_url(url) == "":
-            raise WebGatewayError(f"invalid URL for fetch: {url}", error_code="web_bad_request")
-        request = Request(
-            url,
-            headers={
-                "Accept": "text/html, text/plain, application/xhtml+xml, */*;q=0.8",
-                "User-Agent": self.user_agent,
-            },
-            method="GET",
-        )
+    def fetch(
+        self,
+        url: str,
+        *,
+        format: str,
+        allowed_domains: tuple[str, ...] = (),
+        blocked_domains: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        _ensure_fetch_url_allowed(url, allowed_domains=allowed_domains, blocked_domains=blocked_domains)
         # Retry transient connection-level failures (an HTTPError is a real response and
         # propagates immediately); the final error keeps the original message/code.
         attempts = 3
@@ -233,10 +250,11 @@ class HttpFetchProvider:
         raw = b""
         for attempt in range(attempts):
             try:
-                with urlopen(request, timeout=self.timeout_s) as response:
-                    final_url = response.geturl()
-                    content_type = response.headers.get("Content-Type", "")
-                    raw = response.read(self.max_raw_bytes + 1)
+                final_url, content_type, raw = self._fetch_following_allowed_redirects(
+                    url,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
+                )
                 break
             except HTTPError as exc:
                 raise WebGatewayError(
@@ -270,6 +288,47 @@ class HttpFetchProvider:
             "content_type": content_type,
             "source": self.provider_name,
         }
+
+    def _request(self, url: str) -> Request:
+        return Request(
+            url,
+            headers={
+                "Accept": "text/html, text/plain, application/xhtml+xml, */*;q=0.8",
+                "User-Agent": self.user_agent,
+            },
+            method="GET",
+        )
+
+    def _fetch_following_allowed_redirects(
+        self,
+        url: str,
+        *,
+        allowed_domains: tuple[str, ...],
+        blocked_domains: tuple[str, ...],
+    ) -> tuple[str, str, bytes]:
+        current_url = url
+        for _redirect_count in range(10):
+            try:
+                with _NO_REDIRECT_OPENER.open(self._request(current_url), timeout=self.timeout_s) as response:
+                    return (
+                        response.geturl(),
+                        response.headers.get("Content-Type", ""),
+                        response.read(self.max_raw_bytes + 1),
+                    )
+            except HTTPError as exc:
+                if exc.code not in _REDIRECT_STATUS_CODES:
+                    raise
+                location = exc.headers.get("Location") or exc.headers.get("URI")
+                if not location:
+                    raise
+                next_url = urljoin(current_url, location)
+                _ensure_fetch_url_allowed(
+                    next_url,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
+                )
+                current_url = next_url
+        raise WebGatewayError("fetch redirect limit exceeded", error_code="web_fetch_redirect_limit")
 
 
 @dataclass(frozen=True)
@@ -365,7 +424,14 @@ class SearchFetchContextProvider:
             if not url:
                 continue
             try:
-                pages.append(self.fetch_provider.fetch(url, format="markdown"))
+                pages.append(
+                    self.fetch_provider.fetch(
+                        url,
+                        format="markdown",
+                        allowed_domains=allowed_domains,
+                        blocked_domains=blocked_domains,
+                    )
+                )
             except WebGatewayError:
                 continue
         return self.builder.build(
@@ -438,6 +504,34 @@ def _request_json(
     if not isinstance(payload, dict):
         raise WebGatewayError(f"{error_prefix} response must be an object", error_code=f"{error_code_prefix}_bad_response")
     return payload
+
+
+_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
+
+
+def _ensure_fetch_url_allowed(
+    url: str,
+    *,
+    allowed_domains: tuple[str, ...],
+    blocked_domains: tuple[str, ...],
+) -> None:
+    domain = domain_from_url(url)
+    if not domain:
+        raise WebGatewayError(f"invalid URL for fetch: {url}", error_code="web_bad_request")
+    if not domain_allowed(domain, allowed_domains=allowed_domains, blocked_domains=blocked_domains):
+        raise WebGatewayError(
+            f"fetch target domain is not allowed by binding constraints: {domain}",
+            error_code="web_binding_denied",
+        )
 
 
 def _normalize_brave_results(payload: dict[str, Any], *, max_results: int, source: str) -> list[dict[str, Any]]:
