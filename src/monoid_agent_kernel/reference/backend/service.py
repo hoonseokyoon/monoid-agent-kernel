@@ -1780,7 +1780,10 @@ class RunnerBackend:
         run_dir = self._authorized_run_dir(run_id, token)
         status = self.status(run_id, token)
         status_file = status.get("status_file") if isinstance(status.get("status_file"), dict) else {}
-        last_event_seq = int(status.get("last_event_seq") or status_file.get("last_event_seq") or 0)
+        last_event_seq = max(
+            int(status.get("last_event_seq") or 0),
+            int(status_file.get("last_event_seq") or 0),
+        )
         from_seq = max(0, last_event_seq - event_limit + 1) if last_event_seq else 0
         event_page = _read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=event_limit)
         event_summaries = [_diagnostic_event_summary(event) for event in event_page["events"]]

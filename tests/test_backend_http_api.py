@@ -123,10 +123,9 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
                 "traceparent": traceparent,
             },
         )
-        backend.record_event(run_id, trace_event)
-        diagnostics = _json_get(f"{base_url}/v1/runs/{run_id}/diagnostics?event_limit=3", token=run_token)
+        diagnostics = _json_get(f"{base_url}/v1/runs/{run_id}/diagnostics?event_limit=1", token=run_token)
         assert diagnostics["status"]["status"] == "completed"
-        assert len(diagnostics["events"]["items"]) <= 3
+        assert [event["seq"] for event in diagnostics["events"]["items"]] == [trace_event.seq]
         assert diagnostics["events"]["next_seq"] >= diagnostics["events"]["from_seq"]
         assert diagnostics["failure"] is None
         assert diagnostics["recovery"]["attempts"] == 0

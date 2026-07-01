@@ -201,6 +201,34 @@ def test_web_gateway_applies_signed_fetch_and_context_caps_when_omitted() -> Non
     assert context["effective_max_snippets"] == 1
 
 
+def test_web_gateway_rejects_scoped_fetch_redirect_to_unscoped_domain() -> None:
+    class RedirectingProvider(FakeWebProvider):
+        def fetch(self, url: str, *, format: str) -> dict[str, Any]:
+            del url, format
+            return {
+                "title": "Redirected",
+                "final_url": "https://blog.example.test/redirected",
+                "content": "redirected content",
+                "source": "test",
+            }
+
+    manager = _token_manager()
+    gateway = WebGatewayBackend(token_manager=manager, provider=RedirectingProvider())
+    token = _scoped_web_token(
+        manager,
+        capability="web.fetch",
+        scope={
+            "binding_id": "fetch_docs",
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    with pytest.raises(Exception, match="final domain is not allowed"):
+        gateway.handle_fetch(token, {"url": "https://docs.example.test/open-redirect"})
+
+    assert gateway.tenant_usage("tenant_a")["fetch_calls"] == 0
+
+
 def test_web_gateway_rejects_scoped_token_for_wrong_endpoint() -> None:
     manager = _token_manager()
     provider = _CountingWebProvider()

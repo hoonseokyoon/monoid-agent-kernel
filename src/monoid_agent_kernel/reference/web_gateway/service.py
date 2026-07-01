@@ -259,6 +259,13 @@ class WebGatewayBackend:
         effective_timeout_s = max(1, int(payload.get("timeout_s") or 30))
         effective_max_bytes = max(1, int(payload.get("max_bytes") or 100_000))
         fetched = self.provider.fetch(url, format=output_format)
+        final_url = str(fetched.get("final_url") or url)
+        final_domain = domain_from_url(final_url)
+        if not domain_allowed(final_domain, allowed_domains=request_allowed, blocked_domains=request_blocked):
+            raise WebGatewayError(
+                f"final domain is not allowed by binding constraints: {final_domain}",
+                error_code="web_binding_denied",
+            )
         content = str(fetched.get("content") or "")
         encoded = content.encode("utf-8")
         truncated = len(encoded) > effective_max_bytes
@@ -269,8 +276,8 @@ class WebGatewayBackend:
         response = {
             "protocol": namespaced_id("web-fetch-result.v1"),
             "url": url,
-            "final_url": str(fetched.get("final_url") or url),
-            "domain": domain_from_url(str(fetched.get("final_url") or url)),
+            "final_url": final_url,
+            "domain": final_domain,
             "title": str(fetched.get("title") or ""),
             "format": output_format,
             "content": content,
