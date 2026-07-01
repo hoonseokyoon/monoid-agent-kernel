@@ -1277,13 +1277,15 @@ class RunnerBackend:
             result = args.get("result") if isinstance(args.get("result"), dict) else {}
             approval_result = dict(result)
             if ctype == "approve":
-                approval_result.setdefault("answer", str(args.get("answer") or "Approve"))
-                approval_result.setdefault("approved", True)
+                approval_result["answer"] = str(args.get("answer") or "Approve")
+                approval_result["approved"] = True
             else:
-                approval_result.setdefault("answer", str(args.get("answer") or "Deny"))
-                approval_result.setdefault("approved", False)
-                approval_result.setdefault("granted", False)
-                approval_result.setdefault("reason", command.reason or str(args.get("reason") or "denied"))
+                approval_result["answer"] = str(args.get("answer") or "Deny")
+                approval_result["approved"] = False
+                approval_result["granted"] = False
+                approval_result["reason"] = command.reason or str(
+                    args.get("reason") or approval_result.get("reason") or "denied"
+                )
             return ok(
                 self.report_task_result(
                     run_id,

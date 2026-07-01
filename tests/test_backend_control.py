@@ -426,6 +426,51 @@ def test_dispatch_approve_accepts_callback_token(tmp_path: Path) -> None:
     backend.wait_for_run(run_id, timeout_s=20)
 
 
+def test_dispatch_deny_overwrites_conflicting_result_fields(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    task = backend.create_task(
+        run_id,
+        token,
+        kind="hitl",
+        request={"prompt": "Approve this?", "choices": ("Approve", "Deny")},
+    )
+    denied = backend.dispatch(
+        ControlCommand(
+            type="deny",
+            run_id=run_id,
+            args={
+                "token": token,
+                "task_id": task["task_id"],
+                "result": {"answer": "Approve", "approved": True, "granted": True},
+            },
+            issuer="operator_a",
+            reason="policy denied",
+            command_id="cmd_conflicting_deny",
+        )
+    )
+
+    assert denied.status == "ok"
+    job = json.loads(
+        (
+            backend._record(run_id).run_dir
+            / "artifacts"
+            / "tasks"
+            / task["task_id"]
+            / "task.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert job["result"]["answer"] == "Deny"
+    assert job["result"]["approved"] is False
+    assert job["result"]["granted"] is False
+    assert job["result"]["reason"] == "policy denied"
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
 def test_dispatch_approve_and_deny_are_audited_task_decisions(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
