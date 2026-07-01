@@ -8,6 +8,6 @@ PROFILE = ProfileMetadata(
     profile_id="multi-agent",
     title="Multi Agent",
     summary="Subagent runtime with identity, capability isolation, shared revocation, and trace linkage.",
-    rule_ids=("PH1S-R4", "PH1S-R9"),
+    rule_ids=("OR-04-REVOCATION-SCOPE", "OR-09-SUBAGENT-BOUNDARY"),
     harnesses=("backend", "capability"),
 )

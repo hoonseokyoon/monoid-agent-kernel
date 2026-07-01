@@ -22,7 +22,17 @@ EXPECTED_PROFILE_IDS = (
     "multi-agent",
     "reference-full",
 )
-EXPECTED_RULE_IDS = {f"PH1S-R{idx}" for idx in range(1, 10)}
+EXPECTED_RULE_IDS = {
+    "OR-01-SCOPE-RELATION",
+    "OR-02-CAPABILITY-BOUNDARY",
+    "OR-03-LEASE-ADMISSION",
+    "OR-04-REVOCATION-SCOPE",
+    "OR-05-EVENT-SEQUENCING",
+    "OR-06-CONTROL-AUDIT",
+    "OR-07-DURABLE-METADATA",
+    "OR-08-PROVIDER-CAPS",
+    "OR-09-SUBAGENT-BOUNDARY",
+}
 
 
 def test_phase_1s_profile_metadata_is_registered() -> None:

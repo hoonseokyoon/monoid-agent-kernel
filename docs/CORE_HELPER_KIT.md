@@ -15,15 +15,15 @@ to the Phase 1S operational rules while preserving replaceable deployment choice
 
 | Helper | Contract rules | Purpose |
 | --- | --- | --- |
-| `ScopeRelation` | `PH1S-R1`, `PH1S-R2` | Compare signed scope, requested scope, grant scope, numeric caps, lists, and wildcard domains. |
-| `ProviderGatewayPolicy` | `PH1S-R1`, `PH1S-R2`, `PH1S-R8` | Normalize provider caps and domain filters for gateway calls and redirect checks. |
-| `LeaseAdmission` | `PH1S-R3`, `PH1S-R4`, `PH1S-R9` | Preserve lease policy fields, strip denied grant material, and coordinate revocation semantics. |
-| `RunEventSequencer` | `PH1S-R5`, `PH1S-R6` | Keep run event sequence ownership consistent across queued, live, terminal, and recovered states. |
-| `ControlCommandPolicy` | `PH1S-R3`, `PH1S-R6` | Declare command auth modes, lifecycle requirements, audit envelopes, and decision coercion. |
-| `DurableMetadataCommitter` | `PH1S-R7` | Align local descriptors, shared metadata, compatibility paths, and recovery outcomes. |
-| `LifecycleProjection` | `PH1S-R5`, `PH1S-R7` | Project internal lifecycle states into wire status and operation predicates. |
-| `DiagnosticsBuilder` | `PH1S-R5`, `PH1S-R9` | Build bounded event, failure, recovery, control, and trace summaries with redaction. |
-| `SubagentRuntimeContext` | `PH1S-R4`, `PH1S-R9` | Keep child identity, accounting, capability slots, revocation, and traces connected. |
+| `ScopeRelation` | `OR-01-SCOPE-RELATION`, `OR-02-CAPABILITY-BOUNDARY` | Compare signed scope, requested scope, grant scope, numeric caps, lists, and wildcard domains. |
+| `ProviderGatewayPolicy` | `OR-01-SCOPE-RELATION`, `OR-02-CAPABILITY-BOUNDARY`, `OR-08-PROVIDER-CAPS` | Normalize provider caps and domain filters for gateway calls and redirect checks. |
+| `LeaseAdmission` | `OR-03-LEASE-ADMISSION`, `OR-04-REVOCATION-SCOPE`, `OR-09-SUBAGENT-BOUNDARY` | Preserve lease policy fields, strip denied grant material, and coordinate revocation semantics. |
+| `RunEventSequencer` | `OR-05-EVENT-SEQUENCING`, `OR-06-CONTROL-AUDIT` | Keep run event sequence ownership consistent across queued, live, terminal, and recovered states. |
+| `ControlCommandPolicy` | `OR-03-LEASE-ADMISSION`, `OR-06-CONTROL-AUDIT` | Declare command auth modes, lifecycle requirements, audit envelopes, and decision coercion. |
+| `DurableMetadataCommitter` | `OR-07-DURABLE-METADATA` | Align local descriptors, shared metadata, compatibility paths, and recovery outcomes. |
+| `LifecycleProjection` | `OR-05-EVENT-SEQUENCING`, `OR-07-DURABLE-METADATA` | Project internal lifecycle states into wire status and operation predicates. |
+| `DiagnosticsBuilder` | `OR-05-EVENT-SEQUENCING`, `OR-09-SUBAGENT-BOUNDARY` | Build bounded event, failure, recovery, control, and trace summaries with redaction. |
+| `SubagentRuntimeContext` | `OR-04-REVOCATION-SCOPE`, `OR-09-SUBAGENT-BOUNDARY` | Keep child identity, accounting, capability slots, revocation, and traces connected. |
 
 ## Promotion Rule
 

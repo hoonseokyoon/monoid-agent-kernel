@@ -8,6 +8,6 @@ PROFILE = ProfileMetadata(
     profile_id="durable-runner",
     title="Durable Runner",
     summary="Backend that preserves run state, event sequence, diagnostics, and recovery metadata.",
-    rule_ids=("PH1S-R5", "PH1S-R7", "PH1S-R9"),
+    rule_ids=("OR-05-EVENT-SEQUENCING", "OR-07-DURABLE-METADATA", "OR-09-SUBAGENT-BOUNDARY"),
     harnesses=("backend",),
 )

@@ -52,22 +52,22 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
 
 ## Operational Rules
 
-Phase 1S assigns stable rule ids to the operational semantics that keep agent systems
+Phase 1S assigns stable operational rule ids to the semantics that keep agent systems
 durable, observable, and safe across backend and gateway implementations. These rules are
 contract language: a backend may use the Core Helper Kit or its own implementation path, then
 prove the same behavior through conformance profiles.
 
 | Rule ID | Contract rule | Primary profiles | Helper candidates |
 | --- | --- | --- | --- |
-| `PH1S-R1` | Scope relation is defined once: signed scope bounds request scope, request scope bounds grant scope, numeric caps narrow by smaller values, list caps narrow by subset, and wildcard domains narrow by pattern relation. | `capability-security`, `provider-gateway` | `ScopeRelation`, `ProviderGatewayPolicy` |
-| `PH1S-R2` | Capability identity and binding boundaries are preserved through gateway calls, including endpoint capability matching and domain filters for provider and redirect checks. | `provider-gateway`, `capability-security` | `ProviderGatewayPolicy`, `ScopeRelation` |
-| `PH1S-R3` | Lease admission preserves policy fields and decision semantics: approved leases keep `lease_id`, `issued_at`, `expires_at`, `max_expires_at`, and `scope`; denied decisions strip grant material. | `capability-security`, `control-plane` | `LeaseAdmission`, `ControlCommandPolicy` |
-| `PH1S-R4` | Revocation covers time and child-runtime boundaries, including revoke-now watermarks, wildcard revocation, child-held leases, and shared revocation state. | `capability-security`, `multi-agent` | `LeaseAdmission`, `SubagentRuntimeContext` |
-| `PH1S-R5` | Run event sequence ownership follows lifecycle state: live recorders own live sequence, queued direct appends seed later recorders, terminal appends use guarded fallback, and diagnostics use the newest sequence. | `durable-runner`, `control-plane` | `RunEventSequencer`, `LifecycleProjection`, `DiagnosticsBuilder` |
-| `PH1S-R6` | Control audit follows authorization, lifecycle, and ownership policy: valid target authorization gates run-stream audit, failed authorized commands leave failure audit, and callback-token commands are declared. | `control-plane`, `capability-security` | `ControlCommandPolicy`, `RunEventSequencer` |
-| `PH1S-R7` | Durable metadata writes keep API results and recovery results aligned through schema validation, shared-store compatibility, and commit ordering. | `durable-runner`, `control-plane` | `DurableMetadataCommitter`, `LifecycleProjection` |
-| `PH1S-R8` | Provider gateways apply effective caps on request and response paths, including signed caps, request caps, defaults, redirect boundaries, byte caps, and timeout caps. | `provider-gateway` | `ProviderGatewayPolicy` |
-| `PH1S-R9` | Subagent runtime links identity, capability, and trace boundaries: child runs have their own identity/accounting, isolated live lease slots, shared revocation, and parent-child diagnostics linkage. | `multi-agent`, `capability-security`, `durable-runner` | `SubagentRuntimeContext`, `LeaseAdmission`, `DiagnosticsBuilder` |
+| `OR-01-SCOPE-RELATION` | Scope relation is defined once: signed scope bounds request scope, request scope bounds grant scope, numeric caps narrow by smaller values, list caps narrow by subset, and wildcard domains narrow by pattern relation. | `capability-security`, `provider-gateway` | `ScopeRelation`, `ProviderGatewayPolicy` |
+| `OR-02-CAPABILITY-BOUNDARY` | Capability identity and binding boundaries are preserved through gateway calls, including endpoint capability matching and domain filters for provider and redirect checks. | `provider-gateway`, `capability-security` | `ProviderGatewayPolicy`, `ScopeRelation` |
+| `OR-03-LEASE-ADMISSION` | Lease admission preserves policy fields and decision semantics: approved leases keep `lease_id`, `issued_at`, `expires_at`, `max_expires_at`, and `scope`; denied decisions strip grant material. | `capability-security`, `control-plane` | `LeaseAdmission`, `ControlCommandPolicy` |
+| `OR-04-REVOCATION-SCOPE` | Revocation covers time and child-runtime boundaries, including revoke-now watermarks, wildcard revocation, child-held leases, and shared revocation state. | `capability-security`, `multi-agent` | `LeaseAdmission`, `SubagentRuntimeContext` |
+| `OR-05-EVENT-SEQUENCING` | Run event sequence ownership follows lifecycle state: live recorders own live sequence, queued direct appends seed later recorders, terminal appends use guarded fallback, and diagnostics use the newest sequence. | `durable-runner`, `control-plane` | `RunEventSequencer`, `LifecycleProjection`, `DiagnosticsBuilder` |
+| `OR-06-CONTROL-AUDIT` | Control audit follows authorization, lifecycle, and ownership policy: valid target authorization gates run-stream audit, failed authorized commands leave failure audit, and callback-token commands are declared. | `control-plane`, `capability-security` | `ControlCommandPolicy`, `RunEventSequencer` |
+| `OR-07-DURABLE-METADATA` | Durable metadata writes keep API results and recovery results aligned through schema validation, shared-store compatibility, and commit ordering. | `durable-runner`, `control-plane` | `DurableMetadataCommitter`, `LifecycleProjection` |
+| `OR-08-PROVIDER-CAPS` | Provider gateways apply effective caps on request and response paths, including signed caps, request caps, defaults, redirect boundaries, byte caps, and timeout caps. | `provider-gateway` | `ProviderGatewayPolicy` |
+| `OR-09-SUBAGENT-BOUNDARY` | Subagent runtime links identity, capability, and trace boundaries: child runs have their own identity/accounting, isolated live lease slots, shared revocation, and parent-child diagnostics linkage. | `multi-agent`, `capability-security`, `durable-runner` | `SubagentRuntimeContext`, `LeaseAdmission`, `DiagnosticsBuilder` |
 
 ## Identifier Namespace
 

@@ -8,6 +8,13 @@ PROFILE = ProfileMetadata(
     profile_id="capability-security",
     title="Capability Security",
     summary="Capability-gated runtime with scope narrowing, lease admission, denial, and revocation rules.",
-    rule_ids=("PH1S-R1", "PH1S-R2", "PH1S-R3", "PH1S-R4", "PH1S-R6", "PH1S-R9"),
+    rule_ids=(
+        "OR-01-SCOPE-RELATION",
+        "OR-02-CAPABILITY-BOUNDARY",
+        "OR-03-LEASE-ADMISSION",
+        "OR-04-REVOCATION-SCOPE",
+        "OR-06-CONTROL-AUDIT",
+        "OR-09-SUBAGENT-BOUNDARY",
+    ),
     harnesses=("backend", "capability", "gateway"),
 )
