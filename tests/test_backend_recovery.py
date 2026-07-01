@@ -573,6 +573,34 @@ def test_multinode_reclaim_resumes_from_shared_metadata_without_local_run_json(t
     backend_b.shutdown(drain=True)
 
 
+def test_shared_run_metadata_requires_supported_schema_before_materializing(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    db = tmp_path / "shared.db"
+    shared_checkpoints = SqliteCheckpointStore(db)
+    run_id = "run_future_meta"
+    shared_checkpoints.put_run_metadata(
+        run_id,
+        {
+            "schema_version": "future.backend-run.v99",
+            "run_id": run_id,
+            "tenant_id": "tenant_a",
+            "user_id": "user_a",
+            "workspace_root": str(workspace),
+        },
+    )
+    backend = RunnerBackend(
+        run_root=tmp_path / "local_runs",
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        checkpoint_store=shared_checkpoints,
+    )
+    run_dir = backend.run_root / run_id
+
+    assert backend._read_recovery_meta(run_dir, run_id) is None
+    assert not (run_dir / "run.json").exists()
+
+
 def test_sqlite_lease_concurrent_claim_across_instances(tmp_path: Path) -> None:
     # The cross-instance guarantee: two SqliteLeaseStore instances on the same db (standing
     # in for two hosts) race to claim the same absent/stale run; the transactional CAS lets

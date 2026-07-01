@@ -148,9 +148,13 @@ def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
         payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return None
+    return _validate_run_meta(payload)
+
+
+def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
     if not isinstance(payload, dict) or payload.get("schema_version") not in _ACCEPTED_RUN_META_SCHEMA_VERSIONS:
         return None
-    return payload
+    return dict(payload)
 
 
 def _runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
@@ -2518,9 +2522,10 @@ class RunnerBackend:
         if meta is None and self.checkpoint_store is not None:
             stored = self.checkpoint_store.run_metadata(run_id)
             if stored is not None:
-                meta = dict(stored)
-                run_dir.mkdir(parents=True, exist_ok=True)
-                write_json_atomic(run_dir / "run.json", meta)
+                meta = _validate_run_meta(stored)
+                if meta is not None:
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    write_json_atomic(run_dir / "run.json", meta)
         return meta
 
     def recover_runs(self) -> list[str]:

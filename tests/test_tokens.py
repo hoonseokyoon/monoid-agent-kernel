@@ -67,3 +67,18 @@ def test_token_manager_revokes_specific_token_and_issue_cohort(monkeypatch: pyte
     revoked_cohort = manager.revoke_issued_before(claims.issued_at + 1)
     with pytest.raises(TokenError, match="revoked"):
         revoked_cohort.verify(token, kind="web_gateway", audience="csp.web-gateway")
+
+
+def test_token_manager_ceil_fractional_revoke_watermark(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"t": 2000.1}
+    monkeypatch.setattr(token_module.time, "time", lambda: clock["t"])
+    manager = TokenManager.from_secret("x" * 32)
+    token = _issue(manager, ttl_s=600)
+    claims = manager.verify(token, kind="web_gateway", audience="csp.web-gateway")
+    assert claims.issued_at == 2000
+
+    revoked = manager.revoke_issued_before(2000.9)
+
+    assert revoked.revoked_before == 2001
+    with pytest.raises(TokenError, match="revoked"):
+        revoked.verify(token, kind="web_gateway", audience="csp.web-gateway")

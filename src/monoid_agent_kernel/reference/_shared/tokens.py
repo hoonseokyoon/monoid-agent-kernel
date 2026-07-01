@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import secrets
 import time
 from collections.abc import Iterable, Mapping
@@ -89,7 +90,7 @@ class TokenManager:
             "revoked_token_ids",
             frozenset(str(token_id) for token_id in self.revoked_token_ids if str(token_id)),
         )
-        object.__setattr__(self, "revoked_before", int(self.revoked_before or 0))
+        object.__setattr__(self, "revoked_before", _ceil_epoch(self.revoked_before))
 
     @classmethod
     def ephemeral(cls) -> TokenManager:
@@ -177,7 +178,7 @@ class TokenManager:
             verify_keys=self.verify_keys,
             retired_key_accept_until=self.retired_key_accept_until,
             revoked_token_ids=self.revoked_token_ids,
-            revoked_before=max(self.revoked_before, int(before)),
+            revoked_before=max(self.revoked_before, _ceil_epoch(before)),
         )
 
     def issue(
@@ -286,6 +287,10 @@ def _coerce_secret(secret: str | bytes) -> bytes:
     if len(value) < 32:
         raise TokenError("token signing secret must be at least 32 bytes")
     return value
+
+
+def _ceil_epoch(value: int | float | None) -> int:
+    return int(math.ceil(float(value or 0)))
 
 
 def _b64_json(payload: dict[str, Any]) -> str:
