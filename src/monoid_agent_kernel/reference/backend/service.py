@@ -241,6 +241,16 @@ def _diagnostic_event_summary(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_DIRECT_AUDIT_APPEND_STATUSES = {"completed", "failed", "limited", "ended"}
+
+
+def _run_dir_allows_direct_audit_append(run_dir: Path) -> bool:
+    status = _read_optional_json(run_dir / "status.json")
+    if status is None:
+        return False
+    return str(status.get("status") or "") in _DIRECT_AUDIT_APPEND_STATUSES
+
+
 def _trace_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
     trace_ids: set[str] = set()
     for event in events:
@@ -1380,6 +1390,8 @@ class RunnerBackend:
         if loop is not None and loop.emit_external_event(event_type, data=data, level=level):
             return
         if not run_dir.exists():
+            return
+        if record is None and not _run_dir_allows_direct_audit_append(run_dir):
             return
         try:
             append_event_to_run(run_dir, event_type, data=data, level=level)
@@ -2550,12 +2562,15 @@ class RunnerBackend:
     def _store_run_meta(self, run_id: str, meta: Mapping[str, Any]) -> None:
         if self.checkpoint_store is None:
             return
-        self.checkpoint_store.put_run_metadata(run_id, meta)
+        put_metadata = getattr(self.checkpoint_store, "put_run_metadata", None)
+        if callable(put_metadata):
+            put_metadata(run_id, meta)
 
     def _read_recovery_meta(self, run_dir: Path, run_id: str) -> dict[str, Any] | None:
         meta = _read_run_meta(run_dir)
         if meta is None and self.checkpoint_store is not None:
-            stored = self.checkpoint_store.run_metadata(run_id)
+            read_metadata = getattr(self.checkpoint_store, "run_metadata", None)
+            stored = read_metadata(run_id) if callable(read_metadata) else None
             if stored is not None:
                 meta = _validate_run_meta(stored)
                 if meta is not None:

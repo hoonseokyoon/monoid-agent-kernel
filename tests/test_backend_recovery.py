@@ -50,6 +50,54 @@ def test_read_run_meta_accepts_legacy_schema_version(tmp_path: Path) -> None:
     }
 
 
+def test_backend_accepts_checkpoint_store_without_metadata_methods(tmp_path: Path) -> None:
+    class LegacyCheckpointStore:
+        def put(self, checkpoint: RunCheckpoint, blobs: dict[str, bytes] | None = None) -> None:
+            del checkpoint, blobs
+
+        def latest(self, run_id: str):
+            del run_id
+            return None
+
+        def delete(self, run_id: str) -> None:
+            del run_id
+
+        def put_blob(self, run_id: str, data: bytes) -> str:
+            del run_id, data
+            return "0" * 64
+
+        def get_blob(self, run_id: str, sha256: str) -> bytes:
+            del run_id
+            raise KeyError(sha256)
+
+    workspace = _workspace(tmp_path)
+
+    def factory(spec, llm_gateway_token):
+        del spec, llm_gateway_token
+        return FakeModelAdapter([ModelTurn(response_id="r1", final_text="done")])
+
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=factory,
+        checkpoint_store=LegacyCheckpointStore(),  # type: ignore[arg-type]
+    )
+
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="run",
+            runtime_config=_default_config(),
+        )
+    )
+
+    assert backend.wait_for_run(submission.run_id, timeout_s=10) == "completed"
+
+
 @pytest.mark.slow
 def test_backend_recovers_parked_hitl_run_from_checkpoint(tmp_path: Path) -> None:
     # A run parked on a hosted task is durably checkpointed; a *fresh backend* (new

@@ -222,6 +222,28 @@ def test_dispatch_skips_run_audit_before_loop_owns_sequence(tmp_path: Path) -> N
     backend.wait_for_run(run_id, timeout_s=20)
 
 
+def test_control_audit_skips_recordless_nonterminal_run(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="done")])
+    run_id = "run_remote_live"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "status.json").write_text(
+        json.dumps({"run_id": run_id, "status": "running", "last_event_seq": 1}),
+        encoding="utf-8",
+    )
+    original_events = json.dumps({"seq": 1, "type": "run.started"}) + "\n"
+    (run_dir / "events.jsonl").write_text(original_events, encoding="utf-8")
+
+    backend._emit_control_audit_event(
+        run_id,
+        "control.command.received",
+        {"command_id": "cmd_remote", "command": "status"},
+    )
+
+    assert (run_dir / "events.jsonl").read_text(encoding="utf-8") == original_events
+
+
 def test_dispatch_routes_existing_ops_and_unknown(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
