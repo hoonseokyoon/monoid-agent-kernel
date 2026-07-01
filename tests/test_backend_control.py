@@ -264,6 +264,35 @@ def test_control_audit_skips_direct_append_when_loop_is_not_open(tmp_path: Path)
     backend.wait_for_run(run_id, timeout_s=20)
 
 
+def test_dispatch_appends_terminal_run_audit_after_recorder_closes(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="done")])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_config(),
+        )
+    )
+    assert backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
+    before = _events(backend, submission.run_id)
+
+    result = _dispatch(backend, submission.run_id, submission.run_token, "status")
+
+    assert result.status == "ok"
+    after = _events(backend, submission.run_id)
+    appended = after[len(before) :]
+    assert [event["type"] for event in appended] == [
+        "control.command.received",
+        "control.command.completed",
+    ]
+    seqs = [event["seq"] for event in after]
+    assert seqs == sorted(seqs)
+    assert len(seqs) == len(set(seqs))
+
+
 def test_control_audit_skips_recordless_nonterminal_run(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="done")])
