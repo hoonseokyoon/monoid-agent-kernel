@@ -26,6 +26,8 @@ class WebProvider(Protocol):
         format: str,
         allowed_domains: tuple[str, ...] = (),
         blocked_domains: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -100,9 +102,11 @@ class FakeWebProvider:
         format: str,
         allowed_domains: tuple[str, ...] = (),
         blocked_domains: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
         del format
-        del allowed_domains, blocked_domains
+        del allowed_domains, blocked_domains, timeout_s, max_bytes
         for item in self.corpus:
             if item["url"] == url:
                 return {
@@ -283,6 +287,8 @@ class WebGatewayBackend:
             format=output_format,
             allowed_domains=request_allowed,
             blocked_domains=request_blocked,
+            timeout_s=effective_timeout_s,
+            max_bytes=effective_max_bytes,
         )
         final_url = str(fetched.get("final_url") or url)
         final_domain = domain_from_url(final_url)

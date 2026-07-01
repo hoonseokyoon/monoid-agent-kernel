@@ -183,8 +183,34 @@ def test_web_gateway_applies_signed_scope_when_payload_omits_constraints() -> No
 
 
 def test_web_gateway_applies_signed_fetch_and_context_caps_when_omitted() -> None:
+    class ObservingProvider(FakeWebProvider):
+        last_timeout_s: int | None = None
+        last_max_bytes: int | None = None
+
+        def fetch(
+            self,
+            url: str,
+            *,
+            format: str,
+            allowed_domains: tuple[str, ...] = (),
+            blocked_domains: tuple[str, ...] = (),
+            timeout_s: int | None = None,
+            max_bytes: int | None = None,
+        ) -> dict[str, Any]:
+            self.last_timeout_s = timeout_s
+            self.last_max_bytes = max_bytes
+            return super().fetch(
+                url,
+                format=format,
+                allowed_domains=allowed_domains,
+                blocked_domains=blocked_domains,
+                timeout_s=timeout_s,
+                max_bytes=max_bytes,
+            )
+
     manager = _token_manager()
-    gateway = WebGatewayBackend(token_manager=manager)
+    provider = ObservingProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
     fetch_token = _scoped_web_token(
         manager,
         capability="web.fetch",
@@ -205,6 +231,8 @@ def test_web_gateway_applies_signed_fetch_and_context_caps_when_omitted() -> Non
     assert fetched["effective_timeout_s"] == 2
     assert fetched["truncated"] is True
     assert fetched["content_bytes"] <= 12
+    assert provider.last_timeout_s == 2
+    assert provider.last_max_bytes == 12
 
     context_token = _scoped_web_token(
         manager,
@@ -235,8 +263,10 @@ def test_web_gateway_rejects_scoped_fetch_redirect_to_unscoped_domain() -> None:
             format: str,
             allowed_domains: tuple[str, ...] = (),
             blocked_domains: tuple[str, ...] = (),
+            timeout_s: int | None = None,
+            max_bytes: int | None = None,
         ) -> dict[str, Any]:
-            del url, format, allowed_domains, blocked_domains
+            del url, format, allowed_domains, blocked_domains, timeout_s, max_bytes
             return {
                 "title": "Redirected",
                 "final_url": "https://blog.example.test/redirected",
@@ -661,6 +691,8 @@ class _CountingWebProvider:
         format: str,
         allowed_domains: tuple[str, ...] = (),
         blocked_domains: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
         self.fetch_calls += 1
         return self.delegate.fetch(
@@ -668,6 +700,8 @@ class _CountingWebProvider:
             format=format,
             allowed_domains=allowed_domains,
             blocked_domains=blocked_domains,
+            timeout_s=timeout_s,
+            max_bytes=max_bytes,
         )
 
     def context(

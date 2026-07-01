@@ -34,6 +34,8 @@ class FetchProvider(Protocol):
         format: str,
         allowed_domains: tuple[str, ...] = (),
         blocked_domains: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -72,12 +74,16 @@ class CompositeWebProvider:
         format: str,
         allowed_domains: tuple[str, ...] = (),
         blocked_domains: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
         return self.fetch_provider.fetch(
             url,
             format=format,
             allowed_domains=allowed_domains,
             blocked_domains=blocked_domains,
+            timeout_s=timeout_s,
+            max_bytes=max_bytes,
         )
 
     def context(
@@ -240,8 +246,15 @@ class HttpFetchProvider:
         format: str,
         allowed_domains: tuple[str, ...] = (),
         blocked_domains: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
         _ensure_fetch_url_allowed(url, allowed_domains=allowed_domains, blocked_domains=blocked_domains)
+        effective_timeout_s = max(1, int(timeout_s if timeout_s is not None else self.timeout_s))
+        effective_max_raw_bytes = min(
+            self.max_raw_bytes,
+            max(1, int(max_bytes if max_bytes is not None else self.max_raw_bytes)),
+        )
         # Retry transient connection-level failures (an HTTPError is a real response and
         # propagates immediately); the final error keeps the original message/code.
         attempts = 3
@@ -254,6 +267,8 @@ class HttpFetchProvider:
                     url,
                     allowed_domains=allowed_domains,
                     blocked_domains=blocked_domains,
+                    timeout_s=effective_timeout_s,
+                    max_raw_bytes=effective_max_raw_bytes,
                 )
                 break
             except HTTPError as exc:
@@ -305,15 +320,17 @@ class HttpFetchProvider:
         *,
         allowed_domains: tuple[str, ...],
         blocked_domains: tuple[str, ...],
+        timeout_s: int,
+        max_raw_bytes: int,
     ) -> tuple[str, str, bytes]:
         current_url = url
         for _redirect_count in range(10):
             try:
-                with _NO_REDIRECT_OPENER.open(self._request(current_url), timeout=self.timeout_s) as response:
+                with _NO_REDIRECT_OPENER.open(self._request(current_url), timeout=timeout_s) as response:
                     return (
                         response.geturl(),
                         response.headers.get("Content-Type", ""),
-                        response.read(self.max_raw_bytes + 1),
+                        response.read(max_raw_bytes + 1),
                     )
             except HTTPError as exc:
                 if exc.code not in _REDIRECT_STATUS_CODES:
