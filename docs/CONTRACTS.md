@@ -336,22 +336,17 @@ Task seams above via a `subagent` task kind (`SubagentTaskExecutor`); see
   `max_subagent_depth` (nesting, default 5). Enforced in the executor; a child at the
   depth cap has the `agent.spawn` binding stripped (the tool is absent, not just an
   error at call time).
-- **Result shape** (`subagent_result`): `{status, final_text, message, root_run_id,
-  parent_run_id, child_run_id, task_id, definition_id, depth, traceparent, subagent_type, usage,
-  error}`.
+- **Result shape** (`subagent_result`): `{status, final_text, message, child_run_id,
+  subagent_type, usage, error}`.
 - **Events**: the parent stream carries `subagent.started` (`parent_id` = the spawn
   tool-call event) and `subagent.finished`/`subagent.failed` (`parent_id` = the
-  `subagent.started` event), each carrying `root_run_id`, `parent_run_id`,
-  `child_run_id`, `task_id`, `definition_id`, `depth`, and `traceparent`; finish events also carry
-  the child's `usage`. The child's full event stream goes to its own run dir; external
-  `event_sinks` are not shared with children (stateful sinks like OTel/StatusJson are per-run).
+  `subagent.started` event), the latter carrying the child's `usage`. The child's
+  full event stream goes to its own run dir; external `event_sinks` are not shared
+  with children (stateful sinks like OTel/StatusJson are per-run).
 - **Usage reporting**: the parent's run metrics carry `subagent_count` and
-  `subagent_usage` (the children's combined token totals). Descendant usage is also
-  added to root `total_usage`, so run token budgets and backend tenant usage include
-  delegated work.
-- **Capability boundary**: child loops inherit the parent's broker and share the parent's
-  capability vault. A parent-level capability revoke is visible to child gated tools before
-  a broker request or gateway call can happen.
+  `subagent_usage` (the children's combined token totals). These are kept SEPARATE
+  from the parent's own `total_usage` on purpose — `total_usage` also reflects the
+  parent's remaining context budget, which a child's isolated tokens must not inflate.
 - **Context fork** (`SubagentDefinition.context = "fork"`): instead of a fresh
   isolated context, the child inherits a snapshot of the parent's conversation AND the
   parent's prompt / tools / model (the definition's own prompt/tools/model are ignored)
@@ -464,38 +459,14 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   `unsupported` / `error`). `ControlDispatcher.dispatch(command) -> ControlResult` is the contract;
   `RunnerBackend.dispatch` is the reference impl, routing each command to the in-process method it
   already exposes.
-- Command types: `pause`, `resume`, `cancel`, `approve`, `deny`, `interrupt`, `inspect`,
-  `health`, `send_message`, `runtime_config`, `replace_runtime_config`, `create_task`,
-  `report_task_result`, `status`, `revoke_capability`. `approve` and `deny` are explicit
-  hosted-task decision aliases over `report_task_result`. An unknown type returns `unsupported`
-  (the wire vocabulary stays
+- Command types: `pause`, `resume`, `cancel`, `interrupt`, `inspect`, `health`, `send_message`,
+  `runtime_config`, `replace_runtime_config`, `create_task`, `report_task_result`, `status`,
+  `revoke_capability`. An unknown type returns `unsupported` (the wire vocabulary stays
   forward-compatible).
 - HTTP: `POST /v1/runs/{run_id}/control` with `{"type": ..., "args": {...}, "issuer": ...,
   "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
   envelope stays credential-free). `resume` on a *live* paused run wakes it; on a run not in
   memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
-- Audit: `RunnerBackend.dispatch` appends `control.command.received` and then either
-  `control.command.completed` or `control.command.failed` to the run event log. Events include
-  `command_id`, command type, target run, `issuer` as actor, reason, idempotency key,
-  result/failure code, result status/error, duration, and a safe `token_sha256` reference — never
-  the bearer token itself. A control `send_message` uses the command id as its inbox idempotency
-  key.
-
-### Event Reads
-
-`GET /v1/runs/{run_id}/events?from_seq=N&limit=M` returns `{run_id, events, next_seq, has_more}`.
-`from_seq` remains inclusive for backward compatibility. When `limit` is present, callers resume
-with `from_seq=next_seq` to avoid duplicates; omitting `limit` preserves the historical "return all
-events from N" behavior. `RunnerBackend.descendant_events(...)` uses the same pagination contract
-for subagent event streams authorized through an ancestor run token.
-
-### Diagnostics
-
-`GET /v1/runs/{run_id}/diagnostics?event_limit=N` returns one token-scoped operational aggregate:
-`status`, `failure` (`failure.json` when present), `recovery` attempt state, bounded recent event
-summaries, control-command audit summaries, and trace ids found in recent events. Diagnostics uses
-event summaries rather than raw event payloads so model text, tool arguments, bearer tokens, and
-lease material do not get a new broad read surface.
 ### Inbox Message Envelope
 
 `monoid.inbox-message.v1` (`core/inbox.py`, `InboxMessage`) wraps a message entering a
@@ -607,17 +578,13 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
 - **Implicit, binding-declared**: a `ToolBinding` with `runtime.requires_lease` declares its tool's
   `capability` needs a lease; the agent just calls the tool. `AgentLoop(capability_broker=...)`
   gates the call: a cache miss requests a lease (scoped to the binding) and on grant proceeds; a
-  denial raises so the call never runs and the model gets an actionable error. If no broker is
-  configured, a required lease fails closed with `capability_broker_required`. For local development
-  only, `runtime.requires_lease="optional"` preserves best-effort gating and lets the tool run
-  without a broker. Events `capability.requested` / `capability.granted` / `capability.denied` give
-  the audit trail.
+  denial raises so the call never runs and the model gets an actionable error. Events
+  `capability.requested` / `capability.granted` / `capability.denied` give the audit trail.
 - **Using the lease**: the granted handle reaches the running tool via
   `ToolContext.capability_token(capability) -> token_ref | None` (the handle, resolved at the
   edge). The reference backend provisions a per-run broker with
   `RunnerBackend(capability_broker_factory=lambda request: ...)` — scoped to the run's identity
-  (e.g. a `GatewayCapabilityBroker` per tenant). `None` is only safe for bindings without required
-  leases, or bindings that explicitly opt into `runtime.requires_lease="optional"`.
+  (e.g. a `GatewayCapabilityBroker` per tenant); `None` leaves gating off for that run.
 - **Security invariants the core enforces**: a grant may only NARROW the requested scope, never
   widen it (`CapabilityVault.admit` is fail-closed); a lease is expiry-checked before reuse; the
   per-run vault holds handles only and durable (approved) leases are checkpointed as handles, while
@@ -648,9 +615,9 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
   resurrect it), per `lease_id`, and an issued-before `before` watermark (a bulk cohort kill). Because
   a lease is only a handle the tool re-fetches per call, revocation just refuses to hand the handle
   back — instant, with no distributed secret clawback. Revocation state is checkpointed so a
-  revoked capability stays dead across a restart. Emits `capability.revoked`. The shared
-  `TokenManager` also supports gateway-edge revocation by token id (`jti`) or issued-before
-  watermark when the deployment propagates that revocation state to the gateway verifier.
+  revoked capability stays dead across a restart. Emits `capability.revoked`. (Edge enforcement —
+  the gateway refusing a revoked token too — is a deferred defense-in-depth follow-up; a tool that
+  cached a resolved secret past revocation is bounded only by the short TTL.)
 - **Rotation** (`AgentLoop.capability_rotate_skew_seconds`, default `0.0` = off): a cached lease
   within `skew` seconds of expiry is re-brokered on use — the handle/expiry refresh under a stable
   contract without a model retry or a re-prompt. Bounded by `CapabilityLease.max_expires_at`, an
@@ -664,13 +631,9 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
   context → `WebService` → `WebGatewayClient` as a per-call credential override; absent a lease, the
   client uses its static run-start token — back-compat). The reference `GatewayCapabilityBroker`
   mints a **web-gateway-compatible** token (`kind=web_gateway`/`aud=csp.web-gateway`) for `web.*` so
-  the existing web gateway accepts it unchanged. Brokered web tokens carry a signed `metadata.scope`
-  containing the binding id, domain scope, and web runtime caps such as `max_calls`; the web gateway
-  applies that signed scope before provider invocation. Payload constraints can narrow the signed
-  scope, and requests that widen `allowed_domains`, `binding_id`, or numeric caps fail with
-  `web_scope_denied`. Net effect: web access inherits rotation + revocation (an operator can
-  `revoke_capability("web.search")` to kill a live run's web access without cancelling it). The LLM
-  path is deliberately NOT routed this way.
+  the existing web gateway accepts it unchanged. Net effect: web access inherits rotation +
+  revocation (an operator can `revoke_capability("web.search")` to kill a live run's web access
+  without cancelling it). The LLM path is deliberately NOT routed this way.
 - **Gateway model-token refresh** (separate from capabilities): `GatewayModelAdapter.token_provider`
   is an optional per-request token source; the reference backend wires a source that re-mints the
   `llm_gateway` token near expiry, so a run outliving the token TTL keeps LLM access without a
@@ -753,11 +716,8 @@ additionally carry optional priced sub-counts when the provider reports them —
 which the kernel sums into per-run totals and checks against the token budget. These
 fields are additive; a consumer that ignores them stays correct.
 
-The reference gateway tokens authenticate run identity. New tokens include a `kid` header. A
-`TokenManager` can be built from a keyring, rotated to a new active key, and configured to accept
-retired keys only until a grace-window deadline. Verification also rejects revoked token ids and
-issued-before cohorts before any gateway action proceeds. The LLM request model still selects the
-turn model.
+The reference LLM gateway token authenticates run identity. The request model
+selects the turn model.
 
 ### Web Gateway
 
@@ -781,9 +741,9 @@ Every request includes binding constraints:
 }
 ```
 
-The reference gateway enforces per-run/binding call counters and signed token scope. Brokered web
-tokens carry `metadata.scope`; payload domain, binding, and numeric limit constraints can narrow
-that scope and cannot widen it. Scope violations fail before the provider adapter is called.
+The reference gateway enforces per-run/binding call counters and the
+per-request domain/limit constraints. Web gateway tokens authenticate run
+identity.
 
 ### Reference Backend
 
@@ -911,18 +871,12 @@ recovery is the integrator's call.
 - **Failure bundle:** on failure the core writes `run_dir/failure.json`
   (`{error, error_code, type, last_good_seq, restore_hint}`) — fail loud, name the
   checkpoint to restore from. No auto-recovery.
-- The reference backend writes `run_dir/run.json` and stores the same recovery descriptor in the
-  configured `CheckpointStore`: identity, workspace, limits, policy, and the authoritative resolved
-  runtime config. Runtime-config hot-swaps update both copies with `runtime_config_version`,
-  `runtime_config_hash`, `runtime_config_issuer`, `runtime_config_reason`, and
-  `runtime_config_committed_at`; recovery verifies the hash before rebuilding providers or gateway
-  token sources. A backend that never hosted the run can reclaim it from a shared lease/checkpoint
-  store, read the shared descriptor when local `run.json` is absent, materialize a local copy, then
-  resume. `recover_runs()` scans `run_root`; the active watchdog discovers cross-instance orphaned
-  runs from the shared lease store. Recovery skips terminal checkpoints and failed runs, rebuilds
-  each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
-  is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved
-  follow-up messages, and resumes.
+- The reference backend writes `run_dir/run.json` (recovery descriptor: identity,
+  workspace, limits, policy, resolved runtime config) and exposes `recover_runs()`,
+  which scans `run_root`, skips terminal checkpoints and failed runs, rebuilds each
+  run (re-issuing gateway tokens from the signing key, **re-provisioning the base
+  workspace** is the deployment's job), `restore()`s the loop with the store's blobs,
+  re-enqueues durably-saved follow-up messages, and resumes.
 
 **Assumption (workspace):** the agent workspace is not durable; on restore the
 deployment re-provisions the base (re-clone/re-mount) and the checkpoint re-applies
@@ -993,17 +947,15 @@ Two seams make durability and multi-node recovery pluggable without touching the
 
 Every store must pass the parametrized contract suites (`tests/test_checkpoint_store_contract.py`,
 `tests/test_lease_store_contract.py`): atomic last-good commit, monotonic `latest`, write-once
-blob dedup, run metadata round-trip, and a single-winner `try_claim`. Passing them makes a backend
-a drop-in.
+blob dedup, and a single-winner `try_claim`. Passing them makes a backend a drop-in.
 
 **SQLite reference stores** (`reference/stores/`, stdlib `sqlite3`, zero dependencies):
 `SqliteCheckpointStore` and `SqliteLeaseStore`. A DB transaction supplies the invariants —
 `put` commits atomically (a crash rolls back, so `latest` never sees a torn checkpoint), the
 latest pointer advances monotonically via a conditional UPSERT, blobs are write-once, and
-`try_claim` is a transactional CAS under `BEGIN IMMEDIATE`. `SqliteCheckpointStore` also stores the
-backend run descriptor beside checkpoints, so one shared db can host **both** stores and the
-recovery metadata needed to reclaim and resume a crashed peer's run across the instance boundary
-(a per-host `lease.json` cannot):
+`try_claim` is a transactional CAS under `BEGIN IMMEDIATE`. One shared db can host **both**
+stores, which is the "shared board" that lets a worker on another process/host reclaim a
+crashed peer's run across the instance boundary (a per-host `lease.json` cannot):
 
 ```python
 db = "/shared/monoid.db"

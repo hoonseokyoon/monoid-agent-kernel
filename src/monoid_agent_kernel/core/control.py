@@ -31,8 +31,6 @@ ControlCommandType = Literal[
     "pause",
     "resume",
     "cancel",
-    "approve",
-    "deny",
     "interrupt",
     "inspect",
     "health",
