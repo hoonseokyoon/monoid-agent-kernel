@@ -44,7 +44,14 @@ class BackendHarness(ConformanceHarness, Protocol):
 class GatewayHarness(ConformanceHarness, Protocol):
     """Gateway operation used by provider-gateway profiles."""
 
-    def call_gateway(self, capability: str, payload: JsonObject) -> JsonObject:
+    def call_gateway(
+        self,
+        capability: str,
+        payload: JsonObject,
+        *,
+        signed_capability: str | None = None,
+        signed_scope: JsonObject | None = None,
+    ) -> JsonObject:
         """Call one gateway capability with a normalized payload."""
 
 

@@ -25,21 +25,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from monoid_agent_kernel.core.scope import scope_within
 from monoid_agent_kernel.identifiers import namespaced_id
 
 CAPABILITY_REQUEST_VERSION = namespaced_id("capability-request.v1")
 CAPABILITY_LEASE_VERSION = namespaced_id("capability-lease.v1")
-_NUMERIC_SCOPE_CAP_KEYS = frozenset(
-    {
-        "max_calls",
-        "max_results",
-        "max_bytes",
-        "timeout_s",
-        "max_tokens",
-        "max_urls",
-        "max_snippets",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -179,34 +169,6 @@ class CapabilityBroker(Protocol):
     an in-process policy object, a gateway-token minter, or a human-escalation broker all fit."""
 
     def request(self, req: CapabilityRequest) -> CapabilityGrant: ...
-
-
-def scope_within(inner: dict[str, Any], outer: dict[str, Any]) -> bool:
-    """True if ``inner`` scope is no broader than ``outer`` — the least-privilege check the core
-    applies to a grant (grant.scope must be ⊆ request.scope). List-valued constraints (e.g.
-    ``allowed_domains``) must be a subset; numeric cap constraints may be lower; other scalar
-    constraints must be equal. A key absent from ``outer`` means *unconstrained* there, so any
-    ``inner`` value is within."""
-    for key, inner_val in inner.items():
-        if key not in outer:
-            continue  # outer is unconstrained on this key -> inner is within
-        outer_val = outer[key]
-        if isinstance(inner_val, (list, tuple, set)) and isinstance(outer_val, (list, tuple, set)):
-            if not set(inner_val) <= set(outer_val):
-                return False
-        elif key in _NUMERIC_SCOPE_CAP_KEYS and _numeric_cap_within(inner_val, outer_val):
-            continue
-        elif inner_val != outer_val:
-            return False
-    return True
-
-
-def _numeric_cap_within(inner_val: Any, outer_val: Any) -> bool:
-    if isinstance(inner_val, bool) or isinstance(outer_val, bool):
-        return False
-    if not isinstance(inner_val, int | float) or not isinstance(outer_val, int | float):
-        return False
-    return float(inner_val) <= float(outer_val)
 
 
 @dataclass
