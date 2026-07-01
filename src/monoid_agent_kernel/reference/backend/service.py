@@ -1406,7 +1406,7 @@ class RunnerBackend:
         command_type: str = "",
         args: Mapping[str, Any] | None = None,
     ) -> None:
-        if command_type == "report_task_result":
+        if command_type in {"report_task_result", "approve", "deny"}:
             try:
                 self._verify_task_callback_token(run_id, token, str((args or {}).get("task_id") or ""))
                 return
