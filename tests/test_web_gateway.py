@@ -134,6 +134,31 @@ def test_web_gateway_rejects_payload_domain_escalation_before_provider() -> None
     assert gateway.tenant_usage("tenant_a")["search_calls"] == 0
 
 
+def test_web_gateway_allows_signed_wildcard_domain_narrowing() -> None:
+    manager = _token_manager()
+    gateway = WebGatewayBackend(token_manager=manager)
+    token = _scoped_web_token(
+        manager,
+        scope={
+            "binding_id": "search_docs",
+            "max_results": 3,
+            "allowed_domains": ["*.example.test"],
+        },
+    )
+
+    search = gateway.handle_search(
+        token,
+        {
+            "binding_id": "search_docs",
+            "query": "agent",
+            "allowed_domains": ["*.docs.example.test"],
+        },
+    )
+
+    assert search["result_count"] >= 1
+    assert {result["domain"] for result in search["results"]} == {"docs.example.test"}
+
+
 def test_web_gateway_applies_signed_scope_when_payload_omits_constraints() -> None:
     manager = _token_manager()
     gateway = WebGatewayBackend(token_manager=manager)

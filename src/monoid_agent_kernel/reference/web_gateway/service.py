@@ -535,15 +535,24 @@ def _domain_patterns_within(requested: tuple[str, ...], signed: tuple[str, ...])
     if "*" in signed:
         return True
     for pattern in requested:
-        if pattern == "*":
-            return False
-        if pattern in signed:
-            continue
-        if pattern.startswith("*."):
-            return False
-        if not any(domain_matches(pattern, signed_pattern) for signed_pattern in signed):
+        if not any(_domain_pattern_within(pattern, signed_pattern) for signed_pattern in signed):
             return False
     return True
+
+
+def _domain_pattern_within(pattern: str, signed_pattern: str) -> bool:
+    pattern = pattern.lower().strip()
+    signed_pattern = signed_pattern.lower().strip()
+    if signed_pattern == "*":
+        return True
+    if pattern == "*":
+        return False
+    if pattern == signed_pattern:
+        return True
+    if pattern.startswith("*."):
+        suffix = pattern[2:].strip(".")
+        return bool(suffix) and signed_pattern.startswith("*.") and domain_matches(suffix, signed_pattern)
+    return domain_matches(pattern, signed_pattern)
 
 
 def _filter_context_result(
