@@ -82,3 +82,10 @@ def test_token_manager_ceil_fractional_revoke_watermark(monkeypatch: pytest.Monk
     assert revoked.revoked_before == 2001
     with pytest.raises(TokenError, match="revoked"):
         revoked.verify(token, kind="web_gateway", audience="csp.web-gateway")
+
+
+def test_token_manager_wraps_malformed_header_as_token_error() -> None:
+    manager = TokenManager.from_secret("x" * 32)
+
+    with pytest.raises(TokenError, match="invalid token header"):
+        manager.verify("bm90LWpzb24.e30.signature", kind="web_gateway", audience="csp.web-gateway")

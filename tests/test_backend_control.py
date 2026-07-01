@@ -200,6 +200,28 @@ def test_dispatch_control_audit_uses_live_recorder_sequence(tmp_path: Path) -> N
     backend.wait_for_run(run_id, timeout_s=20)
 
 
+def test_dispatch_skips_run_audit_before_loop_owns_sequence(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+    record = backend._record(run_id)
+    loop = record.loop
+    assert loop is not None
+    before = _events(backend, run_id)
+
+    record.loop = None
+    try:
+        status = _dispatch(backend, run_id, token, "status")
+    finally:
+        record.loop = loop
+
+    assert status.status == "ok"
+    assert _events(backend, run_id) == before
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
 def test_dispatch_routes_existing_ops_and_unknown(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])

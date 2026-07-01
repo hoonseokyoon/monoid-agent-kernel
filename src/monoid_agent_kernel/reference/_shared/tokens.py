@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -226,7 +227,7 @@ class TokenManager:
         except ValueError as exc:
             raise TokenError("invalid token format") from exc
         signing_input = f"{header_raw}.{payload_raw}"
-        header = _json_b64(header_raw)
+        header = _token_json_b64(header_raw, "header")
         if header.get("alg") != "HS256" or header.get("typ") not in ACCEPTED_TOKEN_HEADER_TYPES:
             raise TokenError("invalid token header")
         now = int(time.time())
@@ -241,7 +242,7 @@ class TokenManager:
             for secret in candidate_keys
         ):
             raise TokenError("invalid token signature")
-        payload = _json_b64(payload_raw)
+        payload = _token_json_b64(payload_raw, "payload")
         if payload.get("iss") not in (self.issuer, *self.accepted_issuers):
             raise TokenError("invalid token issuer")
         claims = TokenClaims.from_json(payload)
@@ -291,6 +292,13 @@ def _coerce_secret(secret: str | bytes) -> bytes:
 
 def _ceil_epoch(value: int | float | None) -> int:
     return int(math.ceil(float(value or 0)))
+
+
+def _token_json_b64(value: str, label: str) -> dict[str, Any]:
+    try:
+        return _json_b64(value)
+    except (binascii.Error, TypeError, ValueError) as exc:
+        raise TokenError(f"invalid token {label}") from exc
 
 
 def _b64_json(payload: dict[str, Any]) -> str:
