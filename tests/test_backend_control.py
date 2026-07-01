@@ -167,11 +167,7 @@ def test_dispatch_emits_control_audit_events_without_token_leak(tmp_path: Path) 
     assert failed["failure_code"] == "control_error"
     assert failed["idempotency_key"] == "cmd_bad_replace"
 
-    auth_failed = by_id[("control.command.failed", "cmd_bad_auth")]
-    assert auth_failed["command"] == "inspect"
-    assert auth_failed["error_code"] == "permission_denied"
-    assert auth_failed["failure_code"] == "permission_denied"
-    assert auth_failed["idempotency_key"] == "cmd_bad_auth"
+    assert all(event["data"]["command_id"] != "cmd_bad_auth" for event in events)
 
     serialized_events = "\n".join(json.dumps(event, sort_keys=True) for event in events)
     assert token not in serialized_events

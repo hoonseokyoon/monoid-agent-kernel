@@ -1144,22 +1144,24 @@ class RunnerBackend:
         token_sha256 = TokenManager.token_sha256(token) if token else ""
         started = time.time()
 
-        self._emit_control_audit_event(
-            run_id,
-            "control.command.received",
-            {
-                "command_id": command_id,
-                "command": ctype,
-                "target_run_id": run_id,
-                "actor": command.issuer,
-                "reason": command.reason,
-                "token_sha256": token_sha256,
-                "idempotency_key": idempotency_key,
-                "args_keys": sorted(key for key in command.args if key != "token"),
-            },
-        )
-
+        audit_authorized = False
         try:
+            self._authorize_control_audit_target(run_id, token)
+            audit_authorized = True
+            self._emit_control_audit_event(
+                run_id,
+                "control.command.received",
+                {
+                    "command_id": command_id,
+                    "command": ctype,
+                    "target_run_id": run_id,
+                    "actor": command.issuer,
+                    "reason": command.reason,
+                    "token_sha256": token_sha256,
+                    "idempotency_key": idempotency_key,
+                    "args_keys": sorted(key for key in command.args if key != "token"),
+                },
+            )
             result = self._dispatch_control_command(
                 command,
                 args=args,
@@ -1167,24 +1169,25 @@ class RunnerBackend:
                 command_id=command_id,
             )
         except PermissionDenied as exc:
-            self._emit_control_audit_event(
-                run_id,
-                "control.command.failed",
-                {
-                    "command_id": command_id,
-                    "command": ctype,
-                    "target_run_id": run_id,
-                    "actor": command.issuer,
-                    "idempotency_key": idempotency_key,
-                    "token_sha256": token_sha256,
-                    "status": "error",
-                    "error": str(exc),
-                    "error_code": getattr(exc, "error_code", "permission_denied"),
-                    "failure_code": getattr(exc, "error_code", "permission_denied"),
-                    "duration_ms": (time.time() - started) * 1000,
-                },
-                level="warning",
-            )
+            if audit_authorized:
+                self._emit_control_audit_event(
+                    run_id,
+                    "control.command.failed",
+                    {
+                        "command_id": command_id,
+                        "command": ctype,
+                        "target_run_id": run_id,
+                        "actor": command.issuer,
+                        "idempotency_key": idempotency_key,
+                        "token_sha256": token_sha256,
+                        "status": "error",
+                        "error": str(exc),
+                        "error_code": getattr(exc, "error_code", "permission_denied"),
+                        "failure_code": getattr(exc, "error_code", "permission_denied"),
+                        "duration_ms": (time.time() - started) * 1000,
+                    },
+                    level="warning",
+                )
             raise  # auth failures map to HTTP 401 in the route layer
         except KeyError as exc:
             result = ControlResult(
@@ -1380,6 +1383,13 @@ class RunnerBackend:
             append_event_to_run(run_dir, event_type, data=data, level=level)
         except OSError:
             _LOGGER.debug("control audit event write skipped", exc_info=True)
+
+    def _authorize_control_audit_target(self, run_id: str, token: str) -> None:
+        claims = self._verify_run_token(run_id, token)
+        with self._lock:
+            record = self._records.get(run_id)
+        if record is not None and (claims.tenant_id != record.tenant_id or claims.user_id != record.user_id):
+            raise PermissionDenied("token subject mismatch")
 
     def send_message(
         self,
