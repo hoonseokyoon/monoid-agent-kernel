@@ -340,6 +340,42 @@ def test_capability_task_kind_creates_and_resolves(tmp_path: Path) -> None:
     backend.wait_for_run(run_id, timeout_s=20)
 
 
+def test_dispatch_report_task_result_accepts_callback_token(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    task = backend.create_task(
+        run_id,
+        token,
+        kind="hitl",
+        request={"prompt": "Continue?", "choices": ("Yes", "No")},
+    )
+    result = backend.dispatch(
+        ControlCommand(
+            type="report_task_result",
+            run_id=run_id,
+            args={
+                "token": task["callback_token"],
+                "task_id": task["task_id"],
+                "result": {"answer": "Yes"},
+            },
+            issuer="callback_worker",
+            command_id="cmd_callback_result",
+        )
+    )
+
+    assert result.status == "ok"
+    assert result.data["delivered"] is True
+    events = [event for event in _events(backend, run_id) if event["type"].startswith("control.command.")]
+    by_id = {(event["type"], event["data"]["command_id"]): event["data"] for event in events}
+    assert by_id[("control.command.received", "cmd_callback_result")]["command"] == "report_task_result"
+    assert by_id[("control.command.completed", "cmd_callback_result")]["result_code"] == "ok"
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
 def test_dispatch_approve_and_deny_are_audited_task_decisions(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])

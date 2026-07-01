@@ -1146,7 +1146,7 @@ class RunnerBackend:
 
         audit_authorized = False
         try:
-            self._authorize_control_audit_target(run_id, token)
+            self._authorize_control_audit_target(run_id, token, command_type=ctype, args=args)
             audit_authorized = True
             self._emit_control_audit_event(
                 run_id,
@@ -1386,12 +1386,36 @@ class RunnerBackend:
         except OSError:
             _LOGGER.debug("control audit event write skipped", exc_info=True)
 
-    def _authorize_control_audit_target(self, run_id: str, token: str) -> None:
+    def _authorize_control_audit_target(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        command_type: str = "",
+        args: Mapping[str, Any] | None = None,
+    ) -> None:
+        if command_type == "report_task_result":
+            try:
+                self._verify_task_callback_token(run_id, token, str((args or {}).get("task_id") or ""))
+                return
+            except TokenError:
+                pass
         claims = self._verify_run_token(run_id, token)
+        self._authorize_claim_subject(run_id, claims)
+
+    def _authorize_claim_subject(self, run_id: str, claims: Any) -> None:
         with self._lock:
             record = self._records.get(run_id)
         if record is not None and (claims.tenant_id != record.tenant_id or claims.user_id != record.user_id):
             raise PermissionDenied("token subject mismatch")
+
+    def _verify_task_callback_token(self, run_id: str, token: str, task_id: str) -> None:
+        claims = self.token_manager.verify(
+            token, kind="task_callback", audience=TASK_CALLBACK_AUDIENCES, run_id=run_id
+        )
+        if str(claims.metadata.get("task_id") or "") != task_id:
+            raise PermissionDenied("callback token does not match this task")
+        self._authorize_claim_subject(run_id, claims)
 
     def send_message(
         self,
@@ -1594,11 +1618,7 @@ class RunnerBackend:
         """A task result may be reported with a per-task callback token (scoped to
         run+task) or the run token (operator). Try the scoped token first."""
         try:
-            claims = self.token_manager.verify(
-                token, kind="task_callback", audience=TASK_CALLBACK_AUDIENCES, run_id=run_id
-            )
-            if str(claims.metadata.get("task_id") or "") != task_id:
-                raise PermissionDenied("callback token does not match this task")
+            self._verify_task_callback_token(run_id, token, task_id)
         except TokenError:
             self._authorize_run(run_id, token)
         return self._active_loop(run_id)
