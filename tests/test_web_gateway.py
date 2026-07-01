@@ -142,17 +142,86 @@ def test_web_gateway_applies_signed_scope_when_payload_omits_constraints() -> No
         scope={
             "binding_id": "search_docs",
             "max_calls": 1,
+            "max_results": 1,
             "allowed_domains": ["docs.example.test"],
             "blocked_domains": ["blog.example.test"],
         },
     )
 
-    search = gateway.handle_search(token, {"query": "binding", "max_results": 5})
+    search = gateway.handle_search(token, {"query": "binding"})
 
-    assert search["result_count"] >= 1
+    assert search["result_count"] == 1
+    assert search["effective_max_results"] == 1
     assert {result["domain"] for result in search["results"]} == {"docs.example.test"}
     with pytest.raises(Exception, match="limit exceeded"):
         gateway.handle_search(token, {"query": "binding"})
+
+
+def test_web_gateway_applies_signed_fetch_and_context_caps_when_omitted() -> None:
+    manager = _token_manager()
+    gateway = WebGatewayBackend(token_manager=manager)
+    fetch_token = _scoped_web_token(
+        manager,
+        capability="web.fetch",
+        scope={
+            "binding_id": "fetch_docs",
+            "max_bytes": 12,
+            "timeout_s": 2,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    fetched = gateway.handle_fetch(
+        fetch_token,
+        {"url": "https://docs.example.test/monoid-agent-kernel/web"},
+    )
+
+    assert fetched["effective_max_bytes"] == 12
+    assert fetched["effective_timeout_s"] == 2
+    assert fetched["truncated"] is True
+    assert fetched["content_bytes"] <= 12
+
+    context_token = _scoped_web_token(
+        manager,
+        capability="web.context",
+        run_id="run_context",
+        scope={
+            "binding_id": "context_docs",
+            "max_tokens": 2,
+            "max_urls": 1,
+            "max_snippets": 1,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    context = gateway.handle_context(context_token, {"query": "binding"})
+
+    assert context["effective_max_tokens"] == 2
+    assert context["effective_max_urls"] == 1
+    assert context["effective_max_snippets"] == 1
+
+
+def test_web_gateway_rejects_scoped_token_for_wrong_endpoint() -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(
+        manager,
+        capability="web.search",
+        scope={
+            "binding_id": "search_docs",
+            "max_calls": 1,
+            "allowed_domains": ["docs.example.test"],
+        },
+    )
+
+    with pytest.raises(Exception, match="capability does not match endpoint"):
+        gateway.handle_fetch(token, {"url": "https://docs.example.test/monoid-agent-kernel/web"})
+    with pytest.raises(Exception, match="capability does not match endpoint"):
+        gateway.handle_context(token, {"query": "binding"})
+
+    assert provider.fetch_calls == 0
+    assert provider.context_calls == 0
 
 
 def test_web_gateway_rejects_signed_binding_and_numeric_escalation() -> None:

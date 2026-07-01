@@ -211,7 +211,7 @@ class WebGatewayBackend:
 
     def handle_search(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
-        payload = _apply_signed_scope(claims, payload)
+        payload = _apply_signed_scope(claims, payload, expected_capability="web.search")
         self._check_binding_limit(claims, payload, error_code="web_search_limit_exceeded")
         query = str(payload.get("query") or "")
         if not query.strip():
@@ -242,7 +242,7 @@ class WebGatewayBackend:
 
     def handle_fetch(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
-        payload = _apply_signed_scope(claims, payload)
+        payload = _apply_signed_scope(claims, payload, expected_capability="web.fetch")
         self._check_binding_limit(claims, payload, error_code="web_fetch_limit_exceeded")
         url = str(payload.get("url") or "")
         if not url.strip():
@@ -293,7 +293,7 @@ class WebGatewayBackend:
 
     def handle_context(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
-        payload = _apply_signed_scope(claims, payload)
+        payload = _apply_signed_scope(claims, payload, expected_capability="web.context")
         self._check_binding_limit(claims, payload, error_code="web_context_limit_exceeded")
         query = str(payload.get("query") or "")
         if not query.strip():
@@ -398,10 +398,15 @@ def _domain_tuple(value: Any) -> tuple[str, ...]:
     return tuple(str(item).strip().lower() for item in value if str(item).strip())
 
 
-def _apply_signed_scope(claims: TokenClaims, payload: dict[str, Any]) -> dict[str, Any]:
+def _apply_signed_scope(claims: TokenClaims, payload: dict[str, Any], *, expected_capability: str) -> dict[str, Any]:
     metadata = claims.metadata or {}
     scope = metadata.get("scope")
-    capability = str(metadata.get("capability") or "")
+    capability = str(metadata.get("capability") or "").strip()
+    if capability.startswith("web.") and capability != expected_capability:
+        raise WebGatewayError(
+            "web gateway token capability does not match endpoint",
+            error_code="web_scope_denied",
+        )
     if scope is None:
         if capability.startswith("web."):
             raise WebGatewayError(
@@ -411,6 +416,11 @@ def _apply_signed_scope(claims: TokenClaims, payload: dict[str, Any]) -> dict[st
         return payload
     if not isinstance(scope, dict):
         raise WebGatewayError("web gateway token signed scope is invalid", error_code="web_scope_invalid")
+    if capability != expected_capability:
+        raise WebGatewayError(
+            "web gateway scoped token capability does not match endpoint",
+            error_code="web_scope_denied",
+        )
 
     effective = dict(payload)
     _enforce_binding_id(scope, effective)
@@ -425,7 +435,7 @@ def _apply_signed_scope(claims: TokenClaims, payload: dict[str, Any]) -> dict[st
         "max_urls",
         "max_snippets",
     ):
-        _enforce_numeric_cap(scope, effective, key, fill_default=(key == "max_calls"))
+        _enforce_numeric_cap(scope, effective, key)
     return effective
 
 
@@ -469,16 +479,13 @@ def _enforce_numeric_cap(
     scope: dict[str, Any],
     payload: dict[str, Any],
     key: str,
-    *,
-    fill_default: bool,
 ) -> None:
     if key not in scope or scope.get(key) is None:
         return
     signed = int(scope[key])
     requested_raw = payload.get(key)
     if requested_raw is None:
-        if fill_default:
-            payload[key] = signed
+        payload[key] = signed
         return
     requested = int(requested_raw)
     if requested > signed:
