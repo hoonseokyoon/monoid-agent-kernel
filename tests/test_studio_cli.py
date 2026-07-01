@@ -4,6 +4,7 @@ setup failures (busy port, unwritable dir, missing key, no browser) into an upfr
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ def test_doctor_offline_all_good(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 
 def test_doctor_openai_without_key_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     result = _invoke(tmp_path, "--provider", "openai")
     assert result.exit_code == 1
@@ -44,6 +46,7 @@ def test_doctor_openai_without_key_fails(tmp_path: Path, monkeypatch: pytest.Mon
 def test_doctor_openai_without_sdk_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Key present but the optional [openai] extra not installed → the first turn would fail, so
     # doctor must report it instead of passing.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setattr(
         "monoid_agent_kernel.reference.studio.cli._openai_sdk_importable", lambda: False
@@ -52,6 +55,19 @@ def test_doctor_openai_without_sdk_fails(tmp_path: Path, monkeypatch: pytest.Mon
     assert result.exit_code == 1
     assert "[FAIL]" in result.output
     assert "openai SDK" in result.output
+
+
+def test_doctor_openai_loads_dotenv_over_user_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-user")
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-dotenv\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.cli._openai_sdk_importable", lambda: True
+    )
+    result = _invoke(tmp_path, "--provider", "openai")
+    assert result.exit_code == 0, result.output
+    assert "from .env" in result.output
+    assert os.environ["OPENAI_API_KEY"] == "sk-dotenv"
 
 
 def test_dir_writable_does_not_clobber_existing_files(tmp_path: Path) -> None:

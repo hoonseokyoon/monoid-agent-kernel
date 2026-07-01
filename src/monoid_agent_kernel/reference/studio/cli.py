@@ -19,6 +19,7 @@ from pathlib import Path
 
 import click
 
+from monoid_agent_kernel.env import load_dotenv
 from monoid_agent_kernel.reference.studio import window
 from monoid_agent_kernel.reference.studio.server import _SAMPLE_SKILLS_DIR, StudioConfig, StudioServer
 from monoid_agent_kernel.reference.studio.window import open_app_window
@@ -89,6 +90,12 @@ def _studio_config(
     )
 
 
+def _load_studio_dotenv(provider: str) -> dict[str, str]:
+    if provider != "openai":
+        return {}
+    return load_dotenv(".env", override=True, keys=("OPENAI_API_KEY",))
+
+
 @click.group("studio")
 def studio() -> None:
     """Run the bundled Studio reference app (LLM gateway + Monoid backend + UI)."""
@@ -110,6 +117,7 @@ def studio_serve(
     open_window: bool,
 ) -> None:
     """Start the Studio server and keep it running (window is detachable)."""
+    _load_studio_dotenv(provider)
     server = StudioServer(
         _studio_config(
             workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
@@ -145,6 +153,7 @@ def studio_app(
     mcp: bool,
 ) -> None:
     """Start the server and a desktop window; closing the window stops the server."""
+    _load_studio_dotenv(provider)
     server = StudioServer(
         _studio_config(
             workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
@@ -261,6 +270,7 @@ def studio_doctor(
     Exits non-zero if a hard requirement fails (busy port, unwritable dir, missing API key),
     so it doubles as a CI/launch gate. Browser and OTel gaps are warnings — ``serve`` still runs."""
     hard_failures = 0
+    loaded_dotenv = _load_studio_dotenv(provider)
 
     def report(status: bool | None, label: str, remedy: str = "") -> None:
         mark = {True: "PASS", False: "FAIL", None: "WARN"}[status]
@@ -284,7 +294,8 @@ def studio_doctor(
 
     if provider == "openai":
         if os.environ.get("OPENAI_API_KEY"):
-            report(True, "OPENAI_API_KEY is set")
+            source = " from .env" if "OPENAI_API_KEY" in loaded_dotenv else ""
+            report(True, f"OPENAI_API_KEY is set{source}")
         else:
             hard_failures += 1
             report(False, "OPENAI_API_KEY is not set", "export OPENAI_API_KEY=... or use --provider offline")

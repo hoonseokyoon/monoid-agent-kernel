@@ -28,6 +28,7 @@ env/
 runs/
 runs-*/
 studio-workspace/
+.codex-studio/
 proposal.tar
 
 # IDE / OS

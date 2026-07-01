@@ -36,8 +36,8 @@ upfront pass/fail checklist with remediation.
 
 **Offline vs. live.** With `--provider offline` (the default), the model is a keyless *echo* model:
 it replies but does not reason or call tools — handy for a zero-setup look at the UI. For a real
-agent that plans, writes files, and runs tools, launch with `--provider openai` and an
-`OPENAI_API_KEY` in the environment.
+agent that plans, writes files, and runs tools, launch with `--provider openai`. Studio loads
+`OPENAI_API_KEY` from `.env` in the launch directory before falling back to the ambient environment.
 
 ## Panels
 
