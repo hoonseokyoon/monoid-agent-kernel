@@ -532,6 +532,24 @@ def test_http_fetch_provider_rejects_redirect_before_disallowed_request() -> Non
         upstream.stop()
 
 
+def test_http_fetch_provider_trims_to_requested_max_bytes() -> None:
+    upstream = _FakeUpstreamServer()
+    upstream.start()
+    try:
+        fetch_provider = HttpFetchProvider(timeout_s=5, max_raw_bytes=20_000)
+        fetched = fetch_provider.fetch(
+            f"{upstream.base_url}/large-text",
+            format="text",
+            allowed_domains=("127.0.0.1",),
+            max_bytes=5,
+        )
+
+        assert fetched["content"] == "abcde"
+        assert len(fetched["content"].encode("utf-8")) == 5
+    finally:
+        upstream.stop()
+
+
 def test_brave_llm_context_provider_contract() -> None:
     upstream = _FakeUpstreamServer()
     upstream.start()
@@ -602,6 +620,9 @@ class _FakeUpstreamServer:
                         "<body><main><p>Brave search result body for the kernel.</p></main></body></html>"
                     )
                     return
+                if parsed.path == "/large-text":
+                    self._write_text("abcdef")
+                    return
                 if parsed.path == "/redirect-to-localhost":
                     self.send_response(302)
                     self.send_header("Location", f"http://localhost:{outer.port}/blocked-target")
@@ -648,6 +669,14 @@ class _FakeUpstreamServer:
                 body = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _write_text(self, text: str) -> None:
+                body = text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

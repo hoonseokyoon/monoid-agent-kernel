@@ -288,8 +288,8 @@ class HttpFetchProvider:
                     f"fetch failed: {reason}", error_code="web_fetch_network_error"
                 ) from exc
 
-        if len(raw) > self.max_raw_bytes:
-            raw = raw[: self.max_raw_bytes]
+        if len(raw) > effective_max_raw_bytes:
+            raw = raw[:effective_max_raw_bytes]
         text = _decode_body(raw, content_type)
         output_format = format if format in {"text", "markdown"} else "text"
         content = _html_to_text(text) if _looks_like_html(content_type, text) else text

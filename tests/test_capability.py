@@ -358,6 +358,41 @@ def test_auto_redispatch_runs_gated_tool_without_model_retry(tmp_path: Path) -> 
     loop.close()
 
 
+def test_approved_capability_preserves_lease_policy_fields(tmp_path: Path) -> None:
+    provider = _CapToolProvider()
+    loop = _redispatch_loop(
+        tmp_path,
+        provider,
+        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), ModelTurn(response_id="rd", final_text="done")],
+    )
+    loop.open()
+    parked = loop.run_until_suspended("go")
+    assert parked.reason == "awaiting_tasks"
+    max_expires_at = time.time() + 900
+    issued_at = time.time() - 5
+    lease_id = "lease_policy_ceiling"
+    grant = _grant_lease()
+    grant["lease"].update(
+        {
+            "lease_id": lease_id,
+            "issued_at": issued_at,
+            "max_expires_at": max_expires_at,
+        }
+    )
+
+    loop.report_task_result(parked.awaiting_task_ids[0], grant)
+    resumed = loop.run_until_suspended(None)
+
+    assert resumed.reason == "settled"
+    exported = loop._capability_vault.export_durable()
+    assert len(exported) == 1
+    assert exported[0]["lease_id"] == lease_id
+    assert exported[0]["issued_at"] == issued_at
+    assert exported[0]["max_expires_at"] == max_expires_at
+    assert exported[0]["durable"] is True
+    loop.close()
+
+
 def test_denied_capability_skips_replay(tmp_path: Path) -> None:
     provider = _CapToolProvider()
     loop = _redispatch_loop(

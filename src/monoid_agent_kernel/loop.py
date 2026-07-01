@@ -3342,14 +3342,9 @@ class AgentLoop:
             run_id=self.spec.run_id,
             binding_id=str(request_payload.get("binding_id") or ""),
         )
-        lease = CapabilityLease(
-            capability=str(lease_payload.get("capability") or request.capability),
-            token_ref=str(lease_payload.get("token_ref") or ""),
-            expires_at=float(lease_payload.get("expires_at") or 0.0),
-            scope=dict(lease_payload.get("scope") or {}),
-            # Approved out-of-band → persist (handle only) so a restart does not re-prompt.
-            durable=True,
-        )
+        # Approved out-of-band -> persist (handle only) so a restart does not re-prompt.
+        # Decode through the lease contract path so max_expires_at, issued_at, and lease_id survive.
+        lease = replace(CapabilityLease.from_json(lease_payload), durable=True)
         try:
             self._capability_vault.admit(request, lease)
         except ValueError as exc:

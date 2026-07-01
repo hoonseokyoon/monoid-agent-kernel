@@ -19,6 +19,7 @@ from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
@@ -236,6 +237,34 @@ def test_dispatch_skips_run_audit_before_loop_owns_sequence(tmp_path: Path) -> N
 
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_dispatch_appends_queued_run_audit_before_recorder_starts(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="done")])
+    prepared = backend._prepare_run_record(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_config(),
+        )
+    )
+
+    result = _dispatch(backend, prepared.run_id, prepared.run_token, "status")
+
+    assert result.status == "ok"
+    events = _events(backend, prepared.run_id)
+    assert [event["type"] for event in events] == [
+        "control.command.received",
+        "control.command.completed",
+    ]
+    recorder = AgentRecorder(backend.run_root, prepared.run_id)
+    try:
+        assert recorder.emit("run.started", data={"mode": "propose"}).seq == 3
+    finally:
+        recorder.close()
 
 
 def test_control_audit_skips_direct_append_when_loop_is_not_open(tmp_path: Path) -> None:

@@ -1389,14 +1389,16 @@ class RunnerBackend:
             record = self._records.get(run_id)
             loop = record.loop if record is not None else None
             run_dir = record.run_dir if record is not None else self.run_root / run_id
+        direct_append_allowed = False
         if record is not None:
             if loop is not None and loop.emit_external_event(event_type, data=data, level=level):
                 return
-            if record.status not in _DIRECT_AUDIT_APPEND_STATUSES:
+            direct_append_allowed = record.status == "queued"
+            if not direct_append_allowed and record.status not in _DIRECT_AUDIT_APPEND_STATUSES:
                 return
         if not run_dir.exists():
             return
-        if not _run_dir_allows_direct_audit_append(run_dir):
+        if not direct_append_allowed and not _run_dir_allows_direct_audit_append(run_dir):
             return
         try:
             append_event_to_run(run_dir, event_type, data=data, level=level)
