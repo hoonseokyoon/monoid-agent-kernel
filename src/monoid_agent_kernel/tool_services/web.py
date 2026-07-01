@@ -215,6 +215,7 @@ class WebService:
             default_value=100_000,
             max_value=1_000_000,
         )
+        allowed_domains, blocked_domains = self._domain_filters(args, call)
         event_data = {
             "url_preview": public_url_preview(url),
             "domain": domain_from_url(url),
@@ -223,6 +224,8 @@ class WebService:
             "effective_timeout_s": effective_timeout_s,
             "requested_max_bytes": requested_max_bytes,
             "effective_max_bytes": effective_max_bytes,
+            "allowed_domains": allowed_domains,
+            "blocked_domains": blocked_domains,
             "binding_id": call.binding_id,
         }
         payload = {
@@ -233,6 +236,8 @@ class WebService:
             "format": args.get("format") or "text",
             "timeout_s": effective_timeout_s,
             "max_bytes": effective_max_bytes,
+            "allowed_domains": allowed_domains,
+            "blocked_domains": blocked_domains,
         }
 
         def on_success(result: dict[str, Any]) -> dict[str, Any]:
