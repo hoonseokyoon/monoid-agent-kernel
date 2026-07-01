@@ -1283,6 +1283,8 @@ class RunnerBackend:
                 approval_result["answer"] = str(args.get("answer") or "Deny")
                 approval_result["approved"] = False
                 approval_result["granted"] = False
+                approval_result.pop("lease", None)
+                approval_result.pop("token_ref", None)
                 approval_result["reason"] = command.reason or str(
                     args.get("reason") or approval_result.get("reason") or "denied"
                 )

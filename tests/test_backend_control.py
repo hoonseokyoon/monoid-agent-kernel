@@ -515,7 +515,13 @@ def test_dispatch_deny_overwrites_conflicting_result_fields(tmp_path: Path) -> N
             args={
                 "token": token,
                 "task_id": task["task_id"],
-                "result": {"answer": "Approve", "approved": True, "granted": True},
+                "result": {
+                    "answer": "Approve",
+                    "approved": True,
+                    "granted": True,
+                    "lease": {"capability": "web.search", "token_ref": "secret-ref://lease-1"},
+                    "token_ref": "secret-ref://lease-1",
+                },
             },
             issuer="operator_a",
             reason="policy denied",
@@ -537,6 +543,8 @@ def test_dispatch_deny_overwrites_conflicting_result_fields(tmp_path: Path) -> N
     assert job["result"]["approved"] is False
     assert job["result"]["granted"] is False
     assert job["result"]["reason"] == "policy denied"
+    assert "lease" not in job["result"]
+    assert "token_ref" not in job["result"]
 
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)
