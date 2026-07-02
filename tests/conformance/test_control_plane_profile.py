@@ -73,8 +73,28 @@ class _ReferenceControlPlaneHarness:
     def events(self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None) -> dict[str, Any]:
         return self.backend.events(run_id, token, from_seq=from_seq, limit=limit)
 
+    def descendant_events(
+        self,
+        run_id: str,
+        token: str,
+        descendant_run_id: str,
+        *,
+        from_seq: int = 0,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self.backend.descendant_events(
+            run_id,
+            token,
+            descendant_run_id,
+            from_seq=from_seq,
+            limit=limit,
+        )
+
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
         return self.backend.diagnostics(run_id, token, event_limit=event_limit)
+
+    def result(self, run_id: str, token: str) -> dict[str, Any]:
+        return self.backend.result(run_id, token)
 
     def runtime_config(self, run_id: str, token: str) -> dict[str, Any]:
         return self.backend.runtime_config(run_id, token)

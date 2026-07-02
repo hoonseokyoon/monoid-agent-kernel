@@ -40,6 +40,10 @@ from monoid_agent_kernel.core.event_sequencing import (
     diagnostic_event_summary,
     read_event_page,
 )
+from monoid_agent_kernel.core.subagent_runtime import (
+    subagent_diagnostics_from_events,
+    validate_descendant_run_id,
+)
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
@@ -1787,6 +1791,7 @@ class RunnerBackend:
                 "items": event_summaries,
             },
             "control": {"events": control_events},
+            "subagents": subagent_diagnostics_from_events(event_page["events"]),
             "trace_ids": _trace_ids_from_events(event_page["events"]),
         }
 
@@ -1808,10 +1813,10 @@ class RunnerBackend:
         the ancestor's token plus an id-prefix descendant check (a subagent id always extends its
         parent's with ``.sub.<task>``, at any depth)."""
         self._authorize_run(run_id, token)
-        if descendant_run_id != run_id and not descendant_run_id.startswith(f"{run_id}.sub."):
-            raise PermissionDenied("run is not a descendant of the authorized run")
-        if any(sep in descendant_run_id for sep in ("/", "\\")) or ".." in descendant_run_id:
-            raise PermissionDenied("invalid descendant run id")
+        try:
+            validate_descendant_run_id(run_id, descendant_run_id)
+        except ValueError as exc:
+            raise PermissionDenied(str(exc)) from exc
         events_path = self.run_root / descendant_run_id / "events.jsonl"
         page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
         return {"run_id": descendant_run_id, **page}

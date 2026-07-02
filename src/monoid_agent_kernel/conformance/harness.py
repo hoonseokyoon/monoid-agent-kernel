@@ -33,8 +33,22 @@ class BackendHarness(ConformanceHarness, Protocol):
     def events(self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None) -> JsonObject:
         """Return a page of run events."""
 
+    def descendant_events(
+        self,
+        run_id: str,
+        token: str,
+        descendant_run_id: str,
+        *,
+        from_seq: int = 0,
+        limit: int | None = None,
+    ) -> JsonObject:
+        """Return a page of events for one authorized descendant run."""
+
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> JsonObject:
         """Return the diagnostics aggregate for a run."""
+
+    def result(self, run_id: str, token: str) -> JsonObject:
+        """Return the backend run result projection."""
 
     def runtime_config(self, run_id: str, token: str) -> JsonObject:
         """Return the current runtime config projection for a run."""

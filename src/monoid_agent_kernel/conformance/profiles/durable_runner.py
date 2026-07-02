@@ -98,6 +98,31 @@ def assert_durable_runner_recovery_metadata_profile(harness: BackendHarness) -> 
             _cancel(empty_restart, empty_run_id, empty_token, command_id="cmd_profile_recovery_cleanup_empty_restart")
 
 
+def assert_durable_runner_subagent_diagnostics_profile(harness: BackendHarness) -> None:
+    """Run the Phase 1S subagent diagnostics projection smoke matrix."""
+    submitted = harness.submit_run({"scenario": "subagent-foreground"})
+    run_id = str(submitted["run_id"])
+    token = str(submitted["token"])
+
+    events = list(harness.events(run_id, token)["events"])
+    started = _one_event(events, "subagent.started")
+    started_data = dict(started["data"])
+    child_run_id = str(started_data["child_run_id"])
+    traceparent = str(started_data["traceparent"])
+
+    diagnostics = harness.diagnostics(run_id, token, event_limit=50)
+    items = list(diagnostics["subagents"]["items"])
+    matches = [item for item in items if item["child_run_id"] == child_run_id]
+    assert matches, f"missing diagnostics subagent {child_run_id}"
+    item = matches[0]
+    assert item["task_id"] == started_data["task_id"]
+    assert item["definition_id"] == started_data["definition_id"]
+    assert item["depth"] == started_data["depth"]
+    assert item["traceparent"] == traceparent
+    assert item["status"] == "completed"
+    assert item["usage"].get("total_tokens") == 10
+
+
 def _replace_with_next_config(
     harness: BackendHarness,
     run_id: str,
@@ -126,6 +151,12 @@ def _assert_monotonic_unique_sequence(events: list[dict[str, Any]]) -> None:
     seqs = [int(event["seq"]) for event in events]
     assert seqs == sorted(seqs)
     assert len(seqs) == len(set(seqs))
+
+
+def _one_event(events: list[dict[str, Any]], event_type: str) -> dict[str, Any]:
+    matches = [event for event in events if event["type"] == event_type]
+    assert matches, f"missing event {event_type}"
+    return matches[0]
 
 
 def _cancel(harness: BackendHarness, run_id: str, token: str, *, command_id: str) -> None:

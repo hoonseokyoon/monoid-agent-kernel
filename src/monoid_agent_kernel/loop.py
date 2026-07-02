@@ -72,6 +72,7 @@ from monoid_agent_kernel.core.output_validator import (
     ValidationOutcome,
 )
 from monoid_agent_kernel.core.streaming import QueueEventSink, RunStream
+from monoid_agent_kernel.core.subagent_runtime import SubagentRuntimeContext
 from monoid_agent_kernel.core.spec import (
     AgentRunSpec,
     ModelConfig,
@@ -1942,23 +1943,18 @@ class AgentLoop:
         definition = self.subagent_definitions[definition_id]
         parent_config = self.runtime_config_provider.current_config(self.spec.run_id)
         is_fork = definition.context == "fork"
-        child_run_id = f"{self.spec.run_id}.sub.{task.job_id}"
-        child_depth = depth + 1
-        root_run_id = str(self.spec.metadata.get("root_run_id") or self.spec.run_id)
-        traceparent = str(task.request.get("traceparent") or new_traceparent())
-        identity = {
-            "root_run_id": root_run_id,
-            "parent_run_id": self.spec.run_id,
-            "child_run_id": child_run_id,
-            "task_id": task.job_id,
-            "definition_id": definition_id,
-            "depth": child_depth,
-            "traceparent": traceparent,
-        }
+        subagent = SubagentRuntimeContext.create(
+            parent_run_id=self.spec.run_id,
+            task_id=task.job_id,
+            definition_id=definition_id,
+            parent_depth=depth,
+            root_run_id=str(self.spec.metadata.get("root_run_id") or self.spec.run_id),
+            traceparent=str(task.request.get("traceparent") or ""),
+        )
         # At the depth cap the child must not delegate further: the resolver drops any
         # agent.spawn binding and we give it no definitions, so the tool is simply absent
         # rather than erroring at call time.
-        at_max_depth = child_depth >= self.spec.limits.max_subagent_depth
+        at_max_depth = subagent.depth >= self.spec.limits.max_subagent_depth
         child_config = self._resolve_child_config(
             definition,
             parent_config,
@@ -1982,28 +1978,19 @@ class AgentLoop:
             "subagent.started",
             turn_id=turn_id,
             parent_id=parent_event_id,
-            data={
-                **identity,
-                "subagent_type": definition_id,
-                "background": background,
-            },
+            data=subagent.started_event_data(background=background),
         )
         child_spec = AgentRunSpec(
             workspace_root=self.spec.workspace_root,
             run_root=self.spec.run_root,
-            run_id=child_run_id,
+            run_id=subagent.child_run_id,
             # mode/limits inherit the parent's unless the definition narrows them.
             mode=self.spec.mode if is_fork else (definition.mode or self.spec.mode),
             workspace_backend="overlay",
             limits=self.spec.limits if is_fork else (definition.limits or self.spec.limits),
             permission_policy=self.spec.permission_policy,
             metadata={
-                **identity,
-                # Legacy aliases kept for existing readers.
-                "parent_run_id": self.spec.run_id,
-                "parent_task_id": task.job_id,
-                "subagent_definition_id": definition_id,
-                "subagent_depth": child_depth,
+                **subagent.child_metadata(),
             },
         )
         child = AgentLoop(
@@ -2044,19 +2031,12 @@ class AgentLoop:
                 amount = int(value)
                 parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + amount
                 self._session.state.total_usage[key] = self._session.state.total_usage.get(key, 0) + amount
-        task.result = {
-            "type": "subagent_result",
-            **identity,
-            "task_id": task.job_id,
-            "subagent_type": definition_id,
-            "child_run_id": child_run_id,
-            "status": result.status,
-            "message": result.final_text,
-            "answer": result.final_text,
-            "final_text": result.final_text,
-            "error": result.error,
-            "usage": usage,
-        }
+        task.result = subagent.result_payload(
+            status=result.status,
+            final_text=result.final_text,
+            error=result.error,
+            usage=usage,
+        )
         if result.status == "failed":
             task.status = "failed"
         recorder.emit(
@@ -2064,14 +2044,12 @@ class AgentLoop:
             turn_id=turn_id,
             parent_id=started.event_id,
             level="error" if result.status == "failed" else "info",
-            data={
-                **identity,
-                "subagent_type": definition_id,
-                "status": result.status,
-                "usage": usage,
-                "error": result.error,
-                "error_code": result.error_code,
-            },
+            data=subagent.terminal_event_data(
+                status=result.status,
+                usage=usage,
+                error=result.error,
+                error_code=result.error_code,
+            ),
         )
 
     def _resolve_child_config(

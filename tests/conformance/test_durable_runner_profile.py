@@ -5,18 +5,19 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from support.runtime import runtime_config
+from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
 
 from monoid_agent_kernel.conformance.profiles.durable_runner import (
     assert_durable_runner_event_sequence_profile,
     assert_durable_runner_recovery_metadata_profile,
+    assert_durable_runner_subagent_diagnostics_profile,
 )
-from monoid_agent_kernel.core.agents import AgentRuntimeConfig
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.providers.base import ModelTurn
-from monoid_agent_kernel.providers.fake import FakeModelAdapter
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 
@@ -40,7 +41,24 @@ class _ReferenceDurableRunnerHarness:
         self.token_manager = token_manager or TokenManager.from_secret("x" * 32)
 
         def factory(spec: Any, llm_gateway_token: str) -> FakeModelAdapter:
-            del spec, llm_gateway_token
+            del llm_gateway_token
+            scenario = str(spec.metadata.get("scenario") or "")
+            if scenario == "subagent-foreground":
+                return FakeModelAdapter(
+                    turns=[
+                        ModelTurn(
+                            tool_calls=(
+                                fake_tool_call(
+                                    "agent_spawn",
+                                    {"subagent_type": "researcher", "prompt": "summarize notes"},
+                                    "spawn_1",
+                                ),
+                            )
+                        ),
+                        ModelTurn(final_text="child found answer", usage={"total_tokens": 10}),
+                        ModelTurn(final_text="parent done"),
+                    ]
+                )
             return FakeModelAdapter(turns=[ModelTurn(response_id=f"r_{uuid.uuid4().hex[:8]}", final_text="first")])
 
         self.backend = RunnerBackend(
@@ -50,6 +68,7 @@ class _ReferenceDurableRunnerHarness:
             llm_gateway_url="http://llm-gateway.internal/v1/turns",
             model_adapter_factory=factory,
             checkpoint_store=self.checkpoint_store,
+            subagent_definitions={"researcher": _child_def()},
         )
         self.backend.idle_timeout_s = 30.0
         self.backend.max_recover_attempts = 10_000
@@ -65,17 +84,27 @@ class _ReferenceDurableRunnerHarness:
     def submit_run(self, request: dict[str, Any]) -> dict[str, Any]:
         scenario = str(request["scenario"])
         multi_turn = scenario in {"multi-turn", "recoverable-multi-turn"}
+        config = (
+            AgentRuntimeConfig(
+                definition_id="parent",
+                prompt=PromptSpec(persona_segments=("[[ROLE=PARENT]]",)),
+                tools=(tool_binding("agent.spawn"), tool_binding("run.finish")),
+            )
+            if scenario == "subagent-foreground"
+            else runtime_config("fs.read", "fs.write", "run.finish")
+        )
         submission = self.backend.submit_run(
             BackendRunRequest(
                 tenant_id="tenant_a",
                 user_id="user_a",
                 workspace_root=self.workspace,
                 instruction=f"{scenario} run",
-                runtime_config=runtime_config("fs.read", "fs.write", "run.finish"),
+                runtime_config=config,
                 multi_turn=multi_turn,
+                metadata={"scenario": scenario},
             )
         )
-        if scenario == "completed":
+        if scenario in {"completed", "subagent-foreground"}:
             assert self.backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
         elif multi_turn:
             assert eventually(lambda: self.backend._record(submission.run_id).status == "awaiting_input")
@@ -90,8 +119,28 @@ class _ReferenceDurableRunnerHarness:
     def events(self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None) -> dict[str, Any]:
         return self.backend.events(run_id, token, from_seq=from_seq, limit=limit)
 
+    def descendant_events(
+        self,
+        run_id: str,
+        token: str,
+        descendant_run_id: str,
+        *,
+        from_seq: int = 0,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self.backend.descendant_events(
+            run_id,
+            token,
+            descendant_run_id,
+            from_seq=from_seq,
+            limit=limit,
+        )
+
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
         return self.backend.diagnostics(run_id, token, event_limit=event_limit)
+
+    def result(self, run_id: str, token: str) -> dict[str, Any]:
+        return self.backend.result(run_id, token)
 
     def runtime_config(self, run_id: str, token: str) -> dict[str, Any]:
         return self.backend.runtime_config(run_id, token)
@@ -146,9 +195,21 @@ class _ReferenceDurableRunnerHarness:
         return self.backend.dispatch(ControlCommand.from_json(dict(command))).to_json()
 
 
+def _child_def() -> SubagentDefinition:
+    return SubagentDefinition(
+        description="Researcher",
+        prompt=PromptSpec(persona_segments=("[[ROLE=CHILD]]",)),
+        tools=(),
+    )
+
+
 def test_reference_backend_satisfies_durable_runner_event_sequence_profile(tmp_path: Path) -> None:
     assert_durable_runner_event_sequence_profile(_ReferenceDurableRunnerHarness(tmp_path))
 
 
 def test_reference_backend_satisfies_durable_runner_recovery_metadata_profile(tmp_path: Path) -> None:
     assert_durable_runner_recovery_metadata_profile(_ReferenceDurableRunnerHarness(tmp_path))
+
+
+def test_reference_backend_satisfies_subagent_diagnostics_profile(tmp_path: Path) -> None:
+    assert_durable_runner_subagent_diagnostics_profile(_ReferenceDurableRunnerHarness(tmp_path))
