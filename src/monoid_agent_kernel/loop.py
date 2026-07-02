@@ -172,6 +172,8 @@ from monoid_agent_kernel.web import WebGatewayClient, domain_allowed, domain_fro
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.workspace.local import default_local_workspace_factory
 
+CheckpointPersistCallback = Callable[[RunCheckpoint, Mapping[str, bytes]], None]
+
 
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     """True if a tool binding matches any fnmatch pattern. Matched against the binding's
@@ -722,6 +724,9 @@ class AgentLoop:
     # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
     # Defaults to a local-fs store under the run root; a backend injects a durable one.
     checkpoint_store: CheckpointStore | None = None
+    # Optional backend-owned checkpoint writer. Core still builds the checkpoint and advances its
+    # sequence; a backend can fold in queue/inbox metadata before the bytes are committed.
+    checkpoint_persist_callback: CheckpointPersistCallback | None = None
     # Optional capability broker: a bound tool that declares ``runtime.requires_lease=True``
     # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
     # Secrets stay in the broker; the core only gates on the lease. If no broker is configured,
@@ -1691,7 +1696,11 @@ class AgentLoop:
             return
         session.checkpoint_seq += 1
         checkpoint.seq = session.checkpoint_seq
-        self._checkpoint_store().put(checkpoint, self.collect_checkpoint_blobs())
+        blobs = self.collect_checkpoint_blobs()
+        if self.checkpoint_persist_callback is not None:
+            self.checkpoint_persist_callback(checkpoint, blobs)
+            return
+        self._checkpoint_store().put(checkpoint, blobs)
 
     @staticmethod
     def _workspace_delta_entries(workspace: Workspace) -> list[dict[str, Any]]:
@@ -2724,6 +2733,10 @@ class AgentLoop:
             if state.pending_tool_approval_replays:
                 pending_replays = state.pending_tool_approval_replays
                 state.pending_tool_approval_replays = ()
+                # Persist the consumed approval replay before invoking the approved handler. If the
+                # process exits during the handler, restore must not re-deliver the same approval and
+                # execute a write/side-effecting tool twice.
+                self._persist_checkpoint(session)
                 replay_obs = tuple(
                     obs
                     for replay in pending_replays

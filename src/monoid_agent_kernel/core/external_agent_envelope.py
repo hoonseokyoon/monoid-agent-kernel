@@ -238,14 +238,25 @@ def normalize_external_agent_error(
     return ExternalAgentError(code=code, message=str(error), retryable=retryable)
 
 
-def external_agent_envelope_from_outbox_request(request: OutboxRequest) -> ExternalAgentEnvelope:
+def external_agent_envelope_from_outbox_request(
+    request: OutboxRequest,
+    *,
+    peer_id: str = "",
+) -> ExternalAgentEnvelope:
     """Build an external-agent envelope from a staged outbox request."""
 
     payload = dict(request.payload)
     parts = _parts_from_payload(payload)
     message_id = request.idempotency_key or request.id
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    sender_peer_id = (
+        peer_id
+        or str(metadata.get("peer_id") or metadata.get("source_peer_id") or "").strip()
+        or request.run_id
+        or request.destination
+    )
     return ExternalAgentEnvelope(
-        peer_id=request.destination,
+        peer_id=sender_peer_id,
         parts=parts,
         message_id=message_id,
         task_id=str(payload.get("task_id") or request.correlation_id or message_id),

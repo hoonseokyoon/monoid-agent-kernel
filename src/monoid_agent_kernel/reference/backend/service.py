@@ -67,6 +67,7 @@ from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
     CheckpointStore,
     LocalFsCheckpointStore,
+    RunCheckpoint,
 )
 from monoid_agent_kernel.reference.stores.lease import LeaseStore, LocalFsLeaseStore
 from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_proposal_file_payload
@@ -2105,6 +2106,18 @@ class RunnerBackend:
         checkpoint = loop.snapshot()
         if checkpoint is None:
             return
+        self._persist_run_checkpoint_payload(record, checkpoint, loop.collect_checkpoint_blobs())
+
+    def _persist_run_checkpoint_payload(
+        self,
+        record: BackendRunRecord,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+    ) -> None:
+        """Commit a loop checkpoint after adding backend-owned queue and inbox state."""
+        loop = record.loop
+        if loop is None:
+            return
         # Peek (don't drain) the residual queue; consumed messages are already reflected in
         # the loop's turn handle / pending input. Runs in the driver coroutine on the shared
         # loop, so reading the asyncio.Queue's backing deque needs no lock (single-threaded
@@ -2120,7 +2133,7 @@ class RunnerBackend:
         checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
         # Overwrites the same seq the loop just committed, now with the queue included.
         assert self.checkpoint_store is not None
-        self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
+        self.checkpoint_store.put(checkpoint, blobs)
         self._drain_outbox(record, loop)
 
     async def _persist_run_checkpoint_async(self, record: BackendRunRecord) -> None:
@@ -2299,6 +2312,11 @@ class RunnerBackend:
             context_providers=self.context_providers,
             output_validators=self.output_validators,
             capability_broker=self._capability_broker_for(request),
+            checkpoint_persist_callback=lambda checkpoint, blobs: self._persist_run_checkpoint_payload(
+                self._record(run_id),
+                checkpoint,
+                blobs,
+            ),
         )
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:

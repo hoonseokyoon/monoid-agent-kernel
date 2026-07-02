@@ -382,7 +382,6 @@ class ReferenceBackendHarness:
         self.outbox_sender = RecordingOutboxSender()
         self.message_fabric_directory: dict[str, str] = {}
         self.message_fabric_tokens: dict[str, str] = {}
-        self.message_fabric_sender = InboxRoutingOutboxSender(deliver=self._deliver_message_fabric)
 
         def factory(spec: Any, llm_gateway_token: str) -> _ReferenceMultiAgentAdapter | FakeModelAdapter:
             del llm_gateway_token
@@ -418,7 +417,10 @@ class ReferenceBackendHarness:
         if scenario.startswith("tool-side-effect-"):
             return self.outbox_sender
         if scenario.startswith("message-fabric-"):
-            return self.message_fabric_sender
+            return InboxRoutingOutboxSender(
+                deliver=self._deliver_message_fabric,
+                source_peer_id=str(request.metadata.get("message_fabric_peer_id") or ""),
+            )
         return None
 
     @property
@@ -532,6 +534,10 @@ class ReferenceBackendHarness:
         instruction: str | None = None,
         multi_turn: bool = False,
     ) -> dict[str, str]:
+        metadata: dict[str, Any] = {"scenario": scenario}
+        if scenario.startswith("message-fabric-"):
+            peer_id = scenario.removeprefix("message-fabric-")
+            metadata["message_fabric_peer_id"] = "planner" if peer_id == "peer-unavailable" else peer_id
         submission = self.backend.submit_run(
             BackendRunRequest(
                 tenant_id="tenant_a",
@@ -540,7 +546,7 @@ class ReferenceBackendHarness:
                 instruction=instruction or f"{scenario} run",
                 runtime_config=_runtime_config_for_scenario(scenario),
                 multi_turn=multi_turn,
-                metadata={"scenario": scenario},
+                metadata=metadata,
             )
         )
         return {"run_id": submission.run_id, "token": submission.run_token}

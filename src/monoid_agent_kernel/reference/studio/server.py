@@ -368,7 +368,6 @@ class StudioServer:
         # from _run_tokens. One shared sender drains every run's outbox into the addressed peer's
         # idempotent inbox via the backend's send_message.
         self._agent_directory: dict[str, str] = {}
-        self._a2a_sender = InboxRoutingOutboxSender(deliver=self._a2a_deliver)
         self._lock = threading.RLock()
         self._base_url = ""
 
@@ -547,7 +546,7 @@ class StudioServer:
             # (brokered handle on the request + capability.* events) while the actual cross-agent
             # transport uses Studio's server-side run token. Both are no-ops for a normal chat: a
             # plain chat binds neither outbox.send nor any requires_lease tool.
-            outbox_sender_factory=lambda req: self._a2a_sender,
+            outbox_sender_factory=self._a2a_sender_for,
             capability_broker_factory=lambda req: AutoGrantBroker(),
         )
 
@@ -643,6 +642,12 @@ class StudioServer:
 
     # --- A2A demo (agent-to-agent durable messaging) ------------------------------------
 
+    def _a2a_sender_for(self, request: BackendRunRequest) -> InboxRoutingOutboxSender:
+        return InboxRoutingOutboxSender(
+            deliver=self._a2a_deliver,
+            source_peer_id=str(request.metadata.get("a2a_peer_id") or ""),
+        )
+
     def _a2a_deliver(
         self,
         destination: str,
@@ -710,6 +715,7 @@ class StudioServer:
             mode="propose",
             multi_turn=True,
             runtime_config=self._a2a_peer_config(name, peer),
+            metadata={"a2a_peer_id": name},
         )
         submission = self._backend.submit_run(request)
         with self._lock:

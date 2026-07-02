@@ -72,9 +72,13 @@ class InboxRoutingOutboxSender:
     """
 
     deliver: Callable[..., str]
+    source_peer_id: str = ""
 
     def send(self, request: OutboxRequest) -> OutboxReceipt:
-        envelope = external_agent_envelope_from_outbox_request(request)
+        envelope = external_agent_envelope_from_outbox_request(
+            request,
+            peer_id=self.source_peer_id,
+        )
         try:
             reference = self.deliver(
                 request.destination,

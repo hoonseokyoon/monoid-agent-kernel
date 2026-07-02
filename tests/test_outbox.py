@@ -407,6 +407,7 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
     directory: dict[str, str] = {}  # agent name -> run_id
     tokens: dict[str, str] = {}
     holder: dict[str, Any] = {}
+    delivered_sources: list[tuple[str, str]] = []
 
     def deliver(destination, payload, *, message_id, correlation_id, causation_id, traceparent):
         run_id = directory.get(destination)
@@ -414,6 +415,7 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
             raise LookupError(f"no agent {destination!r}")
         envelope = validate_external_agent_envelope(dict(payload))
         message = external_agent_envelope_to_inbox_message(envelope, run_id=run_id)
+        delivered_sources.append((destination, message.source))
         holder["backend"].send_message(
             run_id,
             tokens[run_id],
@@ -425,8 +427,6 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
             traceparent=message.traceparent or traceparent,
         )
         return f"a2a:{run_id}"
-
-    sender = InboxRoutingOutboxSender(deliver=deliver)
 
     # Worker bootstraps first (we wait for it below), so this ordered script queue is deterministic.
     # Worker: settle the opening turn, then on receiving planner's message reply back to planner.
@@ -446,28 +446,31 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
         model_adapter_factory=factory,
         tool_providers=(OutboxToolProvider(),),
         capability_broker_factory=lambda req: AutoGrantBroker(),
-        outbox_sender_factory=lambda req: sender,
+        outbox_sender_factory=lambda req: InboxRoutingOutboxSender(
+            deliver=deliver,
+            source_peer_id=str(req.metadata.get("message_fabric_peer_id") or ""),
+        ),
     )
     backend.idle_timeout_s = 10.0
     holder["backend"] = backend
 
-    def spawn(instruction: str) -> str:
+    def spawn(name: str, instruction: str) -> str:
         binding = tool_binding("outbox.send", runtime={"requires_lease": True}, scope=ToolScope())
         sub = backend.submit_run(
             BackendRunRequest(
                 tenant_id="tenant_a", user_id="user_a", workspace_root=workspace,
                 instruction=instruction, runtime_config=runtime_config(bindings=(binding,)),
-                multi_turn=True,
+                multi_turn=True, metadata={"message_fabric_peer_id": name},
             )
         )
         tokens[sub.run_id] = sub.run_token
         return sub.run_id
 
     try:
-        worker_id = spawn("stand by for planner")
+        worker_id = spawn("worker", "stand by for planner")
         directory["worker"] = worker_id
         assert eventually(lambda: backend.status(worker_id, tokens[worker_id]).get("status") == "awaiting_input")
-        planner_id = spawn("collaborate with worker")
+        planner_id = spawn("planner", "collaborate with worker")
         directory["planner"] = planner_id
 
         def dispatched_to(run_id: str, dest: str) -> bool:
@@ -481,6 +484,8 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
 
         assert eventually(lambda: dispatched_to(planner_id, "worker"))   # A -> B
         assert eventually(lambda: dispatched_to(worker_id, "planner"))   # B -> A (so B received A's message)
+        assert ("worker", "external-agent:planner") in delivered_sources
+        assert ("planner", "external-agent:worker") in delivered_sources
 
         # The inbox is idempotent: once a message id has been processed, re-delivering it is a no-op.
         assert backend.send_message(worker_id, tokens[worker_id], "dup", message_id="m-dup")["status"] == "queued"

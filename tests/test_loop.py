@@ -456,6 +456,72 @@ def test_ask_authorization_reported_result_survives_restore_before_replay(tmp_pa
     assert getattr(task, "ready_for_reentry") is True
 
 
+def test_ask_authorization_replay_consumed_checkpoint_precedes_handler(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    observed: dict[str, object] = {}
+    task_holder: dict[str, str] = {}
+    loop_holder: dict[str, AgentLoop] = {}
+
+    class Provider:
+        calls = 0
+
+        def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                self.calls += 1
+                loop = loop_holder["loop"]
+                assert loop.checkpoint_store is not None
+                latest = loop.checkpoint_store.latest(loop.spec.run_id)
+                assert latest is not None
+                observed["delivered"] = list(latest.checkpoint.delivered_reentry_jobs)
+                observed["pending_replays"] = list(latest.checkpoint.pending_tool_approval_replays)
+                return ToolResult(ok=True, content={"value": "ok"})
+
+            return [
+                ToolSpec(
+                    id="demo.approval",
+                    description="approval demo",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    provider = Provider()
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+                ModelTurn(final_text="park"),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    loop_holder["loop"] = loop
+    loop.open()
+
+    suspended = loop.run_until_suspended("use the approval tool")
+    task_holder["task_id"] = suspended.awaiting_task_ids[0]
+    loop.report_task_result(task_holder["task_id"], {"approved": True})
+    loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert result.status == "completed"
+    assert provider.calls == 1
+    assert task_holder["task_id"] in observed["delivered"]
+    assert observed["pending_replays"] == []
+
+
 def test_ask_authorization_denial_never_invokes_handler(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

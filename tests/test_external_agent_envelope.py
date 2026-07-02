@@ -123,6 +123,20 @@ def test_outbox_request_converts_to_external_agent_envelope() -> None:
     assert trace_id_of(envelope.traceparent) == trace_id_of(traceparent)
 
 
+def test_outbox_request_converts_to_external_agent_envelope_with_sender_peer_id() -> None:
+    request = OutboxRequest(
+        destination="worker",
+        payload={"text": "please do X"},
+        id="outbox-1",
+        idempotency_key="message-1",
+        run_id="run-planner",
+    )
+
+    envelope = external_agent_envelope_from_outbox_request(request, peer_id="planner")
+
+    assert envelope.peer_id == "planner"
+
+
 def test_external_agent_envelope_converts_to_inbox_message() -> None:
     envelope = ExternalAgentEnvelope(
         peer_id="planner",
