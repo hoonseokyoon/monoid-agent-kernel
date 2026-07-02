@@ -267,7 +267,7 @@ def external_agent_envelope_from_outbox_request(
         traceparent=child_traceparent(request.traceparent),
         tracestate=request.tracestate,
         capability_ref=request.token_ref,
-        metadata=dict(payload.get("metadata") or {}),
+        metadata=dict(metadata),
     )
 
 

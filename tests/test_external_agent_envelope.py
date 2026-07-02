@@ -137,6 +137,20 @@ def test_outbox_request_converts_to_external_agent_envelope_with_sender_peer_id(
     assert envelope.peer_id == "planner"
 
 
+def test_outbox_request_ignores_non_object_metadata_for_text_message() -> None:
+    request = OutboxRequest(
+        destination="worker",
+        payload={"text": "please do X", "metadata": "v1"},
+        id="outbox-1",
+        idempotency_key="message-1",
+    )
+
+    envelope = external_agent_envelope_from_outbox_request(request)
+
+    assert envelope.parts[0].text == "please do X"
+    assert envelope.metadata == {}
+
+
 def test_external_agent_envelope_converts_to_inbox_message() -> None:
     envelope = ExternalAgentEnvelope(
         peer_id="planner",

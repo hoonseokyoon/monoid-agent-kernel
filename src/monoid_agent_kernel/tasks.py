@@ -690,11 +690,11 @@ class HostedResultInjector:
             else f"{self.kind} task {job.job_id} finished with status {job.status}."
         )
         output = {
+            **result,
             "type": self.result_type,
             "task_id": job.job_id,
             "status": job.status,
             "message": message,
-            **result,
         }
         call_id = f"task:{job.job_id}" if self.as_user_message else f"{self.kind}:{job.job_id}"
         return [

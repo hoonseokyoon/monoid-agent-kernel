@@ -9,7 +9,7 @@ from monoid_agent_kernel.core.tool_approval import (
     tool_approval_key,
 )
 from monoid_agent_kernel.permissions import PermissionPolicy
-from monoid_agent_kernel.tasks import HostedTask
+from monoid_agent_kernel.tasks import HostedResultInjector, HostedTask
 from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
 
 
@@ -148,3 +148,34 @@ def test_tool_approval_public_payload_sanitizes_result_grant_material(tmp_path) 
     assert "lease" not in public["result"]
     assert "token_ref" not in public["result"]
     assert "secret-ref://lease" not in str(public)
+
+
+def test_tool_approval_result_observation_preserves_control_fields(tmp_path) -> None:
+    task = HostedTask(
+        job_id="task_1",
+        kind=TOOL_APPROVAL_TASK_KIND,
+        prompt="Approve tool call",
+        status="answered",
+        started_at=1.0,
+        resume_on_exit=True,
+        job_path=tmp_path / "task.json",
+        cancel_path=tmp_path / "cancel.requested",
+        result={
+            "approved": True,
+            "type": "user_supplied",
+            "task_id": "wrong_task",
+            "status": "wrong_status",
+        },
+    )
+    injector = HostedResultInjector(
+        kind=TOOL_APPROVAL_TASK_KIND,
+        tool_name="tool_approval",
+        result_type="tool_approval_result",
+    )
+
+    observation = injector.observations(task, tmp_path)[0]
+
+    assert observation.output["type"] == "tool_approval_result"
+    assert observation.output["task_id"] == "task_1"
+    assert observation.output["status"] == "answered"
+    assert observation.output["approved"] is True
