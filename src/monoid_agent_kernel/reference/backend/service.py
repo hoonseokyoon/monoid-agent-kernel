@@ -1421,11 +1421,6 @@ class RunnerBackend:
             message = normalize_inline_media_dicts(message, pending)
             for data in pending.values():
                 self.checkpoint_store.put_blob(run_id, data)
-        wire_bytes = len(
-            (message if isinstance(message, str) else json.dumps(message)).encode("utf-8")
-        )
-        if wire_bytes > self.max_message_bytes:
-            raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
         envelope = InboxMessage(
             content=message,
             id=message_id or f"inbox_{uuid.uuid4().hex[:12]}",
@@ -1438,6 +1433,9 @@ class RunnerBackend:
             tracestate=tracestate,
             metadata=dict(metadata or {}),
         )
+        wire_bytes = len(json.dumps(envelope.to_json()).encode("utf-8"))
+        if wire_bytes > self.max_message_bytes:
+            raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
                 raise ValueError("cannot send a message to a terminal run")

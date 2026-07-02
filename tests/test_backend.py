@@ -781,6 +781,30 @@ def test_backend_send_message_rejects_oversized_content(tmp_path: Path) -> None:
         backend.send_message(submission.run_id, submission.run_token, "x" * 200)
 
 
+def test_backend_send_message_counts_metadata_in_size_limit(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    backend.max_message_bytes = 220
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Summarize.",
+            runtime_config=_default_config(),
+        )
+    )
+    backend.wait_for_run(submission.run_id, timeout_s=5)
+
+    with pytest.raises(ValueError, match="exceeds"):
+        backend.send_message(
+            submission.run_id,
+            submission.run_token,
+            "ok",
+            metadata={"external_agent_payload": "x" * 500},
+        )
+
+
 def test_backend_bounds_concurrent_runs(tmp_path: Path) -> None:
     # max_concurrent_runs caps active runs: a second submission while the slot is held stays
     # ``queued`` (it never reaches its adapter) until the first run releases the slot.
