@@ -25,6 +25,13 @@ The Reference implementation is the first target for each conformance profile. W
 is added, Reference gets an adapter or smoke path that proves the rule against the bundled example.
 External backends can use that adapter shape as a starting point for their own profile harnesses.
 
+`monoid_agent_kernel.reference.conformance` provides that adapter shape as a public Reference
+example. `ReferenceConformanceFactory` creates fresh backend, capability, and gateway harnesses for
+profile assertions, then runs an offline Studio smoke path for `reference-full`.
+
+The harness keeps profile tests focused on observable behavior. The Reference services keep the
+actual backend, gateway, and Studio wiring visible as a runnable example.
+
 ## Review Focus
 
 Reference review should identify whether the example assembles the contract and helper kit clearly.

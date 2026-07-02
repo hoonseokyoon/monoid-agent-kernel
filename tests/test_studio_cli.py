@@ -4,6 +4,7 @@ setup failures (busy port, unwritable dir, missing key, no browser) into an upfr
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,7 @@ def test_doctor_offline_all_good(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 def test_doctor_openai_without_key_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    result = _invoke(tmp_path, "--provider", "openai")
+    result = _invoke(tmp_path, "--provider", "openai", "--no-env-file")
     assert result.exit_code == 1
     assert "[FAIL]" in result.output
     assert "OPENAI_API_KEY" in result.output
@@ -52,6 +53,53 @@ def test_doctor_openai_without_sdk_fails(tmp_path: Path, monkeypatch: pytest.Mon
     assert result.exit_code == 1
     assert "[FAIL]" in result.output
     assert "openai SDK" in result.output
+
+
+def test_doctor_openai_reads_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.cli._openai_sdk_importable", lambda: True
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENAI_API_KEY=sk-from-env-file\n", encoding="utf-8")
+
+    result = _invoke(tmp_path, "--provider", "openai", "--env-file", str(env_file))
+
+    assert result.exit_code == 0, result.output
+    assert f"OPENAI_API_KEY is set from {env_file}" in result.output
+
+
+def test_doctor_env_file_does_not_override_existing_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-process")
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.cli._openai_sdk_importable", lambda: True
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENAI_API_KEY=sk-from-file\n", encoding="utf-8")
+
+    result = _invoke(tmp_path, "--provider", "openai", "--env-file", str(env_file))
+
+    assert result.exit_code == 0, result.output
+    assert os.environ["OPENAI_API_KEY"] == "sk-from-process"
+    assert f"from {env_file}" not in result.output
+
+
+def test_doctor_no_env_file_skips_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.cli._openai_sdk_importable", lambda: True
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENAI_API_KEY=sk-from-file\n", encoding="utf-8")
+
+    result = _invoke(tmp_path, "--provider", "openai", "--env-file", str(env_file), "--no-env-file")
+
+    assert result.exit_code == 1
+    assert "OPENAI_API_KEY is not set" in result.output
+    assert os.environ.get("OPENAI_API_KEY") is None
 
 
 def test_dir_writable_does_not_clobber_existing_files(tmp_path: Path) -> None:

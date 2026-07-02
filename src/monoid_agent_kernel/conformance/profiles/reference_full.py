@@ -2,7 +2,30 @@
 
 from __future__ import annotations
 
+from typing import Protocol
+
+from monoid_agent_kernel.conformance.harness import BackendHarness, CapabilityHarness, GatewayHarness
+
+from .capability_security import (
+    assert_capability_security_lease_admission,
+    assert_capability_security_revocation_profile,
+)
+from .control_plane import (
+    assert_control_plane_audit_sequence_profile,
+    assert_control_plane_decision_profile,
+)
+from .durable_runner import (
+    assert_durable_runner_event_sequence_profile,
+    assert_durable_runner_recovery_metadata_profile,
+    assert_durable_runner_subagent_diagnostics_profile,
+)
 from ._metadata import ProfileMetadata
+from .multi_agent import (
+    assert_multi_agent_backend_boundary_profile,
+    assert_multi_agent_backend_capability_boundary_profile,
+    assert_multi_agent_shared_revocation_profile,
+)
+from .provider_gateway import assert_provider_gateway_profile
 
 PROFILE = ProfileMetadata(
     profile_id="reference-full",
@@ -19,5 +42,41 @@ PROFILE = ProfileMetadata(
         "OR-08-PROVIDER-CAPS",
         "OR-09-SUBAGENT-BOUNDARY",
     ),
-    harnesses=("backend", "capability", "gateway"),
+    harnesses=("backend", "capability", "gateway", "studio"),
 )
+
+
+class ReferenceFullFactory(Protocol):
+    def new_backend(self) -> BackendHarness:
+        """Return a fresh Reference backend harness."""
+
+    def new_capability(self) -> CapabilityHarness:
+        """Return a fresh Reference capability harness."""
+
+    def new_gateway(self) -> GatewayHarness:
+        """Return a fresh Reference gateway harness."""
+
+    def run_studio_smoke(self) -> dict:
+        """Run the Reference Studio smoke path."""
+
+
+def assert_reference_full_profile(factory: ReferenceFullFactory) -> None:
+    """Run the bundled Reference implementation across the Phase 1S profile set."""
+    assert_provider_gateway_profile(factory.new_gateway())
+
+    assert_capability_security_lease_admission(factory.new_capability())
+    assert_capability_security_revocation_profile(factory.new_capability())
+    assert_multi_agent_shared_revocation_profile(factory.new_capability())
+
+    assert_control_plane_decision_profile(factory.new_backend())
+    assert_control_plane_audit_sequence_profile(factory.new_backend())
+
+    assert_durable_runner_event_sequence_profile(factory.new_backend())
+    assert_durable_runner_recovery_metadata_profile(factory.new_backend())
+    assert_durable_runner_subagent_diagnostics_profile(factory.new_backend())
+
+    assert_multi_agent_backend_boundary_profile(factory.new_backend())
+    assert_multi_agent_backend_capability_boundary_profile(factory.new_backend())
+
+    smoke = factory.run_studio_smoke()
+    assert smoke["run_id"]

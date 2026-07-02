@@ -5,8 +5,9 @@ needed for a specific agent runtime shape. Profiles are additive: a small local 
 run a small profile, while a durable multi-agent backend can run the control, capability,
 gateway, and multi-agent profiles.
 
-The reusable package skeleton lives under `monoid_agent_kernel.conformance`. The Phase 1S first slice adds
-profile metadata and harness protocols. Concrete assertions land in later Phase 1S PRs.
+The reusable package lives under `monoid_agent_kernel.conformance`. Phase 1S adds profile metadata,
+harness protocols, reusable assertion helpers, and a bundled Reference factory that runs the
+profiles against the shipped implementation.
 
 ## Profiles
 
@@ -32,11 +33,22 @@ The conformance package defines three initial Protocol families:
 The first implementation target is the bundled Reference backend and gateways. External backends can
 implement the same harness protocols and run the same profile suite.
 
+## Reference Full
+
+The `reference-full` profile runs the bundled Reference implementation through the profile set. It
+uses `monoid_agent_kernel.reference.conformance.ReferenceConformanceFactory` to create fresh backend,
+capability, and gateway harnesses for each assertion. The factory also runs an offline Studio smoke
+path that boots Studio, starts a chat, observes events, and confirms session visibility.
+
+The profile is a release confidence target for the Reference assembly. External implementations
+should run the smaller profiles directly with their own harnesses.
+
 ## Phase 1S Sequence
 
 1. Phase 1S first slice: profile metadata, harness protocols, and import-smoke tests.
 2. Phase 1S 2차: first matrix tests for scope relation and provider gateway caps.
-3. Later Phase 1S PRs: control audit sequencing, lease admission, durable metadata, diagnostics, and subagent profile assertions.
+3. Phase 1S 3-6차: lease admission, revocation, durable metadata, control audit, diagnostics, and subagent assertions.
+4. Phase 1S 7차: Reference factory, `reference-full`, and Studio smoke integration.
 
 ## Acceptance
 

@@ -20,7 +20,12 @@ from pathlib import Path
 import click
 
 from monoid_agent_kernel.reference.studio import window
-from monoid_agent_kernel.reference.studio.server import _SAMPLE_SKILLS_DIR, StudioConfig, StudioServer
+from monoid_agent_kernel.reference.studio.server import (
+    _SAMPLE_SKILLS_DIR,
+    StudioConfig,
+    StudioServer,
+    load_env_file,
+)
 from monoid_agent_kernel.reference.studio.window import open_app_window
 
 
@@ -63,6 +68,18 @@ def _common_server_options(fn):
         is_flag=True,
         help="Attach the bundled offline reference MCP server and expose its tools.",
     )(fn)
+    fn = click.option(
+        "--no-env-file",
+        is_flag=True,
+        help="Do not load a local env file before starting or checking the provider.",
+    )(fn)
+    fn = click.option(
+        "--env-file",
+        type=click.Path(path_type=Path),
+        default=Path(".env"),
+        show_default=True,
+        help="Env file loaded without overriding existing environment variables.",
+    )(fn)
     fn = _workspace_option(fn)
     return fn
 
@@ -77,6 +94,8 @@ def _studio_config(
     skills_directory: Path,
     no_skills: bool,
     mcp: bool,
+    env_file: Path,
+    no_env_file: bool,
 ) -> StudioConfig:
     return StudioConfig(
         workspace=workspace,
@@ -86,6 +105,7 @@ def _studio_config(
         run_root=run_root,
         skills_directory=None if no_skills else skills_directory,
         mcp=mcp,
+        env_file=None if no_env_file else env_file,
     )
 
 
@@ -107,6 +127,8 @@ def studio_serve(
     skills_directory: Path,
     no_skills: bool,
     mcp: bool,
+    env_file: Path,
+    no_env_file: bool,
     open_window: bool,
 ) -> None:
     """Start the Studio server and keep it running (window is detachable)."""
@@ -114,6 +136,7 @@ def studio_serve(
         _studio_config(
             workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
             skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
+            env_file=env_file, no_env_file=no_env_file,
         )
     )
     url = server.start()
@@ -143,12 +166,15 @@ def studio_app(
     skills_directory: Path,
     no_skills: bool,
     mcp: bool,
+    env_file: Path,
+    no_env_file: bool,
 ) -> None:
     """Start the server and a desktop window; closing the window stops the server."""
     server = StudioServer(
         _studio_config(
             workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
             skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
+            env_file=env_file, no_env_file=no_env_file,
         )
     )
     url = server.start()
@@ -255,12 +281,15 @@ def studio_doctor(
     skills_directory: Path,
     no_skills: bool,
     mcp: bool,
+    env_file: Path,
+    no_env_file: bool,
 ) -> None:
     """Preflight the common setup failures and print pass/fail with exact remediation.
 
     Exits non-zero if a hard requirement fails (busy port, unwritable dir, missing API key),
     so it doubles as a CI/launch gate. Browser and OTel gaps are warnings — ``serve`` still runs."""
     hard_failures = 0
+    loaded_env = load_env_file(None if no_env_file else env_file)
 
     def report(status: bool | None, label: str, remedy: str = "") -> None:
         mark = {True: "PASS", False: "FAIL", None: "WARN"}[status]
@@ -284,7 +313,8 @@ def studio_doctor(
 
     if provider == "openai":
         if os.environ.get("OPENAI_API_KEY"):
-            report(True, "OPENAI_API_KEY is set")
+            source = f" from {env_file}" if "OPENAI_API_KEY" in loaded_env else ""
+            report(True, f"OPENAI_API_KEY is set{source}")
         else:
             hard_failures += 1
             report(False, "OPENAI_API_KEY is not set", "export OPENAI_API_KEY=... or use --provider offline")

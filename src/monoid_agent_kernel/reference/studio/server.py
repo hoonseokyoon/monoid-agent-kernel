@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import secrets
 import threading
 import time
@@ -145,6 +146,32 @@ _SUBAGENT_DEFINITIONS = {
         context="fresh",
     ),
 }
+
+
+def load_env_file(path: Path | None) -> dict[str, str]:
+    """Load simple KEY=VALUE pairs into os.environ without overriding existing values."""
+    if path is None or not path.exists():
+        return {}
+    loaded: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded[key] = value
+    return loaded
 
 
 def _capability_bindings(capability: str) -> tuple[ToolBinding, ...]:
@@ -289,6 +316,8 @@ class StudioConfig:
     skills_directory: Path | None = field(default_factory=lambda: _SAMPLE_SKILLS_DIR)
     # Attach the bundled offline reference MCP server (fake, loopback) and expose its tools.
     mcp: bool = False
+    # Optional env file loaded at server start without overriding process env.
+    env_file: Path | None = None
 
 
 class StudioServer:
@@ -431,6 +460,7 @@ class StudioServer:
 
     def start(self) -> str:
         """Boot gateway + backend + UI. Returns the UI base URL."""
+        load_env_file(self.config.env_file)
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.config.run_root.mkdir(parents=True, exist_ok=True)
 

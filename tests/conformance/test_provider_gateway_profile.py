@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 
@@ -9,64 +8,14 @@ import pytest
 
 from monoid_agent_kernel.conformance.profiles.provider_gateway import assert_provider_gateway_profile
 from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer
-from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.conformance import ReferenceGatewayHarness
 from monoid_agent_kernel.reference.web_gateway.providers import HttpFetchProvider
-from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
+from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider
 from monoid_agent_kernel.web import WebGatewayError
 
 
-@dataclass
-class _ReferenceProviderGatewayHarness:
-    provider: FakeWebProvider = field(default_factory=FakeWebProvider)
-    manager: TokenManager = field(default_factory=lambda: TokenManager.from_secret("w" * 32))
-    _counter: int = 0
-
-    def __post_init__(self) -> None:
-        self.gateway = WebGatewayBackend(token_manager=self.manager, provider=self.provider)
-
-    @property
-    def harness_id(self) -> str:
-        return "reference-web-gateway"
-
-    @property
-    def supported_profiles(self) -> tuple[str, ...]:
-        return ("provider-gateway",)
-
-    def call_gateway(
-        self,
-        capability: str,
-        payload: dict[str, Any],
-        *,
-        signed_capability: str | None = None,
-        signed_scope: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        token = self._token(
-            capability=signed_capability or capability,
-            scope=signed_scope or {},
-        )
-        if capability == "web.search":
-            return self.gateway.handle_search(token, dict(payload))
-        if capability == "web.fetch":
-            return self.gateway.handle_fetch(token, dict(payload))
-        if capability == "web.context":
-            return self.gateway.handle_context(token, dict(payload))
-        raise AssertionError(f"unsupported gateway capability: {capability}")
-
-    def _token(self, *, capability: str, scope: dict[str, Any]) -> str:
-        self._counter += 1
-        return self.manager.issue(
-            kind="web_gateway",
-            audience="csp.web-gateway",
-            run_id=f"run_{self._counter}",
-            tenant_id="tenant_a",
-            user_id="user_a",
-            ttl_s=600,
-            metadata={"capability": capability, "scope": scope},
-        )
-
-
 def test_reference_web_gateway_satisfies_provider_gateway_profile() -> None:
-    assert_provider_gateway_profile(_ReferenceProviderGatewayHarness())
+    assert_provider_gateway_profile(ReferenceGatewayHarness())
 
 
 def test_reference_web_gateway_rejects_redirect_final_domain() -> None:
@@ -89,7 +38,7 @@ def test_reference_web_gateway_rejects_redirect_final_domain() -> None:
                 "source": "test",
             }
 
-    harness = _ReferenceProviderGatewayHarness(provider=RedirectingProvider())
+    harness = ReferenceGatewayHarness(provider=RedirectingProvider())
 
     with pytest.raises(WebGatewayError, match="final domain is not allowed"):
         harness.call_gateway(
