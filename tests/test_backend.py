@@ -82,6 +82,53 @@ def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) ->
     assert hitl_obs[0].output["answer"] == "Ada"
 
 
+def test_backend_task_result_checkpoint_preserves_queued_messages(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick a name"}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="answered"),
+        ],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Name the project, ask me if unsure.",
+            runtime_config=runtime_config("hitl.request"),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: bool(_running_hitl_tasks(backend, run_id)))
+    task = _running_hitl_tasks(backend, run_id)[0]
+
+    queued = backend.send_message(run_id, token, "queued while approval is pending", message_id="queued-1")
+    assert queued["status"] == "queued"
+    assert eventually(lambda: backend._record(run_id).message_queue.qsize() == 1)
+
+    backend.report_task_result(run_id, token, task_id=task.job_id, result={"answer": "Ada"})
+    stored = backend.checkpoint_store.latest(run_id)
+
+    assert stored is not None
+    assert any(
+        isinstance(message, dict) and message.get("id") == "queued-1"
+        for message in stored.checkpoint.queued_messages
+    )
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
 def test_backend_create_task_injects_into_running_run(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     adapters: list = []

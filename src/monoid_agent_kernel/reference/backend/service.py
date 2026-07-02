@@ -1540,7 +1540,14 @@ class RunnerBackend:
         callback) into a running run, waking it if parked. Accepts a per-task
         callback token (scoped to this run+task) or the run token (operator)."""
         loop = self._authorize_task_result(run_id, token, task_id)
-        return loop.report_task_result(task_id, result, status=status)
+        reported = loop.report_task_result(
+            task_id,
+            result,
+            status=status,
+            persist_checkpoint=False,
+        )
+        self._persist_run_checkpoint_from_any_thread(self._record(run_id))
+        return reported
 
     def create_task(
         self,
@@ -2115,6 +2122,19 @@ class RunnerBackend:
         assert self.checkpoint_store is not None
         self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
         self._drain_outbox(record, loop)
+
+    async def _persist_run_checkpoint_async(self, record: BackendRunRecord) -> None:
+        self._persist_run_checkpoint(record)
+
+    def _persist_run_checkpoint_from_any_thread(self, record: BackendRunRecord) -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is _get_shared_loop():
+            self._persist_run_checkpoint(record)
+            return
+        self._spawn(self._persist_run_checkpoint_async(record)).result(timeout=10.0)
 
     def _outbox_backoff_delay(self, attempts: int) -> float:
         """Capped exponential backoff with full jitter — ``uniform(0, min(cap, base*factor**attempts))``.

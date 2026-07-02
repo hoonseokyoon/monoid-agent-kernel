@@ -1575,14 +1575,20 @@ class AgentLoop:
         )
 
     def report_task_result(
-        self, task_id: str, result: dict[str, Any], *, status: str = "answered"
+        self,
+        task_id: str,
+        result: dict[str, Any],
+        *,
+        status: str = "answered",
+        persist_checkpoint: bool = True,
     ) -> dict[str, Any]:
         """Complete a hosted task (e.g. a hitl request) from outside the loop —
         the backend or another thread calls this to deliver a result, waking a
         parked run. The result is injected per the task kind's ResultInjector."""
         session = self._require_open()
         reported = session.res.context.job_manager.report_result(task_id, result, status=status)
-        self._persist_checkpoint(session)
+        if persist_checkpoint:
+            self._persist_checkpoint(session)
         return reported
 
     # --- durable persistence (state-snapshot at park points) ---
