@@ -425,6 +425,8 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
             correlation_id=message.correlation_id or correlation_id,
             causation_id=message.causation_id or causation_id,
             traceparent=message.traceparent or traceparent,
+            message_type=message.type,
+            metadata=message.metadata,
         )
         return f"a2a:{run_id}"
 

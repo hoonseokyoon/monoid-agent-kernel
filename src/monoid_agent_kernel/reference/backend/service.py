@@ -1392,6 +1392,8 @@ class RunnerBackend:
         causation_id: str = "",
         traceparent: str = "",
         tracestate: str = "",
+        message_type: str = "user_message",
+        metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Deliver a follow-up user message to a running multi-turn session. It is queued and
         consumed as the next user turn once the current turn settles.
@@ -1428,11 +1430,13 @@ class RunnerBackend:
             content=message,
             id=message_id or f"inbox_{uuid.uuid4().hex[:12]}",
             source=source,
+            type=message_type,
             run_id=run_id,
             correlation_id=correlation_id,
             causation_id=causation_id,
             traceparent=traceparent,
             tracestate=tracestate,
+            metadata=dict(metadata or {}),
         )
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:

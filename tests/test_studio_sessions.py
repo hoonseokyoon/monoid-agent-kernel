@@ -18,6 +18,12 @@ from support.studio_harness import (
     pytest,
     time,
 )
+from monoid_agent_kernel.core.external_agent_envelope import (
+    ExternalAgentEnvelope,
+    ExternalAgentError,
+    ExternalAgentPart,
+    ExternalAgentResult,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -294,3 +300,57 @@ def test_a2a_demo_preset_wires_two_peers(studio: StudioServer) -> None:
     worker_cfg = studio._backend.current_runtime_config(worker_id)
     assert any(b.ref.tool_id == "outbox.send" for b in worker_cfg.tools)
     assert "planner" in worker_cfg.prompt.system_prompt_base
+
+
+def test_studio_a2a_delivery_preserves_external_agent_metadata(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    server = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"))
+    captured: dict[str, object] = {}
+
+    class BackendStub:
+        def send_message(self, run_id: str, token: str, content, **kwargs):  # noqa: ANN001
+            captured["run_id"] = run_id
+            captured["token"] = token
+            captured["content"] = content
+            captured["kwargs"] = kwargs
+            return {"message_id": kwargs.get("message_id")}
+
+    server._backend = BackendStub()  # type: ignore[assignment]
+    server._agent_directory["worker"] = "run-worker"
+    server._run_tokens["run-worker"] = "run-token"
+    envelope = ExternalAgentEnvelope(
+        peer_id="planner",
+        message_id="message-1",
+        task_id="task-1",
+        request_id="request-1",
+        reply_to_id="reply-1",
+        parts=(ExternalAgentPart(type="text", text="done"),),
+        result=ExternalAgentResult(
+            state="completed",
+            terminal=True,
+            error=ExternalAgentError(code="none", message=""),
+        ),
+        metadata={"custom": "ok", "task_id": "spoofed"},
+    )
+
+    result = server._a2a_deliver(
+        "worker",
+        envelope.to_json(),
+        message_id="fallback",
+        correlation_id="corr-1",
+        causation_id="cause-1",
+        traceparent="",
+    )
+
+    assert result == "a2a:run-worker:message-1"
+    assert captured["run_id"] == "run-worker"
+    assert captured["token"] == "run-token"
+    assert captured["content"] == "done"
+    kwargs = captured["kwargs"]
+    assert kwargs["message_type"] == "external_agent_message"
+    assert kwargs["metadata"]["custom"] == "ok"
+    assert kwargs["metadata"]["task_id"] == "task-1"
+    assert kwargs["metadata"]["request_id"] == "request-1"
+    assert kwargs["metadata"]["reply_to_id"] == "reply-1"
+    assert kwargs["metadata"]["result"]["state"] == "completed"

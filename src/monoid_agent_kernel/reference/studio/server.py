@@ -681,6 +681,8 @@ class StudioServer:
             causation_id=message.causation_id or causation_id,
             traceparent=message.traceparent or traceparent,
             tracestate=message.tracestate,
+            message_type=message.type,
+            metadata=message.metadata,
         )
         return f"a2a:{run_id}:{result.get('message_id', '')}"
 

@@ -170,6 +170,39 @@ def test_external_agent_envelope_converts_to_inbox_message() -> None:
     assert inbox.metadata["task_id"] == "task-1"
 
 
+def test_external_agent_envelope_canonical_metadata_overrides_user_metadata() -> None:
+    envelope = ExternalAgentEnvelope(
+        peer_id="planner",
+        message_id="message-1",
+        task_id="task-1",
+        request_id="request-1",
+        reply_to_id="reply-1",
+        correlation_id="corr-1",
+        causation_id="cause-1",
+        parts=(ExternalAgentPart(type="text", text="done"),),
+        result=ExternalAgentResult(
+            state="completed",
+            terminal=True,
+            error=ExternalAgentError(code="none", message=""),
+        ),
+        metadata={
+            "custom": "ok",
+            "peer_id": "spoofed",
+            "task_id": "spoofed",
+            "result": {"state": "spoofed"},
+        },
+    )
+
+    inbox = external_agent_envelope_to_inbox_message(envelope, run_id="run-1")
+
+    assert inbox.metadata["custom"] == "ok"
+    assert inbox.metadata["peer_id"] == "planner"
+    assert inbox.metadata["task_id"] == "task-1"
+    assert inbox.metadata["request_id"] == "request-1"
+    assert inbox.metadata["reply_to_id"] == "reply-1"
+    assert inbox.metadata["result"]["state"] == "completed"
+
+
 def test_external_agent_data_parts_convert_to_supported_inbox_content() -> None:
     envelope = ExternalAgentEnvelope(
         peer_id="planner",

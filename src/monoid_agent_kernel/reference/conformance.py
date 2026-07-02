@@ -817,6 +817,8 @@ class ReferenceBackendHarness:
             causation_id=message.causation_id,
             traceparent=message.traceparent,
             tracestate=message.tracestate,
+            message_type=message.type,
+            metadata=message.metadata,
         )
 
     def message_fabric_state(self, run_id: str, token: str) -> dict[str, Any]:

@@ -291,12 +291,12 @@ def external_agent_envelope_to_inbox_message(
         traceparent=envelope.traceparent,
         tracestate=envelope.tracestate,
         metadata={
+            **dict(envelope.metadata),
             "task_id": envelope.task_id,
             "request_id": envelope.request_id,
             "reply_to_id": envelope.reply_to_id,
             "peer_id": envelope.peer_id,
             "result": envelope.result.to_json() if envelope.result is not None else None,
-            **dict(envelope.metadata),
         },
     )
 
