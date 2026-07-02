@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
 from support.runtime import runtime_config
 from support.waiting import eventually
 
-from monoid_agent_kernel.conformance.profiles.control_plane import (
-    assert_control_plane_audit_sequence_profile,
-    assert_control_plane_decision_profile,
+from monoid_agent_kernel.conformance.profiles.durable_runner import (
+    assert_durable_runner_event_sequence_profile,
+    assert_durable_runner_recovery_metadata_profile,
 )
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter
@@ -19,36 +21,50 @@ from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 
 
-class _ReferenceControlPlaneHarness:
-    def __init__(self, tmp_path: Path) -> None:
-        self.workspace = tmp_path / "workspace"
-        self.workspace.mkdir()
+class _ReferenceDurableRunnerHarness:
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        workspace: Path | None = None,
+        run_root: Path | None = None,
+        checkpoint_store: LocalFsCheckpointStore | None = None,
+        token_manager: TokenManager | None = None,
+    ) -> None:
+        self.tmp_path = tmp_path
+        self.workspace = workspace or tmp_path / "workspace"
+        self.workspace.mkdir(exist_ok=True)
         self.workspace.joinpath("notes.md").write_text("notes\n", encoding="utf-8")
+        self.run_root = run_root or tmp_path / "runs"
+        self.checkpoint_store = checkpoint_store or LocalFsCheckpointStore(tmp_path / "shared-checkpoints")
+        self.token_manager = token_manager or TokenManager.from_secret("x" * 32)
 
         def factory(spec: Any, llm_gateway_token: str) -> FakeModelAdapter:
             del spec, llm_gateway_token
-            return FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="first")])
+            return FakeModelAdapter(turns=[ModelTurn(response_id=f"r_{uuid.uuid4().hex[:8]}", final_text="first")])
 
         self.backend = RunnerBackend(
-            run_root=tmp_path / "runs",
-            token_manager=TokenManager.from_secret("x" * 32),
+            run_root=self.run_root,
+            token_manager=self.token_manager,
             allowed_workspace_roots=(self.workspace,),
             llm_gateway_url="http://llm-gateway.internal/v1/turns",
             model_adapter_factory=factory,
+            checkpoint_store=self.checkpoint_store,
         )
-        self.backend.idle_timeout_s = 10.0
+        self.backend.idle_timeout_s = 30.0
+        self.backend.max_recover_attempts = 10_000
 
     @property
     def harness_id(self) -> str:
-        return "reference-control-plane"
+        return "reference-durable-runner"
 
     @property
     def supported_profiles(self) -> tuple[str, ...]:
-        return ("control-plane",)
+        return ("durable-runner",)
 
     def submit_run(self, request: dict[str, Any]) -> dict[str, Any]:
         scenario = str(request["scenario"])
-        multi_turn = scenario in {"parked-hitl", "multi-turn"}
+        multi_turn = scenario in {"multi-turn", "recoverable-multi-turn"}
         submission = self.backend.submit_run(
             BackendRunRequest(
                 tenant_id="tenant_a",
@@ -63,8 +79,9 @@ class _ReferenceControlPlaneHarness:
             assert self.backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
         elif multi_turn:
             assert eventually(lambda: self.backend._record(submission.run_id).status == "awaiting_input")
+            assert eventually(lambda: self.checkpoint_store.latest(submission.run_id) is not None)
         else:
-            raise AssertionError(f"unsupported control-plane scenario: {scenario}")
+            raise AssertionError(f"unsupported durable runner scenario: {scenario}")
         return {"run_id": submission.run_id, "token": submission.run_token}
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
@@ -104,9 +121,20 @@ class _ReferenceControlPlaneHarness:
     def recover_runs(self) -> tuple[str, ...]:
         return tuple(self.backend.recover_runs())
 
-    def restart(self, *, local_state: str = "same") -> _ReferenceControlPlaneHarness:
-        del local_state
-        raise NotImplementedError("control-plane profile does not use restart")
+    def restart(self, *, local_state: str = "same") -> _ReferenceDurableRunnerHarness:
+        if local_state == "same":
+            run_root = self.run_root
+        elif local_state == "empty":
+            run_root = self.tmp_path / f"empty-runs-{uuid.uuid4().hex[:8]}"
+        else:
+            raise AssertionError(f"unsupported restart local_state: {local_state}")
+        return _ReferenceDurableRunnerHarness(
+            self.tmp_path,
+            workspace=self.workspace,
+            run_root=run_root,
+            checkpoint_store=self.checkpoint_store,
+            token_manager=self.token_manager,
+        )
 
     def task_result(self, run_id: str, token: str, task_id: str) -> dict[str, Any]:
         self.backend.status(run_id, token)
@@ -118,9 +146,9 @@ class _ReferenceControlPlaneHarness:
         return self.backend.dispatch(ControlCommand.from_json(dict(command))).to_json()
 
 
-def test_reference_backend_satisfies_control_plane_decision_profile(tmp_path: Path) -> None:
-    assert_control_plane_decision_profile(_ReferenceControlPlaneHarness(tmp_path))
+def test_reference_backend_satisfies_durable_runner_event_sequence_profile(tmp_path: Path) -> None:
+    assert_durable_runner_event_sequence_profile(_ReferenceDurableRunnerHarness(tmp_path))
 
 
-def test_reference_backend_satisfies_control_plane_audit_sequence_profile(tmp_path: Path) -> None:
-    assert_control_plane_audit_sequence_profile(_ReferenceControlPlaneHarness(tmp_path))
+def test_reference_backend_satisfies_durable_runner_recovery_metadata_profile(tmp_path: Path) -> None:
+    assert_durable_runner_recovery_metadata_profile(_ReferenceDurableRunnerHarness(tmp_path))

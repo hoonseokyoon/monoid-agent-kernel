@@ -36,6 +36,30 @@ class BackendHarness(ConformanceHarness, Protocol):
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> JsonObject:
         """Return the diagnostics aggregate for a run."""
 
+    def runtime_config(self, run_id: str, token: str) -> JsonObject:
+        """Return the current runtime config projection for a run."""
+
+    def replace_runtime_config(
+        self,
+        run_id: str,
+        token: str,
+        config: JsonObject,
+        *,
+        expected_version: int,
+        issuer: str,
+        reason: str,
+    ) -> JsonObject:
+        """Replace the runtime config for a live run."""
+
+    def resume_run(self, run_id: str, token: str) -> JsonObject:
+        """Materialize and resume one run from durable recovery metadata."""
+
+    def recover_runs(self) -> Sequence[str]:
+        """Recover all discoverable parked runs for this harness instance."""
+
+    def restart(self, *, local_state: str = "same") -> BackendHarness:
+        """Return a fresh harness instance over the same durable state."""
+
     def task_result(self, run_id: str, token: str, task_id: str) -> JsonObject:
         """Return the stored result for one backend task."""
 
