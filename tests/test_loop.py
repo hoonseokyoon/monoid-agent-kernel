@@ -563,6 +563,46 @@ def test_ask_authorization_denial_never_invokes_handler(tmp_path: Path) -> None:
     assert "secret-ref://lease" not in transcript
 
 
+def test_ask_authorization_non_answered_approval_never_invokes_handler(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ApprovalToolProvider()
+    sink = MemoryEventSink()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "cancelled"}, "call_1"),)),
+            ModelTurn(final_text="park"),
+            ModelTurn(final_text="cancelled approval denied"),
+        ]
+    )
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+        event_sinks=(sink,),
+    )
+    loop.open()
+
+    suspended = loop.run_until_suspended("use the approval tool")
+    assert suspended.reason == "awaiting_tasks"
+    loop.report_task_result(
+        suspended.awaiting_task_ids[0],
+        {"approved": True, "reason": "reported after cancellation"},
+        status="cancelled",
+    )
+    loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert result.status == "completed"
+    assert provider.calls == 0
+    assert any(event.type == "tool.approval.denied" for event in sink.events)
+    assert not any(event.type == "tool.approval.approved" for event in sink.events)
+
+
 def test_ask_authorization_replay_rejects_approval_key_mismatch(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

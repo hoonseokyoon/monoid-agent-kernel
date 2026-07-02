@@ -124,10 +124,15 @@ def denied_tool_approval_observation(
     result: Mapping[str, Any] | None,
     *,
     task_id: str,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_tool_approval_result(result, task_id=task_id)
+    deny_reason = str(reason or normalized.get("reason") or "denied")
     return {
         **normalized,
+        "approved": False,
+        "answer": "Deny",
+        "reason": deny_reason,
         "status": "denied",
         "tool_id": str((request or {}).get("tool_id") or ""),
         "binding_id": str((request or {}).get("binding_id") or ""),

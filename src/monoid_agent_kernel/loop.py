@@ -3382,6 +3382,14 @@ class AgentLoop:
         request_payload = getattr(task, "request", None) if task is not None else None
         result_payload = getattr(task, "result", None) if task is not None else None
         normalized = normalize_tool_approval_result(result_payload, task_id=task_id)
+        task_status = str(getattr(task, "status", "") or observation.output.get("status") or "")
+        if normalized["approved"] and task_status != "answered":
+            normalized = {
+                **normalized,
+                "approved": False,
+                "answer": "Deny",
+                "reason": f"tool approval task ended with status {task_status or 'unknown'}",
+            }
         event_type = "tool.approval.approved" if normalized["approved"] else "tool.approval.denied"
         recorder.emit(
             event_type,
@@ -3410,7 +3418,12 @@ class AgentLoop:
             )
         return replace(
             observation,
-            output=denied_tool_approval_observation(request_payload, result_payload, task_id=task_id),
+            output=denied_tool_approval_observation(
+                request_payload,
+                result_payload,
+                task_id=task_id,
+                reason=normalized["reason"],
+            ),
         )
 
     def _admit_capability_grant(

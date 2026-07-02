@@ -77,6 +77,20 @@ def test_denied_tool_approval_observation_strips_replay_material() -> None:
     assert "arguments" not in denied
 
 
+def test_denied_tool_approval_observation_forces_denied_result() -> None:
+    request = {"tool_id": "demo.approval", "binding_id": "demo.approval", "call_name": "demo_approval"}
+    denied = denied_tool_approval_observation(
+        request,
+        {"answer": "Approve", "approved": True, "reason": "cancelled"},
+        task_id="task_1",
+    )
+
+    assert denied["approved"] is False
+    assert denied["answer"] == "Deny"
+    assert denied["status"] == "denied"
+    assert denied["reason"] == "cancelled"
+
+
 def test_approval_replay_requires_approved_result() -> None:
     request = {
         "call_name": "demo_approval",
