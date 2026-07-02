@@ -2,7 +2,7 @@
 
 The Core Helper Kit is the supported runtime and helper module set for building systems that
 satisfy the Monoid Agent Kernel contract. It gives backend and gateway implementers a clear path
-to the Phase 1S operational rules while preserving replaceable deployment choices.
+to the operational rules while preserving replaceable deployment choices.
 
 ## Role
 
@@ -24,6 +24,7 @@ to the Phase 1S operational rules while preserving replaceable deployment choice
 | `core.control_audit.ControlAuditPolicy` | `OR-06-CONTROL-AUDIT` | Build redacted received, completed, and failed control audit payloads and declare callback-token command eligibility. |
 | `core.durable_metadata.DurableMetadataCommitter` | `OR-07-DURABLE-METADATA` | Validate run metadata, commit runtime config updates, write shared metadata, and materialize local recovery descriptors. |
 | `core.subagent_runtime.SubagentRuntimeContext`, `validate_descendant_run_id`, `subagent_diagnostics_from_events` | `OR-09-SUBAGENT-BOUNDARY` | Create child run identity, validate descendant event access, build lifecycle/result payloads, and summarize subagent diagnostics. |
+| `core.tool_approval` | `OR-11-GENERIC-ASK-APPROVAL` | Build approval task payloads, redact argument previews, normalize approve/deny results, and derive replay descriptors for approved calls. |
 
 ## Gateway And Diagnostics Assembly
 
@@ -46,3 +47,9 @@ helper-independent conformance profile.
 Phase 1S defines stable operational rule ids, implements the helper surfaces above, and pins their
 observable behavior through conformance profiles. The full mapping from rule id to helper, profile,
 Reference harness, and test coverage lives in `docs/PHASE_1S_COVERAGE.md`.
+
+## Phase 2 State
+
+Phase 2 starts with executable `tool-agent` approval behavior. `AgentLoop` uses `core.tool_approval`
+for `authorization="ask"` calls, while backend-specific approval UI and notification policy remain
+outside the helper.

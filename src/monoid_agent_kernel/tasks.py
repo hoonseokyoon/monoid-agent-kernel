@@ -16,6 +16,7 @@ from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel._proc import file_size, proc_group_kwargs, terminate_process
 from monoid_agent_kernel.core._util import write_json_atomic
+from monoid_agent_kernel.core.tool_approval import TOOL_APPROVAL_RESULT_TYPE, TOOL_APPROVAL_TASK_KIND
 from monoid_agent_kernel.errors import ToolExecutionError, WorkspaceError
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -834,6 +835,10 @@ class TaskManager:
             # lease / tool-enable decision), resolved through the same report_result -> reentry
             # path as hitl/automation. The grant is injected back as an async tool result.
             "capability": HostedTaskExecutor(kind="capability"),
+            # Generic tool approval: authorization="ask" parks here until an operator/human
+            # reports approve/deny. The loop interprets the result and either replays the captured
+            # call through the normal tool path or delivers a denial observation.
+            TOOL_APPROVAL_TASK_KIND: HostedTaskExecutor(kind=TOOL_APPROVAL_TASK_KIND),
         }
         self.injectors = {
             "shell": ShellResultInjector(),
@@ -843,6 +848,11 @@ class TaskManager:
             ),
             "capability": HostedResultInjector(
                 kind="capability", tool_name="capability", result_type="capability_grant"
+            ),
+            TOOL_APPROVAL_TASK_KIND: HostedResultInjector(
+                kind=TOOL_APPROVAL_TASK_KIND,
+                tool_name="tool_approval",
+                result_type=TOOL_APPROVAL_RESULT_TYPE,
             ),
         }
 

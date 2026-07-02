@@ -19,6 +19,7 @@ from monoid_agent_kernel.core.capability import (
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
+from monoid_agent_kernel.core.tool_surface import ToolQuota
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -277,6 +278,34 @@ class _GatedToolProvider:
         ]
 
 
+class _ApprovalToolProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+        del context
+
+        def handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            del ctx
+            self.calls += 1
+            return ToolResult(ok=True, content={"approved_call": True, "value": args.get("value")})
+
+        return [
+            ToolSpec(
+                id="demo.approval",
+                description="demo approval-gated tool",
+                input_schema={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "additionalProperties": True,
+                },
+                capability="",
+                side_effect="write",
+                handler=handler,
+            )
+        ]
+
+
 class ReferenceBackendHarness:
     def __init__(
         self,
@@ -296,13 +325,14 @@ class ReferenceBackendHarness:
         self.checkpoint_store = checkpoint_store or LocalFsCheckpointStore(root / "shared-checkpoints")
         self.token_manager = token_manager or TokenManager.from_secret("x" * 32)
         self.gated_provider = _GatedToolProvider()
+        self.approval_provider = _ApprovalToolProvider()
 
         def factory(spec: Any, llm_gateway_token: str) -> _ReferenceMultiAgentAdapter | FakeModelAdapter:
             del llm_gateway_token
             scenario = str(spec.metadata.get("scenario") or "")
             if scenario in {"subagent-foreground", "subagent-capability-revoked"}:
                 return _ReferenceMultiAgentAdapter(scenario=scenario, backend=self.backend, run_id=spec.run_id)
-            return FakeModelAdapter(turns=[ModelTurn(response_id=f"r_{uuid.uuid4().hex[:8]}", final_text="first")])
+            return FakeModelAdapter(turns=_turns_for_scenario(scenario))
 
         self.backend = RunnerBackend(
             run_root=self.run_root,
@@ -312,7 +342,7 @@ class ReferenceBackendHarness:
             model_adapter_factory=factory,
             checkpoint_store=self.checkpoint_store,
             subagent_definitions={"researcher": _child_def()},
-            tool_providers=(self.gated_provider,),
+            tool_providers=(self.gated_provider, self.approval_provider),
             capability_broker_factory=lambda req: AutoGrantBroker(),
         )
         self.backend.idle_timeout_s = 30.0
@@ -324,11 +354,18 @@ class ReferenceBackendHarness:
 
     @property
     def supported_profiles(self) -> tuple[str, ...]:
-        return ("control-plane", "durable-runner", "multi-agent", "reference-full")
+        return ("control-plane", "durable-runner", "multi-agent", "tool-agent", "reference-full")
 
     def submit_run(self, request: dict[str, Any]) -> dict[str, Any]:
         scenario = str(request["scenario"])
-        multi_turn = scenario in {"multi-turn", "recoverable-multi-turn", "parked-hitl"}
+        multi_turn = scenario in {
+            "multi-turn",
+            "recoverable-multi-turn",
+            "parked-hitl",
+            "tool-ask-approved",
+            "tool-ask-denied",
+            "tool-ask-stale-denied",
+        }
         submission = self.backend.submit_run(
             BackendRunRequest(
                 tenant_id="tenant_a",
@@ -340,15 +377,64 @@ class ReferenceBackendHarness:
                 metadata={"scenario": scenario},
             )
         )
-        if scenario in {"completed", "subagent-foreground", "subagent-capability-revoked"}:
+        if scenario in {"completed", "subagent-foreground", "subagent-capability-revoked", "tool-quota-denied"}:
             assert self.backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
         elif multi_turn:
             assert _eventually(lambda: self.backend._record(submission.run_id).status == "awaiting_input")
             if scenario == "recoverable-multi-turn":
                 assert _eventually(lambda: self.checkpoint_store.latest(submission.run_id) is not None)
+            elif scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
+                task = self._pending_task(submission.run_id, "tool_approval")
+                if scenario == "tool-ask-stale-denied":
+                    current = self.runtime_config(submission.run_id, submission.run_token)
+                    stale_config = AgentRuntimeConfig.from_json(dict(current["config"]))
+                    stale_config = AgentRuntimeConfig(
+                        definition_id=stale_config.definition_id,
+                        prompt=stale_config.prompt,
+                        tools=(ToolBinding.for_tool("run.finish"),),
+                        config_version=stale_config.config_version + 1,
+                    )
+                    self.replace_runtime_config(
+                        submission.run_id,
+                        submission.run_token,
+                        stale_config.to_json(),
+                        expected_version=int(current["config_version"]),
+                        issuer="profile",
+                        reason="remove approval tool",
+                    )
+                result = (
+                    {"answer": "Deny", "approved": False, "reason": "profile denied"}
+                    if scenario == "tool-ask-denied"
+                    else {"answer": "Approve", "approved": True, "reason": "profile approved"}
+                )
+                self.report_task_result(
+                    submission.run_id,
+                    submission.run_token,
+                    str(task["task_id"]),
+                    result,
+                )
+                assert _eventually(
+                    lambda: _has_event(
+                        self.backend.events(submission.run_id, submission.run_token, limit=200)["events"],
+                        "tool.approval.approved"
+                        if scenario in {"tool-ask-approved", "tool-ask-stale-denied"}
+                        else "tool.approval.denied",
+                    ),
+                    timeout_s=20.0,
+                )
         else:
             raise AssertionError(f"unsupported backend scenario: {scenario}")
         return {"run_id": submission.run_id, "token": submission.run_token}
+
+    def _pending_task(self, run_id: str, kind: str) -> dict[str, Any]:
+        record = self.backend._record(run_id)
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            for task in record.loop._session.res.context.job_manager.list_jobs():  # type: ignore[union-attr]
+                if task.get("kind") == kind and task.get("status") == "running":
+                    return task
+            time.sleep(0.05)
+        raise AssertionError(f"missing pending task kind: {kind}")
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
         return self.backend.status(run_id, token)
@@ -431,8 +517,33 @@ class ReferenceBackendHarness:
     def dispatch(self, command: dict[str, Any]) -> dict[str, Any]:
         return self.backend.dispatch(ControlCommand.from_json(dict(command))).to_json()
 
+    def report_task_result(
+        self,
+        run_id: str,
+        token: str,
+        task_id: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.backend.report_task_result(run_id, token, task_id=task_id, result=result)
+
 
 def _runtime_config_for_scenario(scenario: str) -> AgentRuntimeConfig:
+    if scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool("demo.approval", authorization="ask"),
+                ToolBinding.for_tool("run.finish"),
+            ),
+        )
+    if scenario == "tool-quota-denied":
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool("demo.approval", quota=ToolQuota(max_calls_per_run=0)),
+                ToolBinding.for_tool("run.finish"),
+            ),
+        )
     if scenario == "subagent-capability-revoked":
         return AgentRuntimeConfig(
             definition_id="parent",
@@ -457,6 +568,23 @@ def _runtime_config_for_scenario(scenario: str) -> AgentRuntimeConfig:
             ToolBinding.for_tool("run.finish"),
         ),
     )
+
+
+def _turns_for_scenario(scenario: str) -> list[ModelTurn]:
+    if scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
+        return [
+            ModelTurn(
+                tool_calls=(fake_tool_call("demo_approval", {"value": scenario}, "approval_1"),)
+            ),
+            ModelTurn(response_id="ignored_until_approval", final_text="waiting for approval"),
+            ModelTurn(final_text=f"{scenario} completed"),
+        ]
+    if scenario == "tool-quota-denied":
+        return [
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "quota"}, "approval_1"),)),
+            ModelTurn(final_text="quota denied completed"),
+        ]
+    return [ModelTurn(response_id=f"r_{uuid.uuid4().hex[:8]}", final_text="first")]
 
 
 def _child_def() -> SubagentDefinition:
@@ -485,3 +613,7 @@ def _wait_for_event(server: StudioServer, run_id: str, event_type: str) -> list[
             return events
         time.sleep(0.1)
     return events
+
+
+def _has_event(events: list[dict[str, Any]], event_type: str) -> bool:
+    return any(event.get("type") == event_type for event in events)

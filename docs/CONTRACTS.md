@@ -68,6 +68,8 @@ prove the same behavior through conformance profiles.
 | `OR-07-DURABLE-METADATA` | Durable metadata writes keep API results and recovery results aligned through schema validation, shared-store compatibility, and commit ordering. | `durable-runner`, `control-plane` | `core.durable_metadata.DurableMetadataCommitter`, `validate_run_metadata`, `runtime_config_from_metadata` |
 | `OR-08-PROVIDER-CAPS` | Provider gateways apply effective caps on request and response paths, including signed caps, request caps, defaults, redirect boundaries, byte caps, and timeout caps. | `provider-gateway` | `core.scope.effective_signed_scope`, Reference web gateway cap application |
 | `OR-09-SUBAGENT-BOUNDARY` | Subagent runtime links identity, capability, and trace boundaries: child runs have their own identity/accounting, isolated live lease slots, shared revocation, and parent-child diagnostics linkage. | `multi-agent`, `capability-security`, `durable-runner` | `core.subagent_runtime.SubagentRuntimeContext`, `validate_descendant_run_id`, `subagent_diagnostics_from_events`, `CapabilityVault.fork_for_child` |
+| `OR-10-TOOL-SURFACE-ADMISSION` | Tool execution follows the active turn surface: unavailable tools, hidden/searchable-only tools, denied bindings, and quota-exceeded bindings do not execute handlers. | `tool-agent` | `DefaultToolSurfaceResolver`, `ToolSurfaceSnapshot`, `AgentLoop` tool admission path |
+| `OR-11-GENERIC-ASK-APPROVAL` | `authorization="ask"` creates a durable approval task; approval revalidates the captured call before one execution, and denial returns an observation without invoking the handler. | `tool-agent`, `control-plane` | `core.tool_approval`, `TaskManager`, `AgentLoop` approval replay path |
 
 ## Identifier Namespace
 

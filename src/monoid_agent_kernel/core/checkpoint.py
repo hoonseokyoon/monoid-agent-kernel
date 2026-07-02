@@ -96,6 +96,8 @@ class RunCheckpoint:
     capability_leases: list[dict[str, Any]] = field(default_factory=list)
     # Gated tool calls awaiting auto-redispatch after their capability is granted (Phase ⑤).
     pending_capability_replays: list[dict[str, Any]] = field(default_factory=list)
+    # Generic authorization="ask" tool calls awaiting auto-redispatch after an approval result.
+    pending_tool_approval_replays: list[dict[str, Any]] = field(default_factory=list)
     # Capability revocation records (per-lease, per-capability, and an issued-before watermark) so a
     # revoked capability stays dead across a restart — the kill switch is not forgotten on resume.
     revoked_lease_ids: list[str] = field(default_factory=list)

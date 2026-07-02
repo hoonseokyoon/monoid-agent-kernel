@@ -26,6 +26,10 @@ from .multi_agent import (
     assert_multi_agent_shared_revocation_profile,
 )
 from .provider_gateway import assert_provider_gateway_profile
+from .tool_agent import (
+    assert_tool_agent_generic_ask_approval_profile,
+    assert_tool_agent_surface_admission_profile,
+)
 
 PROFILE = ProfileMetadata(
     profile_id="reference-full",
@@ -41,6 +45,8 @@ PROFILE = ProfileMetadata(
         "OR-07-DURABLE-METADATA",
         "OR-08-PROVIDER-CAPS",
         "OR-09-SUBAGENT-BOUNDARY",
+        "OR-10-TOOL-SURFACE-ADMISSION",
+        "OR-11-GENERIC-ASK-APPROVAL",
     ),
     harnesses=("backend", "capability", "gateway", "studio"),
 )
@@ -70,6 +76,9 @@ def assert_reference_full_profile(factory: ReferenceFullFactory) -> None:
 
     assert_control_plane_decision_profile(factory.new_backend())
     assert_control_plane_audit_sequence_profile(factory.new_backend())
+
+    assert_tool_agent_surface_admission_profile(factory.new_backend())
+    assert_tool_agent_generic_ask_approval_profile(factory.new_backend())
 
     assert_durable_runner_event_sequence_profile(factory.new_backend())
     assert_durable_runner_recovery_metadata_profile(factory.new_backend())

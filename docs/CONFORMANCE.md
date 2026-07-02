@@ -1,7 +1,7 @@
 # Conformance Profiles
 
-Phase 1S introduces conformance profiles so an integrator can validate the contract behavior
-needed for a specific agent runtime shape. Profiles are additive: a small local chatbot can run a
+Conformance profiles let an integrator validate the contract behavior needed for a specific agent
+runtime shape. Profiles are additive: a small local chatbot can run a
 small profile, while a durable multi-agent backend can run the control, capability, gateway, and
 multi-agent profiles.
 
@@ -14,27 +14,28 @@ the profiles against the shipped implementation.
 | Profile | Target runtime | Contract rules |
 | --- | --- | --- |
 | `minimal-agent` | Local loop or chatbot-style integration | Metadata registration profile; concrete assertions remain future profile work. |
-| `tool-agent` | Agent that executes tools | Metadata registration profile; concrete assertions remain future profile work. |
+| `tool-agent` | Agent that executes tools | `OR-10-TOOL-SURFACE-ADMISSION`, `OR-11-GENERIC-ASK-APPROVAL` |
 | `durable-runner` | Backend that survives restarts | `OR-05-EVENT-SEQUENCING`, `OR-07-DURABLE-METADATA`, `OR-09-SUBAGENT-BOUNDARY` |
 | `control-plane` | Backend with external control commands | `OR-03-LEASE-ADMISSION`, `OR-05-EVENT-SEQUENCING`, `OR-06-CONTROL-AUDIT`, `OR-07-DURABLE-METADATA` |
 | `capability-security` | Capability-gated runtime | `OR-01-SCOPE-RELATION`, `OR-02-CAPABILITY-BOUNDARY`, `OR-03-LEASE-ADMISSION`, `OR-04-REVOCATION-SCOPE`, `OR-06-CONTROL-AUDIT`, `OR-09-SUBAGENT-BOUNDARY` |
 | `provider-gateway` | Runtime using LLM/Web gateways | `OR-01-SCOPE-RELATION`, `OR-02-CAPABILITY-BOUNDARY`, `OR-08-PROVIDER-CAPS` |
 | `multi-agent` | Runtime with subagents | `OR-04-REVOCATION-SCOPE`, `OR-09-SUBAGENT-BOUNDARY` |
-| `reference-full` | Bundled Reference services and Studio smoke path | All Phase 1S operational rules plus Reference smoke. |
+| `reference-full` | Bundled Reference services and Studio smoke path | All Phase 1S operational rules, Phase 2 tool-agent approval rules, and Reference smoke. |
 
 ## Executable Assertions
 
 | Profile | Assertion helpers | Harnesses |
 | --- | --- | --- |
 | `provider-gateway` | `assert_provider_gateway_profile` | `GatewayHarness` |
+| `tool-agent` | `assert_tool_agent_surface_admission_profile`; `assert_tool_agent_generic_ask_approval_profile` | `BackendHarness` |
 | `capability-security` | `assert_capability_security_lease_admission`; `assert_capability_security_revocation_profile` | `CapabilityHarness` |
 | `control-plane` | `assert_control_plane_decision_profile`; `assert_control_plane_audit_sequence_profile` | `BackendHarness` |
 | `durable-runner` | `assert_durable_runner_event_sequence_profile`; `assert_durable_runner_recovery_metadata_profile`; `assert_durable_runner_subagent_diagnostics_profile` | `BackendHarness` |
 | `multi-agent` | `assert_multi_agent_backend_boundary_profile`; `assert_multi_agent_backend_capability_boundary_profile`; `assert_multi_agent_shared_revocation_profile` | `BackendHarness`; `CapabilityHarness` |
 | `reference-full` | `assert_reference_full_profile` | `ReferenceFullFactory` with backend, capability, gateway, and Studio harnesses |
 
-`minimal-agent` and `tool-agent` are registered metadata profiles in Phase 1S. Their concrete
-assertion helpers belong to a later profile slice.
+`minimal-agent` remains a registered metadata profile. `tool-agent` is executable for tool surface
+admission and generic approval behavior.
 
 ## Harness Roles
 
@@ -71,6 +72,7 @@ should run the smaller profiles directly with their own harnesses.
 6. Phase 1S 6차: subagent runtime context, descendant event access, diagnostics, and multi-agent conformance.
 7. Phase 1S 7차: Reference conformance factory, `reference-full`, and Studio smoke integration.
 8. Phase 1S 8차: final coverage matrix and public docs closure.
+9. Phase 2 1차: executable `tool-agent` profile and generic `authorization="ask"` approval.
 
 ## Acceptance
 
