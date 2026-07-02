@@ -54,7 +54,7 @@ class ExternalAgentPart:
         part_type = str(payload.get("type") or "").strip()
         if not part_type:
             raise ValueError("external agent part requires type")
-        data_payload = payload.get("data") or {}
+        data_payload = payload["data"] if "data" in payload else {}
         if not isinstance(data_payload, dict):
             raise ValueError("external agent part data must be an object")
         return cls(

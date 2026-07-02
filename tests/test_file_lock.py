@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from monoid_agent_kernel.core import _util
 
 
@@ -22,3 +24,16 @@ def test_file_lock_treats_permission_error_as_lock_contention(tmp_path, monkeypa
         assert calls >= 2
 
     assert not lock_path.exists()
+
+
+def test_file_lock_raises_permission_error_when_lock_cannot_be_created(tmp_path, monkeypatch) -> None:
+    lock_path = tmp_path / ".put.lock"
+
+    def denied_open(path, flags, mode=0o777):
+        raise PermissionError("create denied")
+
+    monkeypatch.setattr(_util.os, "open", denied_open)
+
+    with pytest.raises(PermissionError):
+        with _util.file_lock(lock_path, timeout_s=0.1, stale_s=0.0):
+            raise AssertionError("unreachable")

@@ -88,6 +88,12 @@ def test_external_agent_envelope_rejects_malformed_payload() -> None:
             "parts": [{"type": "text", "text": "hello"}],
             "metadata": 1,
         },
+        {
+            "protocol": EXTERNAL_AGENT_ENVELOPE_VERSION,
+            "peer_id": "worker",
+            "message_id": "msg-1",
+            "parts": [{"type": "data", "data": []}],
+        },
     ],
 )
 def test_external_agent_envelope_rejects_bad_json_shapes(payload: dict) -> None:
