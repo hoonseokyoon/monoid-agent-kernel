@@ -23,7 +23,7 @@ PROFILE = ProfileMetadata(
 
 
 def assert_control_plane_decision_profile(harness: BackendHarness) -> None:
-    """Run the Phase 1S approve/deny control decision smoke matrix."""
+    """Run the approve/deny control decision smoke matrix."""
     submitted = harness.submit_run({"scenario": "parked-hitl"})
     run_id = str(submitted["run_id"])
     token = str(submitted["token"])
@@ -100,7 +100,7 @@ def assert_control_plane_decision_profile(harness: BackendHarness) -> None:
 
 
 def assert_control_plane_audit_sequence_profile(harness: BackendHarness) -> None:
-    """Run the Phase 1S control audit sequencing smoke matrix."""
+    """Run the control audit sequencing smoke matrix."""
     submitted = harness.submit_run({"scenario": "multi-turn"})
     run_id = str(submitted["run_id"])
     token = str(submitted["token"])

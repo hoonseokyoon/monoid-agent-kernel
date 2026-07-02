@@ -57,6 +57,42 @@ def test_external_agent_envelope_rejects_malformed_payload() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "protocol": EXTERNAL_AGENT_ENVELOPE_VERSION,
+            "peer_id": "worker",
+            "message_id": "msg-1",
+            "parts": [1],
+        },
+        {
+            "protocol": EXTERNAL_AGENT_ENVELOPE_VERSION,
+            "peer_id": "worker",
+            "message_id": "msg-1",
+            "parts": [{"type": "data", "data": 1}],
+        },
+        {
+            "protocol": EXTERNAL_AGENT_ENVELOPE_VERSION,
+            "peer_id": "worker",
+            "message_id": "msg-1",
+            "parts": [{"type": "text", "text": "hello"}],
+            "result": 1,
+        },
+        {
+            "protocol": EXTERNAL_AGENT_ENVELOPE_VERSION,
+            "peer_id": "worker",
+            "message_id": "msg-1",
+            "parts": [{"type": "text", "text": "hello"}],
+            "metadata": 1,
+        },
+    ],
+)
+def test_external_agent_envelope_rejects_bad_json_shapes(payload: dict) -> None:
+    with pytest.raises(ValueError):
+        validate_external_agent_envelope(payload)
+
+
 def test_outbox_request_converts_to_external_agent_envelope() -> None:
     traceparent = new_traceparent()
     request = OutboxRequest(

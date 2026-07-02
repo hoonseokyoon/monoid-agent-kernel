@@ -20,6 +20,8 @@ _SECRET_KEY_PARTS = (
     "secret",
     "token",
 )
+_APPROVE_VALUES = {"1", "allow", "allowed", "approve", "approved", "true", "y", "yes"}
+_DENY_VALUES = {"0", "deny", "denied", "false", "n", "no", "reject", "rejected"}
 
 
 def build_tool_approval_task_request(
@@ -81,11 +83,10 @@ def normalize_tool_approval_result(
 ) -> dict[str, Any]:
     payload = dict(result or {})
     answer = str(payload.get("answer") or "").strip()
-    approved = payload.get("approved")
-    if approved is None:
-        lowered = answer.lower()
-        approved = lowered in {"approve", "approved", "allow", "allowed", "yes", "y"}
-    approved_bool = bool(approved)
+    if "approved" in payload and payload.get("approved") is not None:
+        approved_bool = _parse_approval_bool(payload.get("approved")) is True
+    else:
+        approved_bool = _parse_approval_bool(answer) is True
     reason = str(payload.get("reason") or default_reason or ("approved" if approved_bool else "denied"))
     return {
         "type": TOOL_APPROVAL_RESULT_TYPE,
@@ -145,6 +146,18 @@ def _redact_value(value: Any) -> Any:
 def _is_secret_key(key: str) -> bool:
     lowered = key.lower().replace("-", "_")
     return any(part in lowered for part in _SECRET_KEY_PARTS)
+
+
+def _parse_approval_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _APPROVE_VALUES:
+            return True
+        if normalized in _DENY_VALUES:
+            return False
+    return None
 
 
 def _jsonish(value: Any) -> Any:

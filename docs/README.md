@@ -10,7 +10,8 @@ make Monoid embeddable in different products and runtimes:
 | [CONFORMANCE.md](CONFORMANCE.md) | Profile-based conformance tests, harness roles, executable assertions, and the Reference full profile. |
 | [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) | Supported helper modules for scope, lease admission, revocation, event sequencing, control audit, durable metadata, and subagent boundaries. |
 | [REFERENCE.md](REFERENCE.md) | Runnable Reference services, Studio, gateway examples, and the public Reference conformance harness. |
-| [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Phase 1S rule-to-helper-to-profile-to-test coverage matrix. |
+| [OPERATIONAL_RULE_COVERAGE.md](OPERATIONAL_RULE_COVERAGE.md) | Current rule-to-helper-to-profile-to-test coverage matrix for OR-01 through OR-13. |
+| [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |
 | [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |
 | [SKILLS_DESIGN.md](SKILLS_DESIGN.md) | Agent Skills — procedural knowledge delivered through a `ContextProvider`, complementing subagents (execution) and MCP (integration). |

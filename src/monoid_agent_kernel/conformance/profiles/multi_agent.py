@@ -19,7 +19,7 @@ PROFILE = ProfileMetadata(
 
 
 def assert_multi_agent_backend_boundary_profile(harness: BackendHarness) -> None:
-    """Run the Phase 1S backend subagent identity and diagnostics smoke matrix."""
+    """Run the backend subagent identity and diagnostics smoke matrix."""
     submitted = harness.submit_run({"scenario": "subagent-foreground"})
     run_id = str(submitted["run_id"])
     token = str(submitted["token"])
@@ -64,7 +64,7 @@ def assert_multi_agent_backend_boundary_profile(harness: BackendHarness) -> None
 
 
 def assert_multi_agent_backend_capability_boundary_profile(harness: BackendHarness) -> None:
-    """Run the Phase 1S child capability-boundary smoke matrix."""
+    """Run the child capability-boundary smoke matrix."""
     submitted = harness.submit_run({"scenario": "subagent-capability-revoked"})
     run_id = str(submitted["run_id"])
     token = str(submitted["token"])
@@ -84,7 +84,7 @@ def assert_multi_agent_backend_capability_boundary_profile(harness: BackendHarne
 
 
 def assert_multi_agent_shared_revocation_profile(harness: CapabilityHarness) -> None:
-    """Run the Phase 1S child-vault revocation sharing smoke matrix."""
+    """Run the child-vault revocation sharing smoke matrix."""
     _admit_profile_lease(
         harness,
         capability="web.search",

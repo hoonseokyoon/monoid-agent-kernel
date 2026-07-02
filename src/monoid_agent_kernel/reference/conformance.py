@@ -727,6 +727,64 @@ class ReferenceBackendHarness:
                 payloads = list(latest.checkpoint.outbox_requests)
         return {"requests": [_side_effect_request_summary(payload) for payload in payloads]}
 
+    def run_outbox_dispatched_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "tool-side-effect-outbox-dispatched"})
+        events = list(self.events(str(submitted["run_id"]), str(submitted["token"]))["events"])
+        return {
+            "requested": _has_event(events, "outbox.requested", destination="email"),
+            "dispatched": _has_event(events, "outbox.dispatched", destination="email"),
+        }
+
+    def run_pending_recovery_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "tool-side-effect-pending-recovery"})
+        pending_requests = list(self.side_effects(str(submitted["run_id"]), str(submitted["token"]))["requests"])
+        if len(pending_requests) != 1:
+            raise AssertionError("expected one pending side-effect request")
+        restarted = self.restart(local_state="same")
+        recovered_requests = list(
+            restarted.side_effects(str(submitted["run_id"]), str(submitted["token"]))["requests"]
+        )
+        if len(recovered_requests) != 1:
+            raise AssertionError("expected one recovered side-effect request")
+        _cancel_backend_run(self, str(submitted["run_id"]), str(submitted["token"]))
+        return {
+            "request_id": pending_requests[0]["request_id"],
+            "initial_status": pending_requests[0]["status"],
+            "recovered_request_id": recovered_requests[0]["request_id"],
+            "recovered_status": recovered_requests[0]["status"],
+        }
+
+    def run_strict_rejected_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "tool-side-effect-strict-rejected"})
+        events = list(self.events(str(submitted["run_id"]), str(submitted["token"]))["events"])
+        return {
+            "denied": _has_event(
+                events,
+                "permission.denied",
+                call_id="unsafe_1",
+                error_code="tool_side_effect_policy_denied",
+            ),
+            "handler_finished": _has_event(events, "tool.call.finished", call_id="unsafe_1"),
+        }
+
+    def run_idempotent_inline_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "tool-side-effect-idempotent-inline"})
+        events = list(self.events(str(submitted["run_id"]), str(submitted["token"]))["events"])
+        return {
+            "missing_denied": _has_event(
+                events,
+                "permission.denied",
+                call_id="idempotent_missing",
+                error_code="tool_side_effect_policy_denied",
+            ),
+            "valid_finished": _has_event(
+                events,
+                "tool.call.finished",
+                call_id="idempotent_ok",
+                tool="demo_external_idempotent",
+            ),
+        }
+
     def deliver_external_agent_message(
         self,
         run_id: str,
@@ -778,6 +836,54 @@ class ReferenceBackendHarness:
             "run_id": run_id,
             "seen_inbox_ids": seen_ids,
             "requests": [_side_effect_request_summary(payload) for payload in payloads],
+        }
+
+    def run_two_peer_exchange_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "message-fabric-two-peer"})
+        planner_events = list(
+            self.events(str(submitted["run_id"]), str(submitted["token"]), limit=200)["events"]
+        )
+        worker_events = list(
+            self.events(str(submitted["peer_run_id"]), str(submitted["peer_token"]), limit=200)["events"]
+        )
+        return {
+            "planner_dispatched": _has_event(planner_events, "outbox.dispatched", destination="worker"),
+            "worker_replied": _has_event(worker_events, "outbox.dispatched", destination="planner"),
+            "planner_trace_preserved": _event_with_trace(
+                planner_events,
+                "outbox.dispatched",
+                destination="worker",
+            ),
+            "worker_trace_preserved": _event_with_trace(
+                worker_events,
+                "outbox.dispatched",
+                destination="planner",
+            ),
+        }
+
+    def run_malformed_envelope_case(self) -> dict[str, Any]:
+        receiver = self.submit_run({"scenario": "message-fabric-receiver"})
+        malformed = self.deliver_external_agent_message(
+            str(receiver["run_id"]),
+            str(receiver["token"]),
+            {"protocol": "monoid.external-agent-envelope.v1", "peer_id": "planner"},
+        )
+        _cancel_backend_run(self, str(receiver["run_id"]), str(receiver["token"]))
+        return malformed
+
+    def run_duplicate_after_restart_case(self) -> dict[str, Any]:
+        return self.submit_run({"scenario": "message-fabric-duplicate-restart"})
+
+    def run_peer_unavailable_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "message-fabric-peer-unavailable"})
+        state = self.message_fabric_state(str(submitted["run_id"]), str(submitted["token"]))
+        pending = [request for request in state["requests"] if request["destination"] == "missing-worker"]
+        if len(pending) != 1:
+            raise AssertionError("expected one pending message-fabric request")
+        return {
+            "pending": True,
+            "status": pending[0]["status"],
+            "attempts": pending[0]["attempts"],
         }
 
     def _deliver_message_fabric(
@@ -1100,5 +1206,22 @@ def _wait_for_event(server: StudioServer, run_id: str, event_type: str) -> list[
     return events
 
 
-def _has_event(events: list[dict[str, Any]], event_type: str) -> bool:
-    return any(event.get("type") == event_type for event in events)
+def _has_event(events: list[dict[str, Any]], event_type: str, **data: str) -> bool:
+    for event in events:
+        if event.get("type") != event_type:
+            continue
+        event_data = event.get("data") or {}
+        if all(event_data.get(key) == value for key, value in data.items()):
+            return True
+    return False
+
+
+def _event_with_trace(events: list[dict[str, Any]], event_type: str, **data: str) -> bool:
+    for event in events:
+        if event.get("type") != event_type:
+            continue
+        event_data = event.get("data") or {}
+        if not all(event_data.get(key) == value for key, value in data.items()):
+            continue
+        return bool(event_data.get("traceparent"))
+    return False

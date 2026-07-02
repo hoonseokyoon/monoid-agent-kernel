@@ -1,4 +1,4 @@
-"""Phase 1S conformance profile metadata."""
+"""Conformance profile metadata."""
 
 from __future__ import annotations
 

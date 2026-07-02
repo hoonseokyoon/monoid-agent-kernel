@@ -96,6 +96,7 @@ from monoid_agent_kernel.core.tool_approval import (
     build_tool_approval_task_request,
     denied_tool_approval_observation,
     normalize_tool_approval_result,
+    tool_approval_key,
 )
 from monoid_agent_kernel.core.side_effect_policy import (
     ToolSideEffectPolicy,
@@ -1580,7 +1581,9 @@ class AgentLoop:
         the backend or another thread calls this to deliver a result, waking a
         parked run. The result is injected per the task kind's ResultInjector."""
         session = self._require_open()
-        return session.res.context.job_manager.report_result(task_id, result, status=status)
+        reported = session.res.context.job_manager.report_result(task_id, result, status=status)
+        self._persist_checkpoint(session)
+        return reported
 
     # --- durable persistence (state-snapshot at park points) ---
 
@@ -3875,6 +3878,11 @@ class AgentLoop:
         if str(replay.get("tool_id") or "") != bound_tool.base_spec.id:
             raise PermissionDenied(
                 "approved tool call no longer matches its tool",
+                error_code="tool_approval_stale",
+            )
+        if str(replay.get("approval_key") or "") != tool_approval_key(replay):
+            raise PermissionDenied(
+                "approved tool call approval key mismatch",
                 error_code="tool_approval_stale",
             )
 

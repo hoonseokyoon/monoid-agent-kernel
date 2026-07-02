@@ -42,7 +42,7 @@ from .tool_agent import (
 PROFILE = ProfileMetadata(
     profile_id="reference-full",
     title="Reference Full",
-    summary="Bundled Reference services and Studio smoke path across Phase 1S and Phase 2 tool-agent rules.",
+    summary="Bundled Reference services and Studio smoke path across current operational rules.",
     rule_ids=(
         "OR-01-SCOPE-RELATION",
         "OR-02-CAPABILITY-BOUNDARY",
@@ -83,7 +83,7 @@ class ReferenceFullFactory(Protocol):
 
 
 def assert_reference_full_profile(factory: ReferenceFullFactory) -> None:
-    """Run the bundled Reference implementation across the Phase 1S profile set."""
+    """Run the bundled Reference implementation across the current profile set."""
     assert_provider_gateway_profile(factory.new_gateway())
 
     assert_capability_security_lease_admission(factory.new_capability())

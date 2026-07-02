@@ -522,7 +522,7 @@ class HostedTask:
             "created_by": self.created_by,
             "prompt": self.prompt,
             "choices": list(self.choices),
-            "request": self.request,
+            "request": self.public_request(),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration_s": self.duration_s,
@@ -584,7 +584,7 @@ class HostedTask:
             "status": self.status,
             "prompt": self.prompt,
             "choices": list(self.choices),
-            "request": self.request,
+            "request": self.public_request(),
         }
 
     def terminal_event(self) -> tuple[str, str]:
@@ -599,6 +599,12 @@ class HostedTask:
     def public_payload(self, run_dir: Path, permission_policy: PermissionPolicy) -> dict[str, Any]:
         del permission_policy
         return self.to_json(run_dir)
+
+    def public_request(self) -> dict[str, Any]:
+        request = dict(self.request)
+        if self.kind == TOOL_APPROVAL_TASK_KIND:
+            request.pop("arguments", None)
+        return request
 
     def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:
         del run_dir, tail_bytes

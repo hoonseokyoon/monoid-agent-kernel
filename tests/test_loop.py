@@ -394,12 +394,66 @@ def test_ask_authorization_parks_and_approved_call_executes_once(tmp_path: Path)
     second = loop.report_task_result(suspended.awaiting_task_ids[0], {"approved": True})
     assert first["delivered"] is True
     assert second["duplicate"] is True
+    assert loop.checkpoint_store is not None
+    latest = loop.checkpoint_store.latest(loop.spec.run_id)
+    assert latest is not None
+    checkpoint_task = next(
+        task
+        for task in latest.checkpoint.hosted_tasks
+        if task["task_id"] == suspended.awaiting_task_ids[0]
+    )
+    assert checkpoint_task["result"]["approved"] is True
+    assert checkpoint_task["ready_for_reentry"] is True
     resumed = loop.run_until_suspended(None)
     result = loop.close()
 
     assert resumed.turn is not None
     assert provider.calls == 1
     assert result.status == "completed"
+
+
+def test_ask_authorization_reported_result_survives_restore_before_replay(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ApprovalToolProvider()
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+                ModelTurn(final_text="park"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    loop.open()
+    suspended = loop.run_until_suspended("use the approval tool")
+
+    loop.report_task_result(suspended.awaiting_task_ids[0], {"approved": True})
+    assert loop.checkpoint_store is not None
+    latest = loop.checkpoint_store.latest(loop.spec.run_id)
+    assert latest is not None
+
+    restored = AgentLoop(
+        spec=AgentRunSpec(
+            run_id=loop.spec.run_id,
+            workspace_root=workspace,
+            run_root=tmp_path / "restored-runs",
+        ),
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(final_text="restored")]),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    restored.restore(latest.checkpoint, blobs=latest.blob)
+    manager = restored._require_open().res.context.job_manager
+    task = manager.jobs[suspended.awaiting_task_ids[0]]
+
+    assert getattr(task, "result")["approved"] is True
+    assert getattr(task, "ready_for_reentry") is True
 
 
 def test_ask_authorization_denial_never_invokes_handler(tmp_path: Path) -> None:
@@ -441,6 +495,46 @@ def test_ask_authorization_denial_never_invokes_handler(tmp_path: Path) -> None:
     assert provider.calls == 0
     transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
     assert "secret-ref://lease" not in transcript
+
+
+def test_ask_authorization_replay_rejects_approval_key_mismatch(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ApprovalToolProvider()
+    sink = MemoryEventSink()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+            ModelTurn(final_text="park"),
+            ModelTurn(final_text="stale approval rejected"),
+        ]
+    )
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+        event_sinks=(sink,),
+    )
+    loop.open()
+
+    suspended = loop.run_until_suspended("use the approval tool")
+    loop.report_task_result(suspended.awaiting_task_ids[0], {"approved": True})
+    manager = loop._require_open().res.context.job_manager
+    manager.jobs[suspended.awaiting_task_ids[0]].request["approval_key"] = "tampered"
+    loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert result.status == "completed"
+    assert provider.calls == 0
+    assert any(
+        event.type == "permission.denied"
+        and event.data.get("error_code") == "tool_approval_stale"
+        for event in sink.events
+    )
 
 
 def test_strict_external_side_effect_denies_unsafe_tool_before_handler(tmp_path: Path) -> None:

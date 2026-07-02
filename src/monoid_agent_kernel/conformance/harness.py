@@ -82,33 +82,37 @@ class BackendHarness(ConformanceHarness, Protocol):
 
 
 @runtime_checkable
-class SideEffectHarness(BackendHarness, Protocol):
+class SideEffectHarness(ConformanceHarness, Protocol):
     """Backend operations used by side-effect-tool-agent profiles."""
 
-    def restart(self, *, local_state: str = "same") -> SideEffectHarness:
-        """Return a fresh harness instance over the same durable state."""
+    def run_outbox_dispatched_case(self) -> JsonObject:
+        """Run a strict outbox side-effect case that stages and dispatches one request."""
 
-    def side_effects(self, run_id: str, token: str) -> JsonObject:
-        """Return normalized durable side-effect requests for one run."""
+    def run_pending_recovery_case(self) -> JsonObject:
+        """Run a strict outbox side-effect case whose pending request survives restart."""
+
+    def run_strict_rejected_case(self) -> JsonObject:
+        """Run a strict external side-effect case rejected before handler execution."""
+
+    def run_idempotent_inline_case(self) -> JsonObject:
+        """Run an idempotent inline external side-effect case."""
 
 
 @runtime_checkable
-class MessageFabricHarness(BackendHarness, Protocol):
+class MessageFabricHarness(ConformanceHarness, Protocol):
     """Backend operations used by external agent message-fabric profiles."""
 
-    def restart(self, *, local_state: str = "same") -> MessageFabricHarness:
-        """Return a fresh harness instance over the same durable state."""
+    def run_two_peer_exchange_case(self) -> JsonObject:
+        """Run a two-peer exchange over the external-agent message fabric."""
 
-    def deliver_external_agent_message(
-        self,
-        run_id: str,
-        token: str,
-        envelope: JsonObject,
-    ) -> JsonObject:
-        """Deliver one normalized external-agent envelope into a run."""
+    def run_malformed_envelope_case(self) -> JsonObject:
+        """Run a malformed external-agent envelope rejection case."""
 
-    def message_fabric_state(self, run_id: str, token: str) -> JsonObject:
-        """Return normalized message-fabric state for one run."""
+    def run_duplicate_after_restart_case(self) -> JsonObject:
+        """Run a duplicate message case that survives restart."""
+
+    def run_peer_unavailable_case(self) -> JsonObject:
+        """Run a peer-unavailable case that leaves a retryable pending request."""
 
 
 @runtime_checkable

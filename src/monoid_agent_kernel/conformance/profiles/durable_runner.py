@@ -18,7 +18,7 @@ PROFILE = ProfileMetadata(
 
 
 def assert_durable_runner_event_sequence_profile(harness: BackendHarness) -> None:
-    """Run the Phase 1S event sequence and diagnostics smoke matrix."""
+    """Run the event sequence and diagnostics smoke matrix."""
     submitted = harness.submit_run({"scenario": "multi-turn"})
     run_id = str(submitted["run_id"])
     token = str(submitted["token"])
@@ -55,7 +55,7 @@ def assert_durable_runner_event_sequence_profile(harness: BackendHarness) -> Non
 
 
 def assert_durable_runner_recovery_metadata_profile(harness: BackendHarness) -> None:
-    """Run the Phase 1S recovery metadata smoke matrix."""
+    """Run the recovery metadata smoke matrix."""
     same_run = harness.submit_run({"scenario": "recoverable-multi-turn"})
     same_run_id = str(same_run["run_id"])
     same_token = str(same_run["token"])
@@ -99,7 +99,7 @@ def assert_durable_runner_recovery_metadata_profile(harness: BackendHarness) -> 
 
 
 def assert_durable_runner_subagent_diagnostics_profile(harness: BackendHarness) -> None:
-    """Run the Phase 1S subagent diagnostics projection smoke matrix."""
+    """Run the subagent diagnostics projection smoke matrix."""
     submitted = harness.submit_run({"scenario": "subagent-foreground"})
     run_id = str(submitted["run_id"])
     token = str(submitted["token"])

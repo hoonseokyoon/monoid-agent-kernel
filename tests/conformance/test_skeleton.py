@@ -43,12 +43,12 @@ EXPECTED_RULE_IDS = {
 }
 
 
-def test_phase_1s_profile_metadata_is_registered() -> None:
+def test_conformance_profile_metadata_is_registered() -> None:
     assert tuple(profile.profile_id for profile in PROFILES) == EXPECTED_PROFILE_IDS
     assert set(PROFILE_BY_ID) == set(EXPECTED_PROFILE_IDS)
 
 
-def test_phase_1s_profile_rule_ids_are_known() -> None:
+def test_conformance_profile_rule_ids_are_known() -> None:
     declared_rule_ids = {rule_id for profile in PROFILES for rule_id in profile.rule_ids}
 
     assert declared_rule_ids == EXPECTED_RULE_IDS

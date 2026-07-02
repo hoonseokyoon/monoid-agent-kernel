@@ -48,13 +48,18 @@ class ExternalAgentPart:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ExternalAgentPart:
+        if not isinstance(payload, dict):
+            raise ValueError("external agent part must be an object")
         part_type = str(payload.get("type") or "").strip()
         if not part_type:
             raise ValueError("external agent part requires type")
+        data_payload = payload.get("data") or {}
+        if not isinstance(data_payload, dict):
+            raise ValueError("external agent part data must be an object")
         return cls(
             type=part_type,
             text=str(payload.get("text") or ""),
-            data=dict(payload.get("data") or {}),
+            data=dict(data_payload),
             artifact_id=str(payload.get("artifact_id") or ""),
             mime_type=str(payload.get("mime_type") or ""),
         )
@@ -73,6 +78,8 @@ class ExternalAgentError:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ExternalAgentError:
+        if not isinstance(payload, dict):
+            raise ValueError("external agent error must be an object")
         code = str(payload.get("code") or "").strip()
         if not code:
             raise ValueError("external agent error requires code")
@@ -106,20 +113,27 @@ class ExternalAgentResult:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ExternalAgentResult:
+        if not isinstance(payload, dict):
+            raise ValueError("external agent result must be an object")
         state = str(payload.get("state") or "").strip()
         if not state:
             raise ValueError("external agent result requires state")
         error_payload = payload.get("error")
+        if error_payload is not None and not isinstance(error_payload, dict):
+            raise ValueError("external agent result error must be an object")
+        metadata_payload = payload.get("metadata") or {}
+        if not isinstance(metadata_payload, dict):
+            raise ValueError("external agent result metadata must be an object")
         return cls(
             state=state,
             terminal=bool(payload.get("terminal", False)),
             interrupted=bool(payload.get("interrupted", False)),
             error=(
-                ExternalAgentError.from_json(dict(error_payload))
+                ExternalAgentError.from_json(error_payload)
                 if isinstance(error_payload, dict)
                 else None
             ),
-            metadata=dict(payload.get("metadata") or {}),
+            metadata=dict(metadata_payload),
         )
 
 
@@ -163,6 +177,8 @@ class ExternalAgentEnvelope:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ExternalAgentEnvelope:
+        if not isinstance(payload, dict):
+            raise ValueError("external agent envelope must be an object")
         protocol = payload.get("protocol")
         if protocol not in ACCEPTED_EXTERNAL_AGENT_ENVELOPE_VERSIONS:
             raise ValueError("unsupported external agent envelope protocol")
@@ -172,11 +188,16 @@ class ExternalAgentEnvelope:
         parts_payload = payload.get("parts")
         if not isinstance(parts_payload, list) or not parts_payload:
             raise ValueError("external agent envelope requires one or more parts")
-        parts = tuple(ExternalAgentPart.from_json(dict(part)) for part in parts_payload)
+        parts = tuple(ExternalAgentPart.from_json(part) for part in parts_payload)
         message_id = str(payload.get("message_id") or "").strip()
         if not message_id:
             raise ValueError("external agent envelope requires message_id")
         result_payload = payload.get("result")
+        if result_payload is not None and not isinstance(result_payload, dict):
+            raise ValueError("external agent envelope result must be an object")
+        metadata_payload = payload.get("metadata") or {}
+        if not isinstance(metadata_payload, dict):
+            raise ValueError("external agent envelope metadata must be an object")
         return cls(
             peer_id=peer_id,
             parts=parts,
@@ -190,19 +211,19 @@ class ExternalAgentEnvelope:
             tracestate=str(payload.get("tracestate") or ""),
             capability_ref=str(payload.get("capability_ref") or ""),
             result=(
-                ExternalAgentResult.from_json(dict(result_payload))
+                ExternalAgentResult.from_json(result_payload)
                 if isinstance(result_payload, dict)
                 else None
             ),
             created_at=float(payload.get("created_at") or 0.0),
-            metadata=dict(payload.get("metadata") or {}),
+            metadata=dict(metadata_payload),
         )
 
 
 def validate_external_agent_envelope(payload: dict[str, Any]) -> ExternalAgentEnvelope:
     """Parse and validate one serialized external-agent envelope."""
 
-    return ExternalAgentEnvelope.from_json(dict(payload))
+    return ExternalAgentEnvelope.from_json(payload)
 
 
 def normalize_external_agent_error(
@@ -271,7 +292,7 @@ def external_agent_envelope_to_inbox_message(
 def _parts_from_payload(payload: dict[str, Any]) -> tuple[ExternalAgentPart, ...]:
     parts_payload = payload.get("parts")
     if isinstance(parts_payload, list) and parts_payload:
-        return tuple(ExternalAgentPart.from_json(dict(part)) for part in parts_payload)
+        return tuple(ExternalAgentPart.from_json(part) for part in parts_payload)
     text = str(payload.get("text") or payload.get("message") or "")
     if text:
         return (ExternalAgentPart(type="text", text=text),)

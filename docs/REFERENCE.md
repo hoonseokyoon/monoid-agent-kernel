@@ -25,8 +25,8 @@ conformance harnesses can be wired together for local smoke testing and document
 
 ## Conformance Role
 
-The Reference implementation is the first target for each conformance profile. When a Phase 1S rule
-is added, Reference gets an adapter or smoke path that proves the rule against the bundled example.
+The Reference implementation is the first target for each conformance profile. When an operational
+rule is added, Reference gets an adapter or smoke path that proves the rule against the bundled example.
 External backends can use that adapter shape as a starting point for their own profile harnesses.
 
 `monoid_agent_kernel.reference.conformance` provides that adapter shape as a public Reference
@@ -41,5 +41,5 @@ actual backend, gateway, and Studio wiring visible as a runnable example.
 
 Reference review should identify whether the example assembles the contract and helper kit clearly.
 Repeated runtime invariants move into Contract rules, Core Helper Kit modules, and conformance
-profiles. `docs/PHASE_1S_COVERAGE.md` shows the current Phase 1S mapping from rule ids to
-Reference harness scenarios and tests.
+profiles. `docs/OPERATIONAL_RULE_COVERAGE.md` shows the current mapping from rule ids to Reference
+harness cases and tests.

@@ -24,9 +24,10 @@ to the operational rules while preserving replaceable deployment choices.
 | `core.control_audit.ControlAuditPolicy` | `OR-06-CONTROL-AUDIT` | Build redacted received, completed, and failed control audit payloads and declare callback-token command eligibility. |
 | `core.durable_metadata.DurableMetadataCommitter` | `OR-07-DURABLE-METADATA` | Validate run metadata, commit runtime config updates, write shared metadata, and materialize local recovery descriptors. |
 | `core.subagent_runtime.SubagentRuntimeContext`, `validate_descendant_run_id`, `subagent_diagnostics_from_events` | `OR-09-SUBAGENT-BOUNDARY` | Create child run identity, validate descendant event access, build lifecycle/result payloads, and summarize subagent diagnostics. |
+| `core.tool_surface.DefaultToolSurfaceResolver`, `ToolSurfaceSnapshot` | `OR-10-TOOL-SURFACE-ADMISSION` | Build the active turn tool surface and enforce exposure, authorization, quota, scope, and binding availability before handlers run. |
 | `core.tool_approval` | `OR-11-GENERIC-ASK-APPROVAL` | Build approval task payloads, redact argument previews, normalize approve/deny results, and derive replay descriptors for approved calls. |
 | `core.side_effect_policy` | `OR-12-DURABLE-SIDE-EFFECT` | Read runtime side-effect policy, interpret tool/binding declarations, admit strict external side-effect calls through outbox or idempotency keys, and verify outbox staging. |
-| `core.external_agent_envelope` | `OR-13-EXTERNAL-AGENT-ENVELOPE` | Build and validate transport-neutral peer-agent envelopes, preserve ordered parts, propagate correlation/causation/trace identity, and map outbox sends into inbox messages. |
+| `core.external_agent_envelope` | `OR-13-EXTERNAL-AGENT-ENVELOPE` | Build and validate the minimum transport-neutral peer-agent envelope, preserve ordered text/data parts, propagate correlation/causation/trace identity, and map outbox sends into inbox messages. |
 
 ## Gateway And Diagnostics Assembly
 
@@ -44,15 +45,14 @@ A guard starts as helper implementation quality. It becomes Contract language wh
 across implementations, affects security, durability, or observability, and can be asserted by a
 helper-independent conformance profile.
 
-## Phase 1S State
+## Coverage State
 
-Phase 1S defines stable operational rule ids, implements the helper surfaces above, and pins their
-observable behavior through conformance profiles. The full mapping from rule id to helper, profile,
-Reference harness, and test coverage lives in `docs/PHASE_1S_COVERAGE.md`.
+The current operational rules are mapped to helper surfaces, profiles, Reference harnesses, and
+tests in `docs/OPERATIONAL_RULE_COVERAGE.md`.
 
-## Phase 2 State
+## Current Phase 2 State
 
-Phase 2 starts with executable `tool-agent` behavior, an optional `side-effect-tool-agent` profile,
+Phase 2 provides executable `tool-agent` behavior, an optional `side-effect-tool-agent` profile,
 and an optional `message-fabric` profile. `AgentLoop` uses `core.tool_approval` for
 `authorization="ask"` calls and `core.side_effect_policy` for strict external side-effect
 admission. Reference sender and harness code use `core.external_agent_envelope` to route peer-agent
