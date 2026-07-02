@@ -6,8 +6,10 @@ from monoid_agent_kernel.conformance import (
     BackendHarness,
     CapabilityHarness,
     GatewayHarness,
+    MessageFabricHarness,
     PROFILES,
     PROFILE_BY_ID,
+    SideEffectHarness,
     get_profile,
 )
 
@@ -15,6 +17,8 @@ from monoid_agent_kernel.conformance import (
 EXPECTED_PROFILE_IDS = (
     "minimal-agent",
     "tool-agent",
+    "side-effect-tool-agent",
+    "message-fabric",
     "durable-runner",
     "control-plane",
     "capability-security",
@@ -32,15 +36,19 @@ EXPECTED_RULE_IDS = {
     "OR-07-DURABLE-METADATA",
     "OR-08-PROVIDER-CAPS",
     "OR-09-SUBAGENT-BOUNDARY",
+    "OR-10-TOOL-SURFACE-ADMISSION",
+    "OR-11-GENERIC-ASK-APPROVAL",
+    "OR-12-DURABLE-SIDE-EFFECT",
+    "OR-13-EXTERNAL-AGENT-ENVELOPE",
 }
 
 
-def test_phase_1s_profile_metadata_is_registered() -> None:
+def test_conformance_profile_metadata_is_registered() -> None:
     assert tuple(profile.profile_id for profile in PROFILES) == EXPECTED_PROFILE_IDS
     assert set(PROFILE_BY_ID) == set(EXPECTED_PROFILE_IDS)
 
 
-def test_phase_1s_profile_rule_ids_are_known() -> None:
+def test_conformance_profile_rule_ids_are_known() -> None:
     declared_rule_ids = {rule_id for profile in PROFILES for rule_id in profile.rule_ids}
 
     assert declared_rule_ids == EXPECTED_RULE_IDS
@@ -60,3 +68,5 @@ def test_harness_protocols_are_importable() -> None:
     assert BackendHarness.__name__ == "BackendHarness"
     assert GatewayHarness.__name__ == "GatewayHarness"
     assert CapabilityHarness.__name__ == "CapabilityHarness"
+    assert SideEffectHarness.__name__ == "SideEffectHarness"
+    assert MessageFabricHarness.__name__ == "MessageFabricHarness"

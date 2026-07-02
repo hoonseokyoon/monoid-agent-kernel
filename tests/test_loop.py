@@ -5,6 +5,7 @@ from pathlib import Path
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
@@ -17,6 +18,7 @@ from monoid_agent_kernel.providers.fake import (
     FakeStreamingModelAdapter,
     fake_tool_call,
 )
+from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 from monoid_agent_kernel.recorder import MemoryEventSink
 from monoid_agent_kernel.workspace.local import default_local_workspace_factory, sha256_bytes
 from support.process import python_command as _python_command
@@ -316,7 +318,7 @@ def test_binding_authorization_and_quota_are_enforced(tmp_path: Path) -> None:
     config = runtime_config(
         bindings=(
             tool_binding("fs.read", quota=ToolQuota(max_calls_per_run=1)),
-            tool_binding("fs.delete", authorization="ask"),
+            tool_binding("fs.delete", authorization="deny"),
             tool_binding("run.finish"),
         )
     )
@@ -329,8 +331,434 @@ def test_binding_authorization_and_quota_are_enforced(tmp_path: Path) -> None:
 
     transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
     assert "tool_quota_exceeded" in transcript
-    assert "tool_approval_required" in transcript
+    assert "tool_binding_denied" in transcript
     assert workspace.joinpath("old.md").exists()
+
+
+class _ApprovalToolProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+        del context
+
+        def handler(ctx: ToolContext, args: dict) -> ToolResult:
+            del ctx
+            self.calls += 1
+            return ToolResult(ok=True, content={"value": args.get("value")})
+
+        return [
+            ToolSpec(
+                id="demo.approval",
+                description="approval demo",
+                input_schema={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "additionalProperties": True,
+                },
+                capability="",
+                side_effect="write",
+                handler=handler,
+            )
+        ]
+
+
+def test_ask_authorization_parks_and_approved_call_executes_once(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ApprovalToolProvider()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+            ModelTurn(final_text="park"),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    loop.open()
+
+    suspended = loop.run_until_suspended("use the approval tool")
+    assert suspended.reason == "awaiting_tasks"
+    assert suspended.awaiting_task_ids
+    assert provider.calls == 0
+
+    first = loop.report_task_result(suspended.awaiting_task_ids[0], {"approved": True})
+    second = loop.report_task_result(suspended.awaiting_task_ids[0], {"approved": True})
+    assert first["delivered"] is True
+    assert second["duplicate"] is True
+    assert loop.checkpoint_store is not None
+    latest = loop.checkpoint_store.latest(loop.spec.run_id)
+    assert latest is not None
+    checkpoint_task = next(
+        task
+        for task in latest.checkpoint.hosted_tasks
+        if task["task_id"] == suspended.awaiting_task_ids[0]
+    )
+    assert checkpoint_task["result"]["approved"] is True
+    assert checkpoint_task["ready_for_reentry"] is True
+    resumed = loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert resumed.turn is not None
+    assert provider.calls == 1
+    assert result.status == "completed"
+
+
+def test_ask_authorization_reported_result_survives_restore_before_replay(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ApprovalToolProvider()
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+                ModelTurn(final_text="park"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    loop.open()
+    suspended = loop.run_until_suspended("use the approval tool")
+
+    loop.report_task_result(suspended.awaiting_task_ids[0], {"approved": True})
+    assert loop.checkpoint_store is not None
+    latest = loop.checkpoint_store.latest(loop.spec.run_id)
+    assert latest is not None
+
+    restored = AgentLoop(
+        spec=AgentRunSpec(
+            run_id=loop.spec.run_id,
+            workspace_root=workspace,
+            run_root=tmp_path / "restored-runs",
+        ),
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(final_text="restored")]),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    restored.restore(latest.checkpoint, blobs=latest.blob)
+    manager = restored._require_open().res.context.job_manager
+    task = manager.jobs[suspended.awaiting_task_ids[0]]
+
+    assert getattr(task, "result")["approved"] is True
+    assert getattr(task, "ready_for_reentry") is True
+
+
+def test_ask_authorization_replay_consumed_checkpoint_precedes_handler(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    observed: dict[str, object] = {}
+    task_holder: dict[str, str] = {}
+    loop_holder: dict[str, AgentLoop] = {}
+
+    class Provider:
+        calls = 0
+
+        def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                self.calls += 1
+                loop = loop_holder["loop"]
+                assert loop.checkpoint_store is not None
+                latest = loop.checkpoint_store.latest(loop.spec.run_id)
+                assert latest is not None
+                observed["delivered"] = list(latest.checkpoint.delivered_reentry_jobs)
+                observed["pending_replays"] = list(latest.checkpoint.pending_tool_approval_replays)
+                return ToolResult(ok=True, content={"value": "ok"})
+
+            return [
+                ToolSpec(
+                    id="demo.approval",
+                    description="approval demo",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    provider = Provider()
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+                ModelTurn(final_text="park"),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    loop_holder["loop"] = loop
+    loop.open()
+
+    suspended = loop.run_until_suspended("use the approval tool")
+    task_holder["task_id"] = suspended.awaiting_task_ids[0]
+    loop.report_task_result(task_holder["task_id"], {"approved": True})
+    loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert result.status == "completed"
+    assert provider.calls == 1
+    assert task_holder["task_id"] in observed["delivered"]
+    assert observed["pending_replays"] == []
+
+
+def test_ask_authorization_denial_never_invokes_handler(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ApprovalToolProvider()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "no"}, "call_1"),)),
+            ModelTurn(final_text="park"),
+            ModelTurn(final_text="denied"),
+        ]
+    )
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    loop.open()
+
+    suspended = loop.run_until_suspended("use the approval tool")
+    assert suspended.reason == "awaiting_tasks"
+    loop.report_task_result(
+        suspended.awaiting_task_ids[0],
+        {
+            "approved": False,
+            "reason": "policy",
+            "lease": {"token_ref": "secret-ref://lease"},
+            "token_ref": "secret-ref://lease",
+        },
+    )
+    loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert provider.calls == 0
+    transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
+    assert "secret-ref://lease" not in transcript
+
+
+def test_ask_authorization_non_answered_approval_never_invokes_handler(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ApprovalToolProvider()
+    sink = MemoryEventSink()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "cancelled"}, "call_1"),)),
+            ModelTurn(final_text="park"),
+            ModelTurn(final_text="cancelled approval denied"),
+        ]
+    )
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+        event_sinks=(sink,),
+    )
+    loop.open()
+
+    suspended = loop.run_until_suspended("use the approval tool")
+    assert suspended.reason == "awaiting_tasks"
+    loop.report_task_result(
+        suspended.awaiting_task_ids[0],
+        {"approved": True, "reason": "reported after cancellation"},
+        status="cancelled",
+    )
+    loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert result.status == "completed"
+    assert provider.calls == 0
+    assert any(event.type == "tool.approval.denied" for event in sink.events)
+    assert not any(event.type == "tool.approval.approved" for event in sink.events)
+
+
+def test_ask_authorization_replay_rejects_approval_key_mismatch(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ApprovalToolProvider()
+    sink = MemoryEventSink()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+            ModelTurn(final_text="park"),
+            ModelTurn(final_text="stale approval rejected"),
+        ]
+    )
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+        event_sinks=(sink,),
+    )
+    loop.open()
+
+    suspended = loop.run_until_suspended("use the approval tool")
+    loop.report_task_result(suspended.awaiting_task_ids[0], {"approved": True})
+    manager = loop._require_open().res.context.job_manager
+    manager.jobs[suspended.awaiting_task_ids[0]].request["approval_key"] = "tampered"
+    loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert result.status == "completed"
+    assert provider.calls == 0
+    assert any(
+        event.type == "permission.denied"
+        and event.data.get("error_code") == "tool_approval_stale"
+        for event in sink.events
+    )
+
+
+def test_strict_external_side_effect_denies_unsafe_tool_before_handler(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class Provider:
+        calls = 0
+
+        def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                self.calls += 1
+                return ToolResult(ok=True, content={"ran": True})
+
+            return [
+                ToolSpec(
+                    id="demo.external",
+                    description="external",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    provider = Provider()
+    sink = MemoryEventSink()
+    config = AgentRuntimeConfig(
+        definition_id="test-agent",
+        tools=(
+            tool_binding("demo.external", runtime={"external_side_effect": True}),
+            tool_binding("run.finish"),
+        ),
+        metadata={"tool_side_effect_policy": {"mode": "strict"}},
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_external", {}, "external_1"),)),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+        event_sinks=(sink,),
+    )
+
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert provider.calls == 0
+    assert any(
+        event.type == "permission.denied"
+        and event.data.get("error_code") == "tool_side_effect_policy_denied"
+        for event in sink.events
+    )
+
+
+def test_strict_outbox_side_effect_fails_when_handler_stages_no_request(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class Provider:
+        def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                return ToolResult(ok=True, content={"ran": True})
+
+            return [
+                ToolSpec(
+                    id="demo.outbox_missing",
+                    description="external",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    sink = MemoryEventSink()
+    config = AgentRuntimeConfig(
+        definition_id="test-agent",
+        tools=(
+            tool_binding(
+                "demo.outbox_missing",
+                runtime={"external_side_effect": True, "side_effect_delivery": "outbox"},
+            ),
+            tool_binding("run.finish"),
+        ),
+        metadata={"tool_side_effect_policy": {"mode": "strict"}},
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_outbox_missing", {}, "external_1"),)),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(Provider(),),
+        event_sinks=(sink,),
+    )
+
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert any(
+        event.type == "tool.call.failed"
+        and event.data.get("error_code") == "tool_side_effect_outbox_missing"
+        for event in sink.events
+    )
 
 
 def test_shell_binding_auto_approve_updates_proposal(tmp_path: Path) -> None:

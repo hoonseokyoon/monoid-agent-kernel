@@ -1,4 +1,4 @@
-"""Phase 1S conformance profile metadata."""
+"""Conformance profile metadata."""
 
 from __future__ import annotations
 
@@ -6,15 +6,19 @@ from ._metadata import ProfileMetadata
 from .capability_security import PROFILE as CAPABILITY_SECURITY
 from .control_plane import PROFILE as CONTROL_PLANE
 from .durable_runner import PROFILE as DURABLE_RUNNER
+from .message_fabric import PROFILE as MESSAGE_FABRIC
 from .minimal_agent import PROFILE as MINIMAL_AGENT
 from .multi_agent import PROFILE as MULTI_AGENT
 from .provider_gateway import PROFILE as PROVIDER_GATEWAY
 from .reference_full import PROFILE as REFERENCE_FULL
+from .side_effect_tool_agent import PROFILE as SIDE_EFFECT_TOOL_AGENT
 from .tool_agent import PROFILE as TOOL_AGENT
 
 PROFILES: tuple[ProfileMetadata, ...] = (
     MINIMAL_AGENT,
     TOOL_AGENT,
+    SIDE_EFFECT_TOOL_AGENT,
+    MESSAGE_FABRIC,
     DURABLE_RUNNER,
     CONTROL_PLANE,
     CAPABILITY_SECURITY,
@@ -38,12 +42,14 @@ __all__ = [
     "CONTROL_PLANE",
     "DURABLE_RUNNER",
     "MINIMAL_AGENT",
+    "MESSAGE_FABRIC",
     "MULTI_AGENT",
     "PROFILES",
     "PROFILE_BY_ID",
     "PROVIDER_GATEWAY",
     "ProfileMetadata",
     "REFERENCE_FULL",
+    "SIDE_EFFECT_TOOL_AGENT",
     "TOOL_AGENT",
     "get_profile",
 ]

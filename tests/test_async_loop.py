@@ -137,7 +137,12 @@ def test_background_shell_job_completes_on_run_loop_and_reenters(tmp_path: Path)
                 tool_calls=(
                     fake_tool_call(
                         "shell_exec",
-                        {"command": _python_command("print('bg-done')"), "background": True},
+                        {
+                            "command": _python_command(
+                                "import time; time.sleep(0.2); print('bg-done')"
+                            ),
+                            "background": True,
+                        },
                         "c1",
                     ),
                 ),

@@ -18,11 +18,21 @@ from monoid_agent_kernel.core.capability import (
 )
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.control import ControlCommand
+from monoid_agent_kernel.core.external_agent_envelope import (
+    external_agent_envelope_to_inbox_message,
+    validate_external_agent_envelope,
+)
 from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
+from monoid_agent_kernel.core.tool_surface import ToolQuota
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.outbox import (
+    InboxRoutingOutboxSender,
+    OutboxToolProvider,
+    RecordingOutboxSender,
+)
 from monoid_agent_kernel.reference.studio.server import StudioConfig, StudioServer
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
@@ -53,6 +63,12 @@ class ReferenceConformanceFactory:
 
     def new_backend(self) -> ReferenceBackendHarness:
         return ReferenceBackendHarness(self._next_root("backend"))
+
+    def new_side_effect(self) -> ReferenceBackendHarness:
+        return ReferenceBackendHarness(self._next_root("side-effect"))
+
+    def new_message_fabric(self) -> ReferenceBackendHarness:
+        return ReferenceBackendHarness(self._next_root("message-fabric"))
 
     def new_capability(self) -> ReferenceCapabilityHarness:
         return ReferenceCapabilityHarness()
@@ -277,6 +293,71 @@ class _GatedToolProvider:
         ]
 
 
+class _ApprovalToolProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+        del context
+
+        def handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            del ctx
+            self.calls += 1
+            return ToolResult(ok=True, content={"approved_call": True, "value": args.get("value")})
+
+        return [
+            ToolSpec(
+                id="demo.approval",
+                description="demo approval-gated tool",
+                input_schema={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "additionalProperties": True,
+                },
+                capability="",
+                side_effect="write",
+                handler=handler,
+            )
+        ]
+
+
+class _SideEffectDemoProvider:
+    def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+        del context
+
+        def unsafe_handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            del ctx, args
+            return ToolResult(ok=True, content={"unsafe_call": True})
+
+        def idempotent_handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            del ctx
+            key = str(args.get("idempotency_key") or "")
+            return ToolResult(ok=True, content={"idempotency_key": key})
+
+        return [
+            ToolSpec(
+                id="demo.external_unsafe",
+                description="demo external side-effect tool without durable delivery",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+                capability="",
+                side_effect="write",
+                handler=unsafe_handler,
+            ),
+            ToolSpec(
+                id="demo.external_idempotent",
+                description="demo external side-effect tool with caller-provided idempotency",
+                input_schema={
+                    "type": "object",
+                    "properties": {"idempotency_key": {"type": "string"}},
+                    "additionalProperties": True,
+                },
+                capability="",
+                side_effect="write",
+                handler=idempotent_handler,
+            ),
+        ]
+
+
 class ReferenceBackendHarness:
     def __init__(
         self,
@@ -296,13 +377,18 @@ class ReferenceBackendHarness:
         self.checkpoint_store = checkpoint_store or LocalFsCheckpointStore(root / "shared-checkpoints")
         self.token_manager = token_manager or TokenManager.from_secret("x" * 32)
         self.gated_provider = _GatedToolProvider()
+        self.approval_provider = _ApprovalToolProvider()
+        self.side_effect_provider = _SideEffectDemoProvider()
+        self.outbox_sender = RecordingOutboxSender()
+        self.message_fabric_directory: dict[str, str] = {}
+        self.message_fabric_tokens: dict[str, str] = {}
 
         def factory(spec: Any, llm_gateway_token: str) -> _ReferenceMultiAgentAdapter | FakeModelAdapter:
             del llm_gateway_token
             scenario = str(spec.metadata.get("scenario") or "")
             if scenario in {"subagent-foreground", "subagent-capability-revoked"}:
                 return _ReferenceMultiAgentAdapter(scenario=scenario, backend=self.backend, run_id=spec.run_id)
-            return FakeModelAdapter(turns=[ModelTurn(response_id=f"r_{uuid.uuid4().hex[:8]}", final_text="first")])
+            return FakeModelAdapter(turns=_turns_for_scenario(scenario))
 
         self.backend = RunnerBackend(
             run_root=self.run_root,
@@ -312,11 +398,30 @@ class ReferenceBackendHarness:
             model_adapter_factory=factory,
             checkpoint_store=self.checkpoint_store,
             subagent_definitions={"researcher": _child_def()},
-            tool_providers=(self.gated_provider,),
+            tool_providers=(
+                self.gated_provider,
+                self.approval_provider,
+                self.side_effect_provider,
+                OutboxToolProvider(),
+            ),
             capability_broker_factory=lambda req: AutoGrantBroker(),
+            outbox_sender_factory=self._outbox_sender_for,
         )
         self.backend.idle_timeout_s = 30.0
         self.backend.max_recover_attempts = 10_000
+
+    def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
+        scenario = str(request.metadata.get("scenario") or "")
+        if scenario == "tool-side-effect-pending-recovery":
+            return None
+        if scenario.startswith("tool-side-effect-"):
+            return self.outbox_sender
+        if scenario.startswith("message-fabric-"):
+            return InboxRoutingOutboxSender(
+                deliver=self._deliver_message_fabric,
+                source_peer_id=str(request.metadata.get("message_fabric_peer_id") or ""),
+            )
+        return None
 
     @property
     def harness_id(self) -> str:
@@ -324,11 +429,33 @@ class ReferenceBackendHarness:
 
     @property
     def supported_profiles(self) -> tuple[str, ...]:
-        return ("control-plane", "durable-runner", "multi-agent", "reference-full")
+        return (
+            "control-plane",
+            "durable-runner",
+            "multi-agent",
+            "tool-agent",
+            "side-effect-tool-agent",
+            "message-fabric",
+            "reference-full",
+        )
 
     def submit_run(self, request: dict[str, Any]) -> dict[str, Any]:
         scenario = str(request["scenario"])
-        multi_turn = scenario in {"multi-turn", "recoverable-multi-turn", "parked-hitl"}
+        if scenario == "message-fabric-two-peer":
+            return self._submit_message_fabric_two_peer()
+        if scenario == "message-fabric-duplicate-restart":
+            return self._submit_message_fabric_duplicate_restart()
+        multi_turn = scenario in {
+            "multi-turn",
+            "recoverable-multi-turn",
+            "parked-hitl",
+            "tool-ask-approved",
+            "tool-ask-denied",
+            "tool-ask-stale-denied",
+            "tool-side-effect-pending-recovery",
+            "message-fabric-receiver",
+            "message-fabric-worker",
+        }
         submission = self.backend.submit_run(
             BackendRunRequest(
                 tenant_id="tenant_a",
@@ -340,15 +467,178 @@ class ReferenceBackendHarness:
                 metadata={"scenario": scenario},
             )
         )
-        if scenario in {"completed", "subagent-foreground", "subagent-capability-revoked"}:
+        if scenario in {
+            "completed",
+            "subagent-foreground",
+            "subagent-capability-revoked",
+            "tool-quota-denied",
+            "tool-side-effect-outbox-dispatched",
+            "tool-side-effect-strict-rejected",
+            "tool-side-effect-idempotent-inline",
+            "message-fabric-peer-unavailable",
+        }:
             assert self.backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
         elif multi_turn:
             assert _eventually(lambda: self.backend._record(submission.run_id).status == "awaiting_input")
             if scenario == "recoverable-multi-turn":
                 assert _eventually(lambda: self.checkpoint_store.latest(submission.run_id) is not None)
+            elif scenario == "tool-side-effect-pending-recovery":
+                assert _eventually(lambda: self.checkpoint_store.latest(submission.run_id) is not None)
+            elif scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
+                task = self._pending_task(submission.run_id, "tool_approval")
+                if scenario == "tool-ask-stale-denied":
+                    current = self.runtime_config(submission.run_id, submission.run_token)
+                    stale_config = AgentRuntimeConfig.from_json(dict(current["config"]))
+                    stale_config = AgentRuntimeConfig(
+                        definition_id=stale_config.definition_id,
+                        prompt=stale_config.prompt,
+                        tools=(ToolBinding.for_tool("run.finish"),),
+                        config_version=stale_config.config_version + 1,
+                    )
+                    self.replace_runtime_config(
+                        submission.run_id,
+                        submission.run_token,
+                        stale_config.to_json(),
+                        expected_version=int(current["config_version"]),
+                        issuer="profile",
+                        reason="remove approval tool",
+                    )
+                result = (
+                    {"answer": "Deny", "approved": False, "reason": "profile denied"}
+                    if scenario == "tool-ask-denied"
+                    else {"answer": "Approve", "approved": True, "reason": "profile approved"}
+                )
+                self.report_task_result(
+                    submission.run_id,
+                    submission.run_token,
+                    str(task["task_id"]),
+                    result,
+                )
+                assert _eventually(
+                    lambda: _has_event(
+                        self.backend.events(submission.run_id, submission.run_token, limit=200)["events"],
+                        "tool.approval.approved"
+                        if scenario in {"tool-ask-approved", "tool-ask-stale-denied"}
+                        else "tool.approval.denied",
+                    ),
+                    timeout_s=20.0,
+                )
         else:
             raise AssertionError(f"unsupported backend scenario: {scenario}")
         return {"run_id": submission.run_id, "token": submission.run_token}
+
+    def _submit_backend_scenario(
+        self,
+        scenario: str,
+        *,
+        instruction: str | None = None,
+        multi_turn: bool = False,
+    ) -> dict[str, str]:
+        metadata: dict[str, Any] = {"scenario": scenario}
+        if scenario.startswith("message-fabric-"):
+            peer_id = scenario.removeprefix("message-fabric-")
+            metadata["message_fabric_peer_id"] = "planner" if peer_id == "peer-unavailable" else peer_id
+        submission = self.backend.submit_run(
+            BackendRunRequest(
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=self.workspace,
+                instruction=instruction or f"{scenario} run",
+                runtime_config=_runtime_config_for_scenario(scenario),
+                multi_turn=multi_turn,
+                metadata=metadata,
+            )
+        )
+        return {"run_id": submission.run_id, "token": submission.run_token}
+
+    def _submit_message_fabric_two_peer(self) -> dict[str, Any]:
+        worker = self._submit_backend_scenario(
+            "message-fabric-worker",
+            instruction="stand by for planner",
+            multi_turn=True,
+        )
+        self.message_fabric_directory["worker"] = worker["run_id"]
+        self.message_fabric_tokens[worker["run_id"]] = worker["token"]
+        assert _eventually(lambda: self.backend._record(worker["run_id"]).status == "awaiting_input")
+
+        planner = self._submit_backend_scenario(
+            "message-fabric-planner",
+            instruction="collaborate with worker",
+            multi_turn=True,
+        )
+        self.message_fabric_directory["planner"] = planner["run_id"]
+        self.message_fabric_tokens[planner["run_id"]] = planner["token"]
+        assert _eventually(
+            lambda: _has_event(
+                self.events(planner["run_id"], planner["token"], limit=200)["events"],
+                "outbox.dispatched",
+            ),
+            timeout_s=20.0,
+        )
+        assert _eventually(
+            lambda: _has_event(
+                self.events(worker["run_id"], worker["token"], limit=200)["events"],
+                "outbox.dispatched",
+            ),
+            timeout_s=20.0,
+        )
+        return {
+            "run_id": planner["run_id"],
+            "token": planner["token"],
+            "peer_run_id": worker["run_id"],
+            "peer_token": worker["token"],
+        }
+
+    def _submit_message_fabric_duplicate_restart(self) -> dict[str, Any]:
+        receiver = self._submit_backend_scenario(
+            "message-fabric-receiver",
+            instruction="receive external agent messages",
+            multi_turn=True,
+        )
+        assert _eventually(lambda: self.backend._record(receiver["run_id"]).status == "awaiting_input")
+        envelope = _external_agent_envelope("mf-duplicate-1", peer_id="planner", text="hello worker")
+        first = self.deliver_external_agent_message(receiver["run_id"], receiver["token"], envelope)
+        assert first["status"] == "queued"
+        assert _eventually(
+            lambda: "mf-duplicate-1"
+            in self.message_fabric_state(receiver["run_id"], receiver["token"])["seen_inbox_ids"],
+            timeout_s=20.0,
+        )
+        assert _eventually(
+            lambda: (
+                self.checkpoint_store.latest(receiver["run_id"]) is not None
+                and "mf-duplicate-1"
+                in self.checkpoint_store.latest(receiver["run_id"]).checkpoint.inbox_seen_ids  # type: ignore[union-attr]
+            ),
+            timeout_s=20.0,
+        )
+        restarted = self.restart(local_state="same")
+        restarted.resume_run(receiver["run_id"], receiver["token"])
+        duplicate = restarted.deliver_external_agent_message(
+            receiver["run_id"],
+            receiver["token"],
+            envelope,
+        )
+        state = restarted.message_fabric_state(receiver["run_id"], receiver["token"])
+        _cancel_backend_run(restarted, receiver["run_id"], receiver["token"])
+        return {
+            "run_id": receiver["run_id"],
+            "token": receiver["token"],
+            "message_id": "mf-duplicate-1",
+            "first_status": first["status"],
+            "duplicate_status_after_restart": duplicate["status"],
+            "seen_inbox_ids_after_restart": state["seen_inbox_ids"],
+        }
+
+    def _pending_task(self, run_id: str, kind: str) -> dict[str, Any]:
+        record = self.backend._record(run_id)
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            for task in record.loop._session.res.context.job_manager.list_jobs():  # type: ignore[union-attr]
+                if task.get("kind") == kind and task.get("status") == "running":
+                    return task
+            time.sleep(0.05)
+        raise AssertionError(f"missing pending task kind: {kind}")
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
         return self.backend.status(run_id, token)
@@ -428,11 +718,291 @@ class ReferenceBackendHarness:
         task = json.loads(task_path.read_text(encoding="utf-8"))
         return {"result": task["result"]}
 
+    def side_effects(self, run_id: str, token: str) -> dict[str, Any]:
+        payloads: list[dict[str, Any]] = []
+        try:
+            self.backend.status(run_id, token)
+            record = self.backend._record(run_id)
+        except KeyError:
+            record = None
+        if record is not None and record.loop is not None:
+            payloads = record.loop._outbox.export()
+        if not payloads:
+            latest = self.checkpoint_store.latest(run_id)
+            if latest is not None:
+                payloads = list(latest.checkpoint.outbox_requests)
+        return {"requests": [_side_effect_request_summary(payload) for payload in payloads]}
+
+    def run_outbox_dispatched_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "tool-side-effect-outbox-dispatched"})
+        events = list(self.events(str(submitted["run_id"]), str(submitted["token"]))["events"])
+        return {
+            "requested": _has_event(events, "outbox.requested", destination="email"),
+            "dispatched": _has_event(events, "outbox.dispatched", destination="email"),
+        }
+
+    def run_pending_recovery_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "tool-side-effect-pending-recovery"})
+        pending_requests = list(self.side_effects(str(submitted["run_id"]), str(submitted["token"]))["requests"])
+        if len(pending_requests) != 1:
+            raise AssertionError("expected one pending side-effect request")
+        restarted = self.restart(local_state="same")
+        recovered_requests = list(
+            restarted.side_effects(str(submitted["run_id"]), str(submitted["token"]))["requests"]
+        )
+        if len(recovered_requests) != 1:
+            raise AssertionError("expected one recovered side-effect request")
+        _cancel_backend_run(self, str(submitted["run_id"]), str(submitted["token"]))
+        return {
+            "request_id": pending_requests[0]["request_id"],
+            "initial_status": pending_requests[0]["status"],
+            "recovered_request_id": recovered_requests[0]["request_id"],
+            "recovered_status": recovered_requests[0]["status"],
+        }
+
+    def run_strict_rejected_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "tool-side-effect-strict-rejected"})
+        events = list(self.events(str(submitted["run_id"]), str(submitted["token"]))["events"])
+        return {
+            "denied": _has_event(
+                events,
+                "permission.denied",
+                call_id="unsafe_1",
+                error_code="tool_side_effect_policy_denied",
+            ),
+            "handler_finished": _has_event(events, "tool.call.finished", call_id="unsafe_1"),
+        }
+
+    def run_idempotent_inline_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "tool-side-effect-idempotent-inline"})
+        events = list(self.events(str(submitted["run_id"]), str(submitted["token"]))["events"])
+        return {
+            "missing_denied": _has_event(
+                events,
+                "permission.denied",
+                call_id="idempotent_missing",
+                error_code="tool_side_effect_policy_denied",
+            ),
+            "valid_finished": _has_event(
+                events,
+                "tool.call.finished",
+                call_id="idempotent_ok",
+                tool="demo_external_idempotent",
+            ),
+        }
+
+    def deliver_external_agent_message(
+        self,
+        run_id: str,
+        token: str,
+        envelope: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            parsed = validate_external_agent_envelope(dict(envelope))
+        except ValueError as exc:
+            return {
+                "run_id": run_id,
+                "status": "rejected",
+                "error_code": "external_agent_envelope_invalid",
+                "error": str(exc),
+            }
+        message = external_agent_envelope_to_inbox_message(parsed, run_id=run_id)
+        return self.backend.send_message(
+            run_id,
+            token,
+            message.content,
+            message_id=message.id,
+            source=message.source,
+            correlation_id=message.correlation_id,
+            causation_id=message.causation_id,
+            traceparent=message.traceparent,
+            tracestate=message.tracestate,
+            message_type=message.type,
+            metadata=message.metadata,
+        )
+
+    def message_fabric_state(self, run_id: str, token: str) -> dict[str, Any]:
+        payloads: list[dict[str, Any]] = []
+        record = None
+        try:
+            self.backend.status(run_id, token)
+            record = self.backend._record(run_id)
+        except KeyError:
+            pass
+        if record is not None and record.loop is not None:
+            payloads = record.loop._outbox.export()
+        if not payloads:
+            latest = self.checkpoint_store.latest(run_id)
+            if latest is not None:
+                payloads = list(latest.checkpoint.outbox_requests)
+        seen_ids = sorted(record.seen_inbox_ids) if record is not None else []
+        if not seen_ids:
+            latest = self.checkpoint_store.latest(run_id)
+            if latest is not None:
+                seen_ids = sorted(latest.checkpoint.inbox_seen_ids)
+        return {
+            "run_id": run_id,
+            "seen_inbox_ids": seen_ids,
+            "requests": [_side_effect_request_summary(payload) for payload in payloads],
+        }
+
+    def run_two_peer_exchange_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "message-fabric-two-peer"})
+        planner_events = list(
+            self.events(str(submitted["run_id"]), str(submitted["token"]), limit=200)["events"]
+        )
+        worker_events = list(
+            self.events(str(submitted["peer_run_id"]), str(submitted["peer_token"]), limit=200)["events"]
+        )
+        return {
+            "planner_dispatched": _has_event(planner_events, "outbox.dispatched", destination="worker"),
+            "worker_replied": _has_event(worker_events, "outbox.dispatched", destination="planner"),
+            "planner_trace_preserved": _event_with_trace(
+                planner_events,
+                "outbox.dispatched",
+                destination="worker",
+            ),
+            "worker_trace_preserved": _event_with_trace(
+                worker_events,
+                "outbox.dispatched",
+                destination="planner",
+            ),
+        }
+
+    def run_malformed_envelope_case(self) -> dict[str, Any]:
+        receiver = self.submit_run({"scenario": "message-fabric-receiver"})
+        malformed = self.deliver_external_agent_message(
+            str(receiver["run_id"]),
+            str(receiver["token"]),
+            {"protocol": "monoid.external-agent-envelope.v1", "peer_id": "planner"},
+        )
+        _cancel_backend_run(self, str(receiver["run_id"]), str(receiver["token"]))
+        return malformed
+
+    def run_duplicate_after_restart_case(self) -> dict[str, Any]:
+        return self.submit_run({"scenario": "message-fabric-duplicate-restart"})
+
+    def run_peer_unavailable_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "message-fabric-peer-unavailable"})
+        state = self.message_fabric_state(str(submitted["run_id"]), str(submitted["token"]))
+        pending = [request for request in state["requests"] if request["destination"] == "missing-worker"]
+        if len(pending) != 1:
+            raise AssertionError("expected one pending message-fabric request")
+        return {
+            "pending": True,
+            "status": pending[0]["status"],
+            "attempts": pending[0]["attempts"],
+        }
+
+    def _deliver_message_fabric(
+        self,
+        destination: str,
+        envelope: dict[str, Any],
+        *,
+        message_id: str,
+        correlation_id: str,
+        causation_id: str,
+        traceparent: str,
+    ) -> str:
+        del message_id, correlation_id, causation_id, traceparent
+        run_id = self.message_fabric_directory.get(destination)
+        if not run_id:
+            raise LookupError(f"no agent {destination!r}")
+        token = self.message_fabric_tokens[run_id]
+        result = self.deliver_external_agent_message(run_id, token, envelope)
+        return f"external-agent:{run_id}:{result.get('message_id', '')}"
+
     def dispatch(self, command: dict[str, Any]) -> dict[str, Any]:
         return self.backend.dispatch(ControlCommand.from_json(dict(command))).to_json()
 
+    def report_task_result(
+        self,
+        run_id: str,
+        token: str,
+        task_id: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.backend.report_task_result(run_id, token, task_id=task_id, result=result)
+
 
 def _runtime_config_for_scenario(scenario: str) -> AgentRuntimeConfig:
+    if scenario in {"tool-side-effect-outbox-dispatched", "tool-side-effect-pending-recovery"}:
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool(
+                    "outbox.send",
+                    runtime={
+                        "requires_lease": True,
+                        "external_side_effect": True,
+                        "side_effect_delivery": "outbox",
+                    },
+                ),
+                ToolBinding.for_tool("run.finish"),
+            ),
+            metadata={"tool_side_effect_policy": {"mode": "strict"}},
+        )
+    if scenario in {
+        "message-fabric-planner",
+        "message-fabric-worker",
+        "message-fabric-peer-unavailable",
+    }:
+        return AgentRuntimeConfig(
+            definition_id="message-fabric-agent",
+            tools=(
+                ToolBinding.for_tool("outbox.send", runtime={"requires_lease": True}),
+                ToolBinding.for_tool("run.finish"),
+            ),
+        )
+    if scenario == "message-fabric-receiver":
+        return AgentRuntimeConfig(
+            definition_id="message-fabric-agent",
+            tools=(ToolBinding.for_tool("run.finish"),),
+        )
+    if scenario == "tool-side-effect-strict-rejected":
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool(
+                    "demo.external_unsafe",
+                    runtime={"external_side_effect": True},
+                ),
+                ToolBinding.for_tool("run.finish"),
+            ),
+            metadata={"tool_side_effect_policy": {"mode": "strict"}},
+        )
+    if scenario == "tool-side-effect-idempotent-inline":
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool(
+                    "demo.external_idempotent",
+                    runtime={
+                        "external_side_effect": True,
+                        "side_effect_delivery": "idempotent",
+                        "idempotency_key_arg": "idempotency_key",
+                    },
+                ),
+                ToolBinding.for_tool("run.finish"),
+            ),
+            metadata={"tool_side_effect_policy": {"mode": "strict"}},
+        )
+    if scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool("demo.approval", authorization="ask"),
+                ToolBinding.for_tool("run.finish"),
+            ),
+        )
+    if scenario == "tool-quota-denied":
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool("demo.approval", quota=ToolQuota(max_calls_per_run=0)),
+                ToolBinding.for_tool("run.finish"),
+            ),
+        )
     if scenario == "subagent-capability-revoked":
         return AgentRuntimeConfig(
             definition_id="parent",
@@ -459,12 +1029,169 @@ def _runtime_config_for_scenario(scenario: str) -> AgentRuntimeConfig:
     )
 
 
+def _turns_for_scenario(scenario: str) -> list[ModelTurn]:
+    if scenario in {"tool-side-effect-outbox-dispatched", "tool-side-effect-pending-recovery"}:
+        return [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "outbox_send",
+                        {
+                            "destination": "email",
+                            "payload": {"to": "x@example.test"},
+                            "idempotency_key": f"{scenario}:email:1",
+                        },
+                        "outbox_1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text=f"{scenario} completed"),
+        ]
+    if scenario == "message-fabric-planner":
+        return [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "outbox_send",
+                        {
+                            "destination": "worker",
+                            "payload": {
+                                "text": "please do X",
+                                "task_id": "message-fabric-task-1",
+                            },
+                            "idempotency_key": "planner-to-worker-1",
+                        },
+                        "planner_send_1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="planner sent request"),
+        ]
+    if scenario == "message-fabric-worker":
+        return [
+            ModelTurn(final_text="worker standing by"),
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "outbox_send",
+                        {
+                            "destination": "planner",
+                            "payload": {
+                                "text": "done: ok",
+                                "task_id": "message-fabric-task-1",
+                            },
+                            "idempotency_key": "worker-to-planner-1",
+                        },
+                        "worker_send_1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="worker replied"),
+        ]
+    if scenario == "message-fabric-peer-unavailable":
+        return [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "outbox_send",
+                        {
+                            "destination": "missing-worker",
+                            "payload": {"text": "are you there?"},
+                            "idempotency_key": "missing-worker-1",
+                        },
+                        "missing_send_1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="queued unavailable peer"),
+        ]
+    if scenario == "message-fabric-receiver":
+        return [
+            ModelTurn(final_text="receiver standing by"),
+            ModelTurn(final_text="receiver processed message"),
+        ]
+    if scenario == "tool-side-effect-strict-rejected":
+        return [
+            ModelTurn(tool_calls=(fake_tool_call("demo_external_unsafe", {}, "unsafe_1"),)),
+            ModelTurn(final_text="strict rejection completed"),
+        ]
+    if scenario == "tool-side-effect-idempotent-inline":
+        return [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call("demo_external_idempotent", {}, "idempotent_missing"),
+                    fake_tool_call(
+                        "demo_external_idempotent",
+                        {"idempotency_key": "idem-1"},
+                        "idempotent_ok",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="idempotent inline completed"),
+        ]
+    if scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
+        return [
+            ModelTurn(
+                tool_calls=(fake_tool_call("demo_approval", {"value": scenario}, "approval_1"),)
+            ),
+            ModelTurn(response_id="ignored_until_approval", final_text="waiting for approval"),
+            ModelTurn(final_text=f"{scenario} completed"),
+        ]
+    if scenario == "tool-quota-denied":
+        return [
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "quota"}, "approval_1"),)),
+            ModelTurn(final_text="quota denied completed"),
+        ]
+    return [ModelTurn(response_id=f"r_{uuid.uuid4().hex[:8]}", final_text="first")]
+
+
 def _child_def() -> SubagentDefinition:
     return SubagentDefinition(
         description="Researcher",
         prompt=PromptSpec(persona_segments=(CHILD_MARK,)),
         tools=("mcp.demo.gated",),
     )
+
+
+def _side_effect_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload.get("id") or ""),
+        "destination": str(payload.get("destination") or ""),
+        "status": str(payload.get("status") or ""),
+        "idempotency_key": str(payload.get("idempotency_key") or ""),
+        "attempts": int(payload.get("attempts") or 0),
+        "token_ref_present": bool(payload.get("token_ref")),
+    }
+
+
+def _external_agent_envelope(message_id: str, *, peer_id: str, text: str) -> dict[str, Any]:
+    from monoid_agent_kernel.core.external_agent_envelope import (
+        EXTERNAL_AGENT_ENVELOPE_VERSION,
+    )
+
+    return {
+        "protocol": EXTERNAL_AGENT_ENVELOPE_VERSION,
+        "peer_id": peer_id,
+        "message_id": message_id,
+        "task_id": "message-fabric-task-1",
+        "correlation_id": "message-fabric-correlation-1",
+        "causation_id": "message-fabric-cause-1",
+        "parts": [{"type": "text", "text": text}],
+    }
+
+
+def _cancel_backend_run(harness: ReferenceBackendHarness, run_id: str, token: str) -> None:
+    try:
+        harness.dispatch(
+            {
+                "type": "cancel",
+                "run_id": run_id,
+                "args": {"token": token},
+                "issuer": "reference-message-fabric",
+            }
+        )
+    except Exception:
+        pass
 
 
 def _eventually(fn: Any, *, timeout_s: float = 10.0) -> bool:
@@ -485,3 +1212,24 @@ def _wait_for_event(server: StudioServer, run_id: str, event_type: str) -> list[
             return events
         time.sleep(0.1)
     return events
+
+
+def _has_event(events: list[dict[str, Any]], event_type: str, **data: str) -> bool:
+    for event in events:
+        if event.get("type") != event_type:
+            continue
+        event_data = event.get("data") or {}
+        if all(event_data.get(key) == value for key, value in data.items()):
+            return True
+    return False
+
+
+def _event_with_trace(events: list[dict[str, Any]], event_type: str, **data: str) -> bool:
+    for event in events:
+        if event.get("type") != event_type:
+            continue
+        event_data = event.get("data") or {}
+        if not all(event_data.get(key) == value for key, value in data.items()):
+            continue
+        return bool(event_data.get("traceparent"))
+    return False

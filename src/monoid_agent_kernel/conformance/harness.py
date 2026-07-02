@@ -82,6 +82,40 @@ class BackendHarness(ConformanceHarness, Protocol):
 
 
 @runtime_checkable
+class SideEffectHarness(ConformanceHarness, Protocol):
+    """Backend operations used by side-effect-tool-agent profiles."""
+
+    def run_outbox_dispatched_case(self) -> JsonObject:
+        """Run a strict outbox side-effect case that stages and dispatches one request."""
+
+    def run_pending_recovery_case(self) -> JsonObject:
+        """Run a strict outbox side-effect case whose pending request survives restart."""
+
+    def run_strict_rejected_case(self) -> JsonObject:
+        """Run a strict external side-effect case rejected before handler execution."""
+
+    def run_idempotent_inline_case(self) -> JsonObject:
+        """Run an idempotent inline external side-effect case."""
+
+
+@runtime_checkable
+class MessageFabricHarness(ConformanceHarness, Protocol):
+    """Backend operations used by external agent message-fabric profiles."""
+
+    def run_two_peer_exchange_case(self) -> JsonObject:
+        """Run a two-peer exchange over the external-agent message fabric."""
+
+    def run_malformed_envelope_case(self) -> JsonObject:
+        """Run a malformed external-agent envelope rejection case."""
+
+    def run_duplicate_after_restart_case(self) -> JsonObject:
+        """Run a duplicate message case that survives restart."""
+
+    def run_peer_unavailable_case(self) -> JsonObject:
+        """Run a peer-unavailable case that leaves a retryable pending request."""
+
+
+@runtime_checkable
 class GatewayHarness(ConformanceHarness, Protocol):
     """Gateway operation used by provider-gateway profiles."""
 

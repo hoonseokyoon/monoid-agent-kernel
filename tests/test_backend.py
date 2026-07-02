@@ -30,6 +30,7 @@ from support.backend_harness import (
     time,
     tool_binding,
 )
+from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 pytestmark = pytest.mark.integration
 
@@ -80,6 +81,257 @@ def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) ->
     ]
     assert hitl_obs, "the human answer never reached the model through the backend"
     assert hitl_obs[0].output["answer"] == "Ada"
+
+
+def test_backend_task_result_checkpoint_preserves_queued_messages(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    adapters: list = []
+    backend = _hitl_backend(
+        tmp_path,
+        workspace,
+        adapters,
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick a name"}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="answered"),
+        ],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Name the project, ask me if unsure.",
+            runtime_config=runtime_config("hitl.request"),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: bool(_running_hitl_tasks(backend, run_id)))
+    task = _running_hitl_tasks(backend, run_id)[0]
+
+    queued = backend.send_message(run_id, token, "queued while approval is pending", message_id="queued-1")
+    assert queued["status"] == "queued"
+    assert eventually(lambda: backend._record(run_id).message_queue.qsize() == 1)
+
+    backend.report_task_result(run_id, token, task_id=task.job_id, result={"answer": "Ada"})
+    stored = backend.checkpoint_store.latest(run_id)
+
+    assert stored is not None
+    assert any(
+        isinstance(message, dict) and message.get("id") == "queued-1"
+        for message in stored.checkpoint.queued_messages
+    )
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_backend_tool_approval_replay_checkpoint_preserves_queued_messages(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    observed: dict[str, object] = {}
+    holder: dict[str, object] = {}
+
+    class ApprovalProvider:
+        calls = 0
+
+        def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                self.calls += 1
+                backend = holder["backend"]
+                run_id = str(holder["run_id"])
+                latest = backend.checkpoint_store.latest(run_id)
+                assert latest is not None
+                observed["queued_ids"] = [
+                    message.get("id")
+                    for message in latest.checkpoint.queued_messages
+                    if isinstance(message, dict)
+                ]
+                observed["pending_replays"] = list(latest.checkpoint.pending_tool_approval_replays)
+                return ToolResult(ok=True, content={"value": "ok"})
+
+            return [
+                ToolSpec(
+                    id="demo.approval",
+                    description="approval demo",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    provider = ApprovalProvider()
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+                ModelTurn(final_text="park"),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        tool_providers=(provider,),
+    )
+    holder["backend"] = backend
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="use approval",
+            runtime_config=runtime_config(
+                bindings=(
+                    tool_binding("demo.approval", authorization="ask"),
+                    tool_binding("run.finish"),
+                )
+            ),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    holder["run_id"] = run_id
+
+    def pending_approval_tasks() -> list:
+        record = backend._record(run_id)
+        if record.loop is None or record.loop._session is None:
+            return []
+        return [
+            task
+            for task in record.loop._session.res.context.job_manager.list_jobs()
+            if task.get("kind") == "tool_approval" and task.get("status") == "running"
+        ]
+
+    assert eventually(lambda: bool(pending_approval_tasks()))
+    task_id = pending_approval_tasks()[0]["task_id"]
+    queued = backend.send_message(run_id, token, "queued while approval replays", message_id="queued-approval")
+    assert queued["status"] == "queued"
+    backend.report_task_result(run_id, token, task_id=task_id, result={"approved": True})
+
+    assert eventually(lambda: provider.calls == 1 and "queued_ids" in observed)
+    assert "queued-approval" in observed["queued_ids"]
+    assert observed["pending_replays"] == []
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_backend_recovered_tool_approval_replay_checkpoint_preserves_queued_messages(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+    observed: dict[str, object] = {}
+    holder: dict[str, object] = {}
+
+    class ApprovalProvider:
+        calls = 0
+
+        def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                self.calls += 1
+                backend = holder["backend"]
+                run_id = str(holder["run_id"])
+                latest = backend.checkpoint_store.latest(run_id)
+                assert latest is not None
+                observed["queued_ids"] = [
+                    message.get("id")
+                    for message in latest.checkpoint.queued_messages
+                    if isinstance(message, dict)
+                ]
+                observed["pending_replays"] = list(latest.checkpoint.pending_tool_approval_replays)
+                return ToolResult(ok=True, content={"value": "ok"})
+
+            return [
+                ToolSpec(
+                    id="demo.approval",
+                    description="approval demo",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    provider = ApprovalProvider()
+
+    backend1 = RunnerBackend(
+        run_root=run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
+            turns=[ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),))]
+        ),
+        tool_providers=(provider,),
+    )
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="use approval",
+            runtime_config=runtime_config(
+                bindings=(
+                    tool_binding("demo.approval", authorization="ask"),
+                    tool_binding("run.finish"),
+                )
+            ),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    holder["run_id"] = run_id
+
+    def pending_approval_tasks(backend: RunnerBackend) -> list:
+        record = backend._record(run_id)
+        if record.loop is None or record.loop._session is None:
+            return []
+        return [
+            task
+            for task in record.loop._session.res.context.job_manager.list_jobs()
+            if task.get("kind") == "tool_approval" and task.get("status") == "running"
+        ]
+
+    assert eventually(lambda: bool(pending_approval_tasks(backend1)))
+    assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
+
+    backend2 = RunnerBackend(
+        run_root=run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+        tool_providers=(provider,),
+    )
+    backend2.max_recover_attempts = 10_000
+    assert eventually(lambda: run_id in backend2.recover_runs() or run_id in backend2._records)
+    assert eventually(lambda: bool(pending_approval_tasks(backend2)))
+    holder["backend"] = backend2
+
+    queued = backend2.send_message(run_id, token, "queued while recovered approval replays", message_id="queued-recovered")
+    assert queued["status"] == "queued"
+    task_id = pending_approval_tasks(backend2)[0]["task_id"]
+    backend2.report_task_result(run_id, token, task_id=task_id, result={"approved": True})
+
+    assert eventually(lambda: provider.calls == 1 and "queued_ids" in observed)
+    assert "queued-recovered" in observed["queued_ids"]
+    assert observed["pending_replays"] == []
+
+    backend2.cancel_run(run_id, token)
+    backend2.wait_for_run(run_id, timeout_s=20)
+    backend1.shutdown(drain=True)
 
 
 def test_backend_create_task_injects_into_running_run(tmp_path: Path) -> None:
@@ -527,6 +779,30 @@ def test_backend_send_message_rejects_oversized_content(tmp_path: Path) -> None:
     backend.wait_for_run(submission.run_id, timeout_s=5)
     with pytest.raises(ValueError, match="exceeds"):
         backend.send_message(submission.run_id, submission.run_token, "x" * 200)
+
+
+def test_backend_send_message_counts_metadata_in_size_limit(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    backend.max_message_bytes = 220
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Summarize.",
+            runtime_config=_default_config(),
+        )
+    )
+    backend.wait_for_run(submission.run_id, timeout_s=5)
+
+    with pytest.raises(ValueError, match="exceeds"):
+        backend.send_message(
+            submission.run_id,
+            submission.run_token,
+            "ok",
+            metadata={"external_agent_payload": "x" * 500},
+        )
 
 
 def test_backend_bounds_concurrent_runs(tmp_path: Path) -> None:

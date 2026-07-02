@@ -17,19 +17,22 @@ conformance harnesses can be wired together for local smoke testing and document
 - `monoid_agent_kernel.reference.llm_gateway`: LLM gateway example and offline provider path.
 - `monoid_agent_kernel.reference.web_gateway`: scoped web/search/fetch/context gateway example.
 - `monoid_agent_kernel.reference.mcp_gateway`: MCP gateway example for brokered tool integration.
+- `monoid_agent_kernel.reference.outbox`: durable senders, including the Reference message-fabric
+  adapter that routes external-agent envelopes into peer inboxes.
 - `monoid_agent_kernel.reference.stores`: local durable store examples.
 - `monoid_agent_kernel.reference.studio`: browser UI and smoke surface.
 - `monoid_agent_kernel.reference.conformance`: public Reference harnesses for conformance profiles.
 
 ## Conformance Role
 
-The Reference implementation is the first target for each conformance profile. When a Phase 1S rule
-is added, Reference gets an adapter or smoke path that proves the rule against the bundled example.
+The Reference implementation is the first target for each conformance profile. When an operational
+rule is added, Reference gets an adapter or smoke path that proves the rule against the bundled example.
 External backends can use that adapter shape as a starting point for their own profile harnesses.
 
 `monoid_agent_kernel.reference.conformance` provides that adapter shape as a public Reference
-example. `ReferenceConformanceFactory` creates fresh backend, capability, and gateway harnesses for
-profile assertions, then runs an offline Studio smoke path for `reference-full`.
+example. `ReferenceConformanceFactory` creates fresh backend, capability, gateway, side-effect, and
+message-fabric harnesses for profile assertions, then runs an offline Studio smoke path for
+`reference-full`.
 
 The harness keeps profile tests focused on observable behavior. The Reference services keep the
 actual backend, gateway, and Studio wiring visible as a runnable example.
@@ -38,5 +41,5 @@ actual backend, gateway, and Studio wiring visible as a runnable example.
 
 Reference review should identify whether the example assembles the contract and helper kit clearly.
 Repeated runtime invariants move into Contract rules, Core Helper Kit modules, and conformance
-profiles. `docs/PHASE_1S_COVERAGE.md` shows the current Phase 1S mapping from rule ids to
-Reference harness scenarios and tests.
+profiles. `docs/OPERATIONAL_RULE_COVERAGE.md` shows the current mapping from rule ids to Reference
+harness cases and tests.

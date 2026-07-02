@@ -16,6 +16,11 @@ from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel._proc import file_size, proc_group_kwargs, terminate_process
 from monoid_agent_kernel.core._util import write_json_atomic
+from monoid_agent_kernel.core.tool_approval import (
+    TOOL_APPROVAL_RESULT_TYPE,
+    TOOL_APPROVAL_TASK_KIND,
+    normalize_tool_approval_result,
+)
 from monoid_agent_kernel.errors import ToolExecutionError, WorkspaceError
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -521,12 +526,12 @@ class HostedTask:
             "created_by": self.created_by,
             "prompt": self.prompt,
             "choices": list(self.choices),
-            "request": self.request,
+            "request": self.public_request(),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration_s": self.duration_s,
             "error": self.error,
-            "result": self.result,
+            "result": self.public_result(),
         }
 
     def checkpoint_json(self) -> dict[str, Any]:
@@ -583,7 +588,7 @@ class HostedTask:
             "status": self.status,
             "prompt": self.prompt,
             "choices": list(self.choices),
-            "request": self.request,
+            "request": self.public_request(),
         }
 
     def terminal_event(self) -> tuple[str, str]:
@@ -598,6 +603,17 @@ class HostedTask:
     def public_payload(self, run_dir: Path, permission_policy: PermissionPolicy) -> dict[str, Any]:
         del permission_policy
         return self.to_json(run_dir)
+
+    def public_request(self) -> dict[str, Any]:
+        request = dict(self.request)
+        if self.kind == TOOL_APPROVAL_TASK_KIND:
+            request.pop("arguments", None)
+        return request
+
+    def public_result(self) -> dict[str, Any] | None:
+        if self.kind == TOOL_APPROVAL_TASK_KIND and self.result is not None:
+            return normalize_tool_approval_result(self.result, task_id=self.job_id)
+        return self.result
 
     def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:
         del run_dir, tail_bytes
@@ -674,11 +690,11 @@ class HostedResultInjector:
             else f"{self.kind} task {job.job_id} finished with status {job.status}."
         )
         output = {
+            **result,
             "type": self.result_type,
             "task_id": job.job_id,
             "status": job.status,
             "message": message,
-            **result,
         }
         call_id = f"task:{job.job_id}" if self.as_user_message else f"{self.kind}:{job.job_id}"
         return [
@@ -834,6 +850,10 @@ class TaskManager:
             # lease / tool-enable decision), resolved through the same report_result -> reentry
             # path as hitl/automation. The grant is injected back as an async tool result.
             "capability": HostedTaskExecutor(kind="capability"),
+            # Generic tool approval: authorization="ask" parks here until an operator/human
+            # reports approve/deny. The loop interprets the result and either replays the captured
+            # call through the normal tool path or delivers a denial observation.
+            TOOL_APPROVAL_TASK_KIND: HostedTaskExecutor(kind=TOOL_APPROVAL_TASK_KIND),
         }
         self.injectors = {
             "shell": ShellResultInjector(),
@@ -843,6 +863,11 @@ class TaskManager:
             ),
             "capability": HostedResultInjector(
                 kind="capability", tool_name="capability", result_type="capability_grant"
+            ),
+            TOOL_APPROVAL_TASK_KIND: HostedResultInjector(
+                kind=TOOL_APPROVAL_TASK_KIND,
+                tool_name="tool_approval",
+                result_type=TOOL_APPROVAL_RESULT_TYPE,
             ),
         }
 

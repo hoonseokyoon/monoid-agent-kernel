@@ -43,8 +43,9 @@ The package is organized around four roles:
   `ToolSpec` / `@tool`, `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest. See
   [docs/CONTRACTS.md](docs/CONTRACTS.md) for the Python, HTTP, wiring, and operational rules.
 - **Conformance Test** — profile-based tests that check contract behavior for a chosen runtime
-  shape. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the Phase 1S profile model and
-  [docs/PHASE_1S_COVERAGE.md](docs/PHASE_1S_COVERAGE.md) for the rule-to-test coverage matrix.
+  shape. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the profile model and
+  [docs/OPERATIONAL_RULE_COVERAGE.md](docs/OPERATIONAL_RULE_COVERAGE.md) for the
+  rule-to-test coverage matrix.
 - **Core Helper Kit** — the supported runtime and helper modules that make the contract easy to
   satisfy (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). See
   [docs/CORE_HELPER_KIT.md](docs/CORE_HELPER_KIT.md) for the helper boundary.
@@ -586,6 +587,13 @@ for existing durable artifacts and gateway requests.
 Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
 development setup and the lint/test workflow, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 For security issues, follow [SECURITY.md](SECURITY.md) (do not open a public issue).
+
+Fast local confidence checks:
+
+```bash
+python -m pytest tests/conformance -q
+python -m pytest -q -n 4
+```
 
 ## License
 

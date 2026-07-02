@@ -9,8 +9,13 @@ from typing import Any
 from support.runtime import runtime_config, runtime_provider, tool_binding
 from support.waiting import eventually
 
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
+from monoid_agent_kernel.core.external_agent_envelope import (
+    external_agent_envelope_to_inbox_message,
+    validate_external_agent_envelope,
+)
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.loop import AgentLoop
@@ -135,6 +140,44 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(tmp_path: Path)
     child = parse_traceparent(sender.child_traceparents[0])
     assert child is not None and child["trace_id"] == parse_traceparent(tp)["trace_id"]
     assert child["span_id"] != parse_traceparent(tp)["span_id"]
+
+
+def test_strict_outbox_side_effect_stages_and_dispatches(tmp_path: Path) -> None:
+    sender = RecordingOutboxSender()
+    backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    binding = tool_binding(
+        "outbox.send",
+        runtime={
+            "requires_lease": True,
+            "external_side_effect": True,
+            "side_effect_delivery": "outbox",
+        },
+        scope=ToolScope(),
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="go",
+            runtime_config=AgentRuntimeConfig(
+                definition_id="test-agent",
+                tools=(binding,),
+                metadata={"tool_side_effect_policy": {"mode": "strict"}},
+            ),
+        )
+    )
+    assert backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
+
+    assert [request.destination for request in sender.sent] == ["email"]
+    events = [
+        json.loads(line)
+        for line in (backend._record(submission.run_id).run_dir / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert any(event["type"] == "outbox.requested" for event in events)
+    assert any(event["type"] == "outbox.dispatched" for event in events)
 
 
 def test_outbox_not_staged_when_capability_denied(tmp_path: Path) -> None:
@@ -364,20 +407,28 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
     directory: dict[str, str] = {}  # agent name -> run_id
     tokens: dict[str, str] = {}
     holder: dict[str, Any] = {}
+    delivered_sources: list[tuple[str, str]] = []
 
     def deliver(destination, payload, *, message_id, correlation_id, causation_id, traceparent):
         run_id = directory.get(destination)
         if not run_id:  # peer not registered yet -> retryable; the backend redrives
             raise LookupError(f"no agent {destination!r}")
-        text = str(payload.get("text") or json.dumps(payload))
+        envelope = validate_external_agent_envelope(dict(payload))
+        message = external_agent_envelope_to_inbox_message(envelope, run_id=run_id)
+        delivered_sources.append((destination, message.source))
         holder["backend"].send_message(
-            run_id, tokens[run_id], text,
-            message_id=message_id, source="agent",
-            correlation_id=correlation_id, causation_id=causation_id, traceparent=traceparent,
+            run_id,
+            tokens[run_id],
+            message.content,
+            message_id=message.id or message_id,
+            source=message.source,
+            correlation_id=message.correlation_id or correlation_id,
+            causation_id=message.causation_id or causation_id,
+            traceparent=message.traceparent or traceparent,
+            message_type=message.type,
+            metadata=message.metadata,
         )
         return f"a2a:{run_id}"
-
-    sender = InboxRoutingOutboxSender(deliver=deliver)
 
     # Worker bootstraps first (we wait for it below), so this ordered script queue is deterministic.
     # Worker: settle the opening turn, then on receiving planner's message reply back to planner.
@@ -397,28 +448,31 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
         model_adapter_factory=factory,
         tool_providers=(OutboxToolProvider(),),
         capability_broker_factory=lambda req: AutoGrantBroker(),
-        outbox_sender_factory=lambda req: sender,
+        outbox_sender_factory=lambda req: InboxRoutingOutboxSender(
+            deliver=deliver,
+            source_peer_id=str(req.metadata.get("message_fabric_peer_id") or ""),
+        ),
     )
     backend.idle_timeout_s = 10.0
     holder["backend"] = backend
 
-    def spawn(instruction: str) -> str:
+    def spawn(name: str, instruction: str) -> str:
         binding = tool_binding("outbox.send", runtime={"requires_lease": True}, scope=ToolScope())
         sub = backend.submit_run(
             BackendRunRequest(
                 tenant_id="tenant_a", user_id="user_a", workspace_root=workspace,
                 instruction=instruction, runtime_config=runtime_config(bindings=(binding,)),
-                multi_turn=True,
+                multi_turn=True, metadata={"message_fabric_peer_id": name},
             )
         )
         tokens[sub.run_id] = sub.run_token
         return sub.run_id
 
     try:
-        worker_id = spawn("stand by for planner")
+        worker_id = spawn("worker", "stand by for planner")
         directory["worker"] = worker_id
         assert eventually(lambda: backend.status(worker_id, tokens[worker_id]).get("status") == "awaiting_input")
-        planner_id = spawn("collaborate with worker")
+        planner_id = spawn("planner", "collaborate with worker")
         directory["planner"] = planner_id
 
         def dispatched_to(run_id: str, dest: str) -> bool:
@@ -432,6 +486,8 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
 
         assert eventually(lambda: dispatched_to(planner_id, "worker"))   # A -> B
         assert eventually(lambda: dispatched_to(worker_id, "planner"))   # B -> A (so B received A's message)
+        assert ("worker", "external-agent:planner") in delivered_sources
+        assert ("planner", "external-agent:worker") in delivered_sources
 
         # The inbox is idempotent: once a message id has been processed, re-delivering it is a no-op.
         assert backend.send_message(worker_id, tokens[worker_id], "dup", message_id="m-dup")["status"] == "queued"

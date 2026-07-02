@@ -89,6 +89,21 @@ from monoid_agent_kernel.core.tool_surface import (
     ToolSurfaceSnapshot,
     tool_surface_manifest,
 )
+from monoid_agent_kernel.core.tool_approval import (
+    TOOL_APPROVAL_RESULT_TYPE,
+    TOOL_APPROVAL_TASK_KIND,
+    approval_replay_from_task,
+    build_tool_approval_task_request,
+    denied_tool_approval_observation,
+    normalize_tool_approval_result,
+    tool_approval_key,
+)
+from monoid_agent_kernel.core.side_effect_policy import (
+    ToolSideEffectPolicy,
+    admit_tool_side_effect,
+    side_effect_policy_from_config,
+    verify_outbox_side_effect,
+)
 from monoid_agent_kernel.core.workspace_index import build_workspace_index
 from monoid_agent_kernel.errors import (
     ModelAdapterError,
@@ -156,6 +171,8 @@ from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.web import WebGatewayClient, domain_allowed, domain_from_url
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.workspace.local import default_local_workspace_factory
+
+CheckpointPersistCallback = Callable[[RunCheckpoint, Mapping[str, bytes]], None]
 
 
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
@@ -621,6 +638,8 @@ class RunState:
     # auto-redispatches them at the next step boundary instead of relying on a model retry (⑤).
     # Each entry: {call_name, call_id, arguments, binding_id, task_id, capability}.
     pending_capability_replays: tuple[dict[str, Any], ...] = ()
+    # authorization="ask" calls approved by an external task and awaiting normal-path replay.
+    pending_tool_approval_replays: tuple[dict[str, Any], ...] = ()
     tool_call_counts: dict[str, int] = field(default_factory=dict)
     previous_surface_snapshot: ToolSurfaceSnapshot | None = None
     previous_runtime_config: AgentRuntimeConfig | None = None
@@ -705,6 +724,9 @@ class AgentLoop:
     # How checkpoints are durably stored (core defines WHAT, the store defines HOW).
     # Defaults to a local-fs store under the run root; a backend injects a durable one.
     checkpoint_store: CheckpointStore | None = None
+    # Optional backend-owned checkpoint writer. Core still builds the checkpoint and advances its
+    # sequence; a backend can fold in queue/inbox metadata before the bytes are committed.
+    checkpoint_persist_callback: CheckpointPersistCallback | None = None
     # Optional capability broker: a bound tool that declares ``runtime.requires_lease=True``
     # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
     # Secrets stay in the broker; the core only gates on the lease. If no broker is configured,
@@ -1558,13 +1580,21 @@ class AgentLoop:
         )
 
     def report_task_result(
-        self, task_id: str, result: dict[str, Any], *, status: str = "answered"
+        self,
+        task_id: str,
+        result: dict[str, Any],
+        *,
+        status: str = "answered",
+        persist_checkpoint: bool = True,
     ) -> dict[str, Any]:
         """Complete a hosted task (e.g. a hitl request) from outside the loop —
         the backend or another thread calls this to deliver a result, waking a
         parked run. The result is injected per the task kind's ResultInjector."""
         session = self._require_open()
-        return session.res.context.job_manager.report_result(task_id, result, status=status)
+        reported = session.res.context.job_manager.report_result(task_id, result, status=status)
+        if persist_checkpoint:
+            self._persist_checkpoint(session)
+        return reported
 
     # --- durable persistence (state-snapshot at park points) ---
 
@@ -1632,6 +1662,9 @@ class AgentLoop:
             capability_leases=self._capability_vault.export_durable(),
             outbox_requests=self._outbox.export(),
             pending_capability_replays=[dict(replay) for replay in state.pending_capability_replays],
+            pending_tool_approval_replays=[
+                dict(replay) for replay in state.pending_tool_approval_replays
+            ],
             # Revocation records so a revoked capability stays dead across the restart.
             **self._capability_vault.export_revocations(),
         )
@@ -1663,7 +1696,11 @@ class AgentLoop:
             return
         session.checkpoint_seq += 1
         checkpoint.seq = session.checkpoint_seq
-        self._checkpoint_store().put(checkpoint, self.collect_checkpoint_blobs())
+        blobs = self.collect_checkpoint_blobs()
+        if self.checkpoint_persist_callback is not None:
+            self.checkpoint_persist_callback(checkpoint, blobs)
+            return
+        self._checkpoint_store().put(checkpoint, blobs)
 
     @staticmethod
     def _workspace_delta_entries(workspace: Workspace) -> list[dict[str, Any]]:
@@ -1764,6 +1801,9 @@ class AgentLoop:
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
             pending_capability_replays=tuple(dict(replay) for replay in cp.pending_capability_replays),
+            pending_tool_approval_replays=tuple(
+                dict(replay) for replay in cp.pending_tool_approval_replays
+            ),
         )
         # Reinstall durable (approved) capability leases so a human-approved capability is not
         # re-prompted after a restart. Ephemeral sync grants were never persisted; they re-broker.
@@ -2618,6 +2658,7 @@ class AgentLoop:
             turn_context = self._turn_context(state, res, step, max(0, max_steps - local_step))
             turn_registry = self._registry_for_turn(context, turn_context, res)
             runtime_config = self._current_runtime_config(turn_registry)
+            side_effect_policy = side_effect_policy_from_config(runtime_config)
             bound_catalog = compile_bound_tool_catalog(runtime_config, turn_registry)
             # Now that the active tool set for this turn is known, expose it on the turn context so
             # a context provider's dynamic_segment can gate itself on the live config (e.g. the
@@ -2682,6 +2723,34 @@ class AgentLoop:
                             recorder=recorder,
                             turn_id=turn_id,
                             step=step,
+                            side_effect_policy=side_effect_policy,
+                        )
+                    )
+                    is not None
+                )
+                if replay_obs:
+                    state.pending_observations = (*state.pending_observations, *replay_obs)
+            if state.pending_tool_approval_replays:
+                pending_replays = state.pending_tool_approval_replays
+                state.pending_tool_approval_replays = ()
+                # Persist the consumed approval replay before invoking the approved handler. If the
+                # process exits during the handler, restore must not re-deliver the same approval and
+                # execute a write/side-effecting tool twice.
+                self._persist_checkpoint(session)
+                replay_obs = tuple(
+                    obs
+                    for replay in pending_replays
+                    if (
+                        obs := self._execute_tool_approval_replay(
+                            replay,
+                            bound_catalog=bound_catalog,
+                            surface_snapshot=surface_snapshot,
+                            call_counts=state.tool_call_counts,
+                            context=context,
+                            recorder=recorder,
+                            turn_id=turn_id,
+                            step=step,
+                            side_effect_policy=side_effect_policy,
                         )
                     )
                     is not None
@@ -2978,6 +3047,7 @@ class AgentLoop:
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
                     step=step,
+                    side_effect_policy=side_effect_policy,
                 )
                 observations.append(observation)
                 self._check_run_boundary(deadline)
@@ -3276,7 +3346,10 @@ class AgentLoop:
                 "count": len(observations),
             },
         )
+        delivered: list[ToolObservation] = []
         for observation in observations:
+            if observation.output.get("type") == TOOL_APPROVAL_RESULT_TYPE:
+                observation = self._handle_tool_approval_result(observation, context, recorder, state)
             recorder.transcript(
                 {
                     "kind": "tool_observation",
@@ -3294,7 +3367,64 @@ class AgentLoop:
             # gated call was captured + auto-redispatch is on) queue it to run at this step's top.
             elif observation.output.get("type") == "capability_grant":
                 self._admit_capability_grant(observation, context, recorder, state)
-        return tuple(observations)
+            delivered.append(observation)
+        return tuple(delivered)
+
+    def _handle_tool_approval_result(
+        self,
+        observation: ToolObservation,
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        state: RunState,
+    ) -> ToolObservation:
+        task_id = str(observation.output.get("task_id") or "")
+        task = context.job_manager.jobs.get(task_id)
+        request_payload = getattr(task, "request", None) if task is not None else None
+        result_payload = getattr(task, "result", None) if task is not None else None
+        normalized = normalize_tool_approval_result(result_payload, task_id=task_id)
+        task_status = str(getattr(task, "status", "") or observation.output.get("status") or "")
+        if normalized["approved"] and task_status != "answered":
+            normalized = {
+                **normalized,
+                "approved": False,
+                "answer": "Deny",
+                "reason": f"tool approval task ended with status {task_status or 'unknown'}",
+            }
+        event_type = "tool.approval.approved" if normalized["approved"] else "tool.approval.denied"
+        recorder.emit(
+            event_type,
+            data={
+                "task_id": task_id,
+                "tool_id": str((request_payload or {}).get("tool_id") or ""),
+                "binding_id": str((request_payload or {}).get("binding_id") or ""),
+                "call_id": str((request_payload or {}).get("call_id") or ""),
+                "reason": normalized["reason"],
+            },
+        )
+        if normalized["approved"]:
+            replay = approval_replay_from_task(request_payload, result_payload, task_id=task_id)
+            if replay is not None:
+                state.pending_tool_approval_replays = (
+                    *state.pending_tool_approval_replays,
+                    replay,
+                )
+            return replace(
+                observation,
+                output={
+                    **normalized,
+                    "status": "approved",
+                    "message": f"Tool approval task {task_id} was approved.",
+                },
+            )
+        return replace(
+            observation,
+            output=denied_tool_approval_observation(
+                request_payload,
+                result_payload,
+                task_id=task_id,
+                reason=normalized["reason"],
+            ),
+        )
 
     def _admit_capability_grant(
         self,
@@ -3359,6 +3489,11 @@ class AgentLoop:
                     "binding_id": request.binding_id,
                     "capability": request.capability,
                     "task_id": str(observation.output.get("task_id") or ""),
+                    "approved_tool_approval": (
+                        dict(request_payload.get("replay_approved_tool_approval") or {})
+                        if request_payload.get("replay_approved_tool_approval") is not None
+                        else None
+                    ),
                 },
             )
 
@@ -3373,6 +3508,7 @@ class AgentLoop:
         recorder: AgentRecorder,
         turn_id: str,
         step: int,
+        side_effect_policy: ToolSideEffectPolicy,
     ) -> ToolObservation | None:
         """Re-execute one gated tool call after its capability was granted, returning the result as
         a user-message observation (so it never collides with the original call's pending tool
@@ -3393,6 +3529,12 @@ class AgentLoop:
             turn_id=turn_id,
             parent_id=None,
             step=step,
+            approved_tool_approval=(
+                dict(replay.get("approved_tool_approval") or {})
+                if replay.get("approved_tool_approval") is not None
+                else None
+            ),
+            side_effect_policy=side_effect_policy,
         )
         # Deliver as a user message (is_background) under a distinct call_id — the original call_id
         # already carries the "pending" tool result, so a second tool result there would be malformed.
@@ -3403,6 +3545,49 @@ class AgentLoop:
                 "type": "capability_replay_result",
                 "capability": capability,
                 "call": str(replay.get("call_name") or ""),
+                "result": observation.output,
+            },
+            is_background=True,
+        )
+
+    def _execute_tool_approval_replay(
+        self,
+        replay: dict[str, Any],
+        *,
+        bound_catalog: BoundToolCatalog,
+        surface_snapshot: ToolSurfaceSnapshot,
+        call_counts: dict[str, int],
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        turn_id: str,
+        step: int,
+        side_effect_policy: ToolSideEffectPolicy,
+    ) -> ToolObservation | None:
+        call_name = str(replay.get("call_name") or "")
+        if not call_name:
+            return None
+        observation = self._execute_tool_call(
+            call_name=call_name,
+            call_id=str(replay.get("call_id") or ""),
+            arguments=dict(replay.get("arguments") or {}),
+            bound_catalog=bound_catalog,
+            surface_snapshot=surface_snapshot,
+            call_counts=call_counts,
+            context=context,
+            recorder=recorder,
+            turn_id=turn_id,
+            parent_id=None,
+            step=step,
+            approved_tool_approval=replay,
+            side_effect_policy=side_effect_policy,
+        )
+        return ToolObservation(
+            call_id=f"tool_approval_replay:{replay.get('call_id') or ''}",
+            tool_name=call_name,
+            output={
+                "type": "tool_approval_replay_result",
+                "task_id": str(replay.get("task_id") or ""),
+                "call": call_name,
                 "result": observation.output,
             },
             is_background=True,
@@ -3518,6 +3703,8 @@ class AgentLoop:
         bound_tool: BoundTool,
         snapshot: ToolSurfaceSnapshot,
         call_counts: dict[str, int],
+        *,
+        allow_ask: bool = False,
     ) -> ToolAuthorization:
         binding_id = bound_tool.binding_id
         immediate_binding_ids = {tool.id for tool in snapshot.immediate_tools}
@@ -3532,16 +3719,16 @@ class AgentLoop:
                 f"tool binding is not available in this turn: {binding_id}",
                 error_code="tool_not_in_surface",
             )
-        if authorization.decision == "ask":
-            raise PermissionDenied(
-                f"tool binding requires approval: {binding_id}",
-                error_code="tool_approval_required",
-            )
         max_calls = authorization.quota.max_calls_per_run
         if max_calls is not None and call_counts.get(binding_id, 0) >= max_calls:
             raise PermissionDenied(
                 f"tool binding quota exceeded: {binding_id}",
                 error_code="tool_quota_exceeded",
+            )
+        if authorization.decision == "ask" and not allow_ask:
+            raise PermissionDenied(
+                f"tool binding requires approval: {binding_id}",
+                error_code="tool_approval_required",
             )
         return authorization
 
@@ -3624,8 +3811,6 @@ class AgentLoop:
             result = spec.handler(context, arguments)
         finally:
             context._current_call = CallContext("", None, None)
-        if result.ok:
-            self._emit_side_effect_event(spec, arguments, result, context, recorder, turn_id, started_event.event_id)
         return result
 
     def _finalize_tool_call(
@@ -3673,6 +3858,76 @@ class AgentLoop:
         )
         return observation
 
+    def _request_tool_approval(
+        self,
+        bound_tool: BoundTool,
+        authorization: ToolAuthorization,
+        context: AgentToolContext,
+        recorder: AgentRecorder,
+        started_event: AgentEvent | None,
+        turn_id: str,
+        *,
+        call_name: str,
+        call_id: str,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        task_request = build_tool_approval_task_request(
+            spec=bound_tool.base_spec,
+            binding_id=bound_tool.binding_id,
+            model_name=bound_tool.model_name,
+            call_name=call_name,
+            call_id=call_id,
+            arguments=arguments,
+            reason=authorization.reason,
+            turn_id=turn_id,
+            tool_event_id=started_event.event_id if started_event is not None else None,
+        )
+        task_id = context.job_manager.create_task(TOOL_APPROVAL_TASK_KIND, task_request)
+        recorder.emit(
+            "tool.approval.requested",
+            turn_id=turn_id,
+            parent_id=started_event.event_id if started_event is not None else None,
+            data={
+                "task_id": task_id,
+                "tool_id": bound_tool.base_spec.id,
+                "binding_id": bound_tool.binding_id,
+                "call_id": call_id,
+                "side_effect": bound_tool.base_spec.side_effect,
+                "reason": authorization.reason,
+            },
+        )
+        return ToolResult(
+            ok=True,
+            content={
+                "status": "pending_tool_approval",
+                "tool_id": bound_tool.base_spec.id,
+                "binding_id": bound_tool.binding_id,
+                "task_id": task_id,
+                "message": f"Tool call '{call_name}' is pending approval (task {task_id}).",
+            },
+        )
+
+    def _verify_tool_approval_replay(
+        self,
+        bound_tool: BoundTool,
+        replay: Mapping[str, Any],
+    ) -> None:
+        if str(replay.get("binding_id") or "") != bound_tool.binding_id:
+            raise PermissionDenied(
+                "approved tool call no longer matches its binding",
+                error_code="tool_approval_stale",
+            )
+        if str(replay.get("tool_id") or "") != bound_tool.base_spec.id:
+            raise PermissionDenied(
+                "approved tool call no longer matches its tool",
+                error_code="tool_approval_stale",
+            )
+        if str(replay.get("approval_key") or "") != tool_approval_key(replay):
+            raise PermissionDenied(
+                "approved tool call approval key mismatch",
+                error_code="tool_approval_stale",
+            )
+
     def _execute_tool_call(
         self,
         *,
@@ -3687,6 +3942,8 @@ class AgentLoop:
         turn_id: str,
         parent_id: str | None,
         step: int,
+        side_effect_policy: ToolSideEffectPolicy,
+        approved_tool_approval: Mapping[str, Any] | None = None,
     ) -> ToolObservation:
         spec: ToolSpec | None = None
         bound_tool: BoundTool | None = None
@@ -3750,36 +4007,88 @@ class AgentLoop:
                     bound_tool,
                     surface_snapshot,
                     call_counts,
+                    allow_ask=True,
                 )
                 ToolRegistry().validate_args(spec, arguments)
                 self._check_tool_surface_scope(spec, arguments, authorization)
                 self._check_permissions(bound_tool.base_spec, arguments)
-                pending = self._ensure_capability_lease(
-                    bound_tool,
-                    context,
-                    recorder,
-                    started_event,
-                    turn_id,
-                    call_name=call_name,
-                    call_id=call_id,
-                    arguments=arguments,
-                )
-                if pending is not None:
-                    # Capability escalated: the call parks (does not execute); the model retries
-                    # once the lease is granted. Not counted against the binding's call quota.
-                    result = pending
+                if authorization.decision == "ask" and approved_tool_approval is None:
+                    result = self._request_tool_approval(
+                        bound_tool,
+                        authorization,
+                        context,
+                        recorder,
+                        started_event,
+                        turn_id,
+                        call_name=call_name,
+                        call_id=call_id,
+                        arguments=arguments,
+                    )
                 else:
-                    call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
-                    result = self._invoke_handler(
+                    if approved_tool_approval is not None:
+                        self._verify_tool_approval_replay(bound_tool, approved_tool_approval)
+                    side_effect_admission = admit_tool_side_effect(
+                        bound_tool.base_spec,
+                        bound_tool.runtime,
+                        arguments,
+                        side_effect_policy,
+                    )
+                    if not side_effect_admission.allowed:
+                        raise PermissionDenied(
+                            side_effect_admission.error,
+                            error_code=side_effect_admission.error_code,
+                        )
+                    pending = self._ensure_capability_lease(
                         bound_tool,
                         context,
-                        arguments,
+                        recorder,
+                        started_event,
+                        turn_id,
+                        call_name=call_name,
                         call_id=call_id,
-                        turn_id=turn_id,
-                        recorder=recorder,
-                        started_event=started_event,
-                        authorization=authorization,
+                        arguments=arguments,
+                        approved_tool_approval=approved_tool_approval,
                     )
+                    if pending is not None:
+                        # Capability escalated: the call parks (does not execute); the model retries
+                        # once the lease is granted. Not counted against the binding's call quota.
+                        result = pending
+                    else:
+                        call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
+                        outbox_count = (
+                            len(self._outbox.export()) if side_effect_admission.requires_outbox else 0
+                        )
+                        result = self._invoke_handler(
+                            bound_tool,
+                            context,
+                            arguments,
+                            call_id=call_id,
+                            turn_id=turn_id,
+                            recorder=recorder,
+                            started_event=started_event,
+                            authorization=authorization,
+                        )
+                        if result.ok:
+                            if side_effect_admission.requires_outbox:
+                                side_effect_admission = verify_outbox_side_effect(
+                                    side_effect_admission,
+                                    outbox_count,
+                                    len(self._outbox.export()),
+                                )
+                                if not side_effect_admission.allowed:
+                                    raise ToolExecutionError(
+                                        side_effect_admission.error,
+                                        error_code=side_effect_admission.error_code,
+                                    )
+                            self._emit_side_effect_event(
+                                bound_tool.base_spec,
+                                arguments,
+                                result,
+                                context,
+                                recorder,
+                                turn_id,
+                                started_event.event_id,
+                            )
         except ToolExecutionError as exc:
             if started_event is None:
                 started_event = self._emit_tool_started(
@@ -3845,6 +4154,7 @@ class AgentLoop:
         call_name: str,
         call_id: str,
         arguments: dict[str, Any],
+        approved_tool_approval: Mapping[str, Any] | None = None,
     ) -> ToolResult | None:
         """Gate a tool call on a capability lease. Returns ``None`` to proceed (a valid lease is
         cached or was granted synchronously), or a *pending* ``ToolResult`` when the broker
@@ -3972,6 +4282,9 @@ class AgentLoop:
                     "replay_call_name": call_name,
                     "replay_call_id": call_id,
                     "replay_arguments": dict(arguments),
+                    "replay_approved_tool_approval": (
+                        dict(approved_tool_approval) if approved_tool_approval is not None else None
+                    ),
                 },
             )
             tail = (

@@ -42,6 +42,10 @@ from monoid_agent_kernel.core.agents import (
 from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.content import ContentPart, DocumentPart, ImagePart, TextPart
+from monoid_agent_kernel.core.external_agent_envelope import (
+    external_agent_envelope_to_inbox_message,
+    validate_external_agent_envelope,
+)
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import NativeAgentError
@@ -364,7 +368,6 @@ class StudioServer:
         # from _run_tokens. One shared sender drains every run's outbox into the addressed peer's
         # idempotent inbox via the backend's send_message.
         self._agent_directory: dict[str, str] = {}
-        self._a2a_sender = InboxRoutingOutboxSender(deliver=self._a2a_deliver)
         self._lock = threading.RLock()
         self._base_url = ""
 
@@ -543,7 +546,7 @@ class StudioServer:
             # (brokered handle on the request + capability.* events) while the actual cross-agent
             # transport uses Studio's server-side run token. Both are no-ops for a normal chat: a
             # plain chat binds neither outbox.send nor any requires_lease tool.
-            outbox_sender_factory=lambda req: self._a2a_sender,
+            outbox_sender_factory=self._a2a_sender_for,
             capability_broker_factory=lambda req: AutoGrantBroker(),
         )
 
@@ -639,6 +642,12 @@ class StudioServer:
 
     # --- A2A demo (agent-to-agent durable messaging) ------------------------------------
 
+    def _a2a_sender_for(self, request: BackendRunRequest) -> InboxRoutingOutboxSender:
+        return InboxRoutingOutboxSender(
+            deliver=self._a2a_deliver,
+            source_peer_id=str(request.metadata.get("a2a_peer_id") or ""),
+        )
+
     def _a2a_deliver(
         self,
         destination: str,
@@ -660,16 +669,20 @@ class StudioServer:
             token = self._run_tokens.get(run_id or "")
         if not run_id or not token:
             raise LookupError(f"no agent registered as {destination!r}")
-        text = str(payload.get("text") or json.dumps(payload))
+        envelope = validate_external_agent_envelope(dict(payload))
+        message = external_agent_envelope_to_inbox_message(envelope, run_id=run_id)
         result = self._backend.send_message(
             run_id,
             token,
-            text,
-            message_id=message_id,
-            source="agent",
-            correlation_id=correlation_id,
-            causation_id=causation_id,
-            traceparent=traceparent,
+            message.content,
+            message_id=message.id or message_id,
+            source=message.source,
+            correlation_id=message.correlation_id or correlation_id,
+            causation_id=message.causation_id or causation_id,
+            traceparent=message.traceparent or traceparent,
+            tracestate=message.tracestate,
+            message_type=message.type,
+            metadata=message.metadata,
         )
         return f"a2a:{run_id}:{result.get('message_id', '')}"
 
@@ -704,6 +717,7 @@ class StudioServer:
             mode="propose",
             multi_turn=True,
             runtime_config=self._a2a_peer_config(name, peer),
+            metadata={"a2a_peer_id": name},
         )
         submission = self._backend.submit_run(request)
         with self._lock:

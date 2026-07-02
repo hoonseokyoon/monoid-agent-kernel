@@ -20,9 +20,9 @@ The package is organized around four public roles:
   easy to satisfy: `loop.py`, `core/`, `providers/`, `tools`, `workspace`,
   permission, shell execution, and gateway client modules. See `docs/CORE_HELPER_KIT.md`.
 - **Reference** — example services under `monoid_agent_kernel.reference`
-  (`backend`, `llm_gateway`, `web_gateway`, `stores`). These examples are assembled
-  from the public contract and helper kit; core has no dependency on
-  `monoid_agent_kernel.reference`. See `docs/REFERENCE.md`.
+  (`backend`, `llm_gateway`, `web_gateway`, `mcp_gateway`, `stores`, `studio`,
+  `conformance`). These examples are assembled from the public contract and helper kit; core has no
+  dependency on `monoid_agent_kernel.reference`. See `docs/REFERENCE.md`.
 
 Agent configuration enters the engine through `AgentRuntimeConfig`. Legacy
 tool/shell/web policy inputs have left the core, backend, and CLI execution
@@ -52,7 +52,7 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
 
 ## Operational Rules
 
-Phase 1S assigns stable operational rule ids to the semantics that keep agent systems
+Operational rule ids name the semantics that keep agent systems
 durable, observable, and safe across backend and gateway implementations. These rules are
 contract language: a backend may use the Core Helper Kit or its own implementation path, then
 prove the same behavior through conformance profiles.
@@ -68,6 +68,10 @@ prove the same behavior through conformance profiles.
 | `OR-07-DURABLE-METADATA` | Durable metadata writes keep API results and recovery results aligned through schema validation, shared-store compatibility, and commit ordering. | `durable-runner`, `control-plane` | `core.durable_metadata.DurableMetadataCommitter`, `validate_run_metadata`, `runtime_config_from_metadata` |
 | `OR-08-PROVIDER-CAPS` | Provider gateways apply effective caps on request and response paths, including signed caps, request caps, defaults, redirect boundaries, byte caps, and timeout caps. | `provider-gateway` | `core.scope.effective_signed_scope`, Reference web gateway cap application |
 | `OR-09-SUBAGENT-BOUNDARY` | Subagent runtime links identity, capability, and trace boundaries: child runs have their own identity/accounting, isolated live lease slots, shared revocation, and parent-child diagnostics linkage. | `multi-agent`, `capability-security`, `durable-runner` | `core.subagent_runtime.SubagentRuntimeContext`, `validate_descendant_run_id`, `subagent_diagnostics_from_events`, `CapabilityVault.fork_for_child` |
+| `OR-10-TOOL-SURFACE-ADMISSION` | Tool execution follows the active turn surface: unavailable tools, hidden/searchable-only tools, denied bindings, and quota-exceeded bindings do not execute handlers. | `tool-agent` | `DefaultToolSurfaceResolver`, `ToolSurfaceSnapshot`, `AgentLoop` tool admission path |
+| `OR-11-GENERIC-ASK-APPROVAL` | `authorization="ask"` creates a durable approval task; approval revalidates the captured call before one execution, and denial returns an observation without invoking the handler. | `tool-agent`, `control-plane` | `core.tool_approval`, `TaskManager`, `AgentLoop` approval replay path |
+| `OR-12-DURABLE-SIDE-EFFECT` | External side-effect tools declare their delivery semantics; strict runtimes admit them through durable outbox staging or explicit idempotency keys, and outbox-declared handlers stage a durable request before success. | `side-effect-tool-agent` | `core.side_effect_policy`, `core.outbox`, `ToolContext.emit_outbox`, Reference edge drain |
+| `OR-13-EXTERNAL-AGENT-ENVELOPE` | External agent messages preserve peer/message identity, restart-stable dedupe, correlation, causation, trace context, ordered text/data parts, and retryable pending/error state across inbox/outbox boundaries. | `message-fabric` | `core.external_agent_envelope`, `core.inbox`, `core.outbox`, Reference inbox-routing outbox sender |
 
 ## Identifier Namespace
 
@@ -594,9 +598,28 @@ send.
   inbox. Park-and-await (the agent suspending until the reply lands) is a deferred superset that
   reuses this same ack plumbing.
 
+### External Agent Envelope
+
+`monoid.external-agent-envelope.v1` (`core/external_agent_envelope.py`) gives peer-agent messages
+a transport-neutral helper shape above the inbox/outbox primitives. It carries the minimum meaning
+an edge preserves when one agent sends work or a reply to another agent.
+
+- Required Phase 2 meaning: `peer_id`, `message_id`, `correlation_id`, `causation_id`,
+  `traceparent`/`tracestate`, ordered text/data `parts`, and retryable delivery state.
+- `message_id` is the dedupe key. A receiving backend maps it to `InboxMessage.id`, so redelivery
+  is processed once and the processed id survives restart through `RunCheckpoint.inbox_seen_ids`.
+- `parts` are ordered text/data records for the Phase 2 contract. Rich artifacts, terminal result
+  payloads, and full A2A task lifecycle mapping remain extension points.
+- Raw bearer secrets stay outside envelopes, checkpoints, diagnostics, and public event payloads.
+- Helpers: `external_agent_envelope_from_outbox_request`,
+  `external_agent_envelope_to_inbox_message`, `validate_external_agent_envelope`, and
+  `normalize_external_agent_error`. Import them from `monoid_agent_kernel.core.external_agent_envelope`.
+- Reference `InboxRoutingOutboxSender` adapts `OutboxRequest` to `ExternalAgentEnvelope` and routes
+  it into a peer run's idempotent inbox. This is the Reference message-fabric adapter.
+
 ### Trace Context on envelopes (`traceparent` / `tracestate`)
 
-Both envelopes carry optional W3C Trace Context (`core/trace_context.py`): `traceparent`
+Inbox, outbox, and external-agent envelopes carry optional W3C Trace Context (`core/trace_context.py`): `traceparent`
 (`00-{trace-id}-{span-id}-{flags}`) and the opaque vendor `tracestate`. This is **observability
 only** — it complements `correlation_id`/`causation_id` (the domain identity routing and
 reply-matching depend on) and **application behavior never depends on it**; a missing or malformed

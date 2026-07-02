@@ -67,6 +67,7 @@ from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
     CheckpointStore,
     LocalFsCheckpointStore,
+    RunCheckpoint,
 )
 from monoid_agent_kernel.reference.stores.lease import LeaseStore, LocalFsLeaseStore
 from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_proposal_file_payload
@@ -1391,6 +1392,8 @@ class RunnerBackend:
         causation_id: str = "",
         traceparent: str = "",
         tracestate: str = "",
+        message_type: str = "user_message",
+        metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Deliver a follow-up user message to a running multi-turn session. It is queued and
         consumed as the next user turn once the current turn settles.
@@ -1418,21 +1421,21 @@ class RunnerBackend:
             message = normalize_inline_media_dicts(message, pending)
             for data in pending.values():
                 self.checkpoint_store.put_blob(run_id, data)
-        wire_bytes = len(
-            (message if isinstance(message, str) else json.dumps(message)).encode("utf-8")
-        )
-        if wire_bytes > self.max_message_bytes:
-            raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
         envelope = InboxMessage(
             content=message,
             id=message_id or f"inbox_{uuid.uuid4().hex[:12]}",
             source=source,
+            type=message_type,
             run_id=run_id,
             correlation_id=correlation_id,
             causation_id=causation_id,
             traceparent=traceparent,
             tracestate=tracestate,
+            metadata=dict(metadata or {}),
         )
+        wire_bytes = len(json.dumps(envelope.to_json()).encode("utf-8"))
+        if wire_bytes > self.max_message_bytes:
+            raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
         with self._lock:
             if record.status in {"completed", "failed", "limited"}:
                 raise ValueError("cannot send a message to a terminal run")
@@ -1540,7 +1543,14 @@ class RunnerBackend:
         callback) into a running run, waking it if parked. Accepts a per-task
         callback token (scoped to this run+task) or the run token (operator)."""
         loop = self._authorize_task_result(run_id, token, task_id)
-        return loop.report_task_result(task_id, result, status=status)
+        reported = loop.report_task_result(
+            task_id,
+            result,
+            status=status,
+            persist_checkpoint=False,
+        )
+        self._persist_run_checkpoint_from_any_thread(self._record(run_id))
+        return reported
 
     def create_task(
         self,
@@ -2098,6 +2108,18 @@ class RunnerBackend:
         checkpoint = loop.snapshot()
         if checkpoint is None:
             return
+        self._persist_run_checkpoint_payload(record, checkpoint, loop.collect_checkpoint_blobs())
+
+    def _persist_run_checkpoint_payload(
+        self,
+        record: BackendRunRecord,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+    ) -> None:
+        """Commit a loop checkpoint after adding backend-owned queue and inbox state."""
+        loop = record.loop
+        if loop is None:
+            return
         # Peek (don't drain) the residual queue; consumed messages are already reflected in
         # the loop's turn handle / pending input. Runs in the driver coroutine on the shared
         # loop, so reading the asyncio.Queue's backing deque needs no lock (single-threaded
@@ -2113,8 +2135,21 @@ class RunnerBackend:
         checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
         # Overwrites the same seq the loop just committed, now with the queue included.
         assert self.checkpoint_store is not None
-        self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
+        self.checkpoint_store.put(checkpoint, blobs)
         self._drain_outbox(record, loop)
+
+    async def _persist_run_checkpoint_async(self, record: BackendRunRecord) -> None:
+        self._persist_run_checkpoint(record)
+
+    def _persist_run_checkpoint_from_any_thread(self, record: BackendRunRecord) -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is _get_shared_loop():
+            self._persist_run_checkpoint(record)
+            return
+        self._spawn(self._persist_run_checkpoint_async(record)).result(timeout=10.0)
 
     def _outbox_backoff_delay(self, attempts: int) -> float:
         """Capped exponential backoff with full jitter — ``uniform(0, min(cap, base*factor**attempts))``.
@@ -2279,6 +2314,11 @@ class RunnerBackend:
             context_providers=self.context_providers,
             output_validators=self.output_validators,
             capability_broker=self._capability_broker_for(request),
+            checkpoint_persist_callback=lambda checkpoint, blobs: self._persist_run_checkpoint_payload(
+                self._record(run_id),
+                checkpoint,
+                blobs,
+            ),
         )
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
@@ -2769,30 +2809,7 @@ class RunnerBackend:
         )
         with self._lock:
             self._records[run_id] = record
-        spec = self._run_spec_for_request(run_id, request, workspace_root)
-        adapter = self._build_model_adapter(
-            spec,
-            llm_gateway_token,
-            runtime_config.model,
-            token_provider=self._llm_token_source(run_id, request, runtime_config),
-        )
-        loop = AgentLoop(
-            spec=spec,
-            model_adapter=adapter,
-            event_sinks=(BackendRunStateSink(self, run_id), *(make() for make in self.extra_event_sink_factories)),
-            permission_policy=request.permission_policy,
-            cancellation_token=record.cancellation_token,
-            shell_approval_provider=None,
-            web_gateway_client=self._web_gateway_client(web_gateway_token),
-            runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
-            checkpoint_store=self.checkpoint_store,
-            emit_output_deltas=self.emit_output_deltas,
-            subagent_definitions=self.subagent_definitions,
-            tool_providers=self.tool_providers,
-            context_providers=self.context_providers,
-            output_validators=self.output_validators,
-            capability_broker=self._capability_broker_for(request),
-        )
+        loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
         # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
         # restore re-applies the agent's delta from the checkpoint's content blobs.
         loop.restore(checkpoint, blobs=stored.blob)

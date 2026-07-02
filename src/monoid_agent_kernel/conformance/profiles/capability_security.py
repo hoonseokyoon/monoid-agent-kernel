@@ -26,7 +26,7 @@ PROFILE = ProfileMetadata(
 
 
 def assert_capability_security_lease_admission(harness: CapabilityHarness) -> None:
-    """Run the Phase 1S lease-admission conformance smoke matrix."""
+    """Run the lease-admission conformance smoke matrix."""
     request = harness.request_capability(
         {
             "capability": "web.search",
@@ -103,7 +103,7 @@ def assert_capability_security_lease_admission(harness: CapabilityHarness) -> No
 
 
 def assert_capability_security_revocation_profile(harness: CapabilityHarness) -> None:
-    """Run the Phase 1S capability revocation conformance smoke matrix."""
+    """Run the capability revocation conformance smoke matrix."""
     _admit_profile_lease(
         harness,
         capability="web.search",

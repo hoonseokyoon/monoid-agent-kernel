@@ -19,7 +19,7 @@ PROFILE = ProfileMetadata(
 
 
 def assert_provider_gateway_profile(harness: GatewayHarness) -> None:
-    """Run the Phase 1S provider-gateway conformance smoke matrix."""
+    """Run the provider-gateway conformance smoke matrix."""
     search = harness.call_gateway(
         "web.search",
         {"query": "binding"},
