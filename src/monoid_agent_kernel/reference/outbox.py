@@ -16,6 +16,10 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from monoid_agent_kernel.core.external_agent_envelope import (
+    external_agent_envelope_from_outbox_request,
+    normalize_external_agent_error,
+)
 from monoid_agent_kernel.core.outbox import OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.trace_context import child_traceparent
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
@@ -55,35 +59,34 @@ class FailingOutboxSender:
 
 @dataclass
 class InboxRoutingOutboxSender:
-    """Routes a staged outbound send into *another agent's inbox* — the agent-to-agent (A2A) edge.
+    """Routes a staged outbound send into another agent's inbox.
 
-    The injected ``deliver`` callable performs the cross-run handoff (resolve ``destination`` to a
-    peer run and deliver the message through that run's idempotent inbox), keeping this module free
-    of any backend/transport import. ``send`` adapts an :class:`OutboxRequest` to that callable and
-    maps the outcome to an :class:`OutboxReceipt`: any exception becomes a *retryable* failure so the
-    edge's backoff/redrive path takes over (e.g. the peer isn't registered yet, or its queue is
-    momentarily full). The request's ``idempotency_key`` rides along as the inbox dedup key, so a
-    redelivery after a crash is effectively-once at the peer.
+    The injected ``deliver`` callable performs the cross-run handoff: resolve ``destination`` to a
+    peer run and deliver the normalized external-agent envelope through that run's idempotent inbox.
+    This keeps the sender free of backend/transport imports. Any delivery exception becomes a
+    retryable failure so the edge's backoff/redrive path takes over.
 
-    ``deliver(destination, payload, *, message_id, correlation_id, causation_id, traceparent) -> str``
-    returns an external reference recorded on the request; the trace is already a child span of the
-    staged request's trace.
+    ``deliver(destination, envelope, *, message_id, correlation_id, causation_id, traceparent) -> str``
+    returns an external reference recorded on the request. The envelope carries the idempotency key,
+    correlation/causation ids, trace context, ordered parts, and capability handle.
     """
 
     deliver: Callable[..., str]
 
     def send(self, request: OutboxRequest) -> OutboxReceipt:
+        envelope = external_agent_envelope_from_outbox_request(request)
         try:
             reference = self.deliver(
                 request.destination,
-                dict(request.payload),
-                message_id=request.idempotency_key or request.id,
-                correlation_id=request.correlation_id or request.id,
-                causation_id=request.id,
-                traceparent=child_traceparent(request.traceparent),
+                envelope.to_json(),
+                message_id=envelope.message_id,
+                correlation_id=envelope.correlation_id or envelope.message_id,
+                causation_id=envelope.causation_id,
+                traceparent=envelope.traceparent,
             )
         except Exception as exc:  # unresolved peer / full queue / terminal run -> redrive
-            return OutboxReceipt(ok=False, error=str(exc), retryable=True)
+            error = normalize_external_agent_error(exc, code="external_agent_delivery_failed", retryable=True)
+            return OutboxReceipt(ok=False, error=error.message, retryable=error.retryable)
         return OutboxReceipt(ok=True, reference=reference)
 
 

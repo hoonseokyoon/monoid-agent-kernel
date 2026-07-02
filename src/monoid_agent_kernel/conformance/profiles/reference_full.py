@@ -8,6 +8,7 @@ from monoid_agent_kernel.conformance.harness import (
     BackendHarness,
     CapabilityHarness,
     GatewayHarness,
+    MessageFabricHarness,
     SideEffectHarness,
 )
 
@@ -25,6 +26,7 @@ from .durable_runner import (
     assert_durable_runner_subagent_diagnostics_profile,
 )
 from ._metadata import ProfileMetadata
+from .message_fabric import assert_message_fabric_profile
 from .multi_agent import (
     assert_multi_agent_backend_boundary_profile,
     assert_multi_agent_backend_capability_boundary_profile,
@@ -54,8 +56,9 @@ PROFILE = ProfileMetadata(
         "OR-10-TOOL-SURFACE-ADMISSION",
         "OR-11-GENERIC-ASK-APPROVAL",
         "OR-12-DURABLE-SIDE-EFFECT",
+        "OR-13-EXTERNAL-AGENT-ENVELOPE",
     ),
-    harnesses=("backend", "capability", "gateway", "side-effect", "studio"),
+    harnesses=("backend", "capability", "gateway", "side-effect", "message-fabric", "studio"),
 )
 
 
@@ -65,6 +68,9 @@ class ReferenceFullFactory(Protocol):
 
     def new_side_effect(self) -> SideEffectHarness:
         """Return a fresh Reference side-effect harness."""
+
+    def new_message_fabric(self) -> MessageFabricHarness:
+        """Return a fresh Reference message-fabric harness."""
 
     def new_capability(self) -> CapabilityHarness:
         """Return a fresh Reference capability harness."""
@@ -90,6 +96,7 @@ def assert_reference_full_profile(factory: ReferenceFullFactory) -> None:
     assert_tool_agent_surface_admission_profile(factory.new_backend())
     assert_tool_agent_generic_ask_approval_profile(factory.new_backend())
     assert_side_effect_tool_agent_profile(factory.new_side_effect())
+    assert_message_fabric_profile(factory.new_message_fabric())
 
     assert_durable_runner_event_sequence_profile(factory.new_backend())
     assert_durable_runner_recovery_metadata_profile(factory.new_backend())

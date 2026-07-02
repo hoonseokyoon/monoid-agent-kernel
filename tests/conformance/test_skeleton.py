@@ -6,6 +6,7 @@ from monoid_agent_kernel.conformance import (
     BackendHarness,
     CapabilityHarness,
     GatewayHarness,
+    MessageFabricHarness,
     PROFILES,
     PROFILE_BY_ID,
     SideEffectHarness,
@@ -17,6 +18,7 @@ EXPECTED_PROFILE_IDS = (
     "minimal-agent",
     "tool-agent",
     "side-effect-tool-agent",
+    "message-fabric",
     "durable-runner",
     "control-plane",
     "capability-security",
@@ -37,6 +39,7 @@ EXPECTED_RULE_IDS = {
     "OR-10-TOOL-SURFACE-ADMISSION",
     "OR-11-GENERIC-ASK-APPROVAL",
     "OR-12-DURABLE-SIDE-EFFECT",
+    "OR-13-EXTERNAL-AGENT-ENVELOPE",
 }
 
 
@@ -66,3 +69,4 @@ def test_harness_protocols_are_importable() -> None:
     assert GatewayHarness.__name__ == "GatewayHarness"
     assert CapabilityHarness.__name__ == "CapabilityHarness"
     assert SideEffectHarness.__name__ == "SideEffectHarness"
+    assert MessageFabricHarness.__name__ == "MessageFabricHarness"

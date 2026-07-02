@@ -71,6 +71,7 @@ prove the same behavior through conformance profiles.
 | `OR-10-TOOL-SURFACE-ADMISSION` | Tool execution follows the active turn surface: unavailable tools, hidden/searchable-only tools, denied bindings, and quota-exceeded bindings do not execute handlers. | `tool-agent` | `DefaultToolSurfaceResolver`, `ToolSurfaceSnapshot`, `AgentLoop` tool admission path |
 | `OR-11-GENERIC-ASK-APPROVAL` | `authorization="ask"` creates a durable approval task; approval revalidates the captured call before one execution, and denial returns an observation without invoking the handler. | `tool-agent`, `control-plane` | `core.tool_approval`, `TaskManager`, `AgentLoop` approval replay path |
 | `OR-12-DURABLE-SIDE-EFFECT` | External side-effect tools declare their delivery semantics; strict runtimes admit them through durable outbox staging or explicit idempotency keys, and outbox-declared handlers stage a durable request before success. | `side-effect-tool-agent` | `core.side_effect_policy`, `core.outbox`, `ToolContext.emit_outbox`, Reference edge drain |
+| `OR-13-EXTERNAL-AGENT-ENVELOPE` | External agent messages preserve peer identity, message id, task/request id, correlation, causation, trace context, ordered parts, capability references, terminal/error state, and restart-stable dedupe across inbox/outbox boundaries. | `message-fabric` | `core.external_agent_envelope`, `core.inbox`, `core.outbox`, Reference inbox-routing outbox sender |
 
 ## Identifier Namespace
 
@@ -597,9 +598,31 @@ send.
   inbox. Park-and-await (the agent suspending until the reply lands) is a deferred superset that
   reuses this same ack plumbing.
 
+### External Agent Envelope
+
+`monoid.external-agent-envelope.v1` (`core/external_agent_envelope.py`,
+`ExternalAgentEnvelope`) gives peer-agent messages a transport-neutral shape above the inbox/outbox
+primitives. It carries the meaning an edge must preserve when one agent sends work or a reply to
+another agent.
+
+- Fields: `peer_id`, `message_id`, `task_id`, `request_id`, `reply_to_id`, `correlation_id`,
+  `causation_id`, `traceparent`/`tracestate`, ordered `parts`, `capability_ref`, optional
+  `result`, `created_at`, and `metadata`.
+- `message_id` is the dedupe key. A receiving backend maps it to `InboxMessage.id`, so redelivery
+  is processed once and the processed id survives restart through `RunCheckpoint.inbox_seen_ids`.
+- `parts` are ordered text/data/artifact records. Edges can map them to A2A, queues, HTTP, or local
+  function calls while preserving order and task/correlation identity.
+- `capability_ref` is a handle/reference. Raw bearer secrets stay outside envelopes, checkpoints,
+  diagnostics, and public event payloads.
+- Helpers: `external_agent_envelope_from_outbox_request`,
+  `external_agent_envelope_to_inbox_message`, `validate_external_agent_envelope`, and
+  `normalize_external_agent_error`.
+- Reference `InboxRoutingOutboxSender` adapts `OutboxRequest` to `ExternalAgentEnvelope` and routes
+  it into a peer run's idempotent inbox. This is the Reference message-fabric adapter.
+
 ### Trace Context on envelopes (`traceparent` / `tracestate`)
 
-Both envelopes carry optional W3C Trace Context (`core/trace_context.py`): `traceparent`
+Inbox, outbox, and external-agent envelopes carry optional W3C Trace Context (`core/trace_context.py`): `traceparent`
 (`00-{trace-id}-{span-id}-{flags}`) and the opaque vendor `tracestate`. This is **observability
 only** — it complements `correlation_id`/`causation_id` (the domain identity routing and
 reply-matching depend on) and **application behavior never depends on it**; a missing or malformed

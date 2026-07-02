@@ -6,6 +6,7 @@ from ._metadata import ProfileMetadata
 from .capability_security import PROFILE as CAPABILITY_SECURITY
 from .control_plane import PROFILE as CONTROL_PLANE
 from .durable_runner import PROFILE as DURABLE_RUNNER
+from .message_fabric import PROFILE as MESSAGE_FABRIC
 from .minimal_agent import PROFILE as MINIMAL_AGENT
 from .multi_agent import PROFILE as MULTI_AGENT
 from .provider_gateway import PROFILE as PROVIDER_GATEWAY
@@ -17,6 +18,7 @@ PROFILES: tuple[ProfileMetadata, ...] = (
     MINIMAL_AGENT,
     TOOL_AGENT,
     SIDE_EFFECT_TOOL_AGENT,
+    MESSAGE_FABRIC,
     DURABLE_RUNNER,
     CONTROL_PLANE,
     CAPABILITY_SECURITY,
@@ -40,6 +42,7 @@ __all__ = [
     "CONTROL_PLANE",
     "DURABLE_RUNNER",
     "MINIMAL_AGENT",
+    "MESSAGE_FABRIC",
     "MULTI_AGENT",
     "PROFILES",
     "PROFILE_BY_ID",

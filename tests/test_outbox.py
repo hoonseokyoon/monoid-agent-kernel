@@ -12,6 +12,10 @@ from support.waiting import eventually
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
+from monoid_agent_kernel.core.external_agent_envelope import (
+    external_agent_envelope_to_inbox_message,
+    validate_external_agent_envelope,
+)
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.loop import AgentLoop
@@ -408,11 +412,17 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
         run_id = directory.get(destination)
         if not run_id:  # peer not registered yet -> retryable; the backend redrives
             raise LookupError(f"no agent {destination!r}")
-        text = str(payload.get("text") or json.dumps(payload))
+        envelope = validate_external_agent_envelope(dict(payload))
+        message = external_agent_envelope_to_inbox_message(envelope, run_id=run_id)
         holder["backend"].send_message(
-            run_id, tokens[run_id], text,
-            message_id=message_id, source="agent",
-            correlation_id=correlation_id, causation_id=causation_id, traceparent=traceparent,
+            run_id,
+            tokens[run_id],
+            message.content,
+            message_id=message.id or message_id,
+            source=message.source,
+            correlation_id=message.correlation_id or correlation_id,
+            causation_id=message.causation_id or causation_id,
+            traceparent=message.traceparent or traceparent,
         )
         return f"a2a:{run_id}"
 

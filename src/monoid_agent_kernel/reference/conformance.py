@@ -18,13 +18,21 @@ from monoid_agent_kernel.core.capability import (
 )
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.control import ControlCommand
+from monoid_agent_kernel.core.external_agent_envelope import (
+    external_agent_envelope_to_inbox_message,
+    validate_external_agent_envelope,
+)
 from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
 from monoid_agent_kernel.core.tool_surface import ToolQuota
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
-from monoid_agent_kernel.reference.outbox import OutboxToolProvider, RecordingOutboxSender
+from monoid_agent_kernel.reference.outbox import (
+    InboxRoutingOutboxSender,
+    OutboxToolProvider,
+    RecordingOutboxSender,
+)
 from monoid_agent_kernel.reference.studio.server import StudioConfig, StudioServer
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
@@ -58,6 +66,9 @@ class ReferenceConformanceFactory:
 
     def new_side_effect(self) -> ReferenceBackendHarness:
         return ReferenceBackendHarness(self._next_root("side-effect"))
+
+    def new_message_fabric(self) -> ReferenceBackendHarness:
+        return ReferenceBackendHarness(self._next_root("message-fabric"))
 
     def new_capability(self) -> ReferenceCapabilityHarness:
         return ReferenceCapabilityHarness()
@@ -369,6 +380,9 @@ class ReferenceBackendHarness:
         self.approval_provider = _ApprovalToolProvider()
         self.side_effect_provider = _SideEffectDemoProvider()
         self.outbox_sender = RecordingOutboxSender()
+        self.message_fabric_directory: dict[str, str] = {}
+        self.message_fabric_tokens: dict[str, str] = {}
+        self.message_fabric_sender = InboxRoutingOutboxSender(deliver=self._deliver_message_fabric)
 
         def factory(spec: Any, llm_gateway_token: str) -> _ReferenceMultiAgentAdapter | FakeModelAdapter:
             del llm_gateway_token
@@ -397,12 +411,14 @@ class ReferenceBackendHarness:
         self.backend.idle_timeout_s = 30.0
         self.backend.max_recover_attempts = 10_000
 
-    def _outbox_sender_for(self, request: BackendRunRequest) -> RecordingOutboxSender | None:
+    def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
         scenario = str(request.metadata.get("scenario") or "")
         if scenario == "tool-side-effect-pending-recovery":
             return None
         if scenario.startswith("tool-side-effect-"):
             return self.outbox_sender
+        if scenario.startswith("message-fabric-"):
+            return self.message_fabric_sender
         return None
 
     @property
@@ -417,11 +433,16 @@ class ReferenceBackendHarness:
             "multi-agent",
             "tool-agent",
             "side-effect-tool-agent",
+            "message-fabric",
             "reference-full",
         )
 
     def submit_run(self, request: dict[str, Any]) -> dict[str, Any]:
         scenario = str(request["scenario"])
+        if scenario == "message-fabric-two-peer":
+            return self._submit_message_fabric_two_peer()
+        if scenario == "message-fabric-duplicate-restart":
+            return self._submit_message_fabric_duplicate_restart()
         multi_turn = scenario in {
             "multi-turn",
             "recoverable-multi-turn",
@@ -430,6 +451,8 @@ class ReferenceBackendHarness:
             "tool-ask-denied",
             "tool-ask-stale-denied",
             "tool-side-effect-pending-recovery",
+            "message-fabric-receiver",
+            "message-fabric-worker",
         }
         submission = self.backend.submit_run(
             BackendRunRequest(
@@ -450,6 +473,7 @@ class ReferenceBackendHarness:
             "tool-side-effect-outbox-dispatched",
             "tool-side-effect-strict-rejected",
             "tool-side-effect-idempotent-inline",
+            "message-fabric-peer-unavailable",
         }:
             assert self.backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
         elif multi_turn:
@@ -500,6 +524,105 @@ class ReferenceBackendHarness:
         else:
             raise AssertionError(f"unsupported backend scenario: {scenario}")
         return {"run_id": submission.run_id, "token": submission.run_token}
+
+    def _submit_backend_scenario(
+        self,
+        scenario: str,
+        *,
+        instruction: str | None = None,
+        multi_turn: bool = False,
+    ) -> dict[str, str]:
+        submission = self.backend.submit_run(
+            BackendRunRequest(
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=self.workspace,
+                instruction=instruction or f"{scenario} run",
+                runtime_config=_runtime_config_for_scenario(scenario),
+                multi_turn=multi_turn,
+                metadata={"scenario": scenario},
+            )
+        )
+        return {"run_id": submission.run_id, "token": submission.run_token}
+
+    def _submit_message_fabric_two_peer(self) -> dict[str, Any]:
+        worker = self._submit_backend_scenario(
+            "message-fabric-worker",
+            instruction="stand by for planner",
+            multi_turn=True,
+        )
+        self.message_fabric_directory["worker"] = worker["run_id"]
+        self.message_fabric_tokens[worker["run_id"]] = worker["token"]
+        assert _eventually(lambda: self.backend._record(worker["run_id"]).status == "awaiting_input")
+
+        planner = self._submit_backend_scenario(
+            "message-fabric-planner",
+            instruction="collaborate with worker",
+            multi_turn=True,
+        )
+        self.message_fabric_directory["planner"] = planner["run_id"]
+        self.message_fabric_tokens[planner["run_id"]] = planner["token"]
+        assert _eventually(
+            lambda: _has_event(
+                self.events(planner["run_id"], planner["token"], limit=200)["events"],
+                "outbox.dispatched",
+            ),
+            timeout_s=20.0,
+        )
+        assert _eventually(
+            lambda: _has_event(
+                self.events(worker["run_id"], worker["token"], limit=200)["events"],
+                "outbox.dispatched",
+            ),
+            timeout_s=20.0,
+        )
+        return {
+            "run_id": planner["run_id"],
+            "token": planner["token"],
+            "peer_run_id": worker["run_id"],
+            "peer_token": worker["token"],
+        }
+
+    def _submit_message_fabric_duplicate_restart(self) -> dict[str, Any]:
+        receiver = self._submit_backend_scenario(
+            "message-fabric-receiver",
+            instruction="receive external agent messages",
+            multi_turn=True,
+        )
+        assert _eventually(lambda: self.backend._record(receiver["run_id"]).status == "awaiting_input")
+        envelope = _external_agent_envelope("mf-duplicate-1", peer_id="planner", text="hello worker")
+        first = self.deliver_external_agent_message(receiver["run_id"], receiver["token"], envelope)
+        assert first["status"] == "queued"
+        assert _eventually(
+            lambda: "mf-duplicate-1"
+            in self.message_fabric_state(receiver["run_id"], receiver["token"])["seen_inbox_ids"],
+            timeout_s=20.0,
+        )
+        assert _eventually(
+            lambda: (
+                self.checkpoint_store.latest(receiver["run_id"]) is not None
+                and "mf-duplicate-1"
+                in self.checkpoint_store.latest(receiver["run_id"]).checkpoint.inbox_seen_ids  # type: ignore[union-attr]
+            ),
+            timeout_s=20.0,
+        )
+        restarted = self.restart(local_state="same")
+        restarted.resume_run(receiver["run_id"], receiver["token"])
+        duplicate = restarted.deliver_external_agent_message(
+            receiver["run_id"],
+            receiver["token"],
+            envelope,
+        )
+        state = restarted.message_fabric_state(receiver["run_id"], receiver["token"])
+        _cancel_backend_run(restarted, receiver["run_id"], receiver["token"])
+        return {
+            "run_id": receiver["run_id"],
+            "token": receiver["token"],
+            "message_id": "mf-duplicate-1",
+            "first_status": first["status"],
+            "duplicate_status_after_restart": duplicate["status"],
+            "seen_inbox_ids_after_restart": state["seen_inbox_ids"],
+        }
 
     def _pending_task(self, run_id: str, kind: str) -> dict[str, Any]:
         record = self.backend._record(run_id)
@@ -604,6 +727,77 @@ class ReferenceBackendHarness:
                 payloads = list(latest.checkpoint.outbox_requests)
         return {"requests": [_side_effect_request_summary(payload) for payload in payloads]}
 
+    def deliver_external_agent_message(
+        self,
+        run_id: str,
+        token: str,
+        envelope: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            parsed = validate_external_agent_envelope(dict(envelope))
+        except ValueError as exc:
+            return {
+                "run_id": run_id,
+                "status": "rejected",
+                "error_code": "external_agent_envelope_invalid",
+                "error": str(exc),
+            }
+        message = external_agent_envelope_to_inbox_message(parsed, run_id=run_id)
+        return self.backend.send_message(
+            run_id,
+            token,
+            message.content,
+            message_id=message.id,
+            source=message.source,
+            correlation_id=message.correlation_id,
+            causation_id=message.causation_id,
+            traceparent=message.traceparent,
+            tracestate=message.tracestate,
+        )
+
+    def message_fabric_state(self, run_id: str, token: str) -> dict[str, Any]:
+        payloads: list[dict[str, Any]] = []
+        record = None
+        try:
+            self.backend.status(run_id, token)
+            record = self.backend._record(run_id)
+        except KeyError:
+            pass
+        if record is not None and record.loop is not None:
+            payloads = record.loop._outbox.export()
+        if not payloads:
+            latest = self.checkpoint_store.latest(run_id)
+            if latest is not None:
+                payloads = list(latest.checkpoint.outbox_requests)
+        seen_ids = sorted(record.seen_inbox_ids) if record is not None else []
+        if not seen_ids:
+            latest = self.checkpoint_store.latest(run_id)
+            if latest is not None:
+                seen_ids = sorted(latest.checkpoint.inbox_seen_ids)
+        return {
+            "run_id": run_id,
+            "seen_inbox_ids": seen_ids,
+            "requests": [_side_effect_request_summary(payload) for payload in payloads],
+        }
+
+    def _deliver_message_fabric(
+        self,
+        destination: str,
+        envelope: dict[str, Any],
+        *,
+        message_id: str,
+        correlation_id: str,
+        causation_id: str,
+        traceparent: str,
+    ) -> str:
+        del message_id, correlation_id, causation_id, traceparent
+        run_id = self.message_fabric_directory.get(destination)
+        if not run_id:
+            raise LookupError(f"no agent {destination!r}")
+        token = self.message_fabric_tokens[run_id]
+        result = self.deliver_external_agent_message(run_id, token, envelope)
+        return f"external-agent:{run_id}:{result.get('message_id', '')}"
+
     def dispatch(self, command: dict[str, Any]) -> dict[str, Any]:
         return self.backend.dispatch(ControlCommand.from_json(dict(command))).to_json()
 
@@ -633,6 +827,23 @@ def _runtime_config_for_scenario(scenario: str) -> AgentRuntimeConfig:
                 ToolBinding.for_tool("run.finish"),
             ),
             metadata={"tool_side_effect_policy": {"mode": "strict"}},
+        )
+    if scenario in {
+        "message-fabric-planner",
+        "message-fabric-worker",
+        "message-fabric-peer-unavailable",
+    }:
+        return AgentRuntimeConfig(
+            definition_id="message-fabric-agent",
+            tools=(
+                ToolBinding.for_tool("outbox.send", runtime={"requires_lease": True}),
+                ToolBinding.for_tool("run.finish"),
+            ),
+        )
+    if scenario == "message-fabric-receiver":
+        return AgentRuntimeConfig(
+            definition_id="message-fabric-agent",
+            tools=(ToolBinding.for_tool("run.finish"),),
         )
     if scenario == "tool-side-effect-strict-rejected":
         return AgentRuntimeConfig(
@@ -722,6 +933,69 @@ def _turns_for_scenario(scenario: str) -> list[ModelTurn]:
             ),
             ModelTurn(final_text=f"{scenario} completed"),
         ]
+    if scenario == "message-fabric-planner":
+        return [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "outbox_send",
+                        {
+                            "destination": "worker",
+                            "payload": {
+                                "text": "please do X",
+                                "task_id": "message-fabric-task-1",
+                            },
+                            "idempotency_key": "planner-to-worker-1",
+                        },
+                        "planner_send_1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="planner sent request"),
+        ]
+    if scenario == "message-fabric-worker":
+        return [
+            ModelTurn(final_text="worker standing by"),
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "outbox_send",
+                        {
+                            "destination": "planner",
+                            "payload": {
+                                "text": "done: ok",
+                                "task_id": "message-fabric-task-1",
+                            },
+                            "idempotency_key": "worker-to-planner-1",
+                        },
+                        "worker_send_1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="worker replied"),
+        ]
+    if scenario == "message-fabric-peer-unavailable":
+        return [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "outbox_send",
+                        {
+                            "destination": "missing-worker",
+                            "payload": {"text": "are you there?"},
+                            "idempotency_key": "missing-worker-1",
+                        },
+                        "missing_send_1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="queued unavailable peer"),
+        ]
+    if scenario == "message-fabric-receiver":
+        return [
+            ModelTurn(final_text="receiver standing by"),
+            ModelTurn(final_text="receiver processed message"),
+        ]
     if scenario == "tool-side-effect-strict-rejected":
         return [
             ModelTurn(tool_calls=(fake_tool_call("demo_external_unsafe", {}, "unsafe_1"),)),
@@ -774,6 +1048,36 @@ def _side_effect_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "attempts": int(payload.get("attempts") or 0),
         "token_ref_present": bool(payload.get("token_ref")),
     }
+
+
+def _external_agent_envelope(message_id: str, *, peer_id: str, text: str) -> dict[str, Any]:
+    from monoid_agent_kernel.core.external_agent_envelope import (
+        EXTERNAL_AGENT_ENVELOPE_VERSION,
+    )
+
+    return {
+        "protocol": EXTERNAL_AGENT_ENVELOPE_VERSION,
+        "peer_id": peer_id,
+        "message_id": message_id,
+        "task_id": "message-fabric-task-1",
+        "correlation_id": "message-fabric-correlation-1",
+        "causation_id": "message-fabric-cause-1",
+        "parts": [{"type": "text", "text": text}],
+    }
+
+
+def _cancel_backend_run(harness: ReferenceBackendHarness, run_id: str, token: str) -> None:
+    try:
+        harness.dispatch(
+            {
+                "type": "cancel",
+                "run_id": run_id,
+                "args": {"token": token},
+                "issuer": "reference-message-fabric",
+            }
+        )
+    except Exception:
+        pass
 
 
 def _eventually(fn: Any, *, timeout_s: float = 10.0) -> bool:

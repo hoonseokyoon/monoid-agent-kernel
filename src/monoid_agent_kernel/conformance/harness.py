@@ -93,6 +93,25 @@ class SideEffectHarness(BackendHarness, Protocol):
 
 
 @runtime_checkable
+class MessageFabricHarness(BackendHarness, Protocol):
+    """Backend operations used by external agent message-fabric profiles."""
+
+    def restart(self, *, local_state: str = "same") -> MessageFabricHarness:
+        """Return a fresh harness instance over the same durable state."""
+
+    def deliver_external_agent_message(
+        self,
+        run_id: str,
+        token: str,
+        envelope: JsonObject,
+    ) -> JsonObject:
+        """Deliver one normalized external-agent envelope into a run."""
+
+    def message_fabric_state(self, run_id: str, token: str) -> JsonObject:
+        """Return normalized message-fabric state for one run."""
+
+
+@runtime_checkable
 class GatewayHarness(ConformanceHarness, Protocol):
     """Gateway operation used by provider-gateway profiles."""
 

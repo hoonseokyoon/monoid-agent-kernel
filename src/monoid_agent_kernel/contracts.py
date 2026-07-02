@@ -80,6 +80,19 @@ from monoid_agent_kernel.core.outbox import (
     OutboxSender,
 )
 
+# External agent envelope (transport-neutral peer-agent message fabric)
+from monoid_agent_kernel.core.external_agent_envelope import (
+    EXTERNAL_AGENT_ENVELOPE_VERSION,
+    ExternalAgentEnvelope,
+    ExternalAgentError,
+    ExternalAgentPart,
+    ExternalAgentResult,
+    external_agent_envelope_from_outbox_request,
+    external_agent_envelope_to_inbox_message,
+    normalize_external_agent_error,
+    validate_external_agent_envelope,
+)
+
 # W3C Trace Context helpers (observability metadata carried on the envelopes)
 from monoid_agent_kernel.core.trace_context import (
     child_traceparent,
@@ -282,6 +295,16 @@ __all__ = [
     "OutboxRequest",
     "OutboxReceipt",
     "OutboxSender",
+    # external agent envelope
+    "EXTERNAL_AGENT_ENVELOPE_VERSION",
+    "ExternalAgentEnvelope",
+    "ExternalAgentPart",
+    "ExternalAgentResult",
+    "ExternalAgentError",
+    "external_agent_envelope_from_outbox_request",
+    "external_agent_envelope_to_inbox_message",
+    "validate_external_agent_envelope",
+    "normalize_external_agent_error",
     # W3C Trace Context helpers
     "parse_traceparent",
     "new_traceparent",

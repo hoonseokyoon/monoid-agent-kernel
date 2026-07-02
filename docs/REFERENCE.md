@@ -17,6 +17,8 @@ conformance harnesses can be wired together for local smoke testing and document
 - `monoid_agent_kernel.reference.llm_gateway`: LLM gateway example and offline provider path.
 - `monoid_agent_kernel.reference.web_gateway`: scoped web/search/fetch/context gateway example.
 - `monoid_agent_kernel.reference.mcp_gateway`: MCP gateway example for brokered tool integration.
+- `monoid_agent_kernel.reference.outbox`: durable senders, including the Reference message-fabric
+  adapter that routes external-agent envelopes into peer inboxes.
 - `monoid_agent_kernel.reference.stores`: local durable store examples.
 - `monoid_agent_kernel.reference.studio`: browser UI and smoke surface.
 - `monoid_agent_kernel.reference.conformance`: public Reference harnesses for conformance profiles.
@@ -28,8 +30,9 @@ is added, Reference gets an adapter or smoke path that proves the rule against t
 External backends can use that adapter shape as a starting point for their own profile harnesses.
 
 `monoid_agent_kernel.reference.conformance` provides that adapter shape as a public Reference
-example. `ReferenceConformanceFactory` creates fresh backend, capability, and gateway harnesses for
-profile assertions, then runs an offline Studio smoke path for `reference-full`.
+example. `ReferenceConformanceFactory` creates fresh backend, capability, gateway, side-effect, and
+message-fabric harnesses for profile assertions, then runs an offline Studio smoke path for
+`reference-full`.
 
 The harness keeps profile tests focused on observable behavior. The Reference services keep the
 actual backend, gateway, and Studio wiring visible as a runnable example.
