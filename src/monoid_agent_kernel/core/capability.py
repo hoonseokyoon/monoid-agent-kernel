@@ -25,6 +25,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from monoid_agent_kernel.core.lease_admission import validate_lease_admission
 from monoid_agent_kernel.core.scope import scope_within
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -260,11 +261,8 @@ class CapabilityVault:
 
     def admit(self, request: CapabilityRequest, lease: CapabilityLease) -> CapabilityLease:
         """Store a granted lease after enforcing least-privilege (grant scope ⊆ request scope).
-        Raises ``ValueError`` if the broker tried to widen scope (fail-closed)."""
-        if not scope_within(lease.scope, request.scope):
-            raise ValueError(
-                f"broker granted a wider scope than requested for {request.capability!r}"
-            )
+        Raises ``ValueError`` if the broker tried to widen scope or grant another capability."""
+        validate_lease_admission(request.capability, request.scope, lease.capability, lease.scope)
         self._leases[lease.capability] = lease
         return lease
 

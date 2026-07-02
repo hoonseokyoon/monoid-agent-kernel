@@ -36,6 +36,9 @@ class BackendHarness(ConformanceHarness, Protocol):
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> JsonObject:
         """Return the diagnostics aggregate for a run."""
 
+    def task_result(self, run_id: str, token: str, task_id: str) -> JsonObject:
+        """Return the stored result for one backend task."""
+
     def dispatch(self, command: JsonObject) -> JsonObject:
         """Dispatch one backend control command."""
 

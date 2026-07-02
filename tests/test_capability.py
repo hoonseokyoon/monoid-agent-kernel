@@ -86,6 +86,22 @@ def test_vault_admit_rejects_scope_widening() -> None:
         vault.admit(request, widened)
 
 
+def test_vault_admit_rejects_capability_mismatch() -> None:
+    vault = CapabilityVault()
+    request = CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
+    mismatched = CapabilityLease(
+        capability="web.fetch",
+        token_ref="t",
+        expires_at=2000.0,
+        scope={"allowed_domains": ["a.edu"]},
+    )
+
+    with pytest.raises(ValueError):
+        vault.admit(request, mismatched)
+
+    assert vault.token_for("web.fetch", now=0.0) is None
+
+
 def test_vault_admit_accepts_narrower_numeric_web_caps() -> None:
     vault = CapabilityVault()
     request = CapabilityRequest(

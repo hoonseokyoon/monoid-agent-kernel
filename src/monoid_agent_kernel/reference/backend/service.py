@@ -27,6 +27,7 @@ from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
+from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
 from monoid_agent_kernel.core.outbox import OutboxReceipt
 from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
 from monoid_agent_kernel.core.lifecycle import (
@@ -1280,13 +1281,10 @@ class RunnerBackend:
                 approval_result["answer"] = str(args.get("answer") or "Approve")
                 approval_result["approved"] = True
             else:
-                approval_result["answer"] = str(args.get("answer") or "Deny")
-                approval_result["approved"] = False
-                approval_result["granted"] = False
-                approval_result.pop("lease", None)
-                approval_result.pop("token_ref", None)
-                approval_result["reason"] = command.reason or str(
-                    args.get("reason") or approval_result.get("reason") or "denied"
+                approval_result = sanitize_denied_capability_result(
+                    result,
+                    answer=str(args.get("answer") or "Deny"),
+                    reason=command.reason or str(args.get("reason") or approval_result.get("reason") or "denied"),
                 )
             return ok(
                 self.report_task_result(
