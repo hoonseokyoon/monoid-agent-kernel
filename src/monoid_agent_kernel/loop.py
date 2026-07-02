@@ -97,6 +97,12 @@ from monoid_agent_kernel.core.tool_approval import (
     denied_tool_approval_observation,
     normalize_tool_approval_result,
 )
+from monoid_agent_kernel.core.side_effect_policy import (
+    ToolSideEffectPolicy,
+    admit_tool_side_effect,
+    side_effect_policy_from_config,
+    verify_outbox_side_effect,
+)
 from monoid_agent_kernel.core.workspace_index import build_workspace_index
 from monoid_agent_kernel.errors import (
     ModelAdapterError,
@@ -2634,6 +2640,7 @@ class AgentLoop:
             turn_context = self._turn_context(state, res, step, max(0, max_steps - local_step))
             turn_registry = self._registry_for_turn(context, turn_context, res)
             runtime_config = self._current_runtime_config(turn_registry)
+            side_effect_policy = side_effect_policy_from_config(runtime_config)
             bound_catalog = compile_bound_tool_catalog(runtime_config, turn_registry)
             # Now that the active tool set for this turn is known, expose it on the turn context so
             # a context provider's dynamic_segment can gate itself on the live config (e.g. the
@@ -2698,6 +2705,7 @@ class AgentLoop:
                             recorder=recorder,
                             turn_id=turn_id,
                             step=step,
+                            side_effect_policy=side_effect_policy,
                         )
                     )
                     is not None
@@ -2720,6 +2728,7 @@ class AgentLoop:
                             recorder=recorder,
                             turn_id=turn_id,
                             step=step,
+                            side_effect_policy=side_effect_policy,
                         )
                     )
                     is not None
@@ -3016,6 +3025,7 @@ class AgentLoop:
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
                     step=step,
+                    side_effect_policy=side_effect_policy,
                 )
                 observations.append(observation)
                 self._check_run_boundary(deadline)
@@ -3458,6 +3468,7 @@ class AgentLoop:
         recorder: AgentRecorder,
         turn_id: str,
         step: int,
+        side_effect_policy: ToolSideEffectPolicy,
     ) -> ToolObservation | None:
         """Re-execute one gated tool call after its capability was granted, returning the result as
         a user-message observation (so it never collides with the original call's pending tool
@@ -3478,6 +3489,7 @@ class AgentLoop:
             turn_id=turn_id,
             parent_id=None,
             step=step,
+            side_effect_policy=side_effect_policy,
         )
         # Deliver as a user message (is_background) under a distinct call_id — the original call_id
         # already carries the "pending" tool result, so a second tool result there would be malformed.
@@ -3504,6 +3516,7 @@ class AgentLoop:
         recorder: AgentRecorder,
         turn_id: str,
         step: int,
+        side_effect_policy: ToolSideEffectPolicy,
     ) -> ToolObservation | None:
         call_name = str(replay.get("call_name") or "")
         if not call_name:
@@ -3521,6 +3534,7 @@ class AgentLoop:
             parent_id=None,
             step=step,
             approved_tool_approval=replay,
+            side_effect_policy=side_effect_policy,
         )
         return ToolObservation(
             call_id=f"tool_approval_replay:{replay.get('call_id') or ''}",
@@ -3752,8 +3766,6 @@ class AgentLoop:
             result = spec.handler(context, arguments)
         finally:
             context._current_call = CallContext("", None, None)
-        if result.ok:
-            self._emit_side_effect_event(spec, arguments, result, context, recorder, turn_id, started_event.event_id)
         return result
 
     def _finalize_tool_call(
@@ -3880,6 +3892,7 @@ class AgentLoop:
         turn_id: str,
         parent_id: str | None,
         step: int,
+        side_effect_policy: ToolSideEffectPolicy,
         approved_tool_approval: Mapping[str, Any] | None = None,
     ) -> ToolObservation:
         spec: ToolSpec | None = None
@@ -3964,6 +3977,17 @@ class AgentLoop:
                 else:
                     if approved_tool_approval is not None:
                         self._verify_tool_approval_replay(bound_tool, approved_tool_approval)
+                    side_effect_admission = admit_tool_side_effect(
+                        bound_tool.base_spec,
+                        bound_tool.runtime,
+                        arguments,
+                        side_effect_policy,
+                    )
+                    if not side_effect_admission.allowed:
+                        raise PermissionDenied(
+                            side_effect_admission.error,
+                            error_code=side_effect_admission.error_code,
+                        )
                     pending = self._ensure_capability_lease(
                         bound_tool,
                         context,
@@ -3980,6 +4004,7 @@ class AgentLoop:
                         result = pending
                     else:
                         call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
+                        outbox_count = len(self._outbox.export())
                         result = self._invoke_handler(
                             bound_tool,
                             context,
@@ -3990,6 +4015,26 @@ class AgentLoop:
                             started_event=started_event,
                             authorization=authorization,
                         )
+                        if result.ok:
+                            side_effect_admission = verify_outbox_side_effect(
+                                side_effect_admission,
+                                outbox_count,
+                                len(self._outbox.export()),
+                            )
+                            if not side_effect_admission.allowed:
+                                raise ToolExecutionError(
+                                    side_effect_admission.error,
+                                    error_code=side_effect_admission.error_code,
+                                )
+                            self._emit_side_effect_event(
+                                bound_tool.base_spec,
+                                arguments,
+                                result,
+                                context,
+                                recorder,
+                                turn_id,
+                                started_event.event_id,
+                            )
         except ToolExecutionError as exc:
             if started_event is None:
                 started_event = self._emit_tool_started(

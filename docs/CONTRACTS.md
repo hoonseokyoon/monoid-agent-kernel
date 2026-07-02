@@ -70,6 +70,7 @@ prove the same behavior through conformance profiles.
 | `OR-09-SUBAGENT-BOUNDARY` | Subagent runtime links identity, capability, and trace boundaries: child runs have their own identity/accounting, isolated live lease slots, shared revocation, and parent-child diagnostics linkage. | `multi-agent`, `capability-security`, `durable-runner` | `core.subagent_runtime.SubagentRuntimeContext`, `validate_descendant_run_id`, `subagent_diagnostics_from_events`, `CapabilityVault.fork_for_child` |
 | `OR-10-TOOL-SURFACE-ADMISSION` | Tool execution follows the active turn surface: unavailable tools, hidden/searchable-only tools, denied bindings, and quota-exceeded bindings do not execute handlers. | `tool-agent` | `DefaultToolSurfaceResolver`, `ToolSurfaceSnapshot`, `AgentLoop` tool admission path |
 | `OR-11-GENERIC-ASK-APPROVAL` | `authorization="ask"` creates a durable approval task; approval revalidates the captured call before one execution, and denial returns an observation without invoking the handler. | `tool-agent`, `control-plane` | `core.tool_approval`, `TaskManager`, `AgentLoop` approval replay path |
+| `OR-12-DURABLE-SIDE-EFFECT` | External side-effect tools declare their delivery semantics; strict runtimes admit them through durable outbox staging or explicit idempotency keys, and outbox-declared handlers stage a durable request before success. | `tool-agent` | `core.side_effect_policy`, `core.outbox`, `ToolContext.emit_outbox`, Reference edge drain |
 
 ## Identifier Namespace
 

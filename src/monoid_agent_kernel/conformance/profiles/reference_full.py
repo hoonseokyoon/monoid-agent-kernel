@@ -27,6 +27,7 @@ from .multi_agent import (
 )
 from .provider_gateway import assert_provider_gateway_profile
 from .tool_agent import (
+    assert_tool_agent_durable_side_effect_profile,
     assert_tool_agent_generic_ask_approval_profile,
     assert_tool_agent_surface_admission_profile,
 )
@@ -34,7 +35,7 @@ from .tool_agent import (
 PROFILE = ProfileMetadata(
     profile_id="reference-full",
     title="Reference Full",
-    summary="Bundled Reference services and Studio smoke path across all Phase 1S rules.",
+    summary="Bundled Reference services and Studio smoke path across Phase 1S and Phase 2 tool-agent rules.",
     rule_ids=(
         "OR-01-SCOPE-RELATION",
         "OR-02-CAPABILITY-BOUNDARY",
@@ -47,6 +48,7 @@ PROFILE = ProfileMetadata(
         "OR-09-SUBAGENT-BOUNDARY",
         "OR-10-TOOL-SURFACE-ADMISSION",
         "OR-11-GENERIC-ASK-APPROVAL",
+        "OR-12-DURABLE-SIDE-EFFECT",
     ),
     harnesses=("backend", "capability", "gateway", "studio"),
 )
@@ -79,6 +81,7 @@ def assert_reference_full_profile(factory: ReferenceFullFactory) -> None:
 
     assert_tool_agent_surface_admission_profile(factory.new_backend())
     assert_tool_agent_generic_ask_approval_profile(factory.new_backend())
+    assert_tool_agent_durable_side_effect_profile(factory.new_backend())
 
     assert_durable_runner_event_sequence_profile(factory.new_backend())
     assert_durable_runner_recovery_metadata_profile(factory.new_backend())

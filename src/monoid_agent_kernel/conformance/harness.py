@@ -77,6 +77,9 @@ class BackendHarness(ConformanceHarness, Protocol):
     def task_result(self, run_id: str, token: str, task_id: str) -> JsonObject:
         """Return the stored result for one backend task."""
 
+    def side_effects(self, run_id: str, token: str) -> JsonObject:
+        """Return normalized durable side-effect requests for one run."""
+
     def dispatch(self, command: JsonObject) -> JsonObject:
         """Dispatch one backend control command."""
 

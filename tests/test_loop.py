@@ -5,6 +5,7 @@ from pathlib import Path
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
@@ -440,6 +441,124 @@ def test_ask_authorization_denial_never_invokes_handler(tmp_path: Path) -> None:
     assert provider.calls == 0
     transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
     assert "secret-ref://lease" not in transcript
+
+
+def test_strict_external_side_effect_denies_unsafe_tool_before_handler(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class Provider:
+        calls = 0
+
+        def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                self.calls += 1
+                return ToolResult(ok=True, content={"ran": True})
+
+            return [
+                ToolSpec(
+                    id="demo.external",
+                    description="external",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    provider = Provider()
+    sink = MemoryEventSink()
+    config = AgentRuntimeConfig(
+        definition_id="test-agent",
+        tools=(
+            tool_binding("demo.external", runtime={"external_side_effect": True}),
+            tool_binding("run.finish"),
+        ),
+        metadata={"tool_side_effect_policy": {"mode": "strict"}},
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_external", {}, "external_1"),)),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+        event_sinks=(sink,),
+    )
+
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert provider.calls == 0
+    assert any(
+        event.type == "permission.denied"
+        and event.data.get("error_code") == "tool_side_effect_policy_denied"
+        for event in sink.events
+    )
+
+
+def test_strict_outbox_side_effect_fails_when_handler_stages_no_request(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class Provider:
+        def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                return ToolResult(ok=True, content={"ran": True})
+
+            return [
+                ToolSpec(
+                    id="demo.outbox_missing",
+                    description="external",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    sink = MemoryEventSink()
+    config = AgentRuntimeConfig(
+        definition_id="test-agent",
+        tools=(
+            tool_binding(
+                "demo.outbox_missing",
+                runtime={"external_side_effect": True, "side_effect_delivery": "outbox"},
+            ),
+            tool_binding("run.finish"),
+        ),
+        metadata={"tool_side_effect_policy": {"mode": "strict"}},
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_outbox_missing", {}, "external_1"),)),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(Provider(),),
+        event_sinks=(sink,),
+    )
+
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert any(
+        event.type == "tool.call.failed"
+        and event.data.get("error_code") == "tool_side_effect_outbox_missing"
+        for event in sink.events
+    )
 
 
 def test_shell_binding_auto_approve_updates_proposal(tmp_path: Path) -> None:

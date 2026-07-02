@@ -24,6 +24,7 @@ from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.outbox import OutboxToolProvider, RecordingOutboxSender
 from monoid_agent_kernel.reference.studio.server import StudioConfig, StudioServer
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
@@ -306,6 +307,51 @@ class _ApprovalToolProvider:
         ]
 
 
+class _SideEffectDemoProvider:
+    def __init__(self) -> None:
+        self.unsafe_calls = 0
+        self.idempotent_calls = 0
+        self.idempotency_keys: list[str] = []
+
+    def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+        del context
+
+        def unsafe_handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            del ctx, args
+            self.unsafe_calls += 1
+            return ToolResult(ok=True, content={"unsafe_call": True})
+
+        def idempotent_handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            del ctx
+            self.idempotent_calls += 1
+            key = str(args.get("idempotency_key") or "")
+            self.idempotency_keys.append(key)
+            return ToolResult(ok=True, content={"idempotency_key": key})
+
+        return [
+            ToolSpec(
+                id="demo.external_unsafe",
+                description="demo external side-effect tool without durable delivery",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+                capability="",
+                side_effect="write",
+                handler=unsafe_handler,
+            ),
+            ToolSpec(
+                id="demo.external_idempotent",
+                description="demo external side-effect tool with caller-provided idempotency",
+                input_schema={
+                    "type": "object",
+                    "properties": {"idempotency_key": {"type": "string"}},
+                    "additionalProperties": True,
+                },
+                capability="",
+                side_effect="write",
+                handler=idempotent_handler,
+            ),
+        ]
+
+
 class ReferenceBackendHarness:
     def __init__(
         self,
@@ -326,6 +372,8 @@ class ReferenceBackendHarness:
         self.token_manager = token_manager or TokenManager.from_secret("x" * 32)
         self.gated_provider = _GatedToolProvider()
         self.approval_provider = _ApprovalToolProvider()
+        self.side_effect_provider = _SideEffectDemoProvider()
+        self.outbox_sender = RecordingOutboxSender()
 
         def factory(spec: Any, llm_gateway_token: str) -> _ReferenceMultiAgentAdapter | FakeModelAdapter:
             del llm_gateway_token
@@ -342,11 +390,25 @@ class ReferenceBackendHarness:
             model_adapter_factory=factory,
             checkpoint_store=self.checkpoint_store,
             subagent_definitions={"researcher": _child_def()},
-            tool_providers=(self.gated_provider, self.approval_provider),
+            tool_providers=(
+                self.gated_provider,
+                self.approval_provider,
+                self.side_effect_provider,
+                OutboxToolProvider(),
+            ),
             capability_broker_factory=lambda req: AutoGrantBroker(),
+            outbox_sender_factory=self._outbox_sender_for,
         )
         self.backend.idle_timeout_s = 30.0
         self.backend.max_recover_attempts = 10_000
+
+    def _outbox_sender_for(self, request: BackendRunRequest) -> RecordingOutboxSender | None:
+        scenario = str(request.metadata.get("scenario") or "")
+        if scenario == "tool-side-effect-pending-recovery":
+            return None
+        if scenario.startswith("tool-side-effect-"):
+            return self.outbox_sender
+        return None
 
     @property
     def harness_id(self) -> str:
@@ -365,6 +427,7 @@ class ReferenceBackendHarness:
             "tool-ask-approved",
             "tool-ask-denied",
             "tool-ask-stale-denied",
+            "tool-side-effect-pending-recovery",
         }
         submission = self.backend.submit_run(
             BackendRunRequest(
@@ -377,11 +440,21 @@ class ReferenceBackendHarness:
                 metadata={"scenario": scenario},
             )
         )
-        if scenario in {"completed", "subagent-foreground", "subagent-capability-revoked", "tool-quota-denied"}:
+        if scenario in {
+            "completed",
+            "subagent-foreground",
+            "subagent-capability-revoked",
+            "tool-quota-denied",
+            "tool-side-effect-outbox-dispatched",
+            "tool-side-effect-strict-rejected",
+            "tool-side-effect-idempotent-inline",
+        }:
             assert self.backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
         elif multi_turn:
             assert _eventually(lambda: self.backend._record(submission.run_id).status == "awaiting_input")
             if scenario == "recoverable-multi-turn":
+                assert _eventually(lambda: self.checkpoint_store.latest(submission.run_id) is not None)
+            elif scenario == "tool-side-effect-pending-recovery":
                 assert _eventually(lambda: self.checkpoint_store.latest(submission.run_id) is not None)
             elif scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
                 task = self._pending_task(submission.run_id, "tool_approval")
@@ -514,6 +587,27 @@ class ReferenceBackendHarness:
         task = json.loads(task_path.read_text(encoding="utf-8"))
         return {"result": task["result"]}
 
+    def side_effects(self, run_id: str, token: str) -> dict[str, Any]:
+        payloads: list[dict[str, Any]] = []
+        try:
+            self.backend.status(run_id, token)
+            record = self.backend._record(run_id)
+        except KeyError:
+            record = None
+        if record is not None and record.loop is not None:
+            payloads = record.loop._outbox.export()
+        if not payloads:
+            latest = self.checkpoint_store.latest(run_id)
+            if latest is not None:
+                payloads = list(latest.checkpoint.outbox_requests)
+        return {
+            "requests": [_side_effect_request_summary(payload) for payload in payloads],
+            "unsafe_handler_calls": self.side_effect_provider.unsafe_calls,
+            "idempotent_handler_calls": self.side_effect_provider.idempotent_calls,
+            "idempotency_keys": list(self.side_effect_provider.idempotency_keys),
+            "sent_count": len(self.outbox_sender.sent),
+        }
+
     def dispatch(self, command: dict[str, Any]) -> dict[str, Any]:
         return self.backend.dispatch(ControlCommand.from_json(dict(command))).to_json()
 
@@ -528,6 +622,50 @@ class ReferenceBackendHarness:
 
 
 def _runtime_config_for_scenario(scenario: str) -> AgentRuntimeConfig:
+    if scenario in {"tool-side-effect-outbox-dispatched", "tool-side-effect-pending-recovery"}:
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool(
+                    "outbox.send",
+                    runtime={
+                        "requires_lease": True,
+                        "external_side_effect": True,
+                        "side_effect_delivery": "outbox",
+                    },
+                ),
+                ToolBinding.for_tool("run.finish"),
+            ),
+            metadata={"tool_side_effect_policy": {"mode": "strict"}},
+        )
+    if scenario == "tool-side-effect-strict-rejected":
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool(
+                    "demo.external_unsafe",
+                    runtime={"external_side_effect": True},
+                ),
+                ToolBinding.for_tool("run.finish"),
+            ),
+            metadata={"tool_side_effect_policy": {"mode": "strict"}},
+        )
+    if scenario == "tool-side-effect-idempotent-inline":
+        return AgentRuntimeConfig(
+            definition_id="tool-agent",
+            tools=(
+                ToolBinding.for_tool(
+                    "demo.external_idempotent",
+                    runtime={
+                        "external_side_effect": True,
+                        "side_effect_delivery": "idempotent",
+                        "idempotency_key_arg": "idempotency_key",
+                    },
+                ),
+                ToolBinding.for_tool("run.finish"),
+            ),
+            metadata={"tool_side_effect_policy": {"mode": "strict"}},
+        )
     if scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
         return AgentRuntimeConfig(
             definition_id="tool-agent",
@@ -571,6 +709,42 @@ def _runtime_config_for_scenario(scenario: str) -> AgentRuntimeConfig:
 
 
 def _turns_for_scenario(scenario: str) -> list[ModelTurn]:
+    if scenario in {"tool-side-effect-outbox-dispatched", "tool-side-effect-pending-recovery"}:
+        return [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "outbox_send",
+                        {
+                            "destination": "email",
+                            "payload": {"to": "x@example.test"},
+                            "idempotency_key": f"{scenario}:email:1",
+                        },
+                        "outbox_1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text=f"{scenario} completed"),
+        ]
+    if scenario == "tool-side-effect-strict-rejected":
+        return [
+            ModelTurn(tool_calls=(fake_tool_call("demo_external_unsafe", {}, "unsafe_1"),)),
+            ModelTurn(final_text="strict rejection completed"),
+        ]
+    if scenario == "tool-side-effect-idempotent-inline":
+        return [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call("demo_external_idempotent", {}, "idempotent_missing"),
+                    fake_tool_call(
+                        "demo_external_idempotent",
+                        {"idempotency_key": "idem-1"},
+                        "idempotent_ok",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="idempotent inline completed"),
+        ]
     if scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
         return [
             ModelTurn(
@@ -593,6 +767,17 @@ def _child_def() -> SubagentDefinition:
         prompt=PromptSpec(persona_segments=(CHILD_MARK,)),
         tools=("mcp.demo.gated",),
     )
+
+
+def _side_effect_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload.get("id") or ""),
+        "destination": str(payload.get("destination") or ""),
+        "status": str(payload.get("status") or ""),
+        "idempotency_key": str(payload.get("idempotency_key") or ""),
+        "attempts": int(payload.get("attempts") or 0),
+        "token_ref_present": bool(payload.get("token_ref")),
+    }
 
 
 def _eventually(fn: Any, *, timeout_s: float = 10.0) -> bool:

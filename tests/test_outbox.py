@@ -9,6 +9,7 @@ from typing import Any
 from support.runtime import runtime_config, runtime_provider, tool_binding
 from support.waiting import eventually
 
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.spec import AgentRunSpec
@@ -135,6 +136,44 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(tmp_path: Path)
     child = parse_traceparent(sender.child_traceparents[0])
     assert child is not None and child["trace_id"] == parse_traceparent(tp)["trace_id"]
     assert child["span_id"] != parse_traceparent(tp)["span_id"]
+
+
+def test_strict_outbox_side_effect_stages_and_dispatches(tmp_path: Path) -> None:
+    sender = RecordingOutboxSender()
+    backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    binding = tool_binding(
+        "outbox.send",
+        runtime={
+            "requires_lease": True,
+            "external_side_effect": True,
+            "side_effect_delivery": "outbox",
+        },
+        scope=ToolScope(),
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="go",
+            runtime_config=AgentRuntimeConfig(
+                definition_id="test-agent",
+                tools=(binding,),
+                metadata={"tool_side_effect_policy": {"mode": "strict"}},
+            ),
+        )
+    )
+    assert backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
+
+    assert [request.destination for request in sender.sent] == ["email"]
+    events = [
+        json.loads(line)
+        for line in (backend._record(submission.run_id).run_dir / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert any(event["type"] == "outbox.requested" for event in events)
+    assert any(event["type"] == "outbox.dispatched" for event in events)
 
 
 def test_outbox_not_staged_when_capability_denied(tmp_path: Path) -> None:

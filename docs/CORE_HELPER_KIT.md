@@ -25,6 +25,7 @@ to the operational rules while preserving replaceable deployment choices.
 | `core.durable_metadata.DurableMetadataCommitter` | `OR-07-DURABLE-METADATA` | Validate run metadata, commit runtime config updates, write shared metadata, and materialize local recovery descriptors. |
 | `core.subagent_runtime.SubagentRuntimeContext`, `validate_descendant_run_id`, `subagent_diagnostics_from_events` | `OR-09-SUBAGENT-BOUNDARY` | Create child run identity, validate descendant event access, build lifecycle/result payloads, and summarize subagent diagnostics. |
 | `core.tool_approval` | `OR-11-GENERIC-ASK-APPROVAL` | Build approval task payloads, redact argument previews, normalize approve/deny results, and derive replay descriptors for approved calls. |
+| `core.side_effect_policy` | `OR-12-DURABLE-SIDE-EFFECT` | Read runtime side-effect policy, interpret tool/binding declarations, admit strict external side-effect calls through outbox or idempotency keys, and verify outbox staging. |
 
 ## Gateway And Diagnostics Assembly
 
@@ -50,6 +51,7 @@ Reference harness, and test coverage lives in `docs/PHASE_1S_COVERAGE.md`.
 
 ## Phase 2 State
 
-Phase 2 starts with executable `tool-agent` approval behavior. `AgentLoop` uses `core.tool_approval`
-for `authorization="ask"` calls, while backend-specific approval UI and notification policy remain
-outside the helper.
+Phase 2 starts with executable `tool-agent` behavior. `AgentLoop` uses `core.tool_approval`
+for `authorization="ask"` calls and `core.side_effect_policy` for strict external side-effect
+admission. Backend-specific approval UI, notification policy, external senders, and retry schedules
+remain outside these helpers.
