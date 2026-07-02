@@ -43,13 +43,15 @@ The package is organized around four roles:
   `ToolSpec` / `@tool`, `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest. See
   [docs/CONTRACTS.md](docs/CONTRACTS.md) for the Python, HTTP, wiring, and operational rules.
 - **Conformance Test** — profile-based tests that check contract behavior for a chosen runtime
-  shape. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the Phase 1S profile model.
+  shape. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the Phase 1S profile model and
+  [docs/PHASE_1S_COVERAGE.md](docs/PHASE_1S_COVERAGE.md) for the rule-to-test coverage matrix.
 - **Core Helper Kit** — the supported runtime and helper modules that make the contract easy to
   satisfy (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). See
   [docs/CORE_HELPER_KIT.md](docs/CORE_HELPER_KIT.md) for the helper boundary.
 - **Reference** — example services under `monoid_agent_kernel.reference` (`backend`,
-  `llm_gateway`, `web_gateway`, `stores`) assembled from the public contract and helper kit. See
-  [docs/REFERENCE.md](docs/REFERENCE.md) for the reference role and smoke targets.
+  `llm_gateway`, `web_gateway`, `mcp_gateway`, `stores`, `studio`, `conformance`) assembled from
+  the public contract and helper kit. See [docs/REFERENCE.md](docs/REFERENCE.md) for the reference
+  role, harnesses, and smoke targets.
 
 For the dynamic binding-based tool surface, see
 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md).

@@ -1,8 +1,8 @@
 # Reference Services
 
 The Reference services are runnable examples assembled from the Monoid Agent Kernel contract and
-Core Helper Kit. They show how backend, LLM gateway, web gateway, stores, and Studio can be wired
-together for local smoke testing and documentation.
+Core Helper Kit. They show how backend, LLM gateway, web gateway, MCP gateway, stores, Studio, and
+conformance harnesses can be wired together for local smoke testing and documentation.
 
 ## Role
 
@@ -16,8 +16,10 @@ together for local smoke testing and documentation.
 - `monoid_agent_kernel.reference.backend`: durable backend and control-plane example.
 - `monoid_agent_kernel.reference.llm_gateway`: LLM gateway example and offline provider path.
 - `monoid_agent_kernel.reference.web_gateway`: scoped web/search/fetch/context gateway example.
+- `monoid_agent_kernel.reference.mcp_gateway`: MCP gateway example for brokered tool integration.
 - `monoid_agent_kernel.reference.stores`: local durable store examples.
 - `monoid_agent_kernel.reference.studio`: browser UI and smoke surface.
+- `monoid_agent_kernel.reference.conformance`: public Reference harnesses for conformance profiles.
 
 ## Conformance Role
 
@@ -36,4 +38,5 @@ actual backend, gateway, and Studio wiring visible as a runnable example.
 
 Reference review should identify whether the example assembles the contract and helper kit clearly.
 Repeated runtime invariants move into Contract rules, Core Helper Kit modules, and conformance
-profiles.
+profiles. `docs/PHASE_1S_COVERAGE.md` shows the current Phase 1S mapping from rule ids to
+Reference harness scenarios and tests.
