@@ -16,7 +16,11 @@ from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel._proc import file_size, proc_group_kwargs, terminate_process
 from monoid_agent_kernel.core._util import write_json_atomic
-from monoid_agent_kernel.core.tool_approval import TOOL_APPROVAL_RESULT_TYPE, TOOL_APPROVAL_TASK_KIND
+from monoid_agent_kernel.core.tool_approval import (
+    TOOL_APPROVAL_RESULT_TYPE,
+    TOOL_APPROVAL_TASK_KIND,
+    normalize_tool_approval_result,
+)
 from monoid_agent_kernel.errors import ToolExecutionError, WorkspaceError
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -527,7 +531,7 @@ class HostedTask:
             "finished_at": self.finished_at,
             "duration_s": self.duration_s,
             "error": self.error,
-            "result": self.result,
+            "result": self.public_result(),
         }
 
     def checkpoint_json(self) -> dict[str, Any]:
@@ -605,6 +609,11 @@ class HostedTask:
         if self.kind == TOOL_APPROVAL_TASK_KIND:
             request.pop("arguments", None)
         return request
+
+    def public_result(self) -> dict[str, Any] | None:
+        if self.kind == TOOL_APPROVAL_TASK_KIND and self.result is not None:
+            return normalize_tool_approval_result(self.result, task_id=self.job_id)
+        return self.result
 
     def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:
         del run_dir, tail_bytes

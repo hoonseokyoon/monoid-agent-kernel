@@ -121,3 +121,30 @@ def test_tool_approval_public_payload_hides_raw_arguments(tmp_path) -> None:
 
     assert "arguments" not in public["request"]
     assert public["request"]["arguments_preview"]["api_key"] == "[redacted]"
+
+
+def test_tool_approval_public_payload_sanitizes_result_grant_material(tmp_path) -> None:
+    task = HostedTask(
+        job_id="task_1",
+        kind=TOOL_APPROVAL_TASK_KIND,
+        prompt="Approve tool call",
+        status="answered",
+        started_at=1.0,
+        resume_on_exit=True,
+        job_path=tmp_path / "task.json",
+        cancel_path=tmp_path / "cancel.requested",
+        result={
+            "approved": False,
+            "reason": "policy",
+            "lease": {"token_ref": "secret-ref://lease"},
+            "token_ref": "secret-ref://lease",
+        },
+    )
+
+    public = task.public_payload(tmp_path, PermissionPolicy())
+
+    assert public["result"]["approved"] is False
+    assert public["result"]["reason"] == "policy"
+    assert "lease" not in public["result"]
+    assert "token_ref" not in public["result"]
+    assert "secret-ref://lease" not in str(public)

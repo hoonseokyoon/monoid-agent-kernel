@@ -353,6 +353,11 @@ def _capability_task_count(loop: AgentLoop) -> int:
     return sum(1 for job in jobs.values() if job.kind == "capability")
 
 
+def _hosted_task_count(loop: AgentLoop, kind: str) -> int:
+    jobs = loop._session.res.context.job_manager.jobs  # type: ignore[union-attr]
+    return sum(1 for job in jobs.values() if job.kind == kind)
+
+
 def test_auto_redispatch_runs_gated_tool_without_model_retry(tmp_path: Path) -> None:
     provider = _CapToolProvider()
     # No retry turn — the model never re-issues the call; the loop auto-runs it after the grant.
@@ -371,6 +376,57 @@ def test_auto_redispatch_runs_gated_tool_without_model_retry(tmp_path: Path) -> 
     assert provider.calls == 1  # auto-executed exactly once; the model did NOT retry
     assert provider.seen_tokens == ["approved:web.search"]
     assert _capability_task_count(loop) == 1  # no re-escalation (a single capability task)
+    loop.close()
+
+
+def test_ask_approved_capability_replay_does_not_request_second_tool_approval(
+    tmp_path: Path,
+) -> None:
+    provider = _CapToolProvider()
+    binding = tool_binding(
+        "ext.fetch",
+        authorization="ask",
+        runtime={"requires_lease": True},
+        scope=ToolScope(allowed_domains=("a.edu",)),
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                _FETCH,
+                ModelTurn(response_id="approval_wait", final_text="waiting for approval"),
+                ModelTurn(response_id="capability_wait", final_text="waiting for capability"),
+                ModelTurn(response_id="done", final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(bindings=(binding, tool_binding("run.finish")))
+        ),
+        tool_providers=(provider,),
+        capability_broker=HumanEscalationBroker(),
+    )
+    loop.open()
+
+    approval_park = loop.run_until_suspended("go")
+    assert approval_park.reason == "awaiting_tasks"
+    loop.report_task_result(approval_park.awaiting_task_ids[0], {"approved": True})
+
+    capability_park = loop.run_until_suspended(None)
+    assert capability_park.reason == "awaiting_tasks"
+    assert _hosted_task_count(loop, "tool_approval") == 1
+    assert _hosted_task_count(loop, "capability") == 1
+    assert provider.calls == 0
+
+    loop.report_task_result(capability_park.awaiting_task_ids[0], _grant_lease())
+    resumed = loop.run_until_suspended(None)
+
+    assert resumed.reason == "settled"
+    assert provider.calls == 1
+    assert provider.seen_tokens == ["approved:web.search"]
+    assert _hosted_task_count(loop, "tool_approval") == 1
+    assert _hosted_task_count(loop, "capability") == 1
     loop.close()
 
 

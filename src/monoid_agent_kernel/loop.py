@@ -3476,6 +3476,11 @@ class AgentLoop:
                     "binding_id": request.binding_id,
                     "capability": request.capability,
                     "task_id": str(observation.output.get("task_id") or ""),
+                    "approved_tool_approval": (
+                        dict(request_payload.get("replay_approved_tool_approval") or {})
+                        if request_payload.get("replay_approved_tool_approval") is not None
+                        else None
+                    ),
                 },
             )
 
@@ -3511,6 +3516,11 @@ class AgentLoop:
             turn_id=turn_id,
             parent_id=None,
             step=step,
+            approved_tool_approval=(
+                dict(replay.get("approved_tool_approval") or {})
+                if replay.get("approved_tool_approval") is not None
+                else None
+            ),
             side_effect_policy=side_effect_policy,
         )
         # Deliver as a user message (is_background) under a distinct call_id — the original call_id
@@ -4024,6 +4034,7 @@ class AgentLoop:
                         call_name=call_name,
                         call_id=call_id,
                         arguments=arguments,
+                        approved_tool_approval=approved_tool_approval,
                     )
                     if pending is not None:
                         # Capability escalated: the call parks (does not execute); the model retries
@@ -4130,6 +4141,7 @@ class AgentLoop:
         call_name: str,
         call_id: str,
         arguments: dict[str, Any],
+        approved_tool_approval: Mapping[str, Any] | None = None,
     ) -> ToolResult | None:
         """Gate a tool call on a capability lease. Returns ``None`` to proceed (a valid lease is
         cached or was granted synchronously), or a *pending* ``ToolResult`` when the broker
@@ -4257,6 +4269,9 @@ class AgentLoop:
                     "replay_call_name": call_name,
                     "replay_call_id": call_id,
                     "replay_arguments": dict(arguments),
+                    "replay_approved_tool_approval": (
+                        dict(approved_tool_approval) if approved_tool_approval is not None else None
+                    ),
                 },
             )
             tail = (
