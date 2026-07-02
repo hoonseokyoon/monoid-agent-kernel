@@ -33,11 +33,17 @@ upfront pass/fail checklist with remediation.
 | `--skills-directory` | bundled sample | Directory of Agent Skills (`SKILL.md` files). |
 | `--no-skills` | off | Disable Agent Skills entirely. |
 | `--mcp` | off | Attach the bundled offline reference MCP server and expose its tools. |
+| `--env-file` | `.env` | Load simple `KEY=VALUE` entries before provider checks and server start. |
+| `--no-env-file` | off | Skip env-file loading. |
 
 **Offline vs. live.** With `--provider offline` (the default), the model is a keyless *echo* model:
 it replies but does not reason or call tools — handy for a zero-setup look at the UI. For a real
 agent that plans, writes files, and runs tools, launch with `--provider openai` and an
 `OPENAI_API_KEY` in the environment.
+
+`studio serve`, `studio app`, and `studio doctor` load `.env` by default when it exists. Existing
+process environment variables take precedence over env-file values. Use `--env-file <path>` to point
+at another file, or `--no-env-file` to rely only on the process environment.
 
 ## Panels
 

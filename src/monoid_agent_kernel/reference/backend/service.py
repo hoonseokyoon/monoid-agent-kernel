@@ -25,8 +25,28 @@ from monoid_agent_kernel.core.agents import (
 )
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
+from monoid_agent_kernel.core.control_audit import ControlAuditPolicy
+from monoid_agent_kernel.core.durable_metadata import (
+    ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS,
+    RUN_METADATA_SCHEMA_VERSION,
+    DurableMetadataCommitter,
+    read_run_metadata,
+    runtime_config_from_metadata,
+    validate_run_metadata,
+)
+from monoid_agent_kernel.core.event_sequencing import (
+    DIRECT_AUDIT_APPEND_STATUSES,
+    RunEventSequencer,
+    diagnostic_event_summary,
+    read_event_page,
+)
+from monoid_agent_kernel.core.subagent_runtime import (
+    subagent_diagnostics_from_events,
+    validate_descendant_run_id,
+)
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
+from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
 from monoid_agent_kernel.core.outbox import OutboxReceipt
 from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
 from monoid_agent_kernel.core.lifecycle import (
@@ -82,7 +102,6 @@ from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCES,
     TASK_CALLBACK_AUDIENCE,
     TASK_CALLBACK_AUDIENCES,
-    accepted_namespaced_ids,
     namespaced_id,
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
@@ -136,88 +155,29 @@ def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]
     return message  # str
 
 # Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
-_RUN_META_SCHEMA_VERSION = namespaced_id("backend-run.v1")
-_ACCEPTED_RUN_META_SCHEMA_VERSIONS = accepted_namespaced_ids("backend-run.v1")
+_RUN_META_SCHEMA_VERSION = RUN_METADATA_SCHEMA_VERSION
+_ACCEPTED_RUN_META_SCHEMA_VERSIONS = ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS
+_RUN_EVENT_SEQUENCER = RunEventSequencer()
+_CONTROL_AUDIT_POLICY = ControlAuditPolicy()
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.backend")
 
 
 def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
     """Read run.json if present and schema-compatible; ``None`` otherwise (never raises)."""
-    try:
-        payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    return _validate_run_meta(payload)
+    return read_run_metadata(run_dir)
 
 
 def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
-    if not isinstance(payload, dict) or payload.get("schema_version") not in _ACCEPTED_RUN_META_SCHEMA_VERSIONS:
-        return None
-    return dict(payload)
+    return validate_run_metadata(payload)
 
 
 def _runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
-    config_payload = meta.get("runtime_config")
-    if not isinstance(config_payload, dict):
-        raise ValueError("run metadata is missing runtime_config")
-    config = AgentRuntimeConfig.from_json(config_payload)
-    expected_hash = str(meta.get("runtime_config_hash") or config_payload.get("config_hash") or "")
-    if expected_hash and expected_hash != config.config_hash:
-        raise ValueError("runtime config hash mismatch in run metadata")
-    return config
+    return runtime_config_from_metadata(meta)
 
 
 def _read_event_page(events_path: Path, *, from_seq: int, limit: int | None) -> dict[str, Any]:
-    if from_seq < 0:
-        raise ValueError("from_seq must be non-negative")
-    if limit is not None and limit < 1:
-        raise ValueError("limit must be positive")
-    events: list[dict[str, Any]] = []
-    next_seq = from_seq
-    has_more = False
-    if events_path.exists():
-        with events_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                seq = int(event.get("seq") or 0)
-                if seq < from_seq:
-                    continue
-                if limit is not None and len(events) >= limit:
-                    has_more = True
-                    break
-                events.append(event)
-                next_seq = seq + 1
-    return {"events": events, "next_seq": next_seq, "has_more": has_more}
-
-
-_DIAGNOSTIC_EVENT_DATA_KEYS = {
-    "attempts",
-    "actor",
-    "binding_id",
-    "call_id",
-    "capability",
-    "child_run_id",
-    "command",
-    "command_id",
-    "error",
-    "error_code",
-    "failure_code",
-    "idempotency_key",
-    "job_id",
-    "reason",
-    "request_id",
-    "result_code",
-    "run_id",
-    "state",
-    "status",
-    "target_run_id",
-    "task_id",
-    "tool",
-    "traceparent",
-}
+    return read_event_page(events_path, from_seq=from_seq, limit=limit)
 
 
 def _read_optional_json(path: Path) -> dict[str, Any] | None:
@@ -229,26 +189,14 @@ def _read_optional_json(path: Path) -> dict[str, Any] | None:
 
 
 def _diagnostic_event_summary(event: dict[str, Any]) -> dict[str, Any]:
-    data = event.get("data") if isinstance(event.get("data"), dict) else {}
-    return {
-        "seq": event.get("seq"),
-        "type": event.get("type"),
-        "timestamp": event.get("timestamp"),
-        "level": event.get("level"),
-        "turn_id": event.get("turn_id"),
-        "parent_id": event.get("parent_id"),
-        "data": {key: data[key] for key in sorted(_DIAGNOSTIC_EVENT_DATA_KEYS) if key in data},
-    }
+    return diagnostic_event_summary(event)
 
 
-_DIRECT_AUDIT_APPEND_STATUSES = {"completed", "failed", "limited", "ended"}
+_DIRECT_AUDIT_APPEND_STATUSES = DIRECT_AUDIT_APPEND_STATUSES
 
 
 def _run_dir_allows_direct_audit_append(run_dir: Path) -> bool:
-    status = _read_optional_json(run_dir / "status.json")
-    if status is None:
-        return False
-    return str(status.get("status") or "") in _DIRECT_AUDIT_APPEND_STATUSES
+    return _RUN_EVENT_SEQUENCER.run_dir_allows_direct_append(run_dir)
 
 
 def _trace_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
@@ -1161,16 +1109,16 @@ class RunnerBackend:
             self._emit_control_audit_event(
                 run_id,
                 "control.command.received",
-                {
-                    "command_id": command_id,
-                    "command": ctype,
-                    "target_run_id": run_id,
-                    "actor": command.issuer,
-                    "reason": command.reason,
-                    "token_sha256": token_sha256,
-                    "idempotency_key": idempotency_key,
-                    "args_keys": sorted(key for key in command.args if key != "token"),
-                },
+                _CONTROL_AUDIT_POLICY.received_payload(
+                    command_id=command_id,
+                    command_type=ctype,
+                    target_run_id=run_id,
+                    actor=command.issuer,
+                    reason=command.reason,
+                    token_sha256=token_sha256,
+                    idempotency_key=idempotency_key,
+                    args=command.args,
+                ),
             )
             result = self._dispatch_control_command(
                 command,
@@ -1183,19 +1131,18 @@ class RunnerBackend:
                 self._emit_control_audit_event(
                     run_id,
                     "control.command.failed",
-                    {
-                        "command_id": command_id,
-                        "command": ctype,
-                        "target_run_id": run_id,
-                        "actor": command.issuer,
-                        "idempotency_key": idempotency_key,
-                        "token_sha256": token_sha256,
-                        "status": "error",
-                        "error": str(exc),
-                        "error_code": getattr(exc, "error_code", "permission_denied"),
-                        "failure_code": getattr(exc, "error_code", "permission_denied"),
-                        "duration_ms": (time.time() - started) * 1000,
-                    },
+                    _CONTROL_AUDIT_POLICY.failed_payload(
+                        command_id=command_id,
+                        command_type=ctype,
+                        target_run_id=run_id,
+                        actor=command.issuer,
+                        idempotency_key=idempotency_key,
+                        token_sha256=token_sha256,
+                        status="error",
+                        error=str(exc),
+                        error_code=getattr(exc, "error_code", "permission_denied"),
+                        duration_ms=(time.time() - started) * 1000,
+                    ),
                     level="warning",
                 )
             raise  # auth failures map to HTTP 401 in the route layer
@@ -1217,36 +1164,35 @@ class RunnerBackend:
             self._emit_control_audit_event(
                 run_id,
                 "control.command.completed",
-                {
-                    "command_id": command_id,
-                    "command": ctype,
-                    "target_run_id": run_id,
-                    "actor": command.issuer,
-                    "idempotency_key": idempotency_key,
-                    "token_sha256": token_sha256,
-                    "status": result.status,
-                    "result_code": result.error_code or result.status,
-                    "state": result.state,
-                    "duration_ms": duration_ms,
-                },
+                _CONTROL_AUDIT_POLICY.completed_payload(
+                    command_id=command_id,
+                    command_type=ctype,
+                    target_run_id=run_id,
+                    actor=command.issuer,
+                    idempotency_key=idempotency_key,
+                    token_sha256=token_sha256,
+                    status=result.status,
+                    result_code=result.error_code or result.status,
+                    state=result.state,
+                    duration_ms=duration_ms,
+                ),
             )
         else:
             self._emit_control_audit_event(
                 run_id,
                 "control.command.failed",
-                {
-                    "command_id": command_id,
-                    "command": ctype,
-                    "target_run_id": run_id,
-                    "actor": command.issuer,
-                    "idempotency_key": idempotency_key,
-                    "token_sha256": token_sha256,
-                    "status": result.status,
-                    "error": result.error,
-                    "error_code": result.error_code,
-                    "failure_code": result.error_code,
-                    "duration_ms": duration_ms,
-                },
+                _CONTROL_AUDIT_POLICY.failed_payload(
+                    command_id=command_id,
+                    command_type=ctype,
+                    target_run_id=run_id,
+                    actor=command.issuer,
+                    idempotency_key=idempotency_key,
+                    token_sha256=token_sha256,
+                    status=result.status,
+                    error=result.error,
+                    error_code=result.error_code,
+                    duration_ms=duration_ms,
+                ),
                 level="warning",
             )
         return result
@@ -1280,13 +1226,10 @@ class RunnerBackend:
                 approval_result["answer"] = str(args.get("answer") or "Approve")
                 approval_result["approved"] = True
             else:
-                approval_result["answer"] = str(args.get("answer") or "Deny")
-                approval_result["approved"] = False
-                approval_result["granted"] = False
-                approval_result.pop("lease", None)
-                approval_result.pop("token_ref", None)
-                approval_result["reason"] = command.reason or str(
-                    args.get("reason") or approval_result.get("reason") or "denied"
+                approval_result = sanitize_denied_capability_result(
+                    result,
+                    answer=str(args.get("answer") or "Deny"),
+                    reason=command.reason or str(args.get("reason") or approval_result.get("reason") or "denied"),
                 )
             return ok(
                 self.report_task_result(
@@ -1393,8 +1336,8 @@ class RunnerBackend:
         if record is not None:
             if loop is not None and loop.emit_external_event(event_type, data=data, level=level):
                 return
-            direct_append_allowed = record.status == "queued"
-            if not direct_append_allowed and record.status not in _DIRECT_AUDIT_APPEND_STATUSES:
+            direct_append_allowed = _RUN_EVENT_SEQUENCER.is_queued_before_recorder(record.status)
+            if not direct_append_allowed and _RUN_EVENT_SEQUENCER.requires_live_sequence_owner(record.status):
                 return
         if not run_dir.exists():
             return
@@ -1413,7 +1356,7 @@ class RunnerBackend:
         command_type: str = "",
         args: Mapping[str, Any] | None = None,
     ) -> None:
-        if command_type in {"report_task_result", "approve", "deny"}:
+        if _CONTROL_AUDIT_POLICY.accepts_callback_token(command_type):
             try:
                 self._verify_task_callback_token(run_id, token, str((args or {}).get("task_id") or ""))
                 return
@@ -1819,11 +1762,11 @@ class RunnerBackend:
         run_dir = self._authorized_run_dir(run_id, token)
         status = self.status(run_id, token)
         status_file = status.get("status_file") if isinstance(status.get("status_file"), dict) else {}
-        last_event_seq = max(
-            int(status.get("last_event_seq") or 0),
-            int(status_file.get("last_event_seq") or 0),
+        from_seq = _RUN_EVENT_SEQUENCER.diagnostics_from_seq(
+            status,
+            status_file,
+            event_limit=event_limit,
         )
-        from_seq = max(0, last_event_seq - event_limit + 1) if last_event_seq else 0
         event_page = _read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=event_limit)
         event_summaries = [_diagnostic_event_summary(event) for event in event_page["events"]]
         control_events = [
@@ -1848,6 +1791,7 @@ class RunnerBackend:
                 "items": event_summaries,
             },
             "control": {"events": control_events},
+            "subagents": subagent_diagnostics_from_events(event_page["events"]),
             "trace_ids": _trace_ids_from_events(event_page["events"]),
         }
 
@@ -1869,10 +1813,10 @@ class RunnerBackend:
         the ancestor's token plus an id-prefix descendant check (a subagent id always extends its
         parent's with ``.sub.<task>``, at any depth)."""
         self._authorize_run(run_id, token)
-        if descendant_run_id != run_id and not descendant_run_id.startswith(f"{run_id}.sub."):
-            raise PermissionDenied("run is not a descendant of the authorized run")
-        if any(sep in descendant_run_id for sep in ("/", "\\")) or ".." in descendant_run_id:
-            raise PermissionDenied("invalid descendant run id")
+        try:
+            validate_descendant_run_id(run_id, descendant_run_id)
+        except ValueError as exc:
+            raise PermissionDenied(str(exc)) from exc
         events_path = self.run_root / descendant_run_id / "events.jsonl"
         page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
         return {"run_id": descendant_run_id, **page}
@@ -2541,9 +2485,11 @@ class RunnerBackend:
             "runtime_config_reason": record.runtime_config_reason,
             "runtime_config_committed_at": committed_at,
         }
-        record.run_dir.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(record.run_dir / "run.json", meta)
-        self._store_run_meta(record.run_id, meta)
+        DurableMetadataCommitter(self.checkpoint_store).write_initial_metadata(
+            record.run_dir,
+            record.run_id,
+            meta,
+        )
 
     def _write_runtime_config_run_meta(
         self,
@@ -2554,36 +2500,20 @@ class RunnerBackend:
         reason: str,
         committed_at: float,
     ) -> None:
-        meta = _read_run_meta(record.run_dir)
-        if meta is None:
-            raise ValueError("run metadata is not ready")
-        meta["runtime_config"] = config.to_json()
-        meta["runtime_config_version"] = config.config_version
-        meta["runtime_config_hash"] = config.config_hash
-        meta["runtime_config_issuer"] = issuer
-        meta["runtime_config_reason"] = reason
-        meta["runtime_config_committed_at"] = committed_at
-        self._store_run_meta(record.run_id, meta)
-        write_json_atomic(record.run_dir / "run.json", meta)
+        DurableMetadataCommitter(self.checkpoint_store).commit_runtime_config_update(
+            record.run_dir,
+            record.run_id,
+            config,
+            issuer=issuer,
+            reason=reason,
+            committed_at=committed_at,
+        )
 
     def _store_run_meta(self, run_id: str, meta: Mapping[str, Any]) -> None:
-        if self.checkpoint_store is None:
-            return
-        put_metadata = getattr(self.checkpoint_store, "put_run_metadata", None)
-        if callable(put_metadata):
-            put_metadata(run_id, meta)
+        DurableMetadataCommitter(self.checkpoint_store).store_shared_metadata(run_id, meta)
 
     def _read_recovery_meta(self, run_dir: Path, run_id: str) -> dict[str, Any] | None:
-        meta = _read_run_meta(run_dir)
-        if meta is None and self.checkpoint_store is not None:
-            read_metadata = getattr(self.checkpoint_store, "run_metadata", None)
-            stored = read_metadata(run_id) if callable(read_metadata) else None
-            if stored is not None:
-                meta = _validate_run_meta(stored)
-                if meta is not None:
-                    run_dir.mkdir(parents=True, exist_ok=True)
-                    write_json_atomic(run_dir / "run.json", meta)
-        return meta
+        return DurableMetadataCommitter(self.checkpoint_store).read_recovery_metadata(run_dir, run_id)
 
     def recover_runs(self) -> list[str]:
         """Scan ``run_root`` for runs left parked by a previous process and resume each
