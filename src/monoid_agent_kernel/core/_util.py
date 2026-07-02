@@ -99,7 +99,8 @@ def file_lock(lock_path: Path, *, timeout_s: float = 10.0, stale_s: float = 30.0
     A waiter steals a lock older than ``stale_s`` (its holder presumably crashed) and,
     after ``timeout_s`` of waiting on a live holder, steals it anyway — so a stuck holder
     can never deadlock a caller. Released by unlinking the lock file on exit. Cross-process
-    safe on both Windows and POSIX (``O_EXCL`` create is atomic on both)."""
+    safe on both Windows and POSIX (``O_EXCL`` create is atomic on both). Windows may surface an
+    active lock-file sharing race as ``PermissionError``; this path treats it as lock contention."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout_s
     fd: int | None = None
@@ -107,16 +108,25 @@ def file_lock(lock_path: Path, *, timeout_s: float = 10.0, stale_s: float = 30.0
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
-        except FileExistsError:
+        except (FileExistsError, PermissionError) as exc:
             try:
                 age = time.time() - lock_path.stat().st_mtime
             except FileNotFoundError:
                 continue  # holder released between our attempt and the stat — retry
+            except PermissionError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"timed out waiting for lock: {lock_path}") from exc
+                time.sleep(0.02)
+                continue
             if age > stale_s or time.monotonic() > deadline:
                 try:
                     lock_path.unlink()  # steal a stale lock or one we have waited out
                 except FileNotFoundError:
                     pass
+                except PermissionError:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(f"timed out waiting for lock: {lock_path}") from exc
+                    time.sleep(0.02)
                 continue
             time.sleep(0.02)
     try:

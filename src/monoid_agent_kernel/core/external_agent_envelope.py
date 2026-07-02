@@ -8,6 +8,7 @@ binding. Edges can map this shape to HTTP, JSON-RPC, queues, or an in-process re
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -304,8 +305,20 @@ def _content_from_parts(parts: tuple[ExternalAgentPart, ...]) -> str | list[dict
         return parts[0].text
     content: list[dict[str, Any]] = []
     for part in parts:
-        item = part.to_json()
-        if item.get("type") == "data":
-            item["type"] = "input_json"
-        content.append(item)
+        if part.type == "text":
+            content.append({"type": "text", "text": part.text})
+        elif part.type == "data":
+            content.append(
+                {
+                    "type": "text",
+                    "text": json.dumps(part.data, ensure_ascii=False, sort_keys=True),
+                }
+            )
+        else:
+            content.append(
+                {
+                    "type": "text",
+                    "text": json.dumps(part.to_json(), ensure_ascii=False, sort_keys=True),
+                }
+            )
     return content

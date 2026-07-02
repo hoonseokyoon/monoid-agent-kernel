@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from monoid_agent_kernel.core.external_agent_envelope import (
@@ -132,6 +134,25 @@ def test_external_agent_envelope_converts_to_inbox_message() -> None:
     assert inbox.source == "external-agent:planner"
     assert inbox.type == "external_agent_message"
     assert inbox.metadata["task_id"] == "task-1"
+
+
+def test_external_agent_data_parts_convert_to_supported_inbox_content() -> None:
+    envelope = ExternalAgentEnvelope(
+        peer_id="planner",
+        message_id="message-1",
+        parts=(
+            ExternalAgentPart(type="text", text="payload follows"),
+            ExternalAgentPart(type="data", data={"answer": 42}),
+        ),
+    )
+
+    inbox = external_agent_envelope_to_inbox_message(envelope, run_id="run-1")
+
+    assert inbox.content == [
+        {"type": "text", "text": "payload follows"},
+        {"type": "text", "text": '{"answer": 42}'},
+    ]
+    assert json.loads(inbox.content[1]["text"]) == {"answer": 42}
 
 
 def test_external_agent_error_normalization() -> None:
