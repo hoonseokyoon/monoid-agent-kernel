@@ -56,6 +56,9 @@ class ReferenceConformanceFactory:
     def new_backend(self) -> ReferenceBackendHarness:
         return ReferenceBackendHarness(self._next_root("backend"))
 
+    def new_side_effect(self) -> ReferenceBackendHarness:
+        return ReferenceBackendHarness(self._next_root("side-effect"))
+
     def new_capability(self) -> ReferenceCapabilityHarness:
         return ReferenceCapabilityHarness()
 
@@ -308,24 +311,16 @@ class _ApprovalToolProvider:
 
 
 class _SideEffectDemoProvider:
-    def __init__(self) -> None:
-        self.unsafe_calls = 0
-        self.idempotent_calls = 0
-        self.idempotency_keys: list[str] = []
-
     def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
         del context
 
         def unsafe_handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             del ctx, args
-            self.unsafe_calls += 1
             return ToolResult(ok=True, content={"unsafe_call": True})
 
         def idempotent_handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             del ctx
-            self.idempotent_calls += 1
             key = str(args.get("idempotency_key") or "")
-            self.idempotency_keys.append(key)
             return ToolResult(ok=True, content={"idempotency_key": key})
 
         return [
@@ -416,7 +411,14 @@ class ReferenceBackendHarness:
 
     @property
     def supported_profiles(self) -> tuple[str, ...]:
-        return ("control-plane", "durable-runner", "multi-agent", "tool-agent", "reference-full")
+        return (
+            "control-plane",
+            "durable-runner",
+            "multi-agent",
+            "tool-agent",
+            "side-effect-tool-agent",
+            "reference-full",
+        )
 
     def submit_run(self, request: dict[str, Any]) -> dict[str, Any]:
         scenario = str(request["scenario"])
@@ -600,13 +602,7 @@ class ReferenceBackendHarness:
             latest = self.checkpoint_store.latest(run_id)
             if latest is not None:
                 payloads = list(latest.checkpoint.outbox_requests)
-        return {
-            "requests": [_side_effect_request_summary(payload) for payload in payloads],
-            "unsafe_handler_calls": self.side_effect_provider.unsafe_calls,
-            "idempotent_handler_calls": self.side_effect_provider.idempotent_calls,
-            "idempotency_keys": list(self.side_effect_provider.idempotency_keys),
-            "sent_count": len(self.outbox_sender.sent),
-        }
+        return {"requests": [_side_effect_request_summary(payload) for payload in payloads]}
 
     def dispatch(self, command: dict[str, Any]) -> dict[str, Any]:
         return self.backend.dispatch(ControlCommand.from_json(dict(command))).to_json()

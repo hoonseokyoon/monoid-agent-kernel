@@ -8,6 +8,7 @@ from monoid_agent_kernel.conformance import (
     GatewayHarness,
     PROFILES,
     PROFILE_BY_ID,
+    SideEffectHarness,
     get_profile,
 )
 
@@ -15,6 +16,7 @@ from monoid_agent_kernel.conformance import (
 EXPECTED_PROFILE_IDS = (
     "minimal-agent",
     "tool-agent",
+    "side-effect-tool-agent",
     "durable-runner",
     "control-plane",
     "capability-security",
@@ -63,3 +65,4 @@ def test_harness_protocols_are_importable() -> None:
     assert BackendHarness.__name__ == "BackendHarness"
     assert GatewayHarness.__name__ == "GatewayHarness"
     assert CapabilityHarness.__name__ == "CapabilityHarness"
+    assert SideEffectHarness.__name__ == "SideEffectHarness"

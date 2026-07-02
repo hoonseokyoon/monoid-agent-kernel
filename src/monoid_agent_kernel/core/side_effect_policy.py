@@ -37,7 +37,6 @@ class SideEffectAdmission:
     allowed: bool = True
     declaration: SideEffectDeclaration = SideEffectDeclaration()
     requires_outbox: bool = False
-    idempotency_key: str = ""
     error: str = ""
     error_code: str = ""
 
@@ -95,9 +94,8 @@ def admit_tool_side_effect(
 
     if declaration.delivery == "idempotent":
         key_arg = declaration.idempotency_key_arg
-        idempotency_key = str(arguments.get(key_arg) or "").strip()
-        if idempotency_key:
-            return SideEffectAdmission(declaration=declaration, idempotency_key=idempotency_key)
+        if str(arguments.get(key_arg) or "").strip():
+            return SideEffectAdmission(declaration=declaration)
         return SideEffectAdmission(
             allowed=False,
             declaration=declaration,

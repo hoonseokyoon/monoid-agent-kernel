@@ -4004,7 +4004,9 @@ class AgentLoop:
                         result = pending
                     else:
                         call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
-                        outbox_count = len(self._outbox.export())
+                        outbox_count = (
+                            len(self._outbox.export()) if side_effect_admission.requires_outbox else 0
+                        )
                         result = self._invoke_handler(
                             bound_tool,
                             context,
@@ -4016,16 +4018,17 @@ class AgentLoop:
                             authorization=authorization,
                         )
                         if result.ok:
-                            side_effect_admission = verify_outbox_side_effect(
-                                side_effect_admission,
-                                outbox_count,
-                                len(self._outbox.export()),
-                            )
-                            if not side_effect_admission.allowed:
-                                raise ToolExecutionError(
-                                    side_effect_admission.error,
-                                    error_code=side_effect_admission.error_code,
+                            if side_effect_admission.requires_outbox:
+                                side_effect_admission = verify_outbox_side_effect(
+                                    side_effect_admission,
+                                    outbox_count,
+                                    len(self._outbox.export()),
                                 )
+                                if not side_effect_admission.allowed:
+                                    raise ToolExecutionError(
+                                        side_effect_admission.error,
+                                        error_code=side_effect_admission.error_code,
+                                    )
                             self._emit_side_effect_event(
                                 bound_tool.base_spec,
                                 arguments,

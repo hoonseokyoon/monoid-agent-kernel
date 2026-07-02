@@ -10,11 +10,13 @@ from .minimal_agent import PROFILE as MINIMAL_AGENT
 from .multi_agent import PROFILE as MULTI_AGENT
 from .provider_gateway import PROFILE as PROVIDER_GATEWAY
 from .reference_full import PROFILE as REFERENCE_FULL
+from .side_effect_tool_agent import PROFILE as SIDE_EFFECT_TOOL_AGENT
 from .tool_agent import PROFILE as TOOL_AGENT
 
 PROFILES: tuple[ProfileMetadata, ...] = (
     MINIMAL_AGENT,
     TOOL_AGENT,
+    SIDE_EFFECT_TOOL_AGENT,
     DURABLE_RUNNER,
     CONTROL_PLANE,
     CAPABILITY_SECURITY,
@@ -44,6 +46,7 @@ __all__ = [
     "PROVIDER_GATEWAY",
     "ProfileMetadata",
     "REFERENCE_FULL",
+    "SIDE_EFFECT_TOOL_AGENT",
     "TOOL_AGENT",
     "get_profile",
 ]

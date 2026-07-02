@@ -51,7 +51,7 @@ Reference harness, and test coverage lives in `docs/PHASE_1S_COVERAGE.md`.
 
 ## Phase 2 State
 
-Phase 2 starts with executable `tool-agent` behavior. `AgentLoop` uses `core.tool_approval`
-for `authorization="ask"` calls and `core.side_effect_policy` for strict external side-effect
-admission. Backend-specific approval UI, notification policy, external senders, and retry schedules
-remain outside these helpers.
+Phase 2 starts with executable `tool-agent` behavior and an optional `side-effect-tool-agent`
+profile. `AgentLoop` uses `core.tool_approval` for `authorization="ask"` calls and
+`core.side_effect_policy` for strict external side-effect admission. Backend-specific approval UI,
+notification policy, external senders, and retry schedules remain outside these helpers.

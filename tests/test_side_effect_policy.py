@@ -109,7 +109,6 @@ def test_strict_mode_requires_configured_idempotency_key_arg() -> None:
     assert missing.allowed is False
     assert missing.error_code == SIDE_EFFECT_POLICY_DENIED
     assert admitted.allowed is True
-    assert admitted.idempotency_key == "req-1"
 
 
 def test_binding_runtime_overrides_tool_annotations() -> None:

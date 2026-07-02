@@ -77,11 +77,19 @@ class BackendHarness(ConformanceHarness, Protocol):
     def task_result(self, run_id: str, token: str, task_id: str) -> JsonObject:
         """Return the stored result for one backend task."""
 
-    def side_effects(self, run_id: str, token: str) -> JsonObject:
-        """Return normalized durable side-effect requests for one run."""
-
     def dispatch(self, command: JsonObject) -> JsonObject:
         """Dispatch one backend control command."""
+
+
+@runtime_checkable
+class SideEffectHarness(BackendHarness, Protocol):
+    """Backend operations used by side-effect-tool-agent profiles."""
+
+    def restart(self, *, local_state: str = "same") -> SideEffectHarness:
+        """Return a fresh harness instance over the same durable state."""
+
+    def side_effects(self, run_id: str, token: str) -> JsonObject:
+        """Return normalized durable side-effect requests for one run."""
 
 
 @runtime_checkable

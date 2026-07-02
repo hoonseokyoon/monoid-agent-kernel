@@ -13,7 +13,6 @@ PROFILE = ProfileMetadata(
     rule_ids=(
         "OR-10-TOOL-SURFACE-ADMISSION",
         "OR-11-GENERIC-ASK-APPROVAL",
-        "OR-12-DURABLE-SIDE-EFFECT",
     ),
     harnesses=("backend",),
 )
@@ -65,53 +64,6 @@ def assert_tool_agent_generic_ask_approval_profile(harness: BackendHarness) -> N
         for event in stale_events
     )
     _cancel(harness, stale)
-
-
-def assert_tool_agent_durable_side_effect_profile(harness: BackendHarness) -> None:
-    """Run the Phase 2 durable side-effect/outbox smoke matrix."""
-
-    dispatched = harness.submit_run({"scenario": "tool-side-effect-outbox-dispatched"})
-    dispatched_effects = harness.side_effects(str(dispatched["run_id"]), str(dispatched["token"]))
-    dispatched_requests = list(dispatched_effects["requests"])
-    assert len(dispatched_requests) == 1
-    assert dispatched_requests[0]["destination"] == "email"
-    assert dispatched_requests[0]["status"] == "dispatched"
-    assert dispatched_requests[0]["token_ref_present"] is True
-
-    pending = harness.submit_run({"scenario": "tool-side-effect-pending-recovery"})
-    pending_effects = harness.side_effects(str(pending["run_id"]), str(pending["token"]))
-    pending_requests = list(pending_effects["requests"])
-    assert len(pending_requests) == 1
-    assert pending_requests[0]["status"] == "pending"
-    restarted = harness.restart(local_state="same")
-    recovered_effects = restarted.side_effects(str(pending["run_id"]), str(pending["token"]))
-    recovered_requests = list(recovered_effects["requests"])
-    assert len(recovered_requests) == 1
-    assert recovered_requests[0]["request_id"] == pending_requests[0]["request_id"]
-    assert recovered_requests[0]["status"] == "pending"
-    _cancel(harness, pending)
-
-    rejected = harness.submit_run({"scenario": "tool-side-effect-strict-rejected"})
-    rejected_events = list(harness.events(str(rejected["run_id"]), str(rejected["token"]))["events"])
-    assert any(
-        event["type"] == "permission.denied"
-        and event["data"].get("error_code") == "tool_side_effect_policy_denied"
-        for event in rejected_events
-    )
-    rejected_effects = harness.side_effects(str(rejected["run_id"]), str(rejected["token"]))
-    assert rejected_effects["unsafe_handler_calls"] == 0
-    assert rejected_effects["requests"] == []
-
-    idempotent = harness.submit_run({"scenario": "tool-side-effect-idempotent-inline"})
-    idempotent_events = list(harness.events(str(idempotent["run_id"]), str(idempotent["token"]))["events"])
-    assert any(
-        event["type"] == "permission.denied"
-        and event["data"].get("error_code") == "tool_side_effect_policy_denied"
-        for event in idempotent_events
-    )
-    idempotent_effects = harness.side_effects(str(idempotent["run_id"]), str(idempotent["token"]))
-    assert idempotent_effects["idempotent_handler_calls"] == 1
-    assert idempotent_effects["idempotency_keys"] == ["idem-1"]
 
 
 def _has_event(events: list[dict], event_type: str) -> bool:
