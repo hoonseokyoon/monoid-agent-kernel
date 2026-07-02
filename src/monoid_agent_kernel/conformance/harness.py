@@ -73,3 +73,18 @@ class CapabilityHarness(ConformanceHarness, Protocol):
 
     def revoke_capability(self, payload: JsonObject) -> JsonObject:
         """Revoke capabilities according to the payload."""
+
+    def token_for(self, capability: str, *, now: float) -> str | None:
+        """Return the currently usable token handle for one capability."""
+
+    def valid_lease(self, capability: str, scope: JsonObject, *, now: float) -> JsonObject | None:
+        """Return a currently valid lease for one capability and scope."""
+
+    def export_revocations(self) -> JsonObject:
+        """Return serialized revocation state."""
+
+    def import_revocations(self, payload: JsonObject) -> JsonObject:
+        """Merge serialized revocation state and return the current export."""
+
+    def fork_child(self) -> CapabilityHarness:
+        """Return a child capability harness sharing revocation state."""
