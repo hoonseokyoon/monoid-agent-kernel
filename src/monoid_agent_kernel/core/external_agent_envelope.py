@@ -122,7 +122,7 @@ class ExternalAgentResult:
         error_payload = payload.get("error")
         if error_payload is not None and not isinstance(error_payload, dict):
             raise ValueError("external agent result error must be an object")
-        metadata_payload = payload.get("metadata") or {}
+        metadata_payload = payload["metadata"] if "metadata" in payload else {}
         if not isinstance(metadata_payload, dict):
             raise ValueError("external agent result metadata must be an object")
         return cls(
@@ -196,7 +196,7 @@ class ExternalAgentEnvelope:
         result_payload = payload.get("result")
         if result_payload is not None and not isinstance(result_payload, dict):
             raise ValueError("external agent envelope result must be an object")
-        metadata_payload = payload.get("metadata") or {}
+        metadata_payload = payload["metadata"] if "metadata" in payload else {}
         if not isinstance(metadata_payload, dict):
             raise ValueError("external agent envelope metadata must be an object")
         return cls(
