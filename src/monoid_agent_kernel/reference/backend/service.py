@@ -2807,30 +2807,7 @@ class RunnerBackend:
         )
         with self._lock:
             self._records[run_id] = record
-        spec = self._run_spec_for_request(run_id, request, workspace_root)
-        adapter = self._build_model_adapter(
-            spec,
-            llm_gateway_token,
-            runtime_config.model,
-            token_provider=self._llm_token_source(run_id, request, runtime_config),
-        )
-        loop = AgentLoop(
-            spec=spec,
-            model_adapter=adapter,
-            event_sinks=(BackendRunStateSink(self, run_id), *(make() for make in self.extra_event_sink_factories)),
-            permission_policy=request.permission_policy,
-            cancellation_token=record.cancellation_token,
-            shell_approval_provider=None,
-            web_gateway_client=self._web_gateway_client(web_gateway_token),
-            runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
-            checkpoint_store=self.checkpoint_store,
-            emit_output_deltas=self.emit_output_deltas,
-            subagent_definitions=self.subagent_definitions,
-            tool_providers=self.tool_providers,
-            context_providers=self.context_providers,
-            output_validators=self.output_validators,
-            capability_broker=self._capability_broker_for(request),
-        )
+        loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
         # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
         # restore re-applies the agent's delta from the checkpoint's content blobs.
         loop.restore(checkpoint, blobs=stored.blob)

@@ -113,7 +113,10 @@ def file_lock(lock_path: Path, *, timeout_s: float = 10.0, stale_s: float = 30.0
                 age = time.time() - lock_path.stat().st_mtime
             except FileNotFoundError:
                 if isinstance(exc, PermissionError):
-                    raise PermissionError(f"unable to create lock file: {lock_path}") from exc
+                    if time.monotonic() > deadline:
+                        raise PermissionError(f"unable to create lock file: {lock_path}") from exc
+                    time.sleep(0.02)
+                    continue
                 continue  # holder released between our attempt and the stat — retry
             except PermissionError:
                 if time.monotonic() > deadline:
