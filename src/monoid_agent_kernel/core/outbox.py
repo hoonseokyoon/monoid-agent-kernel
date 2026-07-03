@@ -22,9 +22,18 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.core.wire_validation import (
+    parse_bool,
+    parse_float,
+    parse_int,
+    parse_literal,
+    parse_str,
+    require_object,
+)
+from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 OUTBOX_REQUEST_VERSION = namespaced_id("outbox-request.v1")
+ACCEPTED_OUTBOX_REQUEST_VERSIONS = accepted_namespaced_ids("outbox-request.v1")
 
 OutboxStatus = Literal["pending", "dispatched", "failed"]
 
@@ -92,28 +101,34 @@ class OutboxRequest:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> OutboxRequest:
+        payload = require_object(payload, "outbox request")
+        protocol = parse_str(payload, "protocol")
+        if protocol and protocol not in ACCEPTED_OUTBOX_REQUEST_VERSIONS:
+            raise ValueError("unsupported outbox request protocol")
+        request_payload = require_object(payload["payload"], "payload") if "payload" in payload else {}
         kwargs: dict[str, Any] = {
-            "destination": str(payload.get("destination") or ""),
-            "payload": dict(payload.get("payload") or {}),
-            "capability": str(payload.get("capability") or ""),
-            "token_ref": str(payload.get("token_ref") or ""),
-            "run_id": str(payload.get("run_id") or ""),
-            "idempotency_key": str(payload.get("idempotency_key") or ""),
-            "correlation_id": str(payload.get("correlation_id") or ""),
-            "causation_id": str(payload.get("causation_id") or ""),
-            "expect_ack": bool(payload.get("expect_ack", False)),
-            "reply_to": str(payload.get("reply_to") or ""),
-            "traceparent": str(payload.get("traceparent") or ""),
-            "tracestate": str(payload.get("tracestate") or ""),
-            "created_at": float(payload.get("created_at") or 0.0),
-            "status": str(payload.get("status") or "pending"),  # type: ignore[arg-type]
-            "attempts": int(payload.get("attempts") or 0),
-            "next_attempt_at": float(payload.get("next_attempt_at") or 0.0),
-            "reference": str(payload.get("reference") or ""),
-            "error": str(payload.get("error") or ""),
+            "destination": parse_str(payload, "destination"),
+            "payload": dict(request_payload),
+            "capability": parse_str(payload, "capability"),
+            "token_ref": parse_str(payload, "token_ref"),
+            "run_id": parse_str(payload, "run_id"),
+            "idempotency_key": parse_str(payload, "idempotency_key"),
+            "correlation_id": parse_str(payload, "correlation_id"),
+            "causation_id": parse_str(payload, "causation_id"),
+            "expect_ack": parse_bool(payload, "expect_ack", default=False),
+            "reply_to": parse_str(payload, "reply_to"),
+            "traceparent": parse_str(payload, "traceparent"),
+            "tracestate": parse_str(payload, "tracestate"),
+            "created_at": parse_float(payload, "created_at", default=0.0) or 0.0,
+            "status": parse_literal(payload, "status", ("pending", "dispatched", "failed"), default="pending"),
+            "attempts": parse_int(payload, "attempts", default=0),
+            "next_attempt_at": parse_float(payload, "next_attempt_at", default=0.0) or 0.0,
+            "reference": parse_str(payload, "reference"),
+            "error": parse_str(payload, "error"),
         }
-        if payload.get("id"):
-            kwargs["id"] = str(payload["id"])
+        request_id = parse_str(payload, "id")
+        if request_id:
+            kwargs["id"] = request_id
         return cls(**kwargs)
 
 

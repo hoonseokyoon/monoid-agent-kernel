@@ -35,10 +35,17 @@ from monoid_agent_kernel.core.capability_revocation import (
 )
 from monoid_agent_kernel.core.lease_admission import validate_lease_admission
 from monoid_agent_kernel.core.scope import scope_within
-from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.core.wire_validation import (
+    parse_bool,
+    parse_float,
+    parse_str,
+    require_object,
+)
+from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 CAPABILITY_REQUEST_VERSION = namespaced_id("capability-request.v1")
 CAPABILITY_LEASE_VERSION = namespaced_id("capability-lease.v1")
+ACCEPTED_CAPABILITY_LEASE_VERSIONS = accepted_namespaced_ids("capability-lease.v1")
 
 
 @dataclass(frozen=True)
@@ -118,18 +125,29 @@ class CapabilityLease:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> CapabilityLease:
-        max_expires_at = payload.get("max_expires_at")
+        payload = require_object(payload, "capability lease")
+        protocol = parse_str(payload, "protocol")
+        if protocol and protocol not in ACCEPTED_CAPABILITY_LEASE_VERSIONS:
+            raise ValueError("unsupported capability lease protocol")
+        max_expires_at = parse_float(
+            payload,
+            "max_expires_at",
+            default=0.0,
+            allow_none=True,
+        ) if "max_expires_at" in payload else None
+        scope = require_object(payload["scope"], "scope") if "scope" in payload else {}
         kwargs: dict[str, Any] = {
-            "capability": str(payload.get("capability") or ""),
-            "token_ref": str(payload.get("token_ref") or ""),
-            "expires_at": float(payload.get("expires_at") or 0.0),
-            "scope": dict(payload.get("scope") or {}),
-            "durable": bool(payload.get("durable", False)),
-            "issued_at": float(payload.get("issued_at") or 0.0),
-            "max_expires_at": float(max_expires_at) if max_expires_at is not None else None,
+            "capability": parse_str(payload, "capability"),
+            "token_ref": parse_str(payload, "token_ref"),
+            "expires_at": parse_float(payload, "expires_at", default=0.0) or 0.0,
+            "scope": dict(scope),
+            "durable": parse_bool(payload, "durable", default=False),
+            "issued_at": parse_float(payload, "issued_at", default=0.0) or 0.0,
+            "max_expires_at": max_expires_at,
         }
-        if payload.get("lease_id"):
-            kwargs["lease_id"] = str(payload["lease_id"])
+        lease_id = parse_str(payload, "lease_id")
+        if lease_id:
+            kwargs["lease_id"] = lease_id
         return cls(**kwargs)
 
 

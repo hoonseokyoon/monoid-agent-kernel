@@ -731,3 +731,49 @@ def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) 
     )
     with pytest.raises(PermissionDenied):
         backend2.events("../escape", traversal)
+
+
+def test_backend_list_runs_materializes_shared_recovery_metadata(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    run_id = "run_shared_meta"
+    run_dir = run_root / run_id
+    run_dir.mkdir(parents=True)
+    runtime = _default_config()
+    shared_checkpoints = SqliteCheckpointStore(tmp_path / "checkpoints.db")
+    shared_checkpoints.put_run_metadata(
+        run_id,
+        {
+            "schema_version": _RUN_META_SCHEMA_VERSION,
+            "run_id": run_id,
+            "tenant_id": "tenant_a",
+            "user_id": "user_a",
+            "title": "shared title",
+            "created_at": 123.0,
+            "workspace_root": str(workspace),
+            "runtime_config": runtime.to_json(),
+            "runtime_config_hash": runtime.config_hash,
+        },
+    )
+    bad_run_id = "run_bad_meta"
+    (run_root / bad_run_id).mkdir()
+    shared_checkpoints.put_run_metadata(
+        bad_run_id,
+        {"schema_version": "unsupported.v0", "run_id": bad_run_id, "tenant_id": "tenant_a"},
+    )
+    backend = RunnerBackend(
+        run_root=run_root,
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda *_a, **_k: _ScriptedTurnAdapter([]),
+        checkpoint_store=shared_checkpoints,
+    )
+
+    listing = backend.list_runs("tenant_a")["runs"]
+
+    assert listing[0]["run_id"] == run_id
+    assert listing[0]["title"] == "shared title"
+    assert all(entry["run_id"] != bad_run_id for entry in listing)
+    assert (run_dir / "run.json").exists()
+    assert json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["title"] == "shared title"

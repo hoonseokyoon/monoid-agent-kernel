@@ -6,12 +6,14 @@ import pytest
 
 from monoid_agent_kernel.core.external_agent_envelope import (
     EXTERNAL_AGENT_ENVELOPE_VERSION,
+    RESERVED_EXTERNAL_AGENT_METADATA_KEYS,
     ExternalAgentEnvelope,
     ExternalAgentError,
     ExternalAgentPart,
     ExternalAgentResult,
     external_agent_envelope_from_outbox_request,
     external_agent_envelope_to_inbox_message,
+    merge_canonical_metadata,
     normalize_external_agent_error,
     validate_external_agent_envelope,
 )
@@ -165,6 +167,24 @@ def test_outbox_request_converts_to_external_agent_envelope_with_sender_peer_id(
     assert envelope.peer_id == "planner"
 
 
+def test_outbox_request_sender_peer_id_ignores_payload_metadata_identity() -> None:
+    request = OutboxRequest(
+        destination="worker",
+        payload={
+            "text": "please do X",
+            "metadata": {"peer_id": "spoofed", "source_peer_id": "spoofed-source"},
+        },
+        id="outbox-1",
+        idempotency_key="message-1",
+        run_id="run-planner",
+    )
+
+    envelope = external_agent_envelope_from_outbox_request(request)
+
+    assert envelope.peer_id == "run-planner"
+    assert envelope.metadata["peer_id"] == "spoofed"
+
+
 def test_outbox_request_ignores_non_object_metadata_for_text_message() -> None:
     request = OutboxRequest(
         destination="worker",
@@ -177,6 +197,40 @@ def test_outbox_request_ignores_non_object_metadata_for_text_message() -> None:
 
     assert envelope.parts[0].text == "please do X"
     assert envelope.metadata == {}
+
+
+def test_merge_canonical_metadata_preserves_user_non_reserved_keys() -> None:
+    assert RESERVED_EXTERNAL_AGENT_METADATA_KEYS == frozenset(
+        {"peer_id", "task_id", "request_id", "reply_to_id", "result", "traceparent"}
+    )
+
+    merged = merge_canonical_metadata(
+        {
+            "custom": "kept",
+            "peer_id": "spoofed",
+            "task_id": "spoofed",
+            "request_id": "spoofed",
+            "reply_to_id": "spoofed",
+            "result": {"state": "spoofed"},
+            "traceparent": "spoofed",
+        },
+        {
+            "peer_id": "planner",
+            "task_id": "task-1",
+            "request_id": "request-1",
+            "reply_to_id": "reply-1",
+            "result": {"state": "completed"},
+            "traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01",
+        },
+    )
+
+    assert merged["custom"] == "kept"
+    assert merged["peer_id"] == "planner"
+    assert merged["task_id"] == "task-1"
+    assert merged["request_id"] == "request-1"
+    assert merged["reply_to_id"] == "reply-1"
+    assert merged["result"] == {"state": "completed"}
+    assert merged["traceparent"].startswith("00-")
 
 
 def test_external_agent_envelope_converts_to_inbox_message() -> None:
@@ -217,6 +271,7 @@ def test_external_agent_envelope_canonical_metadata_overrides_user_metadata() ->
             "custom": "ok",
             "peer_id": "spoofed",
             "task_id": "spoofed",
+            "traceparent": "spoofed",
             "result": {"state": "spoofed"},
         },
     )
@@ -229,6 +284,7 @@ def test_external_agent_envelope_canonical_metadata_overrides_user_metadata() ->
     assert inbox.metadata["request_id"] == "request-1"
     assert inbox.metadata["reply_to_id"] == "reply-1"
     assert inbox.metadata["result"]["state"] == "completed"
+    assert inbox.metadata["traceparent"] == envelope.traceparent
 
 
 def test_external_agent_data_parts_convert_to_supported_inbox_content() -> None:

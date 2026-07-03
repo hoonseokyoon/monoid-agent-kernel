@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from monoid_agent_kernel.core.scope import effective_signed_scope
 from monoid_agent_kernel.errors import ToolExecutionError, error_code_for_exception
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.public_view import public_error_message
@@ -86,15 +87,24 @@ class WebService:
         return max(1, min(value, effective_max))
 
     def _domain_filters(self, args: dict[str, Any], call: CallContext) -> tuple[list[str], list[str]]:
-        requested_allowed = [str(item).strip().lower() for item in args.get("allowed_domains") or () if str(item).strip()]
-        requested_blocked = [str(item).strip().lower() for item in args.get("blocked_domains") or () if str(item).strip()]
-        scope_allowed = list(call.scope.allowed_domains)
-        scope_blocked = list(call.scope.blocked_domains)
-        if scope_allowed and requested_allowed:
-            allowed = [domain for domain in requested_allowed if domain in scope_allowed]
-        else:
-            allowed = scope_allowed or requested_allowed
-        return allowed, [*scope_blocked, *requested_blocked]
+        requested: dict[str, Any] = {}
+        requested_allowed = [
+            str(item).strip().lower() for item in args.get("allowed_domains") or () if str(item).strip()
+        ]
+        requested_blocked = [
+            str(item).strip().lower() for item in args.get("blocked_domains") or () if str(item).strip()
+        ]
+        if requested_allowed:
+            requested["allowed_domains"] = requested_allowed
+        if requested_blocked:
+            requested["blocked_domains"] = requested_blocked
+        scope: dict[str, Any] = {}
+        if call.scope.allowed_domains:
+            scope["allowed_domains"] = list(call.scope.allowed_domains)
+        if call.scope.blocked_domains:
+            scope["blocked_domains"] = list(call.scope.blocked_domains)
+        effective = effective_signed_scope(scope, requested, numeric_keys=())
+        return list(effective.get("allowed_domains") or ()), list(effective.get("blocked_domains") or ())
 
     def _run_call(
         self,

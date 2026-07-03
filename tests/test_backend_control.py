@@ -82,6 +82,25 @@ def _events(backend: RunnerBackend, run_id: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
 
 
+def test_control_command_from_json_rejects_present_wrong_type_args() -> None:
+    with pytest.raises(ValueError):
+        ControlCommand.from_json({"type": "status", "run_id": "run_1", "args": []})
+
+
+def test_control_command_from_json_accepts_legacy_protocol_id() -> None:
+    command = ControlCommand.from_json(
+        {
+            "protocol": "native-agent-runner.control-command.v1",
+            "type": "status",
+            "run_id": "run_1",
+            "args": {},
+        }
+    )
+
+    assert command.type == "status"
+    assert command.run_id == "run_1"
+
+
 class _UnopenedLoop:
     def __init__(self) -> None:
         self.calls = 0

@@ -7,10 +7,10 @@ make Monoid embeddable in different products and runtimes:
 | Doc | What it covers |
 |-----|----------------|
 | [CONTRACTS.md](CONTRACTS.md) | The stable integration surface: Python contracts, HTTP wire contracts, wiring rules, operational rules, and the contract/core/reference boundary. |
-| [CONFORMANCE.md](CONFORMANCE.md) | Profile-based conformance tests, harness roles, executable assertions, and the Reference full profile. |
-| [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) | Supported helper modules for scope, lease admission, revocation, event sequencing, control audit, durable metadata, and subagent boundaries. |
+| [CONFORMANCE.md](CONFORMANCE.md) | Profile-based conformance tests, harness roles, executable assertions, testing policy, and the Reference full profile. |
+| [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) | Supported helper modules and validation/library policy for contract-aligned implementations. |
 | [REFERENCE.md](REFERENCE.md) | Runnable Reference services, Studio, gateway examples, and the public Reference conformance harness. |
-| [OPERATIONAL_RULE_COVERAGE.md](OPERATIONAL_RULE_COVERAGE.md) | Current rule-to-helper-to-profile-to-test coverage matrix for OR-01 through OR-13. |
+| [OPERATIONAL_RULE_COVERAGE.md](OPERATIONAL_RULE_COVERAGE.md) | Current rule-to-helper-to-profile-to-test coverage matrix and Phase 2S hardening matrix for OR-01 through OR-13. |
 | [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |
 | [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |

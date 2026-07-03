@@ -76,6 +76,20 @@ observable case results through the harness protocols.
 The profile is a release confidence target for the Reference assembly. External implementations
 should run the smaller profiles directly with their own harnesses.
 
+## Testing Policy
+
+Conformance assertions are deterministic behavior checks. They run against harness protocols and
+named Reference cases, then assert observable results such as events, status, diagnostics,
+outbox/inbox state, and public payloads.
+
+Hypothesis property tests target pure helpers, parsers, and serializers. Use them for JSON-native
+wire payloads, sanitizer helpers, metadata merge helpers, and other in-process functions with no
+server, thread, clock, network, or durable backend dependency.
+
+Backend scenarios, conformance assertions, Studio server paths, threaded services, and live
+provider paths use fixed regression cases. This keeps conformance output stable and keeps fuzzing
+focused on edge-case parser coverage.
+
 ## Implementation Sequence
 
 1. Phase 1S 1차: profile metadata, harness protocols, public rule ids, and import-smoke tests.
@@ -93,6 +107,11 @@ should run the smaller profiles directly with their own harnesses.
     inbox-routing outbox sender conformance.
 12. Phase 2 closure: approval hardening, optional harness narrowing, OR-13 contract narrowing, and
     current coverage closure.
+13. Phase 2S 1차: strict wire parser helper and Hypothesis coverage for pure wire parsers.
+14. Phase 2S 2차: public/private payload boundary and canonical external-agent metadata merge.
+15. Phase 2S 3차: helper adoption hardening in web scope, backend events, durable metadata, and
+    Studio subagent routing.
+16. Phase 2S 4차: coverage closure and validation/library policy documentation.
 
 ## Acceptance
 
@@ -105,5 +124,6 @@ Fast local checks:
 
 ```bash
 python -m pytest tests/conformance -q
+python -m pytest tests/test_wire_validation.py tests/test_external_agent_envelope_properties.py tests/test_inbox_outbox_properties.py -q
 python -m pytest -q -n 4
 ```

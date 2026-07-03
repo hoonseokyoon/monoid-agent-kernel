@@ -12,6 +12,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from monoid_agent_kernel.core.agents import AgentDefinition, AgentRuntimeConfig
 from monoid_agent_kernel.core.control import ControlCommand
+from monoid_agent_kernel.core.wire_validation import (
+    optional_list,
+    parse_bool,
+    parse_int,
+    parse_str,
+    require_object,
+)
 from monoid_agent_kernel.reference._shared.http_util import (
     HardenedThreadingHTTPServer,
     HttpRequestTooLarge,
@@ -167,9 +174,9 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                         backend.replace_runtime_config(
                             run_id,
                             self._bearer_token(),
-                            expected_version=int(payload.get("expected_version", 0)),
-                            issuer=str(payload.get("issuer") or ""),
-                            reason=str(payload.get("reason") or ""),
+                            expected_version=parse_int(payload, "expected_version", default=0),
+                            issuer=parse_str(payload, "issuer"),
+                            reason=parse_str(payload, "reason"),
                             config=AgentRuntimeConfig.from_json(payload["config"]),
                         )
                     )
@@ -195,15 +202,14 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     payload = self._read_json()
                     # The bearer token authorizes the run; carry it into args so dispatch (and the
                     # method it wraps) can authorize, without putting it on the wire envelope.
-                    args = dict(payload.get("args") or {})
+                    args = require_object(payload["args"], "args") if "args" in payload else {}
                     args["token"] = self._bearer_token()
-                    command = ControlCommand(
-                        type=str(payload.get("type") or ""),  # type: ignore[arg-type]
-                        run_id=run_id,
-                        args=args,
-                        issuer=str(payload.get("issuer") or ""),
-                        reason=str(payload.get("reason") or ""),
-                        command_id=str(payload.get("command_id") or ""),
+                    command = ControlCommand.from_json(
+                        {
+                            **payload,
+                            "run_id": run_id,
+                            "args": args,
+                        }
                     )
                     self._write_json(backend.dispatch(command).to_json())
                     return
@@ -214,8 +220,8 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                         backend.create_task(
                             run_id,
                             self._bearer_token(),
-                            kind=str(payload.get("kind") or ""),
-                            request=dict(payload.get("request") or {}),
+                            kind=parse_str(payload, "kind"),
+                            request=require_object(payload["request"], "request") if "request" in payload else {},
                         )
                     )
                     return
@@ -233,8 +239,8 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                             run_id,
                             self._bearer_token(),
                             task_id=task_id,
-                            result=dict(payload.get("result") or {}),
-                            status=str(payload.get("status") or "answered"),
+                            result=require_object(payload["result"], "result") if "result" in payload else {},
+                            status=parse_str(payload, "status", default="answered"),
                         )
                     )
                     return
@@ -251,8 +257,11 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                                 run_id,
                                 self._bearer_token(),
                                 approver_id=str(payload["approver_id"]),
-                                approved_paths=tuple(str(path) for path in payload.get("approved_paths") or ()),
-                                note=str(payload.get("note") or ""),
+                                approved_paths=tuple(
+                                    parse_str({"path": path}, "path")
+                                    for path in optional_list(payload, "approved_paths")
+                                ),
+                                note=parse_str(payload, "note"),
                             )
                         )
                         return
@@ -274,7 +283,7 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                                 self._bearer_token(),
                                 target=Path(str(payload["target"])),
                                 approval_path=Path(str(approval_path)) if approval_path else None,
-                                dry_run=bool(payload.get("dry_run", False)),
+                                dry_run=parse_bool(payload, "dry_run", default=False),
                             )
                         )
                         return
@@ -315,8 +324,8 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     if payload.get("runtime_config") is not None
                     else None
                 ),
-                multi_turn=bool(payload.get("multi_turn", False)),
-                metadata=dict(payload.get("metadata") or {}),
+                multi_turn=parse_bool(payload, "multi_turn", default=False),
+                metadata=require_object(payload["metadata"], "metadata") if "metadata" in payload else {},
             )
 
         def _stream_run_sse(self, request: BackendRunRequest) -> None:

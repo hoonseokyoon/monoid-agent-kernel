@@ -138,6 +138,70 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
         thread.join(timeout=5)
 
 
+@pytest.mark.parametrize(
+    "path,payload,token",
+    [
+        (
+            "/v1/runs",
+            {
+                "tenant_id": "tenant_a",
+                "user_id": "user_a",
+                "workspace_root": "__workspace__",
+                "instruction": "Run.",
+                "runtime_config": "__runtime_config__",
+                "multi_turn": "false",
+            },
+            "admin",
+        ),
+        (
+            "/v1/runs",
+            {
+                "tenant_id": "tenant_a",
+                "user_id": "user_a",
+                "workspace_root": "__workspace__",
+                "instruction": "Run.",
+                "runtime_config": "__runtime_config__",
+                "metadata": [],
+            },
+            "admin",
+        ),
+        ("/v1/runs/run_1/control", {"type": "status", "args": []}, "bad-run-token"),
+        ("/v1/runs/run_1/tasks", {"kind": "automation", "request": []}, "bad-run-token"),
+        ("/v1/runs/run_1/tasks/task_1/result", {"result": []}, "bad-run-token"),
+        ("/v1/runs/run_1/proposal/apply", {"target": ".", "dry_run": "false"}, "bad-run-token"),
+    ],
+)
+def test_backend_http_rejects_present_wrong_type_payload_fields(
+    tmp_path: Path,
+    path: str,
+    payload: dict,
+    token: str,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    request_payload = {
+        key: str(workspace)
+        if value == "__workspace__"
+        else _default_config().to_json()
+        if value == "__runtime_config__"
+        else value
+        for key, value in payload.items()
+    }
+    try:
+        _wait_http_ready(base_url)
+        with pytest.raises(HTTPError) as exc_info:
+            _json_request(f"{base_url}{path}", request_payload, token=token)
+        assert exc_info.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_backend_http_cancel_marks_run_limited_with_code(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     started = threading.Event()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -29,6 +30,35 @@ def public_result_content(content: dict[str, Any], policy: PermissionPolicy) -> 
             public[key] = public_path(value, policy)
         else:
             public[key] = preview_value(key, value, policy)
+    return public
+
+
+def public_capability_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the public view of a capability task result.
+
+    The private task result may carry raw grant material used by the loop to admit a lease.
+    Public surfaces only get non-secret lease descriptors and denial state.
+    """
+
+    lease = result.get("lease") if isinstance(result.get("lease"), Mapping) else None
+    granted = result.get("granted") is True or result.get("approved") is True
+    if lease is not None and granted:
+        public: dict[str, Any] = {"status": "granted"}
+        for key in ("capability", "lease_id", "expires_at"):
+            if key in lease:
+                public[key] = lease[key]
+        if isinstance(lease.get("scope"), Mapping):
+            public["scope"] = dict(lease["scope"])
+        if result.get("reason"):
+            public["reason"] = str(result.get("reason"))
+        return public
+
+    public = {"status": "denied", "reason": str(result.get("reason") or "denied")}
+    capability = result.get("capability")
+    if capability is None and lease is not None:
+        capability = lease.get("capability")
+    if capability:
+        public["capability"] = str(capability)
     return public
 
 

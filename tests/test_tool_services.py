@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.tool_services import CallContext, JobsService, ShellService, WebService
 
@@ -110,6 +112,82 @@ def test_web_fetch_payload_carries_binding_domain_constraints() -> None:
     assert gateway.payloads[0]["blocked_domains"] == ["blog.example.test"]
     assert recorder.events[0]["data"]["allowed_domains"] == ["docs.example.test"]
     assert recorder.events[0]["data"]["blocked_domains"] == ["blog.example.test"]
+
+
+def test_web_fetch_domain_filter_uses_scope_relation_for_wildcards() -> None:
+    recorder = _RecordingRecorder(events=[])
+    gateway = _CapturingWebGateway(payloads=[])
+    service = WebService(recorder=recorder, web_gateway_client=gateway)  # type: ignore[arg-type]
+    call = CallContext(
+        tool_call_id="call_1",
+        turn_id="turn_1",
+        tool_event_id="tool_event_1",
+        binding_id="fetch_docs",
+        scope=ToolScope(
+            allowed_domains=("*.example.test",),
+            blocked_domains=("blog.example.test",),
+        ),
+    )
+
+    service.fetch(
+        {
+            "url": "https://docs.example.test/page",
+            "allowed_domains": ["docs.example.test"],
+            "blocked_domains": ["private.example.test"],
+        },
+        call,
+    )
+
+    assert gateway.payloads[0]["allowed_domains"] == ["docs.example.test"]
+    assert gateway.payloads[0]["blocked_domains"] == ["blog.example.test", "private.example.test"]
+    assert recorder.events[0]["data"]["allowed_domains"] == ["docs.example.test"]
+
+
+def test_web_fetch_domain_filter_accepts_nested_wildcard_narrowing() -> None:
+    recorder = _RecordingRecorder(events=[])
+    gateway = _CapturingWebGateway(payloads=[])
+    service = WebService(recorder=recorder, web_gateway_client=gateway)  # type: ignore[arg-type]
+    call = CallContext(
+        tool_call_id="call_1",
+        turn_id="turn_1",
+        tool_event_id="tool_event_1",
+        binding_id="fetch_docs",
+        scope=ToolScope(allowed_domains=("*.example.test",)),
+    )
+
+    service.fetch(
+        {
+            "url": "https://docs.example.test/page",
+            "allowed_domains": ["*.docs.example.test"],
+        },
+        call,
+    )
+
+    assert gateway.payloads[0]["allowed_domains"] == ["*.docs.example.test"]
+
+
+def test_web_fetch_domain_filter_rejects_requested_widening_before_gateway_call() -> None:
+    recorder = _RecordingRecorder(events=[])
+    gateway = _CapturingWebGateway(payloads=[])
+    service = WebService(recorder=recorder, web_gateway_client=gateway)  # type: ignore[arg-type]
+    call = CallContext(
+        tool_call_id="call_1",
+        turn_id="turn_1",
+        tool_event_id="tool_event_1",
+        binding_id="fetch_docs",
+        scope=ToolScope(allowed_domains=("*.docs.example.test",)),
+    )
+
+    with pytest.raises(ValueError, match="allowed_domains exceeds signed scope"):
+        service.fetch(
+            {
+                "url": "https://docs.example.test/page",
+                "allowed_domains": ["*.example.test"],
+            },
+            call,
+        )
+
+    assert gateway.payloads == []
 
 
 @dataclass

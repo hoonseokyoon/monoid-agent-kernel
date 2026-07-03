@@ -21,11 +21,22 @@ from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_TASK_KIND,
     normalize_tool_approval_result,
 )
+from monoid_agent_kernel.core.wire_validation import (
+    optional_list,
+    parse_bool,
+    parse_float,
+    parse_str,
+    require_object,
+)
 from monoid_agent_kernel.errors import ToolExecutionError, WorkspaceError
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ToolObservation
-from monoid_agent_kernel.public_view import public_path
+from monoid_agent_kernel.public_view import (
+    public_capability_result,
+    public_path,
+    public_result_content,
+)
 from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.shell import (
     ShellExecutionOptions,
@@ -560,24 +571,27 @@ class HostedTask:
     def from_checkpoint(cls, payload: dict[str, Any], artifacts_dir: Path) -> HostedTask:
         """Rebuild a parked hosted task from a checkpoint payload. The task dir
         layout matches ``HostedTaskExecutor.start``: ``artifacts_dir/tasks/<id>/``."""
-        task_id = str(payload.get("task_id") or "")
+        payload = require_object(payload, "hosted task checkpoint")
+        task_id = parse_str(payload, "task_id")
         task_dir = artifacts_dir / "tasks" / task_id
+        result = require_object(payload["result"], "result") if "result" in payload and payload["result"] is not None else None
+        finished_at = parse_float(payload, "finished_at", default=0.0, allow_none=True) if "finished_at" in payload else None
         return cls(
             job_id=task_id,
-            kind=str(payload.get("kind") or ""),
-            prompt=str(payload.get("prompt") or ""),
-            status=str(payload.get("status") or "running"),
-            started_at=float(payload.get("started_at") or 0.0),
-            resume_on_exit=bool(payload.get("resume_on_exit", True)),
+            kind=parse_str(payload, "kind"),
+            prompt=parse_str(payload, "prompt"),
+            status=parse_str(payload, "status", default="running"),
+            started_at=parse_float(payload, "started_at", default=0.0) or 0.0,
+            resume_on_exit=parse_bool(payload, "resume_on_exit", default=True),
             job_path=task_dir / "task.json",
             cancel_path=task_dir / "cancel.requested",
-            created_by=str(payload.get("created_by") or "model"),
-            choices=tuple(str(choice) for choice in payload.get("choices") or ()),
-            request=dict(payload.get("request") or {}),
-            finished_at=payload.get("finished_at"),
-            error=str(payload.get("error") or ""),
-            result=payload.get("result"),
-            ready_for_reentry=bool(payload.get("ready_for_reentry", False)),
+            created_by=parse_str(payload, "created_by", default="model"),
+            choices=tuple(parse_str({"choice": choice}, "choice") for choice in optional_list(payload, "choices")),
+            request=require_object(payload["request"], "request") if "request" in payload else {},
+            finished_at=finished_at,
+            error=parse_str(payload, "error"),
+            result=result,
+            ready_for_reentry=parse_bool(payload, "ready_for_reentry", default=False),
         )
 
     def started_content(self, run_dir: Path) -> dict[str, Any]:
@@ -601,19 +615,35 @@ class HostedTask:
         return event_type, level
 
     def public_payload(self, run_dir: Path, permission_policy: PermissionPolicy) -> dict[str, Any]:
-        del permission_policy
-        return self.to_json(run_dir)
+        payload = self.to_json(run_dir)
+        payload["request"] = self.public_request()
+        payload["result"] = self._public_result(permission_policy)
+        return payload
 
     def public_request(self) -> dict[str, Any]:
         request = dict(self.request)
         if self.kind == TOOL_APPROVAL_TASK_KIND:
             request.pop("arguments", None)
+        if self.kind == "capability":
+            request.pop("replay_call_name", None)
+            request.pop("replay_call_id", None)
+            request.pop("replay_arguments", None)
+            request.pop("replay_approved_tool_approval", None)
         return request
 
     def public_result(self) -> dict[str, Any] | None:
         if self.kind == TOOL_APPROVAL_TASK_KIND and self.result is not None:
             return normalize_tool_approval_result(self.result, task_id=self.job_id)
         return self.result
+
+    def _public_result(self, permission_policy: PermissionPolicy) -> dict[str, Any] | None:
+        if self.result is None:
+            return None
+        if self.kind == TOOL_APPROVAL_TASK_KIND:
+            return self.public_result()
+        if self.kind == "capability":
+            return public_capability_result(self.result)
+        return public_result_content(self.result, permission_policy)
 
     def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:
         del run_dir, tail_bytes

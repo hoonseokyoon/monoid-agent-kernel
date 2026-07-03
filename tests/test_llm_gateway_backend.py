@@ -143,6 +143,37 @@ def test_llm_gateway_rejects_cross_run_turn_handle() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda payload: payload.update({"reasoning": []}),
+        lambda payload: payload.update({"messages": {}}),
+        lambda payload: payload.update({"tools": {}}),
+        lambda payload: payload.update({"observations": {}}),
+        lambda payload: payload["tools"][0].update({"input_schema": []}),
+        lambda payload: payload.update(
+            {"previous_turn_handle": "turn_1", "observations": [{"call_id": "c1", "is_background": "false"}]}
+        ),
+        lambda payload: payload.update(
+            {"previous_turn_handle": "turn_1", "observations": [{"call_id": "c1", "output": []}]}
+        ),
+    ],
+)
+def test_llm_gateway_rejects_present_wrong_type_payload_fields(mutator) -> None:
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
+            turns=[ModelTurn(response_id="provider_1", final_text="done")]
+        ),
+    )
+    payload = _payload()
+    mutator(payload)
+
+    with pytest.raises(ValueError):
+        gateway.handle_turn(_llm_token(manager), payload)
+
+
 def test_llm_gateway_http_endpoint_and_usage(tmp_path: Path) -> None:
     manager = _token_manager()
     gateway = LlmGatewayBackend(
@@ -170,6 +201,31 @@ def test_llm_gateway_http_endpoint_and_usage(tmp_path: Path) -> None:
         usage = _json_get(f"{base_url}/internal/llm/tenants/tenant_a/usage", token="admin")
         assert usage["calls"] == 1
         assert usage["total_tokens"] == 9
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_llm_gateway_http_rejects_present_wrong_type_payload_field() -> None:
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
+            turns=[ModelTurn(response_id="provider_1", final_text="done")]
+        ),
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    payload = _payload()
+    payload["reasoning"] = []
+    try:
+        _wait_http_ready(base_url)
+        with pytest.raises(HTTPError) as exc_info:
+            _json_post(f"{base_url}/internal/llm/turns", payload, token=_llm_token(manager))
+        assert exc_info.value.code == 400
     finally:
         server.shutdown()
         server.server_close()

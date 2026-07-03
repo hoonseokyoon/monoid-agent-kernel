@@ -453,9 +453,20 @@ def test_backend_package_endpoints_auth_disabled_apply_and_allowed_apply(tmp_pat
         assert applied["status"] == "applied"
         assert target.joinpath("SUMMARY.md").read_text(encoding="utf-8") == "backend summary\n"
         events = _json_get(f"{base_url}/v1/runs/{run_id}/events", token=run_token)["events"]
-        assert "proposal.package.exported" in [event["type"] for event in events]
-        assert "proposal.approved" in [event["type"] for event in events]
-        assert "proposal.applied" in [event["type"] for event in events]
+        proposal_events = [
+            event
+            for event in events
+            if event.get("type")
+            in {"proposal.package.exported", "proposal.approved", "proposal.applied"}
+        ]
+        assert [event["type"] for event in proposal_events] == [
+            "proposal.package.exported",
+            "proposal.approved",
+            "proposal.applied",
+        ]
+        assert [event["seq"] for event in proposal_events] == sorted(
+            event["seq"] for event in proposal_events
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -493,6 +504,50 @@ def test_backend_apply_endpoint_disabled_without_apply_roots(tmp_path: Path) -> 
             submission.run_token,
             target=tmp_path / "target",
         )
+
+
+def test_backend_proposal_reject_event_uses_backend_event_append(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace.joinpath("notes.md").write_bytes(b"alpha\n")
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=TokenManager.from_secret("r" * 32),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Finish.",
+            runtime_config=runtime_config("run.finish"),
+        )
+    )
+    backend.wait_for_run(submission.run_id, timeout_s=5)
+    backend.export_proposal_package(submission.run_id, submission.run_token)
+
+    rejected = backend.reject_proposal(
+        submission.run_id,
+        submission.run_token,
+        approver_id="user_a",
+        reason="not ready",
+    )
+
+    assert rejected["decision"] == "rejected"
+    events = backend.events(submission.run_id, submission.run_token)["events"]
+    proposal_events = [
+        event
+        for event in events
+        if event.get("type") in {"proposal.package.exported", "proposal.rejected"}
+    ]
+    assert [event["type"] for event in proposal_events] == [
+        "proposal.package.exported",
+        "proposal.rejected",
+    ]
+    assert proposal_events[1]["seq"] > proposal_events[0]["seq"]
 
 
 def test_backend_package_apply_endpoint_handles_deletion_package(tmp_path: Path) -> None:

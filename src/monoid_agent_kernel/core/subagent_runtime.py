@@ -122,6 +122,18 @@ def is_descendant_run_id(ancestor_run_id: str, descendant_run_id: str) -> bool:
     return True
 
 
+def root_run_id_from_descendant(descendant_run_id: str) -> str | None:
+    """Return the root ancestor run id for a subagent descendant id."""
+    run_id = str(descendant_run_id or "")
+    if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
+        return None
+    marker = ".sub."
+    if marker not in run_id:
+        return None
+    root_run_id = run_id.split(marker, 1)[0]
+    return root_run_id or None
+
+
 def subagent_diagnostics_from_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Build a bounded diagnostics projection from parent subagent lifecycle events."""
     by_child: dict[str, dict[str, Any]] = {}

@@ -36,6 +36,7 @@ _wire_id = st.text(
 ).map(str.strip).filter(bool)
 _bad_object_shape = _json_value.filter(lambda value: not isinstance(value, dict))
 _bad_optional_object_shape = _bad_object_shape.filter(lambda value: value is not None)
+_bad_bool_shape = _json_value.filter(lambda value: not isinstance(value, bool))
 
 
 @st.composite
@@ -155,6 +156,29 @@ def test_external_agent_envelope_rejects_malformed_result_metadata(metadata: Any
         validate_external_agent_envelope(payload)
 
 
+@settings(max_examples=25, deadline=None)
+@given(terminal=_bad_bool_shape)
+def test_external_agent_envelope_rejects_malformed_result_bool(terminal: Any) -> None:
+    payload = _valid_envelope_payload()
+    payload["result"] = {"state": "completed", "terminal": terminal}
+
+    with pytest.raises(ValueError):
+        validate_external_agent_envelope(payload)
+
+
+@settings(max_examples=25, deadline=None)
+@given(retryable=_bad_bool_shape)
+def test_external_agent_envelope_rejects_malformed_error_bool(retryable: Any) -> None:
+    payload = _valid_envelope_payload()
+    payload["result"] = {
+        "state": "failed",
+        "error": {"code": "peer_error", "retryable": retryable},
+    }
+
+    with pytest.raises(ValueError):
+        validate_external_agent_envelope(payload)
+
+
 @settings(max_examples=40, deadline=None)
 @given(
     envelope_metadata=_json_object,
@@ -173,6 +197,7 @@ def test_external_agent_envelope_metadata_cannot_override_canonical_inbox_metada
         "custom": "kept",
         "peer_id": "spoofed-peer",
         "task_id": "spoofed-task",
+        "traceparent": "spoofed-trace",
         "result": {"state": "spoofed"},
     }
     envelope = ExternalAgentEnvelope(
@@ -191,3 +216,4 @@ def test_external_agent_envelope_metadata_cannot_override_canonical_inbox_metada
     assert inbox.metadata["peer_id"] == peer_id
     assert inbox.metadata["task_id"] == task_id
     assert inbox.metadata["result"] == (result.to_json() if result is not None else None)
+    assert inbox.metadata["traceparent"] == envelope.traceparent
