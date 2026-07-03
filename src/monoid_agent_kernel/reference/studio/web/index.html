@@ -27,9 +27,19 @@
   .badge { margin-left: auto; font-size: 11px; padding: 2px 8px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--muted); }
   .badge.offline { color: var(--warn); border-color: var(--warn); }
-  #body { flex: 1; display: flex; min-height: 0; }
-  #sidebar { width: 240px; min-width: 240px; overflow: auto; border-right: 1px solid var(--border);
+  #body { flex: 1; display: grid; grid-template-columns: 260px minmax(0, 1fr) 380px; min-height: 0; }
+  #sidebar { overflow: auto; border-right: 1px solid var(--border);
     background: var(--panel); padding: 10px 12px; }
+  #chat { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  #sidepanel { min-width: 320px; border-left: 1px solid var(--border); background: var(--panel);
+    display: flex; flex-direction: column; min-height: 0; }
+  .side-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 8px;
+    border-bottom: 1px solid var(--border); }
+  .side-tabs button { border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+    border-radius: 8px; padding: 7px 8px; font-size: 12px; }
+  .side-tabs button.active { color: var(--text); border-color: var(--accent); }
+  .side-panel { min-height: 0; overflow: auto; padding: 12px 14px; }
+  .side-panel[hidden] { display: none; }
   .side-title { font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
     color: var(--muted); margin-bottom: 8px; }
   #tree { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
@@ -47,12 +57,11 @@
   #jobs li.failed .st { color: var(--err); }
   #log { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 22px 20px; display: flex;
     flex-direction: column; gap: 14px; min-width: 0; }
-  #proposal { width: 380px; min-width: 320px; border-left: 1px solid var(--border);
-    background: var(--panel); padding: 12px 14px; overflow: auto; display: flex;
+  #proposal {
+    padding: 12px 0 0; overflow: auto; display: flex;
     flex-direction: column; gap: 10px; }
   #proposal[hidden] { display: none; }
-  #viewer { width: 420px; min-width: 320px; border-left: 1px solid var(--border);
-    background: var(--panel); padding: 12px 14px; overflow: auto; display: flex; flex-direction: column; }
+  #viewer { padding: 12px 0 0; overflow: auto; display: flex; flex-direction: column; }
   #viewer[hidden] { display: none; }
   #viewer .side-title { display: flex; justify-content: space-between; align-items: center; }
   #viewer-body { flex: 1; margin: 0; white-space: pre; overflow: auto; background: var(--bg);
@@ -185,6 +194,14 @@
   #sessions li.untitled { color: #5b6273; }
   #sessions li.untitled .sid { font-size: 10px; opacity: .7; margin-left: 6px;
     font-family: ui-monospace, Consolas, monospace; }
+  #profiles { list-style: none; padding: 0; margin: 0 0 12px; display: flex; flex-direction: column; gap: 4px; }
+  #profiles li { padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+    color: var(--muted); }
+  #profiles li.active { border-color: var(--accent); color: var(--text); background: rgba(110,168,254,.08); }
+  #profile { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 8px; margin-bottom: 8px; }
+  #live-caps { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+  #live-caps label { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
   #trace { overflow: auto; }
   #trace-tree { font-size: 12px; font-variant-numeric: tabular-nums; }
   #trace-tree ul { list-style: none; margin: 0; padding-left: 14px; border-left: 1px solid var(--border, #2a2f3a); }
@@ -220,64 +237,84 @@
     <a href="#" id="trace-btn" class="hlink" title="Toggle the run trace">Trace</a>
     <a href="/settings" title="Settings" style="color:var(--muted);text-decoration:none;font-size:16px;margin-left:6px">⚙</a>
   </header>
-  <div id="body">
-    <aside id="sidebar">
+  <div id="body" data-testid="studio-shell">
+    <aside id="sidebar" data-testid="left-config-panel">
+      <div class="side-title">Agent profile</div>
+      <select id="profile" data-testid="profile-switcher" title="Active Studio profile"></select>
+      <ul id="profiles" data-testid="profile-list"></ul>
       <div class="side-title">Chats
         <a href="#" id="a2a-demo" class="hlink" style="float:right;font-weight:400"
            title="Spin up two peer agents that message each other through the durable outbox→inbox fabric">⇄ A2A demo</a>
       </div>
-      <ul id="sessions"></ul>
-      <div class="side-title" style="margin-top:14px">Files</div>
-      <ul id="tree"></ul>
+      <ul id="sessions" data-testid="profile-session-list"></ul>
       <div class="side-title" id="plan-title" style="margin-top:14px" hidden>Plan</div>
       <ol id="plan" hidden></ol>
-      <div class="side-title" style="margin-top:14px">Jobs</div>
-      <ul id="jobs"></ul>
-      <div class="side-title" id="skills-title" style="margin-top:14px" hidden>Skills</div>
-      <ul id="skills" hidden></ul>
-      <div class="side-title" id="mcp-title" style="margin-top:14px" hidden>MCP tools</div>
-      <ul id="mcp-tools" hidden></ul>
     </aside>
-    <div id="log"></div>
-    <aside id="proposal" hidden>
-      <div class="side-title">Proposed changes</div>
-      <label id="proposal-all"><input type="checkbox" id="select-all" checked /> Select all</label>
-      <div id="proposal-files"></div>
-      <pre id="diff"></pre>
-      <div id="proposal-actions">
-        <button id="apply" type="button">Approve &amp; apply</button>
-        <button id="export" type="button" title="Download a portable, self-verifying proposal package (.tar)">Export package</button>
+    <section id="chat" data-testid="center-chat">
+      <div id="log" data-testid="chat-log"></div>
+      <footer>
+        <div id="attachments"></div>
+        <form id="form" data-testid="composer">
+          <label id="attach-btn" title="Attach an image or PDF">📎
+            <input id="attach" type="file" accept="image/*,application/pdf" multiple hidden />
+          </label>
+          <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)" autofocus></textarea>
+          <button id="send" type="submit">Send</button>
+          <button id="stop" type="button" hidden>Stop</button>
+        </form>
+      </footer>
+    </section>
+    <aside id="sidepanel" data-testid="right-side-panel">
+      <div class="side-tabs" data-testid="right-panel-tabs">
+        <button id="tab-workspace" type="button" data-panel="workspace-panel" class="active">Workspace</button>
+        <button id="tab-trace" type="button" data-panel="trace-panel">Trace</button>
+        <button id="tab-config" type="button" data-panel="config-panel">Live Config</button>
       </div>
-      <div id="apply-status"></div>
-    </aside>
-    <aside id="trace" hidden>
-      <div class="side-title">Trace</div>
-      <div id="trace-tree"></div>
-    </aside>
-    <aside id="viewer" hidden>
-      <div class="side-title"><span id="viewer-name">File</span>
-        <a href="#" id="viewer-close" class="hlink" title="Close">✕</a></div>
-      <pre id="viewer-body"></pre>
+      <section id="workspace-panel" class="side-panel" data-testid="workspace-panel">
+        <div class="side-title">Workspace</div>
+        <ul id="tree"></ul>
+        <div class="side-title" style="margin-top:14px">Jobs</div>
+        <ul id="jobs"></ul>
+        <aside id="proposal" hidden>
+          <div class="side-title">Proposed changes</div>
+          <label id="proposal-all"><input type="checkbox" id="select-all" checked /> Select all</label>
+          <div id="proposal-files"></div>
+          <pre id="diff"></pre>
+          <div id="proposal-actions">
+            <button id="apply" type="button">Approve &amp; apply</button>
+            <button id="export" type="button" title="Download a portable, self-verifying proposal package (.tar)">Export package</button>
+          </div>
+          <div id="apply-status"></div>
+        </aside>
+        <aside id="viewer" hidden>
+          <div class="side-title"><span id="viewer-name">File</span>
+            <a href="#" id="viewer-close" class="hlink" title="Close">✕</a></div>
+          <pre id="viewer-body"></pre>
+        </aside>
+      </section>
+      <section id="trace-panel" class="side-panel" hidden>
+        <aside id="trace" data-testid="trace-panel-content">
+          <div class="side-title">Trace</div>
+          <div id="trace-tree"></div>
+        </aside>
+      </section>
+      <section id="config-panel" class="side-panel" hidden data-testid="live-config-panel">
+        <div id="setup" data-testid="settings-config-popup">
+          <label>Model <input id="model" type="text" spellcheck="false" autocomplete="off" /></label>
+          <label>Effort <select id="effort"></select></label>
+          <label>Thinking <select id="summary"></select></label>
+          <label title="Export OpenTelemetry spans to the configured OTLP collector">OTel <input type="checkbox" id="otel" /></label>
+          <span id="setup-status"></span>
+        </div>
+        <div class="side-title" style="margin-top:14px">Capabilities</div>
+        <div id="live-caps" data-testid="capability-toggles"></div>
+        <div class="side-title" id="skills-title" style="margin-top:14px" hidden>Skills</div>
+        <ul id="skills" hidden></ul>
+        <div class="side-title" id="mcp-title" style="margin-top:14px" hidden>MCP tools</div>
+        <ul id="mcp-tools" hidden></ul>
+      </section>
     </aside>
   </div>
-  <footer>
-    <div id="setup">
-      <label>Model <input id="model" type="text" spellcheck="false" autocomplete="off" /></label>
-      <label>Effort <select id="effort"></select></label>
-      <label>Thinking <select id="summary"></select></label>
-      <label title="Export OpenTelemetry spans to the configured OTLP collector">OTel <input type="checkbox" id="otel" /></label>
-      <span id="setup-status"></span>
-    </div>
-    <div id="attachments"></div>
-    <form id="form">
-      <label id="attach-btn" title="Attach an image or PDF">📎
-        <input id="attach" type="file" accept="image/*,application/pdf" multiple hidden />
-      </label>
-      <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)" autofocus></textarea>
-      <button id="send" type="submit">Send</button>
-      <button id="stop" type="button" hidden>Stop</button>
-    </form>
-  </footer>
 
 <script>
 const log = document.getElementById("log");
@@ -290,6 +327,7 @@ const attachInput = document.getElementById("attach");
 const attachmentsEl = document.getElementById("attachments");
 let pendingAttachments = [];  // [{name, mime, data_b64}]
 let runId = null;
+let activeProfileId = "default";
 
 function renderAttachments() {
   attachmentsEl.innerHTML = "";
@@ -551,7 +589,7 @@ function handleEvent(ev) {
   const data = ev.data || {};
   if (ev.event_id && !_TRACE_SKIP.has(type)) {  // collect for the trace tree
     runEvents.push(ev);
-    if (traceAside && !traceAside.hidden) renderTrace();
+    if (activeSidePanel === "trace-panel") renderTrace();
   }
   if (ev.studio_activity) { hideTyping(); activity(ev.studio_activity); return; }
   if (type === "proposal.ready" || type === "workspace.diff.updated" || type === "workspace.proposal.updated") {
@@ -780,6 +818,7 @@ async function refreshProposal() {
     });
     syncSelectAll();
     renderDiff(p.diff);
+    showSidePanel("workspace-panel");
     proposalEl.hidden = false;
     applyBtn.disabled = false;
     exportBtn.disabled = false;
@@ -1006,7 +1045,7 @@ async function send(message) {
   try {
     const res = await fetch("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id: runId, message, attachments }),
+      body: JSON.stringify({ run_id: runId, message, attachments, profile_id: activeProfileId }),
     });
     const body = await res.json();
     if (body.error) { bubble("error", body.error); return; }
@@ -1036,6 +1075,7 @@ const viewerName = document.getElementById("viewer-name");
 const viewerBody = document.getElementById("viewer-body");
 document.getElementById("viewer-close").addEventListener("click", (e) => { e.preventDefault(); viewerAside.hidden = true; });
 async function openFile(path) {
+  showSidePanel("workspace-panel");
   viewerName.textContent = path;
   viewerBody.textContent = "loading…";
   viewerAside.hidden = false;
@@ -1061,6 +1101,7 @@ async function openFile(path) {
 // Preview a PROPOSED (not-yet-applied) image in the file viewer — its bytes come from the run's
 // proposal snapshot, not the live workspace (where it won't exist until apply).
 function openProposalImage(path) {
+  showSidePanel("workspace-panel");
   viewerName.textContent = path + " (proposed)";
   viewerBody.textContent = "loading…";
   viewerAside.hidden = false;
@@ -1151,6 +1192,27 @@ async function loadSetup() {
     }
     const otelEl = document.getElementById("otel");
     otelEl.checked = !!s.otel;
+    const liveCaps = document.getElementById("live-caps");
+    const renderLiveCaps = (enabledValues) => {
+      const enabled = new Set(enabledValues || []);
+      liveCaps.innerHTML = "";
+      for (const cap of (s.available || [])) {
+        const label = document.createElement("label");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = cap.key;
+        box.checked = enabled.has(cap.key);
+        box.dataset.testid = "capability-toggle-" + cap.key;
+        box.addEventListener("change", () => {
+          const capabilities = [...liveCaps.querySelectorAll("input:checked")].map((i) => i.value);
+          saveSetting({ capabilities }, "Capabilities");
+        });
+        label.appendChild(box);
+        label.appendChild(document.createTextNode(cap.label));
+        liveCaps.appendChild(label);
+      }
+    };
+    renderLiveCaps(s.capabilities || []);
     modelEl.addEventListener("change", () => saveSetting({ model: modelEl.value }, "Model"));
     effortEl.addEventListener("change", () => saveSetting({ effort: effortEl.value }, "Effort"));
     summaryEl.addEventListener("change", () => saveSetting({ summary: summaryEl.value }, "Thinking"));
@@ -1160,16 +1222,75 @@ async function loadSetup() {
 
 // --- R8: session history + trace tree ---------------------------------------------------
 const sessionsEl = document.getElementById("sessions");
+const profileSelect = document.getElementById("profile");
+const profilesEl = document.getElementById("profiles");
 const newchatBtn = document.getElementById("newchat");
 const a2aBtn = document.getElementById("a2a-demo");
 const traceBtn = document.getElementById("trace-btn");
 const traceAside = document.getElementById("trace");
 const traceTreeEl = document.getElementById("trace-tree");
+let activeSidePanel = "workspace-panel";
 let runEvents = [];
 const _TRACE_SKIP = new Set([
   "model.output.delta", "model.reasoning.delta", "metrics.updated", "workspace.file.read",
   "workspace.file.changed", "workspace.diff.updated", "workspace.proposal.updated", "checkpoint.committed",
 ]);
+
+function showSidePanel(panelId) {
+  activeSidePanel = panelId;
+  document.querySelectorAll(".side-panel").forEach((panel) => {
+    panel.hidden = panel.id !== panelId;
+  });
+  document.querySelectorAll(".side-tabs button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.panel === panelId);
+  });
+  traceBtn.classList.toggle("on", panelId === "trace-panel");
+  if (panelId === "trace-panel") renderTrace();
+}
+
+document.querySelectorAll(".side-tabs button").forEach((button) => {
+  button.addEventListener("click", () => showSidePanel(button.dataset.panel));
+});
+
+function switchProfile(id) {
+  if (!id || id === activeProfileId) return;
+  activeProfileId = id;
+  runId = null;
+  resetChatView();
+  renderProfileActive();
+  refreshSessions();
+  input.focus();
+}
+
+function renderProfileActive() {
+  if (profileSelect) profileSelect.value = activeProfileId;
+  profilesEl.querySelectorAll("li").forEach((li) => {
+    li.classList.toggle("active", li.dataset.profileId === activeProfileId);
+  });
+}
+
+async function loadProfiles() {
+  try {
+    const body = await (await fetch("/api/profiles")).json();
+    activeProfileId = body.default_profile_id || "default";
+    profileSelect.innerHTML = "";
+    profilesEl.innerHTML = "";
+    for (const profile of (body.profiles || [])) {
+      const opt = document.createElement("option");
+      opt.value = profile.id;
+      opt.textContent = profile.name || profile.id;
+      profileSelect.appendChild(opt);
+      const li = document.createElement("li");
+      li.dataset.profileId = profile.id;
+      li.textContent = profile.name || profile.id;
+      li.title = profile.description || "";
+      li.addEventListener("click", () => switchProfile(profile.id));
+      profilesEl.appendChild(li);
+    }
+    profileSelect.addEventListener("change", () => switchProfile(profileSelect.value));
+    renderProfileActive();
+  } catch (_) {}
+}
 
 function resetChatView() {
   if (evtSource) { evtSource.close(); evtSource = null; }
@@ -1180,7 +1301,7 @@ function resetChatView() {
   for (const cid in subagents) { if (subagents[cid].timer) clearTimeout(subagents[cid].timer); delete subagents[cid]; }
   renderPlan([]); setGenerating(false);
   usageEl.textContent = "";
-  if (traceAside && !traceAside.hidden) renderTrace();
+  if (activeSidePanel === "trace-panel") renderTrace();
 }
 
 function newChat() {
@@ -1200,7 +1321,7 @@ function loadSession(id) {
 
 async function refreshSessions() {
   try {
-    const body = await (await fetch("/api/sessions")).json();
+    const body = await (await fetch("/api/sessions?profile_id=" + encodeURIComponent(activeProfileId))).json();
     sessionsEl.innerHTML = "";
     for (const s of (body.sessions || [])) {
       const li = document.createElement("li");
@@ -1288,10 +1409,7 @@ a2aBtn.addEventListener("click", async (e) => {
 });
 traceBtn.addEventListener("click", (e) => {
   e.preventDefault();
-  const show = traceAside.hidden;
-  traceAside.hidden = !show;
-  traceBtn.classList.toggle("on", show);
-  if (show) renderTrace();
+  showSidePanel(activeSidePanel === "trace-panel" ? "workspace-panel" : "trace-panel");
 });
 
 (async function init() {
@@ -1320,6 +1438,7 @@ traceBtn.addEventListener("click", (e) => {
   } catch (_) {}
   loadTree();
   loadSetup();
+  await loadProfiles();
   refreshSessions();
   refreshCapabilities();
   // Deep link (handy for sharing + reproducible screenshots): ?run=<id> opens that session,
@@ -1329,7 +1448,7 @@ traceBtn.addEventListener("click", (e) => {
   if (runParam) {
     loadSession(runParam);
     if (params.get("panel") === "trace") {
-      setTimeout(() => { traceAside.hidden = false; traceBtn.classList.add("on"); renderTrace(); }, 1600);
+      setTimeout(() => { showSidePanel("trace-panel"); }, 1600);
     }
     const fileParam = params.get("file");
     if (fileParam) setTimeout(() => openFile(fileParam), 1600);

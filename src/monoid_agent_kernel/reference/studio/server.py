@@ -271,6 +271,32 @@ _PLAN_BINDING = ToolBinding(
     binding_id="run.update_plan", model_name="run_update_plan", ref=RegistryToolRef("run.update_plan")
 )
 
+_DEFAULT_PROFILES = (
+    {
+        "id": "default",
+        "name": "Default",
+        "description": "General-purpose workspace agent.",
+    },
+    {
+        "id": "reviewer",
+        "name": "Reviewer",
+        "description": "Review-focused profile for analysis and feedback sessions.",
+    },
+    {
+        "id": "builder",
+        "name": "Builder",
+        "description": "Implementation-focused profile for coding sessions.",
+    },
+)
+_DEFAULT_PROFILE_ID = "default"
+_PROFILE_INDEX_NAME = "studio-profiles.json"
+
+
+def _normalize_profile_id(profile_id: str | None) -> str:
+    profile = (profile_id or _DEFAULT_PROFILE_ID).strip() or _DEFAULT_PROFILE_ID
+    known = {p["id"] for p in _DEFAULT_PROFILES}
+    return profile if profile in known else _DEFAULT_PROFILE_ID
+
 
 def _runtime_config_for(
     capabilities: list[str],
@@ -379,6 +405,51 @@ class StudioServer:
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    # --- Studio profiles ---------------------------------------------------------------
+
+    def profiles(self) -> dict[str, Any]:
+        """The lightweight Studio profile catalog.
+
+        Profiles are UI/session scopes only. They do not alter the kernel contract or runtime
+        config; they group Studio history so users can keep different workflows separate.
+        """
+        return {
+            "profiles": [dict(profile) for profile in _DEFAULT_PROFILES],
+            "default_profile_id": _DEFAULT_PROFILE_ID,
+        }
+
+    def _profile_index_path(self) -> Path:
+        return self.config.run_root / _PROFILE_INDEX_NAME
+
+    def _load_profile_index(self) -> dict[str, str]:
+        try:
+            payload = json.loads(self._profile_index_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        raw = payload.get("runs") if isinstance(payload, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(run_id): _normalize_profile_id(str(profile_id))
+            for run_id, profile_id in raw.items()
+        }
+
+    def _write_profile_index(self, index: dict[str, str]) -> None:
+        path = self._profile_index_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"runs": index}, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _remember_run_profile(self, run_id: str, profile_id: str) -> None:
+        profile_id = _normalize_profile_id(profile_id)
+        with self._lock:
+            index = self._load_profile_index()
+            index[run_id] = profile_id
+            self._write_profile_index(index)
+
+    def _profile_for_run(self, run_id: str) -> str:
+        with self._lock:
+            return self._load_profile_index().get(run_id, _DEFAULT_PROFILE_ID)
 
     # --- provider-backed capabilities (Skills / MCP) ------------------------------------
 
@@ -618,10 +689,17 @@ class StudioServer:
                 parts.append(DocumentPart(source_ref=source_ref, mime_type=mime))
         return tuple(parts)
 
-    def start_chat(self, message: str, attachments: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+    def start_chat(
+        self,
+        message: str,
+        attachments: Sequence[dict[str, Any]] = (),
+        *,
+        profile_id: str = _DEFAULT_PROFILE_ID,
+    ) -> dict[str, Any]:
         """Open a new multi-turn session in the workspace and deliver the first message (with any
         image/document attachments as multimodal content parts)."""
         assert self._backend is not None
+        profile_id = _normalize_profile_id(profile_id)
         runtime_config = self._build_config()
         parts = self._parts_from_attachments(message, attachments)
         request = BackendRunRequest(
@@ -633,12 +711,22 @@ class StudioServer:
             mode="propose",
             multi_turn=True,
             runtime_config=runtime_config,
+            metadata={"studio_profile_id": profile_id},
         )
         submission = self._backend.submit_run(request)
         title = " ".join(message.split())[:60] or "(empty)"
         with self._lock:
             self._run_tokens[submission.run_id] = submission.run_token
-            self._sessions.insert(0, {"run_id": submission.run_id, "title": title, "created_at": time.time()})
+            self._sessions.insert(
+                0,
+                {
+                    "run_id": submission.run_id,
+                    "title": title,
+                    "created_at": time.time(),
+                    "profile_id": profile_id,
+                },
+            )
+        self._remember_run_profile(submission.run_id, profile_id)
         return {"run_id": submission.run_id, "status": submission.status}
 
     # --- A2A demo (agent-to-agent durable messaging) ------------------------------------
@@ -718,7 +806,7 @@ class StudioServer:
             mode="propose",
             multi_turn=True,
             runtime_config=self._a2a_peer_config(name, peer),
-            metadata={"a2a_peer_id": name},
+            metadata={"a2a_peer_id": name, "studio_profile_id": _DEFAULT_PROFILE_ID},
         )
         submission = self._backend.submit_run(request)
         with self._lock:
@@ -726,8 +814,14 @@ class StudioServer:
             self._agent_directory[name] = submission.run_id
             self._sessions.insert(
                 0,
-                {"run_id": submission.run_id, "title": f"A2A · {name}", "created_at": time.time()},
+                {
+                    "run_id": submission.run_id,
+                    "title": f"A2A · {name}",
+                    "created_at": time.time(),
+                    "profile_id": _DEFAULT_PROFILE_ID,
+                },
             )
+        self._remember_run_profile(submission.run_id, _DEFAULT_PROFILE_ID)
         return submission.run_id
 
     def start_a2a_demo(self, task: str) -> dict[str, Any]:
@@ -745,7 +839,7 @@ class StudioServer:
         planner_id = self._spawn_peer("planner", "worker", instruction=task)
         return {"planner": planner_id, "worker": worker_id}
 
-    def sessions(self) -> dict[str, Any]:
+    def sessions(self, profile_id: str | None = None) -> dict[str, Any]:
         """The chat history (newest first), restart-surviving via the backend (DX-12).
 
         Source of truth is ``backend.list_runs`` (scans run_root → titles/status + a read token
@@ -754,29 +848,47 @@ class StudioServer:
         isn't on disk yet are overlaid from the in-memory ``_sessions`` so a new chat appears
         immediately."""
         assert self._backend is not None
+        selected_profile = _normalize_profile_id(profile_id) if profile_id is not None else None
+        profile_names = {profile["id"]: profile["name"] for profile in _DEFAULT_PROFILES}
         listing = self._backend.list_runs(_TENANT, user_id=_USER).get("runs", [])
         with self._lock:
             for run in listing:
                 self._run_tokens.setdefault(run["run_id"], run["read_token"])
             known = {run["run_id"] for run in listing}
             recents = [s for s in self._sessions if s["run_id"] not in known]
-        out = [
-            {
-                "run_id": run["run_id"],
-                "title": run["title"] or run["run_id"],
-                "status": run["status"],
-                "created_at": run["created_at"],
-                "recoverable": run["recoverable"],
-            }
-            for run in listing
-        ]
-        out += [
-            {"run_id": s["run_id"], "title": s["title"], "status": "running",
-             "created_at": s["created_at"], "recoverable": False}
-            for s in recents
-        ]
+        out = []
+        for run in listing:
+            run_profile = self._profile_for_run(str(run["run_id"]))
+            if selected_profile is not None and run_profile != selected_profile:
+                continue
+            out.append(
+                {
+                    "run_id": run["run_id"],
+                    "title": run["title"] or run["run_id"],
+                    "status": run["status"],
+                    "created_at": run["created_at"],
+                    "recoverable": run["recoverable"],
+                    "profile_id": run_profile,
+                    "profile_name": profile_names.get(run_profile, run_profile),
+                }
+            )
+        for s in recents:
+            run_profile = _normalize_profile_id(str(s.get("profile_id") or _DEFAULT_PROFILE_ID))
+            if selected_profile is not None and run_profile != selected_profile:
+                continue
+            out.append(
+                {
+                    "run_id": s["run_id"],
+                    "title": s["title"],
+                    "status": "running",
+                    "created_at": s["created_at"],
+                    "recoverable": False,
+                    "profile_id": run_profile,
+                    "profile_name": profile_names.get(run_profile, run_profile),
+                }
+            )
         out.sort(key=lambda entry: entry["created_at"], reverse=True)
-        return {"sessions": out}
+        return {"sessions": out, "profile_id": selected_profile}
 
     def continue_chat(
         self, run_id: str, message: str, attachments: Sequence[dict[str, Any]] = ()
@@ -1123,6 +1235,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/capabilities-catalog":
                 self._write_json(studio.capabilities_catalog())
                 return
+            if parsed.path == "/api/profiles":
+                self._write_json(studio.profiles())
+                return
             if parsed.path == "/healthz":
                 self._write_json({"ok": True})
                 return
@@ -1173,7 +1288,8 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     )
                 return
             if parsed.path == "/api/sessions":
-                self._write_json(studio.sessions())
+                profile_id = (parse_qs(parsed.query).get("profile_id") or [None])[0]
+                self._write_json(studio.sessions(profile_id=profile_id))
                 return
             if parsed.path == "/api/proposal":
                 run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
@@ -1247,7 +1363,11 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     if run_id:
                         result = studio.continue_chat(str(run_id), message, attachments)
                     else:
-                        result = studio.start_chat(message, attachments)
+                        result = studio.start_chat(
+                            message,
+                            attachments,
+                            profile_id=str(body.get("profile_id") or _DEFAULT_PROFILE_ID),
+                        )
                     self._write_json(result)
                     return
                 if parsed.path == "/api/a2a-demo":

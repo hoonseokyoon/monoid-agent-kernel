@@ -73,6 +73,28 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
     # A failed run surfaces the provider error detail (shared by the run.failed + turn.failed paths).
     assert "function providerDetail" in html
     assert "provider_error_code" in html
+    for hook in (
+        'data-testid="studio-shell"',
+        'data-testid="left-config-panel"',
+        'data-testid="profile-switcher"',
+        'data-testid="profile-list"',
+        'data-testid="chat-log"',
+        'data-testid="composer"',
+        'data-testid="right-panel-tabs"',
+        'data-testid="settings-config-popup"',
+        'data-testid="capability-toggles"',
+    ):
+        assert hook in html
+
+
+def test_settings_page_serves_static_test_hooks(studio: StudioServer) -> None:
+    import urllib.request
+
+    with urllib.request.urlopen(f"{studio.base_url}/settings") as resp:
+        html = resp.read().decode("utf-8")
+    assert 'data-testid="settings-popup"' in html
+    assert 'data-testid="capability-toggles"' in html
+    assert 'data-testid="capability-toggle-' in html
 
 
 def test_offline_chat_produces_assistant_reply(studio: StudioServer) -> None:
