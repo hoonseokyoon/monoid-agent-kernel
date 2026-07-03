@@ -25,10 +25,17 @@ def test_mcp_gateway_discovers_and_round_trips_a_call() -> None:
     with serving(_server()) as base_url:
         with McpToolProvider(f"{base_url}/mcp", server="studio") as mcp:
             specs = {s.id: s for s in mcp.get_tools()}
-            assert set(specs) == {"mcp.studio.echo", "mcp.studio.uppercase"}
+            assert set(specs) == {
+                "mcp.studio.echo",
+                "mcp.studio.uppercase",
+                "mcp.studio.resource.read",
+                "mcp.studio.prompt.get",
+            }
             # readOnlyHint annotation maps to side_effect="read"; the unmarked tool is "run".
             assert specs["mcp.studio.echo"].side_effect == "run"
             assert specs["mcp.studio.uppercase"].side_effect == "read"
+            assert specs["mcp.studio.resource.read"].side_effect == "read"
+            assert specs["mcp.studio.prompt.get"].side_effect == "read"
             assert specs["mcp.studio.echo"].input_schema["required"] == ["text"]
 
             ok = specs["mcp.studio.echo"].handler(None, {"text": "hi"})
@@ -36,6 +43,16 @@ def test_mcp_gateway_discovers_and_round_trips_a_call() -> None:
 
             up = specs["mcp.studio.uppercase"].handler(None, {"text": "hi"})
             assert up.ok and up.content["text"] == "HI"
+
+            resource = specs["mcp.studio.resource.read"].handler(None, {"uri": "fake://studio/guide"})
+            assert resource.ok
+            assert "uppercase" in resource.content["contents"][0]["text"]
+
+            prompt = specs["mcp.studio.prompt.get"].handler(
+                None, {"name": "summarize", "arguments": {"topic": "MCP"}}
+            )
+            assert prompt.ok
+            assert prompt.content["messages"][0]["content"]["text"] == "Summarize MCP in two sentences."
 
 
 def test_mcp_gateway_healthz_and_readiness_poll() -> None:
@@ -68,4 +85,9 @@ def test_mcp_gateway_rejects_bad_token_when_admin_configured() -> None:
 
         # The matching token discovers normally.
         with McpToolProvider(f"{base_url}/mcp", server="studio", token="secret") as mcp:
-            assert {s.id for s in mcp.get_tools()} == {"mcp.studio.echo", "mcp.studio.uppercase"}
+            assert {s.id for s in mcp.get_tools()} == {
+                "mcp.studio.echo",
+                "mcp.studio.uppercase",
+                "mcp.studio.resource.read",
+                "mcp.studio.prompt.get",
+            }
