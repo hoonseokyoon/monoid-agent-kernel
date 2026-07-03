@@ -150,6 +150,25 @@ monoid run \
   --runtime-config-file examples/runtime-config.json
 ```
 
+Use the builder CLI to scaffold and preflight those files:
+
+```bash
+monoid builder init --target ./my-agent
+monoid builder config validate \
+  --runtime-config-file ./my-agent/runtime-config.json
+monoid builder tools list \
+  --runtime-config-file ./my-agent/runtime-config.json
+```
+
+`monoid builder init --custom-tool-template` also writes a small `tools.py` provider.
+Pass it explicitly when validating or running custom tools:
+
+```bash
+monoid builder tools list \
+  --tool-module ./my-agent/tools.py:get_tools \
+  --runtime-config-file ./my-agent/runtime-config.json
+```
+
 Programmatic callers drive the run with `AgentLoop.run_once(instruction)` for the
 one-shot case, or `open()` → `submit(user_input)`* → `close()` for a multi-turn
 session in a single run. Each `submit()` settles when the model returns final

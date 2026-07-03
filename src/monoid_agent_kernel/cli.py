@@ -67,6 +67,7 @@ from monoid_agent_kernel.reference.web_gateway.providers import (
 )
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.reference.studio.cli import studio as studio_group
+from monoid_agent_kernel.builder import builder_group
 
 
 @click.group()
@@ -75,6 +76,7 @@ def main() -> None:
 
 
 main.add_command(studio_group)
+main.add_command(builder_group)
 
 
 @main.command()
