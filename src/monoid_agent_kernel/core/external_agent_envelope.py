@@ -31,6 +31,9 @@ EXTERNAL_AGENT_ENVELOPE_VERSION = namespaced_id("external-agent-envelope.v1")
 ACCEPTED_EXTERNAL_AGENT_ENVELOPE_VERSIONS = accepted_namespaced_ids(
     "external-agent-envelope.v1"
 )
+RESERVED_EXTERNAL_AGENT_METADATA_KEYS = frozenset(
+    {"peer_id", "task_id", "request_id", "reply_to_id", "result", "traceparent"}
+)
 
 
 @dataclass(frozen=True)
@@ -236,12 +239,7 @@ def external_agent_envelope_from_outbox_request(
     parts = _parts_from_payload(payload)
     message_id = request.idempotency_key or request.id
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    sender_peer_id = (
-        peer_id
-        or str(metadata.get("peer_id") or metadata.get("source_peer_id") or "").strip()
-        or request.run_id
-        or request.destination
-    )
+    sender_peer_id = peer_id or request.run_id or request.destination
     return ExternalAgentEnvelope(
         peer_id=sender_peer_id,
         parts=parts,
@@ -277,15 +275,33 @@ def external_agent_envelope_to_inbox_message(
         causation_id=envelope.causation_id,
         traceparent=envelope.traceparent,
         tracestate=envelope.tracestate,
-        metadata={
-            **dict(envelope.metadata),
-            "task_id": envelope.task_id,
-            "request_id": envelope.request_id,
-            "reply_to_id": envelope.reply_to_id,
-            "peer_id": envelope.peer_id,
-            "result": envelope.result.to_json() if envelope.result is not None else None,
-        },
+        metadata=merge_canonical_metadata(
+            envelope.metadata,
+            {
+                "task_id": envelope.task_id,
+                "request_id": envelope.request_id,
+                "reply_to_id": envelope.reply_to_id,
+                "peer_id": envelope.peer_id,
+                "result": envelope.result.to_json() if envelope.result is not None else None,
+                "traceparent": envelope.traceparent,
+            },
+        ),
     )
+
+
+def merge_canonical_metadata(
+    user: dict[str, Any],
+    canonical: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge user metadata with canonical identity fields taking precedence."""
+
+    merged = {
+        str(key): value
+        for key, value in dict(user).items()
+        if str(key) not in RESERVED_EXTERNAL_AGENT_METADATA_KEYS
+    }
+    merged.update(canonical)
+    return merged
 
 
 def _parts_from_payload(payload: dict[str, Any]) -> tuple[ExternalAgentPart, ...]:

@@ -164,6 +164,114 @@ def test_tool_approval_public_payload_sanitizes_result_grant_material(tmp_path) 
     assert "secret-ref://lease" not in str(public)
 
 
+def test_capability_public_payload_sanitizes_grant_material_but_keeps_raw_reentry(tmp_path) -> None:
+    task = HostedTask(
+        job_id="task_1",
+        kind="capability",
+        prompt="Approve capability",
+        status="answered",
+        started_at=1.0,
+        resume_on_exit=True,
+        job_path=tmp_path / "task.json",
+        cancel_path=tmp_path / "cancel.requested",
+        request={
+            "capability": "web.search",
+            "scope": {"allowed_domains": ["example.test"]},
+            "replay_call_name": "web_search",
+            "replay_call_id": "call_1",
+            "replay_arguments": {"query": "private"},
+            "replay_approved_tool_approval": {"approval_key": "secret"},
+        },
+        result={
+            "granted": True,
+            "lease": {
+                "capability": "web.search",
+                "lease_id": "lease_1",
+                "token_ref": "secret-ref://lease",
+                "expires_at": 2000.0,
+                "scope": {"allowed_domains": ["example.test"]},
+                "raw_policy": "internal",
+            },
+            "token_ref": "secret-ref://top-level",
+            "replay_arguments": {"query": "private"},
+        },
+    )
+
+    public = task.public_payload(tmp_path, PermissionPolicy())
+
+    assert "replay_arguments" not in public["request"]
+    assert "replay_call_id" not in public["request"]
+    assert public["result"] == {
+        "status": "granted",
+        "capability": "web.search",
+        "lease_id": "lease_1",
+        "expires_at": 2000.0,
+        "scope": {"allowed_domains": ["example.test"]},
+    }
+    assert "secret-ref://lease" not in str(public)
+    assert "replay_arguments" not in str(public)
+    assert task.result_observation(tmp_path)["lease"]["token_ref"] == "secret-ref://lease"
+    assert task.checkpoint_json()["request"]["replay_arguments"] == {"query": "private"}
+    assert task.checkpoint_json()["result"]["lease"]["token_ref"] == "secret-ref://lease"
+    assert task.to_json(tmp_path)["result"]["lease"]["token_ref"] == "secret-ref://lease"
+
+
+def test_capability_public_payload_sanitizes_denied_result(tmp_path) -> None:
+    task = HostedTask(
+        job_id="task_1",
+        kind="capability",
+        prompt="Approve capability",
+        status="answered",
+        started_at=1.0,
+        resume_on_exit=True,
+        job_path=tmp_path / "task.json",
+        cancel_path=tmp_path / "cancel.requested",
+        result={
+            "granted": False,
+            "capability": "web.search",
+            "reason": "policy denied",
+            "lease": {"token_ref": "secret-ref://lease"},
+            "token_ref": "secret-ref://top-level",
+        },
+    )
+
+    public = task.public_payload(tmp_path, PermissionPolicy())
+
+    assert public["result"] == {
+        "status": "denied",
+        "reason": "policy denied",
+        "capability": "web.search",
+    }
+    assert "lease" not in public["result"]
+    assert "token_ref" not in public["result"]
+    assert "secret-ref://lease" not in str(public)
+
+
+def test_generic_hosted_task_public_payload_uses_public_result_content(tmp_path) -> None:
+    task = HostedTask(
+        job_id="task_1",
+        kind="automation",
+        prompt="Run automation",
+        status="answered",
+        started_at=1.0,
+        resume_on_exit=True,
+        job_path=tmp_path / "task.json",
+        cancel_path=tmp_path / "cancel.requested",
+        result={
+            "content": "private body",
+            "path": "secret/report.txt",
+            "note": "x" * 300,
+        },
+    )
+
+    public = task.public_payload(tmp_path, PermissionPolicy(redact_patterns=("secret/**",)))
+
+    assert public["result"]["content"]["redacted"] is True
+    assert public["result"]["path"] == "[redacted-path]"
+    assert public["result"]["note"]["truncated"] is True
+    assert task.result_observation(tmp_path)["content"] == "private body"
+
+
 def test_tool_approval_result_observation_preserves_control_fields(tmp_path) -> None:
     task = HostedTask(
         job_id="task_1",

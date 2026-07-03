@@ -197,6 +197,7 @@ def test_external_agent_envelope_metadata_cannot_override_canonical_inbox_metada
         "custom": "kept",
         "peer_id": "spoofed-peer",
         "task_id": "spoofed-task",
+        "traceparent": "spoofed-trace",
         "result": {"state": "spoofed"},
     }
     envelope = ExternalAgentEnvelope(
@@ -215,3 +216,4 @@ def test_external_agent_envelope_metadata_cannot_override_canonical_inbox_metada
     assert inbox.metadata["peer_id"] == peer_id
     assert inbox.metadata["task_id"] == task_id
     assert inbox.metadata["result"] == (result.to_json() if result is not None else None)
+    assert inbox.metadata["traceparent"] == envelope.traceparent
