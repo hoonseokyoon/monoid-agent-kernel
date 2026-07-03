@@ -167,6 +167,9 @@ class ToolSearchEntry:
     summary: str
     risk: str
     requires_approval: bool
+    namespace: str = ""
+    groups: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
     load_hint: str = "available_next_turn"
     guidance: ToolGuidance = field(default_factory=ToolGuidance)
     annotations: dict[str, Any] = field(default_factory=dict)
@@ -180,6 +183,9 @@ class ToolSearchEntry:
             "summary": self.summary,
             "risk": self.risk,
             "requires_approval": self.requires_approval,
+            "namespace": self.namespace,
+            "groups": list(self.groups),
+            "tags": list(self.tags),
             "load_hint": self.load_hint,
             "guidance": self.guidance.to_json(),
             "annotations": dict(self.annotations),
@@ -311,6 +317,7 @@ class DefaultToolSurfaceResolver:
             "immediate": [tool.id for tool in immediate],
             "searchable": [tool.id for tool in searchable],
             "hidden": sorted(hidden),
+            "search_entries": [entry.to_json() for entry in search_entries],
             "authorizations": {
                 binding_id: authorization.to_json()
                 for binding_id, authorization in sorted(authorizations.items())
@@ -354,6 +361,24 @@ def _search_entry(bound: Any, auth: ToolAuthorization) -> ToolSearchEntry:
         if binding.requires_approval is not None
         else auth.decision == "ask"
     )
+    search_metadata = _tool_search_metadata(binding.metadata)
+    namespace = str(
+        search_metadata.get("namespace")
+        or _namespace_for(binding.binding_id)
+        or _namespace_for(bound.base_spec.id)
+        or "tools"
+    )
+    groups = _string_tuple(search_metadata.get("groups", search_metadata.get("group")))
+    if not groups:
+        groups = (_namespace_for(bound.base_spec.capability) or namespace,)
+    tags = _dedupe_strings(
+        (
+            *_string_tuple(search_metadata.get("tags", search_metadata.get("tag"))),
+            risk,
+            bound.base_spec.side_effect,
+            bound.base_spec.capability,
+        )
+    )
     return ToolSearchEntry(
         binding_id=binding.binding_id,
         tool_id=bound.base_spec.id,
@@ -362,6 +387,9 @@ def _search_entry(bound: Any, auth: ToolAuthorization) -> ToolSearchEntry:
         summary=summary,
         risk=risk,
         requires_approval=requires_approval,
+        namespace=namespace,
+        groups=groups,
+        tags=tags,
         guidance=binding.guidance,
         annotations=dict(spec.annotations),
     )
@@ -433,6 +461,41 @@ def _str_tuple(value: Any) -> tuple[str, ...]:
     if not isinstance(value, list | tuple):
         raise ValueError("expected an array of strings")
     return tuple(str(item) for item in value)
+
+
+def _tool_search_metadata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+    payload = metadata.get("tool_search")
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        return (text,) if text else ()
+    if isinstance(value, list | tuple):
+        return tuple(text for item in value if (text := str(item).strip()))
+    return ()
+
+
+def _dedupe_strings(values: tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return tuple(out)
+
+
+def _namespace_for(value: str) -> str:
+    text = value.strip()
+    if "." not in text:
+        return ""
+    return text.split(".", 1)[0].strip()
 
 
 def _shorten(text: str, limit: int = 320) -> str:
