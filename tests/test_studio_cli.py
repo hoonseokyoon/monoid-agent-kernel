@@ -5,6 +5,7 @@ setup failures (busy port, unwritable dir, missing key, no browser) into an upfr
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import pytest
@@ -150,3 +151,20 @@ def test_doctor_missing_chromium_is_warning_not_failure(
     assert result.exit_code == 0, result.output
     assert "[WARN]" in result.output
     assert "browser" in result.output.lower()
+
+
+def test_accept_runs_offline_deterministic_checks(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        studio,
+        [
+            "accept",
+            "--workspace", str(tmp_path / "ws"),
+            "--run-root", str(tmp_path / "runs"),
+            "--timeout", "10",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["chat"]["run_id"]
+    assert any(check["name"] == "deterministic-chat" and check["ok"] for check in payload["checks"])

@@ -16,6 +16,7 @@ monoid studio serve          # start the server, keep it running (window detacha
 monoid studio app            # server + a desktop window bound together
 monoid studio open           # open a window for an already-running server
 monoid studio doctor         # preflight: check ports, dirs, keys, browser, OTel
+monoid studio accept         # deterministic offline acceptance check, emits JSON
 ```
 
 Run `studio doctor` first if anything looks off — it turns late, cryptic setup failures into an
@@ -47,13 +48,29 @@ at another file, or `--no-env-file` to rely only on the process environment.
 
 ## Panels
 
-- **Chat** (`#log`) — the conversation. A first-run empty-state offers a few one-click prompts; it
-  clears on your first message. Streamed tokens and tool activity appear inline.
-- **Workspace / files** — the file tree for the agent's workspace; click a file to view it.
-- **Trace** — the live event tree (model turns, tool calls), toggleable from the header.
-- **Proposal** — in `propose` mode, the staged diff; review and apply per-path.
-- **Composer** — the input box; Enter sends, Shift+Enter for a newline. Attach images/PDFs for a
-  multimodal provider.
+- **Agent Configuration / Profile** — the left panel contains the active profile switcher and
+  profile-scoped chat history. Built-in profiles are `default`, `reviewer`, and `builder`.
+- **Agent Chat** — the center panel contains the conversation and composer. A first-run
+  empty-state offers a few one-click prompts; it clears on your first message. Streamed tokens and
+  tool activity appear inline.
+- **Side Panel** — the right panel has tabs for Workspace, Trace, and Live Config. Workspace holds
+  files, jobs, proposed changes, and file previews. Trace shows the live event tree. Live Config
+  exposes model, reasoning, OTel, and capability toggles.
+
+Profile state is lightweight Studio metadata. The profile catalog is fixed in Studio, and a small
+`studio-profiles.json` sidecar under the run root maps run ids to profile ids so scoped history
+survives a restart. Profiles are Studio-only history scopes; the kernel contract and runtime config
+stay unchanged.
+
+Stable test hooks are present on the main shell (`data-testid="studio-shell"`), left config panel,
+profile switcher/list, chat log, composer, right-panel tabs, settings/config surfaces, and
+capability toggles.
+
+## Acceptance
+
+`monoid studio accept` starts Studio on an ephemeral port with the offline provider, checks the key
+static/API routes, verifies settings/capabilities/profile history, runs one deterministic chat, and
+prints JSON. Browser smoke is optional and stays outside the default command.
 
 ## Capabilities → tools
 
