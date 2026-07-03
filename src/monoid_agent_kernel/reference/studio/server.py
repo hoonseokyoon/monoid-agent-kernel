@@ -537,10 +537,10 @@ class StudioServer:
             # Agent-as-tool: makes agent.spawn available (bound via the "delegate" capability).
             # Plus any fork-skill subagents synthesized by the skill provider.
             subagent_definitions=subagent_definitions,
-            # The provider seam: Skills (tool + context) and MCP (tool) attach here, shared across
+            # The provider seam: Skills and MCP attach here, shared across
             # runs and re-attached on resume. Their tools are declared to config validation too.
             tool_providers=provider_instances,
-            context_providers=(self._skill_provider,) if self._skill_provider is not None else (),
+            context_providers=tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None),
             # A2A demo: drain each run's outbox into the addressed peer's inbox, and gate outbox.send
             # behind a capability lease (the binding declares requires_lease). AutoGrantBroker grants
             # every request — a dev/demo broker, never production — so the lease gate is *exercised*
@@ -931,20 +931,32 @@ class StudioServer:
 
     def capabilities_catalog(self) -> dict[str, Any]:
         """Read-only catalog of the attached providers' offerings, for a UI list: the available
-        Agent Skills (name + description), the connected MCP server's tools (id + description), and
-        the output validators registered on the backend (id). Each empty when none is attached."""
+        Agent Skills, the connected MCP server's tools/resources/prompts, and the output validators
+        registered on the backend (id). Each empty when none is attached."""
         skills = self._skill_provider.catalog() if self._skill_provider is not None else []
         mcp_tools: list[dict[str, str]] = []
+        mcp_resources: list[dict[str, Any]] = []
+        mcp_prompts: list[dict[str, Any]] = []
         if self._mcp_provider is not None:
             mcp_tools = [
                 {"id": spec.id, "description": spec.description}
                 for spec in self._mcp_provider.get_tools()
+                if not spec.id.endswith((".resource.read", ".prompt.get"))
             ]
+            catalog = self._mcp_provider.catalog()
+            mcp_resources = catalog.get("resources", [])
+            mcp_prompts = catalog.get("prompts", [])
         output_validators = [
             {"id": validator.id}
             for validator in (self._backend.output_validators if self._backend is not None else ())
         ]
-        return {"skills": skills, "mcp_tools": mcp_tools, "output_validators": output_validators}
+        return {
+            "skills": skills,
+            "mcp_tools": mcp_tools,
+            "mcp_resources": mcp_resources,
+            "mcp_prompts": mcp_prompts,
+            "output_validators": output_validators,
+        }
 
     def update_settings(
         self,

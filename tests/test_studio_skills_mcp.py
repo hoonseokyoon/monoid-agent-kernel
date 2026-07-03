@@ -140,6 +140,21 @@ def test_mcp_tool_call_flows_end_to_end(tmp_path: Path) -> None:
         server.shutdown()
 
 
+def test_mcp_catalog_context_reaches_model_when_helpers_bound(tmp_path: Path) -> None:
+    (tmp_path / "ws").mkdir()
+    fake = FakeModelAdapter(turns=[ModelTurn(final_text="ok")])
+    server = _mcp_studio(tmp_path, provider_factory=lambda _claims, _config: fake)
+    server.start()
+    try:
+        run_id = server.start_chat("what MCP context is available?")["run_id"]
+        _wait_settled(server, run_id, 1)
+        assert fake.requests, "the model was never called"
+        assert "fake://studio/guide" in fake.requests[0].system_prompt
+        assert "summarize" in fake.requests[0].system_prompt
+    finally:
+        server.shutdown()
+
+
 def test_mcp_discovery_failure_degrades_to_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # If the MCP server can't be reached at boot, studio must come up Skills-only — never crash.
     import monoid_agent_kernel.reference.studio.server as server_mod
@@ -194,6 +209,8 @@ def test_capabilities_catalog_lists_skills_and_mcp_tools(tmp_path: Path) -> None
         catalog = server.capabilities_catalog()
         assert any(s["name"] == "commit-message" for s in catalog["skills"])
         assert {t["id"] for t in catalog["mcp_tools"]} >= {"mcp.studio.echo", "mcp.studio.uppercase"}
+        assert {r["uri"] for r in catalog["mcp_resources"]} == {"fake://studio/guide"}
+        assert {p["name"] for p in catalog["mcp_prompts"]} == {"summarize"}
     finally:
         server.shutdown()
 
