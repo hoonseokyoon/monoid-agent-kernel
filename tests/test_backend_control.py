@@ -82,6 +82,11 @@ def _events(backend: RunnerBackend, run_id: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
 
 
+def test_control_command_from_json_rejects_present_wrong_type_args() -> None:
+    with pytest.raises(ValueError):
+        ControlCommand.from_json({"type": "status", "run_id": "run_1", "args": []})
+
+
 class _UnopenedLoop:
     def __init__(self) -> None:
         self.calls = 0

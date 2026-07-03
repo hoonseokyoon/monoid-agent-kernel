@@ -17,6 +17,14 @@ from typing import Any
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.outbox import OutboxRequest
 from monoid_agent_kernel.core.trace_context import child_traceparent
+from monoid_agent_kernel.core.wire_validation import (
+    parse_bool,
+    parse_float,
+    parse_required_str,
+    parse_str,
+    require_list,
+    require_object,
+)
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 EXTERNAL_AGENT_ENVELOPE_VERSION = namespaced_id("external-agent-envelope.v1")
@@ -49,20 +57,15 @@ class ExternalAgentPart:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ExternalAgentPart:
-        if not isinstance(payload, dict):
-            raise ValueError("external agent part must be an object")
-        part_type = str(payload.get("type") or "").strip()
-        if not part_type:
-            raise ValueError("external agent part requires type")
-        data_payload = payload["data"] if "data" in payload else {}
-        if not isinstance(data_payload, dict):
-            raise ValueError("external agent part data must be an object")
+        payload = require_object(payload, "external agent part")
+        part_type = parse_required_str(payload, "type", strip=True)
+        data_payload = require_object(payload["data"], "data") if "data" in payload else {}
         return cls(
             type=part_type,
-            text=str(payload.get("text") or ""),
+            text=parse_str(payload, "text"),
             data=dict(data_payload),
-            artifact_id=str(payload.get("artifact_id") or ""),
-            mime_type=str(payload.get("mime_type") or ""),
+            artifact_id=parse_str(payload, "artifact_id"),
+            mime_type=parse_str(payload, "mime_type"),
         )
 
 
@@ -79,15 +82,11 @@ class ExternalAgentError:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ExternalAgentError:
-        if not isinstance(payload, dict):
-            raise ValueError("external agent error must be an object")
-        code = str(payload.get("code") or "").strip()
-        if not code:
-            raise ValueError("external agent error requires code")
+        payload = require_object(payload, "external agent error")
         return cls(
-            code=code,
-            message=str(payload.get("message") or ""),
-            retryable=bool(payload.get("retryable", False)),
+            code=parse_required_str(payload, "code", strip=True),
+            message=parse_str(payload, "message"),
+            retryable=parse_bool(payload, "retryable", default=False),
         )
 
 
@@ -114,21 +113,16 @@ class ExternalAgentResult:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ExternalAgentResult:
-        if not isinstance(payload, dict):
-            raise ValueError("external agent result must be an object")
-        state = str(payload.get("state") or "").strip()
-        if not state:
-            raise ValueError("external agent result requires state")
+        payload = require_object(payload, "external agent result")
+        state = parse_required_str(payload, "state", strip=True)
         error_payload = payload.get("error")
-        if error_payload is not None and not isinstance(error_payload, dict):
-            raise ValueError("external agent result error must be an object")
-        metadata_payload = payload["metadata"] if "metadata" in payload else {}
-        if not isinstance(metadata_payload, dict):
-            raise ValueError("external agent result metadata must be an object")
+        if error_payload is not None:
+            error_payload = require_object(error_payload, "error")
+        metadata_payload = require_object(payload["metadata"], "metadata") if "metadata" in payload else {}
         return cls(
             state=state,
-            terminal=bool(payload.get("terminal", False)),
-            interrupted=bool(payload.get("interrupted", False)),
+            terminal=parse_bool(payload, "terminal", default=False),
+            interrupted=parse_bool(payload, "interrupted", default=False),
             error=(
                 ExternalAgentError.from_json(error_payload)
                 if isinstance(error_payload, dict)
@@ -178,45 +172,38 @@ class ExternalAgentEnvelope:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ExternalAgentEnvelope:
-        if not isinstance(payload, dict):
-            raise ValueError("external agent envelope must be an object")
-        protocol = payload.get("protocol")
+        payload = require_object(payload, "external agent envelope")
+        protocol = parse_str(payload, "protocol")
         if protocol not in ACCEPTED_EXTERNAL_AGENT_ENVELOPE_VERSIONS:
             raise ValueError("unsupported external agent envelope protocol")
-        peer_id = str(payload.get("peer_id") or "").strip()
-        if not peer_id:
-            raise ValueError("external agent envelope requires peer_id")
-        parts_payload = payload.get("parts")
-        if not isinstance(parts_payload, list) or not parts_payload:
+        peer_id = parse_required_str(payload, "peer_id", strip=True)
+        parts_payload = require_list(payload.get("parts"), "parts")
+        if not parts_payload:
             raise ValueError("external agent envelope requires one or more parts")
         parts = tuple(ExternalAgentPart.from_json(part) for part in parts_payload)
-        message_id = str(payload.get("message_id") or "").strip()
-        if not message_id:
-            raise ValueError("external agent envelope requires message_id")
+        message_id = parse_required_str(payload, "message_id", strip=True)
         result_payload = payload.get("result")
-        if result_payload is not None and not isinstance(result_payload, dict):
-            raise ValueError("external agent envelope result must be an object")
-        metadata_payload = payload["metadata"] if "metadata" in payload else {}
-        if not isinstance(metadata_payload, dict):
-            raise ValueError("external agent envelope metadata must be an object")
+        if result_payload is not None:
+            result_payload = require_object(result_payload, "result")
+        metadata_payload = require_object(payload["metadata"], "metadata") if "metadata" in payload else {}
         return cls(
             peer_id=peer_id,
             parts=parts,
             message_id=message_id,
-            task_id=str(payload.get("task_id") or ""),
-            request_id=str(payload.get("request_id") or ""),
-            reply_to_id=str(payload.get("reply_to_id") or ""),
-            correlation_id=str(payload.get("correlation_id") or ""),
-            causation_id=str(payload.get("causation_id") or ""),
-            traceparent=str(payload.get("traceparent") or ""),
-            tracestate=str(payload.get("tracestate") or ""),
-            capability_ref=str(payload.get("capability_ref") or ""),
+            task_id=parse_str(payload, "task_id"),
+            request_id=parse_str(payload, "request_id"),
+            reply_to_id=parse_str(payload, "reply_to_id"),
+            correlation_id=parse_str(payload, "correlation_id"),
+            causation_id=parse_str(payload, "causation_id"),
+            traceparent=parse_str(payload, "traceparent"),
+            tracestate=parse_str(payload, "tracestate"),
+            capability_ref=parse_str(payload, "capability_ref"),
             result=(
                 ExternalAgentResult.from_json(result_payload)
                 if isinstance(result_payload, dict)
                 else None
             ),
-            created_at=float(payload.get("created_at") or 0.0),
+            created_at=parse_float(payload, "created_at", default=0.0) or 0.0,
             metadata=dict(metadata_payload),
         )
 

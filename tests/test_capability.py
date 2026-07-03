@@ -855,6 +855,23 @@ def test_lease_max_expires_at_round_trips() -> None:
     assert CapabilityLease.from_json(plain.to_json()).max_expires_at is None
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("durable", "false"),
+        ("scope", []),
+        ("expires_at", "10.0"),
+        ("issued_at", True),
+    ],
+)
+def test_lease_from_json_rejects_present_wrong_type_fields(field: str, value: object) -> None:
+    payload = CapabilityLease(capability="c", token_ref="t", expires_at=10.0).to_json()
+    payload[field] = value
+
+    with pytest.raises(ValueError):
+        CapabilityLease.from_json(payload)
+
+
 def test_loop_rotates_near_expiry_lease_on_use(tmp_path: Path) -> None:
     provider = _CapToolProvider()
     broker = _CountingBroker(AutoGrantBroker())  # ttl 600; a large skew forces rotation each use

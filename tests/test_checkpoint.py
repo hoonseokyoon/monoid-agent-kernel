@@ -86,6 +86,42 @@ def test_hosted_task_checkpoint_round_trip(tmp_path: Path) -> None:
     assert restored.cancel_path == artifacts / "tasks" / "task_123" / "cancel.requested"
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request", []),
+        ("result", []),
+        ("ready_for_reentry", "false"),
+        ("resume_on_exit", "false"),
+        ("started_at", "100.0"),
+        ("choices", {}),
+        ("status", 1),
+    ],
+)
+def test_hosted_task_from_checkpoint_rejects_present_wrong_type_fields(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    task = HostedTask(
+        job_id="task_123",
+        kind="automation",
+        prompt="run the pipeline",
+        status="running",
+        started_at=100.0,
+        resume_on_exit=True,
+        job_path=artifacts / "tasks" / "task_123" / "task.json",
+        cancel_path=artifacts / "tasks" / "task_123" / "cancel.requested",
+        request={"trigger": "nightly"},
+    )
+    payload = task.checkpoint_json()
+    payload[field] = value
+
+    with pytest.raises(ValueError):
+        HostedTask.from_checkpoint(payload, artifacts)
+
+
 def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
     cp = RunCheckpoint(
         run_id="run_1",

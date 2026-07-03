@@ -10,6 +10,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenError, TokenManager
+from monoid_agent_kernel.core.wire_validation import (
+    optional_list,
+    parse_bool,
+    parse_required_str,
+    parse_str,
+    require_list,
+    require_object,
+)
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
@@ -331,27 +339,32 @@ ACCEPTED_LLM_TURN_PROTOCOL_VERSIONS = accepted_namespaced_ids("llm-turn.v1")
 
 
 def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
-    if payload.get("protocol") not in ACCEPTED_LLM_TURN_PROTOCOL_VERSIONS:
+    payload = require_object(payload, "LLM gateway turn request")
+    protocol = parse_str(payload, "protocol")
+    if protocol not in ACCEPTED_LLM_TURN_PROTOCOL_VERSIONS:
         raise ValueError("unsupported LLM gateway protocol")
-    reasoning_raw = dict(payload.get("reasoning") or {})
-    previous_turn_handle = payload.get("previous_turn_handle")
-    observations = tuple(_parse_observation(item) for item in payload.get("observations") or ())
-    instruction = str(payload.get("instruction") or "")
-    raw_messages = payload.get("messages")
-    messages = tuple(dict(item) for item in raw_messages) if raw_messages is not None else None
+    reasoning_raw = require_object(payload["reasoning"], "reasoning") if "reasoning" in payload else {}
+    previous_turn_handle = parse_str(payload, "previous_turn_handle") or None
+    observations = tuple(_parse_observation(item) for item in optional_list(payload, "observations"))
+    instruction = parse_str(payload, "instruction")
+    messages = (
+        tuple(require_object(item, "message") for item in require_list(payload["messages"], "messages"))
+        if payload.get("messages") is not None
+        else None
+    )
     if messages is None and previous_turn_handle is None and not instruction.strip():
         raise ValueError("instruction is required for the first LLM turn")
     return LlmGatewayTurnRequest(
         protocol=LLM_TURN_PROTOCOL_VERSION,
-        model=str(payload["model"]),
-        system_prompt=str(payload["system_prompt"]),
-        tools=tuple(_parse_tool(item) for item in payload.get("tools") or ()),
+        model=parse_required_str(payload, "model"),
+        system_prompt=parse_required_str(payload, "system_prompt", non_empty=False),
+        tools=tuple(_parse_tool(item) for item in optional_list(payload, "tools")),
         reasoning=ReasoningConfig(
-            effort=reasoning_raw.get("effort", "medium"),
-            summary=reasoning_raw.get("summary", "off"),
+            effort=parse_str(reasoning_raw, "effort", default="medium"),
+            summary=parse_str(reasoning_raw, "summary", default="off"),
         ),
         instruction=instruction,
-        previous_turn_handle=str(previous_turn_handle) if previous_turn_handle else None,
+        previous_turn_handle=previous_turn_handle,
         observations=observations,
         messages=messages,
     )
@@ -361,22 +374,31 @@ def _parse_tool(raw: dict[str, Any]) -> ToolSpec:
     def handler(_context, _args):
         return ToolResult(ok=False, error="gateway tool proxy cannot execute tools")
 
-    tool_id = str(raw.get("id") or raw.get("name") or "")
+    raw = require_object(raw, "tool")
+    tool_id = parse_str(raw, "id") or parse_str(raw, "name")
+    input_schema = (
+        require_object(raw["input_schema"], "input_schema")
+        if "input_schema" in raw
+        else require_object(raw["parameters"], "parameters")
+        if "parameters" in raw
+        else {}
+    )
     return ToolSpec(
         id=tool_id,
-        provider_name=str(raw.get("name") or tool_id.replace(".", "_")),
-        description=str(raw.get("description") or ""),
-        input_schema=dict(raw.get("input_schema") or raw.get("parameters") or {}),
-        capability=str(raw.get("capability") or "unknown"),
-        side_effect=str(raw.get("side_effect") or "read"),  # type: ignore[arg-type]
+        provider_name=parse_str(raw, "name") or tool_id.replace(".", "_"),
+        description=parse_str(raw, "description"),
+        input_schema=dict(input_schema),
+        capability=parse_str(raw, "capability") or "unknown",
+        side_effect=parse_str(raw, "side_effect") or "read",  # type: ignore[arg-type]
         handler=handler,
     )
 
 
 def _parse_observation(raw: dict[str, Any]) -> ToolObservation:
+    raw = require_object(raw, "observation")
     return ToolObservation(
-        call_id=str(raw["call_id"]),
-        tool_name=str(raw.get("tool_name") or ""),
-        output=dict(raw.get("output") or {}),
-        is_background=bool(raw.get("is_background", False)),
+        call_id=parse_required_str(raw, "call_id"),
+        tool_name=parse_str(raw, "tool_name"),
+        output=require_object(raw["output"], "output") if "output" in raw else {},
+        is_background=parse_bool(raw, "is_background", default=False),
     )

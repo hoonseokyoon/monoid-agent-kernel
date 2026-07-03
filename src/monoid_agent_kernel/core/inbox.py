@@ -21,6 +21,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from monoid_agent_kernel.core.wire_validation import (
+    parse_float,
+    parse_str,
+    require_object,
+)
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 INBOX_PROTOCOL_VERSION = namespaced_id("inbox-message.v1")
@@ -70,20 +75,31 @@ class InboxMessage:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> InboxMessage:
+        payload = require_object(payload, "inbox message")
+        protocol = parse_str(payload, "protocol")
+        if protocol and protocol not in ACCEPTED_INBOX_PROTOCOL_VERSIONS:
+            raise ValueError("unsupported inbox message protocol")
+        content = payload.get("content", "")
+        if isinstance(content, list):
+            content = [require_object(part, "content part") for part in content]
+        elif not isinstance(content, str):
+            raise ValueError("content must be a string or list of objects")
+        metadata = require_object(payload["metadata"], "metadata") if "metadata" in payload else {}
         kwargs: dict[str, Any] = {
-            "content": payload.get("content"),
-            "source": str(payload.get("source") or "api"),
-            "type": str(payload.get("type") or "user_message"),
-            "run_id": str(payload.get("run_id") or ""),
-            "created_at": float(payload.get("created_at") or 0.0),
-            "correlation_id": str(payload.get("correlation_id") or ""),
-            "causation_id": str(payload.get("causation_id") or ""),
-            "traceparent": str(payload.get("traceparent") or ""),
-            "tracestate": str(payload.get("tracestate") or ""),
-            "metadata": dict(payload.get("metadata") or {}),
+            "content": content,
+            "source": parse_str(payload, "source", default="api"),
+            "type": parse_str(payload, "type", default="user_message"),
+            "run_id": parse_str(payload, "run_id"),
+            "created_at": parse_float(payload, "created_at", default=0.0) or 0.0,
+            "correlation_id": parse_str(payload, "correlation_id"),
+            "causation_id": parse_str(payload, "causation_id"),
+            "traceparent": parse_str(payload, "traceparent"),
+            "tracestate": parse_str(payload, "tracestate"),
+            "metadata": dict(metadata),
         }
-        if payload.get("id"):
-            kwargs["id"] = str(payload["id"])
+        msg_id = parse_str(payload, "id")
+        if msg_id:
+            kwargs["id"] = msg_id
         return cls(**kwargs)
 
 

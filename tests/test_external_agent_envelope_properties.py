@@ -36,6 +36,7 @@ _wire_id = st.text(
 ).map(str.strip).filter(bool)
 _bad_object_shape = _json_value.filter(lambda value: not isinstance(value, dict))
 _bad_optional_object_shape = _bad_object_shape.filter(lambda value: value is not None)
+_bad_bool_shape = _json_value.filter(lambda value: not isinstance(value, bool))
 
 
 @st.composite
@@ -150,6 +151,29 @@ def test_external_agent_envelope_rejects_malformed_result_shape(result: Any) -> 
 def test_external_agent_envelope_rejects_malformed_result_metadata(metadata: Any) -> None:
     payload = _valid_envelope_payload()
     payload["result"] = {"state": "completed", "metadata": metadata}
+
+    with pytest.raises(ValueError):
+        validate_external_agent_envelope(payload)
+
+
+@settings(max_examples=25, deadline=None)
+@given(terminal=_bad_bool_shape)
+def test_external_agent_envelope_rejects_malformed_result_bool(terminal: Any) -> None:
+    payload = _valid_envelope_payload()
+    payload["result"] = {"state": "completed", "terminal": terminal}
+
+    with pytest.raises(ValueError):
+        validate_external_agent_envelope(payload)
+
+
+@settings(max_examples=25, deadline=None)
+@given(retryable=_bad_bool_shape)
+def test_external_agent_envelope_rejects_malformed_error_bool(retryable: Any) -> None:
+    payload = _valid_envelope_payload()
+    payload["result"] = {
+        "state": "failed",
+        "error": {"code": "peer_error", "retryable": retryable},
+    }
 
     with pytest.raises(ValueError):
         validate_external_agent_envelope(payload)
