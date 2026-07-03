@@ -77,7 +77,9 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
         'data-testid="studio-shell"',
         'data-testid="left-config-panel"',
         'data-testid="profile-switcher"',
+        'data-testid="profile-add"',
         'data-testid="profile-list"',
+        'data-testid="profile-editor-popup"',
         'data-testid="chat-log"',
         'data-testid="composer"',
         'data-testid="right-panel-tabs"',
@@ -103,6 +105,71 @@ def test_offline_chat_produces_assistant_reply(studio: StudioServer) -> None:
     settled = _wait_settled(studio, run_id, 1)
     assert len(settled) == 1
     assert settled[0]["data"]["final_text"]
+
+
+def test_studio_profiles_can_be_saved_and_reloaded(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    run_root = tmp_path / "runs"
+    server = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root))
+
+    saved = server.save_profile(
+        {
+            "name": "Release Reviewer",
+            "description": "Checks release risk.",
+            "instructions": "Always call out release blockers.",
+            "capabilities": ["read", "web"],
+            "model": "gpt-profile",
+            "effort": "high",
+            "summary": "off",
+        }
+    )["profile"]
+
+    assert saved["id"] == "release-reviewer"
+    assert saved["capabilities"] == ["read", "web"]
+    assert saved["built_in"] is False
+
+    reloaded = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root))
+    profiles = {profile["id"]: profile for profile in reloaded.profiles()["profiles"]}
+    assert profiles["release-reviewer"]["instructions"] == "Always call out release blockers."
+    assert profiles["release-reviewer"]["model"] == "gpt-profile"
+
+
+def test_studio_start_chat_uses_selected_profile_runtime_config(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    fake = FakeModelAdapter(turns=[ModelTurn(final_text="profile ok")])
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        profile = server.save_profile(
+            {
+                "name": "Read Only Reviewer",
+                "description": "Focused read-only review.",
+                "instructions": "Mention the profile sentinel.",
+                "capabilities": ["read"],
+                "model": "gpt-profile",
+                "effort": "high",
+                "summary": "off",
+            }
+        )["profile"]
+        run_id = server.start_chat("use the profile", profile_id=profile["id"])["run_id"]
+        _wait_settled(server, run_id, 1)
+        request = fake.requests[0]
+        tool_ids = {tool.id for tool in request.tools}
+        assert "Mention the profile sentinel." in request.system_prompt
+        assert request.model is not None
+        assert request.model.model == "gpt-profile"
+        assert request.model.reasoning.effort == "high"
+        assert request.model.reasoning.summary == "off"
+        assert {"run.update_plan", "fs.read"} <= tool_ids
+        assert "fs.write" not in tool_ids
+        assert "shell.exec" not in tool_ids
+    finally:
+        server.shutdown()
 
 
 def test_multi_turn_session_yields_a_reply_per_message(studio: StudioServer) -> None:

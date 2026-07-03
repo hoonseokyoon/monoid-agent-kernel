@@ -48,8 +48,10 @@ at another file, or `--no-env-file` to rely only on the process environment.
 
 ## Panels
 
-- **Agent Configuration / Profile** — the left panel contains the active profile switcher and
-  profile-scoped chat history. Built-in profiles are `default`, `reviewer`, and `builder`.
+- **Agent Configuration / Profile** — the left panel contains profile cards, the active profile
+  switcher, profile-scoped chat history, and an Add/Edit popup. A profile stores its display name,
+  description, instructions, model, reasoning settings, and enabled capabilities for new chats.
+  Built-in profiles are `default`, `reviewer`, and `builder`; they can be edited locally.
 - **Agent Chat** — the center panel contains the conversation and composer. A first-run
   empty-state offers a few one-click prompts; it clears on your first message. Streamed tokens and
   tool activity appear inline.
@@ -57,10 +59,9 @@ at another file, or `--no-env-file` to rely only on the process environment.
   files, jobs, proposed changes, and file previews. Trace shows the live event tree. Live Config
   exposes model, reasoning, OTel, and capability toggles.
 
-Profile state is lightweight Studio metadata. The profile catalog is fixed in Studio, and a small
-`studio-profiles.json` sidecar under the run root maps run ids to profile ids so scoped history
-survives a restart. Profiles are Studio-only history scopes; the kernel contract and runtime config
-stay unchanged.
+Profile state is lightweight Studio metadata. The `studio-profiles.json` sidecar under the run root
+stores custom profile presets and maps run ids to profile ids so scoped history survives a restart.
+Profiles are Studio-owned presets; the kernel contract stays unchanged.
 
 Stable test hooks are present on the main shell (`data-testid="studio-shell"`), left config panel,
 profile switcher/list, chat log, composer, right-panel tabs, settings/config surfaces, and

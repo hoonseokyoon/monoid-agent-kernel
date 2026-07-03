@@ -194,10 +194,23 @@
   #sessions li.untitled { color: #5b6273; }
   #sessions li.untitled .sid { font-size: 10px; opacity: .7; margin-left: 6px;
     font-family: ui-monospace, Consolas, monospace; }
-  #profiles { list-style: none; padding: 0; margin: 0 0 12px; display: flex; flex-direction: column; gap: 4px; }
-  #profiles li { padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
-    color: var(--muted); }
+  #profile-actions { display: flex; gap: 8px; margin: 0 0 10px; }
+  #profile-add { width: 100%; min-height: 32px; border-radius: 8px; padding: 0 10px; }
+  #profiles { list-style: none; padding: 0; margin: 0 0 12px; display: flex; flex-direction: column; gap: 8px; }
+  #profiles li { padding: 8px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+    color: var(--muted); background: rgba(0,0,0,.08); }
   #profiles li.active { border-color: var(--accent); color: var(--text); background: rgba(110,168,254,.08); }
+  .profile-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .profile-name { color: var(--text); font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .profile-built-in { font-size: 10px; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 999px; padding: 0 5px; }
+  .profile-edit { margin-left: auto; background: transparent; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 6px; min-height: 0; padding: 1px 7px; font-size: 11px; }
+  .profile-edit:hover { color: var(--text); border-color: var(--accent); }
+  .profile-desc { font-size: 11.5px; line-height: 1.35; color: var(--muted); margin-bottom: 5px; }
+  .profile-meta { display: flex; flex-wrap: wrap; gap: 4px; }
+  .profile-chip { font-size: 10.5px; border: 1px solid var(--border); border-radius: 999px;
+    padding: 1px 6px; color: var(--muted); }
   #profile { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 8px; padding: 7px 8px; margin-bottom: 8px; }
   #live-caps { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
@@ -219,6 +232,30 @@
   }
   #onboarding .ob-prompt:hover { border-color: var(--accent); }
   #onboarding .ob-note { font-size: 12px; color: var(--warn); margin-top: 12px; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.58);
+    display: flex; align-items: center; justify-content: center; padding: 24px; z-index: 20; }
+  .modal-backdrop[hidden] { display: none; }
+  .modal { width: min(680px, 100%); max-height: min(86vh, 760px); overflow: auto;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 16px 48px rgba(0,0,0,.45); padding: 16px; }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .modal-head h2 { margin: 0; font-size: 16px; }
+  .modal-close { background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 8px; min-height: 0; padding: 3px 9px; }
+  .profile-form { display: grid; gap: 10px; }
+  .profile-form label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+  .profile-form input, .profile-form textarea, .profile-form select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font: inherit; width: 100%; }
+  .profile-form textarea { min-height: 84px; resize: vertical; }
+  .profile-grid { display: grid; grid-template-columns: 1fr 150px 150px; gap: 10px; }
+  #profile-capabilities { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  #profile-capabilities label { display: flex; align-items: center; gap: 7px;
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 8px; color: var(--text); }
+  #profile-capabilities input { width: auto; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+  #profile-cancel { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  #profile-editor-status { min-height: 18px; font-size: 12px; color: var(--muted); }
 </style>
 <!-- Optional math rendering: KaTeX auto-render. Vendored locally (woff2 fonts only) so Studio
      keeps its no-network promise; if these assets are missing the chat shows raw LaTeX. -->
@@ -241,6 +278,9 @@
     <aside id="sidebar" data-testid="left-config-panel">
       <div class="side-title">Agent profile</div>
       <select id="profile" data-testid="profile-switcher" title="Active Studio profile"></select>
+      <div id="profile-actions">
+        <button id="profile-add" type="button" data-testid="profile-add">Add profile</button>
+      </div>
       <ul id="profiles" data-testid="profile-list"></ul>
       <div class="side-title">Chats
         <a href="#" id="a2a-demo" class="hlink" style="float:right;font-weight:400"
@@ -314,6 +354,49 @@
         <ul id="mcp-tools" hidden></ul>
       </section>
     </aside>
+  </div>
+
+  <div id="profile-modal-backdrop" class="modal-backdrop" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="profile-editor-title"
+      data-testid="profile-editor-popup">
+      <div class="modal-head">
+        <h2 id="profile-editor-title">Agent profile</h2>
+        <button id="profile-close" class="modal-close" type="button" title="Close">Close</button>
+      </div>
+      <form id="profile-form" class="profile-form">
+        <input id="profile-edit-id" type="hidden" />
+        <label>Name
+          <input id="profile-name-input" type="text" maxlength="80" autocomplete="off" required />
+        </label>
+        <label>Description
+          <textarea id="profile-description-input" maxlength="240"></textarea>
+        </label>
+        <label>Instructions
+          <textarea id="profile-instructions-input" maxlength="4000"
+            placeholder="How should this agent behave?"></textarea>
+        </label>
+        <div class="profile-grid">
+          <label>Model
+            <input id="profile-model-input" type="text" spellcheck="false" autocomplete="off" />
+          </label>
+          <label>Effort
+            <select id="profile-effort-input"></select>
+          </label>
+          <label>Thinking
+            <select id="profile-summary-input"></select>
+          </label>
+        </div>
+        <div>
+          <div class="side-title">Capabilities</div>
+          <div id="profile-capabilities"></div>
+        </div>
+        <div id="profile-editor-status"></div>
+        <div class="modal-actions">
+          <button id="profile-cancel" type="button">Cancel</button>
+          <button id="profile-save" type="submit">Save profile</button>
+        </div>
+      </form>
+    </section>
   </div>
 
 <script>
@@ -1224,11 +1307,28 @@ async function loadSetup() {
 const sessionsEl = document.getElementById("sessions");
 const profileSelect = document.getElementById("profile");
 const profilesEl = document.getElementById("profiles");
+const profileAddBtn = document.getElementById("profile-add");
+const profileModal = document.getElementById("profile-modal-backdrop");
+const profileForm = document.getElementById("profile-form");
+const profileEditId = document.getElementById("profile-edit-id");
+const profileNameInput = document.getElementById("profile-name-input");
+const profileDescriptionInput = document.getElementById("profile-description-input");
+const profileInstructionsInput = document.getElementById("profile-instructions-input");
+const profileModelInput = document.getElementById("profile-model-input");
+const profileEffortInput = document.getElementById("profile-effort-input");
+const profileSummaryInput = document.getElementById("profile-summary-input");
+const profileCapabilityEl = document.getElementById("profile-capabilities");
+const profileEditorStatus = document.getElementById("profile-editor-status");
+const profileEditorTitle = document.getElementById("profile-editor-title");
 const newchatBtn = document.getElementById("newchat");
 const a2aBtn = document.getElementById("a2a-demo");
 const traceBtn = document.getElementById("trace-btn");
 const traceAside = document.getElementById("trace");
 const traceTreeEl = document.getElementById("trace-tree");
+let profileCatalog = [];
+let profileCapabilities = [];
+let profileEfforts = [];
+let profileSummaries = [];
 let activeSidePanel = "workspace-panel";
 let runEvents = [];
 const _TRACE_SKIP = new Set([
@@ -1269,28 +1369,168 @@ function renderProfileActive() {
   });
 }
 
+function profileById(id) {
+  return profileCatalog.find((p) => p.id === id) || profileCatalog[0] || null;
+}
+
+function renderProfileOptions() {
+  profileSelect.innerHTML = "";
+  profilesEl.innerHTML = "";
+  for (const profile of profileCatalog) {
+    const opt = document.createElement("option");
+    opt.value = profile.id;
+    opt.textContent = profile.name || profile.id;
+    profileSelect.appendChild(opt);
+
+    const li = document.createElement("li");
+    li.dataset.profileId = profile.id;
+    li.className = "profile-card";
+    const head = document.createElement("div");
+    head.className = "profile-head";
+    const name = document.createElement("span");
+    name.className = "profile-name";
+    name.textContent = profile.name || profile.id;
+    head.appendChild(name);
+    if (profile.built_in) {
+      const badge = document.createElement("span");
+      badge.className = "profile-built-in";
+      badge.textContent = "built-in";
+      head.appendChild(badge);
+    }
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "profile-edit";
+    edit.dataset.testid = "profile-edit-" + profile.id;
+    edit.textContent = "Edit";
+    edit.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openProfileEditor(profile);
+    });
+    head.appendChild(edit);
+    li.appendChild(head);
+    const desc = document.createElement("div");
+    desc.className = "profile-desc";
+    desc.textContent = profile.description || "No description yet.";
+    li.appendChild(desc);
+    const meta = document.createElement("div");
+    meta.className = "profile-meta";
+    [profile.model, profile.effort, ...((profile.capabilities || []).slice(0, 3))].filter(Boolean).forEach((item) => {
+      const chip = document.createElement("span");
+      chip.className = "profile-chip";
+      chip.textContent = item;
+      meta.appendChild(chip);
+    });
+    li.appendChild(meta);
+    li.addEventListener("click", () => switchProfile(profile.id));
+    profilesEl.appendChild(li);
+  }
+  renderProfileActive();
+}
+
 async function loadProfiles() {
   try {
     const body = await (await fetch("/api/profiles")).json();
-    activeProfileId = body.default_profile_id || "default";
-    profileSelect.innerHTML = "";
-    profilesEl.innerHTML = "";
-    for (const profile of (body.profiles || [])) {
-      const opt = document.createElement("option");
-      opt.value = profile.id;
-      opt.textContent = profile.name || profile.id;
-      profileSelect.appendChild(opt);
-      const li = document.createElement("li");
-      li.dataset.profileId = profile.id;
-      li.textContent = profile.name || profile.id;
-      li.title = profile.description || "";
-      li.addEventListener("click", () => switchProfile(profile.id));
-      profilesEl.appendChild(li);
-    }
-    profileSelect.addEventListener("change", () => switchProfile(profileSelect.value));
-    renderProfileActive();
+    profileCatalog = body.profiles || [];
+    profileCapabilities = body.available_capabilities || [];
+    profileEfforts = body.efforts || ["none", "low", "medium", "high", "xhigh"];
+    profileSummaries = body.summaries || ["off", "auto", "detailed"];
+    if (!profileById(activeProfileId)) activeProfileId = body.default_profile_id || "default";
+    renderProfileOptions();
   } catch (_) {}
 }
+
+profileSelect.addEventListener("change", () => switchProfile(profileSelect.value));
+
+function fillSelect(select, values, current) {
+  select.innerHTML = "";
+  for (const value of values) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = value;
+    select.appendChild(opt);
+  }
+  select.value = values.includes(current) ? current : (values[0] || "");
+}
+
+function openProfileEditor(profile) {
+  const source = profile || {
+    id: "",
+    name: "New agent",
+    description: "",
+    instructions: "",
+    capabilities: profileCapabilities.map((c) => c.key),
+    model: "gpt-5.5",
+    effort: "medium",
+    summary: "auto",
+  };
+  profileEditorTitle.textContent = profile ? "Edit agent profile" : "Add agent profile";
+  profileEditId.value = source.id || "";
+  profileNameInput.value = source.name || "";
+  profileDescriptionInput.value = source.description || "";
+  profileInstructionsInput.value = source.instructions || "";
+  profileModelInput.value = source.model || "gpt-5.5";
+  fillSelect(profileEffortInput, profileEfforts, source.effort || "medium");
+  fillSelect(profileSummaryInput, profileSummaries, source.summary || "auto");
+  profileCapabilityEl.innerHTML = "";
+  const enabled = new Set(source.capabilities || []);
+  for (const cap of profileCapabilities) {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = cap.key;
+    box.checked = enabled.has(cap.key);
+    label.appendChild(box);
+    label.appendChild(document.createTextNode(cap.label || cap.key));
+    profileCapabilityEl.appendChild(label);
+  }
+  profileEditorStatus.textContent = "";
+  profileModal.hidden = false;
+  profileNameInput.focus();
+}
+
+function closeProfileEditor() {
+  profileModal.hidden = true;
+}
+
+profileAddBtn.addEventListener("click", () => openProfileEditor(null));
+document.getElementById("profile-close").addEventListener("click", closeProfileEditor);
+document.getElementById("profile-cancel").addEventListener("click", closeProfileEditor);
+profileModal.addEventListener("click", (event) => {
+  if (event.target === profileModal) closeProfileEditor();
+});
+profileForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const capabilities = [...profileCapabilityEl.querySelectorAll("input:checked")].map((input) => input.value);
+  const payload = {
+    name: profileNameInput.value.trim(),
+    description: profileDescriptionInput.value.trim(),
+    instructions: profileInstructionsInput.value.trim(),
+    capabilities,
+    model: profileModelInput.value.trim(),
+    effort: profileEffortInput.value,
+    summary: profileSummaryInput.value,
+  };
+  if (profileEditId.value) payload.id = profileEditId.value;
+  profileEditorStatus.textContent = "Saving…";
+  try {
+    const res = await fetch("/api/profiles", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json();
+    if (body.error) throw new Error(body.error);
+    profileCatalog = body.profiles || profileCatalog;
+    profileCapabilities = body.available_capabilities || profileCapabilities;
+    profileEfforts = body.efforts || profileEfforts;
+    profileSummaries = body.summaries || profileSummaries;
+    if (body.profile && body.profile.id) activeProfileId = body.profile.id;
+    renderProfileOptions();
+    closeProfileEditor();
+    refreshSessions();
+  } catch (err) {
+    profileEditorStatus.textContent = "Error: " + err;
+  }
+});
 
 function resetChatView() {
   if (evtSource) { evtSource.close(); evtSource = null; }

@@ -276,16 +276,40 @@ _DEFAULT_PROFILES = (
         "id": "default",
         "name": "Default",
         "description": "General-purpose workspace agent.",
+        "instructions": "",
+        "capabilities": tuple(_ALL_CAPABILITIES),
+        "model": _DEFAULT_MODEL,
+        "effort": _DEFAULT_EFFORT,
+        "summary": _DEFAULT_SUMMARY,
+        "built_in": True,
     },
     {
         "id": "reviewer",
         "name": "Reviewer",
         "description": "Review-focused profile for analysis and feedback sessions.",
+        "instructions": (
+            "Review code and plans with emphasis on behavioral regressions, security, "
+            "missing tests, and unclear contracts. Lead with concrete findings."
+        ),
+        "capabilities": ("read", "hitl", "web", "delegate"),
+        "model": _DEFAULT_MODEL,
+        "effort": "high",
+        "summary": _DEFAULT_SUMMARY,
+        "built_in": True,
     },
     {
         "id": "builder",
         "name": "Builder",
         "description": "Implementation-focused profile for coding sessions.",
+        "instructions": (
+            "Implement requested changes directly, keep edits scoped, verify with tests, "
+            "and preserve existing project conventions."
+        ),
+        "capabilities": tuple(_ALL_CAPABILITIES),
+        "model": _DEFAULT_MODEL,
+        "effort": _DEFAULT_EFFORT,
+        "summary": _DEFAULT_SUMMARY,
+        "built_in": True,
     },
 )
 _DEFAULT_PROFILE_ID = "default"
@@ -293,9 +317,10 @@ _PROFILE_INDEX_NAME = "studio-profiles.json"
 
 
 def _normalize_profile_id(profile_id: str | None) -> str:
-    profile = (profile_id or _DEFAULT_PROFILE_ID).strip() or _DEFAULT_PROFILE_ID
-    known = {p["id"] for p in _DEFAULT_PROFILES}
-    return profile if profile in known else _DEFAULT_PROFILE_ID
+    profile = (profile_id or _DEFAULT_PROFILE_ID).strip().lower() or _DEFAULT_PROFILE_ID
+    out = "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9") else "-" for ch in profile)
+    out = "-".join(part for part in out.split("-") if part)
+    return out[:64] or _DEFAULT_PROFILE_ID
 
 
 def _runtime_config_for(
@@ -305,6 +330,7 @@ def _runtime_config_for(
     summary: str = _DEFAULT_SUMMARY,
     *,
     provider_bindings: dict[str, tuple[ToolBinding, ...]] | None = None,
+    system_prompt: str = _SYSTEM_PROMPT,
 ) -> AgentRuntimeConfig:
     """Build the runtime config for an enabled-capability set (order-stable, deduped) plus the
     chosen model + reasoning effort + summary visibility. The model flows to the gateway as the
@@ -324,7 +350,7 @@ def _runtime_config_for(
     return AgentRuntimeConfig(
         definition_id="studio-agent",
         model=ModelConfig(model=model, reasoning=ReasoningConfig(effort=effort, summary=summary)),
-        prompt=PromptSpec(system_prompt_base=_SYSTEM_PROMPT),
+        prompt=PromptSpec(system_prompt_base=system_prompt),
         tools=tuple(tools),
     )
 
@@ -408,40 +434,155 @@ class StudioServer:
 
     # --- Studio profiles ---------------------------------------------------------------
 
-    def profiles(self) -> dict[str, Any]:
-        """The lightweight Studio profile catalog.
+    def _profile_defaults(self) -> dict[str, dict[str, Any]]:
+        return {str(profile["id"]): dict(profile) for profile in _DEFAULT_PROFILES}
 
-        Profiles are UI/session scopes only. They do not alter the kernel contract or runtime
-        config; they group Studio history so users can keep different workflows separate.
-        """
+    def _profile_store_path(self) -> Path:
+        return self.config.run_root / _PROFILE_INDEX_NAME
+
+    def _load_profile_store(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self._profile_store_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"profiles": {}, "runs": {}}
+        if not isinstance(payload, dict):
+            return {"profiles": {}, "runs": {}}
+        profiles = payload.get("profiles") if isinstance(payload.get("profiles"), dict) else {}
+        runs = payload.get("runs") if isinstance(payload.get("runs"), dict) else {}
+        return {"profiles": dict(profiles), "runs": dict(runs)}
+
+    def _write_profile_store(self, payload: dict[str, Any]) -> None:
+        path = self._profile_store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        normalized = {
+            "profiles": payload.get("profiles") if isinstance(payload.get("profiles"), dict) else {},
+            "runs": payload.get("runs") if isinstance(payload.get("runs"), dict) else {},
+        }
+        path.write_text(json.dumps(normalized, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _profile_system_prompt(self, profile: dict[str, Any]) -> str:
+        instructions = str(profile.get("instructions") or "").strip()
+        if not instructions:
+            return _SYSTEM_PROMPT
+        return f"{_SYSTEM_PROMPT}\n\nProfile instructions:\n{instructions}"
+
+    def _normalize_profile_payload(
+        self,
+        raw: dict[str, Any],
+        *,
+        profile_id: str,
+        built_in: bool,
+    ) -> dict[str, Any]:
+        available = self._available_capabilities()
+        requested = raw.get("capabilities")
+        if isinstance(requested, (list, tuple)):
+            wanted = {str(cap) for cap in requested}
+            capabilities = [cap for cap in available if cap in wanted]
+        else:
+            capabilities = [cap for cap in available if cap in set(self._capabilities)]
+        if not capabilities and available:
+            capabilities = [available[0]]
+        effort = str(raw.get("effort") or _DEFAULT_EFFORT)
+        if effort not in _ALL_EFFORTS:
+            effort = _DEFAULT_EFFORT
+        summary = str(raw.get("summary") or _DEFAULT_SUMMARY)
+        if summary not in _SUMMARY_CHOICES:
+            summary = _DEFAULT_SUMMARY
+        name = str(raw.get("name") or profile_id).strip()[:80] or profile_id
         return {
-            "profiles": [dict(profile) for profile in _DEFAULT_PROFILES],
+            "id": profile_id,
+            "name": name,
+            "description": str(raw.get("description") or "").strip()[:240],
+            "instructions": str(raw.get("instructions") or "").strip()[:4000],
+            "capabilities": capabilities,
+            "model": str(raw.get("model") or _DEFAULT_MODEL).strip() or _DEFAULT_MODEL,
+            "effort": effort,
+            "summary": summary,
+            "built_in": built_in,
+        }
+
+    def _profiles_by_id(self) -> dict[str, dict[str, Any]]:
+        defaults = self._profile_defaults()
+        profiles = {
+            profile_id: self._normalize_profile_payload(raw, profile_id=profile_id, built_in=True)
+            for profile_id, raw in defaults.items()
+        }
+        store = self._load_profile_store()
+        raw_profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
+        for raw_id, raw in raw_profiles.items():
+            if not isinstance(raw, dict):
+                continue
+            profile_id = _normalize_profile_id(str(raw_id))
+            base = dict(defaults.get(profile_id, {"id": profile_id, "name": profile_id}))
+            base.update(raw)
+            profiles[profile_id] = self._normalize_profile_payload(
+                base,
+                profile_id=profile_id,
+                built_in=profile_id in defaults,
+            )
+        return profiles
+
+    def _known_profile_id(self, profile_id: str | None) -> str:
+        candidate = _normalize_profile_id(profile_id)
+        return candidate if candidate in self._profiles_by_id() else _DEFAULT_PROFILE_ID
+
+    def _profile_for_config(self, profile_id: str | None) -> dict[str, Any]:
+        profiles = self._profiles_by_id()
+        return profiles.get(self._known_profile_id(profile_id), profiles[_DEFAULT_PROFILE_ID])
+
+    def _profile_has_saved_override(self, profile_id: str) -> bool:
+        store = self._load_profile_store()
+        profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
+        return profile_id in profiles
+
+    def _new_profile_id(self, name: str) -> str:
+        profiles = self._profiles_by_id()
+        base = _normalize_profile_id(name) or "agent"
+        candidate = base
+        suffix = 2
+        while candidate in profiles:
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+        return candidate
+
+    def profiles(self) -> dict[str, Any]:
+        """The Studio profile catalog.
+
+        Profiles are Studio-owned agent presets. They choose the model, reasoning settings,
+        prompt instructions, and capability set for new chats. Run history keeps a profile id so
+        sessions stay grouped after restart.
+        """
+        labels = self._capability_labels()
+        return {
+            "profiles": list(self._profiles_by_id().values()),
             "default_profile_id": _DEFAULT_PROFILE_ID,
+            "available_capabilities": [
+                {"key": cap, "label": labels[cap]} for cap in self._available_capabilities()
+            ],
+            "efforts": list(_EFFORT_CHOICES),
+            "summaries": list(_SUMMARY_CHOICES),
         }
 
     def _profile_index_path(self) -> Path:
-        return self.config.run_root / _PROFILE_INDEX_NAME
+        return self._profile_store_path()
 
     def _load_profile_index(self) -> dict[str, str]:
-        try:
-            payload = json.loads(self._profile_index_path().read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
+        payload = self._load_profile_store()
         raw = payload.get("runs") if isinstance(payload, dict) else None
         if not isinstance(raw, dict):
             return {}
         return {
-            str(run_id): _normalize_profile_id(str(profile_id))
+            str(run_id): self._known_profile_id(str(profile_id))
             for run_id, profile_id in raw.items()
         }
 
     def _write_profile_index(self, index: dict[str, str]) -> None:
-        path = self._profile_index_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"runs": index}, indent=2, sort_keys=True), encoding="utf-8")
+        payload = self._load_profile_store()
+        payload["runs"] = index
+        self._write_profile_store(payload)
 
     def _remember_run_profile(self, run_id: str, profile_id: str) -> None:
-        profile_id = _normalize_profile_id(profile_id)
+        profile_id = self._known_profile_id(profile_id)
         with self._lock:
             index = self._load_profile_index()
             index[run_id] = profile_id
@@ -450,6 +591,30 @@ class StudioServer:
     def _profile_for_run(self, run_id: str) -> str:
         with self._lock:
             return self._load_profile_index().get(run_id, _DEFAULT_PROFILE_ID)
+
+    def save_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create or update a Studio profile and persist it in the profile sidecar."""
+        raw_id = str(payload.get("id") or "").strip()
+        profile_id = _normalize_profile_id(raw_id) if raw_id else self._new_profile_id(str(payload.get("name") or "agent"))
+        defaults = self._profile_defaults()
+        existing = self._profiles_by_id().get(profile_id, {"id": profile_id, "name": profile_id})
+        raw = dict(existing)
+        for key in ("name", "description", "instructions", "capabilities", "model", "effort", "summary"):
+            if key in payload:
+                raw[key] = payload[key]
+        profile = self._normalize_profile_payload(
+            raw,
+            profile_id=profile_id,
+            built_in=profile_id in defaults,
+        )
+        store = self._load_profile_store()
+        profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
+        profiles[profile_id] = dict(profile)
+        store["profiles"] = profiles
+        self._write_profile_store(store)
+        body = self.profiles()
+        body["profile"] = profile
+        return body
 
     # --- provider-backed capabilities (Skills / MCP) ------------------------------------
 
@@ -474,8 +639,23 @@ class StudioServer:
             labels[cap] = _PROVIDER_CAPABILITY_LABELS.get(cap, cap)
         return labels
 
-    def _build_config(self) -> AgentRuntimeConfig:
-        """The runtime config for the current settings, including any enabled provider tools."""
+    def _build_config(self, profile_id: str | None = None) -> AgentRuntimeConfig:
+        """Build a runtime config from either the selected profile or the live global settings."""
+        if profile_id is not None:
+            known_profile_id = self._known_profile_id(profile_id)
+            # Preserve the old Live Config behavior for the untouched default profile: settings
+            # changes apply to new chats. Once a profile is edited, its saved preset owns the new
+            # chat config.
+            if known_profile_id != _DEFAULT_PROFILE_ID or self._profile_has_saved_override(known_profile_id):
+                profile = self._profile_for_config(known_profile_id)
+                return _runtime_config_for(
+                    list(profile["capabilities"]),
+                    str(profile["model"]),
+                    str(profile["effort"]),
+                    str(profile["summary"]),
+                    provider_bindings=self._provider_bindings(),
+                    system_prompt=self._profile_system_prompt(profile),
+                )
         return _runtime_config_for(
             self._capabilities,
             self._model,
@@ -699,8 +879,8 @@ class StudioServer:
         """Open a new multi-turn session in the workspace and deliver the first message (with any
         image/document attachments as multimodal content parts)."""
         assert self._backend is not None
-        profile_id = _normalize_profile_id(profile_id)
-        runtime_config = self._build_config()
+        profile_id = self._known_profile_id(profile_id)
+        runtime_config = self._build_config(profile_id)
         parts = self._parts_from_attachments(message, attachments)
         request = BackendRunRequest(
             tenant_id=_TENANT,
@@ -1424,6 +1604,10 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     if "otel" in body:
                         kwargs["otel"] = bool(body.get("otel"))
                     self._write_json(studio.update_settings(**kwargs))
+                    return
+                if parsed.path == "/api/profiles":
+                    body = self._read_json()
+                    self._write_json(studio.save_profile(body))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
             except NativeAgentError as exc:
