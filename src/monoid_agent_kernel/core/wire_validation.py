@@ -5,17 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, TypeVar
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 
 class WireValidationError(ValueError):
     """Raised when a wire payload field is present with the wrong type."""
-
-
-class StrictWireModel(BaseModel):
-    """Base for small parser-local pydantic models."""
-
-    model_config = ConfigDict(strict=True, extra="ignore")
 
 
 _T = TypeVar("_T")
