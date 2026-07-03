@@ -30,9 +30,10 @@ from monoid_agent_kernel.core.wire_validation import (
     parse_str,
     require_object,
 )
-from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 OUTBOX_REQUEST_VERSION = namespaced_id("outbox-request.v1")
+ACCEPTED_OUTBOX_REQUEST_VERSIONS = accepted_namespaced_ids("outbox-request.v1")
 
 OutboxStatus = Literal["pending", "dispatched", "failed"]
 
@@ -102,7 +103,7 @@ class OutboxRequest:
     def from_json(cls, payload: dict[str, Any]) -> OutboxRequest:
         payload = require_object(payload, "outbox request")
         protocol = parse_str(payload, "protocol")
-        if protocol and protocol != OUTBOX_REQUEST_VERSION:
+        if protocol and protocol not in ACCEPTED_OUTBOX_REQUEST_VERSIONS:
             raise ValueError("unsupported outbox request protocol")
         request_payload = require_object(payload["payload"], "payload") if "payload" in payload else {}
         kwargs: dict[str, Any] = {

@@ -45,6 +45,13 @@ def test_outbox_request_round_trips() -> None:
     assert back.status == "pending"
 
 
+def test_outbox_request_from_json_accepts_legacy_protocol_id() -> None:
+    payload = OutboxRequest(destination="email", id="o1").to_json()
+    payload["protocol"] = "native-agent-runner.outbox-request.v1"
+
+    assert OutboxRequest.from_json(payload).id == "o1"
+
+
 def test_outbox_holder_pending_mark_export_import() -> None:
     box = Outbox()
     a = box.append(OutboxRequest(destination="email", id="o1"))

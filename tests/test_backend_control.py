@@ -87,6 +87,20 @@ def test_control_command_from_json_rejects_present_wrong_type_args() -> None:
         ControlCommand.from_json({"type": "status", "run_id": "run_1", "args": []})
 
 
+def test_control_command_from_json_accepts_legacy_protocol_id() -> None:
+    command = ControlCommand.from_json(
+        {
+            "protocol": "native-agent-runner.control-command.v1",
+            "type": "status",
+            "run_id": "run_1",
+            "args": {},
+        }
+    )
+
+    assert command.type == "status"
+    assert command.run_id == "run_1"
+
+
 class _UnopenedLoop:
     def __init__(self) -> None:
         self.calls = 0

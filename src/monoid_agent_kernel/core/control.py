@@ -22,9 +22,10 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
 from monoid_agent_kernel.core.wire_validation import parse_literal, parse_str, require_object
-from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 CONTROL_PROTOCOL_VERSION = namespaced_id("control-command.v1")
+ACCEPTED_CONTROL_PROTOCOL_VERSIONS = accepted_namespaced_ids("control-command.v1")
 
 #: The command vocabulary. Lifecycle ops (pause/resume/cancel/interrupt/inspect/health) plus the
 #: pre-existing session ops (message/config/task/status) unified under one envelope.
@@ -76,7 +77,7 @@ class ControlCommand:
     def from_json(cls, payload: dict[str, Any]) -> ControlCommand:
         payload = require_object(payload, "control command")
         protocol = parse_str(payload, "protocol")
-        if protocol and protocol != CONTROL_PROTOCOL_VERSION:
+        if protocol and protocol not in ACCEPTED_CONTROL_PROTOCOL_VERSIONS:
             raise ValueError("unsupported control command protocol")
         return cls(
             type=parse_literal(payload, "type", get_args(ControlCommandType)),  # type: ignore[arg-type]

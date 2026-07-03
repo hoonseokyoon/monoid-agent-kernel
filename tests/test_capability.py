@@ -855,6 +855,13 @@ def test_lease_max_expires_at_round_trips() -> None:
     assert CapabilityLease.from_json(plain.to_json()).max_expires_at is None
 
 
+def test_lease_from_json_accepts_legacy_protocol_id() -> None:
+    payload = CapabilityLease(capability="c", token_ref="t", expires_at=10.0).to_json()
+    payload["protocol"] = "native-agent-runner.capability-lease.v1"
+
+    assert CapabilityLease.from_json(payload).token_ref == "t"
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

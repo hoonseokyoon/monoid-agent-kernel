@@ -41,10 +41,11 @@ from monoid_agent_kernel.core.wire_validation import (
     parse_str,
     require_object,
 )
-from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 CAPABILITY_REQUEST_VERSION = namespaced_id("capability-request.v1")
 CAPABILITY_LEASE_VERSION = namespaced_id("capability-lease.v1")
+ACCEPTED_CAPABILITY_LEASE_VERSIONS = accepted_namespaced_ids("capability-lease.v1")
 
 
 @dataclass(frozen=True)
@@ -126,7 +127,7 @@ class CapabilityLease:
     def from_json(cls, payload: dict[str, Any]) -> CapabilityLease:
         payload = require_object(payload, "capability lease")
         protocol = parse_str(payload, "protocol")
-        if protocol and protocol != CAPABILITY_LEASE_VERSION:
+        if protocol and protocol not in ACCEPTED_CAPABILITY_LEASE_VERSIONS:
             raise ValueError("unsupported capability lease protocol")
         max_expires_at = parse_float(
             payload,
