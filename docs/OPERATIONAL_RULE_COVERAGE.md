@@ -4,6 +4,11 @@ This document is the current coverage index for Monoid operational rules. It map
 helper surface, executable conformance assertion, Reference harness case, and primary tests that
 prove the rule.
 
+It is also the current index for Phase 2S hardening coverage. Phase 2S keeps the OR-01 through
+OR-13 rule set fixed and tightens existing behavior with strict parsers, public payload
+sanitizers, canonical metadata merge helpers, helper adoption in Reference boundaries, and
+property tests for pure wire helpers.
+
 ## Rule Coverage
 
 | Rule | Contract meaning | Core Helper Kit surface | Conformance assertion | Reference harness / case | Primary tests |
@@ -56,6 +61,27 @@ each assertion:
 
 Reference harnesses may use scenario names internally. Public conformance assertions depend on
 observable behavior returned through harness methods.
+
+## Phase 2S Hardening Coverage
+
+Phase 2S adds edge-case coverage to existing operational rules. It introduces no new rule ids and
+no new conformance profiles.
+
+| Rule | Phase 2S hardening | Helper / parser / sanitizer surface | Primary tests |
+| --- | --- | --- | --- |
+| `OR-01-SCOPE-RELATION` | Web tool-service domain filtering uses the same wildcard narrowing relation as signed gateway scope. | `core.scope.effective_signed_scope`; Reference web tool-service domain filter | `tests/test_tool_services.py`; `tests/test_scope_relation.py`; `tests/test_scope_relation_properties.py` |
+| `OR-02-CAPABILITY-BOUNDARY` | Domain, binding, and capability boundaries stay intact when requested web scope is narrower than signed scope. | `core.scope.effective_signed_scope`; `CapabilityLease.from_json`; strict HTTP payload parsing | `tests/test_tool_services.py`; `tests/test_web_gateway.py`; `tests/test_capability.py` |
+| `OR-03-LEASE-ADMISSION` | Capability result public payloads expose safe lease summaries while internal checkpoint/reentry payloads keep raw grant material. | `public_view.public_capability_result`; `HostedTask.public_payload`; `core.wire_validation` | `tests/test_tool_approval.py`; `tests/test_capability.py`; `tests/test_checkpoint.py` |
+| `OR-04-REVOCATION-SCOPE` | Lease and checkpoint payload parsing rejects present wrong-type fields before durable revocation state is trusted. | `CapabilityLease.from_json`; `HostedTask.from_checkpoint`; `core.wire_validation` | `tests/test_capability.py`; `tests/test_capability_revocation.py`; `tests/test_checkpoint.py` |
+| `OR-05-EVENT-SEQUENCING` | Proposal export, approval, rejection, apply, and conflict events use the same backend event sequencer path as control audit. | `core.event_sequencing.RunEventSequencer`; `RunnerBackend._emit_backend_event` | `tests/test_proposal_package.py`; `tests/test_backend_control.py`; `tests/test_event_sequencing.py` |
+| `OR-06-CONTROL-AUDIT` | Public task payloads redact approval/capability grant material, and callback results parse approval booleans fail-closed. | `core.tool_approval`; `public_view.public_result_content`; `public_capability_result` | `tests/test_tool_approval.py`; `tests/test_backend_control.py` |
+| `OR-07-DURABLE-METADATA` | Run listing reads recovery metadata through the durable metadata helper and materializes local descriptors from shared metadata. | `core.durable_metadata.DurableMetadataCommitter.read_recovery_metadata` | `tests/test_durable_metadata.py`; `tests/test_backend_recovery.py`; `tests/test_backend_runtime_config.py` |
+| `OR-08-PROVIDER-CAPS` | Web request domain scope adopts `effective_signed_scope`; numeric cap behavior stays on the existing bounded cap path. | `core.scope.effective_signed_scope`; Reference web gateway cap application | `tests/test_tool_services.py`; `tests/test_web_gateway.py`; `tests/conformance/test_provider_gateway_profile.py` |
+| `OR-09-SUBAGENT-BOUNDARY` | Studio subagent event routing derives the root ancestor id with the core helper and rejects traversal-shaped ids. | `core.subagent_runtime.root_run_id_from_descendant`; `validate_descendant_run_id` | `tests/test_subagent_runtime_context.py`; `tests/test_studio.py`; `tests/test_studio_sessions.py` |
+| `OR-10-TOOL-SURFACE-ADMISSION` | External HTTP and control payloads parse tool arguments as objects, so wrong-type args do not reach handler admission. | `core.wire_validation`; Reference backend HTTP parsers; `DefaultToolSurfaceResolver` | `tests/test_backend_http_api.py`; `tests/test_tool_surface.py`; `tests/test_loop.py` |
+| `OR-11-GENERIC-ASK-APPROVAL` | Approval callback payloads parse approve/deny values fail-closed, public approval payloads hide raw args, and replay state is checkpointed. | `core.tool_approval`; `HostedTask.public_payload`; approval replay checkpoint commit | `tests/test_tool_approval.py`; `tests/test_loop.py`; `tests/test_checkpoint.py` |
+| `OR-12-DURABLE-SIDE-EFFECT` | Strict side-effect admission is covered by deterministic cases, and outbox/inbox wire payloads get property-tested parser coverage. | `core.side_effect_policy`; `core.outbox.OutboxRequest.from_json`; `core.inbox.InboxMessage.from_json` | `tests/test_side_effect_policy.py`; `tests/test_outbox.py`; `tests/test_inbox_outbox_properties.py` |
+| `OR-13-EXTERNAL-AGENT-ENVELOPE` | Envelope parsing rejects malformed JSON-native shapes, metadata merge protects canonical identity, and inbox/outbox roundtrips are property-tested. | `core.external_agent_envelope`; `merge_canonical_metadata`; `core.wire_validation` | `tests/test_external_agent_envelope.py`; `tests/test_external_agent_envelope_properties.py`; `tests/test_inbox_outbox_properties.py` |
 
 ## Coverage Notes
 

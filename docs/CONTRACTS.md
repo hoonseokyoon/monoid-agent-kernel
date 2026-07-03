@@ -57,6 +57,10 @@ durable, observable, and safe across backend and gateway implementations. These 
 contract language: a backend may use the Core Helper Kit or its own implementation path, then
 prove the same behavior through conformance profiles.
 
+Phase 2S keeps this rule list fixed. It tightens existing rule coverage through strict wire
+parsers, public payload sanitizers, canonical metadata merge, helper adoption in Reference
+boundaries, and property tests for pure helper/parser surfaces.
+
 | Rule ID | Contract rule | Primary profiles | Helper surfaces |
 | --- | --- | --- | --- |
 | `OR-01-SCOPE-RELATION` | Scope relation is defined once: signed scope bounds request scope, request scope bounds grant scope, numeric caps narrow by smaller values, list caps narrow by subset, and wildcard domains narrow by pattern relation. | `capability-security`, `provider-gateway` | `core.scope.scope_within`, `domain_patterns_within`, `effective_signed_scope` |

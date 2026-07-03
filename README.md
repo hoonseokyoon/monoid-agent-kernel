@@ -45,10 +45,11 @@ The package is organized around four roles:
 - **Conformance Test** — profile-based tests that check contract behavior for a chosen runtime
   shape. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the profile model and
   [docs/OPERATIONAL_RULE_COVERAGE.md](docs/OPERATIONAL_RULE_COVERAGE.md) for the
-  rule-to-test coverage matrix.
+  rule-to-test and Phase 2S hardening coverage matrix.
 - **Core Helper Kit** — the supported runtime and helper modules that make the contract easy to
   satisfy (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). See
-  [docs/CORE_HELPER_KIT.md](docs/CORE_HELPER_KIT.md) for the helper boundary.
+  [docs/CORE_HELPER_KIT.md](docs/CORE_HELPER_KIT.md) for the helper boundary and
+  validation/library policy.
 - **Reference** — example services under `monoid_agent_kernel.reference` (`backend`,
   `llm_gateway`, `web_gateway`, `mcp_gateway`, `stores`, `studio`, `conformance`) assembled from
   the public contract and helper kit. See [docs/REFERENCE.md](docs/REFERENCE.md) for the reference
