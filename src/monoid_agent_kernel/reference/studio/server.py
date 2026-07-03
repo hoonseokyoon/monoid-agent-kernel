@@ -47,6 +47,7 @@ from monoid_agent_kernel.core.external_agent_envelope import (
     validate_external_agent_envelope,
 )
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
+from monoid_agent_kernel.core.subagent_runtime import root_run_id_from_descendant
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -821,9 +822,9 @@ class StudioServer:
         path. This is the DX-11 fix: the descendant-events API replaced studio's earlier direct
         events.jsonl read."""
         assert self._backend is not None
-        if ".sub." not in child_run_id:
+        parent_run_id = root_run_id_from_descendant(child_run_id)
+        if parent_run_id is None:
             return {"events": []}
-        parent_run_id = child_run_id.split(".sub.", 1)[0]
         try:
             token = self._token_for(parent_run_id)
             return self._backend.descendant_events(parent_run_id, token, child_run_id, from_seq=from_seq)

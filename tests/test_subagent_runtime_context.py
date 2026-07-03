@@ -5,6 +5,7 @@ import pytest
 from monoid_agent_kernel.core.subagent_runtime import (
     SubagentRuntimeContext,
     is_descendant_run_id,
+    root_run_id_from_descendant,
     subagent_diagnostics_from_events,
     validate_descendant_run_id,
 )
@@ -52,6 +53,15 @@ def test_descendant_run_id_validation() -> None:
         validate_descendant_run_id("run_a", "run_b.sub.task_1")
     with pytest.raises(ValueError, match="invalid descendant"):
         validate_descendant_run_id("run_a", "run_a.sub.../escape")
+
+
+def test_root_run_id_from_descendant() -> None:
+    assert root_run_id_from_descendant("run_a.sub.task_1") == "run_a"
+    assert root_run_id_from_descendant("run_a.sub.task_1.sub.task_2") == "run_a"
+    assert root_run_id_from_descendant("run_a") is None
+    assert root_run_id_from_descendant("../run_a.sub.task_1") is None
+    assert root_run_id_from_descendant("run_a/sub/task_1") is None
+    assert root_run_id_from_descendant("run_a\\sub\\task_1") is None
 
 
 def test_subagent_diagnostics_summary() -> None:

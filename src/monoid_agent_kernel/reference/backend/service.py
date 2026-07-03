@@ -1327,6 +1327,16 @@ class RunnerBackend:
         *,
         level: str = "info",
     ) -> None:
+        self._emit_backend_event(run_id, event_type, data, level=level)
+
+    def _emit_backend_event(
+        self,
+        run_id: str,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        level: str = "info",
+    ) -> None:
         if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
             return
         with self._lock:
@@ -1347,7 +1357,7 @@ class RunnerBackend:
         try:
             append_event_to_run(run_dir, event_type, data=data, level=level)
         except OSError:
-            _LOGGER.debug("control audit event write skipped", exc_info=True)
+            _LOGGER.debug("backend event write skipped", exc_info=True)
 
     def _authorize_control_audit_target(
         self,
@@ -1640,8 +1650,8 @@ class RunnerBackend:
         tar_bytes = output.read_bytes()
         assert self.checkpoint_store is not None
         digest = self.checkpoint_store.put_blob(run_id, tar_bytes)
-        append_event_to_run(
-            record.run_dir,
+        self._emit_backend_event(
+            run_id,
             "proposal.package.exported",
             data={"package_hash": payload["package_hash"], "digest": digest, "size_bytes": len(tar_bytes)},
         )
@@ -1694,8 +1704,8 @@ class RunnerBackend:
             note=note,
         )
         write_approval(record.run_dir / "approval.json", approval)
-        append_event_to_run(
-            record.run_dir,
+        self._emit_backend_event(
+            run_id,
             "proposal.approved",
             data={"approval_hash": approval["approval_hash"], "package_hash": approval["package_hash"]},
         )
@@ -1718,8 +1728,8 @@ class RunnerBackend:
             note=reason,
         )
         write_approval(record.run_dir / "approval.json", approval)
-        append_event_to_run(
-            record.run_dir,
+        self._emit_backend_event(
+            run_id,
             "proposal.rejected",
             data={"approval_hash": approval["approval_hash"], "package_hash": approval["package_hash"]},
         )
@@ -1745,8 +1755,8 @@ class RunnerBackend:
         result = apply_package(record.run_dir, approval=approval, target=target, dry_run=dry_run)
         write_apply_result(record.run_dir / "apply-result.json", result)
         event_type = "proposal.conflict" if result.status == "conflict" else "proposal.applied"
-        append_event_to_run(
-            record.run_dir,
+        self._emit_backend_event(
+            run_id,
             event_type,
             data={
                 "status": result.status,
@@ -2957,13 +2967,12 @@ class RunnerBackend:
         runs: list[dict[str, Any]] = []
         if not self.run_root.is_dir():
             return {"runs": runs}
+        metadata_committer = DurableMetadataCommitter(self.checkpoint_store)
         for run_dir in self.run_root.iterdir():
-            meta_path = run_dir / "run.json"
-            if not run_dir.is_dir() or not meta_path.exists():
+            if not run_dir.is_dir():
                 continue
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
+            meta = metadata_committer.read_recovery_metadata(run_dir, run_dir.name)
+            if meta is None:
                 continue
             if meta.get("tenant_id") != tenant_id:
                 continue

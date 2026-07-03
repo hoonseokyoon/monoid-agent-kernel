@@ -101,6 +101,40 @@ def test_run_tokens_are_not_exposed_to_callers(studio: StudioServer) -> None:
     assert "run_token" not in result
 
 
+def test_subagent_events_uses_root_ancestor_token_for_nested_child(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs")
+    )
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str, int]] = []
+
+        def descendant_events(
+            self,
+            parent_run_id: str,
+            token: str,
+            child_run_id: str,
+            *,
+            from_seq: int = 0,
+        ) -> dict:
+            self.calls.append((parent_run_id, token, child_run_id, from_seq))
+            return {"events": [{"type": "child"}]}
+
+    backend = FakeBackend()
+    server._backend = backend  # type: ignore[assignment]
+    server._run_tokens["run_parent"] = "root-token"
+
+    result = server.subagent_events("run_parent.sub.task_1.sub.task_2", from_seq=7)
+
+    assert result["events"] == [{"type": "child"}]
+    assert backend.calls == [("run_parent", "root-token", "run_parent.sub.task_1.sub.task_2", 7)]
+    assert server.subagent_events("run_parent")["events"] == []
+    assert server.subagent_events("../secret.sub.task")["events"] == []
+
+
 def test_runtime_config_binds_read_write_hitl_shell_and_web() -> None:
     config = _agent_runtime_config()
     refs = {binding.ref.tool_id for binding in config.tools}
