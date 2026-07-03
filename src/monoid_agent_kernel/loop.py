@@ -509,7 +509,8 @@ class AgentToolContext(ToolContext):
             self.tool_search_max_results,
             int(requested_max) if requested_max is not None else self.tool_search_max_results,
         )
-        ranked = _rank_tool_search_entries(query, self.tool_search_entries)
+        entries = _filter_tool_search_entries(self.tool_search_entries, args)
+        ranked = _rank_tool_search_entries(query, entries)
         results = [entry.to_json() for entry in ranked[:max_results]]
         for item in results:
             binding_id = str(item.get("binding_id") or "")
@@ -4548,12 +4549,48 @@ def _rank_tool_search_entries(
                 entry.summary,
                 entry.guidance.summary,
                 entry.guidance.policy,
+                entry.namespace,
+                " ".join(entry.groups),
+                " ".join(entry.tags),
             ]
         ).lower()
         return sum(1 for term in terms if term in haystack)
 
     scored = [(score(entry), index, entry) for index, entry in enumerate(entries)]
     return [entry for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1])) if value > 0]
+
+
+def _filter_tool_search_entries(
+    entries: tuple[ToolSearchEntry, ...],
+    args: Mapping[str, Any],
+) -> tuple[ToolSearchEntry, ...]:
+    namespace = str(args.get("namespace") or "").strip()
+    groups = _filter_values(args.get("groups", args.get("group")))
+    tags = _filter_values(args.get("tags", args.get("tag")))
+    if not namespace and not groups and not tags:
+        return entries
+
+    def matches(entry: ToolSearchEntry) -> bool:
+        if namespace and entry.namespace != namespace:
+            return False
+        if groups and not groups.intersection(entry.groups):
+            return False
+        if tags and not tags.intersection(entry.tags):
+            return False
+        return True
+
+    return tuple(entry for entry in entries if matches(entry))
+
+
+def _filter_values(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        text = value.strip()
+        return {text} if text else set()
+    if isinstance(value, list | tuple):
+        return {text for item in value if (text := str(item).strip())}
+    return set()
 
 
 def _is_tool_search_call(name: str, catalog: BoundToolCatalog) -> bool:

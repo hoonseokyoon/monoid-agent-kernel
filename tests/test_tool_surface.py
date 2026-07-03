@@ -15,7 +15,7 @@ from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.tools.base import ToolContext, ToolRegistry, ToolResult, ToolSpec
 
 
-def _simple_tool(tool_id: str) -> ToolSpec:
+def _simple_tool(tool_id: str, *, capability: str = "test", side_effect: str = "read") -> ToolSpec:
     def handler(_context: ToolContext, _args: dict[str, Any]) -> ToolResult:
         return ToolResult(ok=True, content={"tool": tool_id})
 
@@ -23,8 +23,8 @@ def _simple_tool(tool_id: str) -> ToolSpec:
         id=tool_id,
         description=f"{tool_id} description",
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
-        capability="test",
-        side_effect="read",
+        capability=capability,
+        side_effect=side_effect,  # type: ignore[arg-type]
         handler=handler,
     )
 
@@ -47,6 +47,47 @@ def test_resolver_uses_bound_catalog_and_binding_authorization() -> None:
     assert snapshot.authorization_for("alpha_read").decision == "ask"  # type: ignore[union-attr]
     assert "beta_hidden" in snapshot.hidden_tool_ids
     assert snapshot.search_entries[0].binding_id == "gamma_search"
+
+
+def test_search_entries_include_grouping_metadata_and_defaults() -> None:
+    registry = ToolRegistry()
+    registry.register_many(
+        (
+            _simple_tool("web.search", capability="web.search"),
+            _simple_tool("fs.read", capability="fs.read"),
+        )
+    )
+    config = runtime_config(
+        bindings=(
+            tool_binding(
+                "web.search",
+                binding_id="docs_search",
+                exposure="searchable",
+                metadata={
+                    "tool_search": {
+                        "namespace": "docs",
+                        "groups": ["reference"],
+                        "tags": ["python", "api"],
+                    }
+                },
+            ),
+            tool_binding("fs.read", exposure="searchable"),
+        )
+    )
+    catalog = compile_bound_tool_catalog(config, registry)
+
+    snapshot = DefaultToolSurfaceResolver().resolve(bound_catalog=catalog, turn=type("Turn", (), {"turn_id": "t1"})())
+
+    entries = {entry.binding_id: entry for entry in snapshot.search_entries}
+    docs = entries["docs_search"]
+    assert docs.namespace == "docs"
+    assert docs.groups == ("reference",)
+    assert docs.tags[:2] == ("python", "api")
+    assert docs.binding_id == "docs_search"  # still the only load key
+    defaulted = entries["fs.read"]
+    assert defaulted.namespace == "fs"
+    assert defaulted.groups == ("fs",)
+    assert {"read", "fs.read"}.issubset(set(defaulted.tags))
 
 
 def test_tool_surface_searchable_binding_loads_next_turn(tmp_path: Path) -> None:
@@ -81,6 +122,62 @@ def test_tool_surface_searchable_binding_loads_next_turn(tmp_path: Path) -> None
     transcript = _transcript(result.run_dir)
     snapshots = [item for item in transcript if item["kind"] == "tool_surface_snapshot"]
     assert snapshots[0]["search_entries"][0]["binding_id"] == "fs.read"
+
+
+def test_tool_search_filters_by_group_and_tag_before_next_turn_load(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(
+                    fake_tool_call(
+                        "tool_search",
+                        {"query": "", "groups": ["files"], "tag": "text"},
+                        "search1",
+                    ),
+                ),
+            ),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    config = runtime_config(
+        bindings=(
+            tool_binding(
+                "fs.read",
+                exposure="searchable",
+                metadata={"tool_search": {"namespace": "workspace", "group": "files", "tags": ["text"]}},
+            ),
+            tool_binding(
+                "fs.write",
+                exposure="searchable",
+                metadata={"tool_search": {"namespace": "workspace", "group": "files", "tags": ["write"]}},
+            ),
+            tool_binding(
+                "web.search",
+                exposure="searchable",
+                metadata={"tool_search": {"namespace": "docs", "group": "reference", "tags": ["text"]}},
+            ),
+            tool_binding("run.finish"),
+        )
+    )
+
+    result = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+    ).run_once("Find a text file tool.")
+
+    assert result.status == "completed"
+    observations = [obs.output for req in adapter.requests for obs in req.observations]
+    dumped = json.dumps(observations)
+    assert '"binding_id": "fs.read"' in dumped
+    assert '"binding_id": "fs.write"' not in dumped
+    assert '"binding_id": "web.search"' not in dumped
+    assert "fs.read" in {tool.id for tool in adapter.requests[1].tools}
+    assert "fs.write" not in {tool.id for tool in adapter.requests[1].tools}
+    assert "web.search" not in {tool.id for tool in adapter.requests[1].tools}
 
 
 def test_search_result_is_not_callable_in_same_turn(tmp_path: Path) -> None:

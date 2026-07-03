@@ -177,6 +177,53 @@ def test_skill_tool_returns_instructions_resources_and_advisory(tmp_path: Path) 
     assert set(result.content["resources"]) == {"references/FORMS.md", "scripts/fill.py"}
 
 
+def test_inline_allowed_tools_is_advisory_and_does_not_narrow_parent_surface(tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    _write_skill(
+        skills_root,
+        "notes-helper",
+        description="Help with notes",
+        allowed_tools="fs.read",
+        body="Use fs.read when you need existing notes.",
+    )
+    provider = SkillProvider(load_skill_definitions(skills_root))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("skill", {"name": "notes-helper"}, "c1"),)),
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "fs_write",
+                        {"path": "created.md", "content": "ok\n", "create_dirs": False},
+                        "c2",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    bindings = (*provider.tool_bindings(), tool_binding("fs.write"), tool_binding("run.finish"))
+
+    result = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        context_providers=(provider,),
+        tool_providers=(provider,),
+        runtime_config_provider=runtime_provider(runtime_config(bindings=bindings)),
+    ).run_once("load the helper and write")
+
+    assert result.status == "completed"
+    outputs = [obs.output for req in adapter.requests for obs in req.observations]
+    assert any(
+        isinstance(output, dict)
+        and output.get("ok")
+        and output.get("result", {}).get("path") == "created.md"
+        for output in outputs
+    )
+
+
 def test_skill_tool_unknown_name(tmp_path: Path) -> None:
     _write_skill(tmp_path, "pdf-fill", description="d")
     provider = SkillProvider(load_skill_definitions(tmp_path))

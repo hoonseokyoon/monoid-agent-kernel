@@ -27,6 +27,7 @@ def tool_binding(
     scope: ToolScope | None = None,
     quota: ToolQuota | None = None,
     runtime: dict | None = None,
+    metadata: dict | None = None,
 ) -> ToolBinding:
     resolved_binding_id = binding_id or tool_id
     return ToolBinding(
@@ -39,6 +40,7 @@ def tool_binding(
         scope=scope or ToolScope(),
         quota=quota or ToolQuota(),
         runtime=runtime or {},
+        metadata=metadata or {},
     )
 
 
