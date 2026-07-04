@@ -134,8 +134,13 @@ class RunEventSequencer:
             return False
         state = payload.get("state") or payload.get("status") or ""
         terminal = bool(payload.get("terminal"))
-        if not terminal and str(state) in {"completed", "failed", "cancelled"}:
-            terminal = True
+        if "terminal" not in payload:
+            legacy_status = str(payload.get("status") or "")
+            state_value = str(payload.get("state") or "")
+            if state_value in {"completed", "failed", "cancelled"} or (
+                not state_value and legacy_status in {"completed", "failed", "limited", "cancelled"}
+            ):
+                terminal = True
         return self.is_terminal_direct_append_status(str(state), terminal=terminal)
 
     def newest_sequence(self, status: Mapping[str, Any], status_file: Mapping[str, Any] | None = None) -> int:
