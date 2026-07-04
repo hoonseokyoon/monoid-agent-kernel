@@ -5,8 +5,6 @@ from __future__ import annotations
 import faulthandler
 import os
 import sys
-import time
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any
 
@@ -45,53 +43,19 @@ def pytest_runtest_setup(item: Any) -> None:
     _arm_hang_watchdog()
 
 
-from monoid_agent_kernel.reference.backend.service import RunnerBackend
+from support.backend_factory import ManagedBackendFactory, set_current_backend_factory
 from support.studio_harness import studio as studio
-
-_ACTIVE_BACKENDS: list[RunnerBackend] = []
-_BACKEND_FUTURES: dict[int, list[Any]] = {}
-_ORIGINAL_BACKEND_POST_INIT = RunnerBackend.__post_init__
-_ORIGINAL_BACKEND_SPAWN = RunnerBackend._spawn
-
-
-def _tracked_backend_post_init(self: RunnerBackend) -> None:
-    _ORIGINAL_BACKEND_POST_INIT(self)
-    _ACTIVE_BACKENDS.append(self)
-    _BACKEND_FUTURES.setdefault(id(self), [])
-
-
-def _tracked_backend_spawn(self: RunnerBackend, coro: Any) -> Any:
-    future = _ORIGINAL_BACKEND_SPAWN(self, coro)
-    _BACKEND_FUTURES.setdefault(id(self), []).append(future)
-    return future
-
-
-RunnerBackend.__post_init__ = _tracked_backend_post_init
-RunnerBackend._spawn = _tracked_backend_spawn
 
 
 @pytest.fixture(autouse=True)
-def _drain_runner_backends_after_test() -> Any:
-    yield
+def backend_factory(tmp_path: Path) -> Any:
+    factory = ManagedBackendFactory(tmp_path)
+    set_current_backend_factory(factory)
     try:
-        for backend in list(_ACTIVE_BACKENDS):
-            backend.shutdown(drain=True, drain_timeout_s=5.0)
-        for backend in list(_ACTIVE_BACKENDS):
-            for future in _BACKEND_FUTURES.get(id(backend), []):
-                try:
-                    future.result(timeout=0.5)
-                except FutureTimeoutError:
-                    future.cancel()
-                    time.sleep(0.05)
-                    try:
-                        future.result(timeout=1.0)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+        yield factory
     finally:
-        _BACKEND_FUTURES.clear()
-        _ACTIVE_BACKENDS.clear()
+        set_current_backend_factory(None)
+        factory.close()
 
 
 def pytest_sessionfinish(session: Any, exitstatus: int) -> None:

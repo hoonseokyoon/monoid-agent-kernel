@@ -15,10 +15,11 @@ def test_reference_capability_vault_satisfies_multi_agent_revocation_profile() -
 
 
 def test_reference_backend_satisfies_multi_agent_boundary_profile(tmp_path: Path) -> None:
-    assert_multi_agent_backend_boundary_profile(ReferenceBackendHarness(tmp_path))
+    with ReferenceBackendHarness(tmp_path) as harness:
+        assert_multi_agent_backend_boundary_profile(harness)
 
 
 def test_reference_backend_satisfies_multi_agent_capability_boundary_profile(tmp_path: Path) -> None:
-    harness = ReferenceBackendHarness(tmp_path)
-    assert_multi_agent_backend_capability_boundary_profile(harness)
-    assert harness.gated_provider.calls == 0
+    with ReferenceBackendHarness(tmp_path) as harness:
+        assert_multi_agent_backend_capability_boundary_profile(harness)
+        assert harness.gated_provider.calls == 0

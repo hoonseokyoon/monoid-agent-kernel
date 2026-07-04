@@ -26,10 +26,6 @@ from monoid_agent_kernel.reference.backend.service import BackendRunRequest, Run
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 
-def _token_manager() -> TokenManager:
-    return TokenManager.from_secret("x" * 32)
-
-
 def _workspace(tmp_path: Path) -> Path:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -41,18 +37,8 @@ def _config() -> Any:
     return runtime_config("fs.read", "fs.write", "run.finish")
 
 
-def _backend(tmp_path: Path, workspace: Path, turns: list[ModelTurn]) -> RunnerBackend:
-    def factory(spec: Any, llm_gateway_token: str) -> FakeModelAdapter:
-        del spec, llm_gateway_token
-        return FakeModelAdapter(turns=list(turns))
-
-    backend = RunnerBackend(
-        run_root=tmp_path / "runs",
-        token_manager=_token_manager(),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=factory,
-    )
+def _backend(backend_factory: Any, workspace: Path, turns: list[ModelTurn]) -> RunnerBackend:
+    backend = backend_factory.create(workspace=workspace, turns=turns)
     backend.idle_timeout_s = 10.0
     return backend
 
@@ -117,9 +103,11 @@ class _UnopenedLoop:
         return False
 
 
-def test_dispatch_inspect_and_health_report_live_state(tmp_path: Path) -> None:
+def test_dispatch_inspect_and_health_report_live_state(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     inspect = _dispatch(backend, run_id, token, "inspect")
@@ -139,9 +127,11 @@ def test_dispatch_inspect_and_health_report_live_state(tmp_path: Path) -> None:
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_dispatch_emits_control_audit_events_without_token_leak(tmp_path: Path) -> None:
+def test_dispatch_emits_control_audit_events_without_token_leak(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     status = backend.dispatch(
@@ -213,9 +203,11 @@ def test_dispatch_emits_control_audit_events_without_token_leak(tmp_path: Path) 
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_dispatch_control_audit_uses_live_recorder_sequence(tmp_path: Path) -> None:
+def test_dispatch_control_audit_uses_live_recorder_sequence(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     status = _dispatch(backend, run_id, token, "status")
@@ -236,9 +228,11 @@ def test_dispatch_control_audit_uses_live_recorder_sequence(tmp_path: Path) -> N
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_dispatch_skips_run_audit_before_loop_owns_sequence(tmp_path: Path) -> None:
+def test_dispatch_skips_run_audit_before_loop_owns_sequence(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
     record = backend._record(run_id)
     loop = record.loop
@@ -258,9 +252,11 @@ def test_dispatch_skips_run_audit_before_loop_owns_sequence(tmp_path: Path) -> N
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_dispatch_appends_queued_run_audit_before_recorder_starts(tmp_path: Path) -> None:
+def test_dispatch_appends_queued_run_audit_before_recorder_starts(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="done")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="done")])
     prepared = backend._prepare_run_record(
         BackendRunRequest(
             tenant_id="tenant_a",
@@ -284,11 +280,15 @@ def test_dispatch_appends_queued_run_audit_before_recorder_starts(tmp_path: Path
         assert recorder.emit("run.started", data={"mode": "propose"}).seq == 3
     finally:
         recorder.close()
+        backend.cancel_run(prepared.run_id, prepared.run_token)
+        backend._records.pop(prepared.run_id, None)
 
 
-def test_control_audit_skips_direct_append_when_loop_is_not_open(tmp_path: Path) -> None:
+def test_control_audit_skips_direct_append_when_loop_is_not_open(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
     record = backend._record(run_id)
     loop = record.loop
@@ -312,9 +312,11 @@ def test_control_audit_skips_direct_append_when_loop_is_not_open(tmp_path: Path)
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_dispatch_appends_terminal_run_audit_after_recorder_closes(tmp_path: Path) -> None:
+def test_dispatch_appends_terminal_run_audit_after_recorder_closes(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="done")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="done")])
     submission = backend.submit_run(
         BackendRunRequest(
             tenant_id="tenant_a",
@@ -341,9 +343,11 @@ def test_dispatch_appends_terminal_run_audit_after_recorder_closes(tmp_path: Pat
     assert len(seqs) == len(set(seqs))
 
 
-def test_control_audit_skips_recordless_nonterminal_run(tmp_path: Path) -> None:
+def test_control_audit_skips_recordless_nonterminal_run(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="done")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="done")])
     run_id = "run_remote_live"
     run_dir = backend.run_root / run_id
     run_dir.mkdir(parents=True)
@@ -363,9 +367,9 @@ def test_control_audit_skips_recordless_nonterminal_run(tmp_path: Path) -> None:
     assert (run_dir / "events.jsonl").read_text(encoding="utf-8") == original_events
 
 
-def test_dispatch_routes_existing_ops_and_unknown(tmp_path: Path) -> None:
+def test_dispatch_routes_existing_ops_and_unknown(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     assert _dispatch(backend, run_id, token, "status").status == "ok"
@@ -389,9 +393,11 @@ def test_dispatch_routes_existing_ops_and_unknown(tmp_path: Path) -> None:
     assert backend.wait_for_run(run_id, timeout_s=20) in {"completed", "failed", "limited"}
 
 
-def test_dispatch_inspect_on_terminal_run_is_error(tmp_path: Path) -> None:
+def test_dispatch_inspect_on_terminal_run_is_error(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="done")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="done")])
     submission = backend.submit_run(
         BackendRunRequest(
             tenant_id="tenant_a",
@@ -411,9 +417,9 @@ def test_dispatch_inspect_on_terminal_run_is_error(tmp_path: Path) -> None:
     assert _dispatch(backend, run_id, token, "status").status == "ok"
 
 
-def test_dispatch_bad_token_raises_permission_denied(tmp_path: Path) -> None:
+def test_dispatch_bad_token_raises_permission_denied(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
     with pytest.raises(PermissionDenied):
         backend.dispatch(ControlCommand(type="inspect", run_id=run_id, args={"token": "bad"}))
@@ -421,9 +427,9 @@ def test_dispatch_bad_token_raises_permission_denied(tmp_path: Path) -> None:
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_http_control_route_dispatches_inspect(tmp_path: Path) -> None:
+def test_http_control_route_dispatches_inspect(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
     with serving(server) as base_url:
         created = http_json(
@@ -454,11 +460,13 @@ def test_http_control_route_dispatches_inspect(tmp_path: Path) -> None:
         backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_capability_task_kind_creates_and_resolves(tmp_path: Path) -> None:
+def test_capability_task_kind_creates_and_resolves(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     # Step 5: a scoped-capability request rides the hosted-task seam. The Daemon creates a
     # capability park and resolves it via report_task_result (both reachable through dispatch).
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     created = backend.create_task(
@@ -481,9 +489,11 @@ def test_capability_task_kind_creates_and_resolves(tmp_path: Path) -> None:
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_dispatch_report_task_result_accepts_callback_token(tmp_path: Path) -> None:
+def test_dispatch_report_task_result_accepts_callback_token(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     task = backend.create_task(
@@ -517,9 +527,9 @@ def test_dispatch_report_task_result_accepts_callback_token(tmp_path: Path) -> N
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_dispatch_approve_accepts_callback_token(tmp_path: Path) -> None:
+def test_dispatch_approve_accepts_callback_token(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     task = backend.create_task(
@@ -545,9 +555,11 @@ def test_dispatch_approve_accepts_callback_token(tmp_path: Path) -> None:
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_dispatch_deny_overwrites_conflicting_result_fields(tmp_path: Path) -> None:
+def test_dispatch_deny_overwrites_conflicting_result_fields(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     task = backend.create_task(
@@ -598,9 +610,11 @@ def test_dispatch_deny_overwrites_conflicting_result_fields(tmp_path: Path) -> N
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_dispatch_approve_and_deny_are_audited_task_decisions(tmp_path: Path) -> None:
+def test_dispatch_approve_and_deny_are_audited_task_decisions(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(tmp_path, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     approve_task = backend.create_task(
@@ -710,7 +724,9 @@ class _CapCountingProvider:
         ]
 
 
-def test_dispatch_revoke_capability_blocks_subsequent_call(tmp_path: Path) -> None:
+def test_dispatch_revoke_capability_blocks_subsequent_call(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     # End-to-end operator kill switch: a gated tool runs on a granted lease, the Daemon dispatches
     # revoke_capability, and the next gated call is refused — through the Control protocol.
     workspace = _workspace(tmp_path)
@@ -726,11 +742,8 @@ def test_dispatch_revoke_capability_blocks_subsequent_call(tmp_path: Path) -> No
         del spec, llm_gateway_token
         return FakeModelAdapter(turns=list(turns))
 
-    backend = RunnerBackend(
-        run_root=tmp_path / "runs",
-        token_manager=_token_manager(),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+    backend = backend_factory.create(
+        workspace=workspace,
         model_adapter_factory=factory,
         tool_providers=(provider,),
         capability_broker_factory=lambda req: AutoGrantBroker(),
@@ -767,7 +780,9 @@ def test_dispatch_revoke_capability_blocks_subsequent_call(tmp_path: Path) -> No
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_driver_pauses_mid_turn_then_resumes_to_settle(tmp_path: Path) -> None:
+def test_driver_pauses_mid_turn_then_resumes_to_settle(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
     entered, release = threading.Event(), threading.Event()
     turns = [
@@ -779,11 +794,8 @@ def test_driver_pauses_mid_turn_then_resumes_to_settle(tmp_path: Path) -> None:
         del spec, llm_gateway_token
         return FakeModelAdapter(turns=list(turns))
 
-    backend = RunnerBackend(
-        run_root=tmp_path / "runs",
-        token_manager=_token_manager(),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+    backend = backend_factory.create(
+        workspace=workspace,
         model_adapter_factory=factory,
         tool_providers=(_GateToolProvider(entered, release),),
     )

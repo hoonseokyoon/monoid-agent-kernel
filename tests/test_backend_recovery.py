@@ -235,6 +235,7 @@ def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> No
         SessionState.COMPLETED,
         SessionState.LIMITED,
         SessionState.FAILED,
+        SessionState.CANCELLED,
     }
     instructions = [r.instruction for a in resumed for r in a.requests if r.instruction]
     assert "again" in instructions

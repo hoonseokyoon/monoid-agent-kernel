@@ -620,7 +620,11 @@ Fast local confidence checks:
 ```bash
 python -m pytest tests/conformance -q
 python -m pytest -q -n 4
+python -m pytest -q --cov=monoid_agent_kernel --cov=native_agent_runner
 ```
+
+CI keeps the serial suite as the required gate and runs xdist plus coverage as
+advisory checks while the test seams stabilize.
 
 ## License
 

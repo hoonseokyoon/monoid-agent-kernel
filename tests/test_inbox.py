@@ -16,8 +16,6 @@ from monoid_agent_kernel.core.inbox import (
 )
 from monoid_agent_kernel.identifiers import LEGACY_NAMESPACE
 from monoid_agent_kernel.providers.base import ModelTurn
-from monoid_agent_kernel.providers.fake import FakeModelAdapter
-from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import (
     BackendRunRequest,
     RunnerBackend,
@@ -77,29 +75,16 @@ def test_checkpoint_carries_seen_ids_and_envelope_queue() -> None:
 # --- idempotent ingress through the backend -----------------------------------------------
 
 
-def _backend(tmp_path: Path, turns: list[ModelTurn]) -> tuple[RunnerBackend, Path]:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    workspace.joinpath("notes.md").write_text("notes\n", encoding="utf-8")
-
-    def factory(spec: Any, llm_gateway_token: str) -> FakeModelAdapter:
-        del spec, llm_gateway_token
-        return FakeModelAdapter(turns=list(turns))
-
-    backend = RunnerBackend(
-        run_root=tmp_path / "runs",
-        token_manager=TokenManager.from_secret("x" * 32),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=factory,
-    )
+def _backend(backend_factory: Any, turns: list[ModelTurn]) -> tuple[RunnerBackend, Path]:
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(workspace=workspace, turns=turns)
     backend.idle_timeout_s = 10.0
     return backend, workspace
 
 
-def test_duplicate_message_id_is_processed_once(tmp_path: Path) -> None:
+def test_duplicate_message_id_is_processed_once(backend_factory: Any) -> None:
     backend, workspace = _backend(
-        tmp_path,
+        backend_factory,
         [ModelTurn(response_id="r1", final_text="first"), ModelTurn(response_id="r2", final_text="second")],
     )
     submission = backend.submit_run(
@@ -133,8 +118,8 @@ def test_duplicate_message_id_is_processed_once(tmp_path: Path) -> None:
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_send_message_propagates_trace_context_onto_envelope(tmp_path: Path) -> None:
-    backend, workspace = _backend(tmp_path, [ModelTurn(response_id="r1", final_text="first")])
+def test_send_message_propagates_trace_context_onto_envelope(backend_factory: Any) -> None:
+    backend, workspace = _backend(backend_factory, [ModelTurn(response_id="r1", final_text="first")])
     submission = backend.submit_run(
         BackendRunRequest(
             tenant_id="tenant_a",
@@ -168,8 +153,8 @@ def test_send_message_propagates_trace_context_onto_envelope(tmp_path: Path) -> 
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_message_without_id_gets_a_generated_envelope_id(tmp_path: Path) -> None:
-    backend, workspace = _backend(tmp_path, [ModelTurn(response_id="r1", final_text="first")])
+def test_message_without_id_gets_a_generated_envelope_id(backend_factory: Any) -> None:
+    backend, workspace = _backend(backend_factory, [ModelTurn(response_id="r1", final_text="first")])
     submission = backend.submit_run(
         BackendRunRequest(
             tenant_id="tenant_a",

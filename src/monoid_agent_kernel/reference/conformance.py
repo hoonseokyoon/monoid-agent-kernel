@@ -411,6 +411,16 @@ class ReferenceBackendHarness:
         self.backend.idle_timeout_s = 30.0
         self.backend.max_recover_attempts = 10_000
 
+    def __enter__(self) -> ReferenceBackendHarness:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        del exc_type, exc, tb
+        self.close()
+
+    def close(self) -> None:
+        self.backend.shutdown(drain=True)
+
     def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
         scenario = str(request.metadata.get("scenario") or "")
         if scenario == "tool-side-effect-pending-recovery":

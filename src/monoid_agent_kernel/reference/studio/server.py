@@ -63,7 +63,7 @@ from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.reference.web_gateway.http import create_web_gateway_server
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.reference.studio.activity import describe_event
-from monoid_agent_kernel.reference._shared.http_util import wait_http_ready
+from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer, wait_http_ready
 from monoid_agent_kernel.reference.mcp_gateway import FakeMcpServer, create_mcp_server
 from monoid_agent_kernel.mcp import McpError, McpToolProvider
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
@@ -958,7 +958,7 @@ class StudioServer:
             capability_broker_factory=lambda req: AutoGrantBroker(),
         )
 
-        self._ui_server = ThreadingHTTPServer(
+        self._ui_server = HardenedThreadingHTTPServer(
             (self.config.host, self.config.port), _make_handler(self)
         )
         ui_port = self._ui_server.server_address[1]
@@ -989,6 +989,24 @@ class StudioServer:
                     server.server_close()
                 except Exception:  # pragma: no cover - best-effort teardown
                     _LOGGER.debug("error during server shutdown", exc_info=True)
+        for name, thread in (
+            ("ui", self._ui_thread),
+            ("llm_gateway", self._gateway_thread),
+            ("web_gateway", self._web_gateway_thread),
+            ("mcp_gateway", self._mcp_thread),
+        ):
+            if thread is not None:
+                thread.join(timeout=5.0)
+                if thread.is_alive():
+                    _LOGGER.warning("studio %s thread did not stop within timeout", name)
+        self._ui_server = None
+        self._gateway_server = None
+        self._web_gateway_server = None
+        self._mcp_server = None
+        self._ui_thread = None
+        self._gateway_thread = None
+        self._web_gateway_thread = None
+        self._mcp_thread = None
 
     # --- chat operations (called by the handler) ----------------------------------------
 

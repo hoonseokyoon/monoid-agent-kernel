@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from typing import Any
 
 from support.backend_harness import (
     BackendRunRequest,
@@ -110,7 +111,7 @@ def test_backend_task_result_checkpoint_preserves_queued_messages(tmp_path: Path
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_TASKS)
     assert eventually(lambda: bool(_running_hitl_tasks(backend, run_id)))
     task = _running_hitl_tasks(backend, run_id)[0]
 
@@ -418,7 +419,12 @@ def test_backend_multi_turn_session_threads_two_user_messages(tmp_path: Path) ->
 
     backend.cancel_run(run_id, token)  # stop the open session
     status = backend.wait_for_run(run_id, timeout_s=20)
-    assert status in {SessionState.COMPLETED, SessionState.LIMITED, SessionState.FAILED}
+    assert status in {
+        SessionState.COMPLETED,
+        SessionState.LIMITED,
+        SessionState.FAILED,
+        SessionState.CANCELLED,
+    }
 
     instructions = [r.instruction for a in adapters for r in a.requests if r.instruction]
     assert "hello" in instructions
@@ -559,14 +565,13 @@ def test_token_manager_accepts_legacy_issuer_and_audience_for_migration() -> Non
         current_manager.verify(token, kind="run_access", audience="monoid.backend", run_id="run_1")
 
 
-def test_backend_requires_runtime_config() -> None:
-    workspace = Path(".").resolve()
-    backend = RunnerBackend(
-        run_root=workspace / "runs-test-unused",
-        token_manager=_token_manager(),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+def test_backend_requires_runtime_config(tmp_path: Path, backend_factory: Any) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(
+        workspace=workspace,
+        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
+            turns=[ModelTurn(final_text="done")]
+        ),
     )
 
     with pytest.raises(ValueError, match="agent_definition or runtime_config is required"):

@@ -12,15 +12,15 @@ from urllib.request import Request, urlopen
 import pytest
 
 from support.http import http_get_json as _json_get
+from support.http import serving
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.tool_surface import ToolGuidance
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 from monoid_agent_kernel.providers.fake import fake_tool_call
-from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.http import create_backend_server
-from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.backend.service import BackendRunRequest
 
 
 def _workspace(tmp_path: Path) -> Path:
@@ -28,10 +28,6 @@ def _workspace(tmp_path: Path) -> Path:
     workspace.mkdir()
     workspace.joinpath("notes.md").write_text("hello\n", encoding="utf-8")
     return workspace
-
-
-def _token_manager() -> TokenManager:
-    return TokenManager.from_secret("test-secret-" * 4)
 
 
 def _binding(tool_id: str, *, guidance: str = "") -> ToolBinding:
@@ -79,15 +75,13 @@ class _FailingRunMetadataStore(LocalFsCheckpointStore):
         super().put_run_metadata(run_id, metadata)
 
 
-def test_backend_runtime_config_endpoint_updates_next_turn(tmp_path: Path) -> None:
+def test_backend_runtime_config_endpoint_updates_next_turn(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
     adapter = _BlockingAdapter()
-    backend = RunnerBackend(
-        run_root=tmp_path / "runs",
-        token_manager=_token_manager(),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=lambda _spec, _token: adapter,
+    backend = backend_factory.create(
+        workspace=workspace, model_adapter_factory=lambda _spec, _token: adapter
     )
     initial = _config(1, _binding("fs.read", guidance="initial read"), _binding("run.finish"))
     submission = backend.submit_run(
@@ -129,17 +123,15 @@ def test_backend_runtime_config_endpoint_updates_next_turn(tmp_path: Path) -> No
 
 
 def test_runtime_config_metadata_store_failure_keeps_local_descriptor_unchanged(
-    tmp_path: Path,
+    tmp_path: Path, backend_factory: Any
 ) -> None:
     workspace = _workspace(tmp_path)
     adapter = _BlockingAdapter()
     run_root = tmp_path / "runs"
     store = _FailingRunMetadataStore(run_root)
-    backend = RunnerBackend(
+    backend = backend_factory.create(
         run_root=run_root,
-        token_manager=_token_manager(),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        workspace=workspace,
         model_adapter_factory=lambda _spec, _token: adapter,
         checkpoint_store=store,
     )
@@ -178,21 +170,16 @@ def test_runtime_config_metadata_store_failure_keeps_local_descriptor_unchanged(
     assert backend.wait_for_run(submission.run_id, timeout_s=5) == "completed"
 
 
-def test_backend_http_runtime_config_get_post_and_version_mismatch(tmp_path: Path) -> None:
+def test_backend_http_runtime_config_get_post_and_version_mismatch(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
     adapter = _BlockingAdapter()
-    backend = RunnerBackend(
-        run_root=tmp_path / "runs",
-        token_manager=_token_manager(),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=lambda _spec, _token: adapter,
+    backend = backend_factory.create(
+        workspace=workspace, model_adapter_factory=lambda _spec, _token: adapter
     )
     server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{server.server_address[1]}"
-    try:
+    with serving(server) as base_url:
         created = _json_post(
             f"{base_url}/v1/runs",
             {
@@ -260,11 +247,7 @@ def test_backend_http_runtime_config_get_post_and_version_mismatch(tmp_path: Pat
         assert backend.wait_for_run(run_id, timeout_s=5) == "completed"
         second_read = next(tool for tool in adapter.requests[1].tools if tool.id == "fs.read")
         assert "http replacement" in second_read.description
-    finally:
-        adapter.allow_first_return.set()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
+    adapter.allow_first_return.set()
 
 
 def _json_post(url: str, payload: dict, *, token: str) -> dict:

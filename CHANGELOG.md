@@ -16,6 +16,9 @@ out in commit messages and here.
   `state` plus `terminal` instead of legacy lifecycle `status`. Terminal
   `AgentRunResult.status`, `ControlResult.status`, proposal status, tool status,
   job status, and metrics status keep their domain meanings.
+- Phase 4-3 test/CI readiness: backend tests now have a managed factory seam for
+  spawned future cleanup, Studio shutdown joins owned server threads, and CI runs
+  xdist plus coverage as advisory checks.
 - `AudioPart` and `VideoPart` are now exported from the contract surface to match
   the core content contract.
 

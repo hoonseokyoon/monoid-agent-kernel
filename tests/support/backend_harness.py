@@ -15,6 +15,7 @@ from support.http import (
     http_post_json as _json_request,
     wait_http_ready as _wait_http_ready,
 )
+from support.backend_factory import current_backend_factory
 from support.process import python_command as _python_command
 from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
@@ -39,7 +40,7 @@ from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import (
     _RUN_META_SCHEMA_VERSION,
     BackendRunRequest,
-    RunnerBackend,
+    RunnerBackend as _RunnerBackend,
 )
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 
@@ -109,6 +110,16 @@ __all__ = [
 ]
 
 
+class RunnerBackend(_RunnerBackend):
+    """Test-support alias that registers direct constructions with the active factory."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        managed_factory = current_backend_factory()
+        if managed_factory is not None:
+            managed_factory.track(self)
+
+
 def _token_manager() -> TokenManager:
     return TokenManager.from_secret("x" * 32)
 
@@ -146,6 +157,14 @@ def _backend(tmp_path: Path, workspace: Path, captured_gateway_tokens: list[str]
             ]
         )
 
+    managed_factory = current_backend_factory()
+    if managed_factory is not None:
+        return managed_factory.create(
+            run_root=tmp_path / "runs",
+            workspace=workspace,
+            token_manager=token_manager,
+            model_adapter_factory=factory,
+        )
     return RunnerBackend(
         run_root=tmp_path / "runs",
         token_manager=token_manager,
@@ -164,6 +183,14 @@ def _hitl_backend(tmp_path: Path, workspace: Path, adapters: list, turns: list) 
         adapters.append(adapter)
         return adapter
 
+    managed_factory = current_backend_factory()
+    if managed_factory is not None:
+        return managed_factory.create(
+            run_root=tmp_path / "runs",
+            workspace=workspace,
+            token_manager=token_manager,
+            model_adapter_factory=factory,
+        )
     return RunnerBackend(
         run_root=tmp_path / "runs",
         token_manager=token_manager,
@@ -189,6 +216,14 @@ def _recoverable_backend(run_root: Path, token_manager: TokenManager, workspace:
         adapters.append(adapter)
         return adapter
 
+    managed_factory = current_backend_factory()
+    if managed_factory is not None:
+        return managed_factory.create(
+            run_root=run_root,
+            workspace=workspace,
+            token_manager=token_manager,
+            model_adapter_factory=factory,
+        )
     return RunnerBackend(
         run_root=run_root,
         token_manager=token_manager,
@@ -228,6 +263,16 @@ def _provider_backend(
         return adapter
 
     skill = provider if provider is not None else _skill_provider()
+    managed_factory = current_backend_factory()
+    if managed_factory is not None:
+        return managed_factory.create(
+            run_root=run_root,
+            workspace=workspace,
+            token_manager=token_manager,
+            model_adapter_factory=factory,
+            tool_providers=(skill,),
+            context_providers=(skill,),
+        )
     return RunnerBackend(
         run_root=run_root,
         token_manager=token_manager,
@@ -294,13 +339,22 @@ def _scripted_backend(tmp_path: Path, workspace: Path, adapters: list, script: l
         adapters.append(adapter)
         return adapter
 
-    backend = RunnerBackend(
-        run_root=tmp_path / "runs",
-        token_manager=token_manager,
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=factory,
-    )
+    managed_factory = current_backend_factory()
+    if managed_factory is not None:
+        backend = managed_factory.create(
+            run_root=tmp_path / "runs",
+            workspace=workspace,
+            token_manager=token_manager,
+            model_adapter_factory=factory,
+        )
+    else:
+        backend = RunnerBackend(
+            run_root=tmp_path / "runs",
+            token_manager=token_manager,
+            allowed_workspace_roots=(workspace,),
+            llm_gateway_url="http://llm-gateway.internal/v1/turns",
+            model_adapter_factory=factory,
+        )
     backend.turn_retry = ModelRetryConfig(initial_delay_s=0.0, jitter_s=0.0, max_delay_s=0.0)
     return backend
 

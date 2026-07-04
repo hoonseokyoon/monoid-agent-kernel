@@ -510,6 +510,22 @@ def _teardown_loop(
     idle multi-turn message-get) exits when that call returns."""
     if loop.is_closed():
         return
+    if loop.is_running():
+        async def _cancel_pending_tasks() -> None:
+            pending = [
+                task
+                for task in asyncio.all_tasks(loop)
+                if task is not asyncio.current_task(loop) and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_cancel_pending_tasks(), loop).result(timeout=5)
+        except Exception:  # pragma: no cover - interpreter shutdown best-effort cleanup
+            pass
     loop.call_soon_threadsafe(loop.stop)
     thread.join(timeout=5)
     executor.shutdown(wait=False)

@@ -22,13 +22,8 @@ from support.runtime import runtime_config
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers.base import ModelRequest, ModelStreamChunk, TextDelta, TurnComplete
 from monoid_agent_kernel.providers.fake import FakeStreamingModelAdapter
-from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
-
-
-def _token_manager() -> TokenManager:
-    return TokenManager.from_secret("x" * 32)
 
 
 def _workspace(tmp_path: Path) -> Path:
@@ -37,18 +32,18 @@ def _workspace(tmp_path: Path) -> Path:
     return workspace
 
 
-def _backend(tmp_path: Path, workspace: Path, factory) -> RunnerBackend:
-    return RunnerBackend(
-        run_root=tmp_path / "runs",
-        token_manager=_token_manager(),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=factory,
+def _backend(backend_factory: Any, workspace: Path, factory) -> RunnerBackend:
+    return backend_factory.create(workspace=workspace, model_adapter_factory=factory)
+
+
+def _streaming_backend(
+    backend_factory: Any, workspace: Path, chunks: list[ModelStreamChunk]
+) -> RunnerBackend:
+    return _backend(
+        backend_factory,
+        workspace,
+        lambda spec, token: FakeStreamingModelAdapter(chunk_turns=[list(chunks)]),
     )
-
-
-def _streaming_backend(tmp_path: Path, workspace: Path, chunks: list[ModelStreamChunk]) -> RunnerBackend:
-    return _backend(tmp_path, workspace, lambda spec, token: FakeStreamingModelAdapter(chunk_turns=[list(chunks)]))
 
 
 def _request(workspace: Path) -> BackendRunRequest:
@@ -96,10 +91,10 @@ async def _collect(backend: RunnerBackend, request: BackendRunRequest) -> list[d
 # --- HTTP SSE transport ----------------------------------------------------------------
 
 
-def test_backend_streams_run_over_sse(tmp_path: Path) -> None:
+def test_backend_streams_run_over_sse(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
     chunks = [TextDelta("Hel"), TextDelta("lo"), TurnComplete(response_id="prov", usage={"total_tokens": 5})]
-    backend = _streaming_backend(tmp_path, workspace, chunks)
+    backend = _streaming_backend(backend_factory, workspace, chunks)
     server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
     with serving(server) as base_url:
         frames = _read_sse(base_url, _run_payload(workspace))
@@ -120,9 +115,9 @@ def test_backend_streams_run_over_sse(tmp_path: Path) -> None:
     assert frames[-1]["final_text"] == "Hello"
 
 
-def test_backend_stream_rejects_non_admin(tmp_path: Path) -> None:
+def test_backend_stream_rejects_non_admin(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
-    backend = _streaming_backend(tmp_path, workspace, [TextDelta("x"), TurnComplete()])
+    backend = _streaming_backend(backend_factory, workspace, [TextDelta("x"), TurnComplete()])
     server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
     with serving(server) as base_url:
         with pytest.raises(HTTPError) as excinfo:
@@ -133,9 +128,11 @@ def test_backend_stream_rejects_non_admin(tmp_path: Path) -> None:
 # --- In-process programmatic seam (no HTTP) --------------------------------------------
 
 
-def test_astream_run_programmatic_seam(tmp_path: Path) -> None:
+def test_astream_run_programmatic_seam(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
-    backend = _streaming_backend(tmp_path, workspace, [TextDelta("done"), TurnComplete(response_id="prov")])
+    backend = _streaming_backend(
+        backend_factory, workspace, [TextDelta("done"), TurnComplete(response_id="prov")]
+    )
     frames = asyncio.run(_collect(backend, _request(workspace)))
 
     assert frames[0]["kind"] == "meta"
@@ -145,7 +142,9 @@ def test_astream_run_programmatic_seam(tmp_path: Path) -> None:
     assert frames[-1]["final_text"] == "done"
 
 
-def test_astream_run_emits_failed_result_on_adapter_error(tmp_path: Path) -> None:
+def test_astream_run_emits_failed_result_on_adapter_error(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
 
     class BoomAdapter:
@@ -157,7 +156,7 @@ def test_astream_run_emits_failed_result_on_adapter_error(tmp_path: Path) -> Non
                 raise ModelAdapterError("provider blew up", provider_error_code="gateway_server_error")
             yield  # pragma: no cover - present only to make this an async generator
 
-    backend = _backend(tmp_path, workspace, lambda spec, token: BoomAdapter())
+    backend = _backend(backend_factory, workspace, lambda spec, token: BoomAdapter())
     frames = asyncio.run(_collect(backend, _request(workspace)))
 
     # Exactly one terminal result frame, marking failure.

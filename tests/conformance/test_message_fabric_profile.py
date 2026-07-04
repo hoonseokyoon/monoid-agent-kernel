@@ -7,4 +7,5 @@ from monoid_agent_kernel.reference.conformance import ReferenceBackendHarness
 
 
 def test_message_fabric_profile_passes_against_reference_backend(tmp_path: Path) -> None:
-    assert_message_fabric_profile(ReferenceBackendHarness(tmp_path))
+    with ReferenceBackendHarness(tmp_path) as harness:
+        assert_message_fabric_profile(harness)
