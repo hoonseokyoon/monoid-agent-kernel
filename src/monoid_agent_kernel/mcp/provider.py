@@ -236,10 +236,18 @@ class McpToolProvider:
     def tool_bindings(self) -> tuple[ToolBinding, ...]:
         """Bindings for every discovered tool, to merge into the runtime config so the run can
         see them (provider tools are not auto-bound)."""
-        return tuple(
-            ToolBinding(binding_id=spec.id, ref=RegistryToolRef(tool_id=spec.id), authorization="allow")
-            for spec in self.get_tools()
-        )
+        bindings: list[ToolBinding] = []
+        helper_ids = {self._resource_read_tool_id(), self._prompt_get_tool_id()}
+        for spec in self.get_tools():
+            bindings.append(
+                ToolBinding(
+                    binding_id=spec.id,
+                    ref=RegistryToolRef(tool_id=spec.id),
+                    authorization="allow",
+                    model_name=spec.exported_name if spec.id in helper_ids else None,
+                )
+            )
+        return tuple(bindings)
 
     def catalog(self) -> dict[str, list[dict[str, Any]]]:
         """Plain catalog data for UIs. Tool descriptors keep id/description; resources/prompts

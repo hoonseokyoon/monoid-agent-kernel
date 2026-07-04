@@ -1,7 +1,7 @@
 ---
 name: code-review-checklist
 description: Review a small code change for defects, missing tests, and behavioral regressions.
-allowed-tools: fs.read text.search
+allowed-tools: fs.read text.search skill.read_file
 context: fork
 ---
 

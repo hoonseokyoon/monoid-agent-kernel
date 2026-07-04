@@ -351,6 +351,11 @@ def test_mcp_provider_exposes_resources_prompts_context_and_invalidation() -> No
             )
             segment = mcp.dynamic_segment(bound_turn)
             assert segment is not None and "fake://one" in segment and "brief" in segment
+            bindings = {binding.binding_id: binding for binding in mcp.tool_bindings()}
+            assert bindings["mcp.t.__helper.resource.read"].model_name == "mcp_t_resource_read"
+            assert bindings["mcp.t.__helper.prompt.get"].model_name == "mcp_t_prompt_get"
+            assert "mcp_t_resource_read" in segment
+            assert "mcp_t_prompt_get" in segment
 
             state["resource_version"] = 1
             assert mcp.catalog()["resources"][0]["uri"] == "fake://one"  # cached

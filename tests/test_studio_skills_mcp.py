@@ -25,6 +25,12 @@ def test_skills_capability_offered_and_enabled_by_default(studio: StudioServer) 
     assert "skill" in refs
 
 
+def test_bundled_review_skill_can_read_its_checklist(studio: StudioServer) -> None:
+    assert studio._skill_provider is not None
+    definition = studio._skill_provider.subagent_definitions()["skill:code-review-checklist"]
+    assert "skill.read_file" in definition.tools
+
+
 def test_skill_catalog_injected_into_system_prompt(tmp_path: Path) -> None:
     # The L1 catalog (skill name + description) is a context-provider static segment, so it must
     # reach the model's system prompt — proving the SkillProvider is wired as a context provider.
