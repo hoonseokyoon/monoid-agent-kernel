@@ -100,6 +100,9 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
     assert "resetChatView();" in html
     assert "function refreshPromptPreview" in html
     assert 'fetch("/api/profile-preview"' in html
+    assert "#body { flex: 1; display: grid;" in html
+    assert "#sidebar { overflow: hidden;" in html
+    assert "#sessions { list-style: none;" in html and "overflow: auto;" in html
 
 
 def test_settings_page_serves_static_test_hooks(studio: StudioServer) -> None:
