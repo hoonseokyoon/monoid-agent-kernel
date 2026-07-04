@@ -90,6 +90,11 @@ def _tool_search() -> ToolSpec:
             {
                 "query": {"type": "string"},
                 "max_results": {"type": "integer", "minimum": 1},
+                "namespace": {"type": "string"},
+                "group": {"type": "string"},
+                "groups": {"type": "array", "items": {"type": "string"}},
+                "tag": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
             },
             required=["query"],
         ),

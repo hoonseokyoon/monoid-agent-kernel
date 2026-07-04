@@ -1,13 +1,14 @@
 """A minimal, hand-rolled MCP (Model Context Protocol) client over Streamable HTTP.
 
-Scope is deliberately small — the ``tools/list`` + ``tools/call`` slice with a static bearer
-token — which the MCP spec (rev 2025-06-18) explicitly lets a server answer with a plain
-``application/json`` body, so no SSE parser is needed on the happy path. This avoids the
-official ``mcp`` SDK's heavy, async-only dependency tree (starlette/uvicorn/pydantic/pyjwt)
-for a JSON-RPC handshake that is ~150 lines over the ``httpx`` we already ship as an extra.
+Scope is deliberately small — ``tools/*`` plus read-only resource and prompt helpers with a
+static bearer token — which the MCP spec (rev 2025-06-18) explicitly lets a server answer with
+a plain ``application/json`` body, so no SSE parser is needed on the happy path. This avoids
+the official ``mcp`` SDK's heavy, async-only dependency tree (starlette/uvicorn/pydantic/pyjwt)
+for a JSON-RPC handshake that is small over the ``httpx`` we already ship as an extra.
 
-stdio transport, OAuth flows, resources/prompts/sampling, and ``list_changed`` notifications
-are out of scope (add the official SDK behind the ``[mcp]`` extra later if needed).
+stdio transport, OAuth flows, sampling, subscriptions/SSE listeners, and automatic
+``list_changed`` notification handling are out of scope (add the official SDK behind the
+``[mcp]`` extra later if needed).
 """
 
 from __future__ import annotations
@@ -96,7 +97,30 @@ class McpHttpClient:
         """Return every tool the server exposes, following ``nextCursor`` pagination (spec rev
         2025-06-18). A large server splits ``tools/list`` across pages; reading only the first
         would silently drop tools the caller declared bindings for."""
-        tools: list[dict[str, Any]] = []
+        return self._list_paginated("tools/list", "tools")
+
+    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        result, _ = self._post("tools/call", {"name": name, "arguments": arguments or {}})
+        return result
+
+    def list_resources(self) -> list[dict[str, Any]]:
+        """Return every resource descriptor, following ``nextCursor`` pagination."""
+        return self._list_paginated("resources/list", "resources")
+
+    def read_resource(self, uri: str) -> dict[str, Any]:
+        result, _ = self._post("resources/read", {"uri": uri})
+        return result
+
+    def list_prompts(self) -> list[dict[str, Any]]:
+        """Return every prompt descriptor, following ``nextCursor`` pagination."""
+        return self._list_paginated("prompts/list", "prompts")
+
+    def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        result, _ = self._post("prompts/get", {"name": name, "arguments": arguments or {}})
+        return result
+
+    def _list_paginated(self, method: str, result_key: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
         cursor: str | None = None
         seen: set[str] = set()
         restarted = False
@@ -107,28 +131,24 @@ class McpHttpClient:
             # pages we disable _post's transparent replay (which would resend the stale cursor)
             # and instead restart pagination from the top once after reconnecting.
             try:
-                result, _ = self._post("tools/list", params, _allow_reconnect=cursor is None)
+                result, _ = self._post(method, params, _allow_reconnect=cursor is None)
             except McpError as exc:
                 if exc.code == 404 and cursor is not None and not restarted:
                     restarted = True
                     self.initialize()  # re-handshake (the prior _post already dropped the session)
-                    tools.clear()
+                    items.clear()
                     seen.clear()
                     cursor = None
                     continue
                 raise
-            page = result.get("tools")
+            page = result.get(result_key)
             if isinstance(page, list):
-                tools.extend(page)
+                items.extend(page)
             cursor = result.get("nextCursor")
             if not cursor or not isinstance(cursor, str) or cursor in seen:
                 break  # done, or a malformed/repeating cursor — stop rather than loop forever
             seen.add(cursor)
-        return tools
-
-    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        result, _ = self._post("tools/call", {"name": name, "arguments": arguments or {}})
-        return result
+        return items
 
     # -- transport ---------------------------------------------------------------------
 

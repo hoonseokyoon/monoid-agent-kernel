@@ -15,6 +15,7 @@ make Monoid embeddable in different products and runtimes:
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |
 | [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |
 | [SKILLS_DESIGN.md](SKILLS_DESIGN.md) | Agent Skills — procedural knowledge delivered through a `ContextProvider`, complementing subagents (execution) and MCP (integration). |
+| [FIRST_SKILL_TUTORIAL.md](FIRST_SKILL_TUTORIAL.md) | Create and smoke-test a minimal `SKILL.md` skill locally. |
 
 For observability (OpenTelemetry tracing, the streaming surface, `metrics.json`), see the
 [Observability](../README.md#observability) section of the top-level README and the runnable

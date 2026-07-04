@@ -81,13 +81,15 @@ parent directory is the bundle root for L3. Duplicates: first sorted path wins. 
 directory or unparseable file raises `ValueError` (fail loud), mirroring the subagent
 loader.
 
-## allowed-tools is advisory (Claude parity)
+## allowed-tools semantics
 
-`allowed-tools` in the frontmatter is surfaced to the model (in the `skill` tool result)
-as a hint about which tools the skill expects, but it does **not** restrict the tool
-registry. This matches Claude's actual behavior (pre-approval hint, not a hard block).
-Enforced per-turn gating is a possible later option (`DynamicToolProvider`), deliberately
-out of scope here.
+For inline skills, `allowed-tools` in the frontmatter is surfaced to the model in the
+`skill` tool result as a hint about which tools the skill expects. The parent run's tool
+surface remains unchanged.
+
+For fork skills, a non-empty `allowed-tools` value becomes the synthesized subagent's tool
+allowlist. The subagent resolver matches it against the parent's binding ids, registry tool
+ids, and model names, so it acts as a hard ceiling.
 
 ## Safety
 
@@ -172,14 +174,12 @@ agent-as-tool machine, so there is almost no new plumbing.
   final message; otherwise it loads instructions inline as before. The subagent machine
   supplies depth/fan-out caps, re-entrancy safety, cancellation, usage roll-up, and the
   `subagent.*` events/metrics for free.
-- **A non-empty allowed-tools is *enforced* here.** For inline skills `allowed_tools` is
-  advisory; for a fork skill a non-empty `allowed_tools` becomes the subagent's tool allowlist,
-  resolved against the parent's bindings — a hard ceiling. (An empty `allowed_tools` inherits
-  all of the parent's tools — no narrowing.) So "I want this skill restricted to certain tools"
-  is answered by making
-  it a fork skill, which is why a separate enforced-gating mechanism for inline skills is not
-  worth building. (For a fork skill, write `allowed-tools` in the kernel's tool-id namespace,
-  e.g. `fs.read shell.exec`, since it is matched by fnmatch against tool ids.)
+- **A non-empty allowed-tools is enforced here.** For inline skills `allowed_tools` is
+  advisory. For a fork skill a non-empty `allowed_tools` becomes the subagent's tool
+  allowlist, resolved against the parent's bindings as a hard ceiling. An empty
+  `allowed_tools` inherits all of the parent's tools. Use a fork skill when a skill needs
+  enforced tool restriction. For a fork skill, write `allowed-tools` in the kernel's tool-id
+  namespace, e.g. `fs.read shell.exec`, since it is matched by fnmatch against tool ids.
 
 ## Scope
 

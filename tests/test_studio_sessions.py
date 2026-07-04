@@ -227,6 +227,71 @@ def test_studio_sessions_lists_started_chats_newest_first(studio: StudioServer) 
     assert by_id[r1]["status"] not in {"completed", "failed", "limited"}
 
 
+def test_studio_profiles_scope_session_history(studio: StudioServer) -> None:
+    profiles = studio.profiles()
+    assert profiles["default_profile_id"] == "default"
+    assert "run_update_plan tool" in profiles["system_prompt_base"]
+    assert {"default", "reviewer", "builder"} <= {p["id"] for p in profiles["profiles"]}
+
+    default_run = studio.start_chat("default task", profile_id="default")["run_id"]
+    _wait_settled(studio, default_run, 1)
+    reviewer_run = studio.start_chat("review task", profile_id="reviewer")["run_id"]
+    _wait_settled(studio, reviewer_run, 1)
+
+    default_sessions = studio.sessions(profile_id="default")["sessions"]
+    reviewer_sessions = studio.sessions(profile_id="reviewer")["sessions"]
+
+    assert {s["run_id"] for s in default_sessions} == {default_run}
+    assert {s["run_id"] for s in reviewer_sessions} == {reviewer_run}
+    assert reviewer_sessions[0]["profile_id"] == "reviewer"
+
+
+def test_studio_profile_preview_resolves_model_request_surface(studio: StudioServer) -> None:
+    preview = studio.profile_preview(
+        {
+            "name": "Previewer",
+            "description": "Preview test",
+            "instructions": "Always mention PREVIEW_SENTINEL.",
+            "capabilities": ["read", "write", "delegate"],
+            "model": "gpt-preview",
+            "effort": "high",
+            "summary": "off",
+        }
+    )
+
+    assert "PREVIEW_SENTINEL" in preview["system_prompt"]
+    assert "Profile instructions:" in preview["system_prompt"]
+    assert preview["request_config"]["model"] == "gpt-preview"
+    assert preview["request_config"]["reasoning"] == {"effort": "high", "summary": "off"}
+    tool_names = {tool["name"] for tool in preview["tools"]}
+    assert {"run_update_plan", "fs_read", "fs_write", "agent_spawn"} <= tool_names
+    read_tool = next(tool for tool in preview["tools"] if tool["name"] == "fs_read")
+    assert read_tool["input_schema"]["type"] == "object"
+
+
+def test_studio_profile_history_survives_restart(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    run_root = tmp_path / "runs"
+    s1 = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root))
+    s1.start()
+    try:
+        rid = s1.start_chat("remember reviewer", profile_id="reviewer")["run_id"]
+        _wait_settled(s1, rid, 1)
+    finally:
+        s1.shutdown()
+
+    s2 = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root))
+    s2.start()
+    try:
+        reviewer_sessions = s2.sessions(profile_id="reviewer")["sessions"]
+        default_sessions = s2.sessions(profile_id="default")["sessions"]
+        assert any(x["run_id"] == rid and x["profile_id"] == "reviewer" for x in reviewer_sessions)
+        assert all(x["run_id"] != rid for x in default_sessions)
+    finally:
+        s2.shutdown()
+
+
 def test_run_events_carry_trace_nesting(tmp_path: Path) -> None:
     # The trace tree nests by event_id/parent_id; verify a tool call nests under its turn.
     workspace = tmp_path / "ws"

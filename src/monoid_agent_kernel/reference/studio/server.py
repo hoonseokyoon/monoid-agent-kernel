@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 from monoid_agent_kernel.core.agents import (
@@ -38,7 +38,9 @@ from monoid_agent_kernel.core.agents import (
     RegistryToolRef,
     SubagentDefinition,
     ToolBinding,
+    compile_bound_tool_catalog,
 )
+from monoid_agent_kernel.core.context import TurnContext
 from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.content import ContentPart, DocumentPart, ImagePart, TextPart
@@ -48,7 +50,9 @@ from monoid_agent_kernel.core.external_agent_envelope import (
 )
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
 from monoid_agent_kernel.core.subagent_runtime import root_run_id_from_descendant
-from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.core.prompt import compose_system_prompt
+from monoid_agent_kernel.core.tool_surface import DefaultToolSurfaceResolver, ToolScope
+from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
@@ -63,6 +67,8 @@ from monoid_agent_kernel.reference._shared.http_util import wait_http_ready
 from monoid_agent_kernel.reference.mcp_gateway import FakeMcpServer, create_mcp_server
 from monoid_agent_kernel.mcp import McpError, McpToolProvider
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
+from monoid_agent_kernel.tools.base import ToolRegistry, ToolSpec
+from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.studio")
 
@@ -218,11 +224,11 @@ _DEFAULT_EFFORT = "medium"
 _EFFORT_CHOICES = ("none", "low", "medium", "high", "xhigh")
 # Validation superset = the engine's full ReasoningEffort literal (some values suit other models).
 _ALL_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh")
-# Reasoning *summary* visibility (DX-13b): "auto" surfaces a model-written summary of its thinking
-# in the chat's collapsible "Thinking" panel; "off" hides it. Display-only — independent of the
-# reasoning round-trip, which always travels by-value.
+# Reasoning *summary* visibility (DX-13b): Studio exposes this as one checkbox. "auto"
+# surfaces a model-written summary in the collapsible Thinking panel; "off" hides it.
+# Display-only — independent of the reasoning round-trip, which always travels by-value.
 _DEFAULT_SUMMARY = "auto"
-_SUMMARY_CHOICES = ("off", "auto", "detailed")
+_SUMMARY_CHOICES = ("off", "auto")
 
 # OTel tracing (Tier-3): when toggled on, runs emit GenAI spans via OtelEventSink to an OTLP
 # collector (default = a local Jaeger's OTLP/HTTP port). The exporter + global provider are set
@@ -271,6 +277,57 @@ _PLAN_BINDING = ToolBinding(
     binding_id="run.update_plan", model_name="run_update_plan", ref=RegistryToolRef("run.update_plan")
 )
 
+_DEFAULT_PROFILES = (
+    {
+        "id": "default",
+        "name": "Default",
+        "description": "General-purpose workspace agent.",
+        "instructions": "",
+        "capabilities": tuple(_ALL_CAPABILITIES),
+        "model": _DEFAULT_MODEL,
+        "effort": _DEFAULT_EFFORT,
+        "summary": _DEFAULT_SUMMARY,
+        "built_in": True,
+    },
+    {
+        "id": "reviewer",
+        "name": "Reviewer",
+        "description": "Review-focused profile for analysis and feedback sessions.",
+        "instructions": (
+            "Review code and plans with emphasis on behavioral regressions, security, "
+            "missing tests, and unclear contracts. Lead with concrete findings."
+        ),
+        "capabilities": ("read", "hitl", "web", "delegate"),
+        "model": _DEFAULT_MODEL,
+        "effort": "high",
+        "summary": _DEFAULT_SUMMARY,
+        "built_in": True,
+    },
+    {
+        "id": "builder",
+        "name": "Builder",
+        "description": "Implementation-focused profile for coding sessions.",
+        "instructions": (
+            "Implement requested changes directly, keep edits scoped, verify with tests, "
+            "and preserve existing project conventions."
+        ),
+        "capabilities": tuple(_ALL_CAPABILITIES),
+        "model": _DEFAULT_MODEL,
+        "effort": _DEFAULT_EFFORT,
+        "summary": _DEFAULT_SUMMARY,
+        "built_in": True,
+    },
+)
+_DEFAULT_PROFILE_ID = "default"
+_PROFILE_INDEX_NAME = "studio-profiles.json"
+
+
+def _normalize_profile_id(profile_id: str | None) -> str:
+    profile = (profile_id or _DEFAULT_PROFILE_ID).strip().lower() or _DEFAULT_PROFILE_ID
+    out = "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9") else "-" for ch in profile)
+    out = "-".join(part for part in out.split("-") if part)
+    return out[:64] or _DEFAULT_PROFILE_ID
+
 
 def _runtime_config_for(
     capabilities: list[str],
@@ -279,6 +336,7 @@ def _runtime_config_for(
     summary: str = _DEFAULT_SUMMARY,
     *,
     provider_bindings: dict[str, tuple[ToolBinding, ...]] | None = None,
+    system_prompt: str = _SYSTEM_PROMPT,
 ) -> AgentRuntimeConfig:
     """Build the runtime config for an enabled-capability set (order-stable, deduped) plus the
     chosen model + reasoning effort + summary visibility. The model flows to the gateway as the
@@ -298,9 +356,20 @@ def _runtime_config_for(
     return AgentRuntimeConfig(
         definition_id="studio-agent",
         model=ModelConfig(model=model, reasoning=ReasoningConfig(effort=effort, summary=summary)),
-        prompt=PromptSpec(system_prompt_base=_SYSTEM_PROMPT),
+        prompt=PromptSpec(system_prompt_base=system_prompt),
         tools=tuple(tools),
     )
+
+
+def _gateway_tool_schema(tool: ToolSpec) -> dict[str, Any]:
+    return {
+        "id": tool.id,
+        "name": tool.exported_name,
+        "description": tool.description,
+        "input_schema": tool.input_schema,
+        "capability": tool.capability,
+        "side_effect": tool.side_effect,
+    }
 
 
 def _agent_runtime_config() -> AgentRuntimeConfig:
@@ -380,6 +449,332 @@ class StudioServer:
     def base_url(self) -> str:
         return self._base_url
 
+    # --- Studio profiles ---------------------------------------------------------------
+
+    def _profile_defaults(self) -> dict[str, dict[str, Any]]:
+        defaults: dict[str, dict[str, Any]] = {}
+        all_static = tuple(_ALL_CAPABILITIES)
+        available = tuple(self._available_capabilities())
+        for profile in _DEFAULT_PROFILES:
+            normalized = dict(profile)
+            if tuple(normalized.get("capabilities") or ()) == all_static:
+                normalized["capabilities"] = available
+            defaults[str(normalized["id"])] = normalized
+        return defaults
+
+    def _profile_store_path(self) -> Path:
+        return self.config.run_root / _PROFILE_INDEX_NAME
+
+    def _load_profile_store(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self._profile_store_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"profiles": {}, "runs": {}}
+        if not isinstance(payload, dict):
+            return {"profiles": {}, "runs": {}}
+        profiles = payload.get("profiles") if isinstance(payload.get("profiles"), dict) else {}
+        runs = payload.get("runs") if isinstance(payload.get("runs"), dict) else {}
+        return {"profiles": dict(profiles), "runs": dict(runs)}
+
+    def _write_profile_store(self, payload: dict[str, Any]) -> None:
+        path = self._profile_store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        normalized = {
+            "profiles": payload.get("profiles") if isinstance(payload.get("profiles"), dict) else {},
+            "runs": payload.get("runs") if isinstance(payload.get("runs"), dict) else {},
+        }
+        path.write_text(json.dumps(normalized, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _profile_system_prompt(self, profile: dict[str, Any]) -> str:
+        instructions = str(profile.get("instructions") or "").strip()
+        if not instructions:
+            return _SYSTEM_PROMPT
+        return f"{_SYSTEM_PROMPT}\n\nProfile instructions:\n{instructions}"
+
+    def _normalize_profile_payload(
+        self,
+        raw: dict[str, Any],
+        *,
+        profile_id: str,
+        built_in: bool,
+    ) -> dict[str, Any]:
+        available = self._available_capabilities()
+        requested = raw.get("capabilities")
+        if isinstance(requested, (list, tuple)):
+            wanted = [str(cap) for cap in requested]
+            wanted_set = set(wanted)
+            capabilities = [cap for cap in available if cap in wanted_set]
+            capabilities.extend(
+                cap for cap in wanted if cap not in available and cap not in capabilities
+            )
+        else:
+            capabilities = [cap for cap in available if cap in set(self._capabilities)]
+        if not capabilities and available:
+            capabilities = [available[0]]
+        effort = str(raw.get("effort") or _DEFAULT_EFFORT)
+        if effort not in _ALL_EFFORTS:
+            effort = _DEFAULT_EFFORT
+        summary = str(raw.get("summary") or _DEFAULT_SUMMARY)
+        if summary not in _SUMMARY_CHOICES:
+            summary = _DEFAULT_SUMMARY
+        name = str(raw.get("name") or profile_id).strip()[:80] or profile_id
+        return {
+            "id": profile_id,
+            "name": name,
+            "description": str(raw.get("description") or "").strip()[:240],
+            "instructions": str(raw.get("instructions") or "").strip()[:4000],
+            "capabilities": capabilities,
+            "model": str(raw.get("model") or _DEFAULT_MODEL).strip() or _DEFAULT_MODEL,
+            "effort": effort,
+            "summary": summary,
+            "built_in": built_in,
+        }
+
+    def _profiles_by_id(self) -> dict[str, dict[str, Any]]:
+        defaults = self._profile_defaults()
+        profiles = {
+            profile_id: self._normalize_profile_payload(raw, profile_id=profile_id, built_in=True)
+            for profile_id, raw in defaults.items()
+        }
+        store = self._load_profile_store()
+        raw_profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
+        for raw_id, raw in raw_profiles.items():
+            if not isinstance(raw, dict):
+                continue
+            profile_id = _normalize_profile_id(str(raw_id))
+            base = dict(defaults.get(profile_id, {"id": profile_id, "name": profile_id}))
+            base.update(raw)
+            profiles[profile_id] = self._normalize_profile_payload(
+                base,
+                profile_id=profile_id,
+                built_in=profile_id in defaults,
+            )
+        return profiles
+
+    def _known_profile_id(self, profile_id: str | None) -> str:
+        candidate = _normalize_profile_id(profile_id)
+        return candidate if candidate in self._profiles_by_id() else _DEFAULT_PROFILE_ID
+
+    def _profile_for_config(self, profile_id: str | None) -> dict[str, Any]:
+        profiles = self._profiles_by_id()
+        return profiles.get(self._known_profile_id(profile_id), profiles[_DEFAULT_PROFILE_ID])
+
+    def _profile_has_saved_override(self, profile_id: str) -> bool:
+        store = self._load_profile_store()
+        profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
+        return profile_id in profiles
+
+    def _new_profile_id(self, name: str) -> str:
+        profiles = self._profiles_by_id()
+        base = _normalize_profile_id(name) or "agent"
+        candidate = base
+        suffix = 2
+        while candidate in profiles:
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+        return candidate
+
+    def profiles(self) -> dict[str, Any]:
+        """The Studio profile catalog.
+
+        Profiles are Studio-owned agent presets. They choose the model, reasoning settings,
+        prompt instructions, and capability set for new chats. Run history keeps a profile id so
+        sessions stay grouped after restart.
+        """
+        labels = self._capability_labels()
+        return {
+            "profiles": list(self._profiles_by_id().values()),
+            "default_profile_id": _DEFAULT_PROFILE_ID,
+            "system_prompt_base": _SYSTEM_PROMPT,
+            "available_capabilities": [
+                {"key": cap, "label": labels[cap]} for cap in self._available_capabilities()
+            ],
+            "efforts": list(_EFFORT_CHOICES),
+            "summaries": list(_SUMMARY_CHOICES),
+        }
+
+    def profile_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a draft profile into the first-turn model request preview.
+
+        This mirrors the Studio run bootstrap far enough to show the exact system prompt and
+        tool schema payload a new chat would hand to the model adapter. It does not create a run
+        or execute handlers.
+        """
+        profile = self._draft_profile_from_payload(payload)
+        runtime_config = _runtime_config_for(
+            list(profile["capabilities"]),
+            str(profile["model"]),
+            str(profile["effort"]),
+            str(profile["summary"]),
+            provider_bindings=self._provider_bindings(),
+            system_prompt=self._profile_system_prompt(profile),
+        )
+        registry = self._preview_tool_registry()
+        bound_catalog = compile_bound_tool_catalog(runtime_config, registry)
+        turn_context = TurnContext(
+            step=1,
+            remaining_steps=29,
+            remaining_tool_calls=100,
+            deadline_s=900,
+            plan=(),
+            pending_observation_count=0,
+            bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools),
+        )
+        surface = DefaultToolSurfaceResolver().resolve(
+            bound_catalog=bound_catalog,
+            turn=turn_context,
+        )
+        static_system_prompt = compose_system_prompt(
+            runtime_config.prompt.system_prompt_base or _SYSTEM_PROMPT,
+            (*runtime_config.prompt.persona_segments, *runtime_config.prompt.runtime_segments),
+        )
+        dynamic_segments = []
+        for provider in self._context_providers():
+            segment = provider.dynamic_segment(turn_context)
+            if segment and segment.strip():
+                dynamic_segments.append(segment.strip())
+        dynamic_context = "\n\n".join(dynamic_segments)
+        system_prompt = (
+            static_system_prompt
+            if not dynamic_segments
+            else f"{static_system_prompt}\n\n{dynamic_context}"
+        )
+        tools = [_gateway_tool_schema(tool) for tool in surface.immediate_tools]
+        return {
+            "system_prompt": system_prompt,
+            "tools": tools,
+            "tool_count": len(tools),
+            "request_config": {
+                "model": str(profile["model"]),
+                "reasoning": {"effort": str(profile["effort"]), "summary": str(profile["summary"])},
+                "tool_schema_format": "llm-turn.v1 gateway payload",
+                "turn": "initial new-chat turn",
+            },
+            "notes": [
+                "System prompt includes profile instructions and provider dynamic context for the initial turn.",
+                "Tools are the exact ModelRequest.tools schema sent to the Studio LLM gateway; the gateway provider may convert them to a vendor-native function schema.",
+            ],
+        }
+
+    def _draft_profile_from_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_id = str(payload.get("id") or "").strip()
+        profile_id = _normalize_profile_id(raw_id) if raw_id else _normalize_profile_id(str(payload.get("name") or "preview"))
+        existing = self._profiles_by_id().get(profile_id, {"id": profile_id, "name": profile_id})
+        raw = dict(existing)
+        for key in ("name", "description", "instructions", "capabilities", "model", "effort", "summary"):
+            if key in payload:
+                raw[key] = payload[key]
+        return self._normalize_profile_payload(
+            raw,
+            profile_id=profile_id,
+            built_in=bool(existing.get("built_in", False)),
+        )
+
+    def _subagent_definitions_for_runtime(self) -> dict[str, SubagentDefinition]:
+        definitions = dict(_SUBAGENT_DEFINITIONS)
+        if self._skill_provider is not None:
+            definitions.update(self._skill_provider.subagent_definitions())
+        return definitions
+
+    def _tool_providers_for_runtime(self) -> tuple[Any, ...]:
+        return tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None) + (
+            OutboxToolProvider(),
+        )
+
+    def _context_providers(self) -> tuple[Any, ...]:
+        return tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None)
+
+    def _preview_tool_registry(self) -> ToolRegistry:
+        registry = ToolRegistry()
+        registry.register_many(builtin_tools(cast(Workspace, None)))
+        for provider in self._tool_providers_for_runtime():
+            registry.register_many(provider.get_tools(None))
+        subagents = self._subagent_definitions_for_runtime()
+        if subagents:
+            registry.register(agent_spawn_tool({name: definition.description for name, definition in subagents.items()}))
+        return registry
+
+    def _profile_index_path(self) -> Path:
+        return self._profile_store_path()
+
+    def _load_profile_index(self) -> dict[str, str]:
+        payload = self._load_profile_store()
+        raw = payload.get("runs") if isinstance(payload, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(run_id): self._known_profile_id(str(profile_id))
+            for run_id, profile_id in raw.items()
+        }
+
+    def _write_profile_index(self, index: dict[str, str]) -> None:
+        payload = self._load_profile_store()
+        payload["runs"] = index
+        self._write_profile_store(payload)
+
+    def _remember_run_profile(self, run_id: str, profile_id: str) -> None:
+        profile_id = self._known_profile_id(profile_id)
+        with self._lock:
+            index = self._load_profile_index()
+            index[run_id] = profile_id
+            self._write_profile_index(index)
+
+    def _profile_for_run(self, run_id: str) -> str:
+        with self._lock:
+            return self._load_profile_index().get(run_id, _DEFAULT_PROFILE_ID)
+
+    def save_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create or update a Studio profile and persist it in the profile sidecar."""
+        with self._lock:
+            raw_id = str(payload.get("id") or "").strip()
+            profile_id = (
+                _normalize_profile_id(raw_id)
+                if raw_id
+                else self._new_profile_id(str(payload.get("name") or "agent"))
+            )
+            defaults = self._profile_defaults()
+            existing = self._profiles_by_id().get(profile_id, {"id": profile_id, "name": profile_id})
+            raw = dict(existing)
+            for key in ("name", "description", "instructions", "capabilities", "model", "effort", "summary"):
+                if key in payload:
+                    raw[key] = (
+                        self._preserve_unavailable_capabilities(
+                            existing.get("capabilities"),
+                            payload[key],
+                        )
+                        if key == "capabilities"
+                        else payload[key]
+                    )
+            profile = self._normalize_profile_payload(
+                raw,
+                profile_id=profile_id,
+                built_in=profile_id in defaults,
+            )
+            store = self._load_profile_store()
+            profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
+            profiles[profile_id] = dict(profile)
+            store["profiles"] = profiles
+            self._write_profile_store(store)
+            body = self.profiles()
+        body["profile"] = profile
+        return body
+
+    def _preserve_unavailable_capabilities(
+        self,
+        existing: Any,
+        requested: Any,
+    ) -> Any:
+        if not isinstance(requested, (list, tuple)):
+            return requested
+        capabilities = [str(cap) for cap in requested]
+        available = set(self._available_capabilities())
+        if isinstance(existing, (list, tuple)):
+            for cap in existing:
+                cap_key = str(cap)
+                if cap_key not in available and cap_key not in capabilities:
+                    capabilities.append(cap_key)
+        return capabilities
+
     # --- provider-backed capabilities (Skills / MCP) ------------------------------------
 
     def _provider_bindings(self) -> dict[str, tuple[ToolBinding, ...]]:
@@ -403,8 +798,23 @@ class StudioServer:
             labels[cap] = _PROVIDER_CAPABILITY_LABELS.get(cap, cap)
         return labels
 
-    def _build_config(self) -> AgentRuntimeConfig:
-        """The runtime config for the current settings, including any enabled provider tools."""
+    def _build_config(self, profile_id: str | None = None) -> AgentRuntimeConfig:
+        """Build a runtime config from either the selected profile or the live global settings."""
+        if profile_id is not None:
+            known_profile_id = self._known_profile_id(profile_id)
+            # Preserve the old Live Config behavior for the untouched default profile: settings
+            # changes apply to new chats. Once a profile is edited, its saved preset owns the new
+            # chat config.
+            if known_profile_id != _DEFAULT_PROFILE_ID or self._profile_has_saved_override(known_profile_id):
+                profile = self._profile_for_config(known_profile_id)
+                return _runtime_config_for(
+                    list(profile["capabilities"]),
+                    str(profile["model"]),
+                    str(profile["effort"]),
+                    str(profile["summary"]),
+                    provider_bindings=self._provider_bindings(),
+                    system_prompt=self._profile_system_prompt(profile),
+                )
         return _runtime_config_for(
             self._capabilities,
             self._model,
@@ -508,17 +918,14 @@ class StudioServer:
         # Enable the provider-backed capabilities by default when their provider is attached.
         self._capabilities = self._available_capabilities()
 
-        subagent_definitions = dict(_SUBAGENT_DEFINITIONS)
-        if self._skill_provider is not None:
-            # Fork skills (context: fork) run as subagents; register their synthesized definitions
-            # (namespaced ids, so no collision with the built-in researcher). No-op for the sample.
-            subagent_definitions.update(self._skill_provider.subagent_definitions())
+        # Fork skills (context: fork) run as subagents; register their synthesized definitions
+        # (namespaced ids, so no collision with the built-in researcher). No-op for the sample.
+        subagent_definitions = self._subagent_definitions_for_runtime()
 
-        provider_instances = tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None)
         # A2A demo: the generic outbox.send tool is always available (its binding is added only for
         # the demo peers, so a normal chat never sees it). Its tools are declared to config
         # validation through the same provider seam as Skills/MCP.
-        provider_instances = provider_instances + (OutboxToolProvider(),)
+        provider_instances = self._tool_providers_for_runtime()
 
         self._backend = RunnerBackend(
             run_root=self.config.run_root,
@@ -537,10 +944,10 @@ class StudioServer:
             # Agent-as-tool: makes agent.spawn available (bound via the "delegate" capability).
             # Plus any fork-skill subagents synthesized by the skill provider.
             subagent_definitions=subagent_definitions,
-            # The provider seam: Skills (tool + context) and MCP (tool) attach here, shared across
+            # The provider seam: Skills and MCP attach here, shared across
             # runs and re-attached on resume. Their tools are declared to config validation too.
             tool_providers=provider_instances,
-            context_providers=(self._skill_provider,) if self._skill_provider is not None else (),
+            context_providers=self._context_providers(),
             # A2A demo: drain each run's outbox into the addressed peer's inbox, and gate outbox.send
             # behind a capability lease (the binding declares requires_lease). AutoGrantBroker grants
             # every request — a dev/demo broker, never production — so the lease gate is *exercised*
@@ -618,11 +1025,18 @@ class StudioServer:
                 parts.append(DocumentPart(source_ref=source_ref, mime_type=mime))
         return tuple(parts)
 
-    def start_chat(self, message: str, attachments: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+    def start_chat(
+        self,
+        message: str,
+        attachments: Sequence[dict[str, Any]] = (),
+        *,
+        profile_id: str = _DEFAULT_PROFILE_ID,
+    ) -> dict[str, Any]:
         """Open a new multi-turn session in the workspace and deliver the first message (with any
         image/document attachments as multimodal content parts)."""
         assert self._backend is not None
-        runtime_config = self._build_config()
+        profile_id = self._known_profile_id(profile_id)
+        runtime_config = self._build_config(profile_id)
         parts = self._parts_from_attachments(message, attachments)
         request = BackendRunRequest(
             tenant_id=_TENANT,
@@ -633,12 +1047,22 @@ class StudioServer:
             mode="propose",
             multi_turn=True,
             runtime_config=runtime_config,
+            metadata={"studio_profile_id": profile_id},
         )
         submission = self._backend.submit_run(request)
         title = " ".join(message.split())[:60] or "(empty)"
         with self._lock:
             self._run_tokens[submission.run_id] = submission.run_token
-            self._sessions.insert(0, {"run_id": submission.run_id, "title": title, "created_at": time.time()})
+            self._sessions.insert(
+                0,
+                {
+                    "run_id": submission.run_id,
+                    "title": title,
+                    "created_at": time.time(),
+                    "profile_id": profile_id,
+                },
+            )
+        self._remember_run_profile(submission.run_id, profile_id)
         return {"run_id": submission.run_id, "status": submission.status}
 
     # --- A2A demo (agent-to-agent durable messaging) ------------------------------------
@@ -718,7 +1142,7 @@ class StudioServer:
             mode="propose",
             multi_turn=True,
             runtime_config=self._a2a_peer_config(name, peer),
-            metadata={"a2a_peer_id": name},
+            metadata={"a2a_peer_id": name, "studio_profile_id": _DEFAULT_PROFILE_ID},
         )
         submission = self._backend.submit_run(request)
         with self._lock:
@@ -726,8 +1150,14 @@ class StudioServer:
             self._agent_directory[name] = submission.run_id
             self._sessions.insert(
                 0,
-                {"run_id": submission.run_id, "title": f"A2A · {name}", "created_at": time.time()},
+                {
+                    "run_id": submission.run_id,
+                    "title": f"A2A · {name}",
+                    "created_at": time.time(),
+                    "profile_id": _DEFAULT_PROFILE_ID,
+                },
             )
+        self._remember_run_profile(submission.run_id, _DEFAULT_PROFILE_ID)
         return submission.run_id
 
     def start_a2a_demo(self, task: str) -> dict[str, Any]:
@@ -745,7 +1175,7 @@ class StudioServer:
         planner_id = self._spawn_peer("planner", "worker", instruction=task)
         return {"planner": planner_id, "worker": worker_id}
 
-    def sessions(self) -> dict[str, Any]:
+    def sessions(self, profile_id: str | None = None) -> dict[str, Any]:
         """The chat history (newest first), restart-surviving via the backend (DX-12).
 
         Source of truth is ``backend.list_runs`` (scans run_root → titles/status + a read token
@@ -754,29 +1184,47 @@ class StudioServer:
         isn't on disk yet are overlaid from the in-memory ``_sessions`` so a new chat appears
         immediately."""
         assert self._backend is not None
+        selected_profile = _normalize_profile_id(profile_id) if profile_id is not None else None
+        profile_names = {profile["id"]: profile["name"] for profile in _DEFAULT_PROFILES}
         listing = self._backend.list_runs(_TENANT, user_id=_USER).get("runs", [])
         with self._lock:
             for run in listing:
                 self._run_tokens.setdefault(run["run_id"], run["read_token"])
             known = {run["run_id"] for run in listing}
             recents = [s for s in self._sessions if s["run_id"] not in known]
-        out = [
-            {
-                "run_id": run["run_id"],
-                "title": run["title"] or run["run_id"],
-                "status": run["status"],
-                "created_at": run["created_at"],
-                "recoverable": run["recoverable"],
-            }
-            for run in listing
-        ]
-        out += [
-            {"run_id": s["run_id"], "title": s["title"], "status": "running",
-             "created_at": s["created_at"], "recoverable": False}
-            for s in recents
-        ]
+        out = []
+        for run in listing:
+            run_profile = self._profile_for_run(str(run["run_id"]))
+            if selected_profile is not None and run_profile != selected_profile:
+                continue
+            out.append(
+                {
+                    "run_id": run["run_id"],
+                    "title": run["title"] or run["run_id"],
+                    "status": run["status"],
+                    "created_at": run["created_at"],
+                    "recoverable": run["recoverable"],
+                    "profile_id": run_profile,
+                    "profile_name": profile_names.get(run_profile, run_profile),
+                }
+            )
+        for s in recents:
+            run_profile = _normalize_profile_id(str(s.get("profile_id") or _DEFAULT_PROFILE_ID))
+            if selected_profile is not None and run_profile != selected_profile:
+                continue
+            out.append(
+                {
+                    "run_id": s["run_id"],
+                    "title": s["title"],
+                    "status": "running",
+                    "created_at": s["created_at"],
+                    "recoverable": False,
+                    "profile_id": run_profile,
+                    "profile_name": profile_names.get(run_profile, run_profile),
+                }
+            )
         out.sort(key=lambda entry: entry["created_at"], reverse=True)
-        return {"sessions": out}
+        return {"sessions": out, "profile_id": selected_profile}
 
     def continue_chat(
         self, run_id: str, message: str, attachments: Sequence[dict[str, Any]] = ()
@@ -931,20 +1379,28 @@ class StudioServer:
 
     def capabilities_catalog(self) -> dict[str, Any]:
         """Read-only catalog of the attached providers' offerings, for a UI list: the available
-        Agent Skills (name + description), the connected MCP server's tools (id + description), and
-        the output validators registered on the backend (id). Each empty when none is attached."""
+        Agent Skills, the connected MCP server's tools/resources/prompts, and the output validators
+        registered on the backend (id). Each empty when none is attached."""
         skills = self._skill_provider.catalog() if self._skill_provider is not None else []
         mcp_tools: list[dict[str, str]] = []
+        mcp_resources: list[dict[str, Any]] = []
+        mcp_prompts: list[dict[str, Any]] = []
         if self._mcp_provider is not None:
-            mcp_tools = [
-                {"id": spec.id, "description": spec.description}
-                for spec in self._mcp_provider.get_tools()
-            ]
+            catalog = self._mcp_provider.catalog()
+            mcp_tools = catalog.get("tools", [])
+            mcp_resources = catalog.get("resources", [])
+            mcp_prompts = catalog.get("prompts", [])
         output_validators = [
             {"id": validator.id}
             for validator in (self._backend.output_validators if self._backend is not None else ())
         ]
-        return {"skills": skills, "mcp_tools": mcp_tools, "output_validators": output_validators}
+        return {
+            "skills": skills,
+            "mcp_tools": mcp_tools,
+            "mcp_resources": mcp_resources,
+            "mcp_prompts": mcp_prompts,
+            "output_validators": output_validators,
+        }
 
     def update_settings(
         self,
@@ -970,14 +1426,18 @@ class StudioServer:
             self._summary = summary
         if otel is not None:
             self._set_otel(otel)
-        new_config = self._build_config()
         with self._lock:
-            active = list(self._run_tokens.items())
+            profile_index = self._load_profile_index()
+            active = [
+                (run_id, token, profile_index.get(run_id, _DEFAULT_PROFILE_ID))
+                for run_id, token in self._run_tokens.items()
+            ]
         applied = 0
-        for run_id, token in active:
+        for run_id, token, profile_id in active:
             current = self._backend.current_runtime_config(run_id)
             if current is None:
                 continue
+            new_config = self._build_config(profile_id)
             try:
                 self._backend.replace_runtime_config(
                     run_id,
@@ -1111,6 +1571,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/capabilities-catalog":
                 self._write_json(studio.capabilities_catalog())
                 return
+            if parsed.path == "/api/profiles":
+                self._write_json(studio.profiles())
+                return
             if parsed.path == "/healthz":
                 self._write_json({"ok": True})
                 return
@@ -1161,7 +1624,8 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     )
                 return
             if parsed.path == "/api/sessions":
-                self._write_json(studio.sessions())
+                profile_id = (parse_qs(parsed.query).get("profile_id") or [None])[0]
+                self._write_json(studio.sessions(profile_id=profile_id))
                 return
             if parsed.path == "/api/proposal":
                 run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
@@ -1235,7 +1699,11 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     if run_id:
                         result = studio.continue_chat(str(run_id), message, attachments)
                     else:
-                        result = studio.start_chat(message, attachments)
+                        result = studio.start_chat(
+                            message,
+                            attachments,
+                            profile_id=str(body.get("profile_id") or _DEFAULT_PROFILE_ID),
+                        )
                     self._write_json(result)
                     return
                 if parsed.path == "/api/a2a-demo":
@@ -1292,6 +1760,14 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     if "otel" in body:
                         kwargs["otel"] = bool(body.get("otel"))
                     self._write_json(studio.update_settings(**kwargs))
+                    return
+                if parsed.path == "/api/profiles":
+                    body = self._read_json()
+                    self._write_json(studio.save_profile(body))
+                    return
+                if parsed.path == "/api/profile-preview":
+                    body = self._read_json()
+                    self._write_json(studio.profile_preview(body))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
             except NativeAgentError as exc:

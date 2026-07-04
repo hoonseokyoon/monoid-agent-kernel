@@ -410,17 +410,16 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
   the `skill` tools reach the model (mirrors the MCP provider). The CLI
   `--skills-directory` does all of this.
 - **Definition** (`SkillDefinition`): `name`, `description` (both advertised at L1),
-  `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (**advisory** for
-  inline skills — a hint, not enforced; **enforced** for fork skills, see below), `context`
+  `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (advisory for
+  inline skills and enforced for fork skills, see below), `context`
   (`"inline"` default | `"fork"`), `directory` (bundle root for L3), `metadata`.
-- **Fork skills** (`context: fork`): instead of loading instructions inline, the skill runs
-  as an isolated **subagent** (reusing the subagent machine) and only its final message
-  returns — heavy skills keep their working noise out of the main context. The model calls
-  `skill(name, task)` with `task` describing the goal; the subagent's persona is the skill's
-  instructions and `task` is its first user message. A **non-empty** `allowed_tools` becomes the
-  subagent's tool **allowlist** — resolved against the parent's bindings, so it is a hard
-  ceiling (here `allowed-tools` is genuinely *enforced*, unlike inline skills); an empty
-  `allowed_tools` inherits all of the parent's tools (no narrowing). Enable by
+- **Fork skills** (`context: fork`): the skill runs as an isolated **subagent** (reusing
+  the subagent machine) and only its final message returns. Heavy skills keep their working
+  noise out of the main context. The model calls `skill(name, task)` with `task` describing
+  the goal; the subagent's persona is the skill's instructions and `task` is its first user
+  message. A **non-empty** `allowed_tools` becomes the subagent's tool **allowlist**,
+  resolved against the parent's bindings as a hard ceiling. An empty `allowed_tools`
+  inherits all of the parent's tools. Enable by
   merging `SkillProvider.subagent_definitions()` (namespaced `skill:<name>` ids) into
   `AgentLoop(subagent_definitions=...)`; the CLI does this automatically. The delegated run
   is reported in the usual `subagent_count`/`subagent.*` events and metrics.
@@ -457,7 +456,7 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
   recursively for `SKILL.md` files (the `<skills>/<skill-name>/SKILL.md` convention); the
   skill name is the frontmatter `name` (falling back to the directory name) and the
   SKILL.md's parent directory is the bundle root. Frontmatter fields: `name`, `description`,
-  `allowed-tools` (space-separated per the spec, or an inline list), `metadata`. Parsed by
+  `allowed-tools` (space-separated per the spec, or an inline list), `context`, `metadata`. Parsed by
   the same zero-dependency `parse_frontmatter` used for subagents.
 
 ### Session Lifecycle (`AgentSession` + FSM)

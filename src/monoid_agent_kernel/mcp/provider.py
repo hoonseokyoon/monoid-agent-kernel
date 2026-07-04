@@ -1,9 +1,14 @@
-"""An MCP server exposed as a ``ToolProvider`` — lists its tools and proxies calls.
+"""An MCP server exposed as provider-level tools and optional context.
 
 The core engine is untouched: MCP tools are ordinary ``ToolSpec``s whose handler proxies
 ``tools/call`` over a synchronous ``McpHttpClient``. Because the core runs tool handlers via
 ``asyncio.to_thread``, a blocking httpx call in the handler is the natural fit — no async
 session/loop bridge is needed (unlike frameworks built on the async-only ``mcp`` SDK).
+
+Resources and prompts remain provider-level too: when the MCP server advertises catalogs,
+read-only helper tools expose ``resources/read`` and ``prompts/get`` through the same
+``ToolProvider`` seam, and a ``ContextProvider`` catalog appears only while those helper tools
+are bound.
 
 Provider tools are NOT auto-bound: a run only sees tools that have a matching ``ToolBinding``
 in its runtime config. Use :meth:`McpToolProvider.tool_bindings` to generate those bindings
@@ -38,6 +43,8 @@ class McpToolProvider:
         self._allowed = set(allowed_tools) if allowed_tools is not None else None
         self._blocked = set(blocked_tools or ())
         self._tools: list[dict[str, Any]] | None = None  # discovered MCP tool descriptors (cached)
+        self._resources: list[dict[str, Any]] | None = None  # discovered MCP resource descriptors
+        self._prompts: list[dict[str, Any]] | None = None  # discovered MCP prompt descriptors
 
     def __enter__(self) -> McpToolProvider:
         return self
@@ -53,13 +60,130 @@ class McpToolProvider:
     def _discover(self) -> list[dict[str, Any]]:
         if self._tools is None:
             self._client.initialize()
-            self._tools = [t for t in self._client.list_tools() if self._selected(str(t.get("name") or ""))]
+            try:
+                tools = self._client.list_tools()
+            except McpError as exc:
+                if exc.code == -32601:
+                    tools = []
+                else:
+                    raise
+            self._tools = [
+                t
+                for t in tools
+                if self._selected(str(t.get("name") or ""), f"mcp.{self._server}.{str(t.get('name') or '')}")
+            ]
         return self._tools
 
-    def _selected(self, name: str) -> bool:
-        if name in self._blocked:
+    def _discover_resources(self) -> list[dict[str, Any]]:
+        if self._resources is None:
+            self._client.initialize()
+            self._resources = self._optional_catalog(self._client.list_resources)
+        return self._resources
+
+    def _discover_prompts(self) -> list[dict[str, Any]]:
+        if self._prompts is None:
+            self._client.initialize()
+            self._prompts = self._optional_catalog(self._client.list_prompts)
+        return self._prompts
+
+    def _optional_catalog(self, load: Any) -> list[dict[str, Any]]:
+        try:
+            return [item for item in load() if isinstance(item, dict)]
+        except McpError as exc:
+            if exc.code == -32601:  # server does not implement this optional MCP surface
+                return []
+            raise
+
+    def _selected(self, *names: str) -> bool:
+        candidates = {name for name in names if name}
+        if not candidates:
             return False
-        return self._allowed is None or name in self._allowed
+        if candidates & self._blocked:
+            return False
+        return self._allowed is None or bool(candidates & self._allowed)
+
+    def _resource_read_selected(self) -> bool:
+        return self._selected(
+            "resource.read",
+            "resources/read",
+            f"mcp.{self._server}.resource.read",
+            self._resource_read_tool_id(),
+            self._resource_read_tool_name(),
+        )
+
+    def _prompt_get_selected(self) -> bool:
+        return self._selected(
+            "prompt.get",
+            "prompts/get",
+            f"mcp.{self._server}.prompt.get",
+            self._prompt_get_tool_id(),
+            self._prompt_get_tool_name(),
+        )
+
+    def invalidate_tools(self) -> None:
+        """Drop the cached ``tools/list`` result after an observed tools/list_changed signal."""
+        self._tools = None
+
+    def invalidate_resources(self) -> None:
+        """Drop the cached ``resources/list`` result after an observed resources/list_changed signal."""
+        self._resources = None
+
+    def invalidate_prompts(self) -> None:
+        """Drop the cached ``prompts/list`` result after an observed prompts/list_changed signal."""
+        self._prompts = None
+
+    def handle_list_changed(self, method: str) -> bool:
+        """Invalidate the matching catalog for MCP ``notifications/*/list_changed`` messages.
+
+        This is a manual hook for embedders that already receive notifications. The provider does
+        not start an SSE listener or subscription loop.
+        """
+        if method.endswith("tools/list_changed"):
+            self.invalidate_tools()
+            return True
+        if method.endswith("resources/list_changed"):
+            self.invalidate_resources()
+            return True
+        if method.endswith("prompts/list_changed"):
+            self.invalidate_prompts()
+            return True
+        return False
+
+    # -- ContextProvider ----------------------------------------------------------------
+
+    def static_segment(self) -> str | None:
+        return None
+
+    def dynamic_segment(self, turn: Any) -> str | None:
+        bound = getattr(turn, "bound_tools", frozenset())
+        sections: list[str] = []
+        if self._resource_read_tool_id() in bound and self._resource_read_selected():
+            resources = self._discover_resources()
+            if resources:
+                sections.extend(
+                    [
+                        f"# MCP Resources ({self._server})",
+                        "",
+                        f"Read a resource with `{self._resource_read_tool_name()}` using its URI.",
+                        "",
+                        *_catalog_lines(resources, key="uri"),
+                    ]
+                )
+        if self._prompt_get_tool_id() in bound and self._prompt_get_selected():
+            prompts = self._discover_prompts()
+            if prompts:
+                if sections:
+                    sections.append("")
+                sections.extend(
+                    [
+                        f"# MCP Prompts ({self._server})",
+                        "",
+                        f"Fetch a prompt template with `{self._prompt_get_tool_name()}` using its name.",
+                        "",
+                        *_catalog_lines(prompts, key="name"),
+                    ]
+                )
+        return "\n".join(sections) if sections else None
 
     # -- ToolProvider ------------------------------------------------------------------
 
@@ -76,14 +200,77 @@ class McpToolProvider:
                 provider_name=f"mcp_{self._server}_{name}",  # exported_name; avoids registry collisions
                 annotations=dict(tool.get("annotations") or {}),
             )
+        resources = self._discover_resources() if self._resource_read_selected() else []
+        if resources:
+            yield ToolSpec(
+                id=self._resource_read_tool_id(),
+                description=(
+                    f"Read a resource exposed by the MCP server '{self._server}'. Choose 'uri' "
+                    "from the advertised MCP resource catalog."
+                ),
+                input_schema=_object_schema(
+                    {
+                        "uri": {"type": "string"},
+                    },
+                    required=["uri"],
+                ),
+                capability=f"mcp.{self._server}",
+                side_effect="read",
+                handler=self._resource_read_handler(),
+                provider_name=self._resource_read_exported_name(),
+            )
+        prompts = self._discover_prompts() if self._prompt_get_selected() else []
+        if prompts:
+            yield ToolSpec(
+                id=self._prompt_get_tool_id(),
+                description=(
+                    f"Get a prompt template exposed by the MCP server '{self._server}'. Choose "
+                    "'name' from the advertised MCP prompt catalog and pass optional arguments."
+                ),
+                input_schema=_object_schema(
+                    {
+                        "name": {"type": "string"},
+                        "arguments": {"type": "object", "additionalProperties": True, "default": {}},
+                    },
+                    required=["name"],
+                ),
+                capability=f"mcp.{self._server}",
+                side_effect="read",
+                handler=self._prompt_get_handler(),
+                provider_name=self._prompt_get_exported_name(),
+            )
 
     def tool_bindings(self) -> tuple[ToolBinding, ...]:
         """Bindings for every discovered tool, to merge into the runtime config so the run can
         see them (provider tools are not auto-bound)."""
-        return tuple(
-            ToolBinding(binding_id=spec.id, ref=RegistryToolRef(tool_id=spec.id), authorization="allow")
-            for spec in self.get_tools()
-        )
+        bindings: list[ToolBinding] = []
+        for spec in self.get_tools():
+            model_name = None
+            if spec.id == self._resource_read_tool_id():
+                model_name = self._resource_read_tool_name()
+            elif spec.id == self._prompt_get_tool_id():
+                model_name = self._prompt_get_tool_name()
+            bindings.append(
+                ToolBinding(
+                    binding_id=spec.id,
+                    ref=RegistryToolRef(tool_id=spec.id),
+                    authorization="allow",
+                    model_name=model_name,
+                )
+            )
+        return tuple(bindings)
+
+    def catalog(self) -> dict[str, list[dict[str, Any]]]:
+        """Plain catalog data for UIs. Tool descriptors keep id/description; resources/prompts
+        expose only server-provided descriptors."""
+        return {
+            "tools": [
+                {"id": f"mcp.{self._server}.{str(tool.get('name') or '')}", "description": str(tool.get("description") or "")}
+                for tool in self._discover()
+            ],
+            "resources": list(self._discover_resources()) if self._resource_read_selected() else [],
+            "prompts": list(self._discover_prompts()) if self._prompt_get_selected() else [],
+        }
 
     def _make_handler(self, mcp_name: str):
         def handler(_context: Any, arguments: dict[str, Any]) -> ToolResult:
@@ -94,6 +281,47 @@ class McpToolProvider:
             return _to_tool_result(result)
 
         return handler
+
+    def _resource_read_handler(self):
+        def handler(_context: Any, arguments: dict[str, Any]) -> ToolResult:
+            uri = str(arguments.get("uri") or "")
+            try:
+                result = self._client.read_resource(uri)
+            except McpError as exc:
+                return ToolResult(ok=False, error=str(exc), error_code="mcp_resource_read_failed", retryable=True)
+            return ToolResult(ok=True, content=result)
+
+        return handler
+
+    def _prompt_get_handler(self):
+        def handler(_context: Any, arguments: dict[str, Any]) -> ToolResult:
+            name = str(arguments.get("name") or "")
+            prompt_args = arguments.get("arguments") or {}
+            try:
+                result = self._client.get_prompt(name, prompt_args if isinstance(prompt_args, dict) else {})
+            except McpError as exc:
+                return ToolResult(ok=False, error=str(exc), error_code="mcp_prompt_get_failed", retryable=True)
+            return ToolResult(ok=True, content=result)
+
+        return handler
+
+    def _resource_read_tool_id(self) -> str:
+        return f"mcp.{self._server}.__helper.resource.read"
+
+    def _prompt_get_tool_id(self) -> str:
+        return f"mcp.{self._server}.__helper.prompt.get"
+
+    def _resource_read_tool_name(self) -> str:
+        return f"mcp_{self._server}_resource_read"
+
+    def _prompt_get_tool_name(self) -> str:
+        return f"mcp_{self._server}_prompt_get"
+
+    def _resource_read_exported_name(self) -> str:
+        return f"mcp_{self._server}__helper_resource_read"
+
+    def _prompt_get_exported_name(self) -> str:
+        return f"mcp_{self._server}__helper_prompt_get"
 
 
 def _side_effect(annotations: dict[str, Any] | None) -> ToolSideEffect:
@@ -151,3 +379,29 @@ def _collect_media(blocks: Any) -> list[dict[str, Any]]:
         elif block_type == "resource_link":
             media.append({"type": "resource_link", "uri": block.get("uri"), "name": block.get("name")})
     return media
+
+
+def _object_schema(properties: dict[str, Any], *, required: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": properties,
+        "required": required or [],
+        "additionalProperties": False,
+    }
+
+
+def _catalog_lines(items: list[dict[str, Any]], *, key: str) -> list[str]:
+    lines: list[str] = []
+    for item in items:
+        value = str(item.get(key) or "")
+        if not value:
+            continue
+        name = str(item.get("name") or "")
+        description = str(item.get("description") or "")
+        mime = str(item.get("mimeType") or item.get("mime_type") or "")
+        label = value if not name or name == value else f"{value} ({name})"
+        suffix_parts = [part for part in (description, mime) if part]
+        suffix = f": {'; '.join(suffix_parts)}" if suffix_parts else ""
+        lines.append(f"- {label}{suffix}")
+    return lines

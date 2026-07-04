@@ -27,9 +27,22 @@
   .badge { margin-left: auto; font-size: 11px; padding: 2px 8px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--muted); }
   .badge.offline { color: var(--warn); border-color: var(--warn); }
-  #body { flex: 1; display: flex; min-height: 0; }
-  #sidebar { width: 240px; min-width: 240px; overflow: auto; border-right: 1px solid var(--border);
-    background: var(--panel); padding: 10px 12px; }
+  #body { flex: 1; display: grid; grid-template-columns: 260px minmax(0, 1fr) 380px; min-height: 0;
+    overflow: hidden; }
+  #sidebar { overflow: hidden; border-right: 1px solid var(--border);
+    background: var(--panel); padding: 10px 12px; min-height: 0;
+    display: flex; flex-direction: column; gap: 8px; }
+  #sidebar > .side-title, #sidebar > #profile, #sidebar > #profile-actions { flex: none; }
+  #chat { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  #sidepanel { min-width: 320px; border-left: 1px solid var(--border); background: var(--panel);
+    display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  .side-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 8px;
+    border-bottom: 1px solid var(--border); }
+  .side-tabs button { border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+    border-radius: 8px; padding: 7px 8px; font-size: 12px; }
+  .side-tabs button.active { color: var(--text); border-color: var(--accent); }
+  .side-panel { min-height: 0; overflow: auto; padding: 12px 14px; }
+  .side-panel[hidden] { display: none; }
   .side-title { font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
     color: var(--muted); margin-bottom: 8px; }
   #tree { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
@@ -47,12 +60,11 @@
   #jobs li.failed .st { color: var(--err); }
   #log { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 22px 20px; display: flex;
     flex-direction: column; gap: 14px; min-width: 0; }
-  #proposal { width: 380px; min-width: 320px; border-left: 1px solid var(--border);
-    background: var(--panel); padding: 12px 14px; overflow: auto; display: flex;
+  #proposal {
+    padding: 12px 0 0; overflow: auto; display: flex;
     flex-direction: column; gap: 10px; }
   #proposal[hidden] { display: none; }
-  #viewer { width: 420px; min-width: 320px; border-left: 1px solid var(--border);
-    background: var(--panel); padding: 12px 14px; overflow: auto; display: flex; flex-direction: column; }
+  #viewer { padding: 12px 0 0; overflow: auto; display: flex; flex-direction: column; }
   #viewer[hidden] { display: none; }
   #viewer .side-title { display: flex; justify-content: space-between; align-items: center; }
   #viewer-body { flex: 1; margin: 0; white-space: pre; overflow: auto; background: var(--bg);
@@ -127,7 +139,7 @@
   .hitl button:disabled { opacity: .5; cursor: default; }
   .hitl.answered { opacity: .65; }
   .hitl .answered-note { color: var(--muted); font-size: 12px; margin-top: 8px; }
-  footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
+  footer { flex: none; border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
   #setup { display: flex; align-items: center; gap: 14px; max-width: 900px; margin: 0 auto 8px;
     font-size: 12px; color: var(--muted); flex-wrap: wrap; }
   #setup label { display: flex; align-items: center; gap: 6px; }
@@ -137,7 +149,8 @@
   #setup input:disabled { opacity: .5; }
   #setup-status { color: var(--accent); }
   form { display: flex; gap: 10px; max-width: 900px; margin: 0 auto; align-items: flex-end; }
-  #attachments { display: flex; flex-wrap: wrap; gap: 6px; max-width: 900px; margin: 0 auto 8px; }
+  #attachments { display: flex; flex-wrap: wrap; gap: 6px; max-width: 900px; max-height: 72px;
+    overflow-y: auto; margin: 0 auto 8px; }
   #attachments:empty { display: none; }
   .attach-pill { font-size: 11.5px; background: var(--bg); border: 1px solid var(--border);
     border-radius: 999px; padding: 3px 6px 3px 10px; color: var(--text); display: inline-flex;
@@ -155,7 +168,8 @@
   button:disabled { opacity: .5; cursor: default; }
   #stop { background: var(--err); color: #1c0606; }
   .usage { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  #plan { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+  #plan { list-style: none; padding: 0 2px 0 0; margin: 0; font-size: 13px;
+    flex: 0 1 clamp(80px, 22vh, 240px); min-height: 0; overflow: auto; }
   #plan li { padding: 3px 0; color: var(--muted); display: flex; gap: 6px; align-items: baseline; }
   #plan li .st { flex: none; width: 14px; text-align: center; }
   #plan li.done { color: var(--text); }
@@ -172,7 +186,8 @@
   .subagent .sa-out { white-space: pre-wrap; font-size: 13px; margin-top: 4px; }
   .hlink { color: var(--muted); text-decoration: none; font-size: 12px; margin-left: 10px; cursor: pointer; }
   .hlink:hover, .hlink.on { color: var(--accent); }
-  #sessions { list-style: none; padding: 0; margin: 0; }
+  #sessions { list-style: none; padding: 0 2px 0 0; margin: 0; flex: 1 1 160px;
+    min-height: 80px; overflow: auto; }
   #sessions li { font-size: 12px; padding: 4px 6px; border-radius: 6px; cursor: pointer; color: var(--muted);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #sessions li:hover { background: rgba(255,255,255,.05); }
@@ -185,6 +200,28 @@
   #sessions li.untitled { color: #5b6273; }
   #sessions li.untitled .sid { font-size: 10px; opacity: .7; margin-left: 6px;
     font-family: ui-monospace, Consolas, monospace; }
+  #profile-actions { display: flex; gap: 8px; margin: 0 0 10px; }
+  #profile-add { width: 100%; min-height: 32px; border-radius: 8px; padding: 0 10px; }
+  #profiles { list-style: none; padding: 0 2px 0 0; margin: 0; display: flex; flex-direction: column;
+    gap: 8px; flex: 0 1 clamp(96px, 28vh, 300px); min-height: 0; overflow: auto; }
+  #profiles li { padding: 8px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+    color: var(--muted); background: rgba(0,0,0,.08); }
+  #profiles li.active { border-color: var(--accent); color: var(--text); background: rgba(110,168,254,.08); }
+  .profile-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .profile-name { color: var(--text); font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .profile-built-in { font-size: 10px; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 999px; padding: 0 5px; }
+  .profile-edit { margin-left: auto; background: transparent; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 6px; min-height: 0; padding: 1px 7px; font-size: 11px; }
+  .profile-edit:hover { color: var(--text); border-color: var(--accent); }
+  .profile-desc { font-size: 11.5px; line-height: 1.35; color: var(--muted); margin-bottom: 5px; }
+  .profile-meta { display: flex; flex-wrap: wrap; gap: 4px; }
+  .profile-chip { font-size: 10.5px; border: 1px solid var(--border); border-radius: 999px;
+    padding: 1px 6px; color: var(--muted); }
+  #profile { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 8px; margin-bottom: 8px; }
+  #live-caps { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+  #live-caps label { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
   #trace { overflow: auto; }
   #trace-tree { font-size: 12px; font-variant-numeric: tabular-nums; }
   #trace-tree ul { list-style: none; margin: 0; padding-left: 14px; border-left: 1px solid var(--border, #2a2f3a); }
@@ -202,6 +239,75 @@
   }
   #onboarding .ob-prompt:hover { border-color: var(--accent); }
   #onboarding .ob-note { font-size: 12px; color: var(--warn); margin-top: 12px; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.58);
+    display: flex; align-items: center; justify-content: center; padding: clamp(12px, 2vw, 24px);
+    z-index: 20; overflow: hidden; }
+  .modal-backdrop[hidden] { display: none; }
+  .modal { width: min(1180px, calc(100vw - 32px)); height: min(840px, calc(100dvh - 48px));
+    max-height: calc(100dvh - 24px); overflow: hidden; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 16px 48px rgba(0,0,0,.45); padding: 16px; }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .modal-head h2 { margin: 0; font-size: 16px; }
+  .modal-close { background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 8px; min-height: 0; padding: 3px 9px; }
+  .profile-form { flex: 1; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto auto; gap: 12px; }
+  .profile-editor-layout { display: grid; grid-template-columns: minmax(340px, 0.92fr) minmax(420px, 1.08fr);
+    gap: 14px; align-items: stretch; min-height: 0; overflow: hidden; }
+  .profile-editor-panel { border: 1px solid var(--border); background: rgba(0,0,0,.10);
+    border-radius: 8px; padding: 12px; min-width: 0; min-height: 0; overflow: auto; }
+  .profile-preview-panel { display: grid; grid-template-rows: auto auto minmax(138px, .95fr) minmax(180px, 1.25fr) minmax(92px, .45fr) minmax(76px, .35fr);
+    gap: 10px; overflow: hidden; }
+  .profile-form label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+  .profile-form input, .profile-form textarea, .profile-form select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font: inherit; width: 100%; }
+  .profile-form textarea { min-height: 84px; resize: vertical; }
+  #profile-instructions-input { min-height: 140px; }
+  .profile-grid { display: grid; grid-template-columns: minmax(0, 1fr) 150px; gap: 10px; }
+  .profile-summary-toggle { align-self: end; display: flex !important; align-items: center;
+    grid-auto-flow: column; justify-content: start; gap: 8px !important; min-height: 38px; }
+  .profile-summary-toggle input { width: auto; }
+  #profile-capabilities { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  #profile-capabilities label { display: flex; align-items: center; gap: 7px;
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 8px; color: var(--text); }
+  #profile-capabilities input { width: auto; }
+  .prompt-preview-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline;
+    min-width: 0; }
+  .prompt-preview-head h3 { margin: 0; font-size: 13px; }
+  .prompt-preview-note { color: var(--muted); font-size: 11.5px; }
+  .prompt-block { border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+    padding: 10px; margin-bottom: 10px; }
+  .profile-preview-panel .prompt-block { display: flex; flex-direction: column; min-height: 0;
+    overflow: hidden; margin-bottom: 0; }
+  .prompt-block-title { display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 7px; color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .04em; }
+  .prompt-block-title span:last-child { text-transform: none; letter-spacing: 0; color: var(--accent); }
+  .prompt-block pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; min-height: 0; overflow: auto;
+    font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; color: #d7dde6; }
+  .prompt-block.empty pre { color: var(--muted); font-family: inherit; }
+  .prompt-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+    min-width: 0; }
+  .prompt-meta-card { border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+    color: var(--muted); font-size: 12px; min-width: 0; overflow: hidden; }
+  .prompt-meta-card b { display: block; color: var(--text); font-weight: 600; margin-bottom: 2px; }
+  .prompt-meta-card span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .prompt-context-list { margin: 0; padding-left: 18px; color: #d7dde6; font-size: 12px;
+    min-height: 0; overflow: auto; }
+  .prompt-context-list li { margin: 3px 0; }
+  @media (max-width: 900px) {
+    .modal { height: min(920px, calc(100dvh - 24px)); overflow: auto; }
+    .profile-form { display: block; }
+    .profile-editor-layout { grid-template-columns: 1fr; overflow: visible; }
+    .profile-editor-panel { overflow: visible; }
+    .profile-preview-panel { min-height: min(720px, calc(100dvh - 96px)); overflow: hidden; margin-top: 12px; }
+    .profile-grid { grid-template-columns: 1fr; }
+    .prompt-meta { grid-template-columns: 1fr; }
+  }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+  #profile-cancel { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  #profile-editor-status { min-height: 18px; font-size: 12px; color: var(--muted); }
 </style>
 <!-- Optional math rendering: KaTeX auto-render. Vendored locally (woff2 fonts only) so Studio
      keeps its no-network promise; if these assets are missing the chat shows raw LaTeX. -->
@@ -220,64 +326,162 @@
     <a href="#" id="trace-btn" class="hlink" title="Toggle the run trace">Trace</a>
     <a href="/settings" title="Settings" style="color:var(--muted);text-decoration:none;font-size:16px;margin-left:6px">⚙</a>
   </header>
-  <div id="body">
-    <aside id="sidebar">
+  <div id="body" data-testid="studio-shell">
+    <aside id="sidebar" data-testid="left-config-panel">
+      <div class="side-title">Agent profile</div>
+      <select id="profile" data-testid="profile-switcher" title="Active Studio profile"></select>
+      <div id="profile-actions">
+        <button id="profile-add" type="button" data-testid="profile-add">Add profile</button>
+      </div>
+      <ul id="profiles" data-testid="profile-list"></ul>
       <div class="side-title">Chats
         <a href="#" id="a2a-demo" class="hlink" style="float:right;font-weight:400"
            title="Spin up two peer agents that message each other through the durable outbox→inbox fabric">⇄ A2A demo</a>
       </div>
-      <ul id="sessions"></ul>
-      <div class="side-title" style="margin-top:14px">Files</div>
-      <ul id="tree"></ul>
+      <ul id="sessions" data-testid="profile-session-list"></ul>
       <div class="side-title" id="plan-title" style="margin-top:14px" hidden>Plan</div>
       <ol id="plan" hidden></ol>
-      <div class="side-title" style="margin-top:14px">Jobs</div>
-      <ul id="jobs"></ul>
-      <div class="side-title" id="skills-title" style="margin-top:14px" hidden>Skills</div>
-      <ul id="skills" hidden></ul>
-      <div class="side-title" id="mcp-title" style="margin-top:14px" hidden>MCP tools</div>
-      <ul id="mcp-tools" hidden></ul>
     </aside>
-    <div id="log"></div>
-    <aside id="proposal" hidden>
-      <div class="side-title">Proposed changes</div>
-      <label id="proposal-all"><input type="checkbox" id="select-all" checked /> Select all</label>
-      <div id="proposal-files"></div>
-      <pre id="diff"></pre>
-      <div id="proposal-actions">
-        <button id="apply" type="button">Approve &amp; apply</button>
-        <button id="export" type="button" title="Download a portable, self-verifying proposal package (.tar)">Export package</button>
+    <section id="chat" data-testid="center-chat">
+      <div id="log" data-testid="chat-log"></div>
+      <footer>
+        <div id="attachments"></div>
+        <form id="form" data-testid="composer">
+          <label id="attach-btn" title="Attach an image or PDF">📎
+            <input id="attach" type="file" accept="image/*,application/pdf" multiple hidden />
+          </label>
+          <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)" autofocus></textarea>
+          <button id="send" type="submit">Send</button>
+          <button id="stop" type="button" hidden>Stop</button>
+        </form>
+      </footer>
+    </section>
+    <aside id="sidepanel" data-testid="right-side-panel">
+      <div class="side-tabs" data-testid="right-panel-tabs">
+        <button id="tab-workspace" type="button" data-panel="workspace-panel" class="active">Workspace</button>
+        <button id="tab-trace" type="button" data-panel="trace-panel">Trace</button>
+        <button id="tab-config" type="button" data-panel="config-panel">Live Config</button>
       </div>
-      <div id="apply-status"></div>
-    </aside>
-    <aside id="trace" hidden>
-      <div class="side-title">Trace</div>
-      <div id="trace-tree"></div>
-    </aside>
-    <aside id="viewer" hidden>
-      <div class="side-title"><span id="viewer-name">File</span>
-        <a href="#" id="viewer-close" class="hlink" title="Close">✕</a></div>
-      <pre id="viewer-body"></pre>
+      <section id="workspace-panel" class="side-panel" data-testid="workspace-panel">
+        <div class="side-title">Workspace</div>
+        <ul id="tree"></ul>
+        <div class="side-title" style="margin-top:14px">Jobs</div>
+        <ul id="jobs"></ul>
+        <aside id="proposal" hidden>
+          <div class="side-title">Proposed changes</div>
+          <label id="proposal-all"><input type="checkbox" id="select-all" checked /> Select all</label>
+          <div id="proposal-files"></div>
+          <pre id="diff"></pre>
+          <div id="proposal-actions">
+            <button id="apply" type="button">Approve &amp; apply</button>
+            <button id="export" type="button" title="Download a portable, self-verifying proposal package (.tar)">Export package</button>
+          </div>
+          <div id="apply-status"></div>
+        </aside>
+        <aside id="viewer" hidden>
+          <div class="side-title"><span id="viewer-name">File</span>
+            <a href="#" id="viewer-close" class="hlink" title="Close">✕</a></div>
+          <pre id="viewer-body"></pre>
+        </aside>
+      </section>
+      <section id="trace-panel" class="side-panel" hidden>
+        <aside id="trace" data-testid="trace-panel-content">
+          <div class="side-title">Trace</div>
+          <div id="trace-tree"></div>
+        </aside>
+      </section>
+      <section id="config-panel" class="side-panel" hidden data-testid="live-config-panel">
+        <div id="setup" data-testid="settings-config-popup">
+          <label>Model <input id="model" type="text" spellcheck="false" autocomplete="off" /></label>
+          <label>Thinking level <select id="effort"></select></label>
+          <label title="Show the model-provided reasoning summary when available">Show thinking summary <input type="checkbox" id="summary" /></label>
+          <label title="Export OpenTelemetry spans to the configured OTLP collector">OTel <input type="checkbox" id="otel" /></label>
+          <span id="setup-status"></span>
+        </div>
+        <div class="side-title" style="margin-top:14px">Capabilities</div>
+        <div id="live-caps" data-testid="capability-toggles"></div>
+        <div class="side-title" id="skills-title" style="margin-top:14px" hidden>Skills</div>
+        <ul id="skills" hidden></ul>
+        <div class="side-title" id="mcp-title" style="margin-top:14px" hidden>MCP tools</div>
+        <ul id="mcp-tools" hidden></ul>
+      </section>
     </aside>
   </div>
-  <footer>
-    <div id="setup">
-      <label>Model <input id="model" type="text" spellcheck="false" autocomplete="off" /></label>
-      <label>Effort <select id="effort"></select></label>
-      <label>Thinking <select id="summary"></select></label>
-      <label title="Export OpenTelemetry spans to the configured OTLP collector">OTel <input type="checkbox" id="otel" /></label>
-      <span id="setup-status"></span>
-    </div>
-    <div id="attachments"></div>
-    <form id="form">
-      <label id="attach-btn" title="Attach an image or PDF">📎
-        <input id="attach" type="file" accept="image/*,application/pdf" multiple hidden />
-      </label>
-      <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)" autofocus></textarea>
-      <button id="send" type="submit">Send</button>
-      <button id="stop" type="button" hidden>Stop</button>
-    </form>
-  </footer>
+
+  <div id="profile-modal-backdrop" class="modal-backdrop" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="profile-editor-title"
+      data-testid="profile-editor-popup">
+      <div class="modal-head">
+        <h2 id="profile-editor-title">Agent profile</h2>
+        <button id="profile-close" class="modal-close" type="button" title="Close">Close</button>
+      </div>
+      <form id="profile-form" class="profile-form">
+        <input id="profile-edit-id" type="hidden" />
+        <div class="profile-editor-layout">
+          <div class="profile-editor-panel">
+            <label>Name
+              <input id="profile-name-input" type="text" maxlength="80" autocomplete="off" required />
+            </label>
+            <label>Description
+              <textarea id="profile-description-input" maxlength="240"></textarea>
+            </label>
+            <label>Instructions
+              <textarea id="profile-instructions-input" maxlength="4000"
+                placeholder="How should this agent behave?"></textarea>
+            </label>
+            <div class="profile-grid">
+              <label>Model
+                <input id="profile-model-input" type="text" spellcheck="false" autocomplete="off" />
+              </label>
+              <label>Thinking level
+                <select id="profile-effort-input"></select>
+              </label>
+            </div>
+            <label class="profile-summary-toggle"
+              title="Show the model-provided reasoning summary when available">
+              <input id="profile-summary-input" type="checkbox" />
+              Show thinking summary
+            </label>
+            <div>
+              <div class="side-title">Capabilities</div>
+              <div id="profile-capabilities"></div>
+            </div>
+          </div>
+          <aside class="profile-editor-panel profile-preview-panel" aria-label="Model request preview">
+            <div class="prompt-preview-head">
+              <h3>Model request preview</h3>
+              <span class="prompt-preview-note">initial new-chat turn</span>
+            </div>
+            <div class="prompt-meta">
+              <div class="prompt-meta-card"><b>Name</b><span id="prompt-preview-name"></span></div>
+              <div class="prompt-meta-card"><b>Description</b><span id="prompt-preview-description"></span></div>
+            </div>
+            <div class="prompt-block">
+              <div class="prompt-block-title"><span>ModelRequest.system_prompt</span><span>sent as system prompt</span></div>
+              <pre id="prompt-preview-system"></pre>
+            </div>
+            <div class="prompt-block">
+              <div class="prompt-block-title"><span>ModelRequest.tools</span><span id="prompt-preview-tool-count">0 tools</span></div>
+              <pre id="prompt-preview-tools"></pre>
+            </div>
+            <div class="prompt-block">
+              <div class="prompt-block-title"><span>Model settings</span><span>request config</span></div>
+              <pre id="prompt-preview-settings"></pre>
+            </div>
+            <div class="prompt-block">
+              <div class="prompt-block-title"><span>Preview notes</span><span>boundary</span></div>
+              <ul id="prompt-preview-notes" class="prompt-context-list"></ul>
+            </div>
+          </aside>
+        </div>
+        <div id="profile-editor-status"></div>
+        <div class="modal-actions">
+          <button id="profile-cancel" type="button">Cancel</button>
+          <button id="profile-save" type="submit">Save profile</button>
+        </div>
+      </form>
+    </section>
+  </div>
 
 <script>
 const log = document.getElementById("log");
@@ -290,6 +494,7 @@ const attachInput = document.getElementById("attach");
 const attachmentsEl = document.getElementById("attachments");
 let pendingAttachments = [];  // [{name, mime, data_b64}]
 let runId = null;
+let activeProfileId = "default";
 
 function renderAttachments() {
   attachmentsEl.innerHTML = "";
@@ -551,7 +756,7 @@ function handleEvent(ev) {
   const data = ev.data || {};
   if (ev.event_id && !_TRACE_SKIP.has(type)) {  // collect for the trace tree
     runEvents.push(ev);
-    if (traceAside && !traceAside.hidden) renderTrace();
+    if (activeSidePanel === "trace-panel") renderTrace();
   }
   if (ev.studio_activity) { hideTyping(); activity(ev.studio_activity); return; }
   if (type === "proposal.ready" || type === "workspace.diff.updated" || type === "workspace.proposal.updated") {
@@ -780,6 +985,7 @@ async function refreshProposal() {
     });
     syncSelectAll();
     renderDiff(p.diff);
+    showSidePanel("workspace-panel");
     proposalEl.hidden = false;
     applyBtn.disabled = false;
     exportBtn.disabled = false;
@@ -1006,7 +1212,7 @@ async function send(message) {
   try {
     const res = await fetch("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id: runId, message, attachments }),
+      body: JSON.stringify({ run_id: runId, message, attachments, profile_id: activeProfileId }),
     });
     const body = await res.json();
     if (body.error) { bubble("error", body.error); return; }
@@ -1036,6 +1242,7 @@ const viewerName = document.getElementById("viewer-name");
 const viewerBody = document.getElementById("viewer-body");
 document.getElementById("viewer-close").addEventListener("click", (e) => { e.preventDefault(); viewerAside.hidden = true; });
 async function openFile(path) {
+  showSidePanel("workspace-panel");
   viewerName.textContent = path;
   viewerBody.textContent = "loading…";
   viewerAside.hidden = false;
@@ -1061,6 +1268,7 @@ async function openFile(path) {
 // Preview a PROPOSED (not-yet-applied) image in the file viewer — its bytes come from the run's
 // proposal snapshot, not the live workspace (where it won't exist until apply).
 function openProposalImage(path) {
+  showSidePanel("workspace-panel");
   viewerName.textContent = path + " (proposed)";
   viewerBody.textContent = "loading…";
   viewerAside.hidden = false;
@@ -1142,34 +1350,362 @@ async function loadSetup() {
       if (e === s.effort) opt.selected = true;
       effortEl.appendChild(opt);
     }
-    summaryEl.innerHTML = "";
-    for (const v of (s.summaries || [])) {
-      const opt = document.createElement("option");
-      opt.value = v; opt.textContent = v;
-      if (v === s.summary) opt.selected = true;
-      summaryEl.appendChild(opt);
-    }
+    summaryEl.checked = (s.summary || "auto") !== "off";
     const otelEl = document.getElementById("otel");
     otelEl.checked = !!s.otel;
+    const liveCaps = document.getElementById("live-caps");
+    const renderLiveCaps = (enabledValues) => {
+      const enabled = new Set(enabledValues || []);
+      liveCaps.innerHTML = "";
+      for (const cap of (s.available || [])) {
+        const label = document.createElement("label");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = cap.key;
+        box.checked = enabled.has(cap.key);
+        box.dataset.testid = "capability-toggle-" + cap.key;
+        box.addEventListener("change", () => {
+          const capabilities = [...liveCaps.querySelectorAll("input:checked")].map((i) => i.value);
+          saveSetting({ capabilities }, "Capabilities");
+        });
+        label.appendChild(box);
+        label.appendChild(document.createTextNode(cap.label));
+        liveCaps.appendChild(label);
+      }
+    };
+    renderLiveCaps(s.capabilities || []);
     modelEl.addEventListener("change", () => saveSetting({ model: modelEl.value }, "Model"));
-    effortEl.addEventListener("change", () => saveSetting({ effort: effortEl.value }, "Effort"));
-    summaryEl.addEventListener("change", () => saveSetting({ summary: summaryEl.value }, "Thinking"));
+    effortEl.addEventListener("change", () => saveSetting({ effort: effortEl.value }, "Thinking level"));
+    summaryEl.addEventListener("change", () => saveSetting({ summary: summaryEl.checked ? "auto" : "off" }, "Thinking summary"));
     otelEl.addEventListener("change", () => saveSetting({ otel: otelEl.checked }, "OTel"));
   } catch (_) {}
 }
 
 // --- R8: session history + trace tree ---------------------------------------------------
 const sessionsEl = document.getElementById("sessions");
+const profileSelect = document.getElementById("profile");
+const profilesEl = document.getElementById("profiles");
+const profileAddBtn = document.getElementById("profile-add");
+const profileModal = document.getElementById("profile-modal-backdrop");
+const profileForm = document.getElementById("profile-form");
+const profileEditId = document.getElementById("profile-edit-id");
+const profileNameInput = document.getElementById("profile-name-input");
+const profileDescriptionInput = document.getElementById("profile-description-input");
+const profileInstructionsInput = document.getElementById("profile-instructions-input");
+const profileModelInput = document.getElementById("profile-model-input");
+const profileEffortInput = document.getElementById("profile-effort-input");
+const profileSummaryInput = document.getElementById("profile-summary-input");
+const profileCapabilityEl = document.getElementById("profile-capabilities");
+const profileEditorStatus = document.getElementById("profile-editor-status");
+const profileEditorTitle = document.getElementById("profile-editor-title");
+const promptPreviewName = document.getElementById("prompt-preview-name");
+const promptPreviewDescription = document.getElementById("prompt-preview-description");
+const promptPreviewSystem = document.getElementById("prompt-preview-system");
+const promptPreviewTools = document.getElementById("prompt-preview-tools");
+const promptPreviewToolCount = document.getElementById("prompt-preview-tool-count");
+const promptPreviewSettings = document.getElementById("prompt-preview-settings");
+const promptPreviewNotes = document.getElementById("prompt-preview-notes");
 const newchatBtn = document.getElementById("newchat");
 const a2aBtn = document.getElementById("a2a-demo");
 const traceBtn = document.getElementById("trace-btn");
 const traceAside = document.getElementById("trace");
 const traceTreeEl = document.getElementById("trace-tree");
+let profileCatalog = [];
+let profileCapabilities = [];
+let profileEfforts = [];
+let profilePreviewBound = false;
+let profilePreviewTimer = null;
+let profilePreviewSeq = 0;
+let activeSidePanel = "workspace-panel";
 let runEvents = [];
 const _TRACE_SKIP = new Set([
   "model.output.delta", "model.reasoning.delta", "metrics.updated", "workspace.file.read",
   "workspace.file.changed", "workspace.diff.updated", "workspace.proposal.updated", "checkpoint.committed",
 ]);
+
+function showSidePanel(panelId) {
+  activeSidePanel = panelId;
+  document.querySelectorAll(".side-panel").forEach((panel) => {
+    panel.hidden = panel.id !== panelId;
+  });
+  document.querySelectorAll(".side-tabs button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.panel === panelId);
+  });
+  traceBtn.classList.toggle("on", panelId === "trace-panel");
+  if (panelId === "trace-panel") renderTrace();
+}
+
+document.querySelectorAll(".side-tabs button").forEach((button) => {
+  button.addEventListener("click", () => showSidePanel(button.dataset.panel));
+});
+
+function switchProfile(id) {
+  if (!id || id === activeProfileId) return;
+  activeProfileId = id;
+  runId = null;
+  resetChatView();
+  renderProfileActive();
+  refreshSessions();
+  input.focus();
+}
+
+function renderProfileActive() {
+  if (profileSelect) profileSelect.value = activeProfileId;
+  profilesEl.querySelectorAll("li").forEach((li) => {
+    li.classList.toggle("active", li.dataset.profileId === activeProfileId);
+  });
+}
+
+function profileById(id) {
+  return profileCatalog.find((p) => p.id === id) || profileCatalog[0] || null;
+}
+
+function renderProfileOptions() {
+  profileSelect.innerHTML = "";
+  profilesEl.innerHTML = "";
+  for (const profile of profileCatalog) {
+    const opt = document.createElement("option");
+    opt.value = profile.id;
+    opt.textContent = profile.name || profile.id;
+    profileSelect.appendChild(opt);
+
+    const li = document.createElement("li");
+    li.dataset.profileId = profile.id;
+    li.className = "profile-card";
+    const head = document.createElement("div");
+    head.className = "profile-head";
+    const name = document.createElement("span");
+    name.className = "profile-name";
+    name.textContent = profile.name || profile.id;
+    head.appendChild(name);
+    if (profile.built_in) {
+      const badge = document.createElement("span");
+      badge.className = "profile-built-in";
+      badge.textContent = "built-in";
+      head.appendChild(badge);
+    }
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "profile-edit";
+    edit.dataset.testid = "profile-edit-" + profile.id;
+    edit.textContent = "Edit";
+    edit.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openProfileEditor(profile);
+    });
+    head.appendChild(edit);
+    li.appendChild(head);
+    const desc = document.createElement("div");
+    desc.className = "profile-desc";
+    desc.textContent = profile.description || "No description yet.";
+    li.appendChild(desc);
+    const meta = document.createElement("div");
+    meta.className = "profile-meta";
+    [profile.model, profile.effort, ...((profile.capabilities || []).slice(0, 3))].filter(Boolean).forEach((item) => {
+      const chip = document.createElement("span");
+      chip.className = "profile-chip";
+      chip.textContent = item;
+      meta.appendChild(chip);
+    });
+    li.appendChild(meta);
+    li.addEventListener("click", () => switchProfile(profile.id));
+    profilesEl.appendChild(li);
+  }
+  renderProfileActive();
+}
+
+async function loadProfiles() {
+  try {
+    const body = await (await fetch("/api/profiles")).json();
+    profileCatalog = body.profiles || [];
+    profileCapabilities = body.available_capabilities || [];
+    profileEfforts = body.efforts || ["none", "low", "medium", "high", "xhigh"];
+    if (!profileById(activeProfileId)) activeProfileId = body.default_profile_id || "default";
+    renderProfileOptions();
+  } catch (_) {}
+}
+
+profileSelect.addEventListener("change", () => switchProfile(profileSelect.value));
+
+function fillSelect(select, values, current) {
+  select.innerHTML = "";
+  for (const value of values) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = value;
+    select.appendChild(opt);
+  }
+  select.value = values.includes(current) ? current : (values[0] || "");
+}
+
+function currentProfileCapabilities() {
+  return [...profileCapabilityEl.querySelectorAll("input:checked")].map((input) => input.value);
+}
+
+function currentProfilePayload() {
+  const payload = {
+    name: profileNameInput.value.trim(),
+    description: profileDescriptionInput.value.trim(),
+    instructions: profileInstructionsInput.value.trim(),
+    capabilities: currentProfileCapabilities(),
+    model: profileModelInput.value.trim(),
+    effort: profileEffortInput.value,
+    summary: profileSummaryInput.checked ? "auto" : "off",
+  };
+  if (profileEditId.value) payload.id = profileEditId.value;
+  return payload;
+}
+
+function renderPromptPreviewMeta() {
+  const name = profileNameInput.value.trim() || "New agent";
+  const description = profileDescriptionInput.value.trim() || "UI metadata only; not injected into the system prompt.";
+  promptPreviewName.textContent = name;
+  promptPreviewDescription.textContent = description;
+}
+
+function renderPreviewNotes(notes) {
+  promptPreviewNotes.innerHTML = "";
+  for (const note of (notes || [])) {
+    const li = document.createElement("li");
+    li.textContent = note;
+    promptPreviewNotes.appendChild(li);
+  }
+}
+
+async function refreshPromptPreview() {
+  if (!promptPreviewSystem) return;
+  const seq = ++profilePreviewSeq;
+  renderPromptPreviewMeta();
+  promptPreviewSystem.textContent = "Resolving preview from runtime config…";
+  promptPreviewTools.textContent = "";
+  promptPreviewToolCount.textContent = "loading";
+  promptPreviewSettings.textContent = "";
+  renderPreviewNotes([]);
+  try {
+    const res = await fetch("/api/profile-preview", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(currentProfilePayload()),
+    });
+    const body = await res.json();
+    if (seq !== profilePreviewSeq) return;
+    if (body.error) throw new Error(body.error);
+    promptPreviewSystem.textContent = body.system_prompt || "";
+    promptPreviewTools.textContent = JSON.stringify(body.tools || [], null, 2);
+    promptPreviewToolCount.textContent = (body.tool_count || 0) + " tools";
+    promptPreviewSettings.textContent = JSON.stringify(body.request_config || {}, null, 2);
+    renderPreviewNotes(body.notes || []);
+  } catch (err) {
+    if (seq !== profilePreviewSeq) return;
+    promptPreviewSystem.textContent = "Preview failed: " + err;
+    promptPreviewTools.textContent = "";
+    promptPreviewToolCount.textContent = "error";
+    promptPreviewSettings.textContent = "";
+    renderPreviewNotes([]);
+  }
+}
+
+function schedulePromptPreview() {
+  renderPromptPreviewMeta();
+  if (profilePreviewTimer) clearTimeout(profilePreviewTimer);
+  profilePreviewTimer = setTimeout(refreshPromptPreview, 180);
+}
+
+function bindProfilePreviewListeners() {
+  if (profilePreviewBound) return;
+  profilePreviewBound = true;
+  for (const el of [profileNameInput, profileDescriptionInput, profileInstructionsInput, profileModelInput]) {
+    el.addEventListener("input", schedulePromptPreview);
+  }
+  profileEffortInput.addEventListener("change", schedulePromptPreview);
+  profileSummaryInput.addEventListener("change", schedulePromptPreview);
+  profileCapabilityEl.addEventListener("change", schedulePromptPreview);
+}
+
+function openProfileEditor(profile) {
+  const source = profile || {
+    id: "",
+    name: "New agent",
+    description: "",
+    instructions: "",
+    capabilities: profileCapabilities.map((c) => c.key),
+    model: "gpt-5.5",
+    effort: "medium",
+    summary: "auto",
+  };
+  profileEditorTitle.textContent = profile ? "Edit agent profile" : "Add agent profile";
+  profileEditId.value = source.id || "";
+  profileNameInput.value = source.name || "";
+  profileDescriptionInput.value = source.description || "";
+  profileInstructionsInput.value = source.instructions || "";
+  profileModelInput.value = source.model || "gpt-5.5";
+  fillSelect(profileEffortInput, profileEfforts, source.effort || "medium");
+  profileSummaryInput.checked = (source.summary || "auto") !== "off";
+  profileCapabilityEl.innerHTML = "";
+  const enabled = new Set(source.capabilities || []);
+  for (const cap of profileCapabilities) {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = cap.key;
+    box.checked = enabled.has(cap.key);
+    label.appendChild(box);
+    label.appendChild(document.createTextNode(cap.label || cap.key));
+    profileCapabilityEl.appendChild(label);
+  }
+  profileEditorStatus.textContent = "";
+  profileModal.hidden = false;
+  bindProfilePreviewListeners();
+  refreshPromptPreview();
+  profileNameInput.focus();
+}
+
+function closeProfileEditor() {
+  profileModal.hidden = true;
+}
+
+profileAddBtn.addEventListener("click", () => openProfileEditor(null));
+document.getElementById("profile-close").addEventListener("click", closeProfileEditor);
+document.getElementById("profile-cancel").addEventListener("click", closeProfileEditor);
+profileModal.addEventListener("click", (event) => {
+  if (event.target === profileModal) closeProfileEditor();
+});
+profileForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const capabilities = [...profileCapabilityEl.querySelectorAll("input:checked")].map((input) => input.value);
+  const payload = {
+    name: profileNameInput.value.trim(),
+    description: profileDescriptionInput.value.trim(),
+    instructions: profileInstructionsInput.value.trim(),
+    capabilities,
+    model: profileModelInput.value.trim(),
+    effort: profileEffortInput.value,
+    summary: profileSummaryInput.checked ? "auto" : "off",
+  };
+  if (profileEditId.value) payload.id = profileEditId.value;
+  profileEditorStatus.textContent = "Saving…";
+  try {
+    const res = await fetch("/api/profiles", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json();
+    if (body.error) throw new Error(body.error);
+    profileCatalog = body.profiles || profileCatalog;
+    profileCapabilities = body.available_capabilities || profileCapabilities;
+    profileEfforts = body.efforts || profileEfforts;
+    if (body.profile && body.profile.id) {
+      activeProfileId = body.profile.id;
+      runId = null;
+      resetChatView();
+    }
+    renderProfileOptions();
+    closeProfileEditor();
+    refreshSessions();
+    input.focus();
+  } catch (err) {
+    profileEditorStatus.textContent = "Error: " + err;
+  }
+});
 
 function resetChatView() {
   if (evtSource) { evtSource.close(); evtSource = null; }
@@ -1180,7 +1716,7 @@ function resetChatView() {
   for (const cid in subagents) { if (subagents[cid].timer) clearTimeout(subagents[cid].timer); delete subagents[cid]; }
   renderPlan([]); setGenerating(false);
   usageEl.textContent = "";
-  if (traceAside && !traceAside.hidden) renderTrace();
+  if (activeSidePanel === "trace-panel") renderTrace();
 }
 
 function newChat() {
@@ -1200,7 +1736,7 @@ function loadSession(id) {
 
 async function refreshSessions() {
   try {
-    const body = await (await fetch("/api/sessions")).json();
+    const body = await (await fetch("/api/sessions?profile_id=" + encodeURIComponent(activeProfileId))).json();
     sessionsEl.innerHTML = "";
     for (const s of (body.sessions || [])) {
       const li = document.createElement("li");
@@ -1288,10 +1824,7 @@ a2aBtn.addEventListener("click", async (e) => {
 });
 traceBtn.addEventListener("click", (e) => {
   e.preventDefault();
-  const show = traceAside.hidden;
-  traceAside.hidden = !show;
-  traceBtn.classList.toggle("on", show);
-  if (show) renderTrace();
+  showSidePanel(activeSidePanel === "trace-panel" ? "workspace-panel" : "trace-panel");
 });
 
 (async function init() {
@@ -1320,6 +1853,7 @@ traceBtn.addEventListener("click", (e) => {
   } catch (_) {}
   loadTree();
   loadSetup();
+  await loadProfiles();
   refreshSessions();
   refreshCapabilities();
   // Deep link (handy for sharing + reproducible screenshots): ?run=<id> opens that session,
@@ -1329,7 +1863,7 @@ traceBtn.addEventListener("click", (e) => {
   if (runParam) {
     loadSession(runParam);
     if (params.get("panel") === "trace") {
-      setTimeout(() => { traceAside.hidden = false; traceBtn.classList.add("on"); renderTrace(); }, 1600);
+      setTimeout(() => { showSidePanel("trace-panel"); }, 1600);
     }
     const fileParam = params.get("file");
     if (fileParam) setTimeout(() => openFile(fileParam), 1600);

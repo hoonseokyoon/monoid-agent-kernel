@@ -14,10 +14,13 @@ from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.core.context import TurnContext
 from monoid_agent_kernel.mcp import McpToolProvider
+from monoid_agent_kernel.mcp.client import McpHttpClient
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer
+from monoid_agent_kernel.tools.base import ToolRegistry
 
 _TOOLS = [
     {
@@ -26,6 +29,28 @@ _TOOLS = [
         "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
     },
     {"name": "boom", "description": "Always fails.", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}},
+]
+_RESOURCES = [
+    {
+        "uri": "fake://one",
+        "name": "one",
+        "description": "First fake resource.",
+        "mimeType": "text/plain",
+    },
+    {
+        "uri": "fake://two",
+        "name": "two",
+        "description": "Second fake resource.",
+        "mimeType": "text/plain",
+    },
+]
+_PROMPTS = [
+    {
+        "name": "brief",
+        "description": "Brief prompt.",
+        "arguments": [{"name": "topic", "required": True}],
+    },
+    {"name": "plan", "description": "Plan prompt."},
 ]
 
 
@@ -165,6 +190,266 @@ def test_mcp_list_tools_follows_pagination() -> None:
         with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
             ids = {s.id for s in mcp.get_tools()}
             assert ids == {"mcp.t.echo", "mcp.t.boom"}  # both pages surfaced
+
+
+def _paginated_resource_prompt_handler() -> type[BaseHTTPRequestHandler]:
+    """A server that splits resources/list and prompts/list across two pages."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            return None
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._send(200, b'{"ok":true}')
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            message = json.loads(self.rfile.read(length) or b"{}")
+            method, rid = message.get("method"), message.get("id")
+            if method == "notifications/initialized":
+                self._send(202, b"")
+            elif method == "initialize":
+                self._result(rid, {"protocolVersion": "2025-06-18", "capabilities": {}}, session_id="sess-1")
+            elif method == "resources/list":
+                cursor = (message.get("params") or {}).get("cursor")
+                if cursor is None:
+                    self._result(rid, {"resources": [_RESOURCES[0]], "nextCursor": "r2"})
+                else:
+                    self._result(rid, {"resources": [_RESOURCES[1]]})
+            elif method == "prompts/list":
+                cursor = (message.get("params") or {}).get("cursor")
+                if cursor is None:
+                    self._result(rid, {"prompts": [_PROMPTS[0]], "nextCursor": "p2"})
+                else:
+                    self._result(rid, {"prompts": [_PROMPTS[1]]})
+            else:
+                self._error(rid, -32601, "method not found")
+
+        def _result(self, rid: Any, result: dict[str, Any], *, session_id: str | None = None) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode("utf-8")
+            self._send(200, body, session_id=session_id)
+
+        def _error(self, rid: Any, code: int, msg: str) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}).encode("utf-8")
+            self._send(200, body)
+
+        def _send(self, status: int, body: bytes, *, session_id: str | None = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            if session_id:
+                self.send_header("Mcp-Session-Id", session_id)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def test_mcp_client_lists_resources_and_prompts_with_pagination() -> None:
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _paginated_resource_prompt_handler())
+    with serving(server) as base_url:
+        client = McpHttpClient(f"{base_url}/mcp")
+        try:
+            client.initialize()
+            assert [r["uri"] for r in client.list_resources()] == ["fake://one", "fake://two"]
+            assert [p["name"] for p in client.list_prompts()] == ["brief", "plan"]
+        finally:
+            client.close()
+
+
+def _resource_prompt_handler(state: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
+    """A server with mutable resource/prompt catalogs for provider invalidation tests."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            return None
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._send(200, b'{"ok":true}')
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            message = json.loads(self.rfile.read(length) or b"{}")
+            method, rid = message.get("method"), message.get("id")
+            if method == "notifications/initialized":
+                self._send(202, b"")
+            elif method == "initialize":
+                self._result(rid, {"protocolVersion": "2025-06-18", "capabilities": {}}, session_id="sess-1")
+            elif method == "tools/list":
+                if state.get("tools_error"):
+                    self._error(rid, -32601, "method not found")
+                    return
+                tools = state.get("tools", [])
+                self._result(rid, {"tools": tools if isinstance(tools, list) else []})
+            elif method == "resources/list":
+                state["resources"] += 1
+                self._result(rid, {"resources": [_RESOURCES[min(state["resource_version"], 1)]]})
+            elif method == "resources/read":
+                uri = (message.get("params") or {}).get("uri")
+                self._result(rid, {"contents": [{"uri": uri, "mimeType": "text/plain", "text": f"read {uri}"}]})
+            elif method == "prompts/list":
+                state["prompts"] += 1
+                self._result(rid, {"prompts": [_PROMPTS[min(state["prompt_version"], 1)]]})
+            elif method == "prompts/get":
+                params = message.get("params") or {}
+                self._result(
+                    rid,
+                    {
+                        "description": "Rendered prompt.",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": {"type": "text", "text": f"prompt {params.get('name')}"},
+                            }
+                        ],
+                    },
+                )
+            else:
+                self._error(rid, -32601, "method not found")
+
+        def _result(self, rid: Any, result: dict[str, Any], *, session_id: str | None = None) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode("utf-8")
+            self._send(200, body, session_id=session_id)
+
+        def _error(self, rid: Any, code: int, msg: str) -> None:
+            body = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}).encode("utf-8")
+            self._send(200, body)
+
+        def _send(self, status: int, body: bytes, *, session_id: str | None = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            if session_id:
+                self.send_header("Mcp-Session-Id", session_id)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def test_mcp_provider_exposes_resources_prompts_context_and_invalidation() -> None:
+    state = {"resources": 0, "prompts": 0, "resource_version": 0, "prompt_version": 0}
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _resource_prompt_handler(state))
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
+            specs = {s.id: s for s in mcp.get_tools()}
+            assert set(specs) == {"mcp.t.__helper.resource.read", "mcp.t.__helper.prompt.get"}
+            assert specs["mcp.t.__helper.resource.read"].input_schema["properties"]["uri"] == {"type": "string"}
+            assert specs["mcp.t.__helper.prompt.get"].input_schema["properties"]["name"] == {"type": "string"}
+
+            read = specs["mcp.t.__helper.resource.read"].handler(None, {"uri": "fake://one"})
+            assert read.ok and read.content["contents"][0]["text"] == "read fake://one"
+            prompt = specs["mcp.t.__helper.prompt.get"].handler(None, {"name": "brief", "arguments": {"topic": "x"}})
+            assert prompt.ok and prompt.content["messages"][0]["content"]["text"] == "prompt brief"
+
+            empty_turn = TurnContext(1, 1, 1, None, (), 0, bound_tools=frozenset())
+            assert mcp.dynamic_segment(empty_turn) is None
+            bound_turn = TurnContext(
+                1,
+                1,
+                1,
+                None,
+                (),
+                0,
+                bound_tools=frozenset({"mcp.t.__helper.resource.read", "mcp.t.__helper.prompt.get"}),
+            )
+            segment = mcp.dynamic_segment(bound_turn)
+            assert segment is not None and "fake://one" in segment and "brief" in segment
+            bindings = {binding.binding_id: binding for binding in mcp.tool_bindings()}
+            assert bindings["mcp.t.__helper.resource.read"].model_name == "mcp_t_resource_read"
+            assert bindings["mcp.t.__helper.prompt.get"].model_name == "mcp_t_prompt_get"
+            assert "mcp_t_resource_read" in segment
+            assert "mcp_t_prompt_get" in segment
+
+            state["resource_version"] = 1
+            assert mcp.catalog()["resources"][0]["uri"] == "fake://one"  # cached
+            assert mcp.handle_list_changed("notifications/resources/list_changed") is True
+            assert mcp.catalog()["resources"][0]["uri"] == "fake://two"
+
+            state["prompt_version"] = 1
+            assert mcp.catalog()["prompts"][0]["name"] == "brief"  # cached
+            mcp.invalidate_prompts()
+            assert mcp.catalog()["prompts"][0]["name"] == "plan"
+            assert mcp.handle_list_changed("notifications/unknown/list_changed") is False
+
+
+def test_mcp_resource_prompt_helpers_respect_provider_tool_filters() -> None:
+    state = {"resources": 0, "prompts": 0, "resource_version": 0, "prompt_version": 0}
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _resource_prompt_handler(state))
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t", allowed_tools=("echo",)) as mcp:
+            assert [spec.id for spec in mcp.get_tools()] == []
+            assert mcp.tool_bindings() == ()
+            assert mcp.catalog()["resources"] == []
+            assert mcp.catalog()["prompts"] == []
+            assert state["resources"] == 0
+            assert state["prompts"] == 0
+
+        with McpToolProvider(
+            f"{base_url}/mcp",
+            server="t",
+            allowed_tools=("resource.read", "mcp.t.prompt.get"),
+        ) as mcp:
+            assert {spec.id for spec in mcp.get_tools()} == {
+                "mcp.t.__helper.resource.read",
+                "mcp.t.__helper.prompt.get",
+            }
+
+        with McpToolProvider(
+            f"{base_url}/mcp",
+            server="t",
+            blocked_tools=("resources/read", "mcp_t_prompt_get"),
+        ) as mcp:
+            assert [spec.id for spec in mcp.get_tools()] == []
+            assert mcp.tool_bindings() == ()
+
+
+def test_mcp_resource_prompt_helpers_do_not_collide_with_real_tool_names() -> None:
+    state = {
+        "resources": 0,
+        "prompts": 0,
+        "resource_version": 0,
+        "prompt_version": 0,
+        "tools": [
+            {"name": "resource_read", "description": "Real resource-like tool.", "inputSchema": {"type": "object"}},
+            {"name": "prompt_get", "description": "Real prompt-like tool.", "inputSchema": {"type": "object"}},
+        ],
+    }
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _resource_prompt_handler(state))
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
+            specs = list(mcp.get_tools())
+            assert {spec.id for spec in specs} == {
+                "mcp.t.resource_read",
+                "mcp.t.prompt_get",
+                "mcp.t.__helper.resource.read",
+                "mcp.t.__helper.prompt.get",
+            }
+            registry = ToolRegistry()
+            registry.register_many(specs)
+
+            exported = {spec.id: spec.exported_name for spec in specs}
+            assert exported["mcp.t.resource_read"] == "mcp_t_resource_read"
+            assert exported["mcp.t.__helper.resource.read"] == "mcp_t__helper_resource_read"
+            assert exported["mcp.t.prompt_get"] == "mcp_t_prompt_get"
+            assert exported["mcp.t.__helper.prompt.get"] == "mcp_t__helper_prompt_get"
+            bindings = {binding.binding_id: binding for binding in mcp.tool_bindings()}
+            assert bindings["mcp.t.__helper.resource.read"].model_name == "mcp_t_resource_read"
+            assert bindings["mcp.t.__helper.prompt.get"].model_name == "mcp_t_prompt_get"
+
+
+def test_mcp_resource_prompt_helpers_work_without_tools_list() -> None:
+    state = {"resources": 0, "prompts": 0, "resource_version": 0, "prompt_version": 0, "tools_error": True}
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _resource_prompt_handler(state))
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
+            specs = {spec.id: spec for spec in mcp.get_tools()}
+            assert set(specs) == {"mcp.t.__helper.resource.read", "mcp.t.__helper.prompt.get"}
+            read = specs["mcp.t.__helper.resource.read"].handler(None, {"uri": "fake://one"})
+            prompt = specs["mcp.t.__helper.prompt.get"].handler(None, {"name": "brief"})
+
+    assert read.ok
+    assert prompt.ok
 
 
 def _expiring_handler(state: dict[str, int]) -> type[BaseHTTPRequestHandler]:
