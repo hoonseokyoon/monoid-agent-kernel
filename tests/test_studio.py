@@ -87,6 +87,11 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
         'data-testid="capability-toggles"',
     ):
         assert hook in html
+    # Saving a profile activates that profile and clears the current run so the next message does
+    # not continue a session created under another profile.
+    assert "activeProfileId = body.profile.id;" in html
+    assert "runId = null;" in html
+    assert "resetChatView();" in html
 
 
 def test_settings_page_serves_static_test_hooks(studio: StudioServer) -> None:

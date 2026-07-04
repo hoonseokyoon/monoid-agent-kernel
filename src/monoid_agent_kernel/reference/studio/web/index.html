@@ -1523,10 +1523,15 @@ profileForm.addEventListener("submit", async (event) => {
     profileCapabilities = body.available_capabilities || profileCapabilities;
     profileEfforts = body.efforts || profileEfforts;
     profileSummaries = body.summaries || profileSummaries;
-    if (body.profile && body.profile.id) activeProfileId = body.profile.id;
+    if (body.profile && body.profile.id) {
+      activeProfileId = body.profile.id;
+      runId = null;
+      resetChatView();
+    }
     renderProfileOptions();
     closeProfileEditor();
     refreshSessions();
+    input.focus();
   } catch (err) {
     profileEditorStatus.textContent = "Error: " + err;
   }
