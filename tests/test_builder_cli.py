@@ -99,6 +99,18 @@ def test_builder_init_refuses_existing_files_without_force(tmp_path: Path) -> No
     assert "pass --force" in result.output
 
 
+def test_builder_init_preflights_existing_files_before_writing(tmp_path: Path) -> None:
+    target = tmp_path / "agent"
+    target.mkdir()
+    (target / "run-spec.json").write_text("{}", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["builder", "init", "--target", str(target)])
+
+    assert result.exit_code != 0
+    assert "run-spec.json" in result.output
+    assert not (target / "runtime-config.json").exists()
+
+
 def test_builder_init_can_write_custom_tool_template(tmp_path: Path) -> None:
     target = tmp_path / "agent"
 

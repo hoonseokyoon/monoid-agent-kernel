@@ -40,11 +40,16 @@ def builder_init(target: Path, force: bool, custom_tool_template: bool) -> None:
     if custom_tool_template:
         files["tools.py"] = _CUSTOM_TOOLS_TEMPLATE
 
+    paths = {name: target / name for name in files}
+    if not force:
+        collisions = [path for path in paths.values() if path.exists()]
+        if collisions:
+            names = ", ".join(str(path) for path in collisions)
+            raise click.ClickException(f"{names} already exists; pass --force to overwrite")
+
     written: list[Path] = []
     for name, content in files.items():
-        path = target / name
-        if path.exists() and not force:
-            raise click.ClickException(f"{path} already exists; pass --force to overwrite")
+        path = paths[name]
         path.write_text(content, encoding="utf-8")
         written.append(path)
 
