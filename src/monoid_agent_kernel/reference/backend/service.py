@@ -38,9 +38,7 @@ from monoid_agent_kernel.core.subagent_runtime import (
     validate_descendant_run_id,
 )
 from monoid_agent_kernel.core.events import AgentEvent
-from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.outbox import OutboxReceipt
-from monoid_agent_kernel.core.trace_context import new_traceparent
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     session_state_from_run_status,
@@ -84,6 +82,11 @@ from monoid_agent_kernel.reference.backend.loop_factory import (
     BackendLoopFactoryContext,
     ModelAdapterFactory,
     _GatewayTokenSource,
+)
+from monoid_agent_kernel.reference.backend.outbox_dispatch import (
+    OutboxDispatchContext,
+    OutboxDispatchService,
+    OutboxRetryPolicy,
 )
 from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
@@ -526,6 +529,7 @@ class RunnerBackend:
     _runtime_config: RuntimeConfigService = field(init=False, repr=False)
     _jobs: JobService = field(init=False, repr=False)
     _recovery: RecoveryService = field(init=False, repr=False)
+    _outbox_dispatch: OutboxDispatchService = field(init=False, repr=False)
     _session_boundary: BackendSessionService = field(init=False, repr=False)
     _session_drive: SessionDriveService = field(init=False, repr=False)
     _commands: BackendCommandService = field(init=False, repr=False)
@@ -553,6 +557,7 @@ class RunnerBackend:
         self._runtime_config = self._build_runtime_config_service()
         self._jobs = self._build_job_service()
         self._recovery = self._build_recovery_service()
+        self._outbox_dispatch = self._build_outbox_dispatch_service()
         assert self.checkpoint_store is not None
         self._session_drive = self._build_session_drive_service()
         self._session_boundary = self._build_session_boundary_service()
@@ -658,6 +663,30 @@ class RunnerBackend:
                 record_run_failure=self._record_run_failure,
                 acquire_run_slot=self._acquire_run_slot,
                 release_run_slot=self._release_run_slot,
+            )
+        )
+
+    def _build_outbox_dispatch_service(self) -> OutboxDispatchService:
+        return OutboxDispatchService(
+            OutboxDispatchContext(
+                retry_policy_provider=lambda: OutboxRetryPolicy(
+                    max_attempts=self.outbox_max_attempts,
+                    base_s=self.outbox_retry_base_s,
+                    factor=self.outbox_retry_factor,
+                    cap_s=self.outbox_retry_cap_s,
+                ),
+                max_message_queue_depth_provider=lambda: self.max_message_queue_depth,
+                checkpoint_store_provider=self._checkpoint_store,
+                rng_provider=lambda: self._outbox_rng,
+                live_outbox_runs=self._live_outbox_runs,
+                call_soon=lambda fn, *args: self._call_soon(fn, *args),
+                record_terminal=lambda record: _record_terminal(record),
+                stage_outbox_ack=lambda record, request, status, receipt: self._stage_outbox_ack(
+                    record,
+                    request,
+                    status,
+                    receipt,
+                ),
             )
         )
 
@@ -871,6 +900,16 @@ class RunnerBackend:
     def _live_loop_snapshot(self, record: BackendRunRecord) -> tuple[AgentLoop | None, bool]:
         with self._lock:
             return record.loop, _record_terminal(record)
+
+    def _live_outbox_runs(self) -> list[tuple[BackendRunRecord, AgentLoop]]:
+        with self._lock:
+            return [
+                (record, record.loop)
+                for record in self._records.values()
+                if record.loop is not None
+                and record.outbox_sender is not None
+                and not _record_terminal(record)
+            ]
 
     def _mark_cancel_requested(self, record: BackendRunRecord) -> bool:
         with self._lock:
@@ -1549,83 +1588,15 @@ class RunnerBackend:
         self._spawn(self._persist_run_checkpoint_async(record)).result(timeout=10.0)
 
     def _outbox_backoff_delay(self, attempts: int) -> float:
-        """Capped exponential backoff with full jitter — ``uniform(0, min(cap, base*factor**attempts))``.
-        Full jitter (AWS) maximally decorrelates retries so a fleet of failed sends doesn't restorm a
-        recovering target in lockstep. ``attempts`` is the number already made (>=1 here)."""
-        ceiling = min(self.outbox_retry_cap_s, self.outbox_retry_base_s * (self.outbox_retry_factor ** attempts))
-        return self._outbox_rng.uniform(0.0, max(0.0, ceiling))
+        return self._outbox_dispatch.backoff_delay(attempts)
 
     def _drain_outbox(self, record: BackendRunRecord, loop: AgentLoop) -> None:
-        """Dispatch *due* staged outbox requests at the edge (after they are durably persisted as
-        ``pending``), then persist again so a ``dispatched`` status is recorded. The send happens
-        here, never in the core; a crash between the two persists redispatches on recover, made safe
-        by the request's idempotency_key. A retryable failure stamps a backoff ``next_attempt_at`` so
-        the request is only redispatched once its time arrives (the watchdog redrive tick wakes it,
-        independent of run activity). No-op without a sender or due requests."""
-        sender = record.outbox_sender
-        now = time.time()
-        due = loop.due_outbox(now)
-        if sender is None or not due:
-            return
-        changed = False
-        for request in due:
-            # Ensure the request carries a trace before the edge sends it (requests staged via the
-            # outbox tool already have one; this covers any other path). Observability only.
-            if not request.traceparent:
-                request.traceparent = new_traceparent()
-            try:
-                receipt = sender.send(request)
-            except Exception as exc:  # a sender raising is a retryable transport failure
-                receipt = OutboxReceipt(ok=False, error=str(exc), retryable=True)
-            next_attempt_at = now + self._outbox_backoff_delay(request.attempts + 1)
-            status = loop.record_outbox_result(
-                request.id,
-                receipt,
-                max_attempts=self.outbox_max_attempts,
-                next_attempt_at=next_attempt_at,
-            )
-            changed = True
-            if request.expect_ack and status in {"dispatched", "failed"}:
-                self._stage_outbox_ack(record, request, status, receipt)
-        if changed:
-            checkpoint = loop.snapshot()
-            if checkpoint is not None:
-                checkpoint.queued_messages = [
-                    m for m in list(record.message_queue._queue) if isinstance(m, (str, list, dict))
-                ]
-                checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
-                self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
+        self._outbox_dispatch.drain_outbox(record, loop)
 
     def _stage_outbox_ack(
         self, record: BackendRunRecord, request: Any, status: str, receipt: OutboxReceipt
     ) -> None:
-        """Deliver an outbox send's receipt back to the run as an inbox message (request-reply,
-        **non-park** — the agent observes it on its next activation), correlated by ``correlation_id``.
-        Reuses the idempotent inbox path: a stable ack id (``ack_<request id>``) + the inbox seen-set
-        make a redelivery a no-op. Dropped if the run is terminal (no consumer) or its queue is full
-        (best-effort). Runs on the shared loop, so the queue put needs no cross-thread marshaling."""
-        ack_id = f"ack_{request.id}"
-        if _record_terminal(record):
-            return  # terminal run — no consumer for the ack (documented limitation)
-        if ack_id in record.seen_inbox_ids or record.message_queue.qsize() >= self.max_message_queue_depth:
-            return
-        summary = f"[outbox-ack] request {request.id} to {request.destination!r}: {status}"
-        if receipt.reference:
-            summary += f" (ref={receipt.reference})"
-        if receipt.error:
-            summary += f" (error={receipt.error})"
-        envelope = InboxMessage(
-            content=summary,
-            id=ack_id,
-            source="outbox",
-            type="outbox_ack",
-            run_id=record.run_id,
-            correlation_id=request.correlation_id or request.id,
-            causation_id=request.id,
-            traceparent=request.traceparent,
-            tracestate=request.tracestate,
-        )
-        record.message_queue.put_nowait(envelope.to_json())
+        self._outbox_dispatch.stage_outbox_ack(record, request, status, receipt)
 
     def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
         return self._session_drive.session_should_stop(record, started, turns)
@@ -1963,21 +1934,7 @@ class RunnerBackend:
                 _LOGGER.exception("watchdog tick failed")
 
     def _redrive_outbox(self) -> None:
-        """Redrive due outbox requests for this worker's live runs — the operational tick that makes
-        retry timing independent of run activity (a request whose backoff ``next_attempt_at`` has
-        arrived is dispatched even if its run is otherwise idle). Runs on the watchdog thread but
-        marshals the actual drain onto the shared loop via ``_call_soon`` (the loop and its ``_outbox``
-        are single-threaded on that loop; ``_drain_outbox`` itself filters to due requests)."""
-        with self._lock:
-            live = [
-                (record, record.loop)
-                for record in self._records.values()
-                if record.loop is not None
-                and record.outbox_sender is not None
-                and not _record_terminal(record)
-            ]
-        for record, loop in live:
-            self._call_soon(self._drain_outbox, record, loop)
+        self._outbox_dispatch.redrive_outbox()
 
     def _heartbeat_own_runs(self) -> None:
         assert self.lease_store is not None

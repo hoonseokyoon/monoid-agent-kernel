@@ -18,6 +18,7 @@ uses instead of depending on the whole facade.
 | `BackendSessionService` | Session control actions, task callbacks, inbound messages, and `resume_run` entrypoint. |
 | `SessionDriveService` | Open multi-turn session driving, message waits, checkpoint park points. |
 | `BackendLoopFactory` | Reference `AgentLoop` assembly: run spec, model adapter, gateway clients, runtime-config provider, event sinks, capability broker, outbox sender, and checkpoint callback. |
+| `OutboxDispatchService` | Reference outbox edge dispatch: due-request drain, retry backoff, ack staging, checkpoint persistence, watchdog redrive scheduling. |
 | `ProposalService` | Reference proposal/package/artifact/approve/reject/apply operations. |
 | `RuntimeConfigService` | Runtime config projection, validation, hot-swap, durable metadata commit. |
 | `JobService` | Reference job artifact list/status/log/cancel projections. |
@@ -40,10 +41,10 @@ run records, run requests, loop operations, token claims, and lease stores.
 | Loop factory wiring | `_build_loop_factory`, `_build_loop_build`, and `_build_loop` stay as facade compatibility and composition-root wrappers around `BackendLoopFactory`. |
 | Run execution entrypoints | `submit_run`, `_run_run`, `_drive_session`, and `astream_run` still coordinate cold-start execution around the loop. |
 | Streaming execution | `astream_run` remains facade-owned because it combines submission metadata, event/delta/result framing, stream lifetime, and semaphore ownership. |
-| Outbox edge dispatch | `_drain_outbox`, `_stage_outbox_ack`, retry backoff, and watchdog redrive stay in the Reference operational edge. |
+| Outbox dispatch wiring | `_build_outbox_dispatch_service`, `_drain_outbox`, `_stage_outbox_ack`, `_outbox_backoff_delay`, and `_redrive_outbox` stay as facade compatibility and composition-root wrappers around `OutboxDispatchService`. |
 | Event sink integration | `BackendRunStateSink`, `record_event`, `_emit_backend_event`, and run state mutation keep live record state aligned with recorded events. |
 | Usage accounting | `tenant_usage` and terminal result metric aggregation remain on the backend-owned in-memory usage ledger. |
-| Watchdog heartbeat | `start_watchdog`, `stop_watchdog`, `_watchdog_loop`, `_heartbeat_own_runs`, and `_redrive_outbox` stay with process ownership. Stale reclaim delegates to `RecoveryService`. |
+| Watchdog heartbeat | `start_watchdog`, `stop_watchdog`, `_watchdog_loop`, and `_heartbeat_own_runs` stay with process ownership. Stale reclaim delegates to `RecoveryService`; outbox redrive delegates to `OutboxDispatchService`. |
 | Shared auth/record ports | `_authorize_run`, `_verify_run_token`, `_authorized_run_dir`, `_record`, `_active_record`, and token issuance helpers are backend-owned ports shared by services. |
 | Recovery factories | Recovery request/record reconstruction and gateway-token reissue factories stay in the composition root; `RecoveryService` drives the recovery flow through those ports. |
 
@@ -58,6 +59,7 @@ The main Reference product-specific surfaces have been moved out of the facade:
 | `JobService` | `jobs`, `job_status`, `job_logs`, `cancel_job`. |
 | `RecoveryService` | `recover_runs`, `_attempt_resume`, `_resume_from_checkpoint`, `_run_recovered`, recover-attempt helpers, failure bundle helpers, `_read_recovery_meta`, stale lease reclaim. |
 | `BackendLoopFactory` | `_run_spec_for_request`, `_build_loop`, `_build_model_adapter`, `_llm_token_source`, `_web_gateway_client`, `_capability_broker_for`, `_outbox_sender_for`. |
+| `OutboxDispatchService` | `_drain_outbox`, `_stage_outbox_ack`, `_outbox_backoff_delay`, `_redrive_outbox`. |
 
 Compatibility wrappers remain on `RunnerBackend` where tests or internal call
 sites use private methods. The implementation now delegates through services.
@@ -68,7 +70,6 @@ sites use private methods. The implementation now delegates through services.
 | --- | --- |
 | Service port typing | Private ports now cover the main internal shapes. Remaining `Any` usage is concentrated in dynamic JSON/tool/provider payloads and test-facing monkeypatch seams. |
 | Composition root size | Service context wiring now lives in `_build_*_service` helpers. Future cleanup should keep each helper small rather than adding wiring back to `__post_init__`. |
-| Outbox edge service | Outbox drain/redrive/ack logic is operational edge behavior. It can become a private `OutboxDispatchService` if it grows further. |
 | Event sink/state mutation | `record_event`, `_record_run_result`, `_record_run_failure`, and backend event append remain coherent as live-state ownership. They can be revisited after service port typing is stable. |
 | Streaming path | `astream_run` still owns stream-driven execution. Extract it only after preserving event/result framing with focused tests. |
 
