@@ -484,8 +484,12 @@ class StudioServer:
         available = self._available_capabilities()
         requested = raw.get("capabilities")
         if isinstance(requested, (list, tuple)):
-            wanted = {str(cap) for cap in requested}
-            capabilities = [cap for cap in available if cap in wanted]
+            wanted = [str(cap) for cap in requested]
+            wanted_set = set(wanted)
+            capabilities = [cap for cap in available if cap in wanted_set]
+            capabilities.extend(
+                cap for cap in wanted if cap not in available and cap not in capabilities
+            )
         else:
             capabilities = [cap for cap in available if cap in set(self._capabilities)]
         if not capabilities and available:
@@ -614,7 +618,14 @@ class StudioServer:
             raw = dict(existing)
             for key in ("name", "description", "instructions", "capabilities", "model", "effort", "summary"):
                 if key in payload:
-                    raw[key] = payload[key]
+                    raw[key] = (
+                        self._preserve_unavailable_capabilities(
+                            existing.get("capabilities"),
+                            payload[key],
+                        )
+                        if key == "capabilities"
+                        else payload[key]
+                    )
             profile = self._normalize_profile_payload(
                 raw,
                 profile_id=profile_id,
@@ -628,6 +639,22 @@ class StudioServer:
             body = self.profiles()
         body["profile"] = profile
         return body
+
+    def _preserve_unavailable_capabilities(
+        self,
+        existing: Any,
+        requested: Any,
+    ) -> Any:
+        if not isinstance(requested, (list, tuple)):
+            return requested
+        capabilities = [str(cap) for cap in requested]
+        available = set(self._available_capabilities())
+        if isinstance(existing, (list, tuple)):
+            for cap in existing:
+                cap_key = str(cap)
+                if cap_key not in available and cap_key not in capabilities:
+                    capabilities.append(cap_key)
+        return capabilities
 
     # --- provider-backed capabilities (Skills / MCP) ------------------------------------
 

@@ -20,6 +20,7 @@ from monoid_agent_kernel.mcp.client import McpHttpClient
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer
+from monoid_agent_kernel.tools.base import ToolRegistry
 
 _TOOLS = [
     {
@@ -410,19 +411,31 @@ def test_mcp_resource_prompt_helpers_do_not_collide_with_real_tool_names() -> No
         "resource_version": 0,
         "prompt_version": 0,
         "tools": [
-            {"name": "resource.read", "description": "Real resource-like tool.", "inputSchema": {"type": "object"}},
-            {"name": "prompt.get", "description": "Real prompt-like tool.", "inputSchema": {"type": "object"}},
+            {"name": "resource_read", "description": "Real resource-like tool.", "inputSchema": {"type": "object"}},
+            {"name": "prompt_get", "description": "Real prompt-like tool.", "inputSchema": {"type": "object"}},
         ],
     }
     server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _resource_prompt_handler(state))
     with serving(server) as base_url:
         with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
-            assert {spec.id for spec in mcp.get_tools()} == {
-                "mcp.t.resource.read",
-                "mcp.t.prompt.get",
+            specs = list(mcp.get_tools())
+            assert {spec.id for spec in specs} == {
+                "mcp.t.resource_read",
+                "mcp.t.prompt_get",
                 "mcp.t.__helper.resource.read",
                 "mcp.t.__helper.prompt.get",
             }
+            registry = ToolRegistry()
+            registry.register_many(specs)
+
+            exported = {spec.id: spec.exported_name for spec in specs}
+            assert exported["mcp.t.resource_read"] == "mcp_t_resource_read"
+            assert exported["mcp.t.__helper.resource.read"] == "mcp_t__helper_resource_read"
+            assert exported["mcp.t.prompt_get"] == "mcp_t_prompt_get"
+            assert exported["mcp.t.__helper.prompt.get"] == "mcp_t__helper_prompt_get"
+            bindings = {binding.binding_id: binding for binding in mcp.tool_bindings()}
+            assert bindings["mcp.t.__helper.resource.read"].model_name == "mcp_t_resource_read"
+            assert bindings["mcp.t.__helper.prompt.get"].model_name == "mcp_t_prompt_get"
 
 
 def test_mcp_resource_prompt_helpers_work_without_tools_list() -> None:

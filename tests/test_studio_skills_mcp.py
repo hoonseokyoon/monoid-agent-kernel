@@ -141,6 +141,50 @@ def test_builtin_profiles_include_provider_capabilities_when_saved(tmp_path: Pat
         server.shutdown()
 
 
+def test_saved_profile_preserves_unavailable_provider_capabilities(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with_mcp = _mcp_studio(tmp_path)
+    with_mcp.start()
+    try:
+        profile = with_mcp.save_profile(
+            {
+                "id": "researcher",
+                "name": "Researcher",
+                "capabilities": ["read", "mcp"],
+            }
+        )["profile"]
+        assert "mcp" in profile["capabilities"]
+    finally:
+        with_mcp.shutdown()
+
+    without_mcp = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs", mcp=False)
+    )
+    without_mcp.start()
+    try:
+        profile = {item["id"]: item for item in without_mcp.profiles()["profiles"]}["researcher"]
+        assert "mcp" in profile["capabilities"]
+        saved = without_mcp.save_profile(
+            {
+                "id": "researcher",
+                "name": "Researcher edited",
+                "capabilities": ["read"],
+            }
+        )["profile"]
+        assert "mcp" in saved["capabilities"]
+    finally:
+        without_mcp.shutdown()
+
+    with_mcp_again = _mcp_studio(tmp_path)
+    with_mcp_again.start()
+    try:
+        config = with_mcp_again._build_config("researcher")
+        assert "mcp.studio.echo" in {binding.ref.tool_id for binding in config.tools}
+    finally:
+        with_mcp_again.shutdown()
+
+
 def test_mcp_tool_call_flows_end_to_end(tmp_path: Path) -> None:
     (tmp_path / "ws").mkdir()
     fake = FakeModelAdapter(

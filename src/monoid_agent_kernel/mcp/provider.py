@@ -217,7 +217,7 @@ class McpToolProvider:
                 capability=f"mcp.{self._server}",
                 side_effect="read",
                 handler=self._resource_read_handler(),
-                provider_name=self._resource_read_tool_name(),
+                provider_name=self._resource_read_exported_name(),
             )
         prompts = self._discover_prompts() if self._prompt_get_selected() else []
         if prompts:
@@ -237,21 +237,25 @@ class McpToolProvider:
                 capability=f"mcp.{self._server}",
                 side_effect="read",
                 handler=self._prompt_get_handler(),
-                provider_name=self._prompt_get_tool_name(),
+                provider_name=self._prompt_get_exported_name(),
             )
 
     def tool_bindings(self) -> tuple[ToolBinding, ...]:
         """Bindings for every discovered tool, to merge into the runtime config so the run can
         see them (provider tools are not auto-bound)."""
         bindings: list[ToolBinding] = []
-        helper_ids = {self._resource_read_tool_id(), self._prompt_get_tool_id()}
         for spec in self.get_tools():
+            model_name = None
+            if spec.id == self._resource_read_tool_id():
+                model_name = self._resource_read_tool_name()
+            elif spec.id == self._prompt_get_tool_id():
+                model_name = self._prompt_get_tool_name()
             bindings.append(
                 ToolBinding(
                     binding_id=spec.id,
                     ref=RegistryToolRef(tool_id=spec.id),
                     authorization="allow",
-                    model_name=spec.exported_name if spec.id in helper_ids else None,
+                    model_name=model_name,
                 )
             )
         return tuple(bindings)
@@ -312,6 +316,12 @@ class McpToolProvider:
 
     def _prompt_get_tool_name(self) -> str:
         return f"mcp_{self._server}_prompt_get"
+
+    def _resource_read_exported_name(self) -> str:
+        return f"mcp_{self._server}__helper_resource_read"
+
+    def _prompt_get_exported_name(self) -> str:
+        return f"mcp_{self._server}__helper_prompt_get"
 
 
 def _side_effect(annotations: dict[str, Any] | None) -> ToolSideEffect:
