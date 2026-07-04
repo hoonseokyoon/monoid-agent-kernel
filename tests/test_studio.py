@@ -80,10 +80,11 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
         'data-testid="profile-add"',
         'data-testid="profile-list"',
         'data-testid="profile-editor-popup"',
-        'id="prompt-preview-base"',
-        'id="prompt-preview-instructions"',
-        'id="prompt-preview-context"',
+        'id="prompt-preview-system"',
+        'id="prompt-preview-tools"',
+        'id="prompt-preview-tool-count"',
         'id="prompt-preview-settings"',
+        'id="prompt-preview-notes"',
         'data-testid="chat-log"',
         'data-testid="composer"',
         'data-testid="right-panel-tabs"',
@@ -96,8 +97,8 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
     assert "activeProfileId = body.profile.id;" in html
     assert "runId = null;" in html
     assert "resetChatView();" in html
-    assert "function renderPromptPreview" in html
-    assert "profileSystemPromptBase = body.system_prompt_base" in html
+    assert "function refreshPromptPreview" in html
+    assert 'fetch("/api/profile-preview"' in html
 
 
 def test_settings_page_serves_static_test_hooks(studio: StudioServer) -> None:

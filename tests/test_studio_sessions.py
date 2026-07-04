@@ -246,6 +246,29 @@ def test_studio_profiles_scope_session_history(studio: StudioServer) -> None:
     assert reviewer_sessions[0]["profile_id"] == "reviewer"
 
 
+def test_studio_profile_preview_resolves_model_request_surface(studio: StudioServer) -> None:
+    preview = studio.profile_preview(
+        {
+            "name": "Previewer",
+            "description": "Preview test",
+            "instructions": "Always mention PREVIEW_SENTINEL.",
+            "capabilities": ["read", "write", "delegate"],
+            "model": "gpt-preview",
+            "effort": "high",
+            "summary": "off",
+        }
+    )
+
+    assert "PREVIEW_SENTINEL" in preview["system_prompt"]
+    assert "Profile instructions:" in preview["system_prompt"]
+    assert preview["request_config"]["model"] == "gpt-preview"
+    assert preview["request_config"]["reasoning"] == {"effort": "high", "summary": "off"}
+    tool_names = {tool["name"] for tool in preview["tools"]}
+    assert {"run_update_plan", "fs_read", "fs_write", "agent_spawn"} <= tool_names
+    read_tool = next(tool for tool in preview["tools"] if tool["name"] == "fs_read")
+    assert read_tool["input_schema"]["type"] == "object"
+
+
 def test_studio_profile_history_survives_restart(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()

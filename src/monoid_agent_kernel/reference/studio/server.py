@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 from monoid_agent_kernel.core.agents import (
@@ -38,7 +38,9 @@ from monoid_agent_kernel.core.agents import (
     RegistryToolRef,
     SubagentDefinition,
     ToolBinding,
+    compile_bound_tool_catalog,
 )
+from monoid_agent_kernel.core.context import TurnContext
 from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.content import ContentPart, DocumentPart, ImagePart, TextPart
@@ -48,7 +50,9 @@ from monoid_agent_kernel.core.external_agent_envelope import (
 )
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
 from monoid_agent_kernel.core.subagent_runtime import root_run_id_from_descendant
-from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.core.prompt import compose_system_prompt
+from monoid_agent_kernel.core.tool_surface import DefaultToolSurfaceResolver, ToolScope
+from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
@@ -63,6 +67,8 @@ from monoid_agent_kernel.reference._shared.http_util import wait_http_ready
 from monoid_agent_kernel.reference.mcp_gateway import FakeMcpServer, create_mcp_server
 from monoid_agent_kernel.mcp import McpError, McpToolProvider
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
+from monoid_agent_kernel.tools.base import ToolRegistry, ToolSpec
+from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.studio")
 
@@ -355,6 +361,17 @@ def _runtime_config_for(
     )
 
 
+def _gateway_tool_schema(tool: ToolSpec) -> dict[str, Any]:
+    return {
+        "id": tool.id,
+        "name": tool.exported_name,
+        "description": tool.description,
+        "input_schema": tool.input_schema,
+        "capability": tool.capability,
+        "side_effect": tool.side_effect,
+    }
+
+
 def _agent_runtime_config() -> AgentRuntimeConfig:
     """The full capability set (chat + read + write + HITL + shell + web)."""
     return _runtime_config_for(list(_ALL_CAPABILITIES))
@@ -575,6 +592,107 @@ class StudioServer:
             "efforts": list(_EFFORT_CHOICES),
             "summaries": list(_SUMMARY_CHOICES),
         }
+
+    def profile_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a draft profile into the first-turn model request preview.
+
+        This mirrors the Studio run bootstrap far enough to show the exact system prompt and
+        tool schema payload a new chat would hand to the model adapter. It does not create a run
+        or execute handlers.
+        """
+        profile = self._draft_profile_from_payload(payload)
+        runtime_config = _runtime_config_for(
+            list(profile["capabilities"]),
+            str(profile["model"]),
+            str(profile["effort"]),
+            str(profile["summary"]),
+            provider_bindings=self._provider_bindings(),
+            system_prompt=self._profile_system_prompt(profile),
+        )
+        registry = self._preview_tool_registry()
+        bound_catalog = compile_bound_tool_catalog(runtime_config, registry)
+        turn_context = TurnContext(
+            step=1,
+            remaining_steps=29,
+            remaining_tool_calls=100,
+            deadline_s=900,
+            plan=(),
+            pending_observation_count=0,
+            bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools),
+        )
+        surface = DefaultToolSurfaceResolver().resolve(
+            bound_catalog=bound_catalog,
+            turn=turn_context,
+        )
+        static_system_prompt = compose_system_prompt(
+            runtime_config.prompt.system_prompt_base or _SYSTEM_PROMPT,
+            (*runtime_config.prompt.persona_segments, *runtime_config.prompt.runtime_segments),
+        )
+        dynamic_segments = []
+        for provider in self._context_providers():
+            segment = provider.dynamic_segment(turn_context)
+            if segment and segment.strip():
+                dynamic_segments.append(segment.strip())
+        dynamic_context = "\n\n".join(dynamic_segments)
+        system_prompt = (
+            static_system_prompt
+            if not dynamic_segments
+            else f"{static_system_prompt}\n\n{dynamic_context}"
+        )
+        tools = [_gateway_tool_schema(tool) for tool in surface.immediate_tools]
+        return {
+            "system_prompt": system_prompt,
+            "tools": tools,
+            "tool_count": len(tools),
+            "request_config": {
+                "model": str(profile["model"]),
+                "reasoning": {"effort": str(profile["effort"]), "summary": str(profile["summary"])},
+                "tool_schema_format": "llm-turn.v1 gateway payload",
+                "turn": "initial new-chat turn",
+            },
+            "notes": [
+                "System prompt includes profile instructions and provider dynamic context for the initial turn.",
+                "Tools are the exact ModelRequest.tools schema sent to the Studio LLM gateway; the gateway provider may convert them to a vendor-native function schema.",
+            ],
+        }
+
+    def _draft_profile_from_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_id = str(payload.get("id") or "").strip()
+        profile_id = _normalize_profile_id(raw_id) if raw_id else _normalize_profile_id(str(payload.get("name") or "preview"))
+        existing = self._profiles_by_id().get(profile_id, {"id": profile_id, "name": profile_id})
+        raw = dict(existing)
+        for key in ("name", "description", "instructions", "capabilities", "model", "effort", "summary"):
+            if key in payload:
+                raw[key] = payload[key]
+        return self._normalize_profile_payload(
+            raw,
+            profile_id=profile_id,
+            built_in=bool(existing.get("built_in", False)),
+        )
+
+    def _subagent_definitions_for_runtime(self) -> dict[str, SubagentDefinition]:
+        definitions = dict(_SUBAGENT_DEFINITIONS)
+        if self._skill_provider is not None:
+            definitions.update(self._skill_provider.subagent_definitions())
+        return definitions
+
+    def _tool_providers_for_runtime(self) -> tuple[Any, ...]:
+        return tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None) + (
+            OutboxToolProvider(),
+        )
+
+    def _context_providers(self) -> tuple[Any, ...]:
+        return tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None)
+
+    def _preview_tool_registry(self) -> ToolRegistry:
+        registry = ToolRegistry()
+        registry.register_many(builtin_tools(cast(Workspace, None)))
+        for provider in self._tool_providers_for_runtime():
+            registry.register_many(provider.get_tools(None))
+        subagents = self._subagent_definitions_for_runtime()
+        if subagents:
+            registry.register(agent_spawn_tool({name: definition.description for name, definition in subagents.items()}))
+        return registry
 
     def _profile_index_path(self) -> Path:
         return self._profile_store_path()
@@ -800,17 +918,14 @@ class StudioServer:
         # Enable the provider-backed capabilities by default when their provider is attached.
         self._capabilities = self._available_capabilities()
 
-        subagent_definitions = dict(_SUBAGENT_DEFINITIONS)
-        if self._skill_provider is not None:
-            # Fork skills (context: fork) run as subagents; register their synthesized definitions
-            # (namespaced ids, so no collision with the built-in researcher). No-op for the sample.
-            subagent_definitions.update(self._skill_provider.subagent_definitions())
+        # Fork skills (context: fork) run as subagents; register their synthesized definitions
+        # (namespaced ids, so no collision with the built-in researcher). No-op for the sample.
+        subagent_definitions = self._subagent_definitions_for_runtime()
 
-        provider_instances = tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None)
         # A2A demo: the generic outbox.send tool is always available (its binding is added only for
         # the demo peers, so a normal chat never sees it). Its tools are declared to config
         # validation through the same provider seam as Skills/MCP.
-        provider_instances = provider_instances + (OutboxToolProvider(),)
+        provider_instances = self._tool_providers_for_runtime()
 
         self._backend = RunnerBackend(
             run_root=self.config.run_root,
@@ -832,7 +947,7 @@ class StudioServer:
             # The provider seam: Skills and MCP attach here, shared across
             # runs and re-attached on resume. Their tools are declared to config validation too.
             tool_providers=provider_instances,
-            context_providers=tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None),
+            context_providers=self._context_providers(),
             # A2A demo: drain each run's outbox into the addressed peer's inbox, and gate outbox.send
             # behind a capability lease (the binding declares requires_lease). AutoGrantBroker grants
             # every request — a dev/demo broker, never production — so the lease gate is *exercised*
@@ -1649,6 +1764,10 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/profiles":
                     body = self._read_json()
                     self._write_json(studio.save_profile(body))
+                    return
+                if parsed.path == "/api/profile-preview":
+                    body = self._read_json()
+                    self._write_json(studio.profile_preview(body))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
             except NativeAgentError as exc:

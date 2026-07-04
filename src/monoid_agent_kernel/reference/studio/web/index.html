@@ -428,30 +428,30 @@
               <div id="profile-capabilities"></div>
             </div>
           </div>
-          <aside class="profile-editor-panel" aria-label="System prompt preview">
+          <aside class="profile-editor-panel" aria-label="Model request preview">
             <div class="prompt-preview-head">
-              <h3>System prompt preview</h3>
-              <span class="prompt-preview-note">Updates before save</span>
+              <h3>Model request preview</h3>
+              <span class="prompt-preview-note">initial new-chat turn</span>
             </div>
             <div class="prompt-meta">
               <div class="prompt-meta-card"><b>Name</b><span id="prompt-preview-name"></span></div>
               <div class="prompt-meta-card"><b>Description</b><span id="prompt-preview-description"></span></div>
             </div>
             <div class="prompt-block">
-              <div class="prompt-block-title"><span>Base Studio prompt</span><span>always included</span></div>
-              <pre id="prompt-preview-base"></pre>
-            </div>
-            <div class="prompt-block" id="prompt-preview-instructions-block">
-              <div class="prompt-block-title"><span>Profile instructions</span><span>from Instructions</span></div>
-              <pre id="prompt-preview-instructions"></pre>
+              <div class="prompt-block-title"><span>ModelRequest.system_prompt</span><span>sent as system prompt</span></div>
+              <pre id="prompt-preview-system"></pre>
             </div>
             <div class="prompt-block">
-              <div class="prompt-block-title"><span>Dynamic context preview</span><span>capability dependent</span></div>
-              <ul id="prompt-preview-context" class="prompt-context-list"></ul>
+              <div class="prompt-block-title"><span>ModelRequest.tools</span><span id="prompt-preview-tool-count">0 tools</span></div>
+              <pre id="prompt-preview-tools"></pre>
             </div>
             <div class="prompt-block">
               <div class="prompt-block-title"><span>Model settings</span><span>request config</span></div>
               <pre id="prompt-preview-settings"></pre>
+            </div>
+            <div class="prompt-block">
+              <div class="prompt-block-title"><span>Preview notes</span><span>boundary</span></div>
+              <ul id="prompt-preview-notes" class="prompt-context-list"></ul>
             </div>
           </aside>
         </div>
@@ -1381,11 +1381,11 @@ const profileEditorStatus = document.getElementById("profile-editor-status");
 const profileEditorTitle = document.getElementById("profile-editor-title");
 const promptPreviewName = document.getElementById("prompt-preview-name");
 const promptPreviewDescription = document.getElementById("prompt-preview-description");
-const promptPreviewBase = document.getElementById("prompt-preview-base");
-const promptPreviewInstructions = document.getElementById("prompt-preview-instructions");
-const promptPreviewInstructionsBlock = document.getElementById("prompt-preview-instructions-block");
-const promptPreviewContext = document.getElementById("prompt-preview-context");
+const promptPreviewSystem = document.getElementById("prompt-preview-system");
+const promptPreviewTools = document.getElementById("prompt-preview-tools");
+const promptPreviewToolCount = document.getElementById("prompt-preview-tool-count");
 const promptPreviewSettings = document.getElementById("prompt-preview-settings");
+const promptPreviewNotes = document.getElementById("prompt-preview-notes");
 const newchatBtn = document.getElementById("newchat");
 const a2aBtn = document.getElementById("a2a-demo");
 const traceBtn = document.getElementById("trace-btn");
@@ -1394,8 +1394,9 @@ const traceTreeEl = document.getElementById("trace-tree");
 let profileCatalog = [];
 let profileCapabilities = [];
 let profileEfforts = [];
-let profileSystemPromptBase = "";
 let profilePreviewBound = false;
+let profilePreviewTimer = null;
+let profilePreviewSeq = 0;
 let activeSidePanel = "workspace-panel";
 let runEvents = [];
 const _TRACE_SKIP = new Set([
@@ -1500,7 +1501,6 @@ async function loadProfiles() {
     profileCatalog = body.profiles || [];
     profileCapabilities = body.available_capabilities || [];
     profileEfforts = body.efforts || ["none", "low", "medium", "high", "xhigh"];
-    profileSystemPromptBase = body.system_prompt_base || profileSystemPromptBase || "";
     if (!profileById(activeProfileId)) activeProfileId = body.default_profile_id || "default";
     renderProfileOptions();
   } catch (_) {}
@@ -1523,63 +1523,83 @@ function currentProfileCapabilities() {
   return [...profileCapabilityEl.querySelectorAll("input:checked")].map((input) => input.value);
 }
 
-function profileCapabilityLabels(capabilities) {
-  const labels = new Map(profileCapabilities.map((cap) => [cap.key, cap.label || cap.key]));
-  return capabilities.map((key) => labels.get(key) || key);
+function currentProfilePayload() {
+  const payload = {
+    name: profileNameInput.value.trim(),
+    description: profileDescriptionInput.value.trim(),
+    instructions: profileInstructionsInput.value.trim(),
+    capabilities: currentProfileCapabilities(),
+    model: profileModelInput.value.trim(),
+    effort: profileEffortInput.value,
+    summary: profileSummaryInput.checked ? "auto" : "off",
+  };
+  if (profileEditId.value) payload.id = profileEditId.value;
+  return payload;
 }
 
-function dynamicContextPreviewItems(capabilities) {
-  const enabled = new Set(capabilities || []);
-  const items = [];
-  if (enabled.has("read")) items.push("Read tools can inspect files inside the selected workspace.");
-  if (enabled.has("write")) items.push("Write tools stage proposed file changes before apply.");
-  if (enabled.has("hitl")) items.push("Human approval tools can pause for explicit decisions.");
-  if (enabled.has("shell")) items.push("Shell tools can run commands and background jobs.");
-  if (enabled.has("web")) items.push("Web search, fetch, and context tools are available.");
-  if (enabled.has("delegate")) items.push("Subagent delegation is available through agent_spawn.");
-  if (enabled.has("skills")) items.push("Skill playbooks appear when the skill provider is attached.");
-  if (enabled.has("mcp")) items.push("MCP tools appear when the MCP provider is attached.");
-  if (!items.length) items.push("No optional tool capability is selected. The base prompt and profile instructions still apply.");
-  return items;
-}
-
-function renderPromptPreview() {
-  if (!promptPreviewBase) return;
+function renderPromptPreviewMeta() {
   const name = profileNameInput.value.trim() || "New agent";
   const description = profileDescriptionInput.value.trim() || "UI metadata only; not injected into the system prompt.";
-  const instructions = profileInstructionsInput.value.trim();
-  const capabilities = currentProfileCapabilities();
   promptPreviewName.textContent = name;
   promptPreviewDescription.textContent = description;
-  promptPreviewBase.textContent = profileSystemPromptBase || "Studio base prompt is loaded from the server.";
-  promptPreviewInstructions.textContent = instructions
-    ? "Profile instructions:\n" + instructions
-    : "No profile instructions. The model receives only the base Studio prompt plus dynamic tool context.";
-  promptPreviewInstructionsBlock.classList.toggle("empty", !instructions);
-  promptPreviewContext.innerHTML = "";
-  for (const item of dynamicContextPreviewItems(capabilities)) {
+}
+
+function renderPreviewNotes(notes) {
+  promptPreviewNotes.innerHTML = "";
+  for (const note of (notes || [])) {
     const li = document.createElement("li");
-    li.textContent = item;
-    promptPreviewContext.appendChild(li);
+    li.textContent = note;
+    promptPreviewNotes.appendChild(li);
   }
-  const capabilityLabels = profileCapabilityLabels(capabilities);
-  promptPreviewSettings.textContent = [
-    "model: " + (profileModelInput.value.trim() || "gpt-5.5"),
-    "thinking_level: " + (profileEffortInput.value || "medium"),
-    "show_thinking_summary: " + (profileSummaryInput.checked ? "on (summary=auto)" : "off (summary=off)"),
-    "capabilities: " + (capabilityLabels.length ? capabilityLabels.join(", ") : "none"),
-  ].join("\n");
+}
+
+async function refreshPromptPreview() {
+  if (!promptPreviewSystem) return;
+  const seq = ++profilePreviewSeq;
+  renderPromptPreviewMeta();
+  promptPreviewSystem.textContent = "Resolving preview from runtime config…";
+  promptPreviewTools.textContent = "";
+  promptPreviewToolCount.textContent = "loading";
+  promptPreviewSettings.textContent = "";
+  renderPreviewNotes([]);
+  try {
+    const res = await fetch("/api/profile-preview", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(currentProfilePayload()),
+    });
+    const body = await res.json();
+    if (seq !== profilePreviewSeq) return;
+    if (body.error) throw new Error(body.error);
+    promptPreviewSystem.textContent = body.system_prompt || "";
+    promptPreviewTools.textContent = JSON.stringify(body.tools || [], null, 2);
+    promptPreviewToolCount.textContent = (body.tool_count || 0) + " tools";
+    promptPreviewSettings.textContent = JSON.stringify(body.request_config || {}, null, 2);
+    renderPreviewNotes(body.notes || []);
+  } catch (err) {
+    if (seq !== profilePreviewSeq) return;
+    promptPreviewSystem.textContent = "Preview failed: " + err;
+    promptPreviewTools.textContent = "";
+    promptPreviewToolCount.textContent = "error";
+    promptPreviewSettings.textContent = "";
+    renderPreviewNotes([]);
+  }
+}
+
+function schedulePromptPreview() {
+  renderPromptPreviewMeta();
+  if (profilePreviewTimer) clearTimeout(profilePreviewTimer);
+  profilePreviewTimer = setTimeout(refreshPromptPreview, 180);
 }
 
 function bindProfilePreviewListeners() {
   if (profilePreviewBound) return;
   profilePreviewBound = true;
   for (const el of [profileNameInput, profileDescriptionInput, profileInstructionsInput, profileModelInput]) {
-    el.addEventListener("input", renderPromptPreview);
+    el.addEventListener("input", schedulePromptPreview);
   }
-  profileEffortInput.addEventListener("change", renderPromptPreview);
-  profileSummaryInput.addEventListener("change", renderPromptPreview);
-  profileCapabilityEl.addEventListener("change", renderPromptPreview);
+  profileEffortInput.addEventListener("change", schedulePromptPreview);
+  profileSummaryInput.addEventListener("change", schedulePromptPreview);
+  profileCapabilityEl.addEventListener("change", schedulePromptPreview);
 }
 
 function openProfileEditor(profile) {
@@ -1616,7 +1636,7 @@ function openProfileEditor(profile) {
   profileEditorStatus.textContent = "";
   profileModal.hidden = false;
   bindProfilePreviewListeners();
-  renderPromptPreview();
+  refreshPromptPreview();
   profileNameInput.focus();
 }
 
