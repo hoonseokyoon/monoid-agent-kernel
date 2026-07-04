@@ -603,7 +603,20 @@ class RunnerBackend:
             self.checkpoint_store = LocalFsCheckpointStore(self.run_root)
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
-        self._projection = RunProjectionService(
+        self._projection = self._build_projection_service()
+        self._proposal = self._build_proposal_service()
+        self._runtime_config = self._build_runtime_config_service()
+        self._jobs = self._build_job_service()
+        self._recovery = self._build_recovery_service()
+        assert self.checkpoint_store is not None
+        self._session_drive = self._build_session_drive_service()
+        self._session_boundary = self._build_session_boundary_service()
+        self._commands = self._build_command_service()
+
+    # --- Internal service context providers --------------------------------------------
+
+    def _build_projection_service(self) -> RunProjectionService:
+        return RunProjectionService(
             RunProjectionContext(
                 authorized_run_dir=self._authorized_run_dir,
                 authorize_run=self._authorize_run,
@@ -617,7 +630,9 @@ class RunnerBackend:
                 issue_read_token=self._issue_read_token,
             )
         )
-        self._proposal = ProposalService(
+
+    def _build_proposal_service(self) -> ProposalService:
+        return ProposalService(
             ProposalServiceContext(
                 authorize_run=self._authorize_run,
                 record=self._record,
@@ -627,7 +642,9 @@ class RunnerBackend:
                 allowed_apply_roots_provider=lambda: self.allowed_apply_roots,
             )
         )
-        self._runtime_config = RuntimeConfigService(
+
+    def _build_runtime_config_service(self) -> RuntimeConfigService:
+        return RuntimeConfigService(
             RuntimeConfigContext(
                 authorize_run=self._authorize_run,
                 record=self._record,
@@ -640,8 +657,12 @@ class RunnerBackend:
                 now=time.time,
             )
         )
-        self._jobs = JobService(JobServiceContext(authorize_run=self._authorize_run, record=self._record))
-        self._recovery = RecoveryService(
+
+    def _build_job_service(self) -> JobService:
+        return JobService(JobServiceContext(authorize_run=self._authorize_run, record=self._record))
+
+    def _build_recovery_service(self) -> RecoveryService:
+        return RecoveryService(
             RecoveryContext(
                 run_root_provider=lambda: self.run_root,
                 checkpoint_store_provider=lambda: self.checkpoint_store,
@@ -669,8 +690,9 @@ class RunnerBackend:
                 release_run_slot=self._release_run_slot,
             )
         )
-        assert self.checkpoint_store is not None
-        self._session_drive = SessionDriveService(
+
+    def _build_session_drive_service(self) -> SessionDriveService:
+        return SessionDriveService(
             SessionDriveContext(
                 limits_provider=self._session_drive_limits,
                 checkpoint_store_provider=self._checkpoint_store,
@@ -679,7 +701,9 @@ class RunnerBackend:
                 resume_signal=_RESUME_SESSION,
             )
         )
-        self._session_boundary = BackendSessionService(
+
+    def _build_session_boundary_service(self) -> BackendSessionService:
+        return BackendSessionService(
             BackendSessionContext(
                 authorize_run=self._authorize_run,
                 verify_run_token=self._verify_run_token,
@@ -703,7 +727,9 @@ class RunnerBackend:
                 resume_signal=_RESUME_SESSION,
             )
         )
-        self._commands = BackendCommandService(
+
+    def _build_command_service(self) -> BackendCommandService:
+        return BackendCommandService(
             BackendCommandContext(
                 emit_control_audit_event=self._emit_control_audit_event,
                 verify_run_token=self._verify_run_token,
@@ -725,8 +751,6 @@ class RunnerBackend:
                 replace_runtime_config=self.replace_runtime_config,
             )
         )
-
-    # --- Internal service context providers --------------------------------------------
 
     def _session_drive_limits(self) -> SessionDriveLimits:
         return SessionDriveLimits(

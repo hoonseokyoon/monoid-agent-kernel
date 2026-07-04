@@ -23,6 +23,7 @@ from monoid_agent_kernel.core.lifecycle import (
 )
 from monoid_agent_kernel.core.subagent_runtime import subagent_diagnostics_from_events
 from monoid_agent_kernel.core.trace_context import trace_id_of
+from monoid_agent_kernel.reference.backend.ports import RunRecordPort
 
 _RUN_EVENT_SEQUENCER = RunEventSequencer()
 
@@ -62,7 +63,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def _set_record_state(
-    record: Any,
+    record: RunRecordPort,
     state: SessionState | str,
     *,
     terminal: bool | None = None,
@@ -72,11 +73,11 @@ def _set_record_state(
     record.terminal = bool(terminal) if terminal is not None else session_state in TERMINAL_STATES
 
 
-def _record_terminal(record: Any) -> bool:
+def _record_terminal(record: RunRecordPort) -> bool:
     return record.terminal or record.state in TERMINAL_STATES
 
 
-def _record_lifecycle_payload(record: Any) -> dict[str, Any]:
+def _record_lifecycle_payload(record: RunRecordPort) -> dict[str, Any]:
     return {
         "state": session_state_value(record.state),
         "terminal": _record_terminal(record),
@@ -98,9 +99,9 @@ def _status_payload_lifecycle(
 class RunProjectionContext:
     authorized_run_dir: Callable[[str, str], Path]
     authorize_run: Callable[[str, str], None]
-    record: Callable[[str], Any]
-    active_record: Callable[[str], Any | None]
-    read_proposal: Callable[[Any], dict[str, Any] | None]
+    record: Callable[[str], RunRecordPort]
+    active_record: Callable[[str], RunRecordPort | None]
+    read_proposal: Callable[[RunRecordPort], dict[str, Any] | None]
     read_recover_attempts: Callable[[Path], int]
     run_root_provider: Callable[[], Path]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]

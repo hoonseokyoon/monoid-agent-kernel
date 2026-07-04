@@ -10,12 +10,13 @@ from monoid_agent_kernel.tasks import (
     read_job_log_text,
     request_job_cancel,
 )
+from monoid_agent_kernel.reference.backend.ports import RunRecordPort
 
 
 @dataclass(frozen=True)
 class JobServiceContext:
     authorize_run: Callable[[str, str], None]
-    record: Callable[[str], Any]
+    record: Callable[[str], RunRecordPort]
 
 
 class JobService:

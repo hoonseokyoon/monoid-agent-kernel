@@ -9,10 +9,11 @@ from typing import Any
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.core.control_audit import ControlAuditPolicy
-from monoid_agent_kernel.core.lifecycle import LoopSession
+from monoid_agent_kernel.core.lifecycle import LoopSession, SessionState
 from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManager
+from monoid_agent_kernel.reference.backend.ports import LoopPort, TokenClaimsPort
 
 _CONTROL_AUDIT_POLICY = ControlAuditPolicy()
 
@@ -20,11 +21,11 @@ _CONTROL_AUDIT_POLICY = ControlAuditPolicy()
 @dataclass(frozen=True)
 class BackendCommandContext:
     emit_control_audit_event: Callable[..., None]
-    verify_run_token: Callable[[str, str], Any]
+    verify_run_token: Callable[[str, str], TokenClaimsPort]
     verify_task_callback_token: Callable[[str, str, str], None]
-    authorize_claim_subject: Callable[[str, Any], None]
+    authorize_claim_subject: Callable[[str, TokenClaimsPort], None]
     is_live_run: Callable[[str], bool]
-    active_loop_session: Callable[[str, str], tuple[Any, Any]]
+    active_loop_session: Callable[[str, str], tuple[LoopPort, SessionState]]
     pause_run: Callable[[str, str], dict[str, Any]]
     signal_resume: Callable[[str, str], dict[str, Any]]
     resume_run: Callable[[str, str], dict[str, Any]]

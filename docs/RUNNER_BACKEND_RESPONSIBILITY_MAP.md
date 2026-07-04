@@ -24,13 +24,16 @@ uses instead of depending on the whole facade.
 
 These services are private implementation modules under
 `monoid_agent_kernel.reference.backend`. They are not stable contract exports.
+Their context objects use private Protocol/port types from
+`monoid_agent_kernel.reference.backend.ports` for stable internal shapes such as
+run records, run requests, loop operations, token claims, and lease stores.
 
 ## Responsibilities That Stay On RunnerBackend
 
 | Responsibility | Current owner role |
 | --- | --- |
 | Public facade | Embedder-facing methods stay on `RunnerBackend` so callers interact with one stable object. |
-| Composition root | `RunnerBackend.__post_init__` creates stores, default leases, service instances, and service contexts. |
+| Composition root | `RunnerBackend.__post_init__` creates stores and default leases, then delegates service context wiring to private `_build_*_service` helpers. |
 | Shared runtime ownership | `_spawn`, `_call_soon`, drain/shutdown, shared loop scheduling, semaphore ownership, and stream cancellation stay with the process-level runtime wrapper. |
 | Request admission | `_validate_request`, `_check_workspace_allowed`, initial runtime config validation, gateway token issuance, and initial record creation stay in the facade. |
 | Loop construction | `_build_loop` assembles the Reference `AgentLoop` wiring: model adapter, tool providers, context providers, validators, capability broker, outbox sender, event sinks, and checkpoint callback. |
@@ -61,8 +64,8 @@ sites use private methods. The implementation now delegates through services.
 
 | Target | Why it remains |
 | --- | --- |
-| Service port typing | Service contexts now avoid whole-facade dependencies, but several ports still use `Any` for `BackendRunRecord`, `BackendRunRequest`, `AgentLoop`, and checkpoint-adjacent values. Private Protocols or a small private type module can narrow these without changing public API. |
-| Composition root size | `RunnerBackend.__post_init__` now wires many services. A small context-builder section or helper methods can make the wiring easier to scan. |
+| Service port typing | Private ports now cover the main internal shapes. Remaining `Any` usage is concentrated in dynamic JSON/tool/provider payloads and test-facing monkeypatch seams. |
+| Composition root size | Service context wiring now lives in `_build_*_service` helpers. Future cleanup should keep each helper small rather than adding wiring back to `__post_init__`. |
 | Loop construction | `_build_loop` is still a large Reference assembly point. It is correctly facade-owned today, but a future `LoopFactory` could make model/tool/provider wiring clearer. |
 | Outbox edge service | Outbox drain/redrive/ack logic is operational edge behavior. It can become a private `OutboxDispatchService` if it grows further. |
 | Event sink/state mutation | `record_event`, `_record_run_result`, `_record_run_failure`, and backend event append remain coherent as live-state ownership. They can be revisited after service port typing is stable. |

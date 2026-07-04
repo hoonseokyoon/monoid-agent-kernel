@@ -13,6 +13,7 @@ from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.lifecycle import state_from_suspension
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
+from monoid_agent_kernel.reference.backend.ports import LoopPort, MutableRunRecordPort, RunRequestPort
 from monoid_agent_kernel.reference.backend.projection import _set_record_state
 
 
@@ -30,7 +31,7 @@ class SessionDriveLimits:
 class SessionDriveContext:
     limits_provider: Callable[[], SessionDriveLimits]
     checkpoint_store_provider: Callable[[], CheckpointStore]
-    drain_outbox: Callable[[Any, Any], None]
+    drain_outbox: Callable[[MutableRunRecordPort, LoopPort], None]
     close_signal: object
     resume_signal: object
 
@@ -61,9 +62,9 @@ class SessionDriveService:
 
     async def drive_open_session(
         self,
-        record: Any,
-        request: Any,
-        loop: Any,
+        record: MutableRunRecordPort,
+        request: RunRequestPort,
+        loop: LoopPort,
         suspension: Suspension,
         *,
         started: float,
@@ -170,7 +171,7 @@ class SessionDriveService:
             suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
         return await loop.aclose()
 
-    async def await_session_message(self, record: Any) -> Any:
+    async def await_session_message(self, record: MutableRunRecordPort) -> Any:
         """Await the next user message, ignoring stray resume signals and duplicate inbox ids."""
         deadline = time.monotonic() + self._context.limits_provider().idle_timeout_s
         while True:
@@ -188,7 +189,7 @@ class SessionDriveService:
                     record.seen_inbox_ids.add(msg_id)
             return message
 
-    def persist_run_checkpoint(self, record: Any) -> None:
+    def persist_run_checkpoint(self, record: MutableRunRecordPort) -> None:
         """Augment the loop checkpoint with backend-owned queue and inbox state."""
         loop = record.loop
         if loop is None:
@@ -200,7 +201,7 @@ class SessionDriveService:
 
     def persist_run_checkpoint_payload(
         self,
-        record: Any,
+        record: MutableRunRecordPort,
         checkpoint: RunCheckpoint,
         blobs: Mapping[str, bytes],
     ) -> None:
@@ -215,10 +216,10 @@ class SessionDriveService:
         self._context.checkpoint_store_provider().put(checkpoint, blobs)
         self._context.drain_outbox(record, loop)
 
-    async def persist_run_checkpoint_async(self, record: Any) -> None:
+    async def persist_run_checkpoint_async(self, record: MutableRunRecordPort) -> None:
         self.persist_run_checkpoint(record)
 
-    def session_should_stop(self, record: Any, started: float, turns: int) -> bool:
+    def session_should_stop(self, record: MutableRunRecordPort, started: float, turns: int) -> bool:
         limits = self._context.limits_provider()
         return (
             record.cancellation_token.requested

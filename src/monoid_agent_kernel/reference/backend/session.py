@@ -13,6 +13,7 @@ from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.media import normalize_inline_media_dicts
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.reference._shared.tokens import TokenError
+from monoid_agent_kernel.reference.backend.ports import LoopPort, MutableRunRecordPort, TokenClaimsPort
 from monoid_agent_kernel.reference.backend.projection import (
     _record_lifecycle_payload,
 )
@@ -32,23 +33,23 @@ def _normalize_inbound_message(content: str | Sequence[Any]) -> str | list[dict[
 @dataclass(frozen=True)
 class BackendSessionContext:
     authorize_run: Callable[[str, str], None]
-    verify_run_token: Callable[[str, str], Any]
+    verify_run_token: Callable[[str, str], TokenClaimsPort]
     verify_task_callback_token: Callable[[str, str, str], None]
     issue_task_callback_token: Callable[[str, str, str, str], str]
-    record: Callable[[str], Any]
-    active_record: Callable[[str], Any | None]
+    record: Callable[[str], MutableRunRecordPort]
+    active_record: Callable[[str], MutableRunRecordPort | None]
     run_dir_for: Callable[[str], Path]
     call_soon: Callable[..., None]
-    persist_checkpoint_from_any_thread: Callable[[Any], None]
+    persist_checkpoint_from_any_thread: Callable[[MutableRunRecordPort], None]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     read_recovery_meta: Callable[[Path, str], dict[str, Any] | None]
     attempt_resume: Callable[[Path, str], bool]
     max_message_bytes_provider: Callable[[], int]
     max_message_queue_depth_provider: Callable[[], int]
-    record_terminal: Callable[[Any], bool]
-    live_loop: Callable[[Any], tuple[Any | None, bool]]
-    mark_cancel_requested: Callable[[Any], bool]
-    ensure_message_enqueue_allowed: Callable[[Any], None]
+    record_terminal: Callable[[MutableRunRecordPort], bool]
+    live_loop: Callable[[MutableRunRecordPort], tuple[LoopPort | None, bool]]
+    mark_cancel_requested: Callable[[MutableRunRecordPort], bool]
+    ensure_message_enqueue_allowed: Callable[[MutableRunRecordPort], None]
     close_signal: object
     resume_signal: object
 
@@ -249,18 +250,18 @@ class BackendSessionService:
         record = self._context.record(run_id)
         return {"run_id": run_id, **_record_lifecycle_payload(record), "resumed": True}
 
-    def authorize_active_loop(self, run_id: str, token: str) -> Any:
+    def authorize_active_loop(self, run_id: str, token: str) -> LoopPort:
         self._context.authorize_run(run_id, token)
         return self.active_loop(run_id)
 
-    def authorize_task_result(self, run_id: str, token: str, task_id: str) -> Any:
+    def authorize_task_result(self, run_id: str, token: str, task_id: str) -> LoopPort:
         try:
             self.verify_task_callback_token(run_id, token, task_id)
         except TokenError:
             self._context.authorize_run(run_id, token)
         return self.active_loop(run_id)
 
-    def active_loop(self, run_id: str) -> Any:
+    def active_loop(self, run_id: str) -> LoopPort:
         record = self._context.record(run_id)
         loop, terminal = self._context.live_loop(record)
         if terminal:
@@ -269,7 +270,7 @@ class BackendSessionService:
             raise ValueError("run has not started")
         return loop
 
-    def authorize_claim_subject(self, run_id: str, claims: Any) -> None:
+    def authorize_claim_subject(self, run_id: str, claims: TokenClaimsPort) -> None:
         record = self._context.active_record(run_id)
         if record is not None and (claims.tenant_id != record.tenant_id or claims.user_id != record.user_id):
             raise PermissionDenied("token subject mismatch")

@@ -8,6 +8,7 @@ from typing import Any
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, validate_runtime_config
 from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.durable_metadata import DurableMetadataCommitter, runtime_config_from_metadata
+from monoid_agent_kernel.reference.backend.ports import RunRecordPort
 from monoid_agent_kernel.reference.backend.projection import _record_terminal
 
 
@@ -18,7 +19,7 @@ def runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
 @dataclass(frozen=True)
 class RuntimeConfigContext:
     authorize_run: Callable[[str, str], None]
-    record: Callable[[str], Any]
+    record: Callable[[str], RunRecordPort]
     with_record_lock: Callable[[Callable[[], Any]], Any]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     builtin_tool_specs_provider: Callable[[], tuple[Any, ...]]
@@ -124,7 +125,7 @@ class RuntimeConfigService:
 
     def write_runtime_config_run_meta(
         self,
-        record: Any,
+        record: RunRecordPort,
         config: AgentRuntimeConfig,
         *,
         issuer: str,

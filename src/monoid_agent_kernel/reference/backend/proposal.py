@@ -16,6 +16,7 @@ from monoid_agent_kernel.core.packages import (
 )
 from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.reference.backend.ports import RunRecordPort
 from monoid_agent_kernel.reference.backend.projection import _record_lifecycle_payload
 from monoid_agent_kernel.workspace.paths import is_within
 
@@ -25,8 +26,8 @@ _ARTIFACT_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
 @dataclass(frozen=True)
 class ProposalServiceContext:
     authorize_run: Callable[[str, str], None]
-    record: Callable[[str], Any]
-    read_proposal: Callable[[Any], dict[str, Any] | None]
+    record: Callable[[str], RunRecordPort]
+    read_proposal: Callable[[RunRecordPort], dict[str, Any] | None]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     emit_backend_event: Callable[..., None]
     allowed_apply_roots_provider: Callable[[], tuple[Path, ...]]

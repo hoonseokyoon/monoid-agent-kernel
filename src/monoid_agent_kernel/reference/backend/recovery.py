@@ -8,11 +8,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.core.checkpoint import CheckpointRecord, CheckpointStore
 from monoid_agent_kernel.core.durable_metadata import DurableMetadataCommitter
-from monoid_agent_kernel.core.result import Suspension
+from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.reference.backend.ports import (
+    DriveOpenSessionPort,
+    LeaseStorePort,
+    LoopPort,
+    MutableRunRecordPort,
+    RunRequestPort,
+)
 from monoid_agent_kernel.reference.backend.runtime_config import runtime_config_from_meta
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.backend")
@@ -22,25 +30,28 @@ _LOGGER = logging.getLogger("monoid_agent_kernel.backend")
 class RecoveryContext:
     run_root_provider: Callable[[], Path]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
-    lease_store_provider: Callable[[], Any | None]
+    lease_store_provider: Callable[[], LeaseStorePort | None]
     max_recover_attempts_provider: Callable[[], int]
     worker_id_provider: Callable[[], str]
     lease_ttl_s_provider: Callable[[], float]
     is_record_tracked: Callable[[str], bool]
-    record: Callable[[str], Any]
+    record: Callable[[str], MutableRunRecordPort]
     attempt_resume: Callable[[Path, str], bool]
     resume_from_checkpoint: Callable[[CheckpointRecord, dict[str, Any]], None]
-    make_request: Callable[[Mapping[str, Any], Any], Any]
-    make_record: Callable[[str, Any, Path, str, str, Any, Mapping[str, Any]], Any]
-    issue_llm_gateway_token: Callable[[str, Any, Any], str]
-    issue_web_gateway_token: Callable[[str, Any, Any], str]
-    build_loop: Callable[[str, Any, Path, str, str], Any]
-    register_record: Callable[[Any], None]
-    attach_loop: Callable[[Any, Any, Any], None]
+    make_request: Callable[[Mapping[str, Any], AgentRuntimeConfig], RunRequestPort]
+    make_record: Callable[
+        [str, RunRequestPort, Path, str, str, AgentRuntimeConfig, Mapping[str, Any]],
+        MutableRunRecordPort,
+    ]
+    issue_llm_gateway_token: Callable[[str, RunRequestPort, AgentRuntimeConfig], str]
+    issue_web_gateway_token: Callable[[str, RunRequestPort, AgentRuntimeConfig], str]
+    build_loop: Callable[[str, RunRequestPort, Path, str, str], LoopPort]
+    register_record: Callable[[MutableRunRecordPort], None]
+    attach_loop: Callable[[MutableRunRecordPort, LoopPort, RunRequestPort], None]
     call_soon: Callable[..., None]
-    spawn: Callable[[Awaitable[Any]], Any]
-    drive_open_session: Callable[..., Awaitable[Any]]
-    record_run_result: Callable[[str, Any], None]
+    spawn: Callable[[Awaitable[Any]], object]
+    drive_open_session: DriveOpenSessionPort
+    record_run_result: Callable[[str, AgentRunResult], None]
     record_run_failure: Callable[[str, Exception], None]
     acquire_run_slot: Callable[[], Awaitable[None]]
     release_run_slot: Callable[[], None]
@@ -153,7 +164,7 @@ class RecoveryService:
             self._context.call_soon(record.message_queue.put_nowait, message)
         self._context.spawn(self.run_recovered(run_id, request, loop))
 
-    async def run_recovered(self, run_id: str, request: Any, loop: Any) -> None:
+    async def run_recovered(self, run_id: str, request: RunRequestPort, loop: LoopPort) -> None:
         await self._context.acquire_run_slot()
         try:
             if loop.has_pending_tasks():
