@@ -164,7 +164,7 @@ def test_otel_event_sink_emits_genai_span_tree(tmp_path: Path) -> None:
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-    from monoid_agent_kernel import OtelEventSink
+    from monoid_agent_kernel.observability.otel import OtelEventSink
 
     exporter = InMemorySpanExporter()
     provider = TracerProvider()

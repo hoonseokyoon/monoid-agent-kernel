@@ -32,22 +32,21 @@ paths.
 
 Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
 
-- **Stable**: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig` /
+- **Stable Contract**: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig` /
   `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `tool`, `EventSink`,
-  `CheckpointStore`, `Workspace` / `workspace_factory`, `PermissionPolicy`, and the
-  rest of `contracts`.
-- **Experimental**: async-task seams (`TaskExecutor`, `ResultInjector`,
+  `CheckpointStore`, `Workspace` / `workspace_factory`, and `PermissionPolicy`.
+- **Contract Extension**: async-task seams (`TaskExecutor`, `ResultInjector`,
   `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
   `LoopSession`, `SessionState`, `ControlCommand` / `ControlResult` /
-  `ControlDispatcher`); multimodal input — `ImagePart` and `DocumentPart` are
-  forwarded to multimodal-capable adapters (the gateway and OpenAI adapters), a
-  text-only adapter drops them with a `model.input.degraded` warning, and
-  `AudioPart` / `VideoPart` round-trip as a forward-compatible contract but are
-  not yet forwarded. Output validation — `OutputValidator` / `ValidationOutcome` /
-  `FinalOutputView` / `OutputRetry` / `OutputValidatorError` (post-response conformance:
-  a validator registered via `AgentLoop(output_validators=...)` runs by default and can be
-  disabled per run with an `OutputValidatorBinding(enabled=False)`; on failure the loop re-prompts
-  up to `RunLimits.max_output_retries`).
+  `ControlDispatcher`); capability leases; agent-as-tool delegation; Agent Skills;
+  output validation; and multimodal input. `ImagePart` and `DocumentPart` are forwarded
+  to multimodal-capable adapters. `AudioPart` / `VideoPart` are exported content
+  contracts and round-trip through core JSON/checkpoint paths; provider forwarding is
+  adapter-specific.
+- **Helper Kit**: implementation helpers live under explicit modules such as
+  `monoid_agent_kernel.core.*`, `monoid_agent_kernel.providers.*`,
+  `monoid_agent_kernel.tools.*`, `monoid_agent_kernel.recorder`, and
+  `monoid_agent_kernel.observability`.
 - **Reference examples**: `monoid_agent_kernel.reference.*` services.
 
 ## Operational Rules

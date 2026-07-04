@@ -26,10 +26,7 @@ from monoid_agent_kernel.core.result import AgentArtifact, AgentRunResult, Agent
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
     CheckpointStore,
-    LocalFsCheckpointStore,
     RunCheckpoint,
-    read_checkpoint,
-    write_checkpoint,
 )
 
 # Workspace seam (the file-storage surface the engine works through; the local backend is
@@ -40,20 +37,14 @@ from monoid_agent_kernel.core.workspace import (
     Workspace,
     WorkspaceFactory,
 )
-from monoid_agent_kernel.workspace.local import default_local_workspace_factory
 
 # Session lifecycle (formal FSM + AgentSession contract)
 from monoid_agent_kernel.core.lifecycle import (
-    LEGAL_TRANSITIONS,
     AgentSession,
     LoopSession,
     SessionHealth,
     SessionInspection,
     SessionState,
-    assert_transition,
-    can_transition,
-    state_from_suspension,
-    to_session_state,
 )
 
 # Control protocol (transport-independent command envelope + dispatch seam)
@@ -69,7 +60,6 @@ from monoid_agent_kernel.core.control import (
 from monoid_agent_kernel.core.inbox import (
     INBOX_PROTOCOL_VERSION,
     InboxMessage,
-    is_inbox_envelope,
 )
 
 # Outbox request (capability-gated durable egress; the edge drains via an OutboxSender)
@@ -80,25 +70,15 @@ from monoid_agent_kernel.core.outbox import (
     OutboxSender,
 )
 
-# W3C Trace Context helpers (observability metadata carried on the envelopes)
-from monoid_agent_kernel.core.trace_context import (
-    child_traceparent,
-    new_traceparent,
-    parse_traceparent,
-    trace_id_of,
-)
-
 # Capability request/lease (scoped, short-lived access; secrets stay outside the core)
 from monoid_agent_kernel.core.capability import (
     CAPABILITY_LEASE_VERSION,
     CAPABILITY_REQUEST_VERSION,
-    AutoGrantBroker,
     CapabilityBroker,
     CapabilityDenial,
     CapabilityLease,
     CapabilityPending,
     CapabilityRequest,
-    CapabilityVault,
 )
 
 # Context providers (pluggable static + per-turn system context)
@@ -122,19 +102,11 @@ from monoid_agent_kernel.core.agents import (
     RegistryToolRef,
     RuntimeConfigProvider,
     RuntimeConfigSource,
-    StaticRuntimeConfigProvider,
     SubagentDefinition,
     ToolBinding,
     ToolSearchConfig,
-    coerce_runtime_config_provider,
-    collect_runtime_config_issues,
-    compile_bound_tool_catalog,
-    generated_tool_bindings,
-    static_runtime_config,
-    validate_runtime_config,
 )
 from monoid_agent_kernel.core.tool_surface import (
-    DefaultToolSurfaceResolver,
     ToolAuthorization,
     ToolGuidance,
     ToolQuota,
@@ -146,10 +118,12 @@ from monoid_agent_kernel.core.tool_surface import (
 
 # Multimodal input content parts (contract-only surface; see core/content.py)
 from monoid_agent_kernel.core.content import (
+    AudioPart,
     ContentPart,
     DocumentPart,
     ImagePart,
     TextPart,
+    VideoPart,
 )
 
 # Model adapter contract
@@ -163,7 +137,6 @@ from monoid_agent_kernel.providers.base import (
     ToolCallDelta,
     ToolObservation,
     TurnComplete,
-    assemble_streamed_turn,
 )
 from monoid_agent_kernel.core.streaming import RunStream
 
@@ -179,8 +152,6 @@ from monoid_agent_kernel.tools.base import (
     ToolSpec,
 )
 from monoid_agent_kernel.tools.decorator import tool
-from monoid_agent_kernel.tools import tool_ids
-from monoid_agent_kernel.tools.tool_ids import list_builtin_tools
 
 # Event contract
 from monoid_agent_kernel.core.events import (
@@ -205,13 +176,8 @@ from monoid_agent_kernel.tasks import (
     TaskReporter,
 )
 
-# Subagent (agent-as-tool) delegation tool + file discovery
-from monoid_agent_kernel.core.frontmatter import parse_frontmatter
-from monoid_agent_kernel.subagent_loader import load_subagent_definitions
-from monoid_agent_kernel.tools.builtin import agent_spawn_tool
-
-# Agent Skills (progressive disclosure) — context + tool provider, plus file discovery
-from monoid_agent_kernel.skills import SkillDefinition, SkillProvider, load_skill_definitions
+# Agent Skills (progressive disclosure) — context + tool provider
+from monoid_agent_kernel.skills import SkillDefinition, SkillProvider
 
 
 class core:  # noqa: N801 - intentional lowercase: a curated namespace, not a class to instantiate
@@ -249,22 +215,13 @@ __all__ = [
     "RunCheckpoint",
     "CheckpointStore",
     "CheckpointRecord",
-    "LocalFsCheckpointStore",
-    "read_checkpoint",
-    "write_checkpoint",
     # workspace seam (file-storage surface; the local backend is the default)
     "Workspace",
     "WorkspaceFactory",
     "FileEntry",
     "ChangedEntry",
-    "default_local_workspace_factory",
     # session lifecycle (formal FSM + AgentSession contract)
     "SessionState",
-    "LEGAL_TRANSITIONS",
-    "can_transition",
-    "assert_transition",
-    "state_from_suspension",
-    "to_session_state",
     "AgentSession",
     "LoopSession",
     "SessionInspection",
@@ -276,17 +233,11 @@ __all__ = [
     # inbox message envelope (provenance + idempotent ingress)
     "INBOX_PROTOCOL_VERSION",
     "InboxMessage",
-    "is_inbox_envelope",
     # outbox request (capability-gated durable egress)
     "OUTBOX_REQUEST_VERSION",
     "OutboxRequest",
     "OutboxReceipt",
     "OutboxSender",
-    # W3C Trace Context helpers
-    "parse_traceparent",
-    "new_traceparent",
-    "child_traceparent",
-    "trace_id_of",
     "ControlResult",
     "ControlDispatcher",
     # capability request/lease
@@ -297,8 +248,6 @@ __all__ = [
     "CapabilityDenial",
     "CapabilityPending",
     "CapabilityBroker",
-    "CapabilityVault",
-    "AutoGrantBroker",
     # context providers
     "AgentDefinition",
     "AgentRuntimeConfig",
@@ -308,13 +257,8 @@ __all__ = [
     "RegistryToolRef",
     "RuntimeConfigProvider",
     "RuntimeConfigSource",
-    "StaticRuntimeConfigProvider",
-    "static_runtime_config",
-    "coerce_runtime_config_provider",
     "ToolBinding",
     "ToolSearchConfig",
-    "compile_bound_tool_catalog",
-    "generated_tool_bindings",
     "ContextProvider",
     "TurnContext",
     "OutputValidator",
@@ -323,7 +267,6 @@ __all__ = [
     "FinalOutputView",
     "OutputRetry",
     "OutputValidatorError",
-    "DefaultToolSurfaceResolver",
     "ToolAuthorization",
     "ToolGuidance",
     "ToolQuota",
@@ -336,6 +279,8 @@ __all__ = [
     "TextPart",
     "ImagePart",
     "DocumentPart",
+    "AudioPart",
+    "VideoPart",
     # model adapter contract
     "ModelAdapter",
     "ModelRequest",
@@ -348,7 +293,6 @@ __all__ = [
     "TextDelta",
     "ToolCallDelta",
     "TurnComplete",
-    "assemble_streamed_turn",
     # tool contract
     "DynamicToolProvider",
     "ToolContext",
@@ -359,11 +303,6 @@ __all__ = [
     "ToolSideEffect",
     "ToolSpec",
     "tool",
-    "tool_ids",
-    "list_builtin_tools",
-    # config validation
-    "validate_runtime_config",
-    "collect_runtime_config_issues",
     # NOTE: the curated `core` namespace is intentionally NOT in __all__ — re-exporting it would
     # shadow the `monoid_agent_kernel.core` package at the root. Reach it via
     # `from monoid_agent_kernel.contracts import core`.
@@ -384,11 +323,7 @@ __all__ = [
     # subagent (agent-as-tool) delegation
     "SubagentDefinition",
     "SubagentTaskExecutor",
-    "agent_spawn_tool",
-    "load_subagent_definitions",
-    "parse_frontmatter",
     # agent skills (progressive disclosure)
     "SkillDefinition",
     "SkillProvider",
-    "load_skill_definitions",
 ]

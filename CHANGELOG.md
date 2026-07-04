@@ -7,6 +7,14 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed
+- Phase 4-1 public-surface cleanup: `monoid_agent_kernel.contracts` and the
+  top-level `monoid_agent_kernel` package now export only the contract surface.
+  Helper/default implementations and convenience adapters are imported from their
+  explicit modules.
+- `AudioPart` and `VideoPart` are now exported from the contract surface to match
+  the core content contract.
+
 ## [0.14.0] - 2026-06-30
 
 ### Added

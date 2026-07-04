@@ -78,9 +78,9 @@ config — and `from_config` wires them in one call. `FakeModelAdapter` (a scrip
 makes the first turn run offline, with no gateway or API key:
 
 ```python
-from monoid_agent_kernel import AgentLoop, AgentRunSpec, AgentRuntimeConfig, FakeModelAdapter
-from monoid_agent_kernel import RegistryToolRef, ToolBinding
+from monoid_agent_kernel import AgentLoop, AgentRunSpec, AgentRuntimeConfig, RegistryToolRef, ToolBinding
 from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter
 
 spec = AgentRunSpec(workspace_root="./workspace", mode="apply")
 config = AgentRuntimeConfig(
@@ -105,19 +105,20 @@ your own `ModelAdapter`. Author tools from typed functions with the `@tool` deco
 This package is pre-1.0 (`0.x`): the public surface may change between minor versions, but
 breaking changes are called out in commit messages and this README.
 
-- **Stable** — the core engine and the contracts it implements: `AgentLoop`, `AgentRunSpec`,
-  `AgentRuntimeConfig` / `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `@tool`,
-  `EventSink`, `CheckpointStore`, `Workspace` / `workspace_factory`, `PermissionPolicy`, and
-  the rest of `monoid_agent_kernel.contracts`.
-- **Experimental** — surfaces still settling: the async-task seams (`TaskExecutor`,
-  `ResultInjector`, `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
-  `LoopSession`, `SessionState`, `ControlCommand` / `ControlDispatcher`); capability leases
-  (`CapabilityBroker` / `CapabilityLease`); agent-as-tool delegation (`SubagentDefinition`)
-  and Agent Skills (`SkillProvider`); and the multimodal content parts. `ImagePart` and
-  `DocumentPart` are forwarded to multimodal-capable adapters (the gateway and OpenAI
-  adapters); a text-only adapter drops them with a `model.input.degraded` warning.
-  `AudioPart` / `VideoPart` round-trip as a forward-compatible contract but are not yet
-  forwarded.
+- **Stable Contract** — the core engine and integration contracts exported from
+  `monoid_agent_kernel.contracts`: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig` /
+  `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `@tool`, `EventSink`,
+  `CheckpointStore`, `Workspace` / `workspace_factory`, and `PermissionPolicy`.
+- **Contract Extension** — surfaces that are public but still settling: async task seams,
+  session lifecycle/control, capability leases, agent-as-tool delegation, Agent Skills,
+  output validation, and multimodal content parts. `ImagePart` and `DocumentPart` are
+  forwarded to multimodal-capable adapters. `AudioPart` / `VideoPart` are exported
+  content contracts and round-trip through core JSON/checkpoint paths; provider forwarding
+  is still adapter-specific.
+- **Helper Kit** — implementation helpers live under explicit modules such as
+  `monoid_agent_kernel.core.*`, `monoid_agent_kernel.providers.*`,
+  `monoid_agent_kernel.tools.*`, `monoid_agent_kernel.recorder`, and
+  `monoid_agent_kernel.observability`.
 - **Reference examples** — everything under `monoid_agent_kernel.reference.*` is example
   implementation code; build production services against the contracts.
 
@@ -541,7 +542,8 @@ not nested), and spans carry GenAI attributes (`gen_ai.operation.name`, `gen_ai.
 `gen_ai.tool.name`, token usage). Wire it in with one line:
 
 ```python
-from monoid_agent_kernel import AgentLoop, OtelEventSink
+from monoid_agent_kernel import AgentLoop
+from monoid_agent_kernel.observability.otel import OtelEventSink
 
 loop = AgentLoop.from_config(spec, adapter, config, event_sinks=(OtelEventSink(),))
 ```
