@@ -341,8 +341,8 @@
       <section id="config-panel" class="side-panel" hidden data-testid="live-config-panel">
         <div id="setup" data-testid="settings-config-popup">
           <label>Model <input id="model" type="text" spellcheck="false" autocomplete="off" /></label>
-          <label>Effort <select id="effort"></select></label>
-          <label>Thinking <select id="summary"></select></label>
+          <label>Thinking level <select id="effort"></select></label>
+          <label title="Show the model-provided reasoning summary when available">Show thinking summary <input type="checkbox" id="summary" /></label>
           <label title="Export OpenTelemetry spans to the configured OTLP collector">OTel <input type="checkbox" id="otel" /></label>
           <span id="setup-status"></span>
         </div>
@@ -379,11 +379,11 @@
           <label>Model
             <input id="profile-model-input" type="text" spellcheck="false" autocomplete="off" />
           </label>
-          <label>Effort
+          <label>Thinking level
             <select id="profile-effort-input"></select>
           </label>
-          <label>Thinking
-            <select id="profile-summary-input"></select>
+          <label title="Show the model-provided reasoning summary when available">Show thinking summary
+            <input id="profile-summary-input" type="checkbox" />
           </label>
         </div>
         <div>
@@ -1266,13 +1266,7 @@ async function loadSetup() {
       if (e === s.effort) opt.selected = true;
       effortEl.appendChild(opt);
     }
-    summaryEl.innerHTML = "";
-    for (const v of (s.summaries || [])) {
-      const opt = document.createElement("option");
-      opt.value = v; opt.textContent = v;
-      if (v === s.summary) opt.selected = true;
-      summaryEl.appendChild(opt);
-    }
+    summaryEl.checked = (s.summary || "auto") !== "off";
     const otelEl = document.getElementById("otel");
     otelEl.checked = !!s.otel;
     const liveCaps = document.getElementById("live-caps");
@@ -1297,8 +1291,8 @@ async function loadSetup() {
     };
     renderLiveCaps(s.capabilities || []);
     modelEl.addEventListener("change", () => saveSetting({ model: modelEl.value }, "Model"));
-    effortEl.addEventListener("change", () => saveSetting({ effort: effortEl.value }, "Effort"));
-    summaryEl.addEventListener("change", () => saveSetting({ summary: summaryEl.value }, "Thinking"));
+    effortEl.addEventListener("change", () => saveSetting({ effort: effortEl.value }, "Thinking level"));
+    summaryEl.addEventListener("change", () => saveSetting({ summary: summaryEl.checked ? "auto" : "off" }, "Thinking summary"));
     otelEl.addEventListener("change", () => saveSetting({ otel: otelEl.checked }, "OTel"));
   } catch (_) {}
 }
@@ -1328,7 +1322,6 @@ const traceTreeEl = document.getElementById("trace-tree");
 let profileCatalog = [];
 let profileCapabilities = [];
 let profileEfforts = [];
-let profileSummaries = [];
 let activeSidePanel = "workspace-panel";
 let runEvents = [];
 const _TRACE_SKIP = new Set([
@@ -1433,7 +1426,6 @@ async function loadProfiles() {
     profileCatalog = body.profiles || [];
     profileCapabilities = body.available_capabilities || [];
     profileEfforts = body.efforts || ["none", "low", "medium", "high", "xhigh"];
-    profileSummaries = body.summaries || ["off", "auto", "detailed"];
     if (!profileById(activeProfileId)) activeProfileId = body.default_profile_id || "default";
     renderProfileOptions();
   } catch (_) {}
@@ -1470,7 +1462,7 @@ function openProfileEditor(profile) {
   profileInstructionsInput.value = source.instructions || "";
   profileModelInput.value = source.model || "gpt-5.5";
   fillSelect(profileEffortInput, profileEfforts, source.effort || "medium");
-  fillSelect(profileSummaryInput, profileSummaries, source.summary || "auto");
+  profileSummaryInput.checked = (source.summary || "auto") !== "off";
   profileCapabilityEl.innerHTML = "";
   const enabled = new Set(source.capabilities || []);
   for (const cap of profileCapabilities) {
@@ -1508,7 +1500,7 @@ profileForm.addEventListener("submit", async (event) => {
     capabilities,
     model: profileModelInput.value.trim(),
     effort: profileEffortInput.value,
-    summary: profileSummaryInput.value,
+    summary: profileSummaryInput.checked ? "auto" : "off",
   };
   if (profileEditId.value) payload.id = profileEditId.value;
   profileEditorStatus.textContent = "Saving…";
@@ -1522,7 +1514,6 @@ profileForm.addEventListener("submit", async (event) => {
     profileCatalog = body.profiles || profileCatalog;
     profileCapabilities = body.available_capabilities || profileCapabilities;
     profileEfforts = body.efforts || profileEfforts;
-    profileSummaries = body.summaries || profileSummaries;
     if (body.profile && body.profile.id) {
       activeProfileId = body.profile.id;
       runId = null;

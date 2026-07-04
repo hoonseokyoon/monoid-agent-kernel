@@ -218,11 +218,11 @@ _DEFAULT_EFFORT = "medium"
 _EFFORT_CHOICES = ("none", "low", "medium", "high", "xhigh")
 # Validation superset = the engine's full ReasoningEffort literal (some values suit other models).
 _ALL_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh")
-# Reasoning *summary* visibility (DX-13b): "auto" surfaces a model-written summary of its thinking
-# in the chat's collapsible "Thinking" panel; "off" hides it. Display-only — independent of the
-# reasoning round-trip, which always travels by-value.
+# Reasoning *summary* visibility (DX-13b): Studio exposes this as one checkbox. "auto"
+# surfaces a model-written summary in the collapsible Thinking panel; "off" hides it.
+# Display-only — independent of the reasoning round-trip, which always travels by-value.
 _DEFAULT_SUMMARY = "auto"
-_SUMMARY_CHOICES = ("off", "auto", "detailed")
+_SUMMARY_CHOICES = ("off", "auto")
 
 # OTel tracing (Tier-3): when toggled on, runs emit GenAI spans via OtelEventSink to an OTLP
 # collector (default = a local Jaeger's OTLP/HTTP port). The exporter + global provider are set

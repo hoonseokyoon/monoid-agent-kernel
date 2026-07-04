@@ -74,10 +74,11 @@ def test_settings_model_and_effort_apply_to_new_chats(studio: StudioServer) -> N
 
 
 def test_settings_reasoning_summary_visibility(studio: StudioServer) -> None:
-    # DX-13b: the "Thinking" (reasoning summary) toggle is a real setting that flows into the
-    # runtime config so the model returns a displayable summary.
+    # DX-13b: Studio exposes the reasoning summary as a checkbox: auto when checked, off when
+    # unchecked. Detailed summary support stays provider/model-specific and is not a Studio mode.
     s = studio.settings()
-    assert s["summary"] == "auto" and "off" in s["summaries"]
+    assert s["summary"] == "auto"
+    assert s["summaries"] == ["off", "auto"]
     studio.update_settings(summary="off")
     run_id = studio.start_chat("hi")["run_id"]
     config = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
