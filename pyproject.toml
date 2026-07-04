@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "monoid-agent-kernel"
-version = "0.14.0"
+version = "0.15.0"
 description = "Lightweight durable agent kernel for product integrations"
 readme = "README.md"
 requires-python = ">=3.11"

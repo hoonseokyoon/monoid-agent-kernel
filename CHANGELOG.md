@@ -22,6 +22,35 @@ out in commit messages and here.
 - `AudioPart` and `VideoPart` are now exported from the contract surface to match
   the core content contract.
 
+## [0.15.0] - 2026-07-03
+
+### Added
+- Operational rule coverage for OR-01 through OR-13, mapping each rule to Core Helper Kit
+  surfaces, conformance assertions, Reference harness cases, and primary tests.
+- Executable conformance profiles for tool-agent approval, optional side-effect tools,
+  external-agent message fabric, and the bundled Reference full profile.
+- Strict wire parsing helpers for JSON-native payloads, plus property tests for
+  external-agent envelopes and inbox/outbox round-trips.
+- Public/private task payload separation, including safe public capability-result summaries.
+- Canonical external-agent metadata merge helpers so user metadata cannot override trusted
+  peer, task, request, result, or trace identity.
+
+### Changed
+- Reference backend, web tool service, durable metadata listing, and Studio subagent event
+  routing now consistently use the Core Helper Kit paths established by the operational rules.
+- Approval callback parsing now fails closed for ambiguous approve/deny values while preserving
+  durable replay behavior.
+- Strict parsers continue to accept legacy `native-agent-runner.*` protocol ids during the
+  namespace migration window.
+
+### Fixed
+- Recovered outbox requests, capability leases, and control commands created before the Monoid
+  namespace rename are accepted by the new strict parsers.
+- Public hosted-task payloads no longer expose raw capability grant material such as `lease` or
+  `token_ref`.
+- Requested web domain scope now respects wildcard narrowing rules instead of exact-match-only
+  intersection.
+
 ## [0.14.0] - 2026-06-30
 
 ### Added
