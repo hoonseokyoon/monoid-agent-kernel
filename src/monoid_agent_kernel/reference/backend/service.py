@@ -5,7 +5,6 @@ import atexit
 import json
 import logging
 import random
-import re
 import threading
 import time
 import uuid
@@ -49,13 +48,6 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_from_run_status,
     session_state_value,
 )
-from monoid_agent_kernel.core.packages import (
-    apply_package,
-    create_approval,
-    export_package,
-    write_apply_result,
-    write_approval,
-)
 from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
@@ -64,7 +56,6 @@ from monoid_agent_kernel.core.checkpoint import (
     RunCheckpoint,
 )
 from monoid_agent_kernel.reference.stores.lease import LeaseStore, LocalFsLeaseStore
-from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.content import (
     ContentPart,
@@ -102,11 +93,11 @@ from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
     _json_safe as _json_safe,
-    _record_lifecycle_payload,
     _record_terminal,
     _read_event_page,
     _set_record_state,
 )
+from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
 from monoid_agent_kernel.reference.backend.session import (
     BackendSessionContext,
     BackendSessionService,
@@ -129,11 +120,6 @@ _CLOSE_SESSION = object()
 # queue-waiting branches, which expect a real user message or _CLOSE_SESSION.
 _RESUME_SESSION = object()
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
-
-# A run-artifact fetch handle is a bare sha256 hex digest — validated before any store lookup so a
-# crafted value can never reach the blob layer as a path.
-_ARTIFACT_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
-
 
 # Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
 _RUN_META_SCHEMA_VERSION = RUN_METADATA_SCHEMA_VERSION
@@ -602,6 +588,7 @@ class RunnerBackend:
     # (backend._outbox_rng.seed(...)) without perturbing global random state.
     _outbox_rng: random.Random = field(default_factory=random.Random, init=False, repr=False)
     _projection: RunProjectionService = field(init=False, repr=False)
+    _proposal: ProposalService = field(init=False, repr=False)
     _session_boundary: BackendSessionService = field(init=False, repr=False)
     _session_drive: SessionDriveService = field(init=False, repr=False)
     _commands: BackendCommandService = field(init=False, repr=False)
@@ -635,6 +622,16 @@ class RunnerBackend:
                 checkpoint_store_provider=lambda: self.checkpoint_store,
                 max_recover_attempts_provider=lambda: self.max_recover_attempts,
                 issue_read_token=self._issue_read_token,
+            )
+        )
+        self._proposal = ProposalService(
+            ProposalServiceContext(
+                authorize_run=self._authorize_run,
+                record=self._record,
+                read_proposal=self._read_proposal,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                emit_backend_event=self._emit_backend_event,
+                allowed_apply_roots_provider=lambda: self.allowed_apply_roots,
             )
         )
         assert self.checkpoint_store is not None
@@ -987,34 +984,13 @@ class RunnerBackend:
         return self._projection.result(run_id, token)
 
     def proposal(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        payload = self._read_proposal(record)
-        if payload is None:
-            return {
-                "run_id": record.run_id,
-                "tenant_id": record.tenant_id,
-                **_record_lifecycle_payload(record),
-                "ready": False,
-                "error": record.error,
-            }
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            **_record_lifecycle_payload(record),
-            "ready": True,
-            **payload,
-        }
+        return self._proposal.proposal(run_id, token)
 
     def proposal_diff(self, run_id: str, token: str) -> dict[str, Any]:
         """The unified diff of the current proposal, on demand (works mid-run, not only at the
         end like ``result()``). Token-scoped so an embedder never reads the run dir off disk.
         Binary files appear as a ``<binary sha256=… size=…>`` marker line in the patch."""
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        diff_path = record.run_dir / "diff.patch"
-        diff = diff_path.read_text(encoding="utf-8") if diff_path.exists() else ""
-        return {"run_id": run_id, "ready": diff_path.exists(), "diff": diff}
+        return self._proposal.proposal_diff(run_id, token)
 
     def cancel_run(self, run_id: str, token: str) -> dict[str, Any]:
         return self._session_boundary.cancel_run(run_id, token)
@@ -1280,25 +1256,7 @@ class RunnerBackend:
         return self._session_boundary.active_loop(run_id)
 
     def proposal_file(self, run_id: str, token: str, path: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        proposal = self._read_proposal(record)
-        if proposal is None:
-            raise ValueError("proposal snapshot is not ready")
-        try:
-            file_payload = read_proposal_file_payload(record.run_dir, proposal, path)
-        except ProposalFileError as exc:
-            if exc.reason in {"not_found", "snapshot_missing"}:
-                raise KeyError(str(exc)) from exc
-            if exc.reason == "escapes_run_dir":
-                raise PermissionDenied(str(exc)) from exc
-            raise ValueError(str(exc)) from exc
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            **_record_lifecycle_payload(record),
-            **file_payload,
-        }
+        return self._proposal.proposal_file(run_id, token, path)
 
     def export_proposal_package(self, run_id: str, token: str) -> dict[str, Any]:
         """Build the portable proposal package and return a RECEIPT — never a filesystem path.
@@ -1307,25 +1265,7 @@ class RunnerBackend:
         bytes) is the retrieval handle for :meth:`read_run_artifact`. This keeps the
         "embedder never reads run_dir off disk" invariant for binary artifacts too: a remote
         embedder fetches the bytes back by digest, exactly like Bazel CAS / an OCI blob."""
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        output = record.run_dir / "proposal.tar"
-        payload = export_package(record.run_dir, output)
-        tar_bytes = output.read_bytes()
-        assert self.checkpoint_store is not None
-        digest = self.checkpoint_store.put_blob(run_id, tar_bytes)
-        self._emit_backend_event(
-            run_id,
-            "proposal.package.exported",
-            data={"package_hash": payload["package_hash"], "digest": digest, "size_bytes": len(tar_bytes)},
-        )
-        return {
-            "package_hash": payload["package_hash"],
-            "digest": digest,  # the fetch handle (sha256 of the tar bytes)
-            "size_bytes": len(tar_bytes),
-            "media_type": "application/x-tar",
-            "name": "proposal.tar",  # advisory filename for Content-Disposition only
-        }
+        return self._proposal.export_proposal_package(run_id, token)
 
     def read_run_artifact(
         self, run_id: str, token: str, digest: str, *, offset: int = 0, limit: int | None = None
@@ -1338,17 +1278,7 @@ class RunnerBackend:
         streaming/range fetch is a non-breaking addition; today they slice the in-memory bytes.
         Raises ``KeyError`` (→ 404) when the digest is unknown for this run, ``ValueError`` (→ 400)
         for a malformed digest."""
-        self._authorize_run(run_id, token)
-        if not _ARTIFACT_DIGEST_RE.match(digest):
-            raise ValueError("digest must be a 64-char sha256 hex string")
-        assert self.checkpoint_store is not None
-        try:
-            data = self.checkpoint_store.get_blob(run_id, digest)
-        except KeyError as exc:
-            raise KeyError(f"artifact not found: {digest}") from exc
-        if offset or limit is not None:
-            data = data[offset : (None if limit is None else offset + limit)]
-        return data
+        return self._proposal.read_run_artifact(run_id, token, digest, offset=offset, limit=limit)
 
     def approve_proposal(
         self,
@@ -1359,21 +1289,13 @@ class RunnerBackend:
         approved_paths: tuple[str, ...] = (),
         note: str = "",
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        approval = create_approval(
-            record.run_dir,
+        return self._proposal.approve_proposal(
+            run_id,
+            token,
             approver_id=approver_id,
-            approved_paths=approved_paths or None,
+            approved_paths=approved_paths,
             note=note,
         )
-        write_approval(record.run_dir / "approval.json", approval)
-        self._emit_backend_event(
-            run_id,
-            "proposal.approved",
-            data={"approval_hash": approval["approval_hash"], "package_hash": approval["package_hash"]},
-        )
-        return approval
 
     def reject_proposal(
         self,
@@ -1383,21 +1305,7 @@ class RunnerBackend:
         approver_id: str,
         reason: str,
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        approval = create_approval(
-            record.run_dir,
-            approver_id=approver_id,
-            decision="rejected",
-            note=reason,
-        )
-        write_approval(record.run_dir / "approval.json", approval)
-        self._emit_backend_event(
-            run_id,
-            "proposal.rejected",
-            data={"approval_hash": approval["approval_hash"], "package_hash": approval["package_hash"]},
-        )
-        return approval
+        return self._proposal.reject_proposal(run_id, token, approver_id=approver_id, reason=reason)
 
     def apply_proposal(
         self,
@@ -1408,30 +1316,13 @@ class RunnerBackend:
         approval_path: Path | None = None,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        if not self.allowed_apply_roots:
-            raise PermissionDenied("proposal apply is disabled")
-        target = target.resolve()
-        if not any(is_within(root, target) for root in self.allowed_apply_roots):
-            raise PermissionDenied(f"apply target is outside allowed roots: {target}")
-        record = self._record(run_id)
-        approval = approval_path or (record.run_dir / "approval.json")
-        result = apply_package(record.run_dir, approval=approval, target=target, dry_run=dry_run)
-        write_apply_result(record.run_dir / "apply-result.json", result)
-        event_type = "proposal.conflict" if result.status == "conflict" else "proposal.applied"
-        self._emit_backend_event(
+        return self._proposal.apply_proposal(
             run_id,
-            event_type,
-            data={
-                "status": result.status,
-                "approval_hash": result.approval_hash,
-                "package_hash": result.package_hash,
-                "applied_paths": list(result.applied_paths),
-                "conflicts": [conflict.to_json() for conflict in result.conflicts],
-            },
-            level="warning" if result.status == "conflict" else "info",
+            token,
+            target=target,
+            approval_path=approval_path,
+            dry_run=dry_run,
         )
-        return result.to_json()
 
     def events(
         self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
