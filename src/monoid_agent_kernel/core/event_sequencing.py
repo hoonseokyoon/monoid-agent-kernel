@@ -7,7 +7,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-DIRECT_AUDIT_APPEND_STATUSES = frozenset({"completed", "failed", "limited", "ended"})
+from monoid_agent_kernel.core.lifecycle import (
+    TERMINAL_STATES,
+    SessionState,
+    session_state_from_run_status,
+)
+
+DIRECT_AUDIT_APPEND_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 DEFAULT_DIAGNOSTIC_EVENT_DATA_KEYS = frozenset(
     {
@@ -96,23 +102,46 @@ class RunEventSequencer:
 
     direct_append_statuses: frozenset[str] = field(default_factory=lambda: DIRECT_AUDIT_APPEND_STATUSES)
 
-    def is_queued_before_recorder(self, status: str) -> bool:
+    def is_queued_before_recorder(self, state: str | SessionState) -> bool:
         """Queued runs may seed the event log before the recorder opens."""
-        return status == "queued"
+        return session_state_from_run_status(state) is SessionState.CREATED
 
-    def is_terminal_direct_append_status(self, status: str) -> bool:
+    def is_terminal_direct_append_status(
+        self,
+        state: str | SessionState,
+        *,
+        terminal: bool = False,
+    ) -> bool:
         """Terminal run dirs may receive guarded control audit appends."""
-        return status in self.direct_append_statuses
+        session_state = session_state_from_run_status(state, terminal=terminal)
+        return terminal or session_state in TERMINAL_STATES
 
-    def requires_live_sequence_owner(self, status: str) -> bool:
+    def requires_live_sequence_owner(
+        self,
+        state: str | SessionState,
+        *,
+        terminal: bool = False,
+    ) -> bool:
         """Live non-terminal records should write through the live recorder."""
-        return not self.is_queued_before_recorder(status) and not self.is_terminal_direct_append_status(status)
+        return not self.is_queued_before_recorder(state) and not self.is_terminal_direct_append_status(
+            state,
+            terminal=terminal,
+        )
 
     def run_dir_allows_direct_append(self, run_dir: Path) -> bool:
-        status = _read_optional_json(run_dir / "status.json")
-        if status is None:
+        payload = _read_optional_json(run_dir / "status.json")
+        if payload is None:
             return False
-        return self.is_terminal_direct_append_status(str(status.get("status") or ""))
+        state = payload.get("state") or payload.get("status") or ""
+        terminal = bool(payload.get("terminal"))
+        if "terminal" not in payload:
+            legacy_status = str(payload.get("status") or "")
+            state_value = str(payload.get("state") or "")
+            if state_value in {"completed", "failed", "cancelled"} or (
+                not state_value and legacy_status in {"completed", "failed", "limited", "cancelled"}
+            ):
+                terminal = True
+        return self.is_terminal_direct_append_status(str(state), terminal=terminal)
 
     def newest_sequence(self, status: Mapping[str, Any], status_file: Mapping[str, Any] | None = None) -> int:
         """Return the newest event sequence visible across live and durable projections."""

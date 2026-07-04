@@ -1,5 +1,4 @@
-"""The tool_ids constants must stay in lockstep with the actual builtin tool surface, and be
-reachable from the package root (the discovery surface that replaces bare-string ids)."""
+"""The tool_ids constants must stay in lockstep with the actual builtin tool surface."""
 
 from __future__ import annotations
 
@@ -15,7 +14,8 @@ def _declared_constants() -> dict[str, str]:
 
 
 def test_constants_match_builtin_tool_ids() -> None:
-    from monoid_agent_kernel import list_builtin_tools, tool_ids
+    from monoid_agent_kernel.tools import tool_ids
+    from monoid_agent_kernel.tools.tool_ids import list_builtin_tools
 
     builtin_ids = {spec.id for spec in list_builtin_tools()}
     constant_values = set(_declared_constants().values())
@@ -29,8 +29,9 @@ def test_constants_match_builtin_tool_ids() -> None:
     assert constant_values == builtin_ids | {tool_ids.AGENT_SPAWN}
 
 
-def test_constants_are_reachable_from_package_root() -> None:
-    from monoid_agent_kernel import list_builtin_tools, tool_ids
+def test_constants_are_reachable_from_explicit_tool_ids_module() -> None:
+    from monoid_agent_kernel.tools import tool_ids
+    from monoid_agent_kernel.tools.tool_ids import list_builtin_tools
 
     assert tool_ids.FS_READ == "fs.read"
     assert tool_ids.RUN_FINISH == "run.finish"

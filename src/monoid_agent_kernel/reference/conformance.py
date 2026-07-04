@@ -96,10 +96,11 @@ class ReferenceConformanceFactory:
             submitted = server.start_chat("hello from reference-full smoke")
             run_id = str(submitted["run_id"])
             events = _wait_for_event(server, run_id, "turn.settled")
-            assert _eventually(lambda: server.run_status(run_id)["status"] == "awaiting_input")
+            assert _eventually(lambda: server.run_status(run_id)["state"] == "awaiting_input")
             status = server.run_status(run_id)
             sessions = server.sessions()
-            assert status["status"] == "awaiting_input"
+            assert status["state"] == "awaiting_input"
+            assert status["terminal"] is False
             assert any(session["run_id"] == run_id for session in sessions["sessions"])
             return {"run_id": run_id, "event_count": len(events)}
         finally:
@@ -410,6 +411,16 @@ class ReferenceBackendHarness:
         self.backend.idle_timeout_s = 30.0
         self.backend.max_recover_attempts = 10_000
 
+    def __enter__(self) -> ReferenceBackendHarness:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        del exc_type, exc, tb
+        self.close()
+
+    def close(self) -> None:
+        self.backend.shutdown(drain=True)
+
     def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
         scenario = str(request.metadata.get("scenario") or "")
         if scenario == "tool-side-effect-pending-recovery":
@@ -479,7 +490,9 @@ class ReferenceBackendHarness:
         }:
             assert self.backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
         elif multi_turn:
-            assert _eventually(lambda: self.backend._record(submission.run_id).status == "awaiting_input")
+            task_waiting = {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}
+            expected_state = "awaiting_tasks" if scenario in task_waiting else "awaiting_input"
+            assert _eventually(lambda: self.backend._record(submission.run_id).state.value == expected_state)
             if scenario == "recoverable-multi-turn":
                 assert _eventually(lambda: self.checkpoint_store.latest(submission.run_id) is not None)
             elif scenario == "tool-side-effect-pending-recovery":
@@ -559,7 +572,7 @@ class ReferenceBackendHarness:
         )
         self.message_fabric_directory["worker"] = worker["run_id"]
         self.message_fabric_tokens[worker["run_id"]] = worker["token"]
-        assert _eventually(lambda: self.backend._record(worker["run_id"]).status == "awaiting_input")
+        assert _eventually(lambda: self.backend._record(worker["run_id"]).state.value == "awaiting_input")
 
         planner = self._submit_backend_scenario(
             "message-fabric-planner",
@@ -595,7 +608,7 @@ class ReferenceBackendHarness:
             instruction="receive external agent messages",
             multi_turn=True,
         )
-        assert _eventually(lambda: self.backend._record(receiver["run_id"]).status == "awaiting_input")
+        assert _eventually(lambda: self.backend._record(receiver["run_id"]).state.value == "awaiting_input")
         envelope = _external_agent_envelope("mf-duplicate-1", peer_id="planner", text="hello worker")
         first = self.deliver_external_agent_message(receiver["run_id"], receiver["token"], envelope)
         assert first["status"] == "queued"

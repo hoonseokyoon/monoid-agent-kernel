@@ -95,13 +95,13 @@ def run_acceptance(
         check("chat-start", bool(run_id) and "run_token" not in chat)
         deadline = time.time() + timeout_s
         final_text = ""
-        status = ""
+        state = ""
         while run_id and time.time() < deadline:
             events = server.poll_events(run_id, 0).get("events", [])
             settled = [event for event in events if event.get("type") == "turn.settled"]
             if settled:
                 final_text = str((settled[-1].get("data") or {}).get("final_text") or "")
-                status = str(server.run_status(run_id).get("status") or "")
+                state = str(server.run_status(run_id).get("state") or "")
                 break
             time.sleep(0.1)
         check("deterministic-chat", bool(final_text), final_text[:120])
@@ -117,7 +117,7 @@ def run_acceptance(
             "workspace": str(server.workspace),
             "run_root": str(run_root),
             "checks": checks,
-            "chat": {"run_id": run_id, "status": status, "final_text": final_text},
+            "chat": {"run_id": run_id, "state": state, "final_text": final_text},
         }
     except Exception as exc:  # pragma: no cover - defensive CLI surface
         checks.append({"name": "acceptance", "ok": False, "detail": str(exc)})

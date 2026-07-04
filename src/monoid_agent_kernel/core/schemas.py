@@ -760,10 +760,11 @@ METRICS_SCHEMA: dict[str, Any] = {
 
 STATUS_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "required": ["run_id", "status", "last_event_seq", "last_event_type", "updated_at"],
+    "required": ["run_id", "state", "terminal", "last_event_seq", "last_event_type", "updated_at"],
     "properties": {
         "run_id": {"type": "string", "minLength": 1},
-        "status": {"type": "string"},
+        "state": {"type": "string"},
+        "terminal": {"type": "boolean"},
         "last_event_seq": {"type": "integer", "minimum": 1},
         "last_event_type": {"type": "string"},
         "updated_at": {"type": "string"},

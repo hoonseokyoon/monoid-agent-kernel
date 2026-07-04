@@ -7,6 +7,21 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed
+- Phase 4-1 public-surface cleanup: `monoid_agent_kernel.contracts` and the
+  top-level `monoid_agent_kernel` package now export only the contract surface.
+  Helper/default implementations and convenience adapters are imported from their
+  explicit modules.
+- Phase 4-2 lifecycle vocabulary cleanup: run lifecycle payloads now use
+  `state` plus `terminal` instead of legacy lifecycle `status`. Terminal
+  `AgentRunResult.status`, `ControlResult.status`, proposal status, tool status,
+  job status, and metrics status keep their domain meanings.
+- Phase 4-3 test/CI readiness: backend tests now have a managed factory seam for
+  spawned future cleanup, Studio shutdown joins owned server threads, and CI runs
+  xdist plus coverage as advisory checks.
+- `AudioPart` and `VideoPart` are now exported from the contract surface to match
+  the core content contract.
+
 ## [0.14.0] - 2026-06-30
 
 ### Added

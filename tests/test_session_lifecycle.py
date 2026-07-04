@@ -17,6 +17,8 @@ from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     assert_transition,
     can_transition,
+    session_state_from_run_status,
+    session_state_value,
     state_from_suspension,
     to_session_state,
 )
@@ -328,6 +330,14 @@ def test_to_session_state_folds_cancel_to_cancelled() -> None:
     # The backend records a cancel as status="limited" + error_code="cancelled".
     assert to_session_state("limited", error_code="cancelled") is SessionState.CANCELLED
     assert to_session_state("failed", error_code="cancelled") is SessionState.CANCELLED
+
+
+def test_session_state_helpers_serialize_and_project_lifecycle_values() -> None:
+    assert session_state_value(SessionState.AWAITING_TASKS) == "awaiting_tasks"
+    assert session_state_from_run_status("awaiting_tasks") is SessionState.AWAITING_TASKS
+    assert session_state_from_run_status("limited", terminal=False) is SessionState.LIMITED
+    assert session_state_from_run_status("limited", terminal=True) is SessionState.LIMITED
+    assert session_state_from_run_status("limited", error_code="cancelled", terminal=True) is SessionState.CANCELLED
 
 
 def test_to_session_state_unknown_falls_back_to_created() -> None:

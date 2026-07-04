@@ -102,7 +102,7 @@ Building R8 (chat history). Studio first listed only the chats it started this s
 `run_root`, but the backend had no "list my runs" API and each run's events were gated behind a
 per-run token held only in memory, plus `events()`/`status()` required an in-memory record.
 - **Backend:** `list_runs(tenant_id, *, user_id, limit)` — a trusted-host scan of run_root (like
-  `recover_runs`) reading each `run.json` (now carrying `created_at` + `title`), taking status from
+  `recover_runs`) reading each `run.json` (now carrying `created_at` + `title`), taking lifecycle state from
   a live record when present else status.json, flagging `recoverable`, and **minting a read token
   per entry** (mirrors submit_run returning one). `events()`/`status()` gained a **no-record path**
   via `_authorized_run_dir`: a signed run token authorizes reading `run_root/<run_id>` straight from

@@ -63,7 +63,7 @@ from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.reference.web_gateway.http import create_web_gateway_server
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.reference.studio.activity import describe_event
-from monoid_agent_kernel.reference._shared.http_util import wait_http_ready
+from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer, wait_http_ready
 from monoid_agent_kernel.reference.mcp_gateway import FakeMcpServer, create_mcp_server
 from monoid_agent_kernel.mcp import McpError, McpToolProvider
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
@@ -958,7 +958,7 @@ class StudioServer:
             capability_broker_factory=lambda req: AutoGrantBroker(),
         )
 
-        self._ui_server = ThreadingHTTPServer(
+        self._ui_server = HardenedThreadingHTTPServer(
             (self.config.host, self.config.port), _make_handler(self)
         )
         ui_port = self._ui_server.server_address[1]
@@ -989,6 +989,24 @@ class StudioServer:
                     server.server_close()
                 except Exception:  # pragma: no cover - best-effort teardown
                     _LOGGER.debug("error during server shutdown", exc_info=True)
+        for name, thread in (
+            ("ui", self._ui_thread),
+            ("llm_gateway", self._gateway_thread),
+            ("web_gateway", self._web_gateway_thread),
+            ("mcp_gateway", self._mcp_thread),
+        ):
+            if thread is not None:
+                thread.join(timeout=5.0)
+                if thread.is_alive():
+                    _LOGGER.warning("studio %s thread did not stop within timeout", name)
+        self._ui_server = None
+        self._gateway_server = None
+        self._web_gateway_server = None
+        self._mcp_server = None
+        self._ui_thread = None
+        self._gateway_thread = None
+        self._web_gateway_thread = None
+        self._mcp_thread = None
 
     # --- chat operations (called by the handler) ----------------------------------------
 
@@ -1063,7 +1081,7 @@ class StudioServer:
                 },
             )
         self._remember_run_profile(submission.run_id, profile_id)
-        return {"run_id": submission.run_id, "status": submission.status}
+        return {"run_id": submission.run_id, "state": submission.state.value, "terminal": submission.terminal}
 
     # --- A2A demo (agent-to-agent durable messaging) ------------------------------------
 
@@ -1201,7 +1219,8 @@ class StudioServer:
                 {
                     "run_id": run["run_id"],
                     "title": run["title"] or run["run_id"],
-                    "status": run["status"],
+                    "state": run["state"],
+                    "terminal": bool(run.get("terminal")),
                     "created_at": run["created_at"],
                     "recoverable": run["recoverable"],
                     "profile_id": run_profile,
@@ -1216,7 +1235,8 @@ class StudioServer:
                 {
                     "run_id": s["run_id"],
                     "title": s["title"],
-                    "status": "running",
+                    "state": "running",
+                    "terminal": False,
                     "created_at": s["created_at"],
                     "recoverable": False,
                     "profile_id": run_profile,
@@ -1545,9 +1565,6 @@ class StudioServer:
         return token
 
 
-_TERMINAL = {"completed", "failed", "limited"}
-
-
 def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
     class StudioHandler(BaseHTTPRequestHandler):
         server_version = "MonoidStudio/0.1"
@@ -1810,9 +1827,17 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     else:
                         idle += 0.25
                     # Stop once the run is terminal and we've drained its events.
-                    status = studio.run_status(run_id).get("status")
-                    if status in _TERMINAL and not events:
-                        self._sse_send({"type": "studio.stream.end", "data": {"status": status}})
+                    lifecycle = studio.run_status(run_id)
+                    if lifecycle.get("terminal") and not events:
+                        self._sse_send(
+                            {
+                                "type": "studio.stream.end",
+                                "data": {
+                                    "state": lifecycle.get("state"),
+                                    "terminal": True,
+                                },
+                            }
+                        )
                         return
                     if idle >= 15.0:  # heartbeat so proxies/clients keep the stream open
                         self._sse_comment("keep-alive")

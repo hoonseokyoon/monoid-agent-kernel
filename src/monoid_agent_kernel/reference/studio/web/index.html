@@ -1740,7 +1740,8 @@ async function refreshSessions() {
     sessionsEl.innerHTML = "";
     for (const s of (body.sessions || [])) {
       const li = document.createElement("li");
-      if (!["completed", "failed", "limited"].includes(s.status)) li.classList.add("live");
+      const state = s.state || "created";
+      if (!s.terminal) li.classList.add("live");
       if (s.recoverable) li.classList.add("recoverable");
       if (s.run_id === runId) li.classList.add("active");
       const dot = document.createElement("span"); dot.className = "dot";
@@ -1759,7 +1760,7 @@ async function refreshSessions() {
         const tag = document.createElement("span"); tag.className = "resume-tag"; tag.textContent = "⟳ resume";
         li.appendChild(tag);
       }
-      li.title = (hasTitle ? s.title : "Untitled run (" + s.run_id.slice(0, 8) + ")") + " — " + s.status
+      li.title = (hasTitle ? s.title : "Untitled run (" + s.run_id.slice(0, 8) + ")") + " — " + state
         + (s.recoverable ? " (parked — send a message to resume from its checkpoint)" : "");
       li.addEventListener("click", () => loadSession(s.run_id));
       sessionsEl.appendChild(li);

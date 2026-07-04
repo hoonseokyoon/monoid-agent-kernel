@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Protocol
+from typing import Any, Callable
 
 from monoid_agent_kernel.conformance.harness import (
     BackendHarness,
@@ -90,20 +91,29 @@ def assert_reference_full_profile(factory: ReferenceFullFactory) -> None:
     assert_capability_security_revocation_profile(factory.new_capability())
     assert_multi_agent_shared_revocation_profile(factory.new_capability())
 
-    assert_control_plane_decision_profile(factory.new_backend())
-    assert_control_plane_audit_sequence_profile(factory.new_backend())
+    _run_with_close(factory.new_backend(), assert_control_plane_decision_profile)
+    _run_with_close(factory.new_backend(), assert_control_plane_audit_sequence_profile)
 
-    assert_tool_agent_surface_admission_profile(factory.new_backend())
-    assert_tool_agent_generic_ask_approval_profile(factory.new_backend())
-    assert_side_effect_tool_agent_profile(factory.new_side_effect())
-    assert_message_fabric_profile(factory.new_message_fabric())
+    _run_with_close(factory.new_backend(), assert_tool_agent_surface_admission_profile)
+    _run_with_close(factory.new_backend(), assert_tool_agent_generic_ask_approval_profile)
+    _run_with_close(factory.new_side_effect(), assert_side_effect_tool_agent_profile)
+    _run_with_close(factory.new_message_fabric(), assert_message_fabric_profile)
 
-    assert_durable_runner_event_sequence_profile(factory.new_backend())
-    assert_durable_runner_recovery_metadata_profile(factory.new_backend())
-    assert_durable_runner_subagent_diagnostics_profile(factory.new_backend())
+    _run_with_close(factory.new_backend(), assert_durable_runner_event_sequence_profile)
+    _run_with_close(factory.new_backend(), assert_durable_runner_recovery_metadata_profile)
+    _run_with_close(factory.new_backend(), assert_durable_runner_subagent_diagnostics_profile)
 
-    assert_multi_agent_backend_boundary_profile(factory.new_backend())
-    assert_multi_agent_backend_capability_boundary_profile(factory.new_backend())
+    _run_with_close(factory.new_backend(), assert_multi_agent_backend_boundary_profile)
+    _run_with_close(factory.new_backend(), assert_multi_agent_backend_capability_boundary_profile)
 
     smoke = factory.run_studio_smoke()
     assert smoke["run_id"]
+
+
+def _run_with_close(harness: Any, assertion: Callable[[Any], None]) -> None:
+    try:
+        assertion(harness)
+    finally:
+        close = getattr(harness, "close", None)
+        if callable(close):
+            close()

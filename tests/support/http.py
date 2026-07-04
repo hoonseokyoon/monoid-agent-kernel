@@ -38,6 +38,8 @@ def serving(server: Any) -> Iterator[str]:
         server.shutdown()
         server.server_close()
         thread.join(timeout=10)
+        if thread.is_alive():
+            raise AssertionError("HTTP server thread did not stop")
 
 
 def http_json(

@@ -22,12 +22,11 @@ from monoid_agent_kernel import (  # noqa: E402
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
-    FakeModelAdapter,
     ToolBinding,
-    tool_ids,
 )
 from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
-from monoid_agent_kernel.providers.fake import fake_tool_call  # noqa: E402
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call  # noqa: E402
+from monoid_agent_kernel.tools import tool_ids  # noqa: E402
 
 
 def main() -> None:
