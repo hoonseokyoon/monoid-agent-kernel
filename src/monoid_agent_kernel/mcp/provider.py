@@ -60,7 +60,11 @@ class McpToolProvider:
     def _discover(self) -> list[dict[str, Any]]:
         if self._tools is None:
             self._client.initialize()
-            self._tools = [t for t in self._client.list_tools() if self._selected(str(t.get("name") or ""))]
+            self._tools = [
+                t
+                for t in self._client.list_tools()
+                if self._selected(str(t.get("name") or ""), f"mcp.{self._server}.{str(t.get('name') or '')}")
+            ]
         return self._tools
 
     def _discover_resources(self) -> list[dict[str, Any]]:
@@ -83,10 +87,29 @@ class McpToolProvider:
                 return []
             raise
 
-    def _selected(self, name: str) -> bool:
-        if name in self._blocked:
+    def _selected(self, *names: str) -> bool:
+        candidates = {name for name in names if name}
+        if not candidates:
             return False
-        return self._allowed is None or name in self._allowed
+        if candidates & self._blocked:
+            return False
+        return self._allowed is None or bool(candidates & self._allowed)
+
+    def _resource_read_selected(self) -> bool:
+        return self._selected(
+            "resource.read",
+            "resources/read",
+            self._resource_read_tool_id(),
+            self._resource_read_tool_name(),
+        )
+
+    def _prompt_get_selected(self) -> bool:
+        return self._selected(
+            "prompt.get",
+            "prompts/get",
+            self._prompt_get_tool_id(),
+            self._prompt_get_tool_name(),
+        )
 
     def invalidate_tools(self) -> None:
         """Drop the cached ``tools/list`` result after an observed tools/list_changed signal."""
@@ -125,7 +148,7 @@ class McpToolProvider:
     def dynamic_segment(self, turn: Any) -> str | None:
         bound = getattr(turn, "bound_tools", frozenset())
         sections: list[str] = []
-        if self._resource_read_tool_id() in bound:
+        if self._resource_read_tool_id() in bound and self._resource_read_selected():
             resources = self._discover_resources()
             if resources:
                 sections.extend(
@@ -137,7 +160,7 @@ class McpToolProvider:
                         *_catalog_lines(resources, key="uri"),
                     ]
                 )
-        if self._prompt_get_tool_id() in bound:
+        if self._prompt_get_tool_id() in bound and self._prompt_get_selected():
             prompts = self._discover_prompts()
             if prompts:
                 if sections:
@@ -168,7 +191,7 @@ class McpToolProvider:
                 provider_name=f"mcp_{self._server}_{name}",  # exported_name; avoids registry collisions
                 annotations=dict(tool.get("annotations") or {}),
             )
-        resources = self._discover_resources()
+        resources = self._discover_resources() if self._resource_read_selected() else []
         if resources:
             yield ToolSpec(
                 id=self._resource_read_tool_id(),
@@ -190,7 +213,7 @@ class McpToolProvider:
                 handler=self._resource_read_handler(),
                 provider_name=self._resource_read_tool_name(),
             )
-        prompts = self._discover_prompts()
+        prompts = self._discover_prompts() if self._prompt_get_selected() else []
         if prompts:
             yield ToolSpec(
                 id=self._prompt_get_tool_id(),
@@ -230,8 +253,8 @@ class McpToolProvider:
                 {"id": f"mcp.{self._server}.{str(tool.get('name') or '')}", "description": str(tool.get("description") or "")}
                 for tool in self._discover()
             ],
-            "resources": list(self._discover_resources()),
-            "prompts": list(self._discover_prompts()),
+            "resources": list(self._discover_resources()) if self._resource_read_selected() else [],
+            "prompts": list(self._discover_prompts()) if self._prompt_get_selected() else [],
         }
 
     def _make_handler(self, mcp_name: str):

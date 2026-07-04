@@ -361,6 +361,37 @@ def test_mcp_provider_exposes_resources_prompts_context_and_invalidation() -> No
             assert mcp.handle_list_changed("notifications/unknown/list_changed") is False
 
 
+def test_mcp_resource_prompt_helpers_respect_provider_tool_filters() -> None:
+    state = {"resources": 0, "prompts": 0, "resource_version": 0, "prompt_version": 0}
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _resource_prompt_handler(state))
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t", allowed_tools=("echo",)) as mcp:
+            assert [spec.id for spec in mcp.get_tools()] == []
+            assert mcp.tool_bindings() == ()
+            assert mcp.catalog()["resources"] == []
+            assert mcp.catalog()["prompts"] == []
+            assert state["resources"] == 0
+            assert state["prompts"] == 0
+
+        with McpToolProvider(
+            f"{base_url}/mcp",
+            server="t",
+            allowed_tools=("resource.read", "mcp.t.prompt.get"),
+        ) as mcp:
+            assert {spec.id for spec in mcp.get_tools()} == {
+                "mcp.t.resource.read",
+                "mcp.t.prompt.get",
+            }
+
+        with McpToolProvider(
+            f"{base_url}/mcp",
+            server="t",
+            blocked_tools=("resources/read", "mcp_t_prompt_get"),
+        ) as mcp:
+            assert [spec.id for spec in mcp.get_tools()] == []
+            assert mcp.tool_bindings() == ()
+
+
 def _expiring_handler(state: dict[str, int]) -> type[BaseHTTPRequestHandler]:
     """A server whose session expires once: the first tools/call after init returns 404, forcing
     the client to re-initialize and retry. ``state`` records init/call counts for assertions."""
