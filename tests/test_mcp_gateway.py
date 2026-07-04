@@ -55,6 +55,17 @@ def test_mcp_gateway_discovers_and_round_trips_a_call() -> None:
             assert prompt.content["messages"][0]["content"]["text"] == "Summarize MCP in two sentences."
 
 
+def test_mcp_gateway_initialize_advertises_resources_and_prompts() -> None:
+    with serving(_server()) as base_url:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode("utf-8")
+        request = Request(f"{base_url}/mcp", data=body, headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read())
+
+    capabilities = payload["result"]["capabilities"]
+    assert {"tools", "resources", "prompts"} <= set(capabilities)
+
+
 def test_mcp_gateway_healthz_and_readiness_poll() -> None:
     with serving(_server()) as base_url:
         wait_http_ready(base_url, timeout_s=5)  # must not raise

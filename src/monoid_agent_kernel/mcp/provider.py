@@ -60,9 +60,16 @@ class McpToolProvider:
     def _discover(self) -> list[dict[str, Any]]:
         if self._tools is None:
             self._client.initialize()
+            try:
+                tools = self._client.list_tools()
+            except McpError as exc:
+                if exc.code == -32601:
+                    tools = []
+                else:
+                    raise
             self._tools = [
                 t
-                for t in self._client.list_tools()
+                for t in tools
                 if self._selected(str(t.get("name") or ""), f"mcp.{self._server}.{str(t.get('name') or '')}")
             ]
         return self._tools

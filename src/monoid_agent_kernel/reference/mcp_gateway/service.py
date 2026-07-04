@@ -161,9 +161,16 @@ class FakeMcpServer:
         self._prompts_by_name = {prompt.name: prompt for prompt in self.prompts}
 
     def initialize(self) -> dict[str, Any]:
+        capabilities: dict[str, dict[str, Any]] = {}
+        if self.tools:
+            capabilities["tools"] = {}
+        if self.resources:
+            capabilities["resources"] = {}
+        if self.prompts:
+            capabilities["prompts"] = {}
         return {
             "protocolVersion": self.protocol_version,
-            "capabilities": {"tools": {}},
+            "capabilities": capabilities,
             "serverInfo": {"name": self.server_name, "version": "1"},
         }
 

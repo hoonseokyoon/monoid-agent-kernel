@@ -275,6 +275,9 @@ def _resource_prompt_handler(state: dict[str, Any]) -> type[BaseHTTPRequestHandl
             elif method == "initialize":
                 self._result(rid, {"protocolVersion": "2025-06-18", "capabilities": {}}, session_id="sess-1")
             elif method == "tools/list":
+                if state.get("tools_error"):
+                    self._error(rid, -32601, "method not found")
+                    return
                 tools = state.get("tools", [])
                 self._result(rid, {"tools": tools if isinstance(tools, list) else []})
             elif method == "resources/list":
@@ -420,6 +423,20 @@ def test_mcp_resource_prompt_helpers_do_not_collide_with_real_tool_names() -> No
                 "mcp.t.__helper.resource.read",
                 "mcp.t.__helper.prompt.get",
             }
+
+
+def test_mcp_resource_prompt_helpers_work_without_tools_list() -> None:
+    state = {"resources": 0, "prompts": 0, "resource_version": 0, "prompt_version": 0, "tools_error": True}
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _resource_prompt_handler(state))
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
+            specs = {spec.id: spec for spec in mcp.get_tools()}
+            assert set(specs) == {"mcp.t.__helper.resource.read", "mcp.t.__helper.prompt.get"}
+            read = specs["mcp.t.__helper.resource.read"].handler(None, {"uri": "fake://one"})
+            prompt = specs["mcp.t.__helper.prompt.get"].handler(None, {"name": "brief"})
+
+    assert read.ok
+    assert prompt.ok
 
 
 def _expiring_handler(state: dict[str, int]) -> type[BaseHTTPRequestHandler]:
