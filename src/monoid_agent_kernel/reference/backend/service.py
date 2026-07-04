@@ -92,6 +92,8 @@ from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCE,
     BACKEND_AUDIENCES,
+    TASK_CALLBACK_AUDIENCE,
+    TASK_CALLBACK_AUDIENCES,
     namespaced_id,
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
@@ -106,6 +108,7 @@ from monoid_agent_kernel.reference.backend.projection import (
     _set_record_state,
 )
 from monoid_agent_kernel.reference.backend.session import (
+    BackendSessionContext,
     BackendSessionService,
     _normalize_inbound_message as _normalize_inbound_message,
 )
@@ -636,7 +639,28 @@ class RunnerBackend:
             )
         )
         self._session_boundary = BackendSessionService(
-            self, close_signal=_CLOSE_SESSION, resume_signal=_RESUME_SESSION
+            BackendSessionContext(
+                authorize_run=self._authorize_run,
+                verify_run_token=self._verify_run_token,
+                verify_task_callback_token=self._verify_task_callback_claims,
+                issue_task_callback_token=self._issue_task_callback_token,
+                record=self._record,
+                active_record=self._active_record,
+                run_dir_for=lambda run_id: self.run_root / run_id,
+                call_soon=lambda fn, *args: self._call_soon(fn, *args),
+                persist_checkpoint_from_any_thread=self._persist_run_checkpoint_from_any_thread,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                read_recovery_meta=self._read_recovery_meta,
+                attempt_resume=self._attempt_resume,
+                max_message_bytes_provider=lambda: self.max_message_bytes,
+                max_message_queue_depth_provider=lambda: self.max_message_queue_depth,
+                record_terminal=self._record_terminal_locked,
+                live_loop=self._live_loop_snapshot,
+                mark_cancel_requested=self._mark_cancel_requested,
+                ensure_message_enqueue_allowed=self._ensure_message_enqueue_allowed,
+                close_signal=_CLOSE_SESSION,
+                resume_signal=_RESUME_SESSION,
+            )
         )
         self._commands = BackendCommandService(
             BackendCommandContext(
@@ -697,6 +721,51 @@ class RunnerBackend:
         loop = self._session_boundary.authorize_active_loop(run_id, token)
         record = self._record(run_id)
         return loop, record.state
+
+    def _record_terminal_locked(self, record: BackendRunRecord) -> bool:
+        with self._lock:
+            return _record_terminal(record)
+
+    def _live_loop_snapshot(self, record: BackendRunRecord) -> tuple[AgentLoop | None, bool]:
+        with self._lock:
+            return record.loop, _record_terminal(record)
+
+    def _mark_cancel_requested(self, record: BackendRunRecord) -> bool:
+        with self._lock:
+            if _record_terminal(record):
+                return False
+            record.cancellation_token.cancel()
+            record.error = "run cancellation requested"
+            record.error_code = "cancelled"
+            return True
+
+    def _ensure_message_enqueue_allowed(self, record: BackendRunRecord) -> None:
+        with self._lock:
+            if _record_terminal(record):
+                raise ValueError("cannot send a message to a terminal run")
+            if record.message_queue.qsize() >= self.max_message_queue_depth:
+                raise ValueError("message queue is full; retry once the run drains it")
+
+    def _issue_task_callback_token(self, run_id: str, tenant_id: str, user_id: str, task_id: str) -> str:
+        return self.token_manager.issue(
+            kind="task_callback",
+            audience=TASK_CALLBACK_AUDIENCE,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            ttl_s=self.task_callback_token_ttl_s,
+            metadata={"task_id": task_id},
+        )
+
+    def _verify_task_callback_claims(self, run_id: str, token: str, task_id: str) -> None:
+        claims = self.token_manager.verify(
+            token, kind="task_callback", audience=TASK_CALLBACK_AUDIENCES, run_id=run_id
+        )
+        if str(claims.metadata.get("task_id") or "") != task_id:
+            raise PermissionDenied("callback token does not match this task")
+        record = self._active_record(run_id)
+        if record is not None and (claims.tenant_id != record.tenant_id or claims.user_id != record.user_id):
+            raise PermissionDenied("token subject mismatch")
 
     # --- Shared event loop (coroutine-per-run) ------------------------------------------
 
