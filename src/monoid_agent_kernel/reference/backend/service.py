@@ -69,12 +69,6 @@ from monoid_agent_kernel.core.spec import (
 )
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
-from monoid_agent_kernel.tasks import (
-    get_job_artifact,
-    list_job_artifacts,
-    read_job_log_text,
-    request_job_cancel,
-)
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelAdapter
@@ -88,6 +82,7 @@ from monoid_agent_kernel.identifiers import (
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
 from monoid_agent_kernel.reference.backend.commands import BackendCommandContext, BackendCommandService
+from monoid_agent_kernel.reference.backend.jobs import JobService, JobServiceContext
 from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
@@ -594,6 +589,7 @@ class RunnerBackend:
     _projection: RunProjectionService = field(init=False, repr=False)
     _proposal: ProposalService = field(init=False, repr=False)
     _runtime_config: RuntimeConfigService = field(init=False, repr=False)
+    _jobs: JobService = field(init=False, repr=False)
     _session_boundary: BackendSessionService = field(init=False, repr=False)
     _session_drive: SessionDriveService = field(init=False, repr=False)
     _commands: BackendCommandService = field(init=False, repr=False)
@@ -652,6 +648,7 @@ class RunnerBackend:
                 now=time.time,
             )
         )
+        self._jobs = JobService(JobServiceContext(authorize_run=self._authorize_run, record=self._record))
         assert self.checkpoint_store is not None
         self._session_drive = SessionDriveService(
             SessionDriveContext(
@@ -1321,19 +1318,10 @@ class RunnerBackend:
         return {"run_id": descendant_run_id, **page}
 
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        jobs = list_job_artifacts(record.run_dir)
-        return {"run_id": run_id, "tenant_id": record.tenant_id, "jobs": jobs}
+        return self._jobs.jobs(run_id, token)
 
     def job_status(self, run_id: str, token: str, job_id: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        return {
-            "run_id": run_id,
-            "tenant_id": record.tenant_id,
-            "job": get_job_artifact(record.run_dir, job_id),
-        }
+        return self._jobs.job_status(run_id, token, job_id)
 
     def job_logs(
         self,
@@ -1345,22 +1333,17 @@ class RunnerBackend:
         tail_bytes: int | None = None,
         offset: int | None = None,
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        logs = read_job_log_text(
-            record.run_dir,
+        return self._jobs.job_logs(
+            run_id,
+            token,
             job_id,
-            stream=stream,  # type: ignore[arg-type]
+            stream=stream,
             tail_bytes=tail_bytes,
             offset=offset,
         )
-        return {"run_id": run_id, "tenant_id": record.tenant_id, **logs}
 
     def cancel_job(self, run_id: str, token: str, job_id: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        payload = request_job_cancel(record.run_dir, job_id)
-        return {"run_id": run_id, "tenant_id": record.tenant_id, **payload}
+        return self._jobs.cancel_job(run_id, token, job_id)
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
         with self._lock:
