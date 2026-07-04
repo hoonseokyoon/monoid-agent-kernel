@@ -53,6 +53,22 @@ def _write_skill(root: Path, name: str = "commit-msg") -> Path:
     return skill_dir
 
 
+def _write_fork_skill(root: Path, name: str = "reviewer") -> Path:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / SKILL_FILENAME).write_text(
+        "---\n"
+        f"name: {name}\n"
+        "description: Review code changes\n"
+        "context: fork\n"
+        "allowed-tools: fs.read skill.read_file\n"
+        "---\n"
+        "Review the change.\n",
+        encoding="utf-8",
+    )
+    return skill_dir
+
+
 def test_builder_init_writes_minimal_run_files(tmp_path: Path) -> None:
     target = tmp_path / "agent"
 
@@ -195,6 +211,31 @@ def test_builder_config_validate_registers_skill_tools(tmp_path: Path) -> None:
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["bound_tool_count"] >= 4
+
+
+def test_builder_config_validate_registers_fork_skill_subagents(tmp_path: Path) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_fork_skill(skills_dir)
+    config = _write_runtime_config(tmp_path / "runtime-config.json", "agent.spawn", "run.finish")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "builder",
+            "config",
+            "validate",
+            "--runtime-config-file",
+            str(config),
+            "--skills-directory",
+            str(skills_dir),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["issues"] == []
 
 
 def test_builder_tools_list_marks_runtime_bound_tools(tmp_path: Path) -> None:

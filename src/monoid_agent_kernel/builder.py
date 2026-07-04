@@ -227,6 +227,7 @@ def _build_tool_registry(
     registry = ToolRegistry()
     issues: list[str] = []
     skill_bindings: tuple[ToolBinding, ...] = ()
+    subagents: dict[str, Any] = {}
 
     _register_many(registry, list_builtin_tools(), issues)
 
@@ -241,15 +242,16 @@ def _build_tool_registry(
             skill_tools = tuple(skill_provider.get_tools(None))
             _register_many(registry, skill_tools, issues)
             skill_bindings = skill_provider.tool_bindings()
+            subagents.update(skill_provider.subagent_definitions())
 
     if agents_directory is not None:
-        subagents = load_subagent_definitions(agents_directory)
-        if subagents:
-            _register_many(
-                registry,
-                [agent_spawn_tool({name: definition.description for name, definition in subagents.items()})],
-                issues,
-            )
+        subagents.update(load_subagent_definitions(agents_directory))
+    if subagents:
+        _register_many(
+            registry,
+            [agent_spawn_tool({name: definition.description for name, definition in subagents.items()})],
+            issues,
+        )
 
     return registry, issues, skill_bindings
 
