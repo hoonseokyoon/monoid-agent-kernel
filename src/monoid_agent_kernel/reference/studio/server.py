@@ -602,25 +602,30 @@ class StudioServer:
 
     def save_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Create or update a Studio profile and persist it in the profile sidecar."""
-        raw_id = str(payload.get("id") or "").strip()
-        profile_id = _normalize_profile_id(raw_id) if raw_id else self._new_profile_id(str(payload.get("name") or "agent"))
-        defaults = self._profile_defaults()
-        existing = self._profiles_by_id().get(profile_id, {"id": profile_id, "name": profile_id})
-        raw = dict(existing)
-        for key in ("name", "description", "instructions", "capabilities", "model", "effort", "summary"):
-            if key in payload:
-                raw[key] = payload[key]
-        profile = self._normalize_profile_payload(
-            raw,
-            profile_id=profile_id,
-            built_in=profile_id in defaults,
-        )
-        store = self._load_profile_store()
-        profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
-        profiles[profile_id] = dict(profile)
-        store["profiles"] = profiles
-        self._write_profile_store(store)
-        body = self.profiles()
+        with self._lock:
+            raw_id = str(payload.get("id") or "").strip()
+            profile_id = (
+                _normalize_profile_id(raw_id)
+                if raw_id
+                else self._new_profile_id(str(payload.get("name") or "agent"))
+            )
+            defaults = self._profile_defaults()
+            existing = self._profiles_by_id().get(profile_id, {"id": profile_id, "name": profile_id})
+            raw = dict(existing)
+            for key in ("name", "description", "instructions", "capabilities", "model", "effort", "summary"):
+                if key in payload:
+                    raw[key] = payload[key]
+            profile = self._normalize_profile_payload(
+                raw,
+                profile_id=profile_id,
+                built_in=profile_id in defaults,
+            )
+            store = self._load_profile_store()
+            profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
+            profiles[profile_id] = dict(profile)
+            store["profiles"] = profiles
+            self._write_profile_store(store)
+            body = self.profiles()
         body["profile"] = profile
         return body
 
@@ -1278,14 +1283,18 @@ class StudioServer:
             self._summary = summary
         if otel is not None:
             self._set_otel(otel)
-        new_config = self._build_config()
         with self._lock:
-            active = list(self._run_tokens.items())
+            profile_index = self._load_profile_index()
+            active = [
+                (run_id, token, profile_index.get(run_id, _DEFAULT_PROFILE_ID))
+                for run_id, token in self._run_tokens.items()
+            ]
         applied = 0
-        for run_id, token in active:
+        for run_id, token, profile_id in active:
             current = self._backend.current_runtime_config(run_id)
             if current is None:
                 continue
+            new_config = self._build_config(profile_id)
             try:
                 self._backend.replace_runtime_config(
                     run_id,
