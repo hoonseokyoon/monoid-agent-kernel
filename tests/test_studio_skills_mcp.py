@@ -118,6 +118,23 @@ def test_mcp_boot_discovers_tools_before_serving(tmp_path: Path) -> None:
         server.shutdown()
 
 
+def test_builtin_profiles_include_provider_capabilities_when_saved(tmp_path: Path) -> None:
+    (tmp_path / "ws").mkdir()
+    server = _mcp_studio(tmp_path)
+    server.start()
+    try:
+        profiles = {profile["id"]: profile for profile in server.profiles()["profiles"]}
+        default_profile = dict(profiles["default"])
+        assert {"skills", "mcp"} <= set(default_profile["capabilities"])
+
+        default_profile["description"] = "Edited default profile."
+        saved = server.save_profile(default_profile)["profile"]
+        assert {"skills", "mcp"} <= set(saved["capabilities"])
+        assert {"skill", "mcp.studio.echo"} <= {binding.ref.tool_id for binding in server._build_config("default").tools}
+    finally:
+        server.shutdown()
+
+
 def test_mcp_tool_call_flows_end_to_end(tmp_path: Path) -> None:
     (tmp_path / "ws").mkdir()
     fake = FakeModelAdapter(

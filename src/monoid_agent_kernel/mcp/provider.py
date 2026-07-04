@@ -99,6 +99,7 @@ class McpToolProvider:
         return self._selected(
             "resource.read",
             "resources/read",
+            f"mcp.{self._server}.resource.read",
             self._resource_read_tool_id(),
             self._resource_read_tool_name(),
         )
@@ -107,6 +108,7 @@ class McpToolProvider:
         return self._selected(
             "prompt.get",
             "prompts/get",
+            f"mcp.{self._server}.prompt.get",
             self._prompt_get_tool_id(),
             self._prompt_get_tool_name(),
         )
@@ -285,10 +287,10 @@ class McpToolProvider:
         return handler
 
     def _resource_read_tool_id(self) -> str:
-        return f"mcp.{self._server}.resource.read"
+        return f"mcp.{self._server}.__helper.resource.read"
 
     def _prompt_get_tool_id(self) -> str:
-        return f"mcp.{self._server}.prompt.get"
+        return f"mcp.{self._server}.__helper.prompt.get"
 
     def _resource_read_tool_name(self) -> str:
         return f"mcp_{self._server}_resource_read"

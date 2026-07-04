@@ -256,7 +256,7 @@ def test_mcp_client_lists_resources_and_prompts_with_pagination() -> None:
             client.close()
 
 
-def _resource_prompt_handler(state: dict[str, int]) -> type[BaseHTTPRequestHandler]:
+def _resource_prompt_handler(state: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
     """A server with mutable resource/prompt catalogs for provider invalidation tests."""
 
     class Handler(BaseHTTPRequestHandler):
@@ -275,7 +275,8 @@ def _resource_prompt_handler(state: dict[str, int]) -> type[BaseHTTPRequestHandl
             elif method == "initialize":
                 self._result(rid, {"protocolVersion": "2025-06-18", "capabilities": {}}, session_id="sess-1")
             elif method == "tools/list":
-                self._result(rid, {"tools": []})
+                tools = state.get("tools", [])
+                self._result(rid, {"tools": tools if isinstance(tools, list) else []})
             elif method == "resources/list":
                 state["resources"] += 1
                 self._result(rid, {"resources": [_RESOURCES[min(state["resource_version"], 1)]]})
@@ -328,13 +329,13 @@ def test_mcp_provider_exposes_resources_prompts_context_and_invalidation() -> No
     with serving(server) as base_url:
         with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
             specs = {s.id: s for s in mcp.get_tools()}
-            assert set(specs) == {"mcp.t.resource.read", "mcp.t.prompt.get"}
-            assert specs["mcp.t.resource.read"].input_schema["properties"]["uri"] == {"type": "string"}
-            assert specs["mcp.t.prompt.get"].input_schema["properties"]["name"] == {"type": "string"}
+            assert set(specs) == {"mcp.t.__helper.resource.read", "mcp.t.__helper.prompt.get"}
+            assert specs["mcp.t.__helper.resource.read"].input_schema["properties"]["uri"] == {"type": "string"}
+            assert specs["mcp.t.__helper.prompt.get"].input_schema["properties"]["name"] == {"type": "string"}
 
-            read = specs["mcp.t.resource.read"].handler(None, {"uri": "fake://one"})
+            read = specs["mcp.t.__helper.resource.read"].handler(None, {"uri": "fake://one"})
             assert read.ok and read.content["contents"][0]["text"] == "read fake://one"
-            prompt = specs["mcp.t.prompt.get"].handler(None, {"name": "brief", "arguments": {"topic": "x"}})
+            prompt = specs["mcp.t.__helper.prompt.get"].handler(None, {"name": "brief", "arguments": {"topic": "x"}})
             assert prompt.ok and prompt.content["messages"][0]["content"]["text"] == "prompt brief"
 
             empty_turn = TurnContext(1, 1, 1, None, (), 0, bound_tools=frozenset())
@@ -346,7 +347,7 @@ def test_mcp_provider_exposes_resources_prompts_context_and_invalidation() -> No
                 None,
                 (),
                 0,
-                bound_tools=frozenset({"mcp.t.resource.read", "mcp.t.prompt.get"}),
+                bound_tools=frozenset({"mcp.t.__helper.resource.read", "mcp.t.__helper.prompt.get"}),
             )
             segment = mcp.dynamic_segment(bound_turn)
             assert segment is not None and "fake://one" in segment and "brief" in segment
@@ -381,8 +382,8 @@ def test_mcp_resource_prompt_helpers_respect_provider_tool_filters() -> None:
             allowed_tools=("resource.read", "mcp.t.prompt.get"),
         ) as mcp:
             assert {spec.id for spec in mcp.get_tools()} == {
-                "mcp.t.resource.read",
-                "mcp.t.prompt.get",
+                "mcp.t.__helper.resource.read",
+                "mcp.t.__helper.prompt.get",
             }
 
         with McpToolProvider(
@@ -392,6 +393,28 @@ def test_mcp_resource_prompt_helpers_respect_provider_tool_filters() -> None:
         ) as mcp:
             assert [spec.id for spec in mcp.get_tools()] == []
             assert mcp.tool_bindings() == ()
+
+
+def test_mcp_resource_prompt_helpers_do_not_collide_with_real_tool_names() -> None:
+    state = {
+        "resources": 0,
+        "prompts": 0,
+        "resource_version": 0,
+        "prompt_version": 0,
+        "tools": [
+            {"name": "resource.read", "description": "Real resource-like tool.", "inputSchema": {"type": "object"}},
+            {"name": "prompt.get", "description": "Real prompt-like tool.", "inputSchema": {"type": "object"}},
+        ],
+    }
+    server = HardenedThreadingHTTPServer(("127.0.0.1", 0), _resource_prompt_handler(state))
+    with serving(server) as base_url:
+        with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
+            assert {spec.id for spec in mcp.get_tools()} == {
+                "mcp.t.resource.read",
+                "mcp.t.prompt.get",
+                "mcp.t.__helper.resource.read",
+                "mcp.t.__helper.prompt.get",
+            }
 
 
 def _expiring_handler(state: dict[str, int]) -> type[BaseHTTPRequestHandler]:

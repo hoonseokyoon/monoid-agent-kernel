@@ -28,14 +28,14 @@ def test_mcp_gateway_discovers_and_round_trips_a_call() -> None:
             assert set(specs) == {
                 "mcp.studio.echo",
                 "mcp.studio.uppercase",
-                "mcp.studio.resource.read",
-                "mcp.studio.prompt.get",
+                "mcp.studio.__helper.resource.read",
+                "mcp.studio.__helper.prompt.get",
             }
             # readOnlyHint annotation maps to side_effect="read"; the unmarked tool is "run".
             assert specs["mcp.studio.echo"].side_effect == "run"
             assert specs["mcp.studio.uppercase"].side_effect == "read"
-            assert specs["mcp.studio.resource.read"].side_effect == "read"
-            assert specs["mcp.studio.prompt.get"].side_effect == "read"
+            assert specs["mcp.studio.__helper.resource.read"].side_effect == "read"
+            assert specs["mcp.studio.__helper.prompt.get"].side_effect == "read"
             assert specs["mcp.studio.echo"].input_schema["required"] == ["text"]
 
             ok = specs["mcp.studio.echo"].handler(None, {"text": "hi"})
@@ -44,11 +44,11 @@ def test_mcp_gateway_discovers_and_round_trips_a_call() -> None:
             up = specs["mcp.studio.uppercase"].handler(None, {"text": "hi"})
             assert up.ok and up.content["text"] == "HI"
 
-            resource = specs["mcp.studio.resource.read"].handler(None, {"uri": "fake://studio/guide"})
+            resource = specs["mcp.studio.__helper.resource.read"].handler(None, {"uri": "fake://studio/guide"})
             assert resource.ok
             assert "uppercase" in resource.content["contents"][0]["text"]
 
-            prompt = specs["mcp.studio.prompt.get"].handler(
+            prompt = specs["mcp.studio.__helper.prompt.get"].handler(
                 None, {"name": "summarize", "arguments": {"topic": "MCP"}}
             )
             assert prompt.ok
@@ -88,6 +88,6 @@ def test_mcp_gateway_rejects_bad_token_when_admin_configured() -> None:
             assert {s.id for s in mcp.get_tools()} == {
                 "mcp.studio.echo",
                 "mcp.studio.uppercase",
-                "mcp.studio.resource.read",
-                "mcp.studio.prompt.get",
+                "mcp.studio.__helper.resource.read",
+                "mcp.studio.__helper.prompt.get",
             }

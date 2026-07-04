@@ -435,7 +435,15 @@ class StudioServer:
     # --- Studio profiles ---------------------------------------------------------------
 
     def _profile_defaults(self) -> dict[str, dict[str, Any]]:
-        return {str(profile["id"]): dict(profile) for profile in _DEFAULT_PROFILES}
+        defaults: dict[str, dict[str, Any]] = {}
+        all_static = tuple(_ALL_CAPABILITIES)
+        available = tuple(self._available_capabilities())
+        for profile in _DEFAULT_PROFILES:
+            normalized = dict(profile)
+            if tuple(normalized.get("capabilities") or ()) == all_static:
+                normalized["capabilities"] = available
+            defaults[str(normalized["id"])] = normalized
+        return defaults
 
     def _profile_store_path(self) -> Path:
         return self.config.run_root / _PROFILE_INDEX_NAME
@@ -1230,12 +1238,8 @@ class StudioServer:
         mcp_resources: list[dict[str, Any]] = []
         mcp_prompts: list[dict[str, Any]] = []
         if self._mcp_provider is not None:
-            mcp_tools = [
-                {"id": spec.id, "description": spec.description}
-                for spec in self._mcp_provider.get_tools()
-                if not spec.id.endswith((".resource.read", ".prompt.get"))
-            ]
             catalog = self._mcp_provider.catalog()
+            mcp_tools = catalog.get("tools", [])
             mcp_resources = catalog.get("resources", [])
             mcp_prompts = catalog.get("prompts", [])
         output_validators = [
