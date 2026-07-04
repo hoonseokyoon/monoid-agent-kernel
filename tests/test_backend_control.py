@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +14,11 @@ from support.http import http_json, serving
 from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
 
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.core.events import make_agent_event
+from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.tool_surface import ToolScope
@@ -25,7 +28,12 @@ from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.http import create_backend_server
-from monoid_agent_kernel.reference.backend.service import BackendRunRecord, BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.backend.service import (
+    BackendRunRecord,
+    BackendRunRequest,
+    RunnerBackend,
+    _RESUME_SESSION,
+)
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 
@@ -178,6 +186,139 @@ def test_limited_suspension_marks_record_terminal_before_close(
     assert loop.terminal_seen is True
     assert record.state is SessionState.LIMITED
     assert record.terminal is True
+
+
+def test_session_message_wait_ignores_stray_resume(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    backend.idle_timeout_s = 1.0
+    record = _backend_record("run_resume", tmp_path / "runs" / "run_resume", workspace)
+    record.message_queue.put_nowait(_RESUME_SESSION)
+    record.message_queue.put_nowait("next")
+
+    message = asyncio.run(backend._await_session_message(record))  # noqa: SLF001 - driver boundary regression
+
+    assert message == "next"
+
+
+def test_session_message_wait_skips_duplicate_inbox_envelope(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    backend.idle_timeout_s = 1.0
+    record = _backend_record("run_inbox", tmp_path / "runs" / "run_inbox", workspace)
+    record.seen_inbox_ids.add("msg_1")
+    record.message_queue.put_nowait(InboxMessage(content="duplicate", id="msg_1").to_json())
+    record.message_queue.put_nowait(InboxMessage(content="fresh", id="msg_2").to_json())
+
+    message = asyncio.run(backend._await_session_message(record))  # noqa: SLF001 - driver boundary regression
+
+    assert message["id"] == "msg_2"
+    assert record.seen_inbox_ids == {"msg_1", "msg_2"}
+
+
+def test_paused_session_requeues_user_message_before_resuming_frozen_turn(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    backend.idle_timeout_s = 1.0
+    run_id = "run_paused"
+    run_dir = tmp_path / "runs" / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    request = BackendRunRequest(
+        tenant_id="tenant_a",
+        user_id="user_a",
+        workspace_root=workspace,
+        instruction="paused",
+        runtime_config=_config(),
+        multi_turn=True,
+    )
+
+    class _PausedLoop:
+        inputs: list[Any]
+
+        def __init__(self) -> None:
+            self.inputs = []
+
+        def snapshot(self) -> None:
+            return None
+
+        async def arun_until_suspended(self, value: Any) -> Suspension:
+            self.inputs.append(value)
+            return Suspension(reason="terminal", status="completed")
+
+        async def aclose(self) -> AgentRunResult:
+            return AgentRunResult(
+                run_id=run_id,
+                status="completed",
+                final_text="",
+                run_dir=run_dir,
+                diff_path=run_dir / "diff.patch",
+                proposal_path=run_dir / "proposal.json",
+            )
+
+    loop = _PausedLoop()
+    record.loop = loop  # type: ignore[assignment]
+    record.message_queue.put_nowait("queued while paused")
+    with backend._lock:
+        backend._records[run_id] = record
+
+    asyncio.run(
+        backend._drive_open_session(  # noqa: SLF001 - driver boundary regression
+            record,
+            request,
+            loop,  # type: ignore[arg-type]
+            Suspension(reason="paused", status="running"),
+            started=time.time(),
+            turns=1,
+        )
+    )
+
+    assert loop.inputs == [None]
+    assert record.message_queue.get_nowait() == "queued while paused"
+
+
+def test_checkpoint_persist_carries_pending_messages_and_seen_inbox_ids(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_checkpoint"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.seen_inbox_ids.update({"msg_1", "msg_2"})
+    envelope = InboxMessage(content="queued", id="msg_3").to_json()
+    record.message_queue.put_nowait("plain")
+    record.message_queue.put_nowait(_RESUME_SESSION)
+    record.message_queue.put_nowait(envelope)
+
+    class _SnapshotLoop:
+        def snapshot(self) -> RunCheckpoint:
+            return RunCheckpoint(run_id=run_id, seq=1)
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+        def due_outbox(self, now: float) -> list[Any]:
+            del now
+            return []
+
+    record.loop = _SnapshotLoop()  # type: ignore[assignment]
+
+    backend._persist_run_checkpoint(record)  # noqa: SLF001 - driver boundary regression
+
+    assert backend.checkpoint_store is not None
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.queued_messages == ["plain", envelope]
+    assert stored.checkpoint.inbox_seen_ids == ["msg_1", "msg_2"]
 
 
 class _UnopenedLoop:

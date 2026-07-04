@@ -41,14 +41,13 @@ from monoid_agent_kernel.core.subagent_runtime import (
     validate_descendant_run_id,
 )
 from monoid_agent_kernel.core.events import AgentEvent
-from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
+from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.outbox import OutboxReceipt
 from monoid_agent_kernel.core.trace_context import new_traceparent
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     session_state_from_run_status,
     session_state_value,
-    state_from_suspension,
 )
 from monoid_agent_kernel.core.packages import (
     apply_package,
@@ -69,7 +68,6 @@ from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_propo
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.content import (
     ContentPart,
-    content_part_from_json,
 )
 from monoid_agent_kernel.core.spec import (
     AgentRunSpec,
@@ -110,6 +108,10 @@ from monoid_agent_kernel.reference.backend.session import (
     BackendSessionService,
     _normalize_inbound_message as _normalize_inbound_message,
 )
+from monoid_agent_kernel.reference.backend.session_drive import (
+    SessionDriveService,
+    _queued_message_to_loop_input as _queued_message_to_loop_input,
+)
 from monoid_agent_kernel.recorder import append_event_to_run
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.web import WebGatewayClient
@@ -126,16 +128,6 @@ ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
 # crafted value can never reach the blob layer as a path.
 _ARTIFACT_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
 
-
-def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]:
-    """Convert a dequeued backend message into a loop ``submit`` input. Unwraps an inbox envelope to
-    its ``content`` (the provenance/id stay on the queue/checkpoint, not in the loop); a legacy raw
-    ``str``/``list[dict]`` entry passes through. ``content_part_from_json`` rebuilds typed parts."""
-    if is_inbox_envelope(message):
-        message = InboxMessage.from_json(message).content
-    if isinstance(message, list):
-        return tuple(content_part_from_json(part) for part in message)
-    return message  # str
 
 # Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
 _RUN_META_SCHEMA_VERSION = RUN_METADATA_SCHEMA_VERSION
@@ -449,17 +441,6 @@ def _get_shared_loop() -> asyncio.AbstractEventLoop:
         return _shared_loop
 
 
-async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> None:
-    """Awaitable, cancellable exponential backoff with jitter — the async counterpart of the
-    gateway's sync ``_sleep_before_retry`` (used between turn-level auto-retries on the shared
-    loop). ``attempt`` is 1-based."""
-    delay = min(retry.max_delay_s, retry.initial_delay_s * (retry.backoff_multiplier ** max(0, attempt - 1)))
-    if retry.jitter_s > 0:
-        delay += random.uniform(0, retry.jitter_s)
-    if delay > 0:
-        await asyncio.sleep(delay)
-
-
 @dataclass
 class _GatewayTokenSource:
     """A callable gateway-token source that re-mints shortly before expiry. Resolved per request by
@@ -607,6 +588,7 @@ class RunnerBackend:
     _outbox_rng: random.Random = field(default_factory=random.Random, init=False, repr=False)
     _projection: RunProjectionService = field(init=False, repr=False)
     _session_boundary: BackendSessionService = field(init=False, repr=False)
+    _session_drive: SessionDriveService = field(init=False, repr=False)
     _commands: BackendCommandService = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -627,6 +609,9 @@ class RunnerBackend:
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
         self._projection = RunProjectionService(self)
+        self._session_drive = SessionDriveService(
+            self, close_signal=_CLOSE_SESSION, resume_signal=_RESUME_SESSION
+        )
         self._session_boundary = BackendSessionService(
             self, close_signal=_CLOSE_SESSION, resume_signal=_RESUME_SESSION
         )
@@ -1433,176 +1418,20 @@ class RunnerBackend:
         started: float,
         turns: int,
     ) -> AgentRunResult:
-        """Drive an already-open run as a multi-turn session: wait for a parked task to
-        complete or await the message queue for the next user turn — until idle/lifetime/
-        turn limits, cancel, or close. Shared by cold start and recovery; each park point
-        durably checkpoints (loop state + backend message queue).
-
-        Runs as a coroutine on the shared loop. The next-message wait is a pure
-        ``await asyncio.Queue.get()`` (a parked session holds no thread). The hosted/in-proc
-        task-wait is offloaded with asyncio.to_thread (bounded by task_wait_poll_s and
-        retried) since it blocks on the job manager's cross-thread condition (P2);
-        report_task_result wakes it from another thread."""
-        consecutive_turn_failures = 0
-        while True:
-            # Keep the authoritative FSM state on the record current with each park, so a
-            # concurrent control inspect/health reports the live state.
-            _set_record_state(
-                record,
-                state_from_suspension(suspension),
-                terminal=suspension.reason in {"terminal", "limited"},
-            )
-            if suspension.turn is not None:
-                # Capture the settled turn's validated output so status() can surface it live.
-                record.last_final_output = suspension.turn.final_output
-            if suspension.reason in {"terminal", "limited"}:
-                break
-            if suspension.reason == "awaiting_tasks":
-                self._persist_run_checkpoint(record)
-                ready = await asyncio.to_thread(loop.wait_for_pending_tasks, self.task_wait_poll_s)
-                if self._session_should_stop(record, started, turns):
-                    break
-                if ready or not loop.has_pending_tasks():
-                    # A task was delivered (or none remain): resume the pump.
-                    suspension = await loop.arun_until_suspended(None)
-                # else: tasks still pending after the poll window -> keep waiting.
-                continue
-            if suspension.reason == "paused":
-                # Cooperative pause: the loop froze the turn at a clean step boundary (its
-                # pending_observations are kept). Park until a resume signal wakes us, then
-                # re-pump the SAME turn with no new input. The loop already checkpointed the
-                # pause park; persist the backend queue too.
-                if self._session_should_stop(record, started, turns):
-                    break
-                self._persist_run_checkpoint(record)
-                try:
-                    # Raw get: the paused branch is the one place that must SEE _RESUME_SESSION.
-                    signal = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
-                except asyncio.TimeoutError:
-                    break
-                if signal is _CLOSE_SESSION:
-                    break
-                if signal is not _RESUME_SESSION:
-                    # A user message arrived while paused: resume the frozen turn first, then
-                    # let the settled branch consume this message as the next turn.
-                    record.message_queue.put_nowait(signal)
-                suspension = await loop.arun_until_suspended(None)
-                continue
-            if suspension.reason == "turn_failed":
-                # Recoverable model-turn failure: the session is alive (core kept it so). Apply
-                # the retry POLICY here. Give up once too many turns fail in a row.
-                consecutive_turn_failures += 1
-                if consecutive_turn_failures >= self.max_consecutive_turn_failures or self._session_should_stop(
-                    record, started, turns
-                ):
-                    loop.fail_recoverable(
-                        suspension.error or "model turn failed repeatedly",
-                        error_code=suspension.error_code or "model_error",
-                    )
-                    break
-                if suspension.retryable:
-                    # Transient (429 / exhausted-5xx / network): bounded auto-retry with backoff,
-                    # then re-issue the SAME turn (no new user message).
-                    self._persist_run_checkpoint(record)
-                    await _async_sleep_before_retry(consecutive_turn_failures, self.turn_retry)
-                    if self._session_should_stop(record, started, turns):
-                        break
-                    suspension = await loop.arun_until_suspended(None)
-                    continue
-                # Non-retryable but recoverable (config/auth 4xx): a blind retry would just fail
-                # again. Park for the user to fix the config (model/effort) and resend. A one-shot
-                # run has nobody to resend, so finalize it as failed.
-                if not request.multi_turn:
-                    loop.fail_recoverable(
-                        suspension.error or "model turn failed",
-                        error_code=suspension.error_code or "model_error",
-                    )
-                    break
-                loop.await_user_input()
-                self._persist_run_checkpoint(record)
-                try:
-                    message = await self._await_session_message(record)
-                except asyncio.TimeoutError:
-                    break
-                if message is _CLOSE_SESSION:
-                    break
-                turns += 1
-                suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
-                continue
-            if suspension.reason == "interrupted":
-                # Turn-level stop (the user hit "stop"): not a failure, not terminal. Park the
-                # multi-turn session for the next message; a one-shot run just closes. Does not
-                # count against the turn-failure streak.
-                if not request.multi_turn or self._session_should_stop(record, started, turns):
-                    break
-                loop.await_user_input()
-                self._persist_run_checkpoint(record)
-                try:
-                    message = await self._await_session_message(record)
-                except asyncio.TimeoutError:
-                    break
-                if message is _CLOSE_SESSION:
-                    break
-                turns += 1
-                suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
-                continue
-            # settled. One-shot runs close here; multi-turn awaits the next message.
-            consecutive_turn_failures = 0  # a settled turn clears the failure streak
-            # Drain staged outbox sends now (the loop is still open) so a one-shot run that finishes
-            # without parking still gets its side-effects dispatched; the multi-turn await below
-            # also drains (a no-op then, since these are already dispatched).
-            self._drain_outbox(record, loop)
-            if not request.multi_turn:
-                break
-            if self._session_should_stop(record, started, turns):
-                break
-            loop.await_user_input()
-            self._persist_run_checkpoint(record)
-            try:
-                # Pure async await — a parked multi-turn session holds no thread.
-                message = await self._await_session_message(record)
-            except asyncio.TimeoutError:
-                break  # idle timeout
-            if message is _CLOSE_SESSION:
-                break
-            turns += 1
-            suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
-        return await loop.aclose()
+        return await self._session_drive.drive_open_session(
+            record,
+            request,
+            loop,
+            suspension,
+            started=started,
+            turns=turns,
+        )
 
     async def _await_session_message(self, record: BackendRunRecord) -> Any:
-        """Await the next queued user message, dropping stray ``_RESUME_SESSION`` sentinels (a
-        resume aimed at a run that is not currently paused is a no-op). Raises
-        ``asyncio.TimeoutError`` once the idle timeout elapses, mirroring the bare
-        ``wait_for`` it replaces."""
-        deadline = time.monotonic() + self.idle_timeout_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise asyncio.TimeoutError
-            message = await asyncio.wait_for(record.message_queue.get(), remaining)
-            if message is _RESUME_SESSION:
-                continue  # stray resume (run not paused): ignore and keep waiting
-            if is_inbox_envelope(message):
-                msg_id = str(message.get("id") or "")
-                if msg_id and msg_id in record.seen_inbox_ids:
-                    continue  # idempotent ingress: a redelivered message is processed once
-                if msg_id:
-                    # Mark processed; persisted at the next park checkpoint so the dedup survives a
-                    # restart (the marker rides the same checkpoint as the message's effects).
-                    record.seen_inbox_ids.add(msg_id)
-            return message
+        return await self._session_drive.await_session_message(record)
 
     def _persist_run_checkpoint(self, record: BackendRunRecord) -> None:
-        """Augment the loop's own park-point checkpoint with the backend-owned message
-        queue, so a follow-up message that arrived but was not yet consumed survives a
-        restart. No-op when the loop refuses a snapshot (a live shell job is parked-on)."""
-        loop = record.loop
-        if loop is None:
-            return
-        checkpoint = loop.snapshot()
-        if checkpoint is None:
-            return
-        self._persist_run_checkpoint_payload(record, checkpoint, loop.collect_checkpoint_blobs())
+        self._session_drive.persist_run_checkpoint(record)
 
     def _persist_run_checkpoint_payload(
         self,
@@ -1610,30 +1439,10 @@ class RunnerBackend:
         checkpoint: RunCheckpoint,
         blobs: Mapping[str, bytes],
     ) -> None:
-        """Commit a loop checkpoint after adding backend-owned queue and inbox state."""
-        loop = record.loop
-        if loop is None:
-            return
-        # Peek (don't drain) the residual queue; consumed messages are already reflected in
-        # the loop's turn handle / pending input. Runs in the driver coroutine on the shared
-        # loop, so reading the asyncio.Queue's backing deque needs no lock (single-threaded
-        # loop; producers enqueue via _call_soon on this same loop).
-        residual = [
-            message
-            for message in list(record.message_queue._queue)
-            # inbox envelope dict, or legacy raw str/list parts; the close/resume sentinels (objects)
-            # are dropped.
-            if isinstance(message, (str, list, dict))
-        ]
-        checkpoint.queued_messages = residual
-        checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
-        # Overwrites the same seq the loop just committed, now with the queue included.
-        assert self.checkpoint_store is not None
-        self.checkpoint_store.put(checkpoint, blobs)
-        self._drain_outbox(record, loop)
+        self._session_drive.persist_run_checkpoint_payload(record, checkpoint, blobs)
 
     async def _persist_run_checkpoint_async(self, record: BackendRunRecord) -> None:
-        self._persist_run_checkpoint(record)
+        await self._session_drive.persist_run_checkpoint_async(record)
 
     def _persist_run_checkpoint_from_any_thread(self, record: BackendRunRecord) -> None:
         try:
@@ -1725,11 +1534,7 @@ class RunnerBackend:
         record.message_queue.put_nowait(envelope.to_json())
 
     def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
-        return (
-            record.cancellation_token.requested
-            or (time.time() - started) >= self.max_session_lifetime_s
-            or turns >= self.max_turns
-        )
+        return self._session_drive.session_should_stop(record, started, turns)
 
     async def _run_run(
         self,
