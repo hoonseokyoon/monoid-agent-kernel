@@ -3,16 +3,36 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
-from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.content import ContentPart, content_part_from_json
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.lifecycle import state_from_suspension
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
 from monoid_agent_kernel.reference.backend.projection import _set_record_state
+
+
+@dataclass(frozen=True)
+class SessionDriveLimits:
+    idle_timeout_s: float
+    max_session_lifetime_s: float
+    max_turns: int
+    task_wait_poll_s: float
+    max_consecutive_turn_failures: int
+    turn_retry: ModelRetryConfig
+
+
+@dataclass(frozen=True)
+class SessionDriveContext:
+    limits_provider: Callable[[], SessionDriveLimits]
+    checkpoint_store_provider: Callable[[], CheckpointStore]
+    drain_outbox: Callable[[Any, Any], None]
+    close_signal: object
+    resume_signal: object
 
 
 def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]:
@@ -36,10 +56,8 @@ async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> No
 class SessionDriveService:
     """Open-session driver for the RunnerBackend facade."""
 
-    def __init__(self, backend: Any, *, close_signal: object, resume_signal: object) -> None:
-        self._backend = backend
-        self._close_signal = close_signal
-        self._resume_signal = resume_signal
+    def __init__(self, context: SessionDriveContext) -> None:
+        self._context = context
 
     async def drive_open_session(
         self,
@@ -52,9 +70,9 @@ class SessionDriveService:
         turns: int,
     ) -> AgentRunResult:
         """Drive an already-open run until close, idle, cancellation, or terminal suspension."""
-        backend = self._backend
         consecutive_turn_failures = 0
         while True:
+            limits = self._context.limits_provider()
             _set_record_state(
                 record,
                 state_from_suspension(suspension),
@@ -66,7 +84,7 @@ class SessionDriveService:
                 break
             if suspension.reason == "awaiting_tasks":
                 self.persist_run_checkpoint(record)
-                ready = await asyncio.to_thread(loop.wait_for_pending_tasks, backend.task_wait_poll_s)
+                ready = await asyncio.to_thread(loop.wait_for_pending_tasks, limits.task_wait_poll_s)
                 if self.session_should_stop(record, started, turns):
                     break
                 if ready or not loop.has_pending_tasks():
@@ -77,18 +95,18 @@ class SessionDriveService:
                     break
                 self.persist_run_checkpoint(record)
                 try:
-                    signal = await asyncio.wait_for(record.message_queue.get(), backend.idle_timeout_s)
+                    signal = await asyncio.wait_for(record.message_queue.get(), limits.idle_timeout_s)
                 except asyncio.TimeoutError:
                     break
-                if signal is self._close_signal:
+                if signal is self._context.close_signal:
                     break
-                if signal is not self._resume_signal:
+                if signal is not self._context.resume_signal:
                     record.message_queue.put_nowait(signal)
                 suspension = await loop.arun_until_suspended(None)
                 continue
             if suspension.reason == "turn_failed":
                 consecutive_turn_failures += 1
-                if consecutive_turn_failures >= backend.max_consecutive_turn_failures or self.session_should_stop(
+                if consecutive_turn_failures >= limits.max_consecutive_turn_failures or self.session_should_stop(
                     record, started, turns
                 ):
                     loop.fail_recoverable(
@@ -98,7 +116,7 @@ class SessionDriveService:
                     break
                 if suspension.retryable:
                     self.persist_run_checkpoint(record)
-                    await _async_sleep_before_retry(consecutive_turn_failures, backend.turn_retry)
+                    await _async_sleep_before_retry(consecutive_turn_failures, limits.turn_retry)
                     if self.session_should_stop(record, started, turns):
                         break
                     suspension = await loop.arun_until_suspended(None)
@@ -115,7 +133,7 @@ class SessionDriveService:
                     message = await self.await_session_message(record)
                 except asyncio.TimeoutError:
                     break
-                if message is self._close_signal:
+                if message is self._context.close_signal:
                     break
                 turns += 1
                 suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
@@ -129,13 +147,13 @@ class SessionDriveService:
                     message = await self.await_session_message(record)
                 except asyncio.TimeoutError:
                     break
-                if message is self._close_signal:
+                if message is self._context.close_signal:
                     break
                 turns += 1
                 suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
                 continue
             consecutive_turn_failures = 0
-            backend._drain_outbox(record, loop)
+            self._context.drain_outbox(record, loop)
             if not request.multi_turn:
                 break
             if self.session_should_stop(record, started, turns):
@@ -146,7 +164,7 @@ class SessionDriveService:
                 message = await self.await_session_message(record)
             except asyncio.TimeoutError:
                 break
-            if message is self._close_signal:
+            if message is self._context.close_signal:
                 break
             turns += 1
             suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
@@ -154,14 +172,13 @@ class SessionDriveService:
 
     async def await_session_message(self, record: Any) -> Any:
         """Await the next user message, ignoring stray resume signals and duplicate inbox ids."""
-        backend = self._backend
-        deadline = time.monotonic() + backend.idle_timeout_s
+        deadline = time.monotonic() + self._context.limits_provider().idle_timeout_s
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise asyncio.TimeoutError
             message = await asyncio.wait_for(record.message_queue.get(), remaining)
-            if message is self._resume_signal:
+            if message is self._context.resume_signal:
                 continue
             if is_inbox_envelope(message):
                 msg_id = str(message.get("id") or "")
@@ -195,17 +212,16 @@ class SessionDriveService:
             message for message in list(record.message_queue._queue) if isinstance(message, (str, list, dict))
         ]
         checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
-        assert self._backend.checkpoint_store is not None
-        self._backend.checkpoint_store.put(checkpoint, blobs)
-        self._backend._drain_outbox(record, loop)
+        self._context.checkpoint_store_provider().put(checkpoint, blobs)
+        self._context.drain_outbox(record, loop)
 
     async def persist_run_checkpoint_async(self, record: Any) -> None:
         self.persist_run_checkpoint(record)
 
     def session_should_stop(self, record: Any, started: float, turns: int) -> bool:
-        backend = self._backend
+        limits = self._context.limits_provider()
         return (
             record.cancellation_token.requested
-            or (time.time() - started) >= backend.max_session_lifetime_s
-            or turns >= backend.max_turns
+            or (time.time() - started) >= limits.max_session_lifetime_s
+            or turns >= limits.max_turns
         )

@@ -109,6 +109,8 @@ from monoid_agent_kernel.reference.backend.session import (
     _normalize_inbound_message as _normalize_inbound_message,
 )
 from monoid_agent_kernel.reference.backend.session_drive import (
+    SessionDriveContext,
+    SessionDriveLimits,
     SessionDriveService,
     _queued_message_to_loop_input as _queued_message_to_loop_input,
 )
@@ -609,13 +611,34 @@ class RunnerBackend:
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
         self._projection = RunProjectionService(self)
+        assert self.checkpoint_store is not None
         self._session_drive = SessionDriveService(
-            self, close_signal=_CLOSE_SESSION, resume_signal=_RESUME_SESSION
+            SessionDriveContext(
+                limits_provider=self._session_drive_limits,
+                checkpoint_store_provider=self._checkpoint_store,
+                drain_outbox=self._drain_outbox,
+                close_signal=_CLOSE_SESSION,
+                resume_signal=_RESUME_SESSION,
+            )
         )
         self._session_boundary = BackendSessionService(
             self, close_signal=_CLOSE_SESSION, resume_signal=_RESUME_SESSION
         )
         self._commands = BackendCommandService(self)
+
+    def _session_drive_limits(self) -> SessionDriveLimits:
+        return SessionDriveLimits(
+            idle_timeout_s=self.idle_timeout_s,
+            max_session_lifetime_s=self.max_session_lifetime_s,
+            max_turns=self.max_turns,
+            task_wait_poll_s=self.task_wait_poll_s,
+            max_consecutive_turn_failures=self.max_consecutive_turn_failures,
+            turn_retry=self.turn_retry,
+        )
+
+    def _checkpoint_store(self) -> CheckpointStore:
+        assert self.checkpoint_store is not None
+        return self.checkpoint_store
 
     # --- Shared event loop (coroutine-per-run) ------------------------------------------
 
