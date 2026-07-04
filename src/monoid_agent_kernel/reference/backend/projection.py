@@ -102,8 +102,8 @@ def _status_payload_lifecycle(
         state = SessionState.FAILED
         terminal = True
     else:
-        state = SessionState.COMPLETED
-        terminal = True
+        state = SessionState.CREATED
+        terminal = False
     return {"state": session_state_value(state), "terminal": terminal}
 
 

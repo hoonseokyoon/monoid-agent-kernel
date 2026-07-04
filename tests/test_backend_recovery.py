@@ -787,3 +787,42 @@ def test_backend_list_runs_materializes_shared_recovery_metadata(tmp_path: Path)
     assert all(entry["run_id"] != bad_run_id for entry in listing)
     assert (run_dir / "run.json").exists()
     assert json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["title"] == "shared title"
+
+
+def test_backend_history_without_status_artifact_is_not_reported_completed(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    run_id = "run_created_only"
+    run_dir = run_root / run_id
+    run_dir.mkdir(parents=True)
+    runtime = _default_config()
+    write_json_atomic(
+        run_dir / "run.json",
+        {
+            "schema_version": _RUN_META_SCHEMA_VERSION,
+            "run_id": run_id,
+            "tenant_id": "tenant_a",
+            "user_id": "user_a",
+            "title": "created only",
+            "created_at": 123.0,
+            "workspace_root": str(workspace),
+            "runtime_config": runtime.to_json(),
+            "runtime_config_hash": runtime.config_hash,
+        },
+    )
+    backend = RunnerBackend(
+        run_root=run_root,
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda *_a, **_k: _ScriptedTurnAdapter([]),
+    )
+
+    listing = backend.list_runs("tenant_a")["runs"]
+    entry = next(item for item in listing if item["run_id"] == run_id)
+
+    assert entry["state"] == "created"
+    assert entry["terminal"] is False
+    status = backend.status(run_id, entry["read_token"])
+    assert status["state"] == "created"
+    assert status["terminal"] is False
