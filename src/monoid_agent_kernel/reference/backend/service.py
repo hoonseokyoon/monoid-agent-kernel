@@ -11,7 +11,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
@@ -29,7 +29,6 @@ from monoid_agent_kernel.core.durable_metadata import (
     RUN_METADATA_SCHEMA_VERSION,
     DurableMetadataCommitter,
     read_run_metadata,
-    runtime_config_from_metadata,
     validate_run_metadata,
 )
 from monoid_agent_kernel.core.event_sequencing import (
@@ -98,6 +97,11 @@ from monoid_agent_kernel.reference.backend.projection import (
     _set_record_state,
 )
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
+from monoid_agent_kernel.reference.backend.runtime_config import (
+    RuntimeConfigContext,
+    RuntimeConfigService,
+    runtime_config_from_meta,
+)
 from monoid_agent_kernel.reference.backend.session import (
     BackendSessionContext,
     BackendSessionService,
@@ -139,7 +143,7 @@ def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
 
 
 def _runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
-    return runtime_config_from_metadata(meta)
+    return runtime_config_from_meta(meta)
 
 
 _DIRECT_AUDIT_APPEND_STATUSES = DIRECT_AUDIT_APPEND_STATUSES
@@ -589,6 +593,7 @@ class RunnerBackend:
     _outbox_rng: random.Random = field(default_factory=random.Random, init=False, repr=False)
     _projection: RunProjectionService = field(init=False, repr=False)
     _proposal: ProposalService = field(init=False, repr=False)
+    _runtime_config: RuntimeConfigService = field(init=False, repr=False)
     _session_boundary: BackendSessionService = field(init=False, repr=False)
     _session_drive: SessionDriveService = field(init=False, repr=False)
     _commands: BackendCommandService = field(init=False, repr=False)
@@ -632,6 +637,19 @@ class RunnerBackend:
                 checkpoint_store_provider=lambda: self.checkpoint_store,
                 emit_backend_event=self._emit_backend_event,
                 allowed_apply_roots_provider=lambda: self.allowed_apply_roots,
+            )
+        )
+        self._runtime_config = RuntimeConfigService(
+            RuntimeConfigContext(
+                authorize_run=self._authorize_run,
+                record=self._record,
+                with_record_lock=self._with_record_lock,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                builtin_tool_specs_provider=lambda: _backend_builtin_tool_specs(
+                    self.subagent_definitions,
+                    self.tool_providers,
+                ),
+                now=time.time,
             )
         )
         assert self.checkpoint_store is not None
@@ -706,6 +724,10 @@ class RunnerBackend:
     def _checkpoint_store(self) -> CheckpointStore:
         assert self.checkpoint_store is not None
         return self.checkpoint_store
+
+    def _with_record_lock(self, fn: Callable[[], Any]) -> Any:
+        with self._lock:
+            return fn()
 
     def _active_record(self, run_id: str) -> BackendRunRecord | None:
         with self._lock:
@@ -1135,37 +1157,10 @@ class RunnerBackend:
         )
 
     def current_runtime_config(self, run_id: str) -> AgentRuntimeConfig | None:
-        record = self._record(run_id)
-        with self._lock:
-            return record.runtime_config
+        return self._runtime_config.current_runtime_config(run_id)
 
     def runtime_config(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        with self._lock:
-            config = record.runtime_config
-            if config is None:
-                return {
-                    "run_id": record.run_id,
-                    "tenant_id": record.tenant_id,
-                    "ready": False,
-                    "config_version": 0,
-                    "config_hash": "",
-                    "issuer": record.runtime_config_issuer,
-                    "reason": record.runtime_config_reason,
-                    "committed_at": record.runtime_config_committed_at,
-                }
-            return {
-                "run_id": record.run_id,
-                "tenant_id": record.tenant_id,
-                "ready": True,
-                "issuer": record.runtime_config_issuer,
-                "reason": record.runtime_config_reason,
-                "committed_at": record.runtime_config_committed_at,
-                "config": config.to_json(),
-                "config_version": config.config_version,
-                "config_hash": config.config_hash,
-            }
+        return self._runtime_config.runtime_config(run_id, token)
 
     def replace_runtime_config(
         self,
@@ -1177,47 +1172,14 @@ class RunnerBackend:
         reason: str,
         config: AgentRuntimeConfig,
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        validate_runtime_config(
-            config, _backend_builtin_tool_specs(self.subagent_definitions, self.tool_providers)
+        return self._runtime_config.replace_runtime_config(
+            run_id,
+            token,
+            expected_version=expected_version,
+            issuer=issuer,
+            reason=reason,
+            config=config,
         )
-        record = self._record(run_id)
-        with self._lock:
-            if _record_terminal(record):
-                raise ValueError("cannot update runtime config for a terminal run")
-            current_version = record.runtime_config.config_version if record.runtime_config else 0
-            if expected_version != current_version:
-                raise ValueError(
-                    f"runtime config version mismatch: expected {expected_version}, current {current_version}"
-                )
-            if config.config_version <= current_version:
-                # Auto-bump the version, preserving every other field (incl. output_validators).
-                # replace() copies all fields, so a new config field can't be silently dropped on
-                # hot-swap (an enumerated rebuild here previously dropped output-validator opt-outs).
-                config = replace(config, config_version=current_version + 1)
-            committed_at = time.time()
-            self._write_runtime_config_run_meta(
-                record,
-                config,
-                issuer=issuer,
-                reason=reason,
-                committed_at=committed_at,
-            )
-            record.runtime_config = config
-            record.runtime_config_issuer = issuer
-            record.runtime_config_reason = reason
-            record.runtime_config_committed_at = committed_at
-            return {
-                "run_id": record.run_id,
-                "tenant_id": record.tenant_id,
-                "ready": True,
-                "issuer": issuer,
-                "reason": reason,
-                "committed_at": committed_at,
-                "config": config.to_json(),
-                "config_version": config.config_version,
-                "config_hash": config.config_hash,
-            }
 
     def report_task_result(
         self,
@@ -1893,9 +1855,8 @@ class RunnerBackend:
         reason: str,
         committed_at: float,
     ) -> None:
-        DurableMetadataCommitter(self.checkpoint_store).commit_runtime_config_update(
-            record.run_dir,
-            record.run_id,
+        self._runtime_config.write_runtime_config_run_meta(
+            record,
             config,
             issuer=issuer,
             reason=reason,
