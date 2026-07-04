@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from monoid_agent_kernel.core._util import read_text_resilient
+from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.durable_metadata import DurableMetadataCommitter
 from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
@@ -20,7 +23,6 @@ from monoid_agent_kernel.core.lifecycle import (
 )
 from monoid_agent_kernel.core.subagent_runtime import subagent_diagnostics_from_events
 from monoid_agent_kernel.core.trace_context import trace_id_of
-from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE
 
 _RUN_EVENT_SEQUENCER = RunEventSequencer()
 
@@ -92,22 +94,34 @@ def _status_payload_lifecycle(
     return {"state": session_state_value(state), "terminal": terminal}
 
 
+@dataclass(frozen=True)
+class RunProjectionContext:
+    authorized_run_dir: Callable[[str, str], Path]
+    authorize_run: Callable[[str, str], None]
+    record: Callable[[str], Any]
+    active_record: Callable[[str], Any | None]
+    read_proposal: Callable[[Any], dict[str, Any] | None]
+    read_recover_attempts: Callable[[Path], int]
+    run_root_provider: Callable[[], Path]
+    checkpoint_store_provider: Callable[[], CheckpointStore | None]
+    max_recover_attempts_provider: Callable[[], int]
+    issue_read_token: Callable[[str, str, str], str]
+
+
 class RunProjectionService:
     """Read-only run projections for the RunnerBackend facade."""
 
-    def __init__(self, backend: Any) -> None:
-        self._backend = backend
+    def __init__(self, context: RunProjectionContext) -> None:
+        self._context = context
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
-        backend = self._backend
-        run_dir = backend._authorized_run_dir(run_id, token)
+        run_dir = self._context.authorized_run_dir(run_id, token)
         status_file = run_dir / "status.json"
         status_payload: dict[str, Any] | None = None
         if status_file.exists():
             # Resilient read: the run may be concurrently flipping status.json via atomic replace.
             status_payload = json.loads(read_text_resilient(status_file))
-        with backend._lock:
-            record = backend._records.get(run_id)
+        record = self._context.active_record(run_id)
         if record is None:
             return {
                 "run_id": run_id,
@@ -137,9 +151,8 @@ class RunProjectionService:
         }
 
     def result(self, run_id: str, token: str) -> dict[str, Any]:
-        backend = self._backend
-        backend._authorize_run(run_id, token)
-        record = backend._record(run_id)
+        self._context.authorize_run(run_id, token)
+        record = self._context.record(run_id)
         if record.result is None:
             return {
                 "run_id": record.run_id,
@@ -151,7 +164,7 @@ class RunProjectionService:
             }
         result = record.result
         diff_text = result.diff_path.read_text(encoding="utf-8") if result.diff_path.exists() else ""
-        proposal_payload = backend._read_proposal(record)
+        proposal_payload = self._context.read_proposal(record)
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
@@ -175,15 +188,14 @@ class RunProjectionService:
     def events(
         self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
     ) -> dict[str, Any]:
-        events_path = self._backend._authorized_run_dir(run_id, token) / "events.jsonl"
+        events_path = self._context.authorized_run_dir(run_id, token) / "events.jsonl"
         page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
         return {"run_id": run_id, **page}
 
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
         if event_limit < 1:
             raise ValueError("event_limit must be positive")
-        backend = self._backend
-        run_dir = backend._authorized_run_dir(run_id, token)
+        run_dir = self._context.authorized_run_dir(run_id, token)
         status = self.status(run_id, token)
         status_file = status.get("status_file") if isinstance(status.get("status_file"), dict) else {}
         from_seq = _RUN_EVENT_SEQUENCER.diagnostics_from_seq(
@@ -197,14 +209,14 @@ class RunProjectionService:
             event for event in event_summaries if str(event.get("type") or "").startswith("control.command.")
         ]
         failure = _read_optional_json(run_dir / "failure.json")
-        recover_attempts = backend._read_recover_attempts(run_dir)
+        recover_attempts = self._context.read_recover_attempts(run_dir)
         return {
             "run_id": run_id,
             "status": status,
             "failure": failure,
             "recovery": {
                 "attempts": recover_attempts,
-                "max_attempts": backend.max_recover_attempts,
+                "max_attempts": self._context.max_recover_attempts_provider(),
                 "failure_marked": failure is not None,
                 "unrecoverable": bool(failure and failure.get("error_code") == "unrecoverable"),
             },
@@ -222,12 +234,13 @@ class RunProjectionService:
     def list_runs(
         self, tenant_id: str, *, user_id: str | None = None, limit: int = 100
     ) -> dict[str, Any]:
-        backend = self._backend
         runs: list[dict[str, Any]] = []
-        if not backend.run_root.is_dir():
+        run_root = self._context.run_root_provider()
+        checkpoint_store = self._context.checkpoint_store_provider()
+        if not run_root.is_dir():
             return {"runs": runs}
-        metadata_committer = DurableMetadataCommitter(backend.checkpoint_store)
-        for run_dir in backend.run_root.iterdir():
+        metadata_committer = DurableMetadataCommitter(checkpoint_store)
+        for run_dir in run_root.iterdir():
             if not run_dir.is_dir():
                 continue
             meta = metadata_committer.read_recovery_metadata(run_dir, run_dir.name)
@@ -239,8 +252,7 @@ class RunProjectionService:
             if user_id is not None and run_user != user_id:
                 continue
             run_id = meta.get("run_id") or run_dir.name
-            with backend._lock:
-                record = backend._records.get(run_id)
+            record = self._context.active_record(run_id)
             if record is not None:
                 lifecycle = _record_lifecycle_payload(record)
             else:
@@ -254,8 +266,8 @@ class RunProjectionService:
                         status_payload = None
                 lifecycle = _status_payload_lifecycle(status_payload, run_dir)
             recoverable = False
-            if record is None and not (run_dir / "failure.json").exists() and backend.checkpoint_store is not None:
-                stored = backend.checkpoint_store.latest(run_id)
+            if record is None and not (run_dir / "failure.json").exists() and checkpoint_store is not None:
+                stored = checkpoint_store.latest(run_id)
                 recoverable = stored is not None and not stored.checkpoint.terminal
             runs.append(
                 {
@@ -266,14 +278,7 @@ class RunProjectionService:
                     "created_at": meta.get("created_at") or 0.0,
                     **lifecycle,
                     "recoverable": recoverable,
-                    "read_token": backend.token_manager.issue(
-                        kind="run_access",
-                        audience=BACKEND_AUDIENCE,
-                        run_id=run_id,
-                        tenant_id=tenant_id,
-                        user_id=run_user,
-                        ttl_s=backend.run_token_ttl_s,
-                    ),
+                    "read_token": self._context.issue_read_token(run_id, tenant_id, run_user),
                 }
             )
         runs.sort(key=lambda entry: entry["created_at"], reverse=True)

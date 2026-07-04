@@ -97,6 +97,7 @@ from monoid_agent_kernel.identifiers import (
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
 from monoid_agent_kernel.reference.backend.commands import BackendCommandService
 from monoid_agent_kernel.reference.backend.projection import (
+    RunProjectionContext,
     RunProjectionService,
     _json_safe as _json_safe,
     _record_lifecycle_payload,
@@ -610,7 +611,20 @@ class RunnerBackend:
             self.checkpoint_store = LocalFsCheckpointStore(self.run_root)
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
-        self._projection = RunProjectionService(self)
+        self._projection = RunProjectionService(
+            RunProjectionContext(
+                authorized_run_dir=self._authorized_run_dir,
+                authorize_run=self._authorize_run,
+                record=self._record,
+                active_record=self._active_record,
+                read_proposal=self._read_proposal,
+                read_recover_attempts=self._read_recover_attempts,
+                run_root_provider=lambda: self.run_root,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                max_recover_attempts_provider=lambda: self.max_recover_attempts,
+                issue_read_token=self._issue_read_token,
+            )
+        )
         assert self.checkpoint_store is not None
         self._session_drive = SessionDriveService(
             SessionDriveContext(
@@ -639,6 +653,20 @@ class RunnerBackend:
     def _checkpoint_store(self) -> CheckpointStore:
         assert self.checkpoint_store is not None
         return self.checkpoint_store
+
+    def _active_record(self, run_id: str) -> BackendRunRecord | None:
+        with self._lock:
+            return self._records.get(run_id)
+
+    def _issue_read_token(self, run_id: str, tenant_id: str, user_id: str) -> str:
+        return self.token_manager.issue(
+            kind="run_access",
+            audience=BACKEND_AUDIENCE,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            ttl_s=self.run_token_ttl_s,
+        )
 
     # --- Shared event loop (coroutine-per-run) ------------------------------------------
 
