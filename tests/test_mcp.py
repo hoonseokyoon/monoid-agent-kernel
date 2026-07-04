@@ -329,6 +329,8 @@ def test_mcp_provider_exposes_resources_prompts_context_and_invalidation() -> No
         with McpToolProvider(f"{base_url}/mcp", server="t") as mcp:
             specs = {s.id: s for s in mcp.get_tools()}
             assert set(specs) == {"mcp.t.resource.read", "mcp.t.prompt.get"}
+            assert specs["mcp.t.resource.read"].input_schema["properties"]["uri"] == {"type": "string"}
+            assert specs["mcp.t.prompt.get"].input_schema["properties"]["name"] == {"type": "string"}
 
             read = specs["mcp.t.resource.read"].handler(None, {"uri": "fake://one"})
             assert read.ok and read.content["contents"][0]["text"] == "read fake://one"

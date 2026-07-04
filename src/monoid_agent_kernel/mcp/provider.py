@@ -201,10 +201,7 @@ class McpToolProvider:
                 ),
                 input_schema=_object_schema(
                     {
-                        "uri": {
-                            "type": "string",
-                            "enum": [str(r.get("uri")) for r in resources if r.get("uri")],
-                        },
+                        "uri": {"type": "string"},
                     },
                     required=["uri"],
                 ),
@@ -223,10 +220,7 @@ class McpToolProvider:
                 ),
                 input_schema=_object_schema(
                     {
-                        "name": {
-                            "type": "string",
-                            "enum": [str(p.get("name")) for p in prompts if p.get("name")],
-                        },
+                        "name": {"type": "string"},
                         "arguments": {"type": "object", "additionalProperties": True, "default": {}},
                     },
                     required=["name"],
