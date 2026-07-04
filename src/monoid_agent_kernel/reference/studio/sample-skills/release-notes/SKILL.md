@@ -20,5 +20,5 @@ changes for a version.
 Use `skill.read_file` for `references/release-note-template.md` when the user wants a
 structured release note.
 
-Use `skill.run_script` for `scripts/collect_changes.py` when the workspace has a plain
-text file of one change per line and you need a quick grouping scaffold.
+When the workspace has a plain text file of one change per line, read it directly and group
+the entries in the response.
