@@ -47,7 +47,6 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_from_run_status,
     session_state_value,
 )
-from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
     CheckpointStore,
@@ -78,7 +77,6 @@ from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCES,
     TASK_CALLBACK_AUDIENCE,
     TASK_CALLBACK_AUDIENCES,
-    namespaced_id,
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
 from monoid_agent_kernel.reference.backend.commands import BackendCommandContext, BackendCommandService
@@ -92,11 +90,8 @@ from monoid_agent_kernel.reference.backend.projection import (
     _set_record_state,
 )
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
-from monoid_agent_kernel.reference.backend.runtime_config import (
-    RuntimeConfigContext,
-    RuntimeConfigService,
-    runtime_config_from_meta,
-)
+from monoid_agent_kernel.reference.backend.recovery import RecoveryContext, RecoveryService
+from monoid_agent_kernel.reference.backend.runtime_config import RuntimeConfigContext, RuntimeConfigService
 from monoid_agent_kernel.reference.backend.session import (
     BackendSessionContext,
     BackendSessionService,
@@ -135,10 +130,6 @@ def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
 
 def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
     return validate_run_metadata(payload)
-
-
-def _runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
-    return runtime_config_from_meta(meta)
 
 
 _DIRECT_AUDIT_APPEND_STATUSES = DIRECT_AUDIT_APPEND_STATUSES
@@ -590,6 +581,7 @@ class RunnerBackend:
     _proposal: ProposalService = field(init=False, repr=False)
     _runtime_config: RuntimeConfigService = field(init=False, repr=False)
     _jobs: JobService = field(init=False, repr=False)
+    _recovery: RecoveryService = field(init=False, repr=False)
     _session_boundary: BackendSessionService = field(init=False, repr=False)
     _session_drive: SessionDriveService = field(init=False, repr=False)
     _commands: BackendCommandService = field(init=False, repr=False)
@@ -649,6 +641,34 @@ class RunnerBackend:
             )
         )
         self._jobs = JobService(JobServiceContext(authorize_run=self._authorize_run, record=self._record))
+        self._recovery = RecoveryService(
+            RecoveryContext(
+                run_root_provider=lambda: self.run_root,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                lease_store_provider=lambda: self.lease_store,
+                max_recover_attempts_provider=lambda: self.max_recover_attempts,
+                worker_id_provider=lambda: self._worker_id,
+                lease_ttl_s_provider=lambda: self.lease_ttl_s,
+                is_record_tracked=self._is_live_run,
+                record=self._record,
+                attempt_resume=lambda run_dir, run_id: self._attempt_resume(run_dir, run_id),
+                resume_from_checkpoint=lambda stored, meta: self._resume_from_checkpoint(stored, meta),
+                make_request=self._recovery_request,
+                make_record=self._recovery_record,
+                issue_llm_gateway_token=self._issue_recovery_llm_gateway_token,
+                issue_web_gateway_token=self._issue_recovery_web_gateway_token,
+                build_loop=self._build_loop,
+                register_record=self._register_recovered_record,
+                attach_loop=self._attach_recovered_loop,
+                call_soon=lambda fn, *args: self._call_soon(fn, *args),
+                spawn=self._spawn,
+                drive_open_session=self._drive_open_session,
+                record_run_result=self._record_run_result,
+                record_run_failure=self._record_run_failure,
+                acquire_run_slot=self._acquire_run_slot,
+                release_run_slot=self._release_run_slot,
+            )
+        )
         assert self.checkpoint_store is not None
         self._session_drive = SessionDriveService(
             SessionDriveContext(
@@ -743,6 +763,108 @@ class RunnerBackend:
     def _is_live_run(self, run_id: str) -> bool:
         with self._lock:
             return run_id in self._records
+
+    def _recovery_request(self, meta: Mapping[str, Any], runtime_config: AgentRuntimeConfig) -> BackendRunRequest:
+        limits = meta.get("limits") or {}
+        return BackendRunRequest(
+            tenant_id=str(meta["tenant_id"]),
+            user_id=str(meta["user_id"]),
+            workspace_root=Path(meta["workspace_root"]),
+            instruction="",
+            mode=meta.get("mode", "propose"),
+            workspace_backend=meta.get("workspace_backend", "overlay"),
+            max_steps=int(limits.get("max_steps", 30)),
+            max_tool_calls=int(limits.get("max_tool_calls", 100)),
+            max_bytes_read=int(limits.get("max_bytes_read", 1_000_000)),
+            max_duration_s=limits.get("max_duration_s", 900),
+            permission_policy=PermissionPolicy.from_json(meta.get("permission_policy")),
+            runtime_config=runtime_config,
+            multi_turn=bool(meta.get("multi_turn", False)),
+        )
+
+    def _recovery_record(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        workspace_root: Path,
+        llm_gateway_token: str,
+        web_gateway_token: str,
+        runtime_config: AgentRuntimeConfig,
+        meta: Mapping[str, Any],
+    ) -> BackendRunRecord:
+        return BackendRunRecord(
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_root=workspace_root,
+            run_dir=self.run_root / run_id,
+            state=SessionState.AWAITING_INPUT,
+            terminal=False,
+            created_at=time.time(),
+            run_token_sha256="",
+            llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
+            web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
+            runtime_config=runtime_config,
+            runtime_config_issuer=str(meta.get("runtime_config_issuer") or "recover_runs"),
+            runtime_config_reason=str(meta.get("runtime_config_reason") or "resumed from checkpoint"),
+            runtime_config_committed_at=float(meta.get("runtime_config_committed_at") or time.time()),
+        )
+
+    def _issue_recovery_llm_gateway_token(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        runtime_config: AgentRuntimeConfig,
+    ) -> str:
+        return self.token_manager.issue(
+            kind="llm_gateway",
+            audience="csp.llm-gateway",
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            ttl_s=self.llm_gateway_token_ttl_s,
+            metadata={"agent_config_hash": runtime_config.config_hash},
+        )
+
+    def _issue_recovery_web_gateway_token(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        runtime_config: AgentRuntimeConfig,
+    ) -> str:
+        if not (_runtime_config_uses_web(runtime_config) and self.web_gateway_url):
+            return ""
+        return self.token_manager.issue(
+            kind="web_gateway",
+            audience="csp.web-gateway",
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            ttl_s=self.web_gateway_token_ttl_s,
+            metadata={"agent_config_hash": runtime_config.config_hash},
+        )
+
+    def _register_recovered_record(self, record: BackendRunRecord) -> None:
+        with self._lock:
+            self._records[record.run_id] = record
+
+    def _attach_recovered_loop(
+        self,
+        record: BackendRunRecord,
+        loop: AgentLoop,
+        request: BackendRunRequest,
+    ) -> None:
+        with self._lock:
+            record.loop = loop
+            record.outbox_sender = self._outbox_sender_for(request)
+
+    async def _acquire_run_slot(self) -> None:
+        if self._run_semaphore is not None:
+            await self._run_semaphore.acquire()
+
+    def _release_run_slot(self) -> None:
+        if self._run_semaphore is not None:
+            self._run_semaphore.release()
 
     def _active_loop_session(self, run_id: str, token: str) -> tuple[AgentLoop, SessionState]:
         loop = self._session_boundary.authorize_active_loop(run_id, token)
@@ -1742,52 +1864,23 @@ class RunnerBackend:
         """Write ``run_dir/failure.json`` (the operator-facing failure bundle, same schema
         as the core's). ``overwrite=False`` preserves a bundle the loop already wrote
         (which carries richer, in-run context)."""
-        failure_path = run_dir / "failure.json"
-        if failure_path.exists() and not overwrite:
-            return
-        last_good_seq = 0
-        if self.checkpoint_store is not None:
-            try:
-                stored = self.checkpoint_store.latest(run_id)
-                last_good_seq = stored.seq if stored is not None else 0
-            except Exception:  # pragma: no cover - last-good lookup must never mask the failure
-                last_good_seq = 0
-        bundle = {
-            "schema_version": namespaced_id("failure.v1"),
-            "run_id": run_id,
-            "error": error,
-            "error_code": error_code,
-            "type": exc_type,
-            "last_good_seq": last_good_seq,
-            "restore_hint": (
-                f"restore checkpoint seq {last_good_seq} for run {run_id} via CheckpointStore, "
-                "then resume via recover_runs"
-                if last_good_seq > 0
-                else "no recoverable checkpoint; inspect run logs and run.json"
-            ),
-            "failed_at": time.time(),
-        }
-        run_dir.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(failure_path, bundle)
-
-    def _recover_attempts_path(self, run_dir: Path) -> Path:
-        return run_dir / "recover_attempts.json"
+        self._recovery.write_failure_bundle(
+            run_id,
+            run_dir,
+            error=error,
+            error_code=error_code,
+            exc_type=exc_type,
+            overwrite=overwrite,
+        )
 
     def _read_recover_attempts(self, run_dir: Path) -> int:
-        try:
-            payload = json.loads(self._recover_attempts_path(run_dir).read_text(encoding="utf-8"))
-            return int(payload["count"])
-        except (FileNotFoundError, ValueError, KeyError, OSError, TypeError):
-            return 0
+        return self._recovery.read_recover_attempts(run_dir)
 
     def _bump_recover_attempts(self, run_dir: Path) -> int:
-        count = self._read_recover_attempts(run_dir) + 1
-        run_dir.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(self._recover_attempts_path(run_dir), {"count": count})
-        return count
+        return self._recovery.bump_recover_attempts(run_dir)
 
     def _clear_recover_attempts(self, run_dir: Path) -> None:
-        self._recover_attempts_path(run_dir).unlink(missing_ok=True)
+        self._recovery.clear_recover_attempts(run_dir)
 
     def _write_run_meta(self, record: BackendRunRecord, request: BackendRunRequest) -> None:
         """Write run.json — the durable recovery descriptor. Holds everything
@@ -1850,68 +1943,20 @@ class RunnerBackend:
         DurableMetadataCommitter(self.checkpoint_store).store_shared_metadata(run_id, meta)
 
     def _read_recovery_meta(self, run_dir: Path, run_id: str) -> dict[str, Any] | None:
-        return DurableMetadataCommitter(self.checkpoint_store).read_recovery_metadata(run_dir, run_id)
+        return self._recovery.read_recovery_meta(run_dir, run_id)
 
     def recover_runs(self) -> list[str]:
         """Scan ``run_root`` for runs left parked by a previous process and resume each
         from its checkpoint. Returns the recovered run ids. Idempotent: runs already
         tracked in-memory, terminal checkpoints, and runs missing run.json are skipped."""
-        recovered: list[str] = []
-        if not self.run_root.is_dir():
-            return recovered
-        for run_dir in sorted(path for path in self.run_root.iterdir() if path.is_dir()):
-            run_id = run_dir.name
-            with self._lock:
-                if run_id in self._records:
-                    continue
-            # A failed run is never auto-resumed: its failure.json is the operator's
-            # restore aid (covers the edge where a failure could not write a terminal mark).
-            if (run_dir / "failure.json").exists():
-                continue
-            assert self.checkpoint_store is not None
-            stored = self.checkpoint_store.latest(run_id)
-            if stored is None or stored.checkpoint.terminal:
-                continue
-            if self._attempt_resume(run_dir, run_id):
-                recovered.append(run_id)
-        return recovered
+        return self._recovery.recover_runs()
 
     def _attempt_resume(self, run_dir: Path, run_id: str) -> bool:
         """Resume one run from its latest checkpoint. Returns True on success. Skips runs
         with no resumable checkpoint or missing run.json. On a resume exception, bumps the
         durable attempt counter and, once ``max_recover_attempts`` is reached, marks the run
         unrecoverable (durable failure.json) so it is never retried into a crash loop."""
-        assert self.checkpoint_store is not None
-        stored = self.checkpoint_store.latest(run_id)
-        if stored is None or stored.checkpoint.terminal:
-            return False
-        meta = self._read_recovery_meta(run_dir, run_id)
-        if meta is None:
-            return False
-        try:
-            self._resume_from_checkpoint(stored, meta)
-        except Exception as exc:
-            attempts = self._bump_recover_attempts(run_dir)
-            _LOGGER.error(
-                "resume of run %s failed (attempt %d/%d): %s",
-                run_id,
-                attempts,
-                self.max_recover_attempts,
-                exc,
-            )
-            if attempts >= self.max_recover_attempts:
-                self._write_failure_bundle(
-                    run_id,
-                    run_dir,
-                    error=f"recovery failed after {attempts} attempts: {exc}",
-                    error_code="unrecoverable",
-                    exc_type=type(exc).__name__,
-                    overwrite=True,
-                )
-                _LOGGER.error("run %s marked unrecoverable", run_id)
-            return False
-        self._clear_recover_attempts(run_dir)
-        return True
+        return self._recovery.attempt_resume(run_dir, run_id)
 
     def resume_run(self, run_id: str, token: str) -> dict[str, Any]:
         return self._session_boundary.resume_run(run_id, token)
@@ -1984,129 +2029,13 @@ class RunnerBackend:
         run carries a fresh lease and is left untouched; the claim is a cross-process CAS so
         two watchdogs racing the same run produce exactly one winner. Candidate runs come
         from the lease store, so a shared store surfaces a peer's runs we never hosted."""
-        assert self.lease_store is not None
-        reclaimed: list[str] = []
-        for run_id in sorted(self.lease_store.candidate_run_ids()):
-            with self._lock:
-                if run_id in self._records:
-                    continue
-            run_dir = self.run_root / run_id
-            if (run_dir / "failure.json").exists():
-                continue
-            if not self.lease_store.is_stale(run_id):
-                continue  # a live peer owns it
-            if not self.lease_store.try_claim(run_id, self._worker_id, self.lease_ttl_s):
-                continue  # lost the CAS to another watchdog
-            if self._attempt_resume(run_dir, run_id):
-                _LOGGER.info("watchdog: reclaimed orphaned run %s", run_id)
-                reclaimed.append(run_id)
-            elif not (run_dir / "failure.json").exists():
-                # Resume failed but the attempt cap has not yet marked it unrecoverable.
-                # Release our just-claimed lease so the run is retried next tick (or by a
-                # peer) instead of being stranded behind a fresh lease that never resumes.
-                self.lease_store.release(run_id)
-        return reclaimed
+        return self._recovery.reclaim_stale_runs()
 
     def _resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> None:
-        checkpoint = stored.checkpoint
-        run_id = checkpoint.run_id
-        run_dir = self.run_root / run_id
-        runtime_config = _runtime_config_from_meta(meta)
-        limits = meta.get("limits") or {}
-        request = BackendRunRequest(
-            tenant_id=str(meta["tenant_id"]),
-            user_id=str(meta["user_id"]),
-            workspace_root=Path(meta["workspace_root"]),
-            instruction="",  # the opening turn already ran; recovery resumes from the checkpoint
-            mode=meta.get("mode", "propose"),
-            workspace_backend=meta.get("workspace_backend", "overlay"),
-            max_steps=int(limits.get("max_steps", 30)),
-            max_tool_calls=int(limits.get("max_tool_calls", 100)),
-            max_bytes_read=int(limits.get("max_bytes_read", 1_000_000)),
-            max_duration_s=limits.get("max_duration_s", 900),
-            permission_policy=PermissionPolicy.from_json(meta.get("permission_policy")),
-            runtime_config=runtime_config,
-            multi_turn=bool(meta.get("multi_turn", False)),
-        )
-        workspace_root = request.workspace_root.resolve()
-        # Re-issue gateway tokens — the backend holds the signing key, so the original
-        # (unstored) tokens need not survive the restart.
-        llm_gateway_token = self.token_manager.issue(
-            kind="llm_gateway",
-            audience="csp.llm-gateway",
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            ttl_s=self.llm_gateway_token_ttl_s,
-            metadata={"agent_config_hash": runtime_config.config_hash},
-        )
-        web_gateway_token = ""
-        if _runtime_config_uses_web(runtime_config) and self.web_gateway_url:
-            web_gateway_token = self.token_manager.issue(
-                kind="web_gateway",
-                audience="csp.web-gateway",
-                run_id=run_id,
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
-                ttl_s=self.web_gateway_token_ttl_s,
-                metadata={"agent_config_hash": runtime_config.config_hash},
-            )
-        record = BackendRunRecord(
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            workspace_root=workspace_root,
-            run_dir=run_dir,
-            state=SessionState.AWAITING_INPUT,
-            terminal=False,
-            created_at=time.time(),
-            run_token_sha256="",  # the client still holds its run token (verified cryptographically)
-            llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
-            web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
-            runtime_config=runtime_config,
-            runtime_config_issuer=str(meta.get("runtime_config_issuer") or "recover_runs"),
-            runtime_config_reason=str(meta.get("runtime_config_reason") or "resumed from checkpoint"),
-            runtime_config_committed_at=float(meta.get("runtime_config_committed_at") or time.time()),
-        )
-        with self._lock:
-            self._records[run_id] = record
-        loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
-        # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
-        # restore re-applies the agent's delta from the checkpoint's content blobs.
-        loop.restore(checkpoint, blobs=stored.blob)
-        with self._lock:
-            record.loop = loop
-            record.outbox_sender = self._outbox_sender_for(request)
-        # Restore the inbox dedup set so a message processed before the restart is not reprocessed
-        # if it (or a redelivery) is queued again.
-        record.seen_inbox_ids = set(checkpoint.inbox_seen_ids)
-        # Re-enqueue durable pending messages on the shared loop (before the resume coroutine
-        # drains them); asyncio.Queue puts must run on the loop, not this thread.
-        for message in checkpoint.queued_messages:
-            self._call_soon(record.message_queue.put_nowait, message)
-        # Resume executes as a coroutine on the shared loop (coroutine-per-run).
-        self._spawn(self._run_recovered(run_id, request, loop))
+        self._recovery.resume_from_checkpoint(stored, meta)
 
     async def _run_recovered(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> None:
-        record = self._record(run_id)
-        if self._run_semaphore is not None:
-            await self._run_semaphore.acquire()
-        try:
-            # Derive the starting park from the restored loop: tasks still pending -> a
-            # hosted-task wait; otherwise a settled park awaiting the next user message.
-            if loop.has_pending_tasks():
-                suspension = Suspension(reason="awaiting_tasks", status="running", has_external=True)
-            else:
-                suspension = Suspension(reason="settled", status="completed")
-            result = await self._drive_open_session(
-                record, request, loop, suspension, started=time.time(), turns=1
-            )
-            self._record_run_result(run_id, result)
-        except Exception as exc:
-            self._record_run_failure(run_id, exc)
-        finally:
-            if self._run_semaphore is not None:
-                self._run_semaphore.release()
+        await self._recovery.run_recovered(run_id, request, loop)
 
     def _llm_token_source(
         self, run_id: str, request: BackendRunRequest, runtime_config: AgentRuntimeConfig | None
