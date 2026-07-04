@@ -233,20 +233,24 @@
   #onboarding .ob-prompt:hover { border-color: var(--accent); }
   #onboarding .ob-note { font-size: 12px; color: var(--warn); margin-top: 12px; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.58);
-    display: flex; align-items: center; justify-content: center; padding: 24px; z-index: 20; }
+    display: flex; align-items: center; justify-content: center; padding: clamp(12px, 2vw, 24px);
+    z-index: 20; overflow: hidden; }
   .modal-backdrop[hidden] { display: none; }
-  .modal { width: min(1080px, 100%); max-height: min(90vh, 820px); overflow: auto;
+  .modal { width: min(1180px, calc(100vw - 32px)); height: min(840px, calc(100dvh - 48px));
+    max-height: calc(100dvh - 24px); overflow: hidden; display: flex; flex-direction: column;
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
     box-shadow: 0 16px 48px rgba(0,0,0,.45); padding: 16px; }
   .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
   .modal-head h2 { margin: 0; font-size: 16px; }
   .modal-close { background: transparent; color: var(--muted); border: 1px solid var(--border);
     border-radius: 8px; min-height: 0; padding: 3px 9px; }
-  .profile-form { display: grid; gap: 12px; }
+  .profile-form { flex: 1; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto auto; gap: 12px; }
   .profile-editor-layout { display: grid; grid-template-columns: minmax(340px, 0.92fr) minmax(420px, 1.08fr);
-    gap: 14px; align-items: start; }
+    gap: 14px; align-items: stretch; min-height: 0; overflow: hidden; }
   .profile-editor-panel { border: 1px solid var(--border); background: rgba(0,0,0,.10);
-    border-radius: 8px; padding: 12px; min-width: 0; }
+    border-radius: 8px; padding: 12px; min-width: 0; min-height: 0; overflow: auto; }
+  .profile-preview-panel { display: grid; grid-template-rows: auto auto minmax(138px, .95fr) minmax(180px, 1.25fr) minmax(92px, .45fr) minmax(76px, .35fr);
+    gap: 10px; overflow: hidden; }
   .profile-form label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
   .profile-form input, .profile-form textarea, .profile-form select {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
@@ -262,27 +266,35 @@
     border: 1px solid var(--border); border-radius: 8px; padding: 7px 8px; color: var(--text); }
   #profile-capabilities input { width: auto; }
   .prompt-preview-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline;
-    margin-bottom: 10px; }
+    min-width: 0; }
   .prompt-preview-head h3 { margin: 0; font-size: 13px; }
   .prompt-preview-note { color: var(--muted); font-size: 11.5px; }
   .prompt-block { border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
     padding: 10px; margin-bottom: 10px; }
+  .profile-preview-panel .prompt-block { display: flex; flex-direction: column; min-height: 0;
+    overflow: hidden; margin-bottom: 0; }
   .prompt-block-title { display: flex; align-items: center; justify-content: space-between;
     gap: 10px; margin-bottom: 7px; color: var(--muted); font-size: 11px; text-transform: uppercase;
     letter-spacing: .04em; }
   .prompt-block-title span:last-child { text-transform: none; letter-spacing: 0; color: var(--accent); }
-  .prompt-block pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+  .prompt-block pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; min-height: 0; overflow: auto;
     font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; color: #d7dde6; }
   .prompt-block.empty pre { color: var(--muted); font-family: inherit; }
   .prompt-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
-    margin-bottom: 10px; }
+    min-width: 0; }
   .prompt-meta-card { border: 1px solid var(--border); border-radius: 8px; padding: 8px;
-    color: var(--muted); font-size: 12px; }
+    color: var(--muted); font-size: 12px; min-width: 0; overflow: hidden; }
   .prompt-meta-card b { display: block; color: var(--text); font-weight: 600; margin-bottom: 2px; }
-  .prompt-context-list { margin: 0; padding-left: 18px; color: #d7dde6; font-size: 12px; }
+  .prompt-meta-card span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .prompt-context-list { margin: 0; padding-left: 18px; color: #d7dde6; font-size: 12px;
+    min-height: 0; overflow: auto; }
   .prompt-context-list li { margin: 3px 0; }
   @media (max-width: 900px) {
-    .profile-editor-layout { grid-template-columns: 1fr; }
+    .modal { height: min(920px, calc(100dvh - 24px)); overflow: auto; }
+    .profile-form { display: block; }
+    .profile-editor-layout { grid-template-columns: 1fr; overflow: visible; }
+    .profile-editor-panel { overflow: visible; }
+    .profile-preview-panel { min-height: min(720px, calc(100dvh - 96px)); overflow: hidden; margin-top: 12px; }
     .profile-grid { grid-template-columns: 1fr; }
     .prompt-meta { grid-template-columns: 1fr; }
   }
@@ -428,7 +440,7 @@
               <div id="profile-capabilities"></div>
             </div>
           </div>
-          <aside class="profile-editor-panel" aria-label="Model request preview">
+          <aside class="profile-editor-panel profile-preview-panel" aria-label="Model request preview">
             <div class="prompt-preview-head">
               <h3>Model request preview</h3>
               <span class="prompt-preview-note">initial new-chat turn</span>

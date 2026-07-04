@@ -80,6 +80,7 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
         'data-testid="profile-add"',
         'data-testid="profile-list"',
         'data-testid="profile-editor-popup"',
+        'class="profile-editor-panel profile-preview-panel"',
         'id="prompt-preview-system"',
         'id="prompt-preview-tools"',
         'id="prompt-preview-tool-count"',
