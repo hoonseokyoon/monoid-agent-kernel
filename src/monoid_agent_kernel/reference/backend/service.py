@@ -1383,7 +1383,7 @@ class RunnerBackend:
                 if not _record_terminal(record):
                     _set_record_state(record, SessionState.AWAITING_INPUT, terminal=False)
             elif event.type in {"run.resumed", "model.turn.started"}:
-                if record.state is SessionState.AWAITING_INPUT:
+                if record.state in {SessionState.AWAITING_INPUT, SessionState.AWAITING_TASKS}:
                     _set_record_state(record, SessionState.RUNNING, terminal=False)
             elif event.type == "run.finished":
                 # Record terminal metadata, but DO NOT flip the gating status here. The
@@ -1450,7 +1450,7 @@ class RunnerBackend:
             _set_record_state(
                 record,
                 state_from_suspension(suspension),
-                terminal=suspension.reason == "terminal",
+                terminal=suspension.reason in {"terminal", "limited"},
             )
             if suspension.turn is not None:
                 # Capture the settled turn's validated output so status() can surface it live.

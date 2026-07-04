@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from pathlib import Path
@@ -14,7 +15,9 @@ from support.waiting import eventually
 
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.control import ControlCommand
+from monoid_agent_kernel.core.events import make_agent_event
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.providers.base import ModelTurn
@@ -22,7 +25,7 @@ from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.http import create_backend_server
-from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.backend.service import BackendRunRecord, BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 
@@ -68,6 +71,21 @@ def _events(backend: RunnerBackend, run_id: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
 
 
+def _backend_record(run_id: str, run_dir: Path, workspace: Path) -> BackendRunRecord:
+    return BackendRunRecord(
+        run_id=run_id,
+        tenant_id="tenant_a",
+        user_id="user_a",
+        workspace_root=workspace,
+        run_dir=run_dir,
+        state=SessionState.CREATED,
+        terminal=False,
+        created_at=0.0,
+        run_token_sha256="run-token",
+        llm_gateway_token_sha256="llm-token",
+    )
+
+
 def test_control_command_from_json_rejects_present_wrong_type_args() -> None:
     with pytest.raises(ValueError):
         ControlCommand.from_json({"type": "status", "run_id": "run_1", "args": []})
@@ -85,6 +103,81 @@ def test_control_command_from_json_accepts_legacy_protocol_id() -> None:
 
     assert command.type == "status"
     assert command.run_id == "run_1"
+
+
+@pytest.mark.parametrize("event_type", ["run.resumed", "model.turn.started"])
+def test_task_resume_events_promote_awaiting_tasks_to_running(
+    tmp_path: Path,
+    backend_factory: Any,
+    event_type: str,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_task_resume"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.state = SessionState.AWAITING_TASKS
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(run_id, make_agent_event(run_id=run_id, seq=1, event_type=event_type))
+
+    assert record.state is SessionState.RUNNING
+    assert record.terminal is False
+    record.state = SessionState.CANCELLED
+    record.terminal = True
+
+
+def test_limited_suspension_marks_record_terminal_before_close(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_limited"
+    run_dir = tmp_path / "runs" / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    with backend._lock:
+        backend._records[run_id] = record
+    request = BackendRunRequest(
+        tenant_id="tenant_a",
+        user_id="user_a",
+        workspace_root=workspace,
+        instruction="limited",
+        runtime_config=_config(),
+        multi_turn=True,
+    )
+
+    class _ClosingLoop:
+        terminal_seen: bool | None = None
+
+        async def aclose(self) -> AgentRunResult:
+            self.terminal_seen = record.terminal
+            return AgentRunResult(
+                run_id=run_id,
+                status="limited",
+                final_text="",
+                run_dir=run_dir,
+                diff_path=run_dir / "diff.patch",
+                proposal_path=run_dir / "proposal.json",
+            )
+
+    loop = _ClosingLoop()
+
+    result = asyncio.run(
+        backend._drive_open_session(  # noqa: SLF001 - lifecycle regression around the driver boundary
+            record,
+            request,
+            loop,  # type: ignore[arg-type]
+            Suspension(reason="limited", status="limited"),
+            started=0.0,
+            turns=1,
+        )
+    )
+
+    assert result.status == "limited"
+    assert loop.terminal_seen is True
+    assert record.state is SessionState.LIMITED
+    assert record.terminal is True
 
 
 class _UnopenedLoop:
@@ -390,7 +483,7 @@ def test_dispatch_routes_existing_ops_and_unknown(tmp_path: Path, backend_factor
 
     cancel = _dispatch(backend, run_id, token, "cancel")
     assert cancel.status == "ok"
-    assert backend.wait_for_run(run_id, timeout_s=20) in {"completed", "failed", "limited"}
+    assert backend.wait_for_run(run_id, timeout_s=20) in {"completed", "failed", "limited", "cancelled"}
 
 
 def test_dispatch_inspect_on_terminal_run_is_error(
