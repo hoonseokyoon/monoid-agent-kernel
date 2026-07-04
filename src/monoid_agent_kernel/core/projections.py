@@ -4,6 +4,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from monoid_agent_kernel.core.lifecycle import (
+    SessionState,
+    session_state_from_run_status,
+    session_state_value,
+)
 from monoid_agent_kernel.tasks import list_job_artifacts
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import public_path
@@ -20,6 +25,8 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
     apply_result = _read_json_if_exists(run_dir / "apply-result.json")
     permission_policy = PermissionPolicy.from_json(manifest.get("permission_policy"))
     jobs = _public_jobs(list_job_artifacts(run_dir), permission_policy)
+    state = _payload_state(status_payload, metrics)
+    terminal = _payload_terminal(status_payload, state)
 
     projection: dict[str, Any] = {
         "run_dir": str(run_dir),
@@ -29,7 +36,8 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
             proposal.get("run_id"),
             run_dir.name,
         ),
-        "status": status_payload.get("status") or metrics.get("status") or "unknown",
+        "state": state,
+        "terminal": terminal,
         "error_code": status_payload.get("error_code") or metrics.get("error_code") or "",
         "workspace_backend": (
             status_payload.get("workspace_backend")
@@ -74,19 +82,30 @@ def _apply_event_projection(
             projection["last_event_seq"] = seq
             projection["last_event_type"] = event_type
         if event_type == "run.started":
-            projection["status"] = "running"
+            projection["state"] = session_state_value(SessionState.RUNNING)
+            projection["terminal"] = False
             projection["workspace_backend"] = data.get("workspace_backend") or projection.get("workspace_backend", "")
         elif event_type == "run.finished":
-            projection["status"] = data.get("status") or projection["status"]
+            projection["state"] = session_state_value(
+                session_state_from_run_status(
+                    str(data.get("status") or projection["state"]),
+                    error_code=str(data.get("error_code") or projection["error_code"] or ""),
+                    terminal=True,
+                )
+            )
+            projection["terminal"] = True
             projection["error_code"] = data.get("error_code") or projection["error_code"]
         elif event_type == "run.failed":
-            projection["status"] = "failed"
+            projection["state"] = session_state_value(SessionState.FAILED)
+            projection["terminal"] = True
             projection["error_code"] = data.get("error_code") or projection["error_code"]
         elif event_type == "run.waiting":
-            projection["status"] = "waiting_for_background_jobs"
+            projection["state"] = session_state_value(SessionState.AWAITING_TASKS)
+            projection["terminal"] = False
             projection["waiting_for_background_jobs"] = True
         elif event_type == "run.resumed":
-            projection["status"] = "running"
+            projection["state"] = session_state_value(SessionState.RUNNING)
+            projection["terminal"] = False
             projection["waiting_for_background_jobs"] = False
         elif event_type == "agent.config.updated":
             projection["agent_config"] = {
@@ -143,6 +162,29 @@ def _read_json_if_exists(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _payload_state(status_payload: dict[str, Any], metrics: dict[str, Any]) -> str:
+    raw = status_payload.get("state") or status_payload.get("status") or metrics.get("state") or metrics.get("status")
+    if not raw:
+        return session_state_value(SessionState.CREATED)
+    state = session_state_from_run_status(
+        str(raw),
+        error_code=str(status_payload.get("error_code") or metrics.get("error_code") or ""),
+        terminal=bool(status_payload.get("terminal")),
+    )
+    return session_state_value(state)
+
+
+def _payload_terminal(status_payload: dict[str, Any], state: str) -> bool:
+    if "terminal" in status_payload:
+        return bool(status_payload.get("terminal"))
+    raw = status_payload.get("state") or status_payload.get("status")
+    return str(raw or state) in {"completed", "failed", "limited", "cancelled"} or state in {
+        SessionState.CANCELLED.value,
+        SessionState.FAILED.value,
+        SessionState.COMPLETED.value,
+    }
 
 
 def _public_paths(paths: object, permission_policy: PermissionPolicy) -> list[str]:

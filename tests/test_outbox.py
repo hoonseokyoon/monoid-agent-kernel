@@ -324,7 +324,7 @@ def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None
     backend.outbox_retry_base_s = 0.0  # next_attempt_at == now -> immediately due on redrive
     backend.watchdog_interval_s = 0.05
     run_id, token = _run(backend, workspace, multi_turn=True)
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
     assert eventually(lambda: sender.calls >= 1)  # the park-time drain attempted (and failed) once
 
     backend.start_watchdog()
@@ -478,7 +478,7 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
     try:
         worker_id = spawn("worker", "stand by for planner")
         directory["worker"] = worker_id
-        assert eventually(lambda: backend.status(worker_id, tokens[worker_id]).get("status") == "awaiting_input")
+        assert eventually(lambda: backend.status(worker_id, tokens[worker_id]).get("state") == "awaiting_input")
         planner_id = spawn("planner", "collaborate with worker")
         directory["planner"] = planner_id
 

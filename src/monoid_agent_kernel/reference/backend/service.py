@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from monoid_agent_kernel.core.agents import (
     AgentDefinition,
@@ -52,8 +52,10 @@ from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
 from monoid_agent_kernel.core.lifecycle import (
     LoopSession,
     SessionState,
+    TERMINAL_STATES,
+    session_state_from_run_status,
+    session_state_value,
     state_from_suspension,
-    to_session_state,
 )
 from monoid_agent_kernel.core.packages import (
     apply_package,
@@ -110,8 +112,6 @@ from monoid_agent_kernel.recorder import append_event_to_run
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.web import WebGatewayClient
 from monoid_agent_kernel.workspace.paths import is_within
-
-BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "failed", "limited"]
 
 # Sentinels enqueued to wake/stop a session worker blocked on its message queue.
 _CLOSE_SESSION = object()
@@ -239,7 +239,8 @@ class BackendRunRequest:
 class BackendRunSubmission:
     run_id: str
     run_token: str
-    status: BackendRunState
+    state: SessionState
+    terminal: bool
     run_dir: Path
     status_url: str
     result_url: str
@@ -250,7 +251,8 @@ class BackendRunSubmission:
         return {
             "run_id": self.run_id,
             "run_token": self.run_token,
-            "status": self.status,
+            "state": session_state_value(self.state),
+            "terminal": self.terminal,
             "run_dir": str(self.run_dir),
             "status_url": self.status_url,
             "result_url": self.result_url,
@@ -283,6 +285,55 @@ def _json_safe(value: Any) -> Any:
         return repr(value)
 
 
+def _set_record_state(
+    record: BackendRunRecord,
+    state: SessionState | str,
+    *,
+    terminal: bool | None = None,
+) -> None:
+    session_state = session_state_from_run_status(state)
+    record.state = session_state
+    record.terminal = bool(terminal) if terminal is not None else session_state in TERMINAL_STATES
+
+
+def _record_terminal(record: BackendRunRecord) -> bool:
+    return record.terminal or record.state in TERMINAL_STATES
+
+
+def _record_lifecycle_payload(record: BackendRunRecord) -> dict[str, Any]:
+    return {
+        "state": session_state_value(record.state),
+        "terminal": _record_terminal(record),
+    }
+
+
+def _status_payload_lifecycle(
+    status_payload: Mapping[str, Any] | None,
+    run_dir: Path,
+) -> dict[str, Any]:
+    payload = status_payload or {}
+    raw_state = payload.get("state") or payload.get("status")
+    if raw_state:
+        state = session_state_from_run_status(
+            str(raw_state),
+            error_code=str(payload.get("error_code") or ""),
+            terminal=bool(payload.get("terminal")),
+        )
+        terminal = (
+            bool(payload.get("terminal"))
+            if "terminal" in payload
+            else str(raw_state) in {"completed", "failed", "limited", "cancelled"}
+            or state in TERMINAL_STATES
+        )
+    elif (run_dir / "failure.json").exists():
+        state = SessionState.FAILED
+        terminal = True
+    else:
+        state = SessionState.COMPLETED
+        terminal = True
+    return {"state": session_state_value(state), "terminal": terminal}
+
+
 @dataclass
 class BackendRunRecord:
     run_id: str
@@ -290,7 +341,8 @@ class BackendRunRecord:
     user_id: str
     workspace_root: Path
     run_dir: Path
-    status: BackendRunState
+    state: SessionState
+    terminal: bool
     created_at: float
     run_token_sha256: str
     llm_gateway_token_sha256: str
@@ -314,7 +366,6 @@ class BackendRunRecord:
     # Authoritative lifecycle FSM state, updated by the session driver as it observes each
     # suspension. The control protocol's inspect/health read this (a throwaway LoopSession is
     # seeded with it) since the backend drives the loop directly, not through a facade.
-    session_state: SessionState = SessionState.CREATED
     loop: AgentLoop | None = None
     # Pending user messages for a multi-turn session. asyncio.Queue (not queue.Queue) so the
     # run coroutine awaits the next message WITHOUT holding a thread — a parked multi-turn
@@ -709,9 +760,8 @@ class RunnerBackend:
         Returns the run ids still non-terminal when the timeout elapsed (empty on a clean
         drain). Idempotent; safe to call before :meth:`shutdown`. This is the one-call
         counterpart to issuing a ``cancel_run`` per run and sleeping."""
-        terminal = {"completed", "failed", "limited"}
         with self._lock:
-            records = [record for record in self._records.values() if record.status not in terminal]
+            records = [record for record in self._records.values() if not _record_terminal(record)]
         for record in records:
             with self._lock:
                 record.cancellation_token.cancel()
@@ -724,7 +774,7 @@ class RunnerBackend:
         pending: list[str] = []
         for record in records:
             while time.time() < deadline:
-                if record.status in terminal:
+                if _record_terminal(record):
                     break
                 time.sleep(0.02)
             else:
@@ -802,7 +852,8 @@ class RunnerBackend:
             user_id=request.user_id,
             workspace_root=workspace_root,
             run_dir=run_dir,
-            status="queued",
+            state=SessionState.CREATED,
+            terminal=False,
             created_at=created_at,
             run_token_sha256=TokenManager.token_sha256(run_token),
             llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
@@ -829,7 +880,8 @@ class RunnerBackend:
         return BackendRunSubmission(
             run_id=run_id,
             run_token=prepared.run_token,
-            status="queued",
+            state=prepared.record.state,
+            terminal=prepared.record.terminal,
             run_dir=prepared.record.run_dir,
             status_url=f"/v1/runs/{run_id}/status",
             result_url=f"/v1/runs/{run_id}/result",
@@ -878,7 +930,7 @@ class RunnerBackend:
             # Historical run (no live record, e.g. after a restart): report from status.json.
             return {
                 "run_id": run_id,
-                "status": (status_payload or {}).get("status", "ended"),
+                **_status_payload_lifecycle(status_payload, run_dir),
                 "run_dir": str(run_dir),
                 "status_file": status_payload,
             }
@@ -886,7 +938,7 @@ class RunnerBackend:
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
             "user_id": record.user_id,
-            "status": record.status,
+            **_record_lifecycle_payload(record),
             "created_at": record.created_at,
             "started_at": record.started_at,
             "finished_at": record.finished_at,
@@ -913,7 +965,7 @@ class RunnerBackend:
             return {
                 "run_id": record.run_id,
                 "tenant_id": record.tenant_id,
-                "status": record.status,
+                **_record_lifecycle_payload(record),
                 "ready": False,
                 "error": record.error,
                 "error_code": record.error_code,
@@ -924,6 +976,7 @@ class RunnerBackend:
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
+            **_record_lifecycle_payload(record),
             "status": result.status,
             "ready": True,
             "final_text": result.final_text,
@@ -948,14 +1001,14 @@ class RunnerBackend:
             return {
                 "run_id": record.run_id,
                 "tenant_id": record.tenant_id,
-                "status": record.status,
+                **_record_lifecycle_payload(record),
                 "ready": False,
                 "error": record.error,
             }
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
-            "status": record.status,
+            **_record_lifecycle_payload(record),
             "ready": True,
             **payload,
         }
@@ -974,11 +1027,11 @@ class RunnerBackend:
         self._authorize_run(run_id, token)
         record = self._record(run_id)
         with self._lock:
-            if record.status in {"completed", "failed", "limited"}:
+            if _record_terminal(record):
                 return {
                     "run_id": record.run_id,
                     "tenant_id": record.tenant_id,
-                    "status": record.status,
+                    **_record_lifecycle_payload(record),
                     "cancel_requested": False,
                     "error": record.error,
                     "error_code": record.error_code,
@@ -992,7 +1045,7 @@ class RunnerBackend:
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
-            "status": record.status,
+            **_record_lifecycle_payload(record),
             "cancel_requested": True,
             "error": record.error,
             "error_code": record.error_code,
@@ -1007,14 +1060,14 @@ class RunnerBackend:
         record = self._record(run_id)
         with self._lock:
             loop = record.loop
-            terminal = record.status in {"completed", "failed", "limited"}
+            terminal = _record_terminal(record)
         requested = not terminal and loop is not None
         if requested:
             loop.interrupt_turn()
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
-            "status": record.status,
+            **_record_lifecycle_payload(record),
             "interrupt_requested": requested,
         }
 
@@ -1027,14 +1080,14 @@ class RunnerBackend:
         record = self._record(run_id)
         with self._lock:
             loop = record.loop
-            terminal = record.status in {"completed", "failed", "limited"}
+            terminal = _record_terminal(record)
         requested = not terminal and loop is not None
         if requested:
             loop.pause_turn()
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
-            "status": record.status,
+            **_record_lifecycle_payload(record),
             "pause_requested": requested,
         }
 
@@ -1046,12 +1099,12 @@ class RunnerBackend:
         self._authorize_run(run_id, token)
         record = self._record(run_id)
         with self._lock:
-            terminal = record.status in {"completed", "failed", "limited"}
+            terminal = _record_terminal(record)
         if terminal:
-            return {"run_id": run_id, "status": record.status, "resumed": False}
+            return {"run_id": run_id, **_record_lifecycle_payload(record), "resumed": False}
         # asyncio.Queue is not thread-safe; schedule the put on the shared loop.
         self._call_soon(record.message_queue.put_nowait, _RESUME_SESSION)
-        return {"run_id": run_id, "status": record.status, "resumed": True}
+        return {"run_id": run_id, **_record_lifecycle_payload(record), "resumed": True}
 
     def revoke_capability(
         self,
@@ -1072,7 +1125,7 @@ class RunnerBackend:
         record = self._record(run_id)
         with self._lock:
             loop = record.loop
-            terminal = record.status in {"completed", "failed", "limited"}
+            terminal = _record_terminal(record)
         summary: dict[str, Any] = {}
         revoked = not terminal and loop is not None
         if revoked:
@@ -1082,7 +1135,7 @@ class RunnerBackend:
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
-            "status": record.status,
+            **_record_lifecycle_payload(record),
             "revoked": revoked,
             **summary,
         }
@@ -1247,7 +1300,7 @@ class RunnerBackend:
             loop = self._authorize_active_loop(run_id, token)
             # Seed the throwaway facade with the record's authoritative FSM state (the backend
             # drives the loop directly, so the facade's own cache never tracked this run).
-            session = LoopSession(loop, _state=self._record(run_id).session_state)
+            session = LoopSession(loop, _state=self._record(run_id).state)
             if ctype == "inspect":
                 inspection = session.inspect()
                 return ok(inspection.to_json(), state=inspection.state.value)
@@ -1347,8 +1400,11 @@ class RunnerBackend:
         if record is not None:
             if loop is not None and loop.emit_external_event(event_type, data=data, level=level):
                 return
-            direct_append_allowed = _RUN_EVENT_SEQUENCER.is_queued_before_recorder(record.status)
-            if not direct_append_allowed and _RUN_EVENT_SEQUENCER.requires_live_sequence_owner(record.status):
+            direct_append_allowed = _RUN_EVENT_SEQUENCER.is_queued_before_recorder(record.state)
+            if not direct_append_allowed and _RUN_EVENT_SEQUENCER.requires_live_sequence_owner(
+                record.state,
+                terminal=record.terminal,
+            ):
                 return
         if not run_dir.exists():
             return
@@ -1447,7 +1503,7 @@ class RunnerBackend:
         if wire_bytes > self.max_message_bytes:
             raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
         with self._lock:
-            if record.status in {"completed", "failed", "limited"}:
+            if _record_terminal(record):
                 raise ValueError("cannot send a message to a terminal run")
             if record.message_queue.qsize() >= self.max_message_queue_depth:
                 raise ValueError("message queue is full; retry once the run drains it")
@@ -1504,7 +1560,7 @@ class RunnerBackend:
         )
         record = self._record(run_id)
         with self._lock:
-            if record.status in {"completed", "failed", "limited"}:
+            if _record_terminal(record):
                 raise ValueError("cannot update runtime config for a terminal run")
             current_version = record.runtime_config.config_version if record.runtime_config else 0
             if expected_version != current_version:
@@ -1608,7 +1664,7 @@ class RunnerBackend:
     def _active_loop(self, run_id: str) -> AgentLoop:
         record = self._record(run_id)
         with self._lock:
-            if record.status in {"completed", "failed", "limited"}:
+            if _record_terminal(record):
                 raise ValueError("cannot drive tasks for a terminal run")
             loop = record.loop
         if loop is None:
@@ -1632,7 +1688,7 @@ class RunnerBackend:
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
-            "status": record.status,
+            **_record_lifecycle_payload(record),
             **file_payload,
         }
 
@@ -1896,37 +1952,37 @@ class RunnerBackend:
             record.last_event_seq = event.seq
             record.last_event_type = event.type
             if event.type == "run.started":
-                record.status = "running"
+                _set_record_state(record, SessionState.RUNNING, terminal=False)
                 record.started_at = time.time()
             elif event.type == "run.awaiting_input":
                 # Parked waiting for the next user message or a hosted-task result.
-                if record.status not in {"completed", "failed", "limited"}:
-                    record.status = "awaiting_input"
+                if not _record_terminal(record):
+                    _set_record_state(record, SessionState.AWAITING_INPUT, terminal=False)
             elif event.type in {"run.resumed", "model.turn.started"}:
-                if record.status == "awaiting_input":
-                    record.status = "running"
+                if record.state is SessionState.AWAITING_INPUT:
+                    _set_record_state(record, SessionState.RUNNING, terminal=False)
             elif event.type == "run.finished":
                 # Record terminal metadata, but DO NOT flip the gating status here. The
                 # run.finished event fires inside loop.close() (on the loop's thread), while
                 # record.result is only set afterward by _record_run_result on the worker
-                # thread. Setting status="completed" here would let wait_for_run/result()
-                # observe a terminal status before the result is recorded (result() would
-                # KeyError on final_text). _record_run_result owns the terminal status so it
-                # flips together with record.result, under the same lock.
+                # thread. Marking the run terminal here would let wait_for_run/result() observe
+                # terminal lifecycle before the result is recorded (result() would KeyError on
+                # final_text). _record_run_result owns terminal lifecycle so it flips together
+                # with record.result, under the same lock.
                 record.finished_at = time.time()
                 record.error = str(event.data.get("error") or "")
                 record.error_code = str(event.data.get("error_code") or "")
             elif event.type == "run.failed":
-                record.status = "failed"
+                _set_record_state(record, SessionState.FAILED, terminal=True)
                 record.error = str(event.data.get("error") or "")
                 record.error_code = str(event.data.get("error_code") or "")
 
-    def wait_for_run(self, run_id: str, *, timeout_s: float = 10.0) -> BackendRunState:
+    def wait_for_run(self, run_id: str, *, timeout_s: float = 10.0) -> SessionState:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            status = self._record(run_id).status
-            if status in {"completed", "failed", "limited"}:
-                return status
+            record = self._record(run_id)
+            if _record_terminal(record):
+                return record.state
             time.sleep(0.05)
         raise TimeoutError(f"run did not finish before timeout: {run_id}")
 
@@ -1967,7 +2023,11 @@ class RunnerBackend:
         while True:
             # Keep the authoritative FSM state on the record current with each park, so a
             # concurrent control inspect/health reports the live state.
-            record.session_state = state_from_suspension(suspension)
+            _set_record_state(
+                record,
+                state_from_suspension(suspension),
+                terminal=suspension.reason == "terminal",
+            )
             if suspension.turn is not None:
                 # Capture the settled turn's validated output so status() can surface it live.
                 record.last_final_output = suspension.turn.final_output
@@ -2218,7 +2278,7 @@ class RunnerBackend:
         make a redelivery a no-op. Dropped if the run is terminal (no consumer) or its queue is full
         (best-effort). Runs on the shared loop, so the queue put needs no cross-thread marshaling."""
         ack_id = f"ack_{request.id}"
-        if record.status in {"completed", "failed", "limited"}:
+        if _record_terminal(record):
             return  # terminal run — no consumer for the ack (documented limitation)
         if ack_id in record.seen_inbox_ids or record.message_queue.qsize() >= self.max_message_queue_depth:
             return
@@ -2408,9 +2468,11 @@ class RunnerBackend:
         with self._lock:
             record = self._records[run_id]
             record.result = result
-            record.status = result.status
-            # Reconcile the terminal BackendRunState onto the FSM (cancel -> CANCELLED).
-            record.session_state = to_session_state(result.status, error_code=result.error_code)
+            _set_record_state(
+                record,
+                session_state_from_run_status(result.status, error_code=result.error_code, terminal=True),
+                terminal=True,
+            )
             record.error = result.error
             record.error_code = result.error_code
             record.finished_at = time.time()
@@ -2419,11 +2481,11 @@ class RunnerBackend:
             )
 
     def _record_run_failure(self, run_id: str, exc: Exception) -> None:
-        # Durable failure mark FIRST — before the in-memory status flips to a terminal
+        # Durable failure mark FIRST — before the in-memory lifecycle flips to terminal
         # value. A worker-level crash that bypassed the loop's own bundle would otherwise
         # leave no failure.json, and the restart scanner would treat the run as merely
         # parked and resume it into a crash loop. Writing the bundle before the terminal
-        # status also closes the race where an observer sees ``failed`` but no bundle yet.
+        # state also closes the race where an observer sees ``failed`` but no bundle yet.
         # ``overwrite=False`` preserves the loop's richer bundle when it already wrote one.
         # There is still no auto-recovery: the bundle is purely an operator restore aid.
         self._write_failure_bundle(
@@ -2436,7 +2498,7 @@ class RunnerBackend:
         )
         with self._lock:
             record = self._records[run_id]
-            record.status = "failed"
+            _set_record_state(record, SessionState.FAILED, terminal=True)
             record.error = str(exc)
             record.error_code = getattr(exc, "error_code", "internal_error")
             record.finished_at = time.time()
@@ -2635,7 +2697,7 @@ class RunnerBackend:
         :meth:`_authorize_run` → :meth:`_record`, which raises ``KeyError`` for a run not currently
         in memory. ``resume_run`` materializes that record from the durable checkpoint so a follow-up
         :meth:`send_message` works after a restart. Idempotent: a run already tracked in memory
-        returns ``resumed=False`` with its current status. The run token is the capability; its
+        returns ``resumed=False`` with its current lifecycle state. The run token is the capability; its
         claims are checked against the persisted ``run.json`` identity since there is no record yet.
         """
         claims = self._verify_run_token(run_id, token)
@@ -2644,7 +2706,7 @@ class RunnerBackend:
         if existing is not None:
             if claims.tenant_id != existing.tenant_id or claims.user_id != existing.user_id:
                 raise PermissionDenied("token subject mismatch")
-            return {"run_id": run_id, "status": existing.status, "resumed": False}
+            return {"run_id": run_id, **_record_lifecycle_payload(existing), "resumed": False}
         if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
             raise PermissionDenied("invalid run id")
         run_dir = self.run_root / run_id
@@ -2663,7 +2725,7 @@ class RunnerBackend:
             # _attempt_resume bumps the durable attempt counter / writes failure.json at the cap.
             raise ValueError("resume failed; inspect run logs / failure.json")
         record = self._record(run_id)
-        return {"run_id": run_id, "status": record.status, "resumed": True}
+        return {"run_id": run_id, **_record_lifecycle_payload(record), "resumed": True}
 
     # --- Active watchdog / lease (operational layer; the core never auto-recovers) -------
 
@@ -2703,14 +2765,13 @@ class RunnerBackend:
         arrived is dispatched even if its run is otherwise idle). Runs on the watchdog thread but
         marshals the actual drain onto the shared loop via ``_call_soon`` (the loop and its ``_outbox``
         are single-threaded on that loop; ``_drain_outbox`` itself filters to due requests)."""
-        terminal = {"completed", "failed", "limited"}
         with self._lock:
             live = [
                 (record, record.loop)
                 for record in self._records.values()
                 if record.loop is not None
                 and record.outbox_sender is not None
-                and record.status not in terminal
+                and not _record_terminal(record)
             ]
         for record, loop in live:
             self._call_soon(self._drain_outbox, record, loop)
@@ -2721,7 +2782,7 @@ class RunnerBackend:
             items = list(self._records.items())
         for run_id, record in items:
             try:
-                if record.status in {"completed", "failed", "limited"}:
+                if _record_terminal(record):
                     # Terminal: drop the lease so no watchdog ever reclaims a finished run.
                     self.lease_store.release(run_id)
                 else:
@@ -2807,7 +2868,8 @@ class RunnerBackend:
             user_id=request.user_id,
             workspace_root=workspace_root,
             run_dir=run_dir,
-            status="awaiting_input",
+            state=SessionState.AWAITING_INPUT,
+            terminal=False,
             created_at=time.time(),
             run_token_sha256="",  # the client still holds its run token (verified cryptographically)
             llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
@@ -2960,7 +3022,7 @@ class RunnerBackend:
 
         A trusted-host call (no token, like :meth:`recover_runs`): the embedder owns the run_root
         and is responsible for tenant scoping. Reads each run.json (skipping subagent child runs,
-        which have none) for identity + title + created_at, takes the live status from an
+        which have none) for identity + title + created_at, takes the live state from an
         in-memory record when present else status.json, and mints a fresh read-scoped run token
         per entry so the caller can fetch events/status afterwards (mirrors submit_run returning a
         run token). ``recoverable`` flags a parked run a restart can resume via recover_runs."""
@@ -2983,15 +3045,17 @@ class RunnerBackend:
             with self._lock:
                 record = self._records.get(run_id)
             if record is not None:
-                status = record.status
+                lifecycle = _record_lifecycle_payload(record)
             else:
-                status = "ended"
+                status_payload: dict[str, Any] | None = None
                 status_path = run_dir / "status.json"
                 if status_path.exists():
                     try:
-                        status = json.loads(read_text_resilient(status_path)).get("status", "ended")
+                        payload = json.loads(read_text_resilient(status_path))
+                        status_payload = payload if isinstance(payload, dict) else None
                     except (ValueError, OSError):
-                        pass
+                        status_payload = None
+                lifecycle = _status_payload_lifecycle(status_payload, run_dir)
             recoverable = False
             if record is None and not (run_dir / "failure.json").exists() and self.checkpoint_store is not None:
                 stored = self.checkpoint_store.latest(run_id)
@@ -3003,7 +3067,7 @@ class RunnerBackend:
                     "user_id": run_user,
                     "title": meta.get("title") or "",
                     "created_at": meta.get("created_at") or 0.0,
-                    "status": status,
+                    **lifecycle,
                     "recoverable": recoverable,
                     "read_token": self.token_manager.issue(
                         kind="run_access",

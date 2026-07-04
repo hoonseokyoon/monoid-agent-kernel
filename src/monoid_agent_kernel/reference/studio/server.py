@@ -1063,7 +1063,7 @@ class StudioServer:
                 },
             )
         self._remember_run_profile(submission.run_id, profile_id)
-        return {"run_id": submission.run_id, "status": submission.status}
+        return {"run_id": submission.run_id, "state": submission.state.value, "terminal": submission.terminal}
 
     # --- A2A demo (agent-to-agent durable messaging) ------------------------------------
 
@@ -1201,7 +1201,8 @@ class StudioServer:
                 {
                     "run_id": run["run_id"],
                     "title": run["title"] or run["run_id"],
-                    "status": run["status"],
+                    "state": run["state"],
+                    "terminal": bool(run.get("terminal")),
                     "created_at": run["created_at"],
                     "recoverable": run["recoverable"],
                     "profile_id": run_profile,
@@ -1216,7 +1217,8 @@ class StudioServer:
                 {
                     "run_id": s["run_id"],
                     "title": s["title"],
-                    "status": "running",
+                    "state": "running",
+                    "terminal": False,
                     "created_at": s["created_at"],
                     "recoverable": False,
                     "profile_id": run_profile,
@@ -1545,9 +1547,6 @@ class StudioServer:
         return token
 
 
-_TERMINAL = {"completed", "failed", "limited"}
-
-
 def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
     class StudioHandler(BaseHTTPRequestHandler):
         server_version = "MonoidStudio/0.1"
@@ -1810,9 +1809,17 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     else:
                         idle += 0.25
                     # Stop once the run is terminal and we've drained its events.
-                    status = studio.run_status(run_id).get("status")
-                    if status in _TERMINAL and not events:
-                        self._sse_send({"type": "studio.stream.end", "data": {"status": status}})
+                    lifecycle = studio.run_status(run_id)
+                    if lifecycle.get("terminal") and not events:
+                        self._sse_send(
+                            {
+                                "type": "studio.stream.end",
+                                "data": {
+                                    "state": lifecycle.get("state"),
+                                    "terminal": True,
+                                },
+                            }
+                        )
                         return
                     if idle >= 15.0:  # heartbeat so proxies/clients keep the stream open
                         self._sse_comment("keep-alive")

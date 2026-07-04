@@ -46,7 +46,7 @@ def test_studio_surfaces_turn_failed_without_terminating(tmp_path: Path) -> None
         assert failed["data"]["http_status"] == 400
         assert failed["data"]["retryable"] is False
         # The session is NOT terminal — a follow-up is accepted (this is the whole point).
-        assert server.run_status(run_id)["status"] not in {"completed", "failed", "limited"}
+        assert server.run_status(run_id)["terminal"] is False
         server.continue_chat(run_id, "try again")
         assert _wait_settled(server, run_id, 1)  # the resend settles
     finally:
@@ -68,10 +68,10 @@ def test_studio_cancel_terminates_run(studio: StudioServer) -> None:
     studio.cancel_chat(run_id)  # the Stop button path: cancel is run-level
     deadline = time.time() + 10
     while time.time() < deadline:
-        if studio.run_status(run_id)["status"] in {"completed", "failed", "limited"}:
+        if studio.run_status(run_id)["terminal"]:
             break
         time.sleep(0.1)
-    assert studio.run_status(run_id)["status"] in {"completed", "failed", "limited"}
+    assert studio.run_status(run_id)["terminal"] is True
 
 
 def test_studio_interrupt_keeps_session_alive(tmp_path: Path) -> None:
@@ -93,12 +93,12 @@ def test_studio_interrupt_keeps_session_alive(tmp_path: Path) -> None:
         # The run parks (awaiting_input) — interrupt must NOT terminalize it.
         deadline = time.time() + 10
         while time.time() < deadline:
-            status = server.run_status(run_id)["status"]
-            if status == "awaiting_input":
+            state = server.run_status(run_id)["state"]
+            if state == "awaiting_input":
                 break
-            assert status not in {"completed", "failed", "limited"}, "interrupt terminalized the run"
+            assert server.run_status(run_id)["terminal"] is False, "interrupt terminalized the run"
             time.sleep(0.05)
-        assert server.run_status(run_id)["status"] == "awaiting_input"
+        assert server.run_status(run_id)["state"] == "awaiting_input"
         events = server.poll_events(run_id, 0).get("events", [])
         assert any(e.get("type") == "turn.interrupted" for e in events)
         # The session is alive: a follow-up message settles.
@@ -222,9 +222,10 @@ def test_studio_sessions_lists_started_chats_newest_first(studio: StudioServer) 
     sessions = studio.sessions()["sessions"]
     assert [s["title"] for s in sessions[:2]] == ["second task", "first task"]  # newest first
     assert {r1, r2} <= {s["run_id"] for s in sessions}
-    # each entry carries a live status (active multi-turn sessions are not terminal)
+    # each entry carries a live state (active multi-turn sessions are not terminal)
     by_id = {s["run_id"]: s for s in sessions}
-    assert by_id[r1]["status"] not in {"completed", "failed", "limited"}
+    assert by_id[r1]["terminal"] is False
+    assert by_id[r1]["state"] == "awaiting_input"
 
 
 def test_studio_profiles_scope_session_history(studio: StudioServer) -> None:

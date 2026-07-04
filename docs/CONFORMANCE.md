@@ -47,7 +47,7 @@ optional external-agent envelope profile for runtimes that exchange messages wit
 
 The conformance package defines five Protocol families:
 
-- `BackendHarness`: submits runs, inspects status/events/diagnostics/results, dispatches control
+- `BackendHarness`: submits runs, inspects lifecycle state/events/diagnostics/results, dispatches control
   commands, replaces runtime config, resumes runs, and restarts against durable state.
 - `SideEffectHarness`: runs durable side-effect behavior cases for the optional side-effect profile.
 - `MessageFabricHarness`: runs external-agent message-fabric behavior cases for the optional
@@ -79,7 +79,7 @@ should run the smaller profiles directly with their own harnesses.
 ## Testing Policy
 
 Conformance assertions are deterministic behavior checks. They run against harness protocols and
-named Reference cases, then assert observable results such as events, status, diagnostics,
+named Reference cases, then assert observable results such as events, lifecycle state, diagnostics,
 outbox/inbox state, and public payloads.
 
 Hypothesis property tests target pure helpers, parsers, and serializers. Use them for JSON-native

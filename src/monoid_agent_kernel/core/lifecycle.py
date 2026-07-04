@@ -3,9 +3,8 @@
 ``AgentLoop`` is the engine; an embedder (Agent Cell / Daemon) should be able to
 *control* a session without importing the loop's internals. This module provides:
 
-- ``SessionState`` — the formal lifecycle FSM (the single state vocabulary that the
-  four ad-hoc ones — ``Suspension.reason``, ``status.json``, ``project_run_status``,
-  and the backend's ``BackendRunState`` — fold onto; that reconciliation is staged).
+- ``SessionState`` — the formal lifecycle FSM. Backend lifecycle payloads expose this
+  vocabulary as ``state`` plus a separate ``terminal`` boolean.
 - ``state_from_suspension`` — the projection core: how a pump ``Suspension`` maps to a
   state. This is what keeps the FSM in sync with the engine without the engine knowing
   about the FSM.
@@ -126,15 +125,20 @@ TERMINAL_STATES: frozenset[SessionState] = frozenset(
 )
 
 
-#: Maps the ad-hoc status strings the four legacy vocabularies emit — ``BackendRunState``,
-#: ``status.json`` (StatusJsonSink), and ``project_run_status`` — onto the one ``SessionState``.
-#: ``Suspension.reason`` has its own richer projection in :func:`state_from_suspension`.
+#: Maps legacy lifecycle status strings from older backend payloads and ``status.json`` onto the
+#: one ``SessionState``. ``Suspension.reason`` has its own richer projection in
+#: :func:`state_from_suspension`.
 _STATUS_STRING_TO_STATE: dict[str, SessionState] = {
     "queued": SessionState.CREATED,
+    "created": SessionState.CREATED,
+    "idle": SessionState.IDLE,
     "running": SessionState.RUNNING,
     "awaiting_input": SessionState.AWAITING_INPUT,
+    "awaiting_tasks": SessionState.AWAITING_TASKS,
     "waiting_for_background_jobs": SessionState.AWAITING_TASKS,
     "paused": SessionState.PAUSED,
+    "interrupted": SessionState.INTERRUPTED,
+    "turn_failed": SessionState.TURN_FAILED,
     "completed": SessionState.COMPLETED,
     "failed": SessionState.FAILED,
     "limited": SessionState.LIMITED,
@@ -142,14 +146,34 @@ _STATUS_STRING_TO_STATE: dict[str, SessionState] = {
 }
 
 
-def to_session_state(status: str, *, error_code: str = "") -> SessionState:
-    """Reconcile a legacy status string (from ``BackendRunState`` / ``status.json`` /
-    ``project_run_status``) onto a :class:`SessionState`. A ``"limited"`` status with
-    ``error_code="cancelled"`` folds to ``CANCELLED`` (the backend records cancel that way).
-    Unknown strings fall back to ``CREATED`` rather than raising — the projection is advisory."""
+def session_state_value(state: SessionState | str) -> str:
+    """Return the canonical wire value for a lifecycle state."""
+    return state.value if isinstance(state, SessionState) else SessionState(str(state)).value
+
+
+def session_state_from_run_status(
+    status: str | SessionState,
+    *,
+    error_code: str = "",
+    terminal: bool = False,
+) -> SessionState:
+    """Project run lifecycle strings onto :class:`SessionState`.
+
+    ``status`` may be an existing ``SessionState`` value or one of the legacy lifecycle status
+    strings read from ``status.json`` / older backend payloads. ``terminal`` disambiguates the
+    public lifecycle payload, but ``SessionState.LIMITED`` remains the vocabulary value for both a
+    live budget-limited park and a terminal limited result.
+    """
+    if isinstance(status, SessionState):
+        return status
     if error_code == "cancelled" and status in {"limited", "failed"}:
         return SessionState.CANCELLED
-    return _STATUS_STRING_TO_STATE.get(status, SessionState.CREATED)
+    return _STATUS_STRING_TO_STATE.get(str(status), SessionState.CREATED)
+
+
+def to_session_state(status: str, *, error_code: str = "") -> SessionState:
+    """Compatibility wrapper for legacy status readers."""
+    return session_state_from_run_status(status, error_code=error_code)
 
 
 def can_transition(src: SessionState, dst: SessionState) -> bool:

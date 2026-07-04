@@ -113,13 +113,13 @@ def test_duplicate_message_id_is_processed_once(tmp_path: Path) -> None:
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
 
     # First send with a stable id is accepted and processed (the run takes a turn, parks again).
     first = backend.send_message(run_id, token, content="go", message_id="m1")
     assert first["status"] == "queued"
     assert eventually(lambda: "m1" in backend._record(run_id).seen_inbox_ids)
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
 
     # Re-sending the same id is an idempotent no-op — no second turn.
     dup = backend.send_message(run_id, token, content="go", message_id="m1")
@@ -146,7 +146,7 @@ def test_send_message_propagates_trace_context_onto_envelope(tmp_path: Path) -> 
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
 
     # Capture the enqueued envelope synchronously (the parked run would otherwise consume + unwrap it
     # before the test thread could read the queue). _call_soon receives the to_json() dict verbatim.
@@ -181,7 +181,7 @@ def test_message_without_id_gets_a_generated_envelope_id(tmp_path: Path) -> None
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
     result = backend.send_message(run_id, token, content="go")
     assert result["status"] == "queued"
     assert result["message_id"].startswith("inbox_")  # the edge minted one

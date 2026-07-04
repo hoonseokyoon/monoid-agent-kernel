@@ -314,9 +314,10 @@ monoid job cancel <job_id> --run <run_id>
 > Reference example (`monoid_agent_kernel.reference.backend`). Build production backends against
 > the contracts in [docs/CONTRACTS.md](docs/CONTRACTS.md).
 
-The reference backend issues run tokens, starts kernel runs, and exposes status,
-result, event, and tenant usage APIs. It still uses the keyless gateway model
-provider. Provider API keys stay outside the Monoid backend.
+The reference backend issues run tokens, starts kernel runs, and exposes lifecycle,
+result, event, and tenant usage APIs. Lifecycle payloads use `state` plus `terminal`;
+ready result payloads keep `status` for the terminal `AgentRunResult.status`.
+Provider API keys stay outside the Monoid backend.
 
 Start a local LLM gateway. This process is the provider-credential boundary:
 
@@ -439,6 +440,10 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/jobs/$JOB_ID/logs?stream=stdout
 ```
 
+`/status` returns lifecycle state, for example `{"state":"running","terminal":false}`.
+`/result` returns `ready=false` with lifecycle state while a run is open; when `ready=true`,
+its `status` field is the terminal result status (`completed`, `failed`, or `limited`).
+
 Tenant usage is admin-scoped:
 
 ```bash
@@ -480,7 +485,7 @@ Each run writes:
 
 - `events.jsonl`: public redacted event stream
 - `transcript.jsonl`: private debug/replay transcript with full tool payloads
-- `status.json`: latest run status for polling
+- `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`)
 - `metrics.json`: final counters and timing
 - `manifest.json`: run contract, agent config metadata, binding-aware tool surface, workspace backend
 - `workspace.base.json`: base snapshot used for proposal comparison

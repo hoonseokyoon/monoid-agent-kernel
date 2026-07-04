@@ -56,7 +56,7 @@ def test_send_message_forwards_multimodal_image_by_reference(tmp_path: Path) -> 
     )
     run_id, token = submission.run_id, submission.run_token
 
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input", timeout_s=20)
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input", timeout_s=20)
 
     # Deliver a multimodal follow-up: a workspace image reference + a text part.
     backend.send_message(
@@ -118,7 +118,7 @@ def test_send_message_inline_media_is_blobified_before_queue(tmp_path: Path) -> 
     )
     run_id, token = submission.run_id, submission.run_token
 
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input", timeout_s=20)
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input", timeout_s=20)
 
     data_uri = "data:image/png;base64," + base64.b64encode(_PNG_1x1).decode()
     backend.send_message(run_id, token, [TextPart("look"), ImagePart(source_ref=data_uri, mime_type="image/png")])

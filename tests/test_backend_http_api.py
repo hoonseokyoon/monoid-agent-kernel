@@ -96,10 +96,14 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
         )
         run_id = created["run_id"]
         run_token = created["run_token"]
-        assert backend.wait_for_run(run_id, timeout_s=5) == "completed"
+        assert backend.wait_for_run(run_id, timeout_s=5).value == "completed"
         status = _json_get(f"{base_url}/v1/runs/{run_id}/status", token=run_token)
-        assert status["status"] == "completed"
+        assert status["state"] == "completed"
+        assert status["terminal"] is True
+        assert "status" not in status
         result = _json_get(f"{base_url}/v1/runs/{run_id}/result", token=run_token)
+        assert result["state"] == "completed"
+        assert result["terminal"] is True
         assert result["final_text"] == "done"
         events = _json_get(f"{base_url}/v1/runs/{run_id}/events?from_seq=1", token=run_token)
         assert events["events"][0]["seq"] == 1
@@ -124,7 +128,8 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
             },
         )
         diagnostics = _json_get(f"{base_url}/v1/runs/{run_id}/diagnostics?event_limit=1", token=run_token)
-        assert diagnostics["status"]["status"] == "completed"
+        assert diagnostics["status"]["state"] == "completed"
+        assert diagnostics["status"]["terminal"] is True
         assert [event["seq"] for event in diagnostics["events"]["items"]] == [trace_event.seq]
         assert diagnostics["events"]["next_seq"] >= diagnostics["events"]["from_seq"]
         assert diagnostics["failure"] is None
@@ -245,8 +250,10 @@ def test_backend_http_cancel_marks_run_limited_with_code(tmp_path: Path) -> None
         cancelled = _json_request(f"{base_url}/v1/runs/{run_id}/cancel", {}, token=run_token)
         assert cancelled["cancel_requested"] is True
         release.set()  # let the turn return; the loop then observes the cancel
-        assert backend.wait_for_run(run_id, timeout_s=10) == "limited"
+        assert backend.wait_for_run(run_id, timeout_s=10).value == "cancelled"
         status = _json_get(f"{base_url}/v1/runs/{run_id}/status", token=run_token)
+        assert status["state"] == "cancelled"
+        assert status["terminal"] is True
         assert status["error_code"] == "cancelled"
     finally:
         release.set()
@@ -280,7 +287,7 @@ def test_backend_http_multi_turn_messages_and_task_endpoints(tmp_path: Path) -> 
         run_id, run_token = created["run_id"], created["run_token"]
 
         # First turn settles -> the session parks awaiting the next user message.
-        assert eventually(lambda: backend._record(run_id).status == "awaiting_input", timeout_s=20)
+        assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input", timeout_s=20)
 
         # A follow-up message is threaded as a second user turn.
         queued = _json_request(f"{base_url}/v1/runs/{run_id}/messages", {"content": "again"}, token=run_token)
@@ -293,7 +300,7 @@ def test_backend_http_multi_turn_messages_and_task_endpoints(tmp_path: Path) -> 
         assert "hello" in instructions and "again" in instructions
 
         # Create an automation task -> scoped callback token + URL.
-        assert eventually(lambda: backend._record(run_id).status == "awaiting_input", timeout_s=20)
+        assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input", timeout_s=20)
         task = _json_request(
             f"{base_url}/v1/runs/{run_id}/tasks",
             {"kind": "automation", "request": {"description": "call external system"}},
@@ -320,7 +327,8 @@ def test_backend_http_multi_turn_messages_and_task_endpoints(tmp_path: Path) -> 
         assert done.get("delivered") is True
 
         _json_request(f"{base_url}/v1/runs/{run_id}/cancel", {}, token=run_token)
-        assert backend.wait_for_run(run_id, timeout_s=20) in {"completed", "limited", "failed"}
+        backend.wait_for_run(run_id, timeout_s=20)
+        assert backend._record(run_id).terminal is True
     finally:
         server.shutdown()
         server.server_close()

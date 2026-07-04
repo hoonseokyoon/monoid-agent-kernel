@@ -30,6 +30,7 @@ from support.backend_harness import (
     time,
     tool_binding,
 )
+from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 pytestmark = pytest.mark.integration
@@ -57,7 +58,7 @@ def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) ->
 
     def _drain() -> None:
         for _ in range(1000):
-            if backend._record(run_id).status in {"completed", "failed", "limited"}:
+            if backend._record(run_id).terminal:
                 return
             for task in _running_hitl_tasks(backend, run_id):
                 try:
@@ -71,7 +72,7 @@ def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) ->
     status = backend.wait_for_run(run_id, timeout_s=20)
     responder.join(timeout=5)
 
-    assert status == "completed"
+    assert status is SessionState.COMPLETED
     hitl_obs = [
         obs
         for adapter in adapters
@@ -109,7 +110,7 @@ def test_backend_task_result_checkpoint_preserves_queued_messages(tmp_path: Path
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
     assert eventually(lambda: bool(_running_hitl_tasks(backend, run_id)))
     task = _running_hitl_tasks(backend, run_id)[0]
 
@@ -357,7 +358,7 @@ def test_backend_create_task_injects_into_running_run(tmp_path: Path) -> None:
 
     def _drain() -> None:
         for _ in range(1000):
-            if backend._record(run_id).status in {"completed", "failed", "limited"}:
+            if backend._record(run_id).terminal:
                 return
             running = _running_hitl_tasks(backend, run_id)
             # Once the model's task is parked, inject a backend-initiated task too.
@@ -378,7 +379,7 @@ def test_backend_create_task_injects_into_running_run(tmp_path: Path) -> None:
     status = backend.wait_for_run(run_id, timeout_s=20)
     responder.join(timeout=5)
 
-    assert status == "completed"
+    assert status is SessionState.COMPLETED
     assert created.get("task_id"), "backend-initiated create_task did not return a task id"
     hitl_obs = [
         obs
@@ -409,7 +410,7 @@ def test_backend_multi_turn_session_threads_two_user_messages(tmp_path: Path) ->
     run_id, token = submission.run_id, submission.run_token
 
     # First turn settles -> session parks awaiting the next user message.
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
 
     backend.send_message(run_id, token, content="again")
     # The follow-up message reaches the model as a second user turn.
@@ -417,7 +418,7 @@ def test_backend_multi_turn_session_threads_two_user_messages(tmp_path: Path) ->
 
     backend.cancel_run(run_id, token)  # stop the open session
     status = backend.wait_for_run(run_id, timeout_s=20)
-    assert status in {"completed", "limited", "failed"}
+    assert status in {SessionState.COMPLETED, SessionState.LIMITED, SessionState.FAILED}
 
     instructions = [r.instruction for a in adapters for r in a.requests if r.instruction]
     assert "hello" in instructions
@@ -491,10 +492,10 @@ def test_backend_drain_ends_parked_multi_turn_sessions(tmp_path: Path) -> None:
     )
     run_id = submission.run_id
 
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
     pending = backend.drain(timeout_s=20)
     assert pending == []
-    assert backend._record(run_id).status in {"completed", "failed", "limited"}
+    assert backend._record(run_id).terminal is True
 
 
 def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
@@ -595,9 +596,10 @@ def test_backend_submits_run_issues_tokens_and_returns_usage(tmp_path: Path) -> 
         )
     )
 
-    assert backend.wait_for_run(submission.run_id, timeout_s=5) == "completed"
+    assert backend.wait_for_run(submission.run_id, timeout_s=5) is SessionState.COMPLETED
     status = backend.status(submission.run_id, submission.run_token)
-    assert status["status"] == "completed"
+    assert status["state"] == "completed"
+    assert status["terminal"] is True
     result = backend.result(submission.run_id, submission.run_token)
     assert result["final_text"] == "done"
     assert result["metrics"]["total_tokens"] == 10
@@ -639,7 +641,7 @@ def test_backend_permission_policy_reaches_manifest_and_execution(tmp_path: Path
         )
     )
 
-    assert backend.wait_for_run(submission.run_id, timeout_s=5) == "completed"
+    assert backend.wait_for_run(submission.run_id, timeout_s=5) is SessionState.COMPLETED
     manifest = json.loads(submission.run_dir.joinpath("manifest.json").read_text(encoding="utf-8"))
     assert manifest["permission_policy"] == {"deny_patterns": [".env"], "redact_patterns": [".env"]}
     events = backend.events(submission.run_id, submission.run_token)["events"]
@@ -724,7 +726,7 @@ def test_backend_shell_binding_auto_approves_without_provider_env_leak(
         )
     )
 
-    assert backend.wait_for_run(submission.run_id, timeout_s=5) == "completed"
+    assert backend.wait_for_run(submission.run_id, timeout_s=5) is SessionState.COMPLETED
     assert submission.run_dir.joinpath("proposal", "files", "BACKEND.md").read_text(encoding="utf-8") == "None"
     run_text = "\n".join(path.read_text(encoding="utf-8") for path in submission.run_dir.rglob("*.json*"))
     assert "provider-secret" not in run_text
@@ -835,8 +837,9 @@ def test_backend_bounds_concurrent_runs(tmp_path: Path) -> None:
     assert started.wait(5)  # A entered its adapter and holds the only slot
     second = _submit("B")
     # B is blocked on the concurrency semaphore before its adapter; it cannot progress.
-    assert backend._record(second.run_id).status == "queued"
+    assert backend._record(second.run_id).state is SessionState.CREATED
+    assert backend._record(second.run_id).terminal is False
 
     release.set()
-    assert backend.wait_for_run(first.run_id, timeout_s=10) == "completed"
-    assert backend.wait_for_run(second.run_id, timeout_s=10) == "completed"
+    assert backend.wait_for_run(first.run_id, timeout_s=10) is SessionState.COMPLETED
+    assert backend.wait_for_run(second.run_id, timeout_s=10) is SessionState.COMPLETED

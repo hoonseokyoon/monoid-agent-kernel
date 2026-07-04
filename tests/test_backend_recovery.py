@@ -32,6 +32,7 @@ from support.backend_harness import (
     write_json_atomic,
 )
 from monoid_agent_kernel.reference.backend.service import _read_run_meta
+from monoid_agent_kernel.core.lifecycle import SessionState
 
 pytestmark = pytest.mark.integration
 
@@ -150,7 +151,7 @@ def test_backend_recovers_parked_hitl_run_from_checkpoint(tmp_path: Path) -> Non
     # Deliver the human answer to the recovered run -> it resumes and completes.
     def _drain() -> None:
         for _ in range(1000):
-            if backend2._record(run_id).status in {"completed", "failed", "limited"}:
+            if backend2._record(run_id).terminal:
                 return
             for task in _running_hitl_tasks(backend2, run_id):
                 try:
@@ -164,7 +165,7 @@ def test_backend_recovers_parked_hitl_run_from_checkpoint(tmp_path: Path) -> Non
     status = backend2.wait_for_run(run_id, timeout_s=20)
     responder.join(timeout=5)
 
-    assert status == "completed"
+    assert status is SessionState.COMPLETED
     hitl_obs = [
         obs
         for adapter in resumed
@@ -205,7 +206,7 @@ def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> No
     )
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
-    assert eventually(lambda: backend1._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
 
     # Process 2: a fresh backend (empty _records). send_message would KeyError; resume_run
     # materializes the record from the checkpoint, then the follow-up threads a second turn.
@@ -230,7 +231,11 @@ def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> No
     assert eventually(lambda: len([r for a in resumed for r in a.requests if r.instruction]) >= 1)
 
     backend2.cancel_run(run_id, token)
-    assert backend2.wait_for_run(run_id, timeout_s=20) in {"completed", "limited", "failed"}
+    assert backend2.wait_for_run(run_id, timeout_s=20) in {
+        SessionState.COMPLETED,
+        SessionState.LIMITED,
+        SessionState.FAILED,
+    }
     instructions = [r.instruction for a in resumed for r in a.requests if r.instruction]
     assert "again" in instructions
     backend1.cancel_run(run_id, token)  # stop the defunct first-process worker
@@ -264,7 +269,7 @@ def test_resume_run_uses_latest_runtime_config_after_hotswap(tmp_path: Path) -> 
     )
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
-    assert eventually(lambda: backend1._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
 
     replacement = runtime_config(
         version=2,
@@ -346,7 +351,7 @@ def test_backend_worker_failure_writes_failure_bundle(tmp_path: Path) -> None:
         )
     )
     run_id = submission.run_id
-    assert backend.wait_for_run(run_id, timeout_s=10) == "failed"
+    assert backend.wait_for_run(run_id, timeout_s=10) is SessionState.FAILED
 
     failure_path = run_root / run_id / "failure.json"
     assert failure_path.exists()
@@ -355,7 +360,8 @@ def test_backend_worker_failure_writes_failure_bundle(tmp_path: Path) -> None:
     assert failure["type"] == "RuntimeError"
     assert "last_good_seq" in failure
     diagnostics = backend.diagnostics(run_id, submission.run_token)
-    assert diagnostics["status"]["status"] == "failed"
+    assert diagnostics["status"]["state"] == "failed"
+    assert diagnostics["status"]["terminal"] is True
     assert diagnostics["failure"]["type"] == "RuntimeError"
     assert diagnostics["recovery"]["failure_marked"] is True
     assert diagnostics["events"]["items"] == []
@@ -699,7 +705,7 @@ def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) 
     submission = _submit_multi_turn(backend1, workspace)  # instruction "hi"
     run_id = submission.run_id
     try:
-        assert eventually(lambda: backend1._record(run_id).status == "awaiting_input", timeout_s=20)
+        assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT, timeout_s=20)
     finally:
         backend1.cancel_run(run_id, submission.run_token)
         backend1.wait_for_run(run_id, timeout_s=20)
@@ -719,7 +725,10 @@ def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) 
     # historical event read with no live record
     events = backend2.events(run_id, token)["events"]
     assert any(e.get("type") == "turn.settled" for e in events)
-    assert "status" in backend2.status(run_id, token)
+    historical_status = backend2.status(run_id, token)
+    assert historical_status["state"] == "completed"
+    assert historical_status["terminal"] is True
+    assert "status" not in historical_status
     # tenant scoping
     assert backend2.list_runs("nobody")["runs"] == []
     # auth: a bad token, and a path-traversal run id, are rejected

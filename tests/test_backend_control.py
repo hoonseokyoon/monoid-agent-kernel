@@ -69,7 +69,7 @@ def _parked_multi_turn_run(backend: RunnerBackend, workspace: Path) -> tuple[str
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
     return run_id, token
 
 
@@ -439,7 +439,7 @@ def test_http_control_route_dispatches_inspect(tmp_path: Path) -> None:
             token="admin",
         )
         run_id, run_token = created["run_id"], created["run_token"]
-        assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+        assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
 
         result = http_json(
             f"{base_url}/v1/runs/{run_id}/control",
@@ -750,7 +750,7 @@ def test_dispatch_revoke_capability_blocks_subsequent_call(tmp_path: Path) -> No
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
     assert provider.calls == 1  # the tool ran on the granted lease
 
     revoke = _dispatch(backend, run_id, token, "revoke_capability", capability="web.search")
@@ -760,7 +760,7 @@ def test_dispatch_revoke_capability_blocks_subsequent_call(tmp_path: Path) -> No
 
     # A follow-up message re-issues the gated call; revocation refuses it (no re-broker).
     backend.send_message(run_id, token, content="again")
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
     assert provider.calls == 1  # still 1 — the gated tool stayed blocked after revocation
 
     backend.cancel_run(run_id, token)
@@ -806,13 +806,13 @@ def test_driver_pauses_mid_turn_then_resumes_to_settle(tmp_path: Path) -> None:
     release.set()
 
     # The loop hits the next step boundary, raises TurnPaused; the driver parks the run PAUSED.
-    assert eventually(lambda: backend._record(run_id).session_state == SessionState.PAUSED)
+    assert eventually(lambda: backend._record(run_id).state is SessionState.PAUSED)
     inspect = _dispatch(backend, run_id, token, "inspect")
     assert inspect.state == "paused"
 
     # Resume re-pumps the SAME turn (the gate observation is re-sent) to settle.
     assert _dispatch(backend, run_id, token, "resume").data["resumed"] is True
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
 
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)

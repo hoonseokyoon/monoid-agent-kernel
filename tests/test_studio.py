@@ -250,13 +250,13 @@ def test_multi_turn_session_yields_a_reply_per_message(studio: StudioServer) -> 
     studio.continue_chat(run_id, "third")
     assert len(_wait_settled(studio, run_id, 3)) == 3
     # The session stays open for the next message rather than going terminal.
-    assert studio.run_status(run_id)["status"] not in {"completed", "failed", "limited"}
+    assert studio.run_status(run_id)["terminal"] is False
 
 
 def test_run_tokens_are_not_exposed_to_callers(studio: StudioServer) -> None:
-    # The BFF holds run tokens server-side; start_chat returns only the run id + status.
+    # The BFF holds run tokens server-side; start_chat returns only lifecycle metadata.
     result = studio.start_chat("hello")
-    assert set(result) == {"run_id", "status"}
+    assert set(result) == {"run_id", "state", "terminal"}
     assert "run_token" not in result
 
 

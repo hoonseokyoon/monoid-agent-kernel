@@ -165,15 +165,15 @@ def test_continue_chat_resumes_a_parked_session_after_restart(tmp_path: Path) ->
         run_id = server.start_chat("hello")["run_id"]
         _wait_settled(server, run_id, 1)
 
-        def _await_status(target: str, timeout: float = 10.0) -> bool:
+        def _await_state(target: str, timeout: float = 10.0) -> bool:
             deadline = time.time() + timeout
             while time.time() < deadline:
-                if server.run_status(run_id).get("status") == target:
+                if server.run_status(run_id).get("state") == target:
                     return True
                 time.sleep(0.05)
             return False
 
-        assert _await_status("awaiting_input")
+        assert _await_state("awaiting_input")
 
         # Simulate a restart: drop the in-memory record. A bare send_message would now KeyError;
         # continue_chat must resume from the durable checkpoint first.
