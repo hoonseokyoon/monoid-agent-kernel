@@ -109,9 +109,11 @@ then merge `provider.tool_bindings()` into the runtime config. The CLI does the 
 ```bash
 monoid run \
   --workspace examples/workspaces/edit_markdown_notes \
+  --runtime-config-file examples/runtime-config.json \
   --instruction "Use polite-summary on notes.md." \
   --skills-directory tmp-skills
 ```
 
-The command uses the configured model provider for `monoid run`. The offline snippets above
-verify the skill directory, frontmatter, activation tool, and resource reader without a model.
+Use your generated runtime config in place of `examples/runtime-config.json` when running a
+custom profile. The offline snippets above verify the skill directory, frontmatter, activation
+tool, and resource reader without a model.
