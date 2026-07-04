@@ -95,7 +95,7 @@ from monoid_agent_kernel.identifiers import (
     namespaced_id,
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
-from monoid_agent_kernel.reference.backend.commands import BackendCommandService
+from monoid_agent_kernel.reference.backend.commands import BackendCommandContext, BackendCommandService
 from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
@@ -638,7 +638,28 @@ class RunnerBackend:
         self._session_boundary = BackendSessionService(
             self, close_signal=_CLOSE_SESSION, resume_signal=_RESUME_SESSION
         )
-        self._commands = BackendCommandService(self)
+        self._commands = BackendCommandService(
+            BackendCommandContext(
+                emit_control_audit_event=self._emit_control_audit_event,
+                verify_run_token=self._verify_run_token,
+                verify_task_callback_token=self._verify_task_callback_token,
+                authorize_claim_subject=self._authorize_claim_subject,
+                is_live_run=self._is_live_run,
+                active_loop_session=self._active_loop_session,
+                pause_run=self.pause_run,
+                signal_resume=self.signal_resume,
+                resume_run=self.resume_run,
+                cancel_run=self.cancel_run,
+                interrupt_turn=self.interrupt_turn,
+                report_task_result=self.report_task_result,
+                send_message=self.send_message,
+                create_task=self.create_task,
+                revoke_capability=self.revoke_capability,
+                status=self.status,
+                runtime_config=self.runtime_config,
+                replace_runtime_config=self.replace_runtime_config,
+            )
+        )
 
     def _session_drive_limits(self) -> SessionDriveLimits:
         return SessionDriveLimits(
@@ -667,6 +688,15 @@ class RunnerBackend:
             user_id=user_id,
             ttl_s=self.run_token_ttl_s,
         )
+
+    def _is_live_run(self, run_id: str) -> bool:
+        with self._lock:
+            return run_id in self._records
+
+    def _active_loop_session(self, run_id: str, token: str) -> tuple[AgentLoop, SessionState]:
+        loop = self._session_boundary.authorize_active_loop(run_id, token)
+        record = self._record(run_id)
+        return loop, record.state
 
     # --- Shared event loop (coroutine-per-run) ------------------------------------------
 

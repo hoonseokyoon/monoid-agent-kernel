@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
@@ -15,14 +17,35 @@ from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManage
 _CONTROL_AUDIT_POLICY = ControlAuditPolicy()
 
 
+@dataclass(frozen=True)
+class BackendCommandContext:
+    emit_control_audit_event: Callable[..., None]
+    verify_run_token: Callable[[str, str], Any]
+    verify_task_callback_token: Callable[[str, str, str], None]
+    authorize_claim_subject: Callable[[str, Any], None]
+    is_live_run: Callable[[str], bool]
+    active_loop_session: Callable[[str, str], tuple[Any, Any]]
+    pause_run: Callable[[str, str], dict[str, Any]]
+    signal_resume: Callable[[str, str], dict[str, Any]]
+    resume_run: Callable[[str, str], dict[str, Any]]
+    cancel_run: Callable[[str, str], dict[str, Any]]
+    interrupt_turn: Callable[[str, str], dict[str, Any]]
+    report_task_result: Callable[..., dict[str, Any]]
+    send_message: Callable[..., dict[str, Any]]
+    create_task: Callable[..., dict[str, Any]]
+    revoke_capability: Callable[..., dict[str, Any]]
+    status: Callable[[str, str], dict[str, Any]]
+    runtime_config: Callable[[str, str], dict[str, Any]]
+    replace_runtime_config: Callable[..., dict[str, Any]]
+
+
 class BackendCommandService:
     """Control command dispatch for the RunnerBackend facade."""
 
-    def __init__(self, backend: Any) -> None:
-        self._backend = backend
+    def __init__(self, context: BackendCommandContext) -> None:
+        self._context = context
 
     def dispatch(self, command: ControlCommand) -> ControlResult:
-        backend = self._backend
         args = dict(command.args)
         token = str(args.pop("token", "") or "")
         run_id = command.run_id
@@ -36,7 +59,7 @@ class BackendCommandService:
         try:
             self.authorize_control_audit_target(run_id, token, command_type=ctype, args=args)
             audit_authorized = True
-            backend._emit_control_audit_event(
+            self._context.emit_control_audit_event(
                 run_id,
                 "control.command.received",
                 _CONTROL_AUDIT_POLICY.received_payload(
@@ -58,7 +81,7 @@ class BackendCommandService:
             )
         except PermissionDenied as exc:
             if audit_authorized:
-                backend._emit_control_audit_event(
+                self._context.emit_control_audit_event(
                     run_id,
                     "control.command.failed",
                     _CONTROL_AUDIT_POLICY.failed_payload(
@@ -91,7 +114,7 @@ class BackendCommandService:
 
         duration_ms = (time.time() - started) * 1000
         if result.status == "ok":
-            backend._emit_control_audit_event(
+            self._context.emit_control_audit_event(
                 run_id,
                 "control.command.completed",
                 _CONTROL_AUDIT_POLICY.completed_payload(
@@ -108,7 +131,7 @@ class BackendCommandService:
                 ),
             )
         else:
-            backend._emit_control_audit_event(
+            self._context.emit_control_audit_event(
                 run_id,
                 "control.command.failed",
                 _CONTROL_AUDIT_POLICY.failed_payload(
@@ -135,7 +158,6 @@ class BackendCommandService:
         token: str,
         command_id: str,
     ) -> ControlResult:
-        backend = self._backend
         run_id = command.run_id
         ctype = command.type
 
@@ -143,13 +165,15 @@ class BackendCommandService:
             return ControlResult(run_id=run_id, type=ctype, status="ok", state=state, data=dict(data))
 
         if ctype == "pause":
-            return ok(backend.pause_run(run_id, token))
+            return ok(self._context.pause_run(run_id, token))
         if ctype == "resume":
-            with backend._lock:
-                live = run_id in backend._records
-            return ok(backend.signal_resume(run_id, token) if live else backend.resume_run(run_id, token))
+            return ok(
+                self._context.signal_resume(run_id, token)
+                if self._context.is_live_run(run_id)
+                else self._context.resume_run(run_id, token)
+            )
         if ctype == "cancel":
-            return ok(backend.cancel_run(run_id, token))
+            return ok(self._context.cancel_run(run_id, token))
         if ctype in {"approve", "deny"}:
             result = args.get("result") if isinstance(args.get("result"), dict) else {}
             approval_result = dict(result)
@@ -163,7 +187,7 @@ class BackendCommandService:
                     reason=command.reason or str(args.get("reason") or approval_result.get("reason") or "denied"),
                 )
             return ok(
-                backend.report_task_result(
+                self._context.report_task_result(
                     run_id,
                     token,
                     task_id=str(args.get("task_id") or ""),
@@ -172,22 +196,22 @@ class BackendCommandService:
                 )
             )
         if ctype == "interrupt":
-            return ok(backend.interrupt_turn(run_id, token))
+            return ok(self._context.interrupt_turn(run_id, token))
         if ctype in {"inspect", "health"}:
-            loop = backend._authorize_active_loop(run_id, token)
-            session = LoopSession(loop, _state=backend._record(run_id).state)
+            loop, state = self._context.active_loop_session(run_id, token)
+            session = LoopSession(loop, _state=state)
             if ctype == "inspect":
                 inspection = session.inspect()
                 return ok(inspection.to_json(), state=inspection.state.value)
             health = session.health()
             return ok(health.to_json(), state=health.state.value)
         if ctype == "status":
-            return ok(backend.status(run_id, token))
+            return ok(self._context.status(run_id, token))
         if ctype == "runtime_config":
-            return ok(backend.runtime_config(run_id, token))
+            return ok(self._context.runtime_config(run_id, token))
         if ctype == "replace_runtime_config":
             return ok(
-                backend.replace_runtime_config(
+                self._context.replace_runtime_config(
                     run_id,
                     token,
                     expected_version=int(args.get("expected_version", 0)),
@@ -198,7 +222,7 @@ class BackendCommandService:
             )
         if ctype == "send_message":
             return ok(
-                backend.send_message(
+                self._context.send_message(
                     run_id,
                     token,
                     content=args.get("content") or "",
@@ -208,7 +232,7 @@ class BackendCommandService:
             )
         if ctype == "create_task":
             return ok(
-                backend.create_task(
+                self._context.create_task(
                     run_id,
                     token,
                     kind=str(args.get("kind") or ""),
@@ -217,7 +241,7 @@ class BackendCommandService:
             )
         if ctype == "report_task_result":
             return ok(
-                backend.report_task_result(
+                self._context.report_task_result(
                     run_id,
                     token,
                     task_id=str(args.get("task_id") or ""),
@@ -228,7 +252,7 @@ class BackendCommandService:
         if ctype == "revoke_capability":
             before = args.get("before")
             return ok(
-                backend.revoke_capability(
+                self._context.revoke_capability(
                     run_id,
                     token,
                     capability=(str(args["capability"]) if args.get("capability") else None),
@@ -253,14 +277,13 @@ class BackendCommandService:
         command_type: str = "",
         args: dict[str, Any] | None = None,
     ) -> None:
-        backend = self._backend
         if _CONTROL_AUDIT_POLICY.accepts_callback_token(command_type):
             try:
-                backend._session_boundary.verify_task_callback_token(
+                self._context.verify_task_callback_token(
                     run_id, token, str((args or {}).get("task_id") or "")
                 )
                 return
             except TokenError:
                 pass
-        claims = backend._verify_run_token(run_id, token)
-        backend._session_boundary.authorize_claim_subject(run_id, claims)
+        claims = self._context.verify_run_token(run_id, token)
+        self._context.authorize_claim_subject(run_id, claims)
