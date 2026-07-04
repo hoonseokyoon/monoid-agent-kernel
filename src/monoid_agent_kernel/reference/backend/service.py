@@ -487,6 +487,15 @@ class _GatewayTokenSource:
 
 @dataclass
 class RunnerBackend:
+    """Reference backend facade and composition root.
+
+    Public methods stay on this object. Internal services receive explicit context
+    objects, while process-level runtime ownership, loop construction, and the
+    remaining product-specific Reference surfaces stay here until their own
+    extraction step. See docs/RUNNER_BACKEND_RESPONSIBILITY_MAP.md for the current
+    responsibility map.
+    """
+
     run_root: Path
     token_manager: TokenManager
     allowed_workspace_roots: tuple[Path, ...]
@@ -684,6 +693,8 @@ class RunnerBackend:
                 replace_runtime_config=self.replace_runtime_config,
             )
         )
+
+    # --- Internal service context providers --------------------------------------------
 
     def _session_drive_limits(self) -> SessionDriveLimits:
         return SessionDriveLimits(
