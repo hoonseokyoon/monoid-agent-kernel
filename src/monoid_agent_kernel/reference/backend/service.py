@@ -18,7 +18,6 @@ from typing import Any, cast
 from monoid_agent_kernel.core.agents import (
     AgentDefinition,
     AgentRuntimeConfig,
-    RuntimeConfigProvider,
     SubagentDefinition,
     validate_runtime_config,
 )
@@ -62,7 +61,6 @@ from monoid_agent_kernel.core.spec import (
     AgentRunSpec,
     ModelConfig,
     ModelRetryConfig,
-    RunLimits,
     RunMode,
     WorkspaceBackendKind,
 )
@@ -71,16 +69,22 @@ from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelAdapter
-from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCE,
     BACKEND_AUDIENCES,
     TASK_CALLBACK_AUDIENCE,
     TASK_CALLBACK_AUDIENCES,
 )
-from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
+from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManager
 from monoid_agent_kernel.reference.backend.commands import BackendCommandContext, BackendCommandService
 from monoid_agent_kernel.reference.backend.jobs import JobService, JobServiceContext
+from monoid_agent_kernel.reference.backend.loop_factory import (
+    BackendLoopBuild,
+    BackendLoopFactory,
+    BackendLoopFactoryContext,
+    ModelAdapterFactory,
+    _GatewayTokenSource,
+)
 from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
@@ -113,7 +117,6 @@ _CLOSE_SESSION = object()
 # Wakes a paused worker: resume the SAME turn with no new input. Ignored (a no-op) by the other
 # queue-waiting branches, which expect a real user message or _CLOSE_SESSION.
 _RESUME_SESSION = object()
-ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
 
 # Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
 _RUN_META_SCHEMA_VERSION = RUN_METADATA_SCHEMA_VERSION
@@ -299,28 +302,6 @@ class TenantUsage:
         }
 
 
-class BackendRunStateSink:
-    def __init__(self, backend: RunnerBackend, run_id: str) -> None:
-        self._backend = backend
-        self._run_id = run_id
-
-    def emit(self, event: AgentEvent) -> None:
-        self._backend.record_event(self._run_id, event)
-
-    def close(self) -> None:
-        return None
-
-
-class BackendRuntimeConfigProvider(RuntimeConfigProvider):
-    def __init__(self, backend: RunnerBackend, run_id: str) -> None:
-        self._backend = backend
-        self._run_id = run_id
-
-    def current_config(self, run_id: str) -> AgentRuntimeConfig | None:
-        del run_id
-        return self._backend.current_runtime_config(self._run_id)
-
-
 def _backend_builtin_tool_specs(
     subagent_definitions: Mapping[str, SubagentDefinition] | None = None,
     tool_providers: Sequence[Any] = (),
@@ -421,44 +402,6 @@ def _get_shared_loop() -> asyncio.AbstractEventLoop:
             atexit.register(_teardown_loop, loop, thread, executor)
             _shared_loop = loop
         return _shared_loop
-
-
-@dataclass
-class _GatewayTokenSource:
-    """A callable gateway-token source that re-mints shortly before expiry. Resolved per request by
-    the model adapter (``GatewayModelAdapter.token_provider``), so a run that outlives the token TTL
-    stays authenticated without a restart — the same re-mint the recovery path already performs,
-    applied proactively and in-process (the backend holds the signing key). Not thread-safe by design:
-    a run's model calls are serialized on its loop."""
-
-    token_manager: TokenManager
-    kind: TokenKind
-    audience: str
-    run_id: str
-    tenant_id: str
-    user_id: str
-    ttl_s: int
-    metadata: dict[str, Any] = field(default_factory=dict)
-    refresh_skew_s: int = 300
-    _token: str = ""
-    _expires_at: float = 0.0
-
-    def __call__(self) -> str:
-        now = time.time()
-        # Re-mint near expiry; cap the skew at half the TTL so a short TTL doesn't re-mint every call.
-        skew = min(self.refresh_skew_s, self.ttl_s // 2)
-        if not self._token or now >= self._expires_at - skew:
-            self._token = self.token_manager.issue(
-                kind=self.kind,
-                audience=self.audience,
-                run_id=self.run_id,
-                tenant_id=self.tenant_id,
-                user_id=self.user_id,
-                ttl_s=self.ttl_s,
-                metadata=dict(self.metadata),
-            )
-            self._expires_at = now + self.ttl_s
-        return self._token
 
 
 @dataclass
@@ -577,6 +520,7 @@ class RunnerBackend:
     # RNG for the outbox backoff jitter — a dedicated instance so a test can seed it deterministically
     # (backend._outbox_rng.seed(...)) without perturbing global random state.
     _outbox_rng: random.Random = field(default_factory=random.Random, init=False, repr=False)
+    _loop_factory: BackendLoopFactory = field(init=False, repr=False)
     _projection: RunProjectionService = field(init=False, repr=False)
     _proposal: ProposalService = field(init=False, repr=False)
     _runtime_config: RuntimeConfigService = field(init=False, repr=False)
@@ -603,6 +547,7 @@ class RunnerBackend:
             self.checkpoint_store = LocalFsCheckpointStore(self.run_root)
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
+        self._loop_factory = self._build_loop_factory()
         self._projection = self._build_projection_service()
         self._proposal = self._build_proposal_service()
         self._runtime_config = self._build_runtime_config_service()
@@ -614,6 +559,31 @@ class RunnerBackend:
         self._commands = self._build_command_service()
 
     # --- Internal service context providers --------------------------------------------
+
+    def _build_loop_factory(self) -> BackendLoopFactory:
+        return BackendLoopFactory(
+            BackendLoopFactoryContext(
+                run_root_provider=lambda: self.run_root,
+                llm_gateway_url_provider=lambda: self.llm_gateway_url,
+                web_gateway_url_provider=lambda: self.web_gateway_url,
+                model_adapter_factory_provider=lambda: self.model_adapter_factory,
+                token_manager_provider=lambda: self.token_manager,
+                llm_gateway_token_ttl_s_provider=lambda: self.llm_gateway_token_ttl_s,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                emit_output_deltas_provider=lambda: self.emit_output_deltas,
+                extra_event_sink_factories_provider=lambda: self.extra_event_sink_factories,
+                subagent_definitions_provider=lambda: self.subagent_definitions,
+                tool_providers_provider=lambda: self.tool_providers,
+                context_providers_provider=lambda: self.context_providers,
+                output_validators_provider=lambda: self.output_validators,
+                capability_broker_factory_provider=lambda: self.capability_broker_factory,
+                outbox_sender_factory_provider=lambda: self.outbox_sender_factory,
+                current_runtime_config=self.current_runtime_config,
+                record=self._record,
+                record_event=self.record_event,
+                persist_checkpoint_payload=self._persist_run_checkpoint_payload,
+            )
+        )
 
     def _build_projection_service(self) -> RunProjectionService:
         return RunProjectionService(
@@ -678,7 +648,7 @@ class RunnerBackend:
                 make_record=self._recovery_record,
                 issue_llm_gateway_token=self._issue_recovery_llm_gateway_token,
                 issue_web_gateway_token=self._issue_recovery_web_gateway_token,
-                build_loop=self._build_loop,
+                build_loop=self._build_loop_build,
                 register_record=self._register_recovered_record,
                 attach_loop=self._attach_recovered_loop,
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
@@ -875,12 +845,11 @@ class RunnerBackend:
     def _attach_recovered_loop(
         self,
         record: BackendRunRecord,
-        loop: AgentLoop,
-        request: BackendRunRequest,
+        loop_build: BackendLoopBuild,
     ) -> None:
         with self._lock:
-            record.loop = loop
-            record.outbox_sender = self._outbox_sender_for(request)
+            record.loop = loop_build.loop
+            record.outbox_sender = loop_build.outbox_sender
 
     async def _acquire_run_slot(self) -> None:
         if self._run_semaphore is not None:
@@ -1122,25 +1091,7 @@ class RunnerBackend:
         request: BackendRunRequest,
         workspace_root: Path,
     ) -> AgentRunSpec:
-        return AgentRunSpec(
-            workspace_root=workspace_root,
-            run_root=self.run_root,
-            run_id=run_id,
-            mode=request.mode,
-            workspace_backend=request.workspace_backend,
-            limits=RunLimits(
-                max_steps=request.max_steps,
-                max_tool_calls=request.max_tool_calls,
-                max_bytes_read=request.max_bytes_read,
-                max_duration_s=request.max_duration_s,
-            ),
-            permission_policy=request.permission_policy,
-            metadata={
-                **request.metadata,
-                "tenant_id": request.tenant_id,
-                "user_id": request.user_id,
-            },
-        )
+        return self._loop_factory.run_spec_for_request(run_id, request, workspace_root)
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
         return self._projection.status(run_id, token)
@@ -1694,10 +1645,13 @@ class RunnerBackend:
             await self._run_semaphore.acquire()
         try:
             try:
-                loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
+                loop_build = self._build_loop_build(
+                    run_id, request, workspace_root, llm_gateway_token, web_gateway_token
+                )
+                loop = loop_build.loop
                 with self._lock:
                     self._records[run_id].loop = loop
-                    self._records[run_id].outbox_sender = self._outbox_sender_for(request)
+                    self._records[run_id].outbox_sender = loop_build.outbox_sender
                 # Persist the recovery metadata before the first turn so a crash at any park
                 # point can be resumed (the checkpoint itself is written by the driver).
                 self._write_run_meta(self._record(run_id), request)
@@ -1712,16 +1666,28 @@ class RunnerBackend:
     def _capability_broker_for(self, request: BackendRunRequest) -> Any:
         """Build the run's capability broker from the factory (scoped to run identity), or None
         to leave capability gating off for this run."""
-        if self.capability_broker_factory is None:
-            return None
-        return self.capability_broker_factory(request)
+        return self._loop_factory.capability_broker_for(request)
 
     def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
         """Build the run's outbox sender from the factory (scoped to run identity), or None to leave
         staged outbox requests pending (durable, never dispatched)."""
-        if self.outbox_sender_factory is None:
-            return None
-        return self.outbox_sender_factory(request)
+        return self._loop_factory.outbox_sender_for(request)
+
+    def _build_loop_build(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        workspace_root: Path,
+        llm_gateway_token: str,
+        web_gateway_token: str,
+    ) -> BackendLoopBuild:
+        return self._loop_factory.build(
+            run_id,
+            request,
+            workspace_root,
+            llm_gateway_token,
+            web_gateway_token,
+        )
 
     def _build_loop(
         self,
@@ -1732,36 +1698,14 @@ class RunnerBackend:
         web_gateway_token: str,
     ) -> AgentLoop:
         """Construct the run's AgentLoop (shared by autonomous and stream-driven paths)."""
-        spec = self._run_spec_for_request(run_id, request, workspace_root)
-        runtime_config = self.current_runtime_config(run_id)
-        adapter = self._build_model_adapter(
-            spec,
+        return self._loop_factory.build(
+            run_id,
+            request,
+            workspace_root,
             llm_gateway_token,
-            runtime_config.model if runtime_config is not None else None,
-            token_provider=self._llm_token_source(run_id, request, runtime_config),
-        )
-        return AgentLoop(
-            spec=spec,
-            model_adapter=adapter,
-            event_sinks=(BackendRunStateSink(self, run_id), *(make() for make in self.extra_event_sink_factories)),
-            permission_policy=request.permission_policy,
-            cancellation_token=self._record(run_id).cancellation_token,
-            shell_approval_provider=None,
-            web_gateway_client=self._web_gateway_client(web_gateway_token),
-            runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
-            checkpoint_store=self.checkpoint_store,
-            emit_output_deltas=self.emit_output_deltas,
-            subagent_definitions=self.subagent_definitions,
-            tool_providers=self.tool_providers,
-            context_providers=self.context_providers,
-            output_validators=self.output_validators,
-            capability_broker=self._capability_broker_for(request),
-            checkpoint_persist_callback=lambda checkpoint, blobs: self._persist_run_checkpoint_payload(
-                self._record(run_id),
-                checkpoint,
-                blobs,
-            ),
-        )
+            web_gateway_token,
+            include_outbox_sender=False,
+        ).loop
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
         """Stream-driven run: the transport-neutral programmatic seam behind the SSE endpoint.
@@ -1785,12 +1729,13 @@ class RunnerBackend:
         closed = False
         try:
             yield {"kind": "meta", **self._submission_for(prepared).to_json()}
-            loop = self._build_loop(
+            loop_build = self._build_loop_build(
                 run_id, request, prepared.workspace_root, prepared.llm_gateway_token, prepared.web_gateway_token
             )
+            loop = loop_build.loop
             with self._lock:
                 self._records[run_id].loop = loop
-                self._records[run_id].outbox_sender = self._outbox_sender_for(request)
+                self._records[run_id].outbox_sender = loop_build.outbox_sender
             self._write_run_meta(prepared.record, request)
             await loop.aopen()
             suspension: Suspension | None = None
@@ -2066,16 +2011,7 @@ class RunnerBackend:
     ) -> _GatewayTokenSource:
         """A re-minting source for the run's ``llm_gateway`` token (mirrors the eager issue + the
         recovery re-issue), so a long run keeps LLM access past the token TTL without a restart."""
-        return _GatewayTokenSource(
-            token_manager=self.token_manager,
-            kind="llm_gateway",
-            audience="csp.llm-gateway",
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            ttl_s=self.llm_gateway_token_ttl_s,
-            metadata={"agent_config_hash": runtime_config.config_hash} if runtime_config is not None else {},
-        )
+        return self._loop_factory.llm_token_source(run_id, request, runtime_config)
 
     def _build_model_adapter(
         self,
@@ -2084,14 +2020,10 @@ class RunnerBackend:
         model_config: ModelConfig | None,
         token_provider: Callable[[], str | None] | None = None,
     ) -> ModelAdapter:
-        if self.model_adapter_factory is not None:
-            # Custom factories own their credential lifecycle (they get the freshly-minted token
-            # string); the refresh seam applies to the default gateway adapter only.
-            return self.model_adapter_factory(spec, llm_gateway_token)
-        return GatewayModelAdapter(
-            model_config or ModelConfig(),
-            gateway_url=self.llm_gateway_url,
-            token=llm_gateway_token,
+        return self._loop_factory.build_model_adapter(
+            spec,
+            llm_gateway_token,
+            model_config,
             token_provider=token_provider,
         )
 
@@ -2099,9 +2031,7 @@ class RunnerBackend:
         self,
         token: str,
     ) -> WebGatewayClient | None:
-        if not token:
-            return None
-        return WebGatewayClient(self.web_gateway_url, token=token)
+        return self._loop_factory.web_gateway_client(token)
 
     def _validate_request(self, request: BackendRunRequest) -> None:
         if not request.tenant_id.strip():

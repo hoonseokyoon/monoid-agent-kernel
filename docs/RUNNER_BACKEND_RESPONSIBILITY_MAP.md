@@ -17,6 +17,7 @@ uses instead of depending on the whole facade.
 | `BackendCommandService` | Control command dispatch and audit result mapping. |
 | `BackendSessionService` | Session control actions, task callbacks, inbound messages, and `resume_run` entrypoint. |
 | `SessionDriveService` | Open multi-turn session driving, message waits, checkpoint park points. |
+| `BackendLoopFactory` | Reference `AgentLoop` assembly: run spec, model adapter, gateway clients, runtime-config provider, event sinks, capability broker, outbox sender, and checkpoint callback. |
 | `ProposalService` | Reference proposal/package/artifact/approve/reject/apply operations. |
 | `RuntimeConfigService` | Runtime config projection, validation, hot-swap, durable metadata commit. |
 | `JobService` | Reference job artifact list/status/log/cancel projections. |
@@ -36,7 +37,7 @@ run records, run requests, loop operations, token claims, and lease stores.
 | Composition root | `RunnerBackend.__post_init__` creates stores and default leases, then delegates service context wiring to private `_build_*_service` helpers. |
 | Shared runtime ownership | `_spawn`, `_call_soon`, drain/shutdown, shared loop scheduling, semaphore ownership, and stream cancellation stay with the process-level runtime wrapper. |
 | Request admission | `_validate_request`, `_check_workspace_allowed`, initial runtime config validation, gateway token issuance, and initial record creation stay in the facade. |
-| Loop construction | `_build_loop` assembles the Reference `AgentLoop` wiring: model adapter, tool providers, context providers, validators, capability broker, outbox sender, event sinks, and checkpoint callback. |
+| Loop factory wiring | `_build_loop_factory`, `_build_loop_build`, and `_build_loop` stay as facade compatibility and composition-root wrappers around `BackendLoopFactory`. |
 | Run execution entrypoints | `submit_run`, `_run_run`, `_drive_session`, and `astream_run` still coordinate cold-start execution around the loop. |
 | Streaming execution | `astream_run` remains facade-owned because it combines submission metadata, event/delta/result framing, stream lifetime, and semaphore ownership. |
 | Outbox edge dispatch | `_drain_outbox`, `_stage_outbox_ack`, retry backoff, and watchdog redrive stay in the Reference operational edge. |
@@ -56,6 +57,7 @@ The main Reference product-specific surfaces have been moved out of the facade:
 | `RuntimeConfigService` | `current_runtime_config`, `runtime_config`, `replace_runtime_config`, `_write_runtime_config_run_meta`. |
 | `JobService` | `jobs`, `job_status`, `job_logs`, `cancel_job`. |
 | `RecoveryService` | `recover_runs`, `_attempt_resume`, `_resume_from_checkpoint`, `_run_recovered`, recover-attempt helpers, failure bundle helpers, `_read_recovery_meta`, stale lease reclaim. |
+| `BackendLoopFactory` | `_run_spec_for_request`, `_build_loop`, `_build_model_adapter`, `_llm_token_source`, `_web_gateway_client`, `_capability_broker_for`, `_outbox_sender_for`. |
 
 Compatibility wrappers remain on `RunnerBackend` where tests or internal call
 sites use private methods. The implementation now delegates through services.
@@ -66,7 +68,6 @@ sites use private methods. The implementation now delegates through services.
 | --- | --- |
 | Service port typing | Private ports now cover the main internal shapes. Remaining `Any` usage is concentrated in dynamic JSON/tool/provider payloads and test-facing monkeypatch seams. |
 | Composition root size | Service context wiring now lives in `_build_*_service` helpers. Future cleanup should keep each helper small rather than adding wiring back to `__post_init__`. |
-| Loop construction | `_build_loop` is still a large Reference assembly point. It is correctly facade-owned today, but a future `LoopFactory` could make model/tool/provider wiring clearer. |
 | Outbox edge service | Outbox drain/redrive/ack logic is operational edge behavior. It can become a private `OutboxDispatchService` if it grows further. |
 | Event sink/state mutation | `record_event`, `_record_run_result`, `_record_run_failure`, and backend event append remain coherent as live-state ownership. They can be revisited after service port typing is stable. |
 | Streaming path | `astream_run` still owns stream-driven execution. Extract it only after preserving event/result framing with focused tests. |

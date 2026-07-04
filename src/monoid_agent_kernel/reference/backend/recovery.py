@@ -17,6 +17,7 @@ from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference.backend.ports import (
     DriveOpenSessionPort,
     LeaseStorePort,
+    LoopBuildPort,
     LoopPort,
     MutableRunRecordPort,
     RunRequestPort,
@@ -45,9 +46,9 @@ class RecoveryContext:
     ]
     issue_llm_gateway_token: Callable[[str, RunRequestPort, AgentRuntimeConfig], str]
     issue_web_gateway_token: Callable[[str, RunRequestPort, AgentRuntimeConfig], str]
-    build_loop: Callable[[str, RunRequestPort, Path, str, str], LoopPort]
+    build_loop: Callable[[str, RunRequestPort, Path, str, str], LoopBuildPort]
     register_record: Callable[[MutableRunRecordPort], None]
-    attach_loop: Callable[[MutableRunRecordPort, LoopPort, RunRequestPort], None]
+    attach_loop: Callable[[MutableRunRecordPort, LoopBuildPort], None]
     call_soon: Callable[..., None]
     spawn: Callable[[Awaitable[Any]], object]
     drive_open_session: DriveOpenSessionPort
@@ -156,9 +157,10 @@ class RecoveryService:
             meta,
         )
         self._context.register_record(record)
-        loop = self._context.build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
+        loop_build = self._context.build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
+        loop = loop_build.loop
         loop.restore(checkpoint, blobs=stored.blob)
-        self._context.attach_loop(record, loop, request)
+        self._context.attach_loop(record, loop_build)
         record.seen_inbox_ids = set(checkpoint.inbox_seen_ids)
         for message in checkpoint.queued_messages:
             self._context.call_soon(record.message_queue.put_nowait, message)

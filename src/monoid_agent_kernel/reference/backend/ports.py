@@ -74,6 +74,11 @@ class LoopPort(Protocol):
     def restore(self, checkpoint: RunCheckpoint, *, blobs: Mapping[str, bytes]) -> None: ...
 
 
+class LoopBuildPort(Protocol):
+    loop: LoopPort
+    outbox_sender: Any
+
+
 class RunRecordPort(Protocol):
     run_id: str
     tenant_id: str
