@@ -37,22 +37,18 @@ from monoid_agent_kernel.core.durable_metadata import (
 from monoid_agent_kernel.core.event_sequencing import (
     DIRECT_AUDIT_APPEND_STATUSES,
     RunEventSequencer,
-    diagnostic_event_summary,
-    read_event_page,
 )
 from monoid_agent_kernel.core.subagent_runtime import (
-    subagent_diagnostics_from_events,
     validate_descendant_run_id,
 )
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
 from monoid_agent_kernel.core.outbox import OutboxReceipt
-from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
+from monoid_agent_kernel.core.trace_context import new_traceparent
 from monoid_agent_kernel.core.lifecycle import (
     LoopSession,
     SessionState,
-    TERMINAL_STATES,
     session_state_from_run_status,
     session_state_value,
     state_from_suspension,
@@ -64,7 +60,7 @@ from monoid_agent_kernel.core.packages import (
     write_apply_result,
     write_approval,
 )
-from monoid_agent_kernel.core._util import read_text_resilient, write_json_atomic
+from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
     CheckpointStore,
@@ -108,6 +104,13 @@ from monoid_agent_kernel.identifiers import (
     namespaced_id,
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
+from monoid_agent_kernel.reference.backend.projection import (
+    RunProjectionService,
+    _record_lifecycle_payload,
+    _record_terminal,
+    _read_event_page,
+    _set_record_state,
+)
 from monoid_agent_kernel.recorder import append_event_to_run
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.web import WebGatewayClient
@@ -177,37 +180,11 @@ def _runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
     return runtime_config_from_metadata(meta)
 
 
-def _read_event_page(events_path: Path, *, from_seq: int, limit: int | None) -> dict[str, Any]:
-    return read_event_page(events_path, from_seq=from_seq, limit=limit)
-
-
-def _read_optional_json(path: Path) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _diagnostic_event_summary(event: dict[str, Any]) -> dict[str, Any]:
-    return diagnostic_event_summary(event)
-
-
 _DIRECT_AUDIT_APPEND_STATUSES = DIRECT_AUDIT_APPEND_STATUSES
 
 
 def _run_dir_allows_direct_audit_append(run_dir: Path) -> bool:
     return _RUN_EVENT_SEQUENCER.run_dir_allows_direct_append(run_dir)
-
-
-def _trace_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
-    trace_ids: set[str] = set()
-    for event in events:
-        data = event.get("data") if isinstance(event.get("data"), dict) else {}
-        trace_id = trace_id_of(str(data.get("traceparent") or ""))
-        if trace_id:
-            trace_ids.add(trace_id)
-    return sorted(trace_ids)
 
 
 @dataclass(frozen=True)
@@ -272,66 +249,6 @@ class _PreparedRun:
     run_token: str
     llm_gateway_token: str
     web_gateway_token: str
-
-
-def _json_safe(value: Any) -> Any:
-    """Render an output validator's value safe for a JSON wire projection **at any nesting depth**.
-    Round-trips through json with a ``repr`` fallback so a non-serializable value — a Pydantic
-    model, dataclass, or bytes, even nested inside a dict/list — can never 500 the HTTP response
-    when the edge later ``json.dumps`` it."""
-    try:
-        return json.loads(json.dumps(value, default=repr))
-    except (TypeError, ValueError):
-        return repr(value)
-
-
-def _set_record_state(
-    record: BackendRunRecord,
-    state: SessionState | str,
-    *,
-    terminal: bool | None = None,
-) -> None:
-    session_state = session_state_from_run_status(state)
-    record.state = session_state
-    record.terminal = bool(terminal) if terminal is not None else session_state in TERMINAL_STATES
-
-
-def _record_terminal(record: BackendRunRecord) -> bool:
-    return record.terminal or record.state in TERMINAL_STATES
-
-
-def _record_lifecycle_payload(record: BackendRunRecord) -> dict[str, Any]:
-    return {
-        "state": session_state_value(record.state),
-        "terminal": _record_terminal(record),
-    }
-
-
-def _status_payload_lifecycle(
-    status_payload: Mapping[str, Any] | None,
-    run_dir: Path,
-) -> dict[str, Any]:
-    payload = status_payload or {}
-    raw_state = payload.get("state") or payload.get("status")
-    if raw_state:
-        state = session_state_from_run_status(
-            str(raw_state),
-            error_code=str(payload.get("error_code") or ""),
-            terminal=bool(payload.get("terminal")),
-        )
-        terminal = (
-            bool(payload.get("terminal"))
-            if "terminal" in payload
-            else str(raw_state) in {"completed", "failed", "limited", "cancelled"}
-            or state in TERMINAL_STATES
-        )
-    elif (run_dir / "failure.json").exists():
-        state = SessionState.FAILED
-        terminal = True
-    else:
-        state = SessionState.COMPLETED
-        terminal = True
-    return {"state": session_state_value(state), "terminal": terminal}
 
 
 @dataclass
@@ -710,6 +627,7 @@ class RunnerBackend:
     # RNG for the outbox backoff jitter — a dedicated instance so a test can seed it deterministically
     # (backend._outbox_rng.seed(...)) without perturbing global random state.
     _outbox_rng: random.Random = field(default_factory=random.Random, init=False, repr=False)
+    _projection: RunProjectionService = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._worker_id = uuid.uuid4().hex
@@ -728,6 +646,7 @@ class RunnerBackend:
             self.checkpoint_store = LocalFsCheckpointStore(self.run_root)
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
+        self._projection = RunProjectionService(self)
 
     # --- Shared event loop (coroutine-per-run) ------------------------------------------
 
@@ -932,82 +851,10 @@ class RunnerBackend:
         )
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
-        run_dir = self._authorized_run_dir(run_id, token)
-        status_file = run_dir / "status.json"
-        status_payload: dict[str, Any] | None = None
-        if status_file.exists():
-            # Resilient read: the run is concurrently flipping status.json via an atomic
-            # os.replace; on Windows a plain read mid-replace hits a sharing violation. Mirror
-            # the writer's retry (write_json_atomic / _atomic_replace) so the poll closes the race.
-            status_payload = json.loads(read_text_resilient(status_file))
-        with self._lock:
-            record = self._records.get(run_id)
-        if record is None:
-            # Historical run (no live record, e.g. after a restart): report from status.json.
-            return {
-                "run_id": run_id,
-                **_status_payload_lifecycle(status_payload, run_dir),
-                "run_dir": str(run_dir),
-                "status_file": status_payload,
-            }
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "user_id": record.user_id,
-            **_record_lifecycle_payload(record),
-            "created_at": record.created_at,
-            "started_at": record.started_at,
-            "finished_at": record.finished_at,
-            "run_dir": str(record.run_dir),
-            "last_event_seq": record.last_event_seq,
-            "last_event_type": record.last_event_type,
-            "error": record.error,
-            "error_code": record.error_code,
-            # Prefer the live park-point capture; fall back to the terminal result for
-            # stream-driven runs (astream_run) that record an AgentRunResult without ever
-            # passing through _drive_open_session, where last_final_output stays None.
-            "final_output": _json_safe(
-                record.last_final_output
-                if record.last_final_output is not None
-                else (record.result.final_output if record.result is not None else None)
-            ),
-            "status_file": status_payload,
-        }
+        return self._projection.status(run_id, token)
 
     def result(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        if record.result is None:
-            return {
-                "run_id": record.run_id,
-                "tenant_id": record.tenant_id,
-                **_record_lifecycle_payload(record),
-                "ready": False,
-                "error": record.error,
-                "error_code": record.error_code,
-            }
-        result = record.result
-        diff_text = result.diff_path.read_text(encoding="utf-8") if result.diff_path.exists() else ""
-        proposal_payload = self._read_proposal(record)
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            **_record_lifecycle_payload(record),
-            "status": result.status,
-            "ready": True,
-            "final_text": result.final_text,
-            "final_output": _json_safe(result.final_output),
-            "error": result.error,
-            "error_code": result.error_code,
-            "run_dir": str(result.run_dir),
-            "manifest_path": str(result.run_dir / "manifest.json"),
-            "diff_path": str(result.diff_path),
-            "diff": diff_text,
-            "proposal_path": str(result.proposal_path),
-            "proposal": proposal_payload,
-            "artifacts": [artifact.__dict__ for artifact in result.artifacts],
-            "metrics": result.metrics,
-        }
+        return self._projection.result(run_id, token)
 
     def proposal(self, run_id: str, token: str) -> dict[str, Any]:
         self._authorize_run(run_id, token)
@@ -1844,48 +1691,10 @@ class RunnerBackend:
     def events(
         self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
     ) -> dict[str, Any]:
-        events_path = self._authorized_run_dir(run_id, token) / "events.jsonl"
-        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
-        return {"run_id": run_id, **page}
+        return self._projection.events(run_id, token, from_seq=from_seq, limit=limit)
 
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
-        if event_limit < 1:
-            raise ValueError("event_limit must be positive")
-        run_dir = self._authorized_run_dir(run_id, token)
-        status = self.status(run_id, token)
-        status_file = status.get("status_file") if isinstance(status.get("status_file"), dict) else {}
-        from_seq = _RUN_EVENT_SEQUENCER.diagnostics_from_seq(
-            status,
-            status_file,
-            event_limit=event_limit,
-        )
-        event_page = _read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=event_limit)
-        event_summaries = [_diagnostic_event_summary(event) for event in event_page["events"]]
-        control_events = [
-            event for event in event_summaries if str(event.get("type") or "").startswith("control.command.")
-        ]
-        failure = _read_optional_json(run_dir / "failure.json")
-        recover_attempts = self._read_recover_attempts(run_dir)
-        return {
-            "run_id": run_id,
-            "status": status,
-            "failure": failure,
-            "recovery": {
-                "attempts": recover_attempts,
-                "max_attempts": self.max_recover_attempts,
-                "failure_marked": failure is not None,
-                "unrecoverable": bool(failure and failure.get("error_code") == "unrecoverable"),
-            },
-            "events": {
-                "from_seq": from_seq,
-                "next_seq": event_page["next_seq"],
-                "has_more": event_page["has_more"],
-                "items": event_summaries,
-            },
-            "control": {"events": control_events},
-            "subagents": subagent_diagnostics_from_events(event_page["events"]),
-            "trace_ids": _trace_ids_from_events(event_page["events"]),
-        }
+        return self._projection.diagnostics(run_id, token, event_limit=event_limit)
 
     def descendant_events(
         self,
@@ -3034,69 +2843,7 @@ class RunnerBackend:
     def list_runs(
         self, tenant_id: str, *, user_id: str | None = None, limit: int = 100
     ) -> dict[str, Any]:
-        """List a tenant's runs from ``run_root`` (newest first) — the durable history.
-
-        A trusted-host call (no token, like :meth:`recover_runs`): the embedder owns the run_root
-        and is responsible for tenant scoping. Reads each run.json (skipping subagent child runs,
-        which have none) for identity + title + created_at, takes the live state from an
-        in-memory record when present else status.json, and mints a fresh read-scoped run token
-        per entry so the caller can fetch events/status afterwards (mirrors submit_run returning a
-        run token). ``recoverable`` flags a parked run a restart can resume via recover_runs."""
-        runs: list[dict[str, Any]] = []
-        if not self.run_root.is_dir():
-            return {"runs": runs}
-        metadata_committer = DurableMetadataCommitter(self.checkpoint_store)
-        for run_dir in self.run_root.iterdir():
-            if not run_dir.is_dir():
-                continue
-            meta = metadata_committer.read_recovery_metadata(run_dir, run_dir.name)
-            if meta is None:
-                continue
-            if meta.get("tenant_id") != tenant_id:
-                continue
-            run_user = meta.get("user_id") or ""
-            if user_id is not None and run_user != user_id:
-                continue
-            run_id = meta.get("run_id") or run_dir.name
-            with self._lock:
-                record = self._records.get(run_id)
-            if record is not None:
-                lifecycle = _record_lifecycle_payload(record)
-            else:
-                status_payload: dict[str, Any] | None = None
-                status_path = run_dir / "status.json"
-                if status_path.exists():
-                    try:
-                        payload = json.loads(read_text_resilient(status_path))
-                        status_payload = payload if isinstance(payload, dict) else None
-                    except (ValueError, OSError):
-                        status_payload = None
-                lifecycle = _status_payload_lifecycle(status_payload, run_dir)
-            recoverable = False
-            if record is None and not (run_dir / "failure.json").exists() and self.checkpoint_store is not None:
-                stored = self.checkpoint_store.latest(run_id)
-                recoverable = stored is not None and not stored.checkpoint.terminal
-            runs.append(
-                {
-                    "run_id": run_id,
-                    "tenant_id": tenant_id,
-                    "user_id": run_user,
-                    "title": meta.get("title") or "",
-                    "created_at": meta.get("created_at") or 0.0,
-                    **lifecycle,
-                    "recoverable": recoverable,
-                    "read_token": self.token_manager.issue(
-                        kind="run_access",
-                        audience=BACKEND_AUDIENCE,
-                        run_id=run_id,
-                        tenant_id=tenant_id,
-                        user_id=run_user,
-                        ttl_s=self.run_token_ttl_s,
-                    ),
-                }
-            )
-        runs.sort(key=lambda entry: entry["created_at"], reverse=True)
-        return {"runs": runs[:limit]}
+        return self._projection.list_runs(tenant_id, user_id=user_id, limit=limit)
 
     def _record(self, run_id: str) -> BackendRunRecord:
         with self._lock:
