@@ -14,6 +14,7 @@ from monoid_agent_kernel.core.event_sequencing import (
 from monoid_agent_kernel.core.lifecycle import (
     TERMINAL_STATES,
     SessionState,
+    lifecycle_from_status_artifact,
     session_state_from_run_status,
     session_state_value,
 )
@@ -84,26 +85,10 @@ def _status_payload_lifecycle(
     status_payload: Mapping[str, Any] | None,
     run_dir: Path,
 ) -> dict[str, Any]:
-    payload = status_payload or {}
-    raw_state = payload.get("state") or payload.get("status")
-    if raw_state:
-        state = session_state_from_run_status(
-            str(raw_state),
-            error_code=str(payload.get("error_code") or ""),
-            terminal=bool(payload.get("terminal")),
-        )
-        terminal = (
-            bool(payload.get("terminal"))
-            if "terminal" in payload
-            else str(raw_state) in {"completed", "failed", "limited", "cancelled"}
-            or state in TERMINAL_STATES
-        )
-    elif (run_dir / "failure.json").exists():
-        state = SessionState.FAILED
-        terminal = True
-    else:
-        state = SessionState.CREATED
-        terminal = False
+    state, terminal = lifecycle_from_status_artifact(
+        status_payload,
+        failure_present=(run_dir / "failure.json").exists(),
+    )
     return {"state": session_state_value(state), "terminal": terminal}
 
 
