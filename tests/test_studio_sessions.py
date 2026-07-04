@@ -230,6 +230,7 @@ def test_studio_sessions_lists_started_chats_newest_first(studio: StudioServer) 
 def test_studio_profiles_scope_session_history(studio: StudioServer) -> None:
     profiles = studio.profiles()
     assert profiles["default_profile_id"] == "default"
+    assert "run_update_plan tool" in profiles["system_prompt_base"]
     assert {"default", "reviewer", "builder"} <= {p["id"] for p in profiles["profiles"]}
 
     default_run = studio.start_chat("default task", profile_id="default")["run_id"]

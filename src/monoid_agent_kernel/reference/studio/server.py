@@ -568,6 +568,7 @@ class StudioServer:
         return {
             "profiles": list(self._profiles_by_id().values()),
             "default_profile_id": _DEFAULT_PROFILE_ID,
+            "system_prompt_base": _SYSTEM_PROMPT,
             "available_capabilities": [
                 {"key": cap, "label": labels[cap]} for cap in self._available_capabilities()
             ],
