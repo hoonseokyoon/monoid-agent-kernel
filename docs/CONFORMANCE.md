@@ -29,13 +29,13 @@ profiles against the shipped implementation.
 | Profile | Assertion helpers | Harnesses |
 | --- | --- | --- |
 | `provider-gateway` | `assert_provider_gateway_profile` | `GatewayHarness` |
-| `tool-agent` | `assert_tool_agent_surface_admission_profile`; `assert_tool_agent_generic_ask_approval_profile` | `BackendHarness` |
+| `tool-agent` | `assert_tool_agent_surface_admission_profile`; `assert_tool_agent_generic_ask_approval_profile` | `ToolAgentHarness` |
 | `side-effect-tool-agent` | `assert_side_effect_tool_agent_profile` | `SideEffectHarness` |
 | `message-fabric` | `assert_message_fabric_profile` | `MessageFabricHarness` |
 | `capability-security` | `assert_capability_security_lease_admission`; `assert_capability_security_revocation_profile` | `CapabilityHarness` |
-| `control-plane` | `assert_control_plane_decision_profile`; `assert_control_plane_audit_sequence_profile` | `BackendHarness` |
-| `durable-runner` | `assert_durable_runner_event_sequence_profile`; `assert_durable_runner_recovery_metadata_profile`; `assert_durable_runner_subagent_diagnostics_profile` | `BackendHarness` |
-| `multi-agent` | `assert_multi_agent_backend_boundary_profile`; `assert_multi_agent_backend_capability_boundary_profile`; `assert_multi_agent_shared_revocation_profile` | `BackendHarness`; `CapabilityHarness` |
+| `control-plane` | `assert_control_plane_decision_profile`; `assert_control_plane_audit_sequence_profile` | `ControlPlaneHarness` |
+| `durable-runner` | `assert_durable_runner_event_sequence_profile`; `assert_durable_runner_recovery_metadata_profile`; `assert_durable_runner_subagent_diagnostics_profile` | `DurableRunnerHarness` |
+| `multi-agent` | `assert_multi_agent_backend_boundary_profile`; `assert_multi_agent_backend_capability_boundary_profile`; `assert_multi_agent_shared_revocation_profile` | `MultiAgentBackendHarness`; `CapabilityHarness` |
 | `reference-full` | `assert_reference_full_profile` | `ReferenceFullFactory` with backend, capability, gateway, side-effect, message-fabric, and Studio harnesses |
 
 `minimal-agent` remains a registered metadata profile. `tool-agent` is executable for tool surface
@@ -45,10 +45,12 @@ optional external-agent envelope profile for runtimes that exchange messages wit
 
 ## Harness Roles
 
-The conformance package defines five Protocol families:
+The conformance package defines profile-specific Protocol families:
 
-- `BackendHarness`: submits runs, inspects lifecycle state/events/diagnostics/results, dispatches control
-  commands, replaces runtime config, resumes runs, and restarts against durable state.
+- `ToolAgentHarness`: runs tool surface admission and generic approval behavior cases.
+- `ControlPlaneHarness`: runs decision and control audit sequencing behavior cases.
+- `DurableRunnerHarness`: runs event sequence, recovery metadata, and subagent diagnostics cases.
+- `MultiAgentBackendHarness`: runs backend-visible subagent boundary and capability-boundary cases.
 - `SideEffectHarness`: runs durable side-effect behavior cases for the optional side-effect profile.
 - `MessageFabricHarness`: runs external-agent message-fabric behavior cases for the optional
   message-fabric profile.
@@ -56,6 +58,8 @@ The conformance package defines five Protocol families:
   outcomes.
 - `CapabilityHarness`: issues capability requests, grants, denials, revocations, callback-token
   results, and child-vault checks.
+- `BackendHarness`: raw backend operations kept for compatibility and custom harnesses. New generic
+  profile assertions use the narrower Protocols above.
 
 The bundled Reference implementation is the first harness target. External backends can implement
 the same harness protocols and run the same profile suite.
@@ -64,10 +68,10 @@ the same harness protocols and run the same profile suite.
 
 The `reference-full` profile runs the bundled Reference implementation through the concrete current
 profile set. It uses
-`monoid_agent_kernel.reference.conformance.ReferenceConformanceFactory` to create a fresh backend,
-capability, gateway, side-effect, or message-fabric harness for each assertion. The factory also
-runs an offline Studio smoke path that boots Studio, starts a chat, observes events, and confirms
-session visibility.
+`monoid_agent_kernel.reference.conformance.ReferenceConformanceFactory` to create fresh
+profile-specific backend harnesses, capability harnesses, gateway harnesses, side-effect harnesses,
+and message-fabric harnesses. The factory also runs an offline Studio smoke path that boots Studio,
+starts a chat, observes events, and confirms session visibility.
 
 Reference harnesses use named scenarios internally. Those scenario names are fixture details for
 the bundled implementation. External implementations satisfy conformance by returning the same
@@ -79,8 +83,9 @@ should run the smaller profiles directly with their own harnesses.
 ## Testing Policy
 
 Conformance assertions are deterministic behavior checks. They run against harness protocols and
-named Reference cases, then assert observable results such as events, lifecycle state, diagnostics,
-outbox/inbox state, and public payloads.
+case methods, then assert observable results such as events, lifecycle state, diagnostics,
+outbox/inbox state, and public payloads. Reference scenario names stay inside
+`monoid_agent_kernel.reference.conformance`.
 
 Hypothesis property tests target pure helpers, parsers, and serializers. Use them for JSON-native
 wire payloads, sanitizer helpers, metadata merge helpers, and other in-process functions with no
@@ -112,13 +117,16 @@ focused on edge-case parser coverage.
 15. Phase 2S 3차: helper adoption hardening in web scope, backend events, durable metadata, and
     Studio subagent routing.
 16. Phase 2S 4차: coverage closure and validation/library policy documentation.
+17. Phase 4-4P: profile-specific harness protocols, Reference fixture decoupling, and conformance
+    import-boundary guards.
+18. Phase 4-4Q: Phase 4 structural closure docs and CI/advisory risk position.
 
 ## Acceptance
 
 A profile passes when the implementation satisfies the observable behavior named by the rule ids.
 The tests assert behavior through harness protocols. The Core Helper Kit provides the supported
 implementation path for those behaviors. `docs/OPERATIONAL_RULE_COVERAGE.md` maps every rule to
-helpers, assertions, Reference cases, and tests.
+helpers, assertions, Reference case methods, and tests.
 
 Fast local checks:
 

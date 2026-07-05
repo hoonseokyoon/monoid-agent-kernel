@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from monoid_agent_kernel.core.lifecycle import (
     TERMINAL_STATES,
     SessionState,
+    lifecycle_from_status_artifact,
     session_state_from_run_status,
 )
 
@@ -132,16 +133,8 @@ class RunEventSequencer:
         payload = _read_optional_json(run_dir / "status.json")
         if payload is None:
             return False
-        state = payload.get("state") or payload.get("status") or ""
-        terminal = bool(payload.get("terminal"))
-        if "terminal" not in payload:
-            legacy_status = str(payload.get("status") or "")
-            state_value = str(payload.get("state") or "")
-            if state_value in {"completed", "failed", "cancelled"} or (
-                not state_value and legacy_status in {"completed", "failed", "limited", "cancelled"}
-            ):
-                terminal = True
-        return self.is_terminal_direct_append_status(str(state), terminal=terminal)
+        state, terminal = lifecycle_from_status_artifact(payload)
+        return self.is_terminal_direct_append_status(state, terminal=terminal)
 
     def newest_sequence(self, status: Mapping[str, Any], status_file: Mapping[str, Any] | None = None) -> int:
         """Return the newest event sequence visible across live and durable projections."""

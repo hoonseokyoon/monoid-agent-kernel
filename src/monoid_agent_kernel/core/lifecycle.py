@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.result import AgentTurnResult, Suspension
@@ -169,6 +169,41 @@ def session_state_from_run_status(
     if error_code == "cancelled" and status in {"limited", "failed"}:
         return SessionState.CANCELLED
     return _STATUS_STRING_TO_STATE.get(str(status), SessionState.CREATED)
+
+
+def lifecycle_from_status_artifact(
+    payload: Mapping[str, Any] | None,
+    *,
+    failure_present: bool = False,
+) -> tuple[SessionState, bool]:
+    """Project a durable ``status.json`` payload onto ``(state, terminal)``.
+
+    New artifacts carry ``state`` plus an explicit ``terminal`` flag. Legacy artifacts carry
+    ``status`` only, so terminal result statuses are inferred there, including bare
+    ``status="limited"`` from pre-``state`` terminal-limited runs.
+    """
+    status_payload = payload or {}
+    state_value = status_payload.get("state")
+    status_value = status_payload.get("status")
+    raw_state = state_value or status_value
+    if raw_state:
+        terminal = bool(status_payload.get("terminal"))
+        state = session_state_from_run_status(
+            str(raw_state),
+            error_code=str(status_payload.get("error_code") or ""),
+            terminal=terminal,
+        )
+        if "terminal" not in status_payload:
+            state_text = str(state_value or "")
+            status_text = str(status_value or "")
+            if state_text in {"completed", "failed", "cancelled"} or (
+                not state_text and status_text in {"completed", "failed", "limited", "cancelled"}
+            ):
+                terminal = True
+        return state, terminal
+    if failure_present:
+        return SessionState.FAILED, True
+    return SessionState.CREATED, False
 
 
 def to_session_state(status: str, *, error_code: str = "") -> SessionState:

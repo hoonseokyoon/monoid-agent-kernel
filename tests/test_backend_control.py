@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +14,11 @@ from support.http import http_json, serving
 from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
 
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.core.events import make_agent_event
+from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.tool_surface import ToolScope
@@ -25,7 +28,12 @@ from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.http import create_backend_server
-from monoid_agent_kernel.reference.backend.service import BackendRunRecord, BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.backend.service import (
+    BackendRunRecord,
+    BackendRunRequest,
+    RunnerBackend,
+    _RESUME_SESSION,
+)
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 
@@ -127,6 +135,157 @@ def test_task_resume_events_promote_awaiting_tasks_to_running(
     record.terminal = True
 
 
+def test_run_finished_event_defers_terminal_until_result_is_recorded(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_finish_deferred"
+    run_dir = tmp_path / "runs" / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=1,
+            event_type="run.finished",
+            data={"error": "", "error_code": ""},
+        ),
+    )
+
+    assert record.finished_at is not None
+    assert record.terminal is False
+    assert record.result is None
+    assert backend.tenant_usage("tenant_a")["runs"] == 0
+
+    result = AgentRunResult(
+        run_id=run_id,
+        status="completed",
+        final_text="done",
+        run_dir=run_dir,
+        diff_path=run_dir / "diff.patch",
+        proposal_path=run_dir / "proposal.json",
+        metrics={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+    )
+    backend._record_run_result(run_id, result)
+
+    assert record.result is result
+    assert record.state is SessionState.COMPLETED
+    assert record.terminal is True
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 5
+
+
+def test_record_run_failure_writes_bundle_before_terminal_flip(
+    tmp_path: Path,
+    backend_factory: Any,
+    monkeypatch: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_order"
+    run_dir = tmp_path / "runs" / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    def _raise_before_terminal(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RuntimeError("bundle write failed")
+
+    monkeypatch.setattr(backend, "_write_failure_bundle", _raise_before_terminal)
+
+    with pytest.raises(RuntimeError, match="bundle write failed"):
+        backend._record_run_failure(run_id, RuntimeError("worker boom"))
+
+    assert record.state is SessionState.RUNNING
+    assert record.terminal is False
+    assert record.error == ""
+    assert not (run_dir / "failure.json").exists()
+    with backend._lock:
+        backend._records.pop(run_id, None)
+
+
+def test_usage_comes_from_terminal_result_not_metric_events(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_usage_terminal"
+    run_dir = tmp_path / "runs" / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=1,
+            event_type="metrics.updated",
+            data={"metrics": {"total_tokens": 999}},
+        ),
+    )
+    assert backend.tenant_usage("tenant_a")["total_tokens"] == 0
+
+    backend._record_run_result(
+        run_id,
+        AgentRunResult(
+            run_id=run_id,
+            status="limited",
+            final_text="",
+            run_dir=run_dir,
+            diff_path=run_dir / "diff.patch",
+            proposal_path=run_dir / "proposal.json",
+            metrics={"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
+            error="limited",
+            error_code="cancelled",
+        ),
+    )
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 10
+
+
+def test_tenant_usage_is_process_local_after_backend_restart(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend1 = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        turns=[ModelTurn(response_id="r1", final_text="done", usage={"total_tokens": 7})],
+    )
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="finish",
+            runtime_config=_config(),
+        )
+    )
+    assert backend1.wait_for_run(submission.run_id, timeout_s=20) is SessionState.COMPLETED
+    assert backend1.tenant_usage("tenant_a")["runs"] == 1
+
+    backend2 = backend_factory.create(run_root=run_root, workspace=workspace, turns=[])
+
+    assert backend2.tenant_usage("tenant_a")["runs"] == 0
+    assert backend2.tenant_usage("tenant_a")["total_tokens"] == 0
+
+
 def test_limited_suspension_marks_record_terminal_before_close(
     tmp_path: Path,
     backend_factory: Any,
@@ -178,6 +337,170 @@ def test_limited_suspension_marks_record_terminal_before_close(
     assert loop.terminal_seen is True
     assert record.state is SessionState.LIMITED
     assert record.terminal is True
+
+
+def test_session_message_wait_ignores_stray_resume(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    backend.idle_timeout_s = 1.0
+    record = _backend_record("run_resume", tmp_path / "runs" / "run_resume", workspace)
+    record.message_queue.put_nowait(_RESUME_SESSION)
+    record.message_queue.put_nowait("next")
+
+    message = asyncio.run(backend._await_session_message(record))  # noqa: SLF001 - driver boundary regression
+
+    assert message == "next"
+
+
+def test_session_message_wait_skips_duplicate_inbox_envelope(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    backend.idle_timeout_s = 1.0
+    record = _backend_record("run_inbox", tmp_path / "runs" / "run_inbox", workspace)
+    record.seen_inbox_ids.add("msg_1")
+    record.message_queue.put_nowait(InboxMessage(content="duplicate", id="msg_1").to_json())
+    record.message_queue.put_nowait(InboxMessage(content="fresh", id="msg_2").to_json())
+
+    message = asyncio.run(backend._await_session_message(record))  # noqa: SLF001 - driver boundary regression
+
+    assert message["id"] == "msg_2"
+    assert record.seen_inbox_ids == {"msg_1", "msg_2"}
+
+
+def test_paused_session_requeues_user_message_before_resuming_frozen_turn(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    backend.idle_timeout_s = 1.0
+    run_id = "run_paused"
+    run_dir = tmp_path / "runs" / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    request = BackendRunRequest(
+        tenant_id="tenant_a",
+        user_id="user_a",
+        workspace_root=workspace,
+        instruction="paused",
+        runtime_config=_config(),
+        multi_turn=True,
+    )
+
+    class _PausedLoop:
+        inputs: list[Any]
+
+        def __init__(self) -> None:
+            self.inputs = []
+
+        def snapshot(self) -> None:
+            return None
+
+        async def arun_until_suspended(self, value: Any) -> Suspension:
+            self.inputs.append(value)
+            return Suspension(reason="terminal", status="completed")
+
+        async def aclose(self) -> AgentRunResult:
+            return AgentRunResult(
+                run_id=run_id,
+                status="completed",
+                final_text="",
+                run_dir=run_dir,
+                diff_path=run_dir / "diff.patch",
+                proposal_path=run_dir / "proposal.json",
+            )
+
+    loop = _PausedLoop()
+    record.loop = loop  # type: ignore[assignment]
+    record.message_queue.put_nowait("queued while paused")
+    with backend._lock:
+        backend._records[run_id] = record
+
+    asyncio.run(
+        backend._drive_open_session(  # noqa: SLF001 - driver boundary regression
+            record,
+            request,
+            loop,  # type: ignore[arg-type]
+            Suspension(reason="paused", status="running"),
+            started=time.time(),
+            turns=1,
+        )
+    )
+
+    assert loop.inputs == [None]
+    assert record.message_queue.get_nowait() == "queued while paused"
+
+
+def test_checkpoint_persist_carries_pending_messages_and_seen_inbox_ids(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_checkpoint"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.seen_inbox_ids.update({"msg_1", "msg_2"})
+    envelope = InboxMessage(content="queued", id="msg_3").to_json()
+    record.message_queue.put_nowait("plain")
+    record.message_queue.put_nowait(_RESUME_SESSION)
+    record.message_queue.put_nowait(envelope)
+
+    class _SnapshotLoop:
+        def snapshot(self) -> RunCheckpoint:
+            return RunCheckpoint(run_id=run_id, seq=1)
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+        def due_outbox(self, now: float) -> list[Any]:
+            del now
+            return []
+
+    record.loop = _SnapshotLoop()  # type: ignore[assignment]
+
+    backend._persist_run_checkpoint(record)  # noqa: SLF001 - driver boundary regression
+
+    assert backend.checkpoint_store is not None
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.queued_messages == ["plain", envelope]
+    assert stored.checkpoint.inbox_seen_ids == ["msg_1", "msg_2"]
+
+
+def test_send_message_enqueue_persists_queue_snapshot_before_return(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_enqueue_checkpoint"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    envelope = InboxMessage(content="queued before task result", id="msg_review").to_json()
+
+    class _SnapshotLoop:
+        def snapshot(self) -> RunCheckpoint:
+            return RunCheckpoint(run_id=run_id, seq=1)
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+        def due_outbox(self, now: float) -> list[Any]:
+            del now
+            return []
+
+    record.loop = _SnapshotLoop()  # type: ignore[assignment]
+
+    backend._enqueue_message_and_checkpoint(record, envelope)  # noqa: SLF001 - enqueue durability regression
+
+    assert backend.checkpoint_store is not None
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.queued_messages == [envelope]
 
 
 class _UnopenedLoop:

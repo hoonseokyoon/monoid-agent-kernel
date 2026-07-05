@@ -624,7 +624,9 @@ python -m pytest -q --cov=monoid_agent_kernel --cov=native_agent_runner
 ```
 
 CI keeps the serial suite as the required gate and runs xdist plus coverage as
-advisory checks while the test seams stabilize.
+advisory checks while the test seams stabilize. See
+[docs/PHASE_4_CLOSURE.md](docs/PHASE_4_CLOSURE.md) for the current Phase 4
+structure closure and CI promotion criteria.
 
 ## License
 

@@ -339,7 +339,7 @@ def test_outbox_ack_delivered_to_run_inbox_and_consumed(backend_factory: Any) ->
     # Capture the exact ack envelope at staging (wrap put_nowait around the original call — no race,
     # since the put happens synchronously on the shared loop before the parked driver can consume it).
     captured: list[dict] = []
-    original_stage = backend._stage_outbox_ack
+    original_stage = backend._outbox_dispatch.stage_outbox_ack
 
     def stage_spy(record: Any, request: Any, status: str, receipt: Any) -> None:
         real_put = record.message_queue.put_nowait
@@ -355,7 +355,7 @@ def test_outbox_ack_delivered_to_run_inbox_and_consumed(backend_factory: Any) ->
         finally:
             record.message_queue.put_nowait = real_put  # type: ignore[method-assign]
 
-    backend._stage_outbox_ack = stage_spy  # type: ignore[method-assign]
+    backend._outbox_dispatch.stage_outbox_ack = stage_spy  # type: ignore[method-assign]
 
     run_id, token = _run(backend, workspace, multi_turn=True)
     request_id = sender.sent[0].id if eventually(lambda: sender.sent) else ""

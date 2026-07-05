@@ -448,8 +448,8 @@ def test_watchdog_reclaims_stale_lease_run(tmp_path: Path, monkeypatch) -> None:
 
     resumed: list = []
     monkeypatch.setattr(
-        backend,
-        "_resume_from_checkpoint",
+        backend._recovery,
+        "resume_from_checkpoint",
         lambda stored, meta: resumed.append(stored.checkpoint.run_id),
     )
 
@@ -542,7 +542,7 @@ def test_multinode_reclaim_over_shared_sqlite(tmp_path: Path, monkeypatch) -> No
     )
     resumed: list = []
     monkeypatch.setattr(
-        backend_b, "_attempt_resume", lambda run_dir, rid: (resumed.append(rid) or True)
+        backend_b._recovery, "attempt_resume", lambda run_dir, rid: (resumed.append(rid) or True)
     )
 
     reclaimed = backend_b._reclaim_stale_runs()

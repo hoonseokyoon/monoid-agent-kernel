@@ -37,6 +37,33 @@ from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 pytestmark = pytest.mark.integration
 
 
+def test_run_preparation_writes_initial_metadata_once(tmp_path: Path, monkeypatch: Any) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    calls: list[str] = []
+    original = backend._run_preparation.write_run_meta
+
+    def _spy(record: Any, request: BackendRunRequest) -> None:
+        calls.append(record.run_id)
+        original(record, request)
+
+    monkeypatch.setattr(backend._run_preparation, "write_run_meta", _spy)
+
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="write metadata once",
+            runtime_config=_default_config(),
+        )
+    )
+
+    assert (submission.run_dir / "run.json").exists()
+    assert backend.wait_for_run(submission.run_id, timeout_s=20) is SessionState.COMPLETED
+    assert calls == [submission.run_id]
+
+
 def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     adapters: list = []
