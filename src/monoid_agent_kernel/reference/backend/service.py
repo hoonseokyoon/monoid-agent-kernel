@@ -16,12 +16,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from monoid_agent_kernel.core.agents import (
-    AgentDefinition,
     AgentRuntimeConfig,
     SubagentDefinition,
-    validate_runtime_config,
 )
-from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.core.durable_metadata import (
     ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS,
@@ -42,7 +39,6 @@ from monoid_agent_kernel.core.outbox import OutboxReceipt
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     session_state_from_run_status,
-    session_state_value,
 )
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
@@ -52,15 +48,10 @@ from monoid_agent_kernel.core.checkpoint import (
 )
 from monoid_agent_kernel.reference.stores.lease import LeaseStore, LocalFsLeaseStore
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
-from monoid_agent_kernel.core.content import (
-    ContentPart,
-)
 from monoid_agent_kernel.core.spec import (
     AgentRunSpec,
     ModelConfig,
     ModelRetryConfig,
-    RunMode,
-    WorkspaceBackendKind,
 )
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.errors import PermissionDenied
@@ -104,6 +95,17 @@ from monoid_agent_kernel.reference.backend.run_execution import (
     RunExecutionService,
     stream_item_frame,
 )
+from monoid_agent_kernel.reference.backend.run_preparation import (
+    RunPreparationContext,
+    RunPreparationService,
+    runtime_config_uses_web as _runtime_config_uses_web,
+)
+from monoid_agent_kernel.reference.backend.run_types import (
+    BackendRunRecord,
+    BackendRunRequest,
+    BackendRunSubmission,
+    _PreparedRun,
+)
 from monoid_agent_kernel.reference.backend.session import (
     BackendSessionContext,
     BackendSessionService,
@@ -118,7 +120,6 @@ from monoid_agent_kernel.reference.backend.session_drive import (
 from monoid_agent_kernel.recorder import append_event_to_run
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.web import WebGatewayClient
-from monoid_agent_kernel.workspace.paths import is_within
 
 # Sentinels enqueued to wake/stop a session worker blocked on its message queue.
 _CLOSE_SESSION = object()
@@ -148,118 +149,6 @@ _DIRECT_AUDIT_APPEND_STATUSES = DIRECT_AUDIT_APPEND_STATUSES
 
 def _run_dir_allows_direct_audit_append(run_dir: Path) -> bool:
     return _RUN_EVENT_SEQUENCER.run_dir_allows_direct_append(run_dir)
-
-
-@dataclass(frozen=True)
-class BackendRunRequest:
-    tenant_id: str
-    user_id: str
-    workspace_root: Path
-    instruction: str
-    # Optional multimodal first turn: when non-empty, these content parts (text + image/document
-    # references) drive the opening turn instead of ``instruction``. ``instruction`` is still used
-    # for the run title / metadata, so callers pass the text alongside.
-    input_parts: tuple[ContentPart, ...] = ()
-    mode: RunMode = "propose"
-    workspace_backend: WorkspaceBackendKind = "overlay"
-    max_steps: int = 30
-    max_tool_calls: int = 100
-    max_bytes_read: int = 1_000_000
-    max_duration_s: int | None = 900
-    permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
-    agent_definition: AgentDefinition | None = None
-    runtime_config: AgentRuntimeConfig | None = None
-    # When False (default) the run closes after the first turn settles (one-shot).
-    # When True the session stays open awaiting follow-up messages (multi-turn).
-    multi_turn: bool = False
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class BackendRunSubmission:
-    run_id: str
-    run_token: str
-    state: SessionState
-    terminal: bool
-    run_dir: Path
-    status_url: str
-    result_url: str
-    events_url: str
-    proposal_url: str
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "run_id": self.run_id,
-            "run_token": self.run_token,
-            "state": session_state_value(self.state),
-            "terminal": self.terminal,
-            "run_dir": str(self.run_dir),
-            "status_url": self.status_url,
-            "result_url": self.result_url,
-            "events_url": self.events_url,
-            "proposal_url": self.proposal_url,
-        }
-
-
-@dataclass(frozen=True)
-class _PreparedRun:
-    """The shared output of run setup (validate + tokens + stored record), before the run is
-    driven. Consumed by ``submit_run`` (autonomous) and ``astream_run`` (stream-driven)."""
-
-    run_id: str
-    record: BackendRunRecord
-    workspace_root: Path
-    run_token: str
-    llm_gateway_token: str
-    web_gateway_token: str
-
-
-@dataclass
-class BackendRunRecord:
-    run_id: str
-    tenant_id: str
-    user_id: str
-    workspace_root: Path
-    run_dir: Path
-    state: SessionState
-    terminal: bool
-    created_at: float
-    run_token_sha256: str
-    llm_gateway_token_sha256: str
-    web_gateway_token_sha256: str = ""
-    started_at: float | None = None
-    finished_at: float | None = None
-    error: str = ""
-    error_code: str = ""
-    result: AgentRunResult | None = None
-    # Latest settled turn's validated output (AgentTurnResult.final_output), captured per park so a
-    # live multi-turn run can expose it via status() before the run closes (result() carries the
-    # final one). Process-local — not persisted. None when no output validator produced a value.
-    last_final_output: Any = None
-    last_event_seq: int = 0
-    last_event_type: str = ""
-    cancellation_token: CancellationToken = field(default_factory=CancellationToken)
-    runtime_config: AgentRuntimeConfig | None = None
-    runtime_config_issuer: str = ""
-    runtime_config_reason: str = ""
-    runtime_config_committed_at: float = 0.0
-    # Authoritative lifecycle FSM state, updated by the session driver as it observes each
-    # suspension. The control protocol's inspect/health read this (a throwaway LoopSession is
-    # seeded with it) since the backend drives the loop directly, not through a facade.
-    loop: AgentLoop | None = None
-    # Pending user messages for a multi-turn session. asyncio.Queue (not queue.Queue) so the
-    # run coroutine awaits the next message WITHOUT holding a thread — a parked multi-turn
-    # session is just a suspended coroutine, not a blocked worker (which would exhaust the
-    # shared executor). Producers (send_message/cancel from other threads) enqueue via the
-    # backend's _call_soon so the put runs on the loop. Created without a running loop (3.10+
-    # binds lazily); all gets/puts happen on the shared loop.
-    message_queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue, repr=False)
-    # Ids of inbox messages already processed — the idempotency/dedup set. Checkpointed (restored on
-    # recover) so a redelivered message is dropped once, even across a restart. Mutated only on the
-    # shared loop (dequeue), so no extra lock is needed.
-    seen_inbox_ids: set[str] = field(default_factory=set, repr=False)
-    # The run's outbox sender (drains staged sends), or None to leave staged requests pending.
-    outbox_sender: Any = field(default=None, repr=False)
 
 
 @dataclass
@@ -328,10 +217,6 @@ def _backend_builtin_tool_specs(
     for provider in tool_providers:
         specs.extend(provider.get_tools())
     return tuple(specs)
-
-
-def _runtime_config_uses_web(config: AgentRuntimeConfig) -> bool:
-    return any(binding.ref.tool_id.startswith("web.") for binding in config.tools)
 
 
 class _DaemonDetachedExecutor(ThreadPoolExecutor):
@@ -534,6 +419,7 @@ class RunnerBackend:
     _runtime_config: RuntimeConfigService = field(init=False, repr=False)
     _jobs: JobService = field(init=False, repr=False)
     _recovery: RecoveryService = field(init=False, repr=False)
+    _run_preparation: RunPreparationService = field(init=False, repr=False)
     _outbox_dispatch: OutboxDispatchService = field(init=False, repr=False)
     _run_execution: RunExecutionService = field(init=False, repr=False)
     _session_boundary: BackendSessionService = field(init=False, repr=False)
@@ -557,6 +443,7 @@ class RunnerBackend:
             self.checkpoint_store = LocalFsCheckpointStore(self.run_root)
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
+        self._run_preparation = self._build_run_preparation_service()
         self._loop_factory = self._build_loop_factory()
         self._projection = self._build_projection_service()
         self._proposal = self._build_proposal_service()
@@ -571,6 +458,26 @@ class RunnerBackend:
         self._commands = self._build_command_service()
 
     # --- Internal service context providers --------------------------------------------
+
+    def _build_run_preparation_service(self) -> RunPreparationService:
+        return RunPreparationService(
+            RunPreparationContext(
+                run_root_provider=lambda: self.run_root,
+                allowed_workspace_roots_provider=lambda: self.allowed_workspace_roots,
+                token_manager_provider=lambda: self.token_manager,
+                run_token_ttl_s_provider=lambda: self.run_token_ttl_s,
+                llm_gateway_token_ttl_s_provider=lambda: self.llm_gateway_token_ttl_s,
+                web_gateway_token_ttl_s_provider=lambda: self.web_gateway_token_ttl_s,
+                web_gateway_url_provider=lambda: self.web_gateway_url,
+                builtin_tool_specs_provider=lambda: _backend_builtin_tool_specs(
+                    self.subagent_definitions,
+                    self.tool_providers,
+                ),
+                checkpoint_store_provider=self._checkpoint_store,
+                register_record=self._register_record,
+                now=time.time,
+            )
+        )
 
     def _build_loop_factory(self) -> BackendLoopFactory:
         return BackendLoopFactory(
@@ -714,7 +621,6 @@ class RunnerBackend:
                 build_loop=self._build_loop_build,
                 attach_loop=self._attach_loop_build,
                 record=self._record,
-                write_run_meta=self._write_run_meta,
                 drive_open_session=self._drive_open_session,
                 record_run_result=self._record_run_result,
                 record_run_failure=self._record_run_failure,
@@ -810,6 +716,10 @@ class RunnerBackend:
         with self._lock:
             return run_id in self._records
 
+    def _register_record(self, record: BackendRunRecord) -> None:
+        with self._lock:
+            self._records[record.run_id] = record
+
     def _recovery_request(self, meta: Mapping[str, Any], runtime_config: AgentRuntimeConfig) -> BackendRunRequest:
         limits = meta.get("limits") or {}
         return BackendRunRequest(
@@ -891,8 +801,7 @@ class RunnerBackend:
         )
 
     def _register_recovered_record(self, record: BackendRunRecord) -> None:
-        with self._lock:
-            self._records[record.run_id] = record
+        self._register_record(record)
 
     def _attach_loop_build(
         self,
@@ -1061,98 +970,10 @@ class RunnerBackend:
         return self._submission_for(prepared)
 
     def _prepare_run_record(self, request: BackendRunRequest) -> _PreparedRun:
-        """Validate the request, mint the three run tokens, and store a queued run record.
-
-        Shared by ``submit_run`` (autonomous drive) and ``astream_run`` (stream-driven). Stops
-        at "record stored under lock" — the caller owns how the run is then driven."""
-        self._validate_request(request)
-        workspace_root = request.workspace_root.resolve()
-        self._check_workspace_allowed(workspace_root)
-        run_id = uuid.uuid4().hex
-        run_dir = self.run_root / run_id
-        run_token = self.token_manager.issue(
-            kind="run_access",
-            audience=BACKEND_AUDIENCE,
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            ttl_s=self.run_token_ttl_s,
-        )
-        tool_specs = _backend_builtin_tool_specs(self.subagent_definitions, self.tool_providers)
-        initial_runtime_config = request.runtime_config
-        runtime_config_issuer = "submit_run"
-        runtime_config_reason = "initial runtime config"
-        if initial_runtime_config is None and request.agent_definition is not None:
-            initial_runtime_config = AgentRuntimeConfig.from_definition(request.agent_definition)
-            runtime_config_reason = "initial agent definition"
-        elif initial_runtime_config is None:
-            raise ValueError("agent_definition or runtime_config is required")
-        validate_runtime_config(initial_runtime_config, tool_specs)
-        llm_gateway_token = self.token_manager.issue(
-            kind="llm_gateway",
-            audience="csp.llm-gateway",
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            ttl_s=self.llm_gateway_token_ttl_s,
-            metadata={"agent_config_hash": initial_runtime_config.config_hash},
-        )
-        web_gateway_token = ""
-        if _runtime_config_uses_web(initial_runtime_config):
-            if not self.web_gateway_url:
-                raise ValueError("web_gateway_url is required when runtime config binds web tools")
-            web_gateway_token = self.token_manager.issue(
-                kind="web_gateway",
-                audience="csp.web-gateway",
-                run_id=run_id,
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
-                ttl_s=self.web_gateway_token_ttl_s,
-                metadata={"agent_config_hash": initial_runtime_config.config_hash},
-            )
-        created_at = time.time()
-        record = BackendRunRecord(
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            workspace_root=workspace_root,
-            run_dir=run_dir,
-            state=SessionState.CREATED,
-            terminal=False,
-            created_at=created_at,
-            run_token_sha256=TokenManager.token_sha256(run_token),
-            llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
-            web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
-            runtime_config=initial_runtime_config,
-            runtime_config_issuer=runtime_config_issuer,
-            runtime_config_reason=runtime_config_reason,
-            runtime_config_committed_at=created_at,
-        )
-        self._write_run_meta(record, request)
-        with self._lock:
-            self._records[run_id] = record
-        return _PreparedRun(
-            run_id=run_id,
-            record=record,
-            workspace_root=workspace_root,
-            run_token=run_token,
-            llm_gateway_token=llm_gateway_token,
-            web_gateway_token=web_gateway_token,
-        )
+        return self._run_preparation.prepare(request)
 
     def _submission_for(self, prepared: _PreparedRun) -> BackendRunSubmission:
-        run_id = prepared.run_id
-        return BackendRunSubmission(
-            run_id=run_id,
-            run_token=prepared.run_token,
-            state=prepared.record.state,
-            terminal=prepared.record.terminal,
-            run_dir=prepared.record.run_dir,
-            status_url=f"/v1/runs/{run_id}/status",
-            result_url=f"/v1/runs/{run_id}/result",
-            events_url=f"/v1/runs/{run_id}/events",
-            proposal_url=f"/v1/runs/{run_id}/proposal",
-        )
+        return self._run_preparation.submission_for(prepared)
 
     def _run_spec_for_request(
         self,
@@ -1776,44 +1597,7 @@ class RunnerBackend:
         self._recovery.clear_recover_attempts(run_dir)
 
     def _write_run_meta(self, record: BackendRunRecord, request: BackendRunRequest) -> None:
-        """Write run.json — the durable recovery descriptor. Holds everything
-        ``recover_runs`` needs to rebuild a run that was parked when the process died:
-        identity, workspace, limits, policy, and the resolved runtime config (gateway
-        tokens are re-issued on recovery, not stored). Runtime-config changes update this
-        descriptor, so recovery uses the latest committed config instead of the run-start config."""
-        config = record.runtime_config
-        committed_at = record.runtime_config_committed_at or time.time()
-        meta = {
-            "schema_version": _RUN_META_SCHEMA_VERSION,
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "user_id": record.user_id,
-            "workspace_root": str(record.workspace_root),
-            "mode": request.mode,
-            "workspace_backend": request.workspace_backend,
-            "multi_turn": request.multi_turn,
-            # For history listing (DX-12): a created-at stamp + a short title (first instruction).
-            "created_at": record.created_at,
-            "title": " ".join((request.instruction or "").split())[:80],
-            "limits": {
-                "max_steps": request.max_steps,
-                "max_tool_calls": request.max_tool_calls,
-                "max_bytes_read": request.max_bytes_read,
-                "max_duration_s": request.max_duration_s,
-            },
-            "permission_policy": request.permission_policy.to_json(),
-            "runtime_config": config.to_json() if config else None,
-            "runtime_config_version": config.config_version if config else 0,
-            "runtime_config_hash": config.config_hash if config else "",
-            "runtime_config_issuer": record.runtime_config_issuer,
-            "runtime_config_reason": record.runtime_config_reason,
-            "runtime_config_committed_at": committed_at,
-        }
-        DurableMetadataCommitter(self.checkpoint_store).write_initial_metadata(
-            record.run_dir,
-            record.run_id,
-            meta,
-        )
+        self._run_preparation.write_run_meta(record, request)
 
     def _write_runtime_config_run_meta(
         self,
@@ -1944,24 +1728,10 @@ class RunnerBackend:
         return self._loop_factory.web_gateway_client(token)
 
     def _validate_request(self, request: BackendRunRequest) -> None:
-        if not request.tenant_id.strip():
-            raise ValueError("tenant_id is required")
-        if not request.user_id.strip():
-            raise ValueError("user_id is required")
-        if not request.instruction.strip() and not request.input_parts:
-            raise ValueError("instruction or input_parts is required")
-        if request.mode not in {"read-only", "propose", "apply"}:
-            raise ValueError(f"unsupported mode: {request.mode}")
-        if request.workspace_backend not in {"overlay", "staging"}:
-            raise ValueError(f"unsupported workspace_backend: {request.workspace_backend}")
-        if request.agent_definition is None and request.runtime_config is None:
-            raise ValueError("agent_definition or runtime_config is required")
+        self._run_preparation.validate_request(request)
 
     def _check_workspace_allowed(self, workspace_root: Path) -> None:
-        if not workspace_root.exists() or not workspace_root.is_dir():
-            raise ValueError(f"workspace root does not exist: {workspace_root}")
-        if not any(is_within(root, workspace_root) for root in self.allowed_workspace_roots):
-            raise PermissionDenied(f"workspace root is outside allowed roots: {workspace_root}")
+        self._run_preparation.check_workspace_allowed(workspace_root)
 
     def _authorize_run(self, run_id: str, token: str) -> None:
         claims = self._verify_run_token(run_id, token)

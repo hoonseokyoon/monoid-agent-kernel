@@ -14,6 +14,7 @@ uses instead of depending on the whole facade.
 | Service | Current responsibility |
 | --- | --- |
 | `RunProjectionService` | Read-only projections: `status`, `result`, `events`, `diagnostics`, `list_runs`. |
+| `RunPreparationService` | Request validation, workspace admission, initial runtime config validation, run token issuance, record creation, initial run metadata materialization, and submission payload assembly. |
 | `BackendCommandService` | Control command dispatch and audit result mapping. |
 | `BackendSessionService` | Session control actions, task callbacks, inbound messages, and `resume_run` entrypoint. |
 | `SessionDriveService` | Open multi-turn session driving, message waits, checkpoint park points. |
@@ -38,7 +39,7 @@ run records, run requests, loop operations, token claims, and lease stores.
 | Public facade | Embedder-facing methods stay on `RunnerBackend` so callers interact with one stable object. |
 | Composition root | `RunnerBackend.__post_init__` creates stores and default leases, then delegates service context wiring to private `_build_*_service` helpers. |
 | Shared runtime ownership | `_spawn`, `_call_soon`, drain/shutdown, shared loop scheduling, semaphore ownership, and stream cancellation stay with the process-level runtime wrapper. |
-| Request admission | `_validate_request`, `_check_workspace_allowed`, initial runtime config validation, gateway token issuance, and initial record creation stay in the facade. |
+| Request admission wiring | `submit_run`, `astream_run`, `_prepare_run_record`, `_submission_for`, `_validate_request`, `_check_workspace_allowed`, and `_write_run_meta` stay as facade compatibility and public API wrappers around `RunPreparationService`. |
 | Loop factory wiring | `_build_loop_factory`, `_build_loop_build`, and `_build_loop` stay as facade compatibility and composition-root wrappers around `BackendLoopFactory`. |
 | Run execution wiring | `submit_run`, `_run_run`, `_drive_session`, `astream_run`, and `_frame` stay as facade compatibility and public API wrappers around `RunExecutionService`. |
 | Streaming public API | `astream_run` remains the embedder-facing stream seam; stream frame construction and run driving delegate to `RunExecutionService`. |
@@ -55,6 +56,7 @@ The main Reference product-specific surfaces have been moved out of the facade:
 
 | Extracted service | Former backend surface |
 | --- | --- |
+| `RunPreparationService` | `_prepare_run_record`, `_submission_for`, `_validate_request`, `_check_workspace_allowed`, `_write_run_meta`. |
 | `ProposalService` | `proposal`, `proposal_diff`, `proposal_file`, `export_proposal_package`, `read_run_artifact`, `approve_proposal`, `reject_proposal`, `apply_proposal`. |
 | `RuntimeConfigService` | `current_runtime_config`, `runtime_config`, `replace_runtime_config`, `_write_runtime_config_run_meta`. |
 | `JobService` | `jobs`, `job_status`, `job_logs`, `cancel_job`. |

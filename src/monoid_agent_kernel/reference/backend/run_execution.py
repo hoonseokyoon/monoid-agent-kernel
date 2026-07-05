@@ -55,7 +55,6 @@ class RunExecutionContext:
     build_loop: Callable[[str, RunRequestPort, Path, str, str], LoopBuildPort]
     attach_loop: Callable[[MutableRunRecordPort, LoopBuildPort], None]
     record: Callable[[str], MutableRunRecordPort]
-    write_run_meta: Callable[[MutableRunRecordPort, RunRequestPort], None]
     drive_open_session: DriveOpenSessionPort
     record_run_result: Callable[[str, AgentRunResult], None]
     record_run_failure: Callable[[str, Exception], None]
@@ -83,7 +82,6 @@ class RunExecutionService:
                 )
                 loop = loop_build.loop
                 self._context.attach_loop(prepared.record, loop_build)
-                self._context.write_run_meta(prepared.record, request)
                 result = await self.drive_session(prepared.run_id, request, loop)
                 self._context.record_run_result(prepared.run_id, result)
             except Exception as exc:
@@ -131,7 +129,6 @@ class RunExecutionService:
             )
             loop = loop_build.loop
             self._context.attach_loop(prepared.record, loop_build)
-            self._context.write_run_meta(prepared.record, request)
             await loop.aopen()
             suspension: Suspension | None = None
             first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
