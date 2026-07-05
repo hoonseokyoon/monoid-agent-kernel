@@ -20,18 +20,19 @@ replaceable contracts.
 ## See it run
 
 The bundled **Agent Studio** reference app (`monoid studio serve`) drives the kernel
-through its Python API behind a single-page UI.
+through its Python API behind a single-page UI. A profile chooses the model, reasoning
+level, prompt instructions, and tool surface; each profile keeps its own chat history.
 
-![Agent Studio: an agent reasons, runs Python, and produces a result in the workspace](docs/img/hero.png)
+![Agent Studio: a Visual Analyst profile reads sales data, writes insights, and generates an annotated revenue chart](docs/img/studio-v016-main.png)
 
-*A real agent — it plans, writes and runs code in a workspace, and reports back; every step is
-observable, and generated output (here, a plot) previews inline.*
+*A real Studio run: the agent reads `sales.csv`, writes `INSIGHTS.md`, generates an
+annotated `revenue_trend.svg`, and previews the artifact directly in the workspace panel.*
 
-![Two agents collaborating over the durable outbox→inbox fabric](docs/img/a2a.png)
+![Agent Studio profile builder showing the exact system prompt and tool schema preview](docs/img/studio-v016-profile-builder.png)
 
-*Two independently-configured agent profiles, running on one kernel, collaborate by passing
-messages over a durable, capability-gated **outbox→inbox** fabric — the capability and outbox
-events are visible in the trace on the right.*
+*The profile editor shows the exact first-turn model request boundary: system prompt,
+tool schemas, model settings, and preview notes. Users can edit the profile on the left
+and see what the model will receive on the right.*
 
 ## Architecture: Contract / Conformance Test / Core Helper Kit / Reference
 
@@ -78,9 +79,9 @@ config — and `from_config` wires them in one call. `FakeModelAdapter` (a scrip
 makes the first turn run offline, with no gateway or API key:
 
 ```python
-from monoid_agent_kernel import AgentLoop, AgentRunSpec, AgentRuntimeConfig, FakeModelAdapter
-from monoid_agent_kernel import RegistryToolRef, ToolBinding
+from monoid_agent_kernel import AgentLoop, AgentRunSpec, AgentRuntimeConfig, RegistryToolRef, ToolBinding
 from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter
 
 spec = AgentRunSpec(workspace_root="./workspace", mode="apply")
 config = AgentRuntimeConfig(
@@ -105,19 +106,20 @@ your own `ModelAdapter`. Author tools from typed functions with the `@tool` deco
 This package is pre-1.0 (`0.x`): the public surface may change between minor versions, but
 breaking changes are called out in commit messages and this README.
 
-- **Stable** — the core engine and the contracts it implements: `AgentLoop`, `AgentRunSpec`,
-  `AgentRuntimeConfig` / `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `@tool`,
-  `EventSink`, `CheckpointStore`, `Workspace` / `workspace_factory`, `PermissionPolicy`, and
-  the rest of `monoid_agent_kernel.contracts`.
-- **Experimental** — surfaces still settling: the async-task seams (`TaskExecutor`,
-  `ResultInjector`, `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
-  `LoopSession`, `SessionState`, `ControlCommand` / `ControlDispatcher`); capability leases
-  (`CapabilityBroker` / `CapabilityLease`); agent-as-tool delegation (`SubagentDefinition`)
-  and Agent Skills (`SkillProvider`); and the multimodal content parts. `ImagePart` and
-  `DocumentPart` are forwarded to multimodal-capable adapters (the gateway and OpenAI
-  adapters); a text-only adapter drops them with a `model.input.degraded` warning.
-  `AudioPart` / `VideoPart` round-trip as a forward-compatible contract but are not yet
-  forwarded.
+- **Stable Contract** — the core engine and integration contracts exported from
+  `monoid_agent_kernel.contracts`: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig` /
+  `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `@tool`, `EventSink`,
+  `CheckpointStore`, `Workspace` / `workspace_factory`, and `PermissionPolicy`.
+- **Contract Extension** — surfaces that are public but still settling: async task seams,
+  session lifecycle/control, capability leases, agent-as-tool delegation, Agent Skills,
+  output validation, and multimodal content parts. `ImagePart` and `DocumentPart` are
+  forwarded to multimodal-capable adapters. `AudioPart` / `VideoPart` are exported
+  content contracts and round-trip through core JSON/checkpoint paths; provider forwarding
+  is still adapter-specific.
+- **Helper Kit** — implementation helpers live under explicit modules such as
+  `monoid_agent_kernel.core.*`, `monoid_agent_kernel.providers.*`,
+  `monoid_agent_kernel.tools.*`, `monoid_agent_kernel.recorder`, and
+  `monoid_agent_kernel.observability`.
 - **Reference examples** — everything under `monoid_agent_kernel.reference.*` is example
   implementation code; build production services against the contracts.
 
@@ -148,6 +150,25 @@ monoid run \
   --spec examples/run-spec.json \
   --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
   --runtime-config-file examples/runtime-config.json
+```
+
+Use the builder CLI to scaffold and preflight those files:
+
+```bash
+monoid builder init --target ./my-agent
+monoid builder config validate \
+  --runtime-config-file ./my-agent/runtime-config.json
+monoid builder tools list \
+  --runtime-config-file ./my-agent/runtime-config.json
+```
+
+`monoid builder init --custom-tool-template` also writes a small `tools.py` provider.
+Pass it explicitly when validating or running custom tools:
+
+```bash
+monoid builder tools list \
+  --tool-module ./my-agent/tools.py:get_tools \
+  --runtime-config-file ./my-agent/runtime-config.json
 ```
 
 Programmatic callers drive the run with `AgentLoop.run_once(instruction)` for the
@@ -294,9 +315,10 @@ monoid job cancel <job_id> --run <run_id>
 > Reference example (`monoid_agent_kernel.reference.backend`). Build production backends against
 > the contracts in [docs/CONTRACTS.md](docs/CONTRACTS.md).
 
-The reference backend issues run tokens, starts kernel runs, and exposes status,
-result, event, and tenant usage APIs. It still uses the keyless gateway model
-provider. Provider API keys stay outside the Monoid backend.
+The reference backend issues run tokens, starts kernel runs, and exposes lifecycle,
+result, event, and tenant usage APIs. Lifecycle payloads use `state` plus `terminal`;
+ready result payloads keep `status` for the terminal `AgentRunResult.status`.
+Provider API keys stay outside the Monoid backend.
 
 Start a local LLM gateway. This process is the provider-credential boundary:
 
@@ -419,6 +441,10 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/jobs/$JOB_ID/logs?stream=stdout
 ```
 
+`/status` returns lifecycle state, for example `{"state":"running","terminal":false}`.
+`/result` returns `ready=false` with lifecycle state while a run is open; when `ready=true`,
+its `status` field is the terminal result status (`completed`, `failed`, or `limited`).
+
 Tenant usage is admin-scoped:
 
 ```bash
@@ -460,7 +486,7 @@ Each run writes:
 
 - `events.jsonl`: public redacted event stream
 - `transcript.jsonl`: private debug/replay transcript with full tool payloads
-- `status.json`: latest run status for polling
+- `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`)
 - `metrics.json`: final counters and timing
 - `manifest.json`: run contract, agent config metadata, binding-aware tool surface, workspace backend
 - `workspace.base.json`: base snapshot used for proposal comparison
@@ -522,7 +548,8 @@ not nested), and spans carry GenAI attributes (`gen_ai.operation.name`, `gen_ai.
 `gen_ai.tool.name`, token usage). Wire it in with one line:
 
 ```python
-from monoid_agent_kernel import AgentLoop, OtelEventSink
+from monoid_agent_kernel import AgentLoop
+from monoid_agent_kernel.observability.otel import OtelEventSink
 
 loop = AgentLoop.from_config(spec, adapter, config, event_sinks=(OtelEventSink(),))
 ```
@@ -594,7 +621,13 @@ Fast local confidence checks:
 ```bash
 python -m pytest tests/conformance -q
 python -m pytest -q -n 4
+python -m pytest -q --cov=monoid_agent_kernel --cov=native_agent_runner
 ```
+
+CI keeps the serial suite as the required gate and runs xdist plus coverage as
+advisory checks while the test seams stabilize. See
+[docs/PHASE_4_CLOSURE.md](docs/PHASE_4_CLOSURE.md) for the current Phase 4
+structure closure and CI promotion criteria.
 
 ## License
 

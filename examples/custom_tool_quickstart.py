@@ -15,9 +15,9 @@ from pathlib import Path
 # Make the example runnable from a checkout without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from monoid_agent_kernel import AgentLoop, AgentRunSpec, FakeModelAdapter, tool  # noqa: E402
+from monoid_agent_kernel import AgentLoop, AgentRunSpec, tool  # noqa: E402
 from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
-from monoid_agent_kernel.providers.fake import fake_tool_call  # noqa: E402
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call  # noqa: E402
 
 
 # A custom tool. @tool derives the input schema from the type hints; its model-facing name is

@@ -5,11 +5,15 @@ import pytest
 from monoid_agent_kernel.conformance import (
     BackendHarness,
     CapabilityHarness,
+    ControlPlaneHarness,
+    DurableRunnerHarness,
     GatewayHarness,
     MessageFabricHarness,
+    MultiAgentBackendHarness,
     PROFILES,
     PROFILE_BY_ID,
     SideEffectHarness,
+    ToolAgentHarness,
     get_profile,
 )
 
@@ -66,6 +70,10 @@ def test_get_profile_returns_registered_metadata(profile_id: str) -> None:
 
 def test_harness_protocols_are_importable() -> None:
     assert BackendHarness.__name__ == "BackendHarness"
+    assert ToolAgentHarness.__name__ == "ToolAgentHarness"
+    assert ControlPlaneHarness.__name__ == "ControlPlaneHarness"
+    assert DurableRunnerHarness.__name__ == "DurableRunnerHarness"
+    assert MultiAgentBackendHarness.__name__ == "MultiAgentBackendHarness"
     assert GatewayHarness.__name__ == "GatewayHarness"
     assert CapabilityHarness.__name__ == "CapabilityHarness"
     assert SideEffectHarness.__name__ == "SideEffectHarness"

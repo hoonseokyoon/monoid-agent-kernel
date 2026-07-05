@@ -55,6 +55,41 @@ def test_terminal_direct_append_keeps_unique_increasing_sequence(tmp_path) -> No
     assert page["next_seq"] == 3
 
 
+def test_legacy_limited_status_allows_direct_append(tmp_path) -> None:
+    run_dir = tmp_path / "runs" / "run_limited"
+    run_dir.mkdir(parents=True)
+    (run_dir / "status.json").write_text(
+        json.dumps({"run_id": "run_limited", "status": "limited", "last_event_seq": 0}),
+        encoding="utf-8",
+    )
+
+    assert RunEventSequencer().run_dir_allows_direct_append(run_dir) is True
+
+
+def test_live_limited_state_requires_terminal_flag_for_direct_append(tmp_path) -> None:
+    run_dir = tmp_path / "runs" / "run_live_limited"
+    run_dir.mkdir(parents=True)
+    (run_dir / "status.json").write_text(
+        json.dumps({"run_id": "run_live_limited", "state": "limited", "last_event_seq": 0}),
+        encoding="utf-8",
+    )
+    sequencer = RunEventSequencer()
+
+    assert sequencer.run_dir_allows_direct_append(run_dir) is False
+    (run_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run_live_limited",
+                "state": "limited",
+                "terminal": True,
+                "last_event_seq": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert sequencer.run_dir_allows_direct_append(run_dir) is True
+
+
 def test_recordless_nonterminal_run_skips_direct_append(tmp_path) -> None:
     run_dir = tmp_path / "runs" / "run_live"
     run_dir.mkdir(parents=True)

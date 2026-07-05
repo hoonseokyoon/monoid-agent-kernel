@@ -34,9 +34,14 @@ python -m pytest -q        # serial compatibility suite
 - Add or update tests for any behavior change. Custom adapters/workspaces/stores
   should plug into the existing parametrized contract suites in `tests/`
   (e.g. `test_workspace_contract.py`, `test_checkpoint_store_contract.py`).
+- Backend tests that create `RunnerBackend` should use the `backend_factory`
+  fixture or the helpers in `tests/support/backend_harness.py`; the fixture owns
+  spawned futures and fails the test if a backend leaves live runs behind.
 - Use `python -m pytest --durations=30` when a change could affect suite runtime.
 - Mark deliberate timeout or live-provider coverage with `slow` or `live` so the
   fast local path stays clear.
+- CI keeps `pytest -q` as the required gate and runs `pytest -q -n 4 -m "not live"`
+  plus coverage as advisory signals until they stabilize.
 - To profile without unrelated pytest plugins, run
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -p xdist -n 4 -q -m "not slow and not live"`.
 - Match the surrounding code style: typed, small functions, comment density and

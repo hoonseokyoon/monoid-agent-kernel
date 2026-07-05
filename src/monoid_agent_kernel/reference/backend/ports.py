@@ -1,0 +1,188 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Awaitable, Mapping
+from pathlib import Path
+from typing import Any, Protocol
+
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.outbox import OutboxSender
+from monoid_agent_kernel.core.result import AgentRunResult, Suspension
+
+
+class TokenClaimsPort(Protocol):
+    tenant_id: str
+    user_id: str
+    run_id: str
+
+
+class CancellationTokenPort(Protocol):
+    requested: bool
+
+
+class MessageQueuePort(Protocol):
+    def qsize(self) -> int: ...
+
+    def put_nowait(self, item: Any) -> None: ...
+
+    def get(self) -> Awaitable[Any]: ...
+
+
+def queued_message_snapshot(queue: MessageQueuePort) -> list[str | list[Any] | dict[str, Any]]:
+    raw_queue = getattr(queue, "_queue", ())
+    return [message for message in list(raw_queue) if isinstance(message, (str, list, dict))]
+
+
+class LoopPort(Protocol):
+    def wait_for_pending_tasks(self, timeout_s: float) -> bool: ...
+
+    def has_pending_tasks(self) -> bool: ...
+
+    def emit_external_event(
+        self,
+        event_type: str,
+        *,
+        data: dict[str, Any] | None = None,
+        level: str = "info",
+    ) -> bool: ...
+
+    async def arun_until_suspended(self, user_input: Any | None = None) -> Suspension: ...
+
+    def fail_recoverable(self, error: str, *, error_code: str) -> None: ...
+
+    def await_user_input(self) -> None: ...
+
+    async def aclose(self) -> AgentRunResult: ...
+
+    def snapshot(self) -> RunCheckpoint | None: ...
+
+    def collect_checkpoint_blobs(self) -> Mapping[str, bytes]: ...
+
+    def interrupt_turn(self) -> None: ...
+
+    def pause_turn(self) -> None: ...
+
+    def revoke_capability(
+        self,
+        *,
+        capability: str | None = None,
+        lease_id: str | None = None,
+        before: float | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]: ...
+
+    def report_task_result(
+        self,
+        task_id: str,
+        result: dict[str, Any],
+        *,
+        status: str,
+        persist_checkpoint: bool,
+    ) -> dict[str, Any]: ...
+
+    def create_task(self, kind: str, request: dict[str, Any]) -> str: ...
+
+    def restore(self, checkpoint: RunCheckpoint, *, blobs: Mapping[str, bytes]) -> None: ...
+
+
+class RunStreamPort(Protocol):
+    suspension: Suspension | None
+
+    async def __aenter__(self) -> RunStreamPort: ...
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None: ...
+
+    def __aiter__(self) -> AsyncIterator[Any]: ...
+
+
+class RunExecutionLoopPort(LoopPort, Protocol):
+    async def aopen(self) -> None: ...
+
+    def astream(self, user_input: Any) -> RunStreamPort: ...
+
+
+class LoopBuildPort(Protocol):
+    loop: RunExecutionLoopPort
+    outbox_sender: OutboxSender | None
+
+
+class RunRecordPort(Protocol):
+    run_id: str
+    tenant_id: str
+    user_id: str
+    workspace_root: Path
+    run_dir: Path
+    state: SessionState
+    terminal: bool
+    created_at: float
+    started_at: float
+    finished_at: float
+    last_event_seq: int
+    last_event_type: str
+    error: str
+    error_code: str
+    result: AgentRunResult | None
+    last_final_output: Any
+    runtime_config: AgentRuntimeConfig | None
+    runtime_config_issuer: str
+    runtime_config_reason: str
+    runtime_config_committed_at: float
+
+
+class MutableRunRecordPort(RunRecordPort, Protocol):
+    message_queue: MessageQueuePort
+    loop: LoopPort | None
+    cancellation_token: CancellationTokenPort
+    seen_inbox_ids: set[str]
+    outbox_sender: OutboxSender | None
+
+
+class PreparedRunPort(Protocol):
+    run_id: str
+    record: MutableRunRecordPort
+    workspace_root: Path
+    run_token: str
+    llm_gateway_token: str
+    web_gateway_token: str
+
+
+class RunRequestPort(Protocol):
+    tenant_id: str
+    user_id: str
+    workspace_root: Path
+    instruction: str
+    input_parts: tuple[Any, ...]
+    mode: str
+    workspace_backend: str
+    max_steps: int
+    max_tool_calls: int
+    max_bytes_read: int
+    max_duration_s: int | None
+    permission_policy: Any
+    runtime_config: AgentRuntimeConfig | None
+    multi_turn: bool
+    metadata: dict[str, Any]
+
+
+class LeaseStorePort(Protocol):
+    def candidate_run_ids(self) -> list[str]: ...
+
+    def is_stale(self, run_id: str) -> bool: ...
+
+    def try_claim(self, run_id: str, worker_id: str, ttl_s: float) -> bool: ...
+
+    def release(self, run_id: str) -> None: ...
+
+
+class DriveOpenSessionPort(Protocol):
+    def __call__(
+        self,
+        record: MutableRunRecordPort,
+        request: RunRequestPort,
+        loop: LoopPort,
+        suspension: Suspension,
+        *,
+        started: float,
+        turns: int,
+    ) -> Awaitable[AgentRunResult]: ...

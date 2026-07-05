@@ -123,6 +123,36 @@ def test_shell_background_job_is_listed(tmp_path: Path) -> None:
         server.shutdown()
 
 
+def test_shutdown_drains_background_shell_job_and_server_threads(tmp_path: Path) -> None:
+    server = _shell_studio(
+        tmp_path,
+        [
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "shell_exec",
+                        {"command": _python_command("import time; time.sleep(30)"), "background": True},
+                        "c1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="started a long background job"),
+        ],
+    )
+    server.start()
+    run_id = server.start_chat("run a long job")["run_id"]
+    _wait_settled(server, run_id, 1)
+    assert server.jobs(run_id).get("jobs")
+
+    server.shutdown()
+
+    assert server.run_status(run_id)["terminal"] is True
+    assert server._ui_thread is None
+    assert server._gateway_thread is None
+    assert server._web_gateway_thread is None
+    assert server._mcp_thread is None
+
+
 def test_web_search_runs_through_the_gateway(tmp_path: Path) -> None:
     fake = FakeModelAdapter(
         turns=[

@@ -2,67 +2,41 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import json
 import logging
 import random
-import re
 import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from monoid_agent_kernel.core.agents import (
-    AgentDefinition,
     AgentRuntimeConfig,
-    RuntimeConfigProvider,
     SubagentDefinition,
-    validate_runtime_config,
 )
-from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
-from monoid_agent_kernel.core.control_audit import ControlAuditPolicy
 from monoid_agent_kernel.core.durable_metadata import (
     ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS,
     RUN_METADATA_SCHEMA_VERSION,
     DurableMetadataCommitter,
     read_run_metadata,
-    runtime_config_from_metadata,
     validate_run_metadata,
 )
+from monoid_agent_kernel.core.capability import CapabilityBroker
+from monoid_agent_kernel.core.context import ContextProvider
+from monoid_agent_kernel.core.events import AgentEvent, EventSink
 from monoid_agent_kernel.core.event_sequencing import (
-    DIRECT_AUDIT_APPEND_STATUSES,
     RunEventSequencer,
-    diagnostic_event_summary,
-    read_event_page,
 )
-from monoid_agent_kernel.core.subagent_runtime import (
-    subagent_diagnostics_from_events,
-    validate_descendant_run_id,
-)
-from monoid_agent_kernel.core.events import AgentEvent
-from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
-from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
-from monoid_agent_kernel.core.outbox import OutboxReceipt
-from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
+from monoid_agent_kernel.core.outbox import OutboxSender, OutboxReceipt
+from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.lifecycle import (
-    LoopSession,
     SessionState,
-    state_from_suspension,
-    to_session_state,
 )
-from monoid_agent_kernel.core.packages import (
-    apply_package,
-    create_approval,
-    export_package,
-    write_apply_result,
-    write_approval,
-)
-from monoid_agent_kernel.core._util import read_text_resilient, write_json_atomic
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
     CheckpointStore,
@@ -70,96 +44,94 @@ from monoid_agent_kernel.core.checkpoint import (
     RunCheckpoint,
 )
 from monoid_agent_kernel.reference.stores.lease import LeaseStore, LocalFsLeaseStore
-from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
-from monoid_agent_kernel.core.content import (
-    ContentPart,
-    content_part_from_json,
-    content_part_to_json,
-)
-from monoid_agent_kernel.core.media import normalize_inline_media_dicts
 from monoid_agent_kernel.core.spec import (
     AgentRunSpec,
     ModelConfig,
     ModelRetryConfig,
-    RunLimits,
-    RunMode,
-    WorkspaceBackendKind,
 )
 from monoid_agent_kernel.core.workspace import Workspace
-from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
-from monoid_agent_kernel.tasks import (
-    get_job_artifact,
-    list_job_artifacts,
-    read_job_log_text,
-    request_job_cancel,
-)
+from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelAdapter
-from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCE,
     BACKEND_AUDIENCES,
     TASK_CALLBACK_AUDIENCE,
     TASK_CALLBACK_AUDIENCES,
-    namespaced_id,
 )
-from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenKind, TokenManager
+from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManager
+from monoid_agent_kernel.reference.backend.commands import BackendCommandContext, BackendCommandService
+from monoid_agent_kernel.reference.backend.jobs import JobService, JobServiceContext
+from monoid_agent_kernel.reference.backend.loop_factory import (
+    BackendLoopBuild,
+    BackendLoopFactory,
+    BackendLoopFactoryContext,
+    ModelAdapterFactory,
+    _GatewayTokenSource,
+)
+from monoid_agent_kernel.reference.backend.outbox_dispatch import (
+    OutboxDispatchContext,
+    OutboxDispatchService,
+    OutboxRetryPolicy,
+)
+from monoid_agent_kernel.reference.backend.projection import (
+    RunProjectionContext,
+    RunProjectionService,
+    _json_safe as _json_safe,
+)
+from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
+from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
+from monoid_agent_kernel.reference.backend.recovery import RecoveryContext, RecoveryService
+from monoid_agent_kernel.reference.backend.runtime_config import RuntimeConfigContext, RuntimeConfigService
+from monoid_agent_kernel.reference.backend.run_execution import (
+    RunExecutionContext,
+    RunExecutionService,
+    stream_item_frame,
+)
+from monoid_agent_kernel.reference.backend.run_preparation import (
+    RunPreparationContext,
+    RunPreparationService,
+    runtime_config_uses_web as _runtime_config_uses_web,
+)
+from monoid_agent_kernel.reference.backend.run_state import (
+    RunStateMutationContext,
+    RunStateMutationService,
+    record_terminal as _record_terminal,
+)
+from monoid_agent_kernel.reference.backend.run_types import (
+    BackendRunRecord,
+    BackendRunRequest,
+    BackendRunSubmission,
+    _PreparedRun,
+)
+from monoid_agent_kernel.reference.backend.session import (
+    BackendSessionContext,
+    BackendSessionService,
+    _normalize_inbound_message as _normalize_inbound_message,
+)
+from monoid_agent_kernel.reference.backend.session_drive import (
+    SessionDriveContext,
+    SessionDriveLimits,
+    SessionDriveService,
+    _queued_message_to_loop_input as _queued_message_to_loop_input,
+)
 from monoid_agent_kernel.recorder import append_event_to_run
+from monoid_agent_kernel.tools.base import ToolProvider
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.web import WebGatewayClient
-from monoid_agent_kernel.workspace.paths import is_within
-
-BackendRunState = Literal["queued", "running", "awaiting_input", "completed", "failed", "limited"]
 
 # Sentinels enqueued to wake/stop a session worker blocked on its message queue.
 _CLOSE_SESSION = object()
 # Wakes a paused worker: resume the SAME turn with no new input. Ignored (a no-op) by the other
 # queue-waiting branches, which expect a real user message or _CLOSE_SESSION.
 _RESUME_SESSION = object()
-ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
-
-# A run-artifact fetch handle is a bare sha256 hex digest — validated before any store lookup so a
-# crafted value can never reach the blob layer as a path.
-_ARTIFACT_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
-
-
-# --- multimodal message normalization (the backend message queue stays JSON-native) ---------
-# A backend message is either a ``str`` (text) or a ``list[dict]`` of content-part dicts (a
-# multimodal message carried by-reference). Keeping the queue + checkpoint JSON-native means a
-# parked multimodal message survives a restart with no dataclass (de)serialization in the driver.
-
-
-def _normalize_inbound_message(content: str | Sequence[Any]) -> str | list[dict[str, Any]]:
-    """Normalize a ``send_message`` argument into the queue's JSON-native wire form. Accepts a
-    plain ``str``, a sequence of ``ContentPart`` dataclasses, or a sequence of already-serialized
-    content-part dicts (the HTTP boundary sends the latter)."""
-    if isinstance(content, str):
-        return content
-    parts: list[dict[str, Any]] = []
-    for item in content:
-        parts.append(item if isinstance(item, dict) else content_part_to_json(item))
-    if not parts:
-        raise ValueError("message has no content")
-    return parts
-
-
-def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]:
-    """Convert a dequeued backend message into a loop ``submit`` input. Unwraps an inbox envelope to
-    its ``content`` (the provenance/id stay on the queue/checkpoint, not in the loop); a legacy raw
-    ``str``/``list[dict]`` entry passes through. ``content_part_from_json`` rebuilds typed parts."""
-    if is_inbox_envelope(message):
-        message = InboxMessage.from_json(message).content
-    if isinstance(message, list):
-        return tuple(content_part_from_json(part) for part in message)
-    return message  # str
 
 # Durable recovery descriptor (run.json) — what recover_runs needs to rebuild a parked run.
 _RUN_META_SCHEMA_VERSION = RUN_METADATA_SCHEMA_VERSION
 _ACCEPTED_RUN_META_SCHEMA_VERSIONS = ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS
 _RUN_EVENT_SEQUENCER = RunEventSequencer()
-_CONTROL_AUDIT_POLICY = ControlAuditPolicy()
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.backend")
 
@@ -173,237 +145,9 @@ def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
     return validate_run_metadata(payload)
 
 
-def _runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
-    return runtime_config_from_metadata(meta)
-
-
-def _read_event_page(events_path: Path, *, from_seq: int, limit: int | None) -> dict[str, Any]:
-    return read_event_page(events_path, from_seq=from_seq, limit=limit)
-
-
-def _read_optional_json(path: Path) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _diagnostic_event_summary(event: dict[str, Any]) -> dict[str, Any]:
-    return diagnostic_event_summary(event)
-
-
-_DIRECT_AUDIT_APPEND_STATUSES = DIRECT_AUDIT_APPEND_STATUSES
-
-
-def _run_dir_allows_direct_audit_append(run_dir: Path) -> bool:
-    return _RUN_EVENT_SEQUENCER.run_dir_allows_direct_append(run_dir)
-
-
-def _trace_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
-    trace_ids: set[str] = set()
-    for event in events:
-        data = event.get("data") if isinstance(event.get("data"), dict) else {}
-        trace_id = trace_id_of(str(data.get("traceparent") or ""))
-        if trace_id:
-            trace_ids.add(trace_id)
-    return sorted(trace_ids)
-
-
-@dataclass(frozen=True)
-class BackendRunRequest:
-    tenant_id: str
-    user_id: str
-    workspace_root: Path
-    instruction: str
-    # Optional multimodal first turn: when non-empty, these content parts (text + image/document
-    # references) drive the opening turn instead of ``instruction``. ``instruction`` is still used
-    # for the run title / metadata, so callers pass the text alongside.
-    input_parts: tuple[ContentPart, ...] = ()
-    mode: RunMode = "propose"
-    workspace_backend: WorkspaceBackendKind = "overlay"
-    max_steps: int = 30
-    max_tool_calls: int = 100
-    max_bytes_read: int = 1_000_000
-    max_duration_s: int | None = 900
-    permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
-    agent_definition: AgentDefinition | None = None
-    runtime_config: AgentRuntimeConfig | None = None
-    # When False (default) the run closes after the first turn settles (one-shot).
-    # When True the session stays open awaiting follow-up messages (multi-turn).
-    multi_turn: bool = False
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class BackendRunSubmission:
-    run_id: str
-    run_token: str
-    status: BackendRunState
-    run_dir: Path
-    status_url: str
-    result_url: str
-    events_url: str
-    proposal_url: str
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "run_id": self.run_id,
-            "run_token": self.run_token,
-            "status": self.status,
-            "run_dir": str(self.run_dir),
-            "status_url": self.status_url,
-            "result_url": self.result_url,
-            "events_url": self.events_url,
-            "proposal_url": self.proposal_url,
-        }
-
-
-@dataclass(frozen=True)
-class _PreparedRun:
-    """The shared output of run setup (validate + tokens + stored record), before the run is
-    driven. Consumed by ``submit_run`` (autonomous) and ``astream_run`` (stream-driven)."""
-
-    run_id: str
-    record: BackendRunRecord
-    workspace_root: Path
-    run_token: str
-    llm_gateway_token: str
-    web_gateway_token: str
-
-
-def _json_safe(value: Any) -> Any:
-    """Render an output validator's value safe for a JSON wire projection **at any nesting depth**.
-    Round-trips through json with a ``repr`` fallback so a non-serializable value — a Pydantic
-    model, dataclass, or bytes, even nested inside a dict/list — can never 500 the HTTP response
-    when the edge later ``json.dumps`` it."""
-    try:
-        return json.loads(json.dumps(value, default=repr))
-    except (TypeError, ValueError):
-        return repr(value)
-
-
-@dataclass
-class BackendRunRecord:
-    run_id: str
-    tenant_id: str
-    user_id: str
-    workspace_root: Path
-    run_dir: Path
-    status: BackendRunState
-    created_at: float
-    run_token_sha256: str
-    llm_gateway_token_sha256: str
-    web_gateway_token_sha256: str = ""
-    started_at: float | None = None
-    finished_at: float | None = None
-    error: str = ""
-    error_code: str = ""
-    result: AgentRunResult | None = None
-    # Latest settled turn's validated output (AgentTurnResult.final_output), captured per park so a
-    # live multi-turn run can expose it via status() before the run closes (result() carries the
-    # final one). Process-local — not persisted. None when no output validator produced a value.
-    last_final_output: Any = None
-    last_event_seq: int = 0
-    last_event_type: str = ""
-    cancellation_token: CancellationToken = field(default_factory=CancellationToken)
-    runtime_config: AgentRuntimeConfig | None = None
-    runtime_config_issuer: str = ""
-    runtime_config_reason: str = ""
-    runtime_config_committed_at: float = 0.0
-    # Authoritative lifecycle FSM state, updated by the session driver as it observes each
-    # suspension. The control protocol's inspect/health read this (a throwaway LoopSession is
-    # seeded with it) since the backend drives the loop directly, not through a facade.
-    session_state: SessionState = SessionState.CREATED
-    loop: AgentLoop | None = None
-    # Pending user messages for a multi-turn session. asyncio.Queue (not queue.Queue) so the
-    # run coroutine awaits the next message WITHOUT holding a thread — a parked multi-turn
-    # session is just a suspended coroutine, not a blocked worker (which would exhaust the
-    # shared executor). Producers (send_message/cancel from other threads) enqueue via the
-    # backend's _call_soon so the put runs on the loop. Created without a running loop (3.10+
-    # binds lazily); all gets/puts happen on the shared loop.
-    message_queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue, repr=False)
-    # Ids of inbox messages already processed — the idempotency/dedup set. Checkpointed (restored on
-    # recover) so a redelivered message is dropped once, even across a restart. Mutated only on the
-    # shared loop (dequeue), so no extra lock is needed.
-    seen_inbox_ids: set[str] = field(default_factory=set, repr=False)
-    # The run's outbox sender (drains staged sends), or None to leave staged requests pending.
-    outbox_sender: Any = field(default=None, repr=False)
-
-
-@dataclass
-class TenantUsage:
-    tenant_id: str
-    runs: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    web_search_calls: int = 0
-    web_fetch_calls: int = 0
-    web_context_calls: int = 0
-    web_failed_calls: int = 0
-    web_result_count: int = 0
-    web_bytes_returned: int = 0
-    web_context_source_count: int = 0
-    web_context_bytes_returned: int = 0
-
-    def add_metrics(self, metrics: dict[str, Any]) -> None:
-        self.runs += 1
-        self.input_tokens += int(metrics.get("input_tokens") or 0)
-        self.output_tokens += int(metrics.get("output_tokens") or 0)
-        self.total_tokens += int(metrics.get("total_tokens") or 0)
-        self.web_search_calls += int(metrics.get("web_search_calls") or 0)
-        self.web_fetch_calls += int(metrics.get("web_fetch_calls") or 0)
-        self.web_context_calls += int(metrics.get("web_context_calls") or 0)
-        self.web_failed_calls += int(metrics.get("web_failed_calls") or 0)
-        self.web_result_count += int(metrics.get("web_result_count") or 0)
-        self.web_bytes_returned += int(metrics.get("web_bytes_returned") or 0)
-        self.web_context_source_count += int(metrics.get("web_context_source_count") or 0)
-        self.web_context_bytes_returned += int(metrics.get("web_context_bytes_returned") or 0)
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "tenant_id": self.tenant_id,
-            "runs": self.runs,
-            "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens,
-            "total_tokens": self.total_tokens,
-            "web_search_calls": self.web_search_calls,
-            "web_fetch_calls": self.web_fetch_calls,
-            "web_context_calls": self.web_context_calls,
-            "web_failed_calls": self.web_failed_calls,
-            "web_result_count": self.web_result_count,
-            "web_bytes_returned": self.web_bytes_returned,
-            "web_context_source_count": self.web_context_source_count,
-            "web_context_bytes_returned": self.web_context_bytes_returned,
-        }
-
-
-class BackendRunStateSink:
-    def __init__(self, backend: RunnerBackend, run_id: str) -> None:
-        self._backend = backend
-        self._run_id = run_id
-
-    def emit(self, event: AgentEvent) -> None:
-        self._backend.record_event(self._run_id, event)
-
-    def close(self) -> None:
-        return None
-
-
-class BackendRuntimeConfigProvider(RuntimeConfigProvider):
-    def __init__(self, backend: RunnerBackend, run_id: str) -> None:
-        self._backend = backend
-        self._run_id = run_id
-
-    def current_config(self, run_id: str) -> AgentRuntimeConfig | None:
-        del run_id
-        return self._backend.current_runtime_config(self._run_id)
-
-
 def _backend_builtin_tool_specs(
     subagent_definitions: Mapping[str, SubagentDefinition] | None = None,
-    tool_providers: Sequence[Any] = (),
+    tool_providers: Sequence[ToolProvider] = (),
 ) -> tuple[Any, ...]:
     specs = list(builtin_tools(cast(Workspace, None)))
     # agent.spawn is registered dynamically by the loop bootstrap (only when the run carries
@@ -419,10 +163,6 @@ def _backend_builtin_tool_specs(
     for provider in tool_providers:
         specs.extend(provider.get_tools())
     return tuple(specs)
-
-
-def _runtime_config_uses_web(config: AgentRuntimeConfig) -> bool:
-    return any(binding.ref.tool_id.startswith("web.") for binding in config.tools)
 
 
 class _DaemonDetachedExecutor(ThreadPoolExecutor):
@@ -459,6 +199,22 @@ def _teardown_loop(
     idle multi-turn message-get) exits when that call returns."""
     if loop.is_closed():
         return
+    if loop.is_running():
+        async def _cancel_pending_tasks() -> None:
+            pending = [
+                task
+                for task in asyncio.all_tasks(loop)
+                if task is not asyncio.current_task(loop) and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_cancel_pending_tasks(), loop).result(timeout=5)
+        except Exception:  # pragma: no cover - interpreter shutdown best-effort cleanup
+            pass
     loop.call_soon_threadsafe(loop.stop)
     thread.join(timeout=5)
     executor.shutdown(wait=False)
@@ -487,57 +243,17 @@ def _get_shared_loop() -> asyncio.AbstractEventLoop:
         return _shared_loop
 
 
-async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> None:
-    """Awaitable, cancellable exponential backoff with jitter — the async counterpart of the
-    gateway's sync ``_sleep_before_retry`` (used between turn-level auto-retries on the shared
-    loop). ``attempt`` is 1-based."""
-    delay = min(retry.max_delay_s, retry.initial_delay_s * (retry.backoff_multiplier ** max(0, attempt - 1)))
-    if retry.jitter_s > 0:
-        delay += random.uniform(0, retry.jitter_s)
-    if delay > 0:
-        await asyncio.sleep(delay)
-
-
-@dataclass
-class _GatewayTokenSource:
-    """A callable gateway-token source that re-mints shortly before expiry. Resolved per request by
-    the model adapter (``GatewayModelAdapter.token_provider``), so a run that outlives the token TTL
-    stays authenticated without a restart — the same re-mint the recovery path already performs,
-    applied proactively and in-process (the backend holds the signing key). Not thread-safe by design:
-    a run's model calls are serialized on its loop."""
-
-    token_manager: TokenManager
-    kind: TokenKind
-    audience: str
-    run_id: str
-    tenant_id: str
-    user_id: str
-    ttl_s: int
-    metadata: dict[str, Any] = field(default_factory=dict)
-    refresh_skew_s: int = 300
-    _token: str = ""
-    _expires_at: float = 0.0
-
-    def __call__(self) -> str:
-        now = time.time()
-        # Re-mint near expiry; cap the skew at half the TTL so a short TTL doesn't re-mint every call.
-        skew = min(self.refresh_skew_s, self.ttl_s // 2)
-        if not self._token or now >= self._expires_at - skew:
-            self._token = self.token_manager.issue(
-                kind=self.kind,
-                audience=self.audience,
-                run_id=self.run_id,
-                tenant_id=self.tenant_id,
-                user_id=self.user_id,
-                ttl_s=self.ttl_s,
-                metadata=dict(self.metadata),
-            )
-            self._expires_at = now + self.ttl_s
-        return self._token
-
-
 @dataclass
 class RunnerBackend:
+    """Reference backend facade and composition root.
+
+    Public methods stay on this object. Internal services receive explicit context
+    objects, while process-level runtime ownership, loop construction, and the
+    remaining product-specific Reference surfaces stay here until their own
+    extraction step. See docs/RUNNER_BACKEND_RESPONSIBILITY_MAP.md for the current
+    responsibility map.
+    """
+
     run_root: Path
     token_manager: TokenManager
     allowed_workspace_roots: tuple[Path, ...]
@@ -572,7 +288,7 @@ class RunnerBackend:
     # required for stateful sinks like OtelEventSink (per-run span state). The seam an embedder
     # uses to attach observability without a core dep — e.g. studio sets ``(OtelEventSink,)`` when
     # OTel is toggled on. Read at loop-build time so it can change at runtime. Empty → no deps.
-    extra_event_sink_factories: tuple[Any, ...] = ()
+    extra_event_sink_factories: tuple[Callable[[], EventSink], ...] = ()
     # Tool/context providers attached to every run the backend builds (Skills, MCP, custom).
     # The embedder-facing seam for the loop's tool_providers/context_providers (the CLI passes
     # these to AgentLoop directly; without these fields an out-of-process embedder could not
@@ -582,23 +298,23 @@ class RunnerBackend:
     # client is documented thread-safe; SkillProvider is read-only). Read at loop-build time so
     # a parked run re-attaches them on resume/restart. Their tools must also be declared to
     # config validation — see _backend_builtin_tool_specs. Empty → no providers.
-    tool_providers: tuple[Any, ...] = ()
-    context_providers: tuple[Any, ...] = ()
+    tool_providers: tuple[ToolProvider, ...] = ()
+    context_providers: tuple[ContextProvider, ...] = ()
     # Output validators attached to every run the backend builds. Default-on: each runs unless a
     # run's config disables it via OutputValidatorBinding(enabled=False). Read at loop-build time
     # so a parked run re-attaches them on resume/restart, exactly like tool/context providers.
     # Empty → no validators.
-    output_validators: tuple[Any, ...] = ()
+    output_validators: tuple[OutputValidator, ...] = ()
     # Per-run capability broker factory: ``(request) -> CapabilityBroker | None``. Called at
     # loop-build time so a broker can be scoped to the run's identity (tenant/user/run id) — e.g.
     # a GatewayCapabilityBroker minting per-tenant tokens. None (or a None return) leaves capability
     # gating off for that run. A factory (not an instance) because a broker is typically per-run
     # identity-bound, unlike the shared tool/context providers above.
-    capability_broker_factory: Callable[[BackendRunRequest], Any] | None = None
+    capability_broker_factory: Callable[[BackendRunRequest], CapabilityBroker | None] | None = None
     # Per-run outbox sender (drains staged outbound sends at the edge — see core/outbox.py). A
     # factory like capability_broker_factory; None (or a None return) leaves staged requests pending
     # (durable, never dispatched). The drain performs the actual IO; the core only stages.
-    outbox_sender_factory: Callable[[BackendRunRequest], Any] | None = None
+    outbox_sender_factory: Callable[[BackendRunRequest], OutboxSender | None] | None = None
     # An outbox request is redispatched (at-least-once + idempotency_key) at most this many times on
     # a retryable failure before it is dead-lettered as failed.
     outbox_max_attempts: int = 5
@@ -634,7 +350,6 @@ class RunnerBackend:
     # on another process/host reclaim a crashed peer's run.
     lease_store: LeaseStore | None = None
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
-    _usage: dict[str, TenantUsage] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _worker_id: str = field(default="", init=False, repr=False)
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -643,6 +358,19 @@ class RunnerBackend:
     # RNG for the outbox backoff jitter — a dedicated instance so a test can seed it deterministically
     # (backend._outbox_rng.seed(...)) without perturbing global random state.
     _outbox_rng: random.Random = field(default_factory=random.Random, init=False, repr=False)
+    _loop_factory: BackendLoopFactory = field(init=False, repr=False)
+    _projection: RunProjectionService = field(init=False, repr=False)
+    _proposal: ProposalService = field(init=False, repr=False)
+    _runtime_config: RuntimeConfigService = field(init=False, repr=False)
+    _jobs: JobService = field(init=False, repr=False)
+    _recovery: RecoveryService = field(init=False, repr=False)
+    _run_preparation: RunPreparationService = field(init=False, repr=False)
+    _run_state: RunStateMutationService = field(init=False, repr=False)
+    _outbox_dispatch: OutboxDispatchService = field(init=False, repr=False)
+    _run_execution: RunExecutionService = field(init=False, repr=False)
+    _session_boundary: BackendSessionService = field(init=False, repr=False)
+    _session_drive: SessionDriveService = field(init=False, repr=False)
+    _commands: BackendCommandService = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._worker_id = uuid.uuid4().hex
@@ -661,6 +389,453 @@ class RunnerBackend:
             self.checkpoint_store = LocalFsCheckpointStore(self.run_root)
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
+        self._run_preparation = self._build_run_preparation_service()
+        self._run_state = self._build_run_state_mutation_service()
+        self._loop_factory = self._build_loop_factory()
+        self._projection = self._build_projection_service()
+        self._proposal = self._build_proposal_service()
+        self._runtime_config = self._build_runtime_config_service()
+        self._jobs = self._build_job_service()
+        self._recovery = self._build_recovery_service()
+        self._outbox_dispatch = self._build_outbox_dispatch_service()
+        assert self.checkpoint_store is not None
+        self._session_drive = self._build_session_drive_service()
+        self._run_execution = self._build_run_execution_service()
+        self._session_boundary = self._build_session_boundary_service()
+        self._commands = self._build_command_service()
+
+    # --- Internal service context providers --------------------------------------------
+
+    def _build_run_preparation_service(self) -> RunPreparationService:
+        return RunPreparationService(
+            RunPreparationContext(
+                run_root_provider=lambda: self.run_root,
+                allowed_workspace_roots_provider=lambda: self.allowed_workspace_roots,
+                token_manager_provider=lambda: self.token_manager,
+                run_token_ttl_s_provider=lambda: self.run_token_ttl_s,
+                llm_gateway_token_ttl_s_provider=lambda: self.llm_gateway_token_ttl_s,
+                web_gateway_token_ttl_s_provider=lambda: self.web_gateway_token_ttl_s,
+                web_gateway_url_provider=lambda: self.web_gateway_url,
+                builtin_tool_specs_provider=lambda: _backend_builtin_tool_specs(
+                    self.subagent_definitions,
+                    self.tool_providers,
+                ),
+                checkpoint_store_provider=self._checkpoint_store,
+                register_record=self._register_record,
+                now=time.time,
+            )
+        )
+
+    def _build_run_state_mutation_service(self) -> RunStateMutationService:
+        return RunStateMutationService(
+            RunStateMutationContext(
+                with_record_lock=self._with_record_lock,
+                active_record=self._active_record,
+                record=self._record,
+                run_root_provider=lambda: self.run_root,
+                now=time.time,
+                write_failure_bundle=lambda run_id, run_dir, **kwargs: self._write_failure_bundle(
+                    run_id,
+                    run_dir,
+                    **kwargs,
+                ),
+                append_event=append_event_to_run,
+                event_sequencer=_RUN_EVENT_SEQUENCER,
+                logger=_LOGGER,
+            )
+        )
+
+    def _build_loop_factory(self) -> BackendLoopFactory:
+        return BackendLoopFactory(
+            BackendLoopFactoryContext(
+                run_root_provider=lambda: self.run_root,
+                llm_gateway_url_provider=lambda: self.llm_gateway_url,
+                web_gateway_url_provider=lambda: self.web_gateway_url,
+                model_adapter_factory_provider=lambda: self.model_adapter_factory,
+                token_manager_provider=lambda: self.token_manager,
+                llm_gateway_token_ttl_s_provider=lambda: self.llm_gateway_token_ttl_s,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                emit_output_deltas_provider=lambda: self.emit_output_deltas,
+                extra_event_sink_factories_provider=lambda: self.extra_event_sink_factories,
+                subagent_definitions_provider=lambda: self.subagent_definitions,
+                tool_providers_provider=lambda: self.tool_providers,
+                context_providers_provider=lambda: self.context_providers,
+                output_validators_provider=lambda: self.output_validators,
+                capability_broker_factory_provider=lambda: self.capability_broker_factory,
+                outbox_sender_factory_provider=lambda: self.outbox_sender_factory,
+                current_runtime_config=self.current_runtime_config,
+                record=self._record,
+                record_event=self.record_event,
+                persist_checkpoint_payload=self._persist_run_checkpoint_payload,
+            )
+        )
+
+    def _build_projection_service(self) -> RunProjectionService:
+        return RunProjectionService(
+            RunProjectionContext(
+                authorized_run_dir=self._authorized_run_dir,
+                authorize_run=self._authorize_run,
+                record=self._record,
+                active_record=self._active_record,
+                read_recover_attempts=self._read_recover_attempts,
+                run_root_provider=lambda: self.run_root,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                max_recover_attempts_provider=lambda: self.max_recover_attempts,
+                issue_read_token=self._issue_read_token,
+            )
+        )
+
+    def _build_proposal_service(self) -> ProposalService:
+        return ProposalService(
+            ProposalServiceContext(
+                authorize_run=self._authorize_run,
+                record=self._record,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                emit_backend_event=self._emit_backend_event,
+                allowed_apply_roots_provider=lambda: self.allowed_apply_roots,
+            )
+        )
+
+    def _build_runtime_config_service(self) -> RuntimeConfigService:
+        return RuntimeConfigService(
+            RuntimeConfigContext(
+                authorize_run=self._authorize_run,
+                record=self._record,
+                with_record_lock=self._with_record_lock,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                builtin_tool_specs_provider=lambda: _backend_builtin_tool_specs(
+                    self.subagent_definitions,
+                    self.tool_providers,
+                ),
+                now=time.time,
+            )
+        )
+
+    def _build_job_service(self) -> JobService:
+        return JobService(JobServiceContext(authorize_run=self._authorize_run, record=self._record))
+
+    def _build_recovery_service(self) -> RecoveryService:
+        return RecoveryService(
+            RecoveryContext(
+                run_root_provider=lambda: self.run_root,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                lease_store_provider=lambda: self.lease_store,
+                max_recover_attempts_provider=lambda: self.max_recover_attempts,
+                worker_id_provider=lambda: self._worker_id,
+                lease_ttl_s_provider=lambda: self.lease_ttl_s,
+                is_record_tracked=self._is_live_run,
+                record=self._record,
+                make_request=self._recovery_request,
+                make_record=self._recovery_record,
+                issue_llm_gateway_token=self._issue_recovery_llm_gateway_token,
+                issue_web_gateway_token=self._issue_recovery_web_gateway_token,
+                build_loop=self._build_loop_build,
+                register_record=self._register_recovered_record,
+                attach_loop=self._attach_loop_build,
+                call_soon=lambda fn, *args: self._call_soon(fn, *args),
+                spawn=self._spawn,
+                drive_open_session=self._drive_open_session,
+                record_run_result=self._record_run_result,
+                record_run_failure=self._record_run_failure,
+                acquire_run_slot=self._acquire_run_slot,
+                release_run_slot=self._release_run_slot,
+            )
+        )
+
+    def _build_outbox_dispatch_service(self) -> OutboxDispatchService:
+        return OutboxDispatchService(
+            OutboxDispatchContext(
+                retry_policy_provider=lambda: OutboxRetryPolicy(
+                    max_attempts=self.outbox_max_attempts,
+                    base_s=self.outbox_retry_base_s,
+                    factor=self.outbox_retry_factor,
+                    cap_s=self.outbox_retry_cap_s,
+                ),
+                max_message_queue_depth_provider=lambda: self.max_message_queue_depth,
+                checkpoint_store_provider=self._checkpoint_store,
+                rng_provider=lambda: self._outbox_rng,
+                live_outbox_runs=self._live_outbox_runs,
+                call_soon=lambda fn, *args: self._call_soon(fn, *args),
+                record_terminal=lambda record: _record_terminal(record),
+            )
+        )
+
+    def _build_session_drive_service(self) -> SessionDriveService:
+        return SessionDriveService(
+            SessionDriveContext(
+                limits_provider=self._session_drive_limits,
+                checkpoint_store_provider=self._checkpoint_store,
+                drain_outbox=self._drain_outbox,
+                close_signal=_CLOSE_SESSION,
+                resume_signal=_RESUME_SESSION,
+            )
+        )
+
+    def _build_run_execution_service(self) -> RunExecutionService:
+        return RunExecutionService(
+            RunExecutionContext(
+                build_loop=self._build_loop_build,
+                attach_loop=self._attach_loop_build,
+                record=self._record,
+                drive_open_session=self._drive_open_session,
+                record_run_result=self._record_run_result,
+                record_run_failure=self._record_run_failure,
+                acquire_run_slot=self._acquire_run_slot,
+                release_run_slot=self._release_run_slot,
+                submission_json=lambda prepared: self._submission_for(prepared).to_json(),
+            )
+        )
+
+    def _build_session_boundary_service(self) -> BackendSessionService:
+        return BackendSessionService(
+            BackendSessionContext(
+                authorize_run=self._authorize_run,
+                verify_run_token=self._verify_run_token,
+                verify_task_callback_token=self._verify_task_callback_claims,
+                issue_task_callback_token=self._issue_task_callback_token,
+                record=self._record,
+                active_record=self._active_record,
+                run_dir_for=lambda run_id: self.run_root / run_id,
+                call_soon=lambda fn, *args: self._call_soon(fn, *args),
+                enqueue_message_and_checkpoint=self._enqueue_message_and_checkpoint,
+                persist_checkpoint_from_any_thread=self._persist_run_checkpoint_from_any_thread,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
+                read_recovery_meta=self._read_recovery_meta,
+                attempt_resume=self._attempt_resume,
+                max_message_bytes_provider=lambda: self.max_message_bytes,
+                max_message_queue_depth_provider=lambda: self.max_message_queue_depth,
+                record_terminal=self._record_terminal_locked,
+                live_loop=self._live_loop_snapshot,
+                mark_cancel_requested=self._mark_cancel_requested,
+                ensure_message_enqueue_allowed=self._ensure_message_enqueue_allowed,
+                close_signal=_CLOSE_SESSION,
+                resume_signal=_RESUME_SESSION,
+            )
+        )
+
+    def _build_command_service(self) -> BackendCommandService:
+        return BackendCommandService(
+            BackendCommandContext(
+                emit_control_audit_event=self._emit_control_audit_event,
+                verify_run_token=self._verify_run_token,
+                verify_task_callback_token=self._verify_task_callback_token,
+                authorize_claim_subject=self._authorize_claim_subject,
+                is_live_run=self._is_live_run,
+                active_loop_session=self._active_loop_session,
+                run_control=self._session_boundary,
+                task_messages=self._session_boundary,
+                capability_control=self._session_boundary,
+                projection=self._projection,
+                runtime_config=self._runtime_config,
+            )
+        )
+
+    def _session_drive_limits(self) -> SessionDriveLimits:
+        return SessionDriveLimits(
+            idle_timeout_s=self.idle_timeout_s,
+            max_session_lifetime_s=self.max_session_lifetime_s,
+            max_turns=self.max_turns,
+            task_wait_poll_s=self.task_wait_poll_s,
+            max_consecutive_turn_failures=self.max_consecutive_turn_failures,
+            turn_retry=self.turn_retry,
+        )
+
+    def _checkpoint_store(self) -> CheckpointStore:
+        assert self.checkpoint_store is not None
+        return self.checkpoint_store
+
+    def _with_record_lock(self, fn: Callable[[], Any]) -> Any:
+        with self._lock:
+            return fn()
+
+    def _active_record(self, run_id: str) -> BackendRunRecord | None:
+        with self._lock:
+            return self._records.get(run_id)
+
+    def _issue_read_token(self, run_id: str, tenant_id: str, user_id: str) -> str:
+        return self.token_manager.issue(
+            kind="run_access",
+            audience=BACKEND_AUDIENCE,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            ttl_s=self.run_token_ttl_s,
+        )
+
+    def _is_live_run(self, run_id: str) -> bool:
+        with self._lock:
+            return run_id in self._records
+
+    def _register_record(self, record: BackendRunRecord) -> None:
+        with self._lock:
+            self._records[record.run_id] = record
+
+    def _recovery_request(self, meta: Mapping[str, Any], runtime_config: AgentRuntimeConfig) -> BackendRunRequest:
+        limits = meta.get("limits") or {}
+        return BackendRunRequest(
+            tenant_id=str(meta["tenant_id"]),
+            user_id=str(meta["user_id"]),
+            workspace_root=Path(meta["workspace_root"]),
+            instruction="",
+            mode=meta.get("mode", "propose"),
+            workspace_backend=meta.get("workspace_backend", "overlay"),
+            max_steps=int(limits.get("max_steps", 30)),
+            max_tool_calls=int(limits.get("max_tool_calls", 100)),
+            max_bytes_read=int(limits.get("max_bytes_read", 1_000_000)),
+            max_duration_s=limits.get("max_duration_s", 900),
+            permission_policy=PermissionPolicy.from_json(meta.get("permission_policy")),
+            runtime_config=runtime_config,
+            multi_turn=bool(meta.get("multi_turn", False)),
+        )
+
+    def _recovery_record(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        workspace_root: Path,
+        llm_gateway_token: str,
+        web_gateway_token: str,
+        runtime_config: AgentRuntimeConfig,
+        meta: Mapping[str, Any],
+    ) -> BackendRunRecord:
+        return BackendRunRecord(
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_root=workspace_root,
+            run_dir=self.run_root / run_id,
+            state=SessionState.AWAITING_INPUT,
+            terminal=False,
+            created_at=time.time(),
+            run_token_sha256="",
+            llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
+            web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
+            runtime_config=runtime_config,
+            runtime_config_issuer=str(meta.get("runtime_config_issuer") or "recover_runs"),
+            runtime_config_reason=str(meta.get("runtime_config_reason") or "resumed from checkpoint"),
+            runtime_config_committed_at=float(meta.get("runtime_config_committed_at") or time.time()),
+        )
+
+    def _issue_recovery_llm_gateway_token(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        runtime_config: AgentRuntimeConfig,
+    ) -> str:
+        return self.token_manager.issue(
+            kind="llm_gateway",
+            audience="csp.llm-gateway",
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            ttl_s=self.llm_gateway_token_ttl_s,
+            metadata={"agent_config_hash": runtime_config.config_hash},
+        )
+
+    def _issue_recovery_web_gateway_token(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        runtime_config: AgentRuntimeConfig,
+    ) -> str:
+        if not (_runtime_config_uses_web(runtime_config) and self.web_gateway_url):
+            return ""
+        return self.token_manager.issue(
+            kind="web_gateway",
+            audience="csp.web-gateway",
+            run_id=run_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            ttl_s=self.web_gateway_token_ttl_s,
+            metadata={"agent_config_hash": runtime_config.config_hash},
+        )
+
+    def _register_recovered_record(self, record: BackendRunRecord) -> None:
+        self._register_record(record)
+
+    def _attach_loop_build(
+        self,
+        record: BackendRunRecord,
+        loop_build: BackendLoopBuild,
+    ) -> None:
+        with self._lock:
+            record.loop = loop_build.loop
+            record.outbox_sender = loop_build.outbox_sender
+
+    def _attach_recovered_loop(
+        self,
+        record: BackendRunRecord,
+        loop_build: BackendLoopBuild,
+    ) -> None:
+        self._attach_loop_build(record, loop_build)
+
+    async def _acquire_run_slot(self) -> None:
+        if self._run_semaphore is not None:
+            await self._run_semaphore.acquire()
+
+    def _release_run_slot(self) -> None:
+        if self._run_semaphore is not None:
+            self._run_semaphore.release()
+
+    def _active_loop_session(self, run_id: str, token: str) -> tuple[AgentLoop, SessionState]:
+        loop = self._session_boundary.authorize_active_loop(run_id, token)
+        record = self._record(run_id)
+        return loop, record.state
+
+    def _record_terminal_locked(self, record: BackendRunRecord) -> bool:
+        with self._lock:
+            return _record_terminal(record)
+
+    def _live_loop_snapshot(self, record: BackendRunRecord) -> tuple[AgentLoop | None, bool]:
+        with self._lock:
+            return record.loop, _record_terminal(record)
+
+    def _live_outbox_runs(self) -> list[tuple[BackendRunRecord, AgentLoop]]:
+        with self._lock:
+            return [
+                (record, record.loop)
+                for record in self._records.values()
+                if record.loop is not None
+                and record.outbox_sender is not None
+                and not _record_terminal(record)
+            ]
+
+    def _mark_cancel_requested(self, record: BackendRunRecord) -> bool:
+        with self._lock:
+            if _record_terminal(record):
+                return False
+            record.cancellation_token.cancel()
+            record.error = "run cancellation requested"
+            record.error_code = "cancelled"
+            return True
+
+    def _ensure_message_enqueue_allowed(self, record: BackendRunRecord) -> None:
+        with self._lock:
+            if _record_terminal(record):
+                raise ValueError("cannot send a message to a terminal run")
+            if record.message_queue.qsize() >= self.max_message_queue_depth:
+                raise ValueError("message queue is full; retry once the run drains it")
+
+    def _issue_task_callback_token(self, run_id: str, tenant_id: str, user_id: str, task_id: str) -> str:
+        return self.token_manager.issue(
+            kind="task_callback",
+            audience=TASK_CALLBACK_AUDIENCE,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            ttl_s=self.task_callback_token_ttl_s,
+            metadata={"task_id": task_id},
+        )
+
+    def _verify_task_callback_claims(self, run_id: str, token: str, task_id: str) -> None:
+        claims = self.token_manager.verify(
+            token, kind="task_callback", audience=TASK_CALLBACK_AUDIENCES, run_id=run_id
+        )
+        if str(claims.metadata.get("task_id") or "") != task_id:
+            raise PermissionDenied("callback token does not match this task")
+        record = self._active_record(run_id)
+        if record is not None and (claims.tenant_id != record.tenant_id or claims.user_id != record.user_id):
+            raise PermissionDenied("token subject mismatch")
 
     # --- Shared event loop (coroutine-per-run) ------------------------------------------
 
@@ -672,6 +847,34 @@ class RunnerBackend:
     def _call_soon(self, fn: Callable[..., Any], *args: Any) -> None:
         """Run a thread-safe callback on the process-shared run loop (fire-and-forget)."""
         _get_shared_loop().call_soon_threadsafe(fn, *args)
+
+    def _enqueue_message_and_checkpoint(self, record: BackendRunRecord, message: Any) -> None:
+        """Enqueue an inbox message on the shared loop and persist the queue snapshot before returning."""
+
+        def _enqueue_and_persist() -> None:
+            record.message_queue.put_nowait(message)
+            self._persist_run_checkpoint(record)
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is _get_shared_loop():
+            _enqueue_and_persist()
+            return
+
+        done: Future[None] = Future()
+
+        def _complete() -> None:
+            try:
+                _enqueue_and_persist()
+            except BaseException as exc:
+                done.set_exception(exc)
+            else:
+                done.set_result(None)
+
+        _get_shared_loop().call_soon_threadsafe(_complete)
+        done.result(timeout=10.0)
 
     def spawn_coroutine(self, coro: Any) -> Any:
         """Schedule a coroutine on the process-shared run loop; returns a
@@ -709,9 +912,8 @@ class RunnerBackend:
         Returns the run ids still non-terminal when the timeout elapsed (empty on a clean
         drain). Idempotent; safe to call before :meth:`shutdown`. This is the one-call
         counterpart to issuing a ``cancel_run`` per run and sleeping."""
-        terminal = {"completed", "failed", "limited"}
         with self._lock:
-            records = [record for record in self._records.values() if record.status not in terminal]
+            records = [record for record in self._records.values() if not _record_terminal(record)]
         for record in records:
             with self._lock:
                 record.cancellation_token.cancel()
@@ -724,7 +926,7 @@ class RunnerBackend:
         pending: list[str] = []
         for record in records:
             while time.time() < deadline:
-                if record.status in terminal:
+                if _record_terminal(record):
                     break
                 time.sleep(0.02)
             else:
@@ -746,96 +948,10 @@ class RunnerBackend:
         return self._submission_for(prepared)
 
     def _prepare_run_record(self, request: BackendRunRequest) -> _PreparedRun:
-        """Validate the request, mint the three run tokens, and store a queued run record.
-
-        Shared by ``submit_run`` (autonomous drive) and ``astream_run`` (stream-driven). Stops
-        at "record stored under lock" — the caller owns how the run is then driven."""
-        self._validate_request(request)
-        workspace_root = request.workspace_root.resolve()
-        self._check_workspace_allowed(workspace_root)
-        run_id = uuid.uuid4().hex
-        run_dir = self.run_root / run_id
-        run_token = self.token_manager.issue(
-            kind="run_access",
-            audience=BACKEND_AUDIENCE,
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            ttl_s=self.run_token_ttl_s,
-        )
-        tool_specs = _backend_builtin_tool_specs(self.subagent_definitions, self.tool_providers)
-        initial_runtime_config = request.runtime_config
-        runtime_config_issuer = "submit_run"
-        runtime_config_reason = "initial runtime config"
-        if initial_runtime_config is None and request.agent_definition is not None:
-            initial_runtime_config = AgentRuntimeConfig.from_definition(request.agent_definition)
-            runtime_config_reason = "initial agent definition"
-        elif initial_runtime_config is None:
-            raise ValueError("agent_definition or runtime_config is required")
-        validate_runtime_config(initial_runtime_config, tool_specs)
-        llm_gateway_token = self.token_manager.issue(
-            kind="llm_gateway",
-            audience="csp.llm-gateway",
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            ttl_s=self.llm_gateway_token_ttl_s,
-            metadata={"agent_config_hash": initial_runtime_config.config_hash},
-        )
-        web_gateway_token = ""
-        if _runtime_config_uses_web(initial_runtime_config):
-            if not self.web_gateway_url:
-                raise ValueError("web_gateway_url is required when runtime config binds web tools")
-            web_gateway_token = self.token_manager.issue(
-                kind="web_gateway",
-                audience="csp.web-gateway",
-                run_id=run_id,
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
-                ttl_s=self.web_gateway_token_ttl_s,
-                metadata={"agent_config_hash": initial_runtime_config.config_hash},
-            )
-        created_at = time.time()
-        record = BackendRunRecord(
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            workspace_root=workspace_root,
-            run_dir=run_dir,
-            status="queued",
-            created_at=created_at,
-            run_token_sha256=TokenManager.token_sha256(run_token),
-            llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
-            web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
-            runtime_config=initial_runtime_config,
-            runtime_config_issuer=runtime_config_issuer,
-            runtime_config_reason=runtime_config_reason,
-            runtime_config_committed_at=created_at,
-        )
-        self._write_run_meta(record, request)
-        with self._lock:
-            self._records[run_id] = record
-        return _PreparedRun(
-            run_id=run_id,
-            record=record,
-            workspace_root=workspace_root,
-            run_token=run_token,
-            llm_gateway_token=llm_gateway_token,
-            web_gateway_token=web_gateway_token,
-        )
+        return self._run_preparation.prepare(request)
 
     def _submission_for(self, prepared: _PreparedRun) -> BackendRunSubmission:
-        run_id = prepared.run_id
-        return BackendRunSubmission(
-            run_id=run_id,
-            run_token=prepared.run_token,
-            status="queued",
-            run_dir=prepared.record.run_dir,
-            status_url=f"/v1/runs/{run_id}/status",
-            result_url=f"/v1/runs/{run_id}/result",
-            events_url=f"/v1/runs/{run_id}/events",
-            proposal_url=f"/v1/runs/{run_id}/proposal",
-        )
+        return self._run_preparation.submission_for(prepared)
 
     def _run_spec_for_request(
         self,
@@ -843,215 +959,34 @@ class RunnerBackend:
         request: BackendRunRequest,
         workspace_root: Path,
     ) -> AgentRunSpec:
-        return AgentRunSpec(
-            workspace_root=workspace_root,
-            run_root=self.run_root,
-            run_id=run_id,
-            mode=request.mode,
-            workspace_backend=request.workspace_backend,
-            limits=RunLimits(
-                max_steps=request.max_steps,
-                max_tool_calls=request.max_tool_calls,
-                max_bytes_read=request.max_bytes_read,
-                max_duration_s=request.max_duration_s,
-            ),
-            permission_policy=request.permission_policy,
-            metadata={
-                **request.metadata,
-                "tenant_id": request.tenant_id,
-                "user_id": request.user_id,
-            },
-        )
+        return self._loop_factory.run_spec_for_request(run_id, request, workspace_root)
 
     def status(self, run_id: str, token: str) -> dict[str, Any]:
-        run_dir = self._authorized_run_dir(run_id, token)
-        status_file = run_dir / "status.json"
-        status_payload: dict[str, Any] | None = None
-        if status_file.exists():
-            # Resilient read: the run is concurrently flipping status.json via an atomic
-            # os.replace; on Windows a plain read mid-replace hits a sharing violation. Mirror
-            # the writer's retry (write_json_atomic / _atomic_replace) so the poll closes the race.
-            status_payload = json.loads(read_text_resilient(status_file))
-        with self._lock:
-            record = self._records.get(run_id)
-        if record is None:
-            # Historical run (no live record, e.g. after a restart): report from status.json.
-            return {
-                "run_id": run_id,
-                "status": (status_payload or {}).get("status", "ended"),
-                "run_dir": str(run_dir),
-                "status_file": status_payload,
-            }
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "user_id": record.user_id,
-            "status": record.status,
-            "created_at": record.created_at,
-            "started_at": record.started_at,
-            "finished_at": record.finished_at,
-            "run_dir": str(record.run_dir),
-            "last_event_seq": record.last_event_seq,
-            "last_event_type": record.last_event_type,
-            "error": record.error,
-            "error_code": record.error_code,
-            # Prefer the live park-point capture; fall back to the terminal result for
-            # stream-driven runs (astream_run) that record an AgentRunResult without ever
-            # passing through _drive_open_session, where last_final_output stays None.
-            "final_output": _json_safe(
-                record.last_final_output
-                if record.last_final_output is not None
-                else (record.result.final_output if record.result is not None else None)
-            ),
-            "status_file": status_payload,
-        }
+        return self._projection.status(run_id, token)
 
     def result(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        if record.result is None:
-            return {
-                "run_id": record.run_id,
-                "tenant_id": record.tenant_id,
-                "status": record.status,
-                "ready": False,
-                "error": record.error,
-                "error_code": record.error_code,
-            }
-        result = record.result
-        diff_text = result.diff_path.read_text(encoding="utf-8") if result.diff_path.exists() else ""
-        proposal_payload = self._read_proposal(record)
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "status": result.status,
-            "ready": True,
-            "final_text": result.final_text,
-            "final_output": _json_safe(result.final_output),
-            "error": result.error,
-            "error_code": result.error_code,
-            "run_dir": str(result.run_dir),
-            "manifest_path": str(result.run_dir / "manifest.json"),
-            "diff_path": str(result.diff_path),
-            "diff": diff_text,
-            "proposal_path": str(result.proposal_path),
-            "proposal": proposal_payload,
-            "artifacts": [artifact.__dict__ for artifact in result.artifacts],
-            "metrics": result.metrics,
-        }
+        return self._projection.result(run_id, token)
 
     def proposal(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        payload = self._read_proposal(record)
-        if payload is None:
-            return {
-                "run_id": record.run_id,
-                "tenant_id": record.tenant_id,
-                "status": record.status,
-                "ready": False,
-                "error": record.error,
-            }
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "status": record.status,
-            "ready": True,
-            **payload,
-        }
+        return self._proposal.proposal(run_id, token)
 
     def proposal_diff(self, run_id: str, token: str) -> dict[str, Any]:
         """The unified diff of the current proposal, on demand (works mid-run, not only at the
         end like ``result()``). Token-scoped so an embedder never reads the run dir off disk.
         Binary files appear as a ``<binary sha256=… size=…>`` marker line in the patch."""
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        diff_path = record.run_dir / "diff.patch"
-        diff = diff_path.read_text(encoding="utf-8") if diff_path.exists() else ""
-        return {"run_id": run_id, "ready": diff_path.exists(), "diff": diff}
+        return self._proposal.proposal_diff(run_id, token)
 
     def cancel_run(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        with self._lock:
-            if record.status in {"completed", "failed", "limited"}:
-                return {
-                    "run_id": record.run_id,
-                    "tenant_id": record.tenant_id,
-                    "status": record.status,
-                    "cancel_requested": False,
-                    "error": record.error,
-                    "error_code": record.error_code,
-                }
-            record.cancellation_token.cancel()
-            record.error = "run cancellation requested"
-            record.error_code = "cancelled"
-        # Wake a run parked on its message queue so it stops promptly. The put runs on the
-        # shared loop (asyncio.Queue is not thread-safe), scheduled from this thread.
-        self._call_soon(record.message_queue.put_nowait, _CLOSE_SESSION)
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "status": record.status,
-            "cancel_requested": True,
-            "error": record.error,
-            "error_code": record.error_code,
-        }
+        return self._session_boundary.cancel_run(run_id, token)
 
     def interrupt_turn(self, run_id: str, token: str) -> dict[str, Any]:
-        """Turn-level stop (keeps the session alive): signal the loop to halt the current
-        turn at its next step boundary; the driver then parks for the next message. Unlike
-        :meth:`cancel_run` this does NOT terminalize the run. A no-op on a terminal or
-        not-yet-built run. The flag set is a thread-safe one-way signal (like cancel)."""
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        with self._lock:
-            loop = record.loop
-            terminal = record.status in {"completed", "failed", "limited"}
-        requested = not terminal and loop is not None
-        if requested:
-            loop.interrupt_turn()
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "status": record.status,
-            "interrupt_requested": requested,
-        }
+        return self._session_boundary.interrupt_turn(run_id, token)
 
     def pause_run(self, run_id: str, token: str) -> dict[str, Any]:
-        """Cooperative pause (keeps the session alive): signal the loop to freeze the current
-        turn at its next start-of-step boundary; the driver then parks until a resume wakes it.
-        A no-op on a terminal or not-yet-built run. The flag set is a thread-safe one-way signal
-        (like cancel/interrupt). Resume via the ``resume`` control command (``signal_resume``)."""
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        with self._lock:
-            loop = record.loop
-            terminal = record.status in {"completed", "failed", "limited"}
-        requested = not terminal and loop is not None
-        if requested:
-            loop.pause_turn()
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "status": record.status,
-            "pause_requested": requested,
-        }
+        return self._session_boundary.pause_run(run_id, token)
 
     def signal_resume(self, run_id: str, token: str) -> dict[str, Any]:
-        """Wake a paused *live* run: push a resume signal so the driver re-pumps the frozen turn
-        with no new input. For a run not currently in memory (parked after a restart), use
-        :meth:`resume_run` (checkpoint recovery) instead — the ``resume`` control command picks
-        the right one. A no-op on a terminal run."""
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        with self._lock:
-            terminal = record.status in {"completed", "failed", "limited"}
-        if terminal:
-            return {"run_id": run_id, "status": record.status, "resumed": False}
-        # asyncio.Queue is not thread-safe; schedule the put on the shared loop.
-        self._call_soon(record.message_queue.put_nowait, _RESUME_SESSION)
-        return {"run_id": run_id, "status": record.status, "resumed": True}
+        return self._session_boundary.signal_resume(run_id, token)
 
     def revoke_capability(
         self,
@@ -1063,140 +998,17 @@ class RunnerBackend:
         before: float | None = None,
         reason: str = "",
     ) -> dict[str, Any]:
-        """Revoke a capability lease on a *live* run (the operator/Daemon kill switch). Mirrors
-        :meth:`pause_run`: signal the loop directly (a thread-safe vault mutation). A no-op on a
-        terminal or not-in-memory run (revoking a parked-and-evicted run is not supported in v1 —
-        load it first). The ``capability.denied`` audit event is emitted on the loop thread when the
-        next gated call hits the revocation."""
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        with self._lock:
-            loop = record.loop
-            terminal = record.status in {"completed", "failed", "limited"}
-        summary: dict[str, Any] = {}
-        revoked = not terminal and loop is not None
-        if revoked:
-            summary = loop.revoke_capability(
-                capability=capability, lease_id=lease_id, before=before, reason=reason
-            )
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "status": record.status,
-            "revoked": revoked,
-            **summary,
-        }
+        return self._session_boundary.revoke_capability(
+            run_id,
+            token,
+            capability=capability,
+            lease_id=lease_id,
+            before=before,
+            reason=reason,
+        )
 
     def dispatch(self, command: ControlCommand) -> ControlResult:
-        """Reference ``ControlDispatcher``: route one ``ControlCommand`` to the in-process method
-        that already backs it. The run token travels in ``command.args['token']`` (the HTTP layer
-        injects the bearer token); it is consumed here and never echoed back. Auth failures
-        propagate (the HTTP layer maps them to 401); a missing run is reported as ``unsupported``;
-        a controlled operation error is reported as ``error`` with its code. Unknown command types
-        return ``unsupported`` — the wire vocabulary stays forward-compatible."""
-        args = dict(command.args)
-        token = str(args.pop("token", "") or "")
-        run_id = command.run_id
-        ctype = command.type
-        command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
-        idempotency_key = command.command_id or command_id
-        token_sha256 = TokenManager.token_sha256(token) if token else ""
-        started = time.time()
-
-        audit_authorized = False
-        try:
-            self._authorize_control_audit_target(run_id, token, command_type=ctype, args=args)
-            audit_authorized = True
-            self._emit_control_audit_event(
-                run_id,
-                "control.command.received",
-                _CONTROL_AUDIT_POLICY.received_payload(
-                    command_id=command_id,
-                    command_type=ctype,
-                    target_run_id=run_id,
-                    actor=command.issuer,
-                    reason=command.reason,
-                    token_sha256=token_sha256,
-                    idempotency_key=idempotency_key,
-                    args=command.args,
-                ),
-            )
-            result = self._dispatch_control_command(
-                command,
-                args=args,
-                token=token,
-                command_id=command_id,
-            )
-        except PermissionDenied as exc:
-            if audit_authorized:
-                self._emit_control_audit_event(
-                    run_id,
-                    "control.command.failed",
-                    _CONTROL_AUDIT_POLICY.failed_payload(
-                        command_id=command_id,
-                        command_type=ctype,
-                        target_run_id=run_id,
-                        actor=command.issuer,
-                        idempotency_key=idempotency_key,
-                        token_sha256=token_sha256,
-                        status="error",
-                        error=str(exc),
-                        error_code=getattr(exc, "error_code", "permission_denied"),
-                        duration_ms=(time.time() - started) * 1000,
-                    ),
-                    level="warning",
-                )
-            raise  # auth failures map to HTTP 401 in the route layer
-        except KeyError as exc:
-            result = ControlResult(
-                run_id=run_id, type=ctype, status="unsupported", error=str(exc), error_code="run_not_found"
-            )
-        except (ValueError, NativeAgentError) as exc:
-            result = ControlResult(
-                run_id=run_id,
-                type=ctype,
-                status="error",
-                error=str(exc),
-                error_code=getattr(exc, "error_code", "control_error"),
-            )
-
-        duration_ms = (time.time() - started) * 1000
-        if result.status == "ok":
-            self._emit_control_audit_event(
-                run_id,
-                "control.command.completed",
-                _CONTROL_AUDIT_POLICY.completed_payload(
-                    command_id=command_id,
-                    command_type=ctype,
-                    target_run_id=run_id,
-                    actor=command.issuer,
-                    idempotency_key=idempotency_key,
-                    token_sha256=token_sha256,
-                    status=result.status,
-                    result_code=result.error_code or result.status,
-                    state=result.state,
-                    duration_ms=duration_ms,
-                ),
-            )
-        else:
-            self._emit_control_audit_event(
-                run_id,
-                "control.command.failed",
-                _CONTROL_AUDIT_POLICY.failed_payload(
-                    command_id=command_id,
-                    command_type=ctype,
-                    target_run_id=run_id,
-                    actor=command.issuer,
-                    idempotency_key=idempotency_key,
-                    token_sha256=token_sha256,
-                    status=result.status,
-                    error=result.error,
-                    error_code=result.error_code,
-                    duration_ms=duration_ms,
-                ),
-                level="warning",
-            )
-        return result
+        return self._commands.dispatch(command)
 
     def _dispatch_control_command(
         self,
@@ -1206,117 +1018,11 @@ class RunnerBackend:
         token: str,
         command_id: str,
     ) -> ControlResult:
-        run_id = command.run_id
-        ctype = command.type
-
-        def ok(data: dict[str, Any], *, state: str | None = None) -> ControlResult:
-            return ControlResult(run_id=run_id, type=ctype, status="ok", state=state, data=dict(data))
-
-        if ctype == "pause":
-            return ok(self.pause_run(run_id, token))
-        if ctype == "resume":
-            with self._lock:
-                live = run_id in self._records
-            return ok(self.signal_resume(run_id, token) if live else self.resume_run(run_id, token))
-        if ctype == "cancel":
-            return ok(self.cancel_run(run_id, token))
-        if ctype in {"approve", "deny"}:
-            result = args.get("result") if isinstance(args.get("result"), dict) else {}
-            approval_result = dict(result)
-            if ctype == "approve":
-                approval_result["answer"] = str(args.get("answer") or "Approve")
-                approval_result["approved"] = True
-            else:
-                approval_result = sanitize_denied_capability_result(
-                    result,
-                    answer=str(args.get("answer") or "Deny"),
-                    reason=command.reason or str(args.get("reason") or approval_result.get("reason") or "denied"),
-                )
-            return ok(
-                self.report_task_result(
-                    run_id,
-                    token,
-                    task_id=str(args.get("task_id") or ""),
-                    result=approval_result,
-                    status=str(args.get("status") or "answered"),
-                )
-            )
-        if ctype == "interrupt":
-            return ok(self.interrupt_turn(run_id, token))
-        if ctype in {"inspect", "health"}:
-            loop = self._authorize_active_loop(run_id, token)
-            # Seed the throwaway facade with the record's authoritative FSM state (the backend
-            # drives the loop directly, so the facade's own cache never tracked this run).
-            session = LoopSession(loop, _state=self._record(run_id).session_state)
-            if ctype == "inspect":
-                inspection = session.inspect()
-                return ok(inspection.to_json(), state=inspection.state.value)
-            health = session.health()
-            return ok(health.to_json(), state=health.state.value)
-        if ctype == "status":
-            return ok(self.status(run_id, token))
-        if ctype == "runtime_config":
-            return ok(self.runtime_config(run_id, token))
-        if ctype == "replace_runtime_config":
-            return ok(
-                self.replace_runtime_config(
-                    run_id,
-                    token,
-                    expected_version=int(args.get("expected_version", 0)),
-                    issuer=command.issuer,
-                    reason=command.reason,
-                    config=AgentRuntimeConfig.from_json(args["config"]),
-                )
-            )
-        if ctype == "send_message":
-            # A control command carries its own id (command_id) — use it as the inbox dedup key
-            # so a redelivered control send is processed once.
-            return ok(
-                self.send_message(
-                    run_id,
-                    token,
-                    content=args.get("content") or "",
-                    message_id=command_id,
-                    source="control",
-                )
-            )
-        if ctype == "create_task":
-            return ok(
-                self.create_task(
-                    run_id,
-                    token,
-                    kind=str(args.get("kind") or ""),
-                    request=dict(args.get("request") or {}),
-                )
-            )
-        if ctype == "report_task_result":
-            return ok(
-                self.report_task_result(
-                    run_id,
-                    token,
-                    task_id=str(args.get("task_id") or ""),
-                    result=dict(args.get("result") or {}),
-                    status=str(args.get("status") or "answered"),
-                )
-            )
-        if ctype == "revoke_capability":
-            before = args.get("before")
-            return ok(
-                self.revoke_capability(
-                    run_id,
-                    token,
-                    capability=(str(args["capability"]) if args.get("capability") else None),
-                    lease_id=(str(args["lease_id"]) if args.get("lease_id") else None),
-                    before=(float(before) if before is not None else None),
-                    reason=command.reason,
-                )
-            )
-        return ControlResult(
-            run_id=run_id,
-            type=ctype,
-            status="unsupported",
-            error=f"unknown control command type: {ctype}",
-            error_code="unknown_control_command",
+        return self._commands.dispatch_control_command(
+            command,
+            args=args,
+            token=token,
+            command_id=command_id,
         )
 
     def _emit_control_audit_event(
@@ -1337,27 +1043,7 @@ class RunnerBackend:
         *,
         level: str = "info",
     ) -> None:
-        if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
-            return
-        with self._lock:
-            record = self._records.get(run_id)
-            loop = record.loop if record is not None else None
-            run_dir = record.run_dir if record is not None else self.run_root / run_id
-        direct_append_allowed = False
-        if record is not None:
-            if loop is not None and loop.emit_external_event(event_type, data=data, level=level):
-                return
-            direct_append_allowed = _RUN_EVENT_SEQUENCER.is_queued_before_recorder(record.status)
-            if not direct_append_allowed and _RUN_EVENT_SEQUENCER.requires_live_sequence_owner(record.status):
-                return
-        if not run_dir.exists():
-            return
-        if not direct_append_allowed and not _run_dir_allows_direct_audit_append(run_dir):
-            return
-        try:
-            append_event_to_run(run_dir, event_type, data=data, level=level)
-        except OSError:
-            _LOGGER.debug("backend event write skipped", exc_info=True)
+        self._run_state.emit_backend_event(run_id, event_type, data, level=level)
 
     def _authorize_control_audit_target(
         self,
@@ -1367,28 +1053,18 @@ class RunnerBackend:
         command_type: str = "",
         args: Mapping[str, Any] | None = None,
     ) -> None:
-        if _CONTROL_AUDIT_POLICY.accepts_callback_token(command_type):
-            try:
-                self._verify_task_callback_token(run_id, token, str((args or {}).get("task_id") or ""))
-                return
-            except TokenError:
-                pass
-        claims = self._verify_run_token(run_id, token)
-        self._authorize_claim_subject(run_id, claims)
+        self._commands.authorize_control_audit_target(
+            run_id,
+            token,
+            command_type=command_type,
+            args=dict(args or {}),
+        )
 
     def _authorize_claim_subject(self, run_id: str, claims: Any) -> None:
-        with self._lock:
-            record = self._records.get(run_id)
-        if record is not None and (claims.tenant_id != record.tenant_id or claims.user_id != record.user_id):
-            raise PermissionDenied("token subject mismatch")
+        self._session_boundary.authorize_claim_subject(run_id, claims)
 
     def _verify_task_callback_token(self, run_id: str, token: str, task_id: str) -> None:
-        claims = self.token_manager.verify(
-            token, kind="task_callback", audience=TASK_CALLBACK_AUDIENCES, run_id=run_id
-        )
-        if str(claims.metadata.get("task_id") or "") != task_id:
-            raise PermissionDenied("callback token does not match this task")
-        self._authorize_claim_subject(run_id, claims)
+        self._session_boundary.verify_task_callback_token(run_id, token, task_id)
 
     def send_message(
         self,
@@ -1405,88 +1081,25 @@ class RunnerBackend:
         message_type: str = "user_message",
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Deliver a follow-up user message to a running multi-turn session. It is queued and
-        consumed as the next user turn once the current turn settles.
-
-        ``content`` is either a plain ``str`` or a sequence of content parts (``ContentPart``
-        dataclasses or their JSON dicts) for a multimodal message. Multimodal parts reference
-        workspace files by ``source_ref`` — the bytes are resolved at wire-build time — so the
-        message itself stays small; the size limit applies to the by-reference wire form.
-
-        The message is wrapped in an ``inbox-message.v1`` envelope (provenance + idempotency). A
-        caller-supplied ``message_id`` is the dedup key: re-sending it (a retry) is processed once —
-        an already-processed id short-circuits to ``status="duplicate"``. Absent an id, a uuid is
-        minted (only duplicates still in flight dedup)."""
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        # Already-processed id -> idempotent no-op (the dequeue-time check below catches the rest).
-        if message_id and message_id in record.seen_inbox_ids:
-            return {"run_id": run_id, "status": "duplicate", "message_id": message_id}
-        message = _normalize_inbound_message(content)
-        # Normalize inline (data:) media to durable blobs BEFORE queueing, so the queue — and any
-        # checkpoint taken while the message is still unconsumed — carries only small blob: refs,
-        # never the bytes inline. The loop resolves these via the checkpoint-store blob_reader.
-        if isinstance(message, list) and self.checkpoint_store is not None:
-            pending: dict[str, bytes] = {}
-            message = normalize_inline_media_dicts(message, pending)
-            for data in pending.values():
-                self.checkpoint_store.put_blob(run_id, data)
-        envelope = InboxMessage(
-            content=message,
-            id=message_id or f"inbox_{uuid.uuid4().hex[:12]}",
+        return self._session_boundary.send_message(
+            run_id,
+            token,
+            content,
+            message_id=message_id,
             source=source,
-            type=message_type,
-            run_id=run_id,
             correlation_id=correlation_id,
             causation_id=causation_id,
             traceparent=traceparent,
             tracestate=tracestate,
-            metadata=dict(metadata or {}),
+            message_type=message_type,
+            metadata=metadata,
         )
-        wire_bytes = len(json.dumps(envelope.to_json()).encode("utf-8"))
-        if wire_bytes > self.max_message_bytes:
-            raise ValueError(f"message exceeds the {self.max_message_bytes}-byte limit")
-        with self._lock:
-            if record.status in {"completed", "failed", "limited"}:
-                raise ValueError("cannot send a message to a terminal run")
-            if record.message_queue.qsize() >= self.max_message_queue_depth:
-                raise ValueError("message queue is full; retry once the run drains it")
-        # Enqueue on the shared loop (asyncio.Queue is not thread-safe across threads).
-        self._call_soon(record.message_queue.put_nowait, envelope.to_json())
-        return {"run_id": run_id, "status": "queued", "message_id": envelope.id}
 
     def current_runtime_config(self, run_id: str) -> AgentRuntimeConfig | None:
-        record = self._record(run_id)
-        with self._lock:
-            return record.runtime_config
+        return self._runtime_config.current_runtime_config(run_id)
 
     def runtime_config(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        with self._lock:
-            config = record.runtime_config
-            if config is None:
-                return {
-                    "run_id": record.run_id,
-                    "tenant_id": record.tenant_id,
-                    "ready": False,
-                    "config_version": 0,
-                    "config_hash": "",
-                    "issuer": record.runtime_config_issuer,
-                    "reason": record.runtime_config_reason,
-                    "committed_at": record.runtime_config_committed_at,
-                }
-            return {
-                "run_id": record.run_id,
-                "tenant_id": record.tenant_id,
-                "ready": True,
-                "issuer": record.runtime_config_issuer,
-                "reason": record.runtime_config_reason,
-                "committed_at": record.runtime_config_committed_at,
-                "config": config.to_json(),
-                "config_version": config.config_version,
-                "config_hash": config.config_hash,
-            }
+        return self._runtime_config.runtime_config(run_id, token)
 
     def replace_runtime_config(
         self,
@@ -1498,47 +1111,14 @@ class RunnerBackend:
         reason: str,
         config: AgentRuntimeConfig,
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        validate_runtime_config(
-            config, _backend_builtin_tool_specs(self.subagent_definitions, self.tool_providers)
+        return self._runtime_config.replace_runtime_config(
+            run_id,
+            token,
+            expected_version=expected_version,
+            issuer=issuer,
+            reason=reason,
+            config=config,
         )
-        record = self._record(run_id)
-        with self._lock:
-            if record.status in {"completed", "failed", "limited"}:
-                raise ValueError("cannot update runtime config for a terminal run")
-            current_version = record.runtime_config.config_version if record.runtime_config else 0
-            if expected_version != current_version:
-                raise ValueError(
-                    f"runtime config version mismatch: expected {expected_version}, current {current_version}"
-                )
-            if config.config_version <= current_version:
-                # Auto-bump the version, preserving every other field (incl. output_validators).
-                # replace() copies all fields, so a new config field can't be silently dropped on
-                # hot-swap (an enumerated rebuild here previously dropped output-validator opt-outs).
-                config = replace(config, config_version=current_version + 1)
-            committed_at = time.time()
-            self._write_runtime_config_run_meta(
-                record,
-                config,
-                issuer=issuer,
-                reason=reason,
-                committed_at=committed_at,
-            )
-            record.runtime_config = config
-            record.runtime_config_issuer = issuer
-            record.runtime_config_reason = reason
-            record.runtime_config_committed_at = committed_at
-            return {
-                "run_id": record.run_id,
-                "tenant_id": record.tenant_id,
-                "ready": True,
-                "issuer": issuer,
-                "reason": reason,
-                "committed_at": committed_at,
-                "config": config.to_json(),
-                "config_version": config.config_version,
-                "config_hash": config.config_hash,
-            }
 
     def report_task_result(
         self,
@@ -1549,18 +1129,13 @@ class RunnerBackend:
         result: dict[str, Any],
         status: str = "answered",
     ) -> dict[str, Any]:
-        """Deliver a hosted-task result (e.g. a human answer, an automation
-        callback) into a running run, waking it if parked. Accepts a per-task
-        callback token (scoped to this run+task) or the run token (operator)."""
-        loop = self._authorize_task_result(run_id, token, task_id)
-        reported = loop.report_task_result(
-            task_id,
-            result,
+        return self._session_boundary.report_task_result(
+            run_id,
+            token,
+            task_id=task_id,
+            result=result,
             status=status,
-            persist_checkpoint=False,
         )
-        self._persist_run_checkpoint_from_any_thread(self._record(run_id))
-        return reported
 
     def create_task(
         self,
@@ -1570,71 +1145,19 @@ class RunnerBackend:
         kind: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
-        """Backend-initiated task creation in a running run (automation/hitl).
-
-        Returns the task id plus a scoped callback token and URL an external system
-        POSTs to when it completes the work (Trigger.dev wait-token style)."""
-        loop = self._authorize_active_loop(run_id, token)
-        record = self._record(run_id)
-        task_id = loop.create_task(kind, request)
-        callback_token = self.token_manager.issue(
-            kind="task_callback",
-            audience=TASK_CALLBACK_AUDIENCE,
-            run_id=run_id,
-            tenant_id=record.tenant_id,
-            user_id=record.user_id,
-            ttl_s=self.task_callback_token_ttl_s,
-            metadata={"task_id": task_id},
-        )
-        return {
-            "task_id": task_id,
-            "callback_token": callback_token,
-            "callback_url": f"/v1/runs/{run_id}/tasks/{task_id}/result",
-        }
+        return self._session_boundary.create_task(run_id, token, kind=kind, request=request)
 
     def _authorize_active_loop(self, run_id: str, token: str) -> AgentLoop:
-        self._authorize_run(run_id, token)
-        return self._active_loop(run_id)
+        return self._session_boundary.authorize_active_loop(run_id, token)
 
     def _authorize_task_result(self, run_id: str, token: str, task_id: str) -> AgentLoop:
-        """A task result may be reported with a per-task callback token (scoped to
-        run+task) or the run token (operator). Try the scoped token first."""
-        try:
-            self._verify_task_callback_token(run_id, token, task_id)
-        except TokenError:
-            self._authorize_run(run_id, token)
-        return self._active_loop(run_id)
+        return self._session_boundary.authorize_task_result(run_id, token, task_id)
 
     def _active_loop(self, run_id: str) -> AgentLoop:
-        record = self._record(run_id)
-        with self._lock:
-            if record.status in {"completed", "failed", "limited"}:
-                raise ValueError("cannot drive tasks for a terminal run")
-            loop = record.loop
-        if loop is None:
-            raise ValueError("run has not started")
-        return loop
+        return self._session_boundary.active_loop(run_id)
 
     def proposal_file(self, run_id: str, token: str, path: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        proposal = self._read_proposal(record)
-        if proposal is None:
-            raise ValueError("proposal snapshot is not ready")
-        try:
-            file_payload = read_proposal_file_payload(record.run_dir, proposal, path)
-        except ProposalFileError as exc:
-            if exc.reason in {"not_found", "snapshot_missing"}:
-                raise KeyError(str(exc)) from exc
-            if exc.reason == "escapes_run_dir":
-                raise PermissionDenied(str(exc)) from exc
-            raise ValueError(str(exc)) from exc
-        return {
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "status": record.status,
-            **file_payload,
-        }
+        return self._proposal.proposal_file(run_id, token, path)
 
     def export_proposal_package(self, run_id: str, token: str) -> dict[str, Any]:
         """Build the portable proposal package and return a RECEIPT — never a filesystem path.
@@ -1643,25 +1166,7 @@ class RunnerBackend:
         bytes) is the retrieval handle for :meth:`read_run_artifact`. This keeps the
         "embedder never reads run_dir off disk" invariant for binary artifacts too: a remote
         embedder fetches the bytes back by digest, exactly like Bazel CAS / an OCI blob."""
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        output = record.run_dir / "proposal.tar"
-        payload = export_package(record.run_dir, output)
-        tar_bytes = output.read_bytes()
-        assert self.checkpoint_store is not None
-        digest = self.checkpoint_store.put_blob(run_id, tar_bytes)
-        self._emit_backend_event(
-            run_id,
-            "proposal.package.exported",
-            data={"package_hash": payload["package_hash"], "digest": digest, "size_bytes": len(tar_bytes)},
-        )
-        return {
-            "package_hash": payload["package_hash"],
-            "digest": digest,  # the fetch handle (sha256 of the tar bytes)
-            "size_bytes": len(tar_bytes),
-            "media_type": "application/x-tar",
-            "name": "proposal.tar",  # advisory filename for Content-Disposition only
-        }
+        return self._proposal.export_proposal_package(run_id, token)
 
     def read_run_artifact(
         self, run_id: str, token: str, digest: str, *, offset: int = 0, limit: int | None = None
@@ -1674,17 +1179,7 @@ class RunnerBackend:
         streaming/range fetch is a non-breaking addition; today they slice the in-memory bytes.
         Raises ``KeyError`` (→ 404) when the digest is unknown for this run, ``ValueError`` (→ 400)
         for a malformed digest."""
-        self._authorize_run(run_id, token)
-        if not _ARTIFACT_DIGEST_RE.match(digest):
-            raise ValueError("digest must be a 64-char sha256 hex string")
-        assert self.checkpoint_store is not None
-        try:
-            data = self.checkpoint_store.get_blob(run_id, digest)
-        except KeyError as exc:
-            raise KeyError(f"artifact not found: {digest}") from exc
-        if offset or limit is not None:
-            data = data[offset : (None if limit is None else offset + limit)]
-        return data
+        return self._proposal.read_run_artifact(run_id, token, digest, offset=offset, limit=limit)
 
     def approve_proposal(
         self,
@@ -1695,21 +1190,13 @@ class RunnerBackend:
         approved_paths: tuple[str, ...] = (),
         note: str = "",
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        approval = create_approval(
-            record.run_dir,
+        return self._proposal.approve_proposal(
+            run_id,
+            token,
             approver_id=approver_id,
-            approved_paths=approved_paths or None,
+            approved_paths=approved_paths,
             note=note,
         )
-        write_approval(record.run_dir / "approval.json", approval)
-        self._emit_backend_event(
-            run_id,
-            "proposal.approved",
-            data={"approval_hash": approval["approval_hash"], "package_hash": approval["package_hash"]},
-        )
-        return approval
 
     def reject_proposal(
         self,
@@ -1719,21 +1206,7 @@ class RunnerBackend:
         approver_id: str,
         reason: str,
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        approval = create_approval(
-            record.run_dir,
-            approver_id=approver_id,
-            decision="rejected",
-            note=reason,
-        )
-        write_approval(record.run_dir / "approval.json", approval)
-        self._emit_backend_event(
-            run_id,
-            "proposal.rejected",
-            data={"approval_hash": approval["approval_hash"], "package_hash": approval["package_hash"]},
-        )
-        return approval
+        return self._proposal.reject_proposal(run_id, token, approver_id=approver_id, reason=reason)
 
     def apply_proposal(
         self,
@@ -1744,76 +1217,21 @@ class RunnerBackend:
         approval_path: Path | None = None,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        if not self.allowed_apply_roots:
-            raise PermissionDenied("proposal apply is disabled")
-        target = target.resolve()
-        if not any(is_within(root, target) for root in self.allowed_apply_roots):
-            raise PermissionDenied(f"apply target is outside allowed roots: {target}")
-        record = self._record(run_id)
-        approval = approval_path or (record.run_dir / "approval.json")
-        result = apply_package(record.run_dir, approval=approval, target=target, dry_run=dry_run)
-        write_apply_result(record.run_dir / "apply-result.json", result)
-        event_type = "proposal.conflict" if result.status == "conflict" else "proposal.applied"
-        self._emit_backend_event(
+        return self._proposal.apply_proposal(
             run_id,
-            event_type,
-            data={
-                "status": result.status,
-                "approval_hash": result.approval_hash,
-                "package_hash": result.package_hash,
-                "applied_paths": list(result.applied_paths),
-                "conflicts": [conflict.to_json() for conflict in result.conflicts],
-            },
-            level="warning" if result.status == "conflict" else "info",
+            token,
+            target=target,
+            approval_path=approval_path,
+            dry_run=dry_run,
         )
-        return result.to_json()
 
     def events(
         self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
     ) -> dict[str, Any]:
-        events_path = self._authorized_run_dir(run_id, token) / "events.jsonl"
-        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
-        return {"run_id": run_id, **page}
+        return self._projection.events(run_id, token, from_seq=from_seq, limit=limit)
 
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
-        if event_limit < 1:
-            raise ValueError("event_limit must be positive")
-        run_dir = self._authorized_run_dir(run_id, token)
-        status = self.status(run_id, token)
-        status_file = status.get("status_file") if isinstance(status.get("status_file"), dict) else {}
-        from_seq = _RUN_EVENT_SEQUENCER.diagnostics_from_seq(
-            status,
-            status_file,
-            event_limit=event_limit,
-        )
-        event_page = _read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=event_limit)
-        event_summaries = [_diagnostic_event_summary(event) for event in event_page["events"]]
-        control_events = [
-            event for event in event_summaries if str(event.get("type") or "").startswith("control.command.")
-        ]
-        failure = _read_optional_json(run_dir / "failure.json")
-        recover_attempts = self._read_recover_attempts(run_dir)
-        return {
-            "run_id": run_id,
-            "status": status,
-            "failure": failure,
-            "recovery": {
-                "attempts": recover_attempts,
-                "max_attempts": self.max_recover_attempts,
-                "failure_marked": failure is not None,
-                "unrecoverable": bool(failure and failure.get("error_code") == "unrecoverable"),
-            },
-            "events": {
-                "from_seq": from_seq,
-                "next_seq": event_page["next_seq"],
-                "has_more": event_page["has_more"],
-                "items": event_summaries,
-            },
-            "control": {"events": control_events},
-            "subagents": subagent_diagnostics_from_events(event_page["events"]),
-            "trace_ids": _trace_ids_from_events(event_page["events"]),
-        }
+        return self._projection.diagnostics(run_id, token, event_limit=event_limit)
 
     def descendant_events(
         self,
@@ -1824,37 +1242,19 @@ class RunnerBackend:
         from_seq: int = 0,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """Stream a descendant (subagent) run's events, authorized via the ancestor's run token.
-
-        A spawned subagent is an isolated child run (id ``<parent>.sub.<task>``) under the same
-        run_root but with NO backend record/token, so :meth:`events` can't reach it. The owner of
-        an ancestor run reads a descendant's events.jsonl here — its tool calls + token deltas —
-        for live subagent observability, without touching the filesystem itself. Authorization is
-        the ancestor's token plus an id-prefix descendant check (a subagent id always extends its
-        parent's with ``.sub.<task>``, at any depth)."""
-        self._authorize_run(run_id, token)
-        try:
-            validate_descendant_run_id(run_id, descendant_run_id)
-        except ValueError as exc:
-            raise PermissionDenied(str(exc)) from exc
-        events_path = self.run_root / descendant_run_id / "events.jsonl"
-        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
-        return {"run_id": descendant_run_id, **page}
+        return self._projection.descendant_events(
+            run_id,
+            token,
+            descendant_run_id,
+            from_seq=from_seq,
+            limit=limit,
+        )
 
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        jobs = list_job_artifacts(record.run_dir)
-        return {"run_id": run_id, "tenant_id": record.tenant_id, "jobs": jobs}
+        return self._jobs.jobs(run_id, token)
 
     def job_status(self, run_id: str, token: str, job_id: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        return {
-            "run_id": run_id,
-            "tenant_id": record.tenant_id,
-            "job": get_job_artifact(record.run_dir, job_id),
-        }
+        return self._jobs.job_status(run_id, token, job_id)
 
     def job_logs(
         self,
@@ -1866,82 +1266,35 @@ class RunnerBackend:
         tail_bytes: int | None = None,
         offset: int | None = None,
     ) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        logs = read_job_log_text(
-            record.run_dir,
+        return self._jobs.job_logs(
+            run_id,
+            token,
             job_id,
-            stream=stream,  # type: ignore[arg-type]
+            stream=stream,
             tail_bytes=tail_bytes,
             offset=offset,
         )
-        return {"run_id": run_id, "tenant_id": record.tenant_id, **logs}
 
     def cancel_job(self, run_id: str, token: str, job_id: str) -> dict[str, Any]:
-        self._authorize_run(run_id, token)
-        record = self._record(run_id)
-        payload = request_job_cancel(record.run_dir, job_id)
-        return {"run_id": run_id, "tenant_id": record.tenant_id, **payload}
+        return self._jobs.cancel_job(run_id, token, job_id)
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
-        with self._lock:
-            usage = self._usage.get(tenant_id) or TenantUsage(tenant_id)
-            return usage.to_json()
+        return self._run_state.tenant_usage(tenant_id)
 
     def record_event(self, run_id: str, event: AgentEvent) -> None:
-        with self._lock:
-            record = self._records.get(run_id)
-            if record is None:
-                return
-            record.last_event_seq = event.seq
-            record.last_event_type = event.type
-            if event.type == "run.started":
-                record.status = "running"
-                record.started_at = time.time()
-            elif event.type == "run.awaiting_input":
-                # Parked waiting for the next user message or a hosted-task result.
-                if record.status not in {"completed", "failed", "limited"}:
-                    record.status = "awaiting_input"
-            elif event.type in {"run.resumed", "model.turn.started"}:
-                if record.status == "awaiting_input":
-                    record.status = "running"
-            elif event.type == "run.finished":
-                # Record terminal metadata, but DO NOT flip the gating status here. The
-                # run.finished event fires inside loop.close() (on the loop's thread), while
-                # record.result is only set afterward by _record_run_result on the worker
-                # thread. Setting status="completed" here would let wait_for_run/result()
-                # observe a terminal status before the result is recorded (result() would
-                # KeyError on final_text). _record_run_result owns the terminal status so it
-                # flips together with record.result, under the same lock.
-                record.finished_at = time.time()
-                record.error = str(event.data.get("error") or "")
-                record.error_code = str(event.data.get("error_code") or "")
-            elif event.type == "run.failed":
-                record.status = "failed"
-                record.error = str(event.data.get("error") or "")
-                record.error_code = str(event.data.get("error_code") or "")
+        self._run_state.record_event(run_id, event)
 
-    def wait_for_run(self, run_id: str, *, timeout_s: float = 10.0) -> BackendRunState:
+    def wait_for_run(self, run_id: str, *, timeout_s: float = 10.0) -> SessionState:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            status = self._record(run_id).status
-            if status in {"completed", "failed", "limited"}:
-                return status
+            record = self._record(run_id)
+            if _record_terminal(record):
+                return record.state
             time.sleep(0.05)
         raise TimeoutError(f"run did not finish before timeout: {run_id}")
 
     async def _drive_session(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> AgentRunResult:
-        """Cold-start driver: open the run, take the first turn, then hand off to the
-        shared open-session loop (also used by checkpoint recovery)."""
-        record = self._record(run_id)
-        await loop.aopen()
-        first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
-        try:
-            suspension = await loop.arun_until_suspended(first_input)
-        except NativeAgentError:
-            # Bootstrap failed (terminal session already recorded); just finalize.
-            return await loop.aclose()
-        return await self._drive_open_session(record, request, loop, suspension, started=time.time(), turns=1)
+        return await self._run_execution.drive_session(run_id, request, loop)
 
     async def _drive_open_session(
         self,
@@ -1953,172 +1306,20 @@ class RunnerBackend:
         started: float,
         turns: int,
     ) -> AgentRunResult:
-        """Drive an already-open run as a multi-turn session: wait for a parked task to
-        complete or await the message queue for the next user turn — until idle/lifetime/
-        turn limits, cancel, or close. Shared by cold start and recovery; each park point
-        durably checkpoints (loop state + backend message queue).
-
-        Runs as a coroutine on the shared loop. The next-message wait is a pure
-        ``await asyncio.Queue.get()`` (a parked session holds no thread). The hosted/in-proc
-        task-wait is offloaded with asyncio.to_thread (bounded by task_wait_poll_s and
-        retried) since it blocks on the job manager's cross-thread condition (P2);
-        report_task_result wakes it from another thread."""
-        consecutive_turn_failures = 0
-        while True:
-            # Keep the authoritative FSM state on the record current with each park, so a
-            # concurrent control inspect/health reports the live state.
-            record.session_state = state_from_suspension(suspension)
-            if suspension.turn is not None:
-                # Capture the settled turn's validated output so status() can surface it live.
-                record.last_final_output = suspension.turn.final_output
-            if suspension.reason in {"terminal", "limited"}:
-                break
-            if suspension.reason == "awaiting_tasks":
-                self._persist_run_checkpoint(record)
-                ready = await asyncio.to_thread(loop.wait_for_pending_tasks, self.task_wait_poll_s)
-                if self._session_should_stop(record, started, turns):
-                    break
-                if ready or not loop.has_pending_tasks():
-                    # A task was delivered (or none remain): resume the pump.
-                    suspension = await loop.arun_until_suspended(None)
-                # else: tasks still pending after the poll window -> keep waiting.
-                continue
-            if suspension.reason == "paused":
-                # Cooperative pause: the loop froze the turn at a clean step boundary (its
-                # pending_observations are kept). Park until a resume signal wakes us, then
-                # re-pump the SAME turn with no new input. The loop already checkpointed the
-                # pause park; persist the backend queue too.
-                if self._session_should_stop(record, started, turns):
-                    break
-                self._persist_run_checkpoint(record)
-                try:
-                    # Raw get: the paused branch is the one place that must SEE _RESUME_SESSION.
-                    signal = await asyncio.wait_for(record.message_queue.get(), self.idle_timeout_s)
-                except asyncio.TimeoutError:
-                    break
-                if signal is _CLOSE_SESSION:
-                    break
-                if signal is not _RESUME_SESSION:
-                    # A user message arrived while paused: resume the frozen turn first, then
-                    # let the settled branch consume this message as the next turn.
-                    record.message_queue.put_nowait(signal)
-                suspension = await loop.arun_until_suspended(None)
-                continue
-            if suspension.reason == "turn_failed":
-                # Recoverable model-turn failure: the session is alive (core kept it so). Apply
-                # the retry POLICY here. Give up once too many turns fail in a row.
-                consecutive_turn_failures += 1
-                if consecutive_turn_failures >= self.max_consecutive_turn_failures or self._session_should_stop(
-                    record, started, turns
-                ):
-                    loop.fail_recoverable(
-                        suspension.error or "model turn failed repeatedly",
-                        error_code=suspension.error_code or "model_error",
-                    )
-                    break
-                if suspension.retryable:
-                    # Transient (429 / exhausted-5xx / network): bounded auto-retry with backoff,
-                    # then re-issue the SAME turn (no new user message).
-                    self._persist_run_checkpoint(record)
-                    await _async_sleep_before_retry(consecutive_turn_failures, self.turn_retry)
-                    if self._session_should_stop(record, started, turns):
-                        break
-                    suspension = await loop.arun_until_suspended(None)
-                    continue
-                # Non-retryable but recoverable (config/auth 4xx): a blind retry would just fail
-                # again. Park for the user to fix the config (model/effort) and resend. A one-shot
-                # run has nobody to resend, so finalize it as failed.
-                if not request.multi_turn:
-                    loop.fail_recoverable(
-                        suspension.error or "model turn failed",
-                        error_code=suspension.error_code or "model_error",
-                    )
-                    break
-                loop.await_user_input()
-                self._persist_run_checkpoint(record)
-                try:
-                    message = await self._await_session_message(record)
-                except asyncio.TimeoutError:
-                    break
-                if message is _CLOSE_SESSION:
-                    break
-                turns += 1
-                suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
-                continue
-            if suspension.reason == "interrupted":
-                # Turn-level stop (the user hit "stop"): not a failure, not terminal. Park the
-                # multi-turn session for the next message; a one-shot run just closes. Does not
-                # count against the turn-failure streak.
-                if not request.multi_turn or self._session_should_stop(record, started, turns):
-                    break
-                loop.await_user_input()
-                self._persist_run_checkpoint(record)
-                try:
-                    message = await self._await_session_message(record)
-                except asyncio.TimeoutError:
-                    break
-                if message is _CLOSE_SESSION:
-                    break
-                turns += 1
-                suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
-                continue
-            # settled. One-shot runs close here; multi-turn awaits the next message.
-            consecutive_turn_failures = 0  # a settled turn clears the failure streak
-            # Drain staged outbox sends now (the loop is still open) so a one-shot run that finishes
-            # without parking still gets its side-effects dispatched; the multi-turn await below
-            # also drains (a no-op then, since these are already dispatched).
-            self._drain_outbox(record, loop)
-            if not request.multi_turn:
-                break
-            if self._session_should_stop(record, started, turns):
-                break
-            loop.await_user_input()
-            self._persist_run_checkpoint(record)
-            try:
-                # Pure async await — a parked multi-turn session holds no thread.
-                message = await self._await_session_message(record)
-            except asyncio.TimeoutError:
-                break  # idle timeout
-            if message is _CLOSE_SESSION:
-                break
-            turns += 1
-            suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
-        return await loop.aclose()
+        return await self._session_drive.drive_open_session(
+            record,
+            request,
+            loop,
+            suspension,
+            started=started,
+            turns=turns,
+        )
 
     async def _await_session_message(self, record: BackendRunRecord) -> Any:
-        """Await the next queued user message, dropping stray ``_RESUME_SESSION`` sentinels (a
-        resume aimed at a run that is not currently paused is a no-op). Raises
-        ``asyncio.TimeoutError`` once the idle timeout elapses, mirroring the bare
-        ``wait_for`` it replaces."""
-        deadline = time.monotonic() + self.idle_timeout_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise asyncio.TimeoutError
-            message = await asyncio.wait_for(record.message_queue.get(), remaining)
-            if message is _RESUME_SESSION:
-                continue  # stray resume (run not paused): ignore and keep waiting
-            if is_inbox_envelope(message):
-                msg_id = str(message.get("id") or "")
-                if msg_id and msg_id in record.seen_inbox_ids:
-                    continue  # idempotent ingress: a redelivered message is processed once
-                if msg_id:
-                    # Mark processed; persisted at the next park checkpoint so the dedup survives a
-                    # restart (the marker rides the same checkpoint as the message's effects).
-                    record.seen_inbox_ids.add(msg_id)
-            return message
+        return await self._session_drive.await_session_message(record)
 
     def _persist_run_checkpoint(self, record: BackendRunRecord) -> None:
-        """Augment the loop's own park-point checkpoint with the backend-owned message
-        queue, so a follow-up message that arrived but was not yet consumed survives a
-        restart. No-op when the loop refuses a snapshot (a live shell job is parked-on)."""
-        loop = record.loop
-        if loop is None:
-            return
-        checkpoint = loop.snapshot()
-        if checkpoint is None:
-            return
-        self._persist_run_checkpoint_payload(record, checkpoint, loop.collect_checkpoint_blobs())
+        self._session_drive.persist_run_checkpoint(record)
 
     def _persist_run_checkpoint_payload(
         self,
@@ -2126,30 +1327,10 @@ class RunnerBackend:
         checkpoint: RunCheckpoint,
         blobs: Mapping[str, bytes],
     ) -> None:
-        """Commit a loop checkpoint after adding backend-owned queue and inbox state."""
-        loop = record.loop
-        if loop is None:
-            return
-        # Peek (don't drain) the residual queue; consumed messages are already reflected in
-        # the loop's turn handle / pending input. Runs in the driver coroutine on the shared
-        # loop, so reading the asyncio.Queue's backing deque needs no lock (single-threaded
-        # loop; producers enqueue via _call_soon on this same loop).
-        residual = [
-            message
-            for message in list(record.message_queue._queue)
-            # inbox envelope dict, or legacy raw str/list parts; the close/resume sentinels (objects)
-            # are dropped.
-            if isinstance(message, (str, list, dict))
-        ]
-        checkpoint.queued_messages = residual
-        checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
-        # Overwrites the same seq the loop just committed, now with the queue included.
-        assert self.checkpoint_store is not None
-        self.checkpoint_store.put(checkpoint, blobs)
-        self._drain_outbox(record, loop)
+        self._session_drive.persist_run_checkpoint_payload(record, checkpoint, blobs)
 
     async def _persist_run_checkpoint_async(self, record: BackendRunRecord) -> None:
-        self._persist_run_checkpoint(record)
+        await self._session_drive.persist_run_checkpoint_async(record)
 
     def _persist_run_checkpoint_from_any_thread(self, record: BackendRunRecord) -> None:
         try:
@@ -2162,90 +1343,18 @@ class RunnerBackend:
         self._spawn(self._persist_run_checkpoint_async(record)).result(timeout=10.0)
 
     def _outbox_backoff_delay(self, attempts: int) -> float:
-        """Capped exponential backoff with full jitter — ``uniform(0, min(cap, base*factor**attempts))``.
-        Full jitter (AWS) maximally decorrelates retries so a fleet of failed sends doesn't restorm a
-        recovering target in lockstep. ``attempts`` is the number already made (>=1 here)."""
-        ceiling = min(self.outbox_retry_cap_s, self.outbox_retry_base_s * (self.outbox_retry_factor ** attempts))
-        return self._outbox_rng.uniform(0.0, max(0.0, ceiling))
+        return self._outbox_dispatch.backoff_delay(attempts)
 
     def _drain_outbox(self, record: BackendRunRecord, loop: AgentLoop) -> None:
-        """Dispatch *due* staged outbox requests at the edge (after they are durably persisted as
-        ``pending``), then persist again so a ``dispatched`` status is recorded. The send happens
-        here, never in the core; a crash between the two persists redispatches on recover, made safe
-        by the request's idempotency_key. A retryable failure stamps a backoff ``next_attempt_at`` so
-        the request is only redispatched once its time arrives (the watchdog redrive tick wakes it,
-        independent of run activity). No-op without a sender or due requests."""
-        sender = record.outbox_sender
-        now = time.time()
-        due = loop.due_outbox(now)
-        if sender is None or not due:
-            return
-        changed = False
-        for request in due:
-            # Ensure the request carries a trace before the edge sends it (requests staged via the
-            # outbox tool already have one; this covers any other path). Observability only.
-            if not request.traceparent:
-                request.traceparent = new_traceparent()
-            try:
-                receipt = sender.send(request)
-            except Exception as exc:  # a sender raising is a retryable transport failure
-                receipt = OutboxReceipt(ok=False, error=str(exc), retryable=True)
-            next_attempt_at = now + self._outbox_backoff_delay(request.attempts + 1)
-            status = loop.record_outbox_result(
-                request.id,
-                receipt,
-                max_attempts=self.outbox_max_attempts,
-                next_attempt_at=next_attempt_at,
-            )
-            changed = True
-            if request.expect_ack and status in {"dispatched", "failed"}:
-                self._stage_outbox_ack(record, request, status, receipt)
-        if changed:
-            checkpoint = loop.snapshot()
-            if checkpoint is not None:
-                checkpoint.queued_messages = [
-                    m for m in list(record.message_queue._queue) if isinstance(m, (str, list, dict))
-                ]
-                checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
-                self.checkpoint_store.put(checkpoint, loop.collect_checkpoint_blobs())
+        self._outbox_dispatch.drain_outbox(record, loop)
 
     def _stage_outbox_ack(
         self, record: BackendRunRecord, request: Any, status: str, receipt: OutboxReceipt
     ) -> None:
-        """Deliver an outbox send's receipt back to the run as an inbox message (request-reply,
-        **non-park** — the agent observes it on its next activation), correlated by ``correlation_id``.
-        Reuses the idempotent inbox path: a stable ack id (``ack_<request id>``) + the inbox seen-set
-        make a redelivery a no-op. Dropped if the run is terminal (no consumer) or its queue is full
-        (best-effort). Runs on the shared loop, so the queue put needs no cross-thread marshaling."""
-        ack_id = f"ack_{request.id}"
-        if record.status in {"completed", "failed", "limited"}:
-            return  # terminal run — no consumer for the ack (documented limitation)
-        if ack_id in record.seen_inbox_ids or record.message_queue.qsize() >= self.max_message_queue_depth:
-            return
-        summary = f"[outbox-ack] request {request.id} to {request.destination!r}: {status}"
-        if receipt.reference:
-            summary += f" (ref={receipt.reference})"
-        if receipt.error:
-            summary += f" (error={receipt.error})"
-        envelope = InboxMessage(
-            content=summary,
-            id=ack_id,
-            source="outbox",
-            type="outbox_ack",
-            run_id=record.run_id,
-            correlation_id=request.correlation_id or request.id,
-            causation_id=request.id,
-            traceparent=request.traceparent,
-            tracestate=request.tracestate,
-        )
-        record.message_queue.put_nowait(envelope.to_json())
+        self._outbox_dispatch.stage_outbox_ack(record, request, status, receipt)
 
     def _session_should_stop(self, record: BackendRunRecord, started: float, turns: int) -> bool:
-        return (
-            record.cancellation_token.requested
-            or (time.time() - started) >= self.max_session_lifetime_s
-            or turns >= self.max_turns
-        )
+        return self._session_drive.session_should_stop(record, started, turns)
 
     async def _run_run(
         self,
@@ -2255,41 +1364,41 @@ class RunnerBackend:
         llm_gateway_token: str,
         web_gateway_token: str,
     ) -> None:
-        # Bound concurrent active runs: at capacity this awaits (without holding a thread),
-        # so the run stays ``queued`` until a slot frees rather than piling work onto a
-        # saturated process.
-        if self._run_semaphore is not None:
-            await self._run_semaphore.acquire()
-        try:
-            try:
-                loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
-                with self._lock:
-                    self._records[run_id].loop = loop
-                    self._records[run_id].outbox_sender = self._outbox_sender_for(request)
-                # Persist the recovery metadata before the first turn so a crash at any park
-                # point can be resumed (the checkpoint itself is written by the driver).
-                self._write_run_meta(self._record(run_id), request)
-                result = await self._drive_session(run_id, request, loop)
-                self._record_run_result(run_id, result)
-            except Exception as exc:
-                self._record_run_failure(run_id, exc)
-        finally:
-            if self._run_semaphore is not None:
-                self._run_semaphore.release()
+        prepared = _PreparedRun(
+            run_id=run_id,
+            record=self._record(run_id),
+            workspace_root=workspace_root,
+            run_token="",
+            llm_gateway_token=llm_gateway_token,
+            web_gateway_token=web_gateway_token,
+        )
+        await self._run_execution.run_prepared(prepared, request)
 
     def _capability_broker_for(self, request: BackendRunRequest) -> Any:
         """Build the run's capability broker from the factory (scoped to run identity), or None
         to leave capability gating off for this run."""
-        if self.capability_broker_factory is None:
-            return None
-        return self.capability_broker_factory(request)
+        return self._loop_factory.capability_broker_for(request)
 
     def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
         """Build the run's outbox sender from the factory (scoped to run identity), or None to leave
         staged outbox requests pending (durable, never dispatched)."""
-        if self.outbox_sender_factory is None:
-            return None
-        return self.outbox_sender_factory(request)
+        return self._loop_factory.outbox_sender_for(request)
+
+    def _build_loop_build(
+        self,
+        run_id: str,
+        request: BackendRunRequest,
+        workspace_root: Path,
+        llm_gateway_token: str,
+        web_gateway_token: str,
+    ) -> BackendLoopBuild:
+        return self._loop_factory.build(
+            run_id,
+            request,
+            workspace_root,
+            llm_gateway_token,
+            web_gateway_token,
+        )
 
     def _build_loop(
         self,
@@ -2300,36 +1409,14 @@ class RunnerBackend:
         web_gateway_token: str,
     ) -> AgentLoop:
         """Construct the run's AgentLoop (shared by autonomous and stream-driven paths)."""
-        spec = self._run_spec_for_request(run_id, request, workspace_root)
-        runtime_config = self.current_runtime_config(run_id)
-        adapter = self._build_model_adapter(
-            spec,
+        return self._loop_factory.build(
+            run_id,
+            request,
+            workspace_root,
             llm_gateway_token,
-            runtime_config.model if runtime_config is not None else None,
-            token_provider=self._llm_token_source(run_id, request, runtime_config),
-        )
-        return AgentLoop(
-            spec=spec,
-            model_adapter=adapter,
-            event_sinks=(BackendRunStateSink(self, run_id), *(make() for make in self.extra_event_sink_factories)),
-            permission_policy=request.permission_policy,
-            cancellation_token=self._record(run_id).cancellation_token,
-            shell_approval_provider=None,
-            web_gateway_client=self._web_gateway_client(web_gateway_token),
-            runtime_config_provider=BackendRuntimeConfigProvider(self, run_id),
-            checkpoint_store=self.checkpoint_store,
-            emit_output_deltas=self.emit_output_deltas,
-            subagent_definitions=self.subagent_definitions,
-            tool_providers=self.tool_providers,
-            context_providers=self.context_providers,
-            output_validators=self.output_validators,
-            capability_broker=self._capability_broker_for(request),
-            checkpoint_persist_callback=lambda checkpoint, blobs: self._persist_run_checkpoint_payload(
-                self._record(run_id),
-                checkpoint,
-                blobs,
-            ),
-        )
+            web_gateway_token,
+            include_outbox_sender=False,
+        ).loop
 
     async def astream_run(self, request: BackendRunRequest) -> AsyncIterator[dict[str, Any]]:
         """Stream-driven run: the transport-neutral programmatic seam behind the SSE endpoint.
@@ -2346,100 +1433,18 @@ class RunnerBackend:
         deferred), so this never leaves a resumable run dangling.
         """
         prepared = self._prepare_run_record(request)
-        run_id = prepared.run_id
-        if self._run_semaphore is not None:
-            await self._run_semaphore.acquire()
-        loop: AgentLoop | None = None
-        closed = False
-        try:
-            yield {"kind": "meta", **self._submission_for(prepared).to_json()}
-            loop = self._build_loop(
-                run_id, request, prepared.workspace_root, prepared.llm_gateway_token, prepared.web_gateway_token
-            )
-            with self._lock:
-                self._records[run_id].loop = loop
-                self._records[run_id].outbox_sender = self._outbox_sender_for(request)
-            self._write_run_meta(prepared.record, request)
-            await loop.aopen()
-            suspension: Suspension | None = None
-            first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
-            async with loop.astream(first_input) as stream:
-                async for item in stream:
-                    yield self._frame(item)
-                suspension = stream.suspension
-            result = await loop.aclose()
-            closed = True
-            self._record_run_result(run_id, result)
-            frame: dict[str, Any] = {
-                "kind": "result",
-                "status": result.status,
-                "final_text": result.final_text,
-                "error": result.error,
-                "error_code": result.error_code,
-            }
-            if suspension is not None and suspension.has_external:
-                frame["awaiting_task_ids"] = list(suspension.awaiting_task_ids)
-                frame["note"] = "run closed; hosted task cancelled (HITL streaming deferred)"
+        async for frame in self._run_execution.stream_prepared(prepared, request):
             yield frame
-        except Exception as exc:
-            if loop is not None and not closed:
-                try:
-                    await loop.aclose()
-                except Exception:  # noqa: BLE001 - finalization best-effort; the failure is recorded below
-                    pass
-            self._record_run_failure(run_id, exc)
-            yield {
-                "kind": "result",
-                "status": "failed",
-                "error": str(exc),
-                "error_code": getattr(exc, "error_code", "internal_error"),
-            }
-        finally:
-            if self._run_semaphore is not None:
-                self._run_semaphore.release()
 
     def _frame(self, item: Any) -> dict[str, Any]:
         """Wrap one astream item as a neutral wire frame (reference framing on core to_json)."""
-        if isinstance(item, AgentEvent):
-            return {"kind": "event", **item.to_json()}
-        return {"kind": "delta", **item.to_json()}  # ModelStreamChunk
+        return stream_item_frame(item)
 
     def _record_run_result(self, run_id: str, result: AgentRunResult) -> None:
-        with self._lock:
-            record = self._records[run_id]
-            record.result = result
-            record.status = result.status
-            # Reconcile the terminal BackendRunState onto the FSM (cancel -> CANCELLED).
-            record.session_state = to_session_state(result.status, error_code=result.error_code)
-            record.error = result.error
-            record.error_code = result.error_code
-            record.finished_at = time.time()
-            self._usage.setdefault(record.tenant_id, TenantUsage(record.tenant_id)).add_metrics(
-                result.metrics
-            )
+        self._run_state.record_run_result(run_id, result)
 
     def _record_run_failure(self, run_id: str, exc: Exception) -> None:
-        # Durable failure mark FIRST — before the in-memory status flips to a terminal
-        # value. A worker-level crash that bypassed the loop's own bundle would otherwise
-        # leave no failure.json, and the restart scanner would treat the run as merely
-        # parked and resume it into a crash loop. Writing the bundle before the terminal
-        # status also closes the race where an observer sees ``failed`` but no bundle yet.
-        # ``overwrite=False`` preserves the loop's richer bundle when it already wrote one.
-        # There is still no auto-recovery: the bundle is purely an operator restore aid.
-        self._write_failure_bundle(
-            run_id,
-            self.run_root / run_id,
-            error=str(exc),
-            error_code=getattr(exc, "error_code", "internal_error"),
-            exc_type=type(exc).__name__,
-            overwrite=False,
-        )
-        with self._lock:
-            record = self._records[run_id]
-            record.status = "failed"
-            record.error = str(exc)
-            record.error_code = getattr(exc, "error_code", "internal_error")
-            record.finished_at = time.time()
+        self._run_state.record_run_failure(run_id, exc)
 
     def _write_failure_bundle(
         self,
@@ -2454,92 +1459,26 @@ class RunnerBackend:
         """Write ``run_dir/failure.json`` (the operator-facing failure bundle, same schema
         as the core's). ``overwrite=False`` preserves a bundle the loop already wrote
         (which carries richer, in-run context)."""
-        failure_path = run_dir / "failure.json"
-        if failure_path.exists() and not overwrite:
-            return
-        last_good_seq = 0
-        if self.checkpoint_store is not None:
-            try:
-                stored = self.checkpoint_store.latest(run_id)
-                last_good_seq = stored.seq if stored is not None else 0
-            except Exception:  # pragma: no cover - last-good lookup must never mask the failure
-                last_good_seq = 0
-        bundle = {
-            "schema_version": namespaced_id("failure.v1"),
-            "run_id": run_id,
-            "error": error,
-            "error_code": error_code,
-            "type": exc_type,
-            "last_good_seq": last_good_seq,
-            "restore_hint": (
-                f"restore checkpoint seq {last_good_seq} for run {run_id} via CheckpointStore, "
-                "then resume via recover_runs"
-                if last_good_seq > 0
-                else "no recoverable checkpoint; inspect run logs and run.json"
-            ),
-            "failed_at": time.time(),
-        }
-        run_dir.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(failure_path, bundle)
-
-    def _recover_attempts_path(self, run_dir: Path) -> Path:
-        return run_dir / "recover_attempts.json"
+        self._recovery.write_failure_bundle(
+            run_id,
+            run_dir,
+            error=error,
+            error_code=error_code,
+            exc_type=exc_type,
+            overwrite=overwrite,
+        )
 
     def _read_recover_attempts(self, run_dir: Path) -> int:
-        try:
-            payload = json.loads(self._recover_attempts_path(run_dir).read_text(encoding="utf-8"))
-            return int(payload["count"])
-        except (FileNotFoundError, ValueError, KeyError, OSError, TypeError):
-            return 0
+        return self._recovery.read_recover_attempts(run_dir)
 
     def _bump_recover_attempts(self, run_dir: Path) -> int:
-        count = self._read_recover_attempts(run_dir) + 1
-        run_dir.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(self._recover_attempts_path(run_dir), {"count": count})
-        return count
+        return self._recovery.bump_recover_attempts(run_dir)
 
     def _clear_recover_attempts(self, run_dir: Path) -> None:
-        self._recover_attempts_path(run_dir).unlink(missing_ok=True)
+        self._recovery.clear_recover_attempts(run_dir)
 
     def _write_run_meta(self, record: BackendRunRecord, request: BackendRunRequest) -> None:
-        """Write run.json — the durable recovery descriptor. Holds everything
-        ``recover_runs`` needs to rebuild a run that was parked when the process died:
-        identity, workspace, limits, policy, and the resolved runtime config (gateway
-        tokens are re-issued on recovery, not stored). Runtime-config changes update this
-        descriptor, so recovery uses the latest committed config instead of the run-start config."""
-        config = record.runtime_config
-        committed_at = record.runtime_config_committed_at or time.time()
-        meta = {
-            "schema_version": _RUN_META_SCHEMA_VERSION,
-            "run_id": record.run_id,
-            "tenant_id": record.tenant_id,
-            "user_id": record.user_id,
-            "workspace_root": str(record.workspace_root),
-            "mode": request.mode,
-            "workspace_backend": request.workspace_backend,
-            "multi_turn": request.multi_turn,
-            # For history listing (DX-12): a created-at stamp + a short title (first instruction).
-            "created_at": record.created_at,
-            "title": " ".join((request.instruction or "").split())[:80],
-            "limits": {
-                "max_steps": request.max_steps,
-                "max_tool_calls": request.max_tool_calls,
-                "max_bytes_read": request.max_bytes_read,
-                "max_duration_s": request.max_duration_s,
-            },
-            "permission_policy": request.permission_policy.to_json(),
-            "runtime_config": config.to_json() if config else None,
-            "runtime_config_version": config.config_version if config else 0,
-            "runtime_config_hash": config.config_hash if config else "",
-            "runtime_config_issuer": record.runtime_config_issuer,
-            "runtime_config_reason": record.runtime_config_reason,
-            "runtime_config_committed_at": committed_at,
-        }
-        DurableMetadataCommitter(self.checkpoint_store).write_initial_metadata(
-            record.run_dir,
-            record.run_id,
-            meta,
-        )
+        self._run_preparation.write_run_meta(record, request)
 
     def _write_runtime_config_run_meta(
         self,
@@ -2550,9 +1489,8 @@ class RunnerBackend:
         reason: str,
         committed_at: float,
     ) -> None:
-        DurableMetadataCommitter(self.checkpoint_store).commit_runtime_config_update(
-            record.run_dir,
-            record.run_id,
+        self._runtime_config.write_runtime_config_run_meta(
+            record,
             config,
             issuer=issuer,
             reason=reason,
@@ -2563,107 +1501,23 @@ class RunnerBackend:
         DurableMetadataCommitter(self.checkpoint_store).store_shared_metadata(run_id, meta)
 
     def _read_recovery_meta(self, run_dir: Path, run_id: str) -> dict[str, Any] | None:
-        return DurableMetadataCommitter(self.checkpoint_store).read_recovery_metadata(run_dir, run_id)
+        return self._recovery.read_recovery_meta(run_dir, run_id)
 
     def recover_runs(self) -> list[str]:
         """Scan ``run_root`` for runs left parked by a previous process and resume each
         from its checkpoint. Returns the recovered run ids. Idempotent: runs already
         tracked in-memory, terminal checkpoints, and runs missing run.json are skipped."""
-        recovered: list[str] = []
-        if not self.run_root.is_dir():
-            return recovered
-        for run_dir in sorted(path for path in self.run_root.iterdir() if path.is_dir()):
-            run_id = run_dir.name
-            with self._lock:
-                if run_id in self._records:
-                    continue
-            # A failed run is never auto-resumed: its failure.json is the operator's
-            # restore aid (covers the edge where a failure could not write a terminal mark).
-            if (run_dir / "failure.json").exists():
-                continue
-            assert self.checkpoint_store is not None
-            stored = self.checkpoint_store.latest(run_id)
-            if stored is None or stored.checkpoint.terminal:
-                continue
-            if self._attempt_resume(run_dir, run_id):
-                recovered.append(run_id)
-        return recovered
+        return self._recovery.recover_runs()
 
     def _attempt_resume(self, run_dir: Path, run_id: str) -> bool:
         """Resume one run from its latest checkpoint. Returns True on success. Skips runs
         with no resumable checkpoint or missing run.json. On a resume exception, bumps the
         durable attempt counter and, once ``max_recover_attempts`` is reached, marks the run
         unrecoverable (durable failure.json) so it is never retried into a crash loop."""
-        assert self.checkpoint_store is not None
-        stored = self.checkpoint_store.latest(run_id)
-        if stored is None or stored.checkpoint.terminal:
-            return False
-        meta = self._read_recovery_meta(run_dir, run_id)
-        if meta is None:
-            return False
-        try:
-            self._resume_from_checkpoint(stored, meta)
-        except Exception as exc:
-            attempts = self._bump_recover_attempts(run_dir)
-            _LOGGER.error(
-                "resume of run %s failed (attempt %d/%d): %s",
-                run_id,
-                attempts,
-                self.max_recover_attempts,
-                exc,
-            )
-            if attempts >= self.max_recover_attempts:
-                self._write_failure_bundle(
-                    run_id,
-                    run_dir,
-                    error=f"recovery failed after {attempts} attempts: {exc}",
-                    error_code="unrecoverable",
-                    exc_type=type(exc).__name__,
-                    overwrite=True,
-                )
-                _LOGGER.error("run %s marked unrecoverable", run_id)
-            return False
-        self._clear_recover_attempts(run_dir)
-        return True
+        return self._recovery.attempt_resume(run_dir, run_id)
 
     def resume_run(self, run_id: str, token: str) -> dict[str, Any]:
-        """Resume a single parked run from its checkpoint — the token-scoped, single-run analog of
-        :meth:`recover_runs` (which is a process-global, no-token operator primitive).
-
-        This closes the read/write asymmetry: a token holder could always *read* a historical run
-        (:meth:`_authorized_run_dir` needs no in-memory record), but every *write* path goes through
-        :meth:`_authorize_run` → :meth:`_record`, which raises ``KeyError`` for a run not currently
-        in memory. ``resume_run`` materializes that record from the durable checkpoint so a follow-up
-        :meth:`send_message` works after a restart. Idempotent: a run already tracked in memory
-        returns ``resumed=False`` with its current status. The run token is the capability; its
-        claims are checked against the persisted ``run.json`` identity since there is no record yet.
-        """
-        claims = self._verify_run_token(run_id, token)
-        with self._lock:
-            existing = self._records.get(run_id)
-        if existing is not None:
-            if claims.tenant_id != existing.tenant_id or claims.user_id != existing.user_id:
-                raise PermissionDenied("token subject mismatch")
-            return {"run_id": run_id, "status": existing.status, "resumed": False}
-        if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
-            raise PermissionDenied("invalid run id")
-        run_dir = self.run_root / run_id
-        meta = self._read_recovery_meta(run_dir, run_id)
-        if meta is None:
-            raise KeyError(f"unknown run: {run_id}")
-        if claims.tenant_id != (meta.get("tenant_id") or "") or claims.user_id != (meta.get("user_id") or ""):
-            raise PermissionDenied("token subject mismatch")
-        if (run_dir / "failure.json").exists():
-            raise ValueError("run is marked unrecoverable; inspect failure.json")
-        assert self.checkpoint_store is not None
-        stored = self.checkpoint_store.latest(run_id)
-        if stored is None or stored.checkpoint.terminal:
-            raise ValueError("run has no resumable checkpoint")
-        if not self._attempt_resume(run_dir, run_id):
-            # _attempt_resume bumps the durable attempt counter / writes failure.json at the cap.
-            raise ValueError("resume failed; inspect run logs / failure.json")
-        record = self._record(run_id)
-        return {"run_id": run_id, "status": record.status, "resumed": True}
+        return self._session_boundary.resume_run(run_id, token)
 
     # --- Active watchdog / lease (operational layer; the core never auto-recovers) -------
 
@@ -2698,22 +1552,7 @@ class RunnerBackend:
                 _LOGGER.exception("watchdog tick failed")
 
     def _redrive_outbox(self) -> None:
-        """Redrive due outbox requests for this worker's live runs — the operational tick that makes
-        retry timing independent of run activity (a request whose backoff ``next_attempt_at`` has
-        arrived is dispatched even if its run is otherwise idle). Runs on the watchdog thread but
-        marshals the actual drain onto the shared loop via ``_call_soon`` (the loop and its ``_outbox``
-        are single-threaded on that loop; ``_drain_outbox`` itself filters to due requests)."""
-        terminal = {"completed", "failed", "limited"}
-        with self._lock:
-            live = [
-                (record, record.loop)
-                for record in self._records.values()
-                if record.loop is not None
-                and record.outbox_sender is not None
-                and record.status not in terminal
-            ]
-        for record, loop in live:
-            self._call_soon(self._drain_outbox, record, loop)
+        self._outbox_dispatch.redrive_outbox()
 
     def _heartbeat_own_runs(self) -> None:
         assert self.lease_store is not None
@@ -2721,7 +1560,7 @@ class RunnerBackend:
             items = list(self._records.items())
         for run_id, record in items:
             try:
-                if record.status in {"completed", "failed", "limited"}:
+                if _record_terminal(record):
                     # Terminal: drop the lease so no watchdog ever reclaims a finished run.
                     self.lease_store.release(run_id)
                 else:
@@ -2734,144 +1573,20 @@ class RunnerBackend:
         run carries a fresh lease and is left untouched; the claim is a cross-process CAS so
         two watchdogs racing the same run produce exactly one winner. Candidate runs come
         from the lease store, so a shared store surfaces a peer's runs we never hosted."""
-        assert self.lease_store is not None
-        reclaimed: list[str] = []
-        for run_id in sorted(self.lease_store.candidate_run_ids()):
-            with self._lock:
-                if run_id in self._records:
-                    continue
-            run_dir = self.run_root / run_id
-            if (run_dir / "failure.json").exists():
-                continue
-            if not self.lease_store.is_stale(run_id):
-                continue  # a live peer owns it
-            if not self.lease_store.try_claim(run_id, self._worker_id, self.lease_ttl_s):
-                continue  # lost the CAS to another watchdog
-            if self._attempt_resume(run_dir, run_id):
-                _LOGGER.info("watchdog: reclaimed orphaned run %s", run_id)
-                reclaimed.append(run_id)
-            elif not (run_dir / "failure.json").exists():
-                # Resume failed but the attempt cap has not yet marked it unrecoverable.
-                # Release our just-claimed lease so the run is retried next tick (or by a
-                # peer) instead of being stranded behind a fresh lease that never resumes.
-                self.lease_store.release(run_id)
-        return reclaimed
+        return self._recovery.reclaim_stale_runs()
 
     def _resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> None:
-        checkpoint = stored.checkpoint
-        run_id = checkpoint.run_id
-        run_dir = self.run_root / run_id
-        runtime_config = _runtime_config_from_meta(meta)
-        limits = meta.get("limits") or {}
-        request = BackendRunRequest(
-            tenant_id=str(meta["tenant_id"]),
-            user_id=str(meta["user_id"]),
-            workspace_root=Path(meta["workspace_root"]),
-            instruction="",  # the opening turn already ran; recovery resumes from the checkpoint
-            mode=meta.get("mode", "propose"),
-            workspace_backend=meta.get("workspace_backend", "overlay"),
-            max_steps=int(limits.get("max_steps", 30)),
-            max_tool_calls=int(limits.get("max_tool_calls", 100)),
-            max_bytes_read=int(limits.get("max_bytes_read", 1_000_000)),
-            max_duration_s=limits.get("max_duration_s", 900),
-            permission_policy=PermissionPolicy.from_json(meta.get("permission_policy")),
-            runtime_config=runtime_config,
-            multi_turn=bool(meta.get("multi_turn", False)),
-        )
-        workspace_root = request.workspace_root.resolve()
-        # Re-issue gateway tokens — the backend holds the signing key, so the original
-        # (unstored) tokens need not survive the restart.
-        llm_gateway_token = self.token_manager.issue(
-            kind="llm_gateway",
-            audience="csp.llm-gateway",
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            ttl_s=self.llm_gateway_token_ttl_s,
-            metadata={"agent_config_hash": runtime_config.config_hash},
-        )
-        web_gateway_token = ""
-        if _runtime_config_uses_web(runtime_config) and self.web_gateway_url:
-            web_gateway_token = self.token_manager.issue(
-                kind="web_gateway",
-                audience="csp.web-gateway",
-                run_id=run_id,
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
-                ttl_s=self.web_gateway_token_ttl_s,
-                metadata={"agent_config_hash": runtime_config.config_hash},
-            )
-        record = BackendRunRecord(
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            workspace_root=workspace_root,
-            run_dir=run_dir,
-            status="awaiting_input",
-            created_at=time.time(),
-            run_token_sha256="",  # the client still holds its run token (verified cryptographically)
-            llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
-            web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
-            runtime_config=runtime_config,
-            runtime_config_issuer=str(meta.get("runtime_config_issuer") or "recover_runs"),
-            runtime_config_reason=str(meta.get("runtime_config_reason") or "resumed from checkpoint"),
-            runtime_config_committed_at=float(meta.get("runtime_config_committed_at") or time.time()),
-        )
-        with self._lock:
-            self._records[run_id] = record
-        loop = self._build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
-        # The base workspace is re-provisioned by the deployment (re-mount/re-clone);
-        # restore re-applies the agent's delta from the checkpoint's content blobs.
-        loop.restore(checkpoint, blobs=stored.blob)
-        with self._lock:
-            record.loop = loop
-            record.outbox_sender = self._outbox_sender_for(request)
-        # Restore the inbox dedup set so a message processed before the restart is not reprocessed
-        # if it (or a redelivery) is queued again.
-        record.seen_inbox_ids = set(checkpoint.inbox_seen_ids)
-        # Re-enqueue durable pending messages on the shared loop (before the resume coroutine
-        # drains them); asyncio.Queue puts must run on the loop, not this thread.
-        for message in checkpoint.queued_messages:
-            self._call_soon(record.message_queue.put_nowait, message)
-        # Resume executes as a coroutine on the shared loop (coroutine-per-run).
-        self._spawn(self._run_recovered(run_id, request, loop))
+        self._recovery.resume_from_checkpoint(stored, meta)
 
     async def _run_recovered(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> None:
-        record = self._record(run_id)
-        if self._run_semaphore is not None:
-            await self._run_semaphore.acquire()
-        try:
-            # Derive the starting park from the restored loop: tasks still pending -> a
-            # hosted-task wait; otherwise a settled park awaiting the next user message.
-            if loop.has_pending_tasks():
-                suspension = Suspension(reason="awaiting_tasks", status="running", has_external=True)
-            else:
-                suspension = Suspension(reason="settled", status="completed")
-            result = await self._drive_open_session(
-                record, request, loop, suspension, started=time.time(), turns=1
-            )
-            self._record_run_result(run_id, result)
-        except Exception as exc:
-            self._record_run_failure(run_id, exc)
-        finally:
-            if self._run_semaphore is not None:
-                self._run_semaphore.release()
+        await self._recovery.run_recovered(run_id, request, loop)
 
     def _llm_token_source(
         self, run_id: str, request: BackendRunRequest, runtime_config: AgentRuntimeConfig | None
     ) -> _GatewayTokenSource:
         """A re-minting source for the run's ``llm_gateway`` token (mirrors the eager issue + the
         recovery re-issue), so a long run keeps LLM access past the token TTL without a restart."""
-        return _GatewayTokenSource(
-            token_manager=self.token_manager,
-            kind="llm_gateway",
-            audience="csp.llm-gateway",
-            run_id=run_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
-            ttl_s=self.llm_gateway_token_ttl_s,
-            metadata={"agent_config_hash": runtime_config.config_hash} if runtime_config is not None else {},
-        )
+        return self._loop_factory.llm_token_source(run_id, request, runtime_config)
 
     def _build_model_adapter(
         self,
@@ -2880,14 +1595,10 @@ class RunnerBackend:
         model_config: ModelConfig | None,
         token_provider: Callable[[], str | None] | None = None,
     ) -> ModelAdapter:
-        if self.model_adapter_factory is not None:
-            # Custom factories own their credential lifecycle (they get the freshly-minted token
-            # string); the refresh seam applies to the default gateway adapter only.
-            return self.model_adapter_factory(spec, llm_gateway_token)
-        return GatewayModelAdapter(
-            model_config or ModelConfig(),
-            gateway_url=self.llm_gateway_url,
-            token=llm_gateway_token,
+        return self._loop_factory.build_model_adapter(
+            spec,
+            llm_gateway_token,
+            model_config,
             token_provider=token_provider,
         )
 
@@ -2895,29 +1606,13 @@ class RunnerBackend:
         self,
         token: str,
     ) -> WebGatewayClient | None:
-        if not token:
-            return None
-        return WebGatewayClient(self.web_gateway_url, token=token)
+        return self._loop_factory.web_gateway_client(token)
 
     def _validate_request(self, request: BackendRunRequest) -> None:
-        if not request.tenant_id.strip():
-            raise ValueError("tenant_id is required")
-        if not request.user_id.strip():
-            raise ValueError("user_id is required")
-        if not request.instruction.strip() and not request.input_parts:
-            raise ValueError("instruction or input_parts is required")
-        if request.mode not in {"read-only", "propose", "apply"}:
-            raise ValueError(f"unsupported mode: {request.mode}")
-        if request.workspace_backend not in {"overlay", "staging"}:
-            raise ValueError(f"unsupported workspace_backend: {request.workspace_backend}")
-        if request.agent_definition is None and request.runtime_config is None:
-            raise ValueError("agent_definition or runtime_config is required")
+        self._run_preparation.validate_request(request)
 
     def _check_workspace_allowed(self, workspace_root: Path) -> None:
-        if not workspace_root.exists() or not workspace_root.is_dir():
-            raise ValueError(f"workspace root does not exist: {workspace_root}")
-        if not any(is_within(root, workspace_root) for root in self.allowed_workspace_roots):
-            raise PermissionDenied(f"workspace root is outside allowed roots: {workspace_root}")
+        self._run_preparation.check_workspace_allowed(workspace_root)
 
     def _authorize_run(self, run_id: str, token: str) -> None:
         claims = self._verify_run_token(run_id, token)
@@ -2956,67 +1651,7 @@ class RunnerBackend:
     def list_runs(
         self, tenant_id: str, *, user_id: str | None = None, limit: int = 100
     ) -> dict[str, Any]:
-        """List a tenant's runs from ``run_root`` (newest first) — the durable history.
-
-        A trusted-host call (no token, like :meth:`recover_runs`): the embedder owns the run_root
-        and is responsible for tenant scoping. Reads each run.json (skipping subagent child runs,
-        which have none) for identity + title + created_at, takes the live status from an
-        in-memory record when present else status.json, and mints a fresh read-scoped run token
-        per entry so the caller can fetch events/status afterwards (mirrors submit_run returning a
-        run token). ``recoverable`` flags a parked run a restart can resume via recover_runs."""
-        runs: list[dict[str, Any]] = []
-        if not self.run_root.is_dir():
-            return {"runs": runs}
-        metadata_committer = DurableMetadataCommitter(self.checkpoint_store)
-        for run_dir in self.run_root.iterdir():
-            if not run_dir.is_dir():
-                continue
-            meta = metadata_committer.read_recovery_metadata(run_dir, run_dir.name)
-            if meta is None:
-                continue
-            if meta.get("tenant_id") != tenant_id:
-                continue
-            run_user = meta.get("user_id") or ""
-            if user_id is not None and run_user != user_id:
-                continue
-            run_id = meta.get("run_id") or run_dir.name
-            with self._lock:
-                record = self._records.get(run_id)
-            if record is not None:
-                status = record.status
-            else:
-                status = "ended"
-                status_path = run_dir / "status.json"
-                if status_path.exists():
-                    try:
-                        status = json.loads(read_text_resilient(status_path)).get("status", "ended")
-                    except (ValueError, OSError):
-                        pass
-            recoverable = False
-            if record is None and not (run_dir / "failure.json").exists() and self.checkpoint_store is not None:
-                stored = self.checkpoint_store.latest(run_id)
-                recoverable = stored is not None and not stored.checkpoint.terminal
-            runs.append(
-                {
-                    "run_id": run_id,
-                    "tenant_id": tenant_id,
-                    "user_id": run_user,
-                    "title": meta.get("title") or "",
-                    "created_at": meta.get("created_at") or 0.0,
-                    "status": status,
-                    "recoverable": recoverable,
-                    "read_token": self.token_manager.issue(
-                        kind="run_access",
-                        audience=BACKEND_AUDIENCE,
-                        run_id=run_id,
-                        tenant_id=tenant_id,
-                        user_id=run_user,
-                        ttl_s=self.run_token_ttl_s,
-                    ),
-                }
-            )
-        runs.sort(key=lambda entry: entry["created_at"], reverse=True)
-        return {"runs": runs[:limit]}
+        return self._projection.list_runs(tenant_id, user_id=user_id, limit=limit)
 
     def _record(self, run_id: str) -> BackendRunRecord:
         with self._lock:
@@ -3026,10 +1661,4 @@ class RunnerBackend:
                 raise KeyError(f"unknown run: {run_id}") from exc
 
     def _read_proposal(self, record: BackendRunRecord) -> dict[str, Any] | None:
-        proposal_path = record.run_dir / "proposal.json"
-        if not proposal_path.exists():
-            return None
-        payload = json.loads(proposal_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("proposal snapshot must be a JSON object")
-        return payload
+        return read_proposal_snapshot(record)

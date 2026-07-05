@@ -32,22 +32,21 @@ paths.
 
 Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
 
-- **Stable**: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig` /
+- **Stable Contract**: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig` /
   `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `tool`, `EventSink`,
-  `CheckpointStore`, `Workspace` / `workspace_factory`, `PermissionPolicy`, and the
-  rest of `contracts`.
-- **Experimental**: async-task seams (`TaskExecutor`, `ResultInjector`,
+  `CheckpointStore`, `Workspace` / `workspace_factory`, and `PermissionPolicy`.
+- **Contract Extension**: async-task seams (`TaskExecutor`, `ResultInjector`,
   `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
   `LoopSession`, `SessionState`, `ControlCommand` / `ControlResult` /
-  `ControlDispatcher`); multimodal input — `ImagePart` and `DocumentPart` are
-  forwarded to multimodal-capable adapters (the gateway and OpenAI adapters), a
-  text-only adapter drops them with a `model.input.degraded` warning, and
-  `AudioPart` / `VideoPart` round-trip as a forward-compatible contract but are
-  not yet forwarded. Output validation — `OutputValidator` / `ValidationOutcome` /
-  `FinalOutputView` / `OutputRetry` / `OutputValidatorError` (post-response conformance:
-  a validator registered via `AgentLoop(output_validators=...)` runs by default and can be
-  disabled per run with an `OutputValidatorBinding(enabled=False)`; on failure the loop re-prompts
-  up to `RunLimits.max_output_retries`).
+  `ControlDispatcher`); capability leases; agent-as-tool delegation; Agent Skills;
+  output validation; and multimodal input. `ImagePart` and `DocumentPart` are forwarded
+  to multimodal-capable adapters. `AudioPart` / `VideoPart` are exported content
+  contracts and round-trip through core JSON/checkpoint paths; provider forwarding is
+  adapter-specific.
+- **Helper Kit**: implementation helpers live under explicit modules such as
+  `monoid_agent_kernel.core.*`, `monoid_agent_kernel.providers.*`,
+  `monoid_agent_kernel.tools.*`, `monoid_agent_kernel.recorder`, and
+  `monoid_agent_kernel.observability`.
 - **Reference examples**: `monoid_agent_kernel.reference.*` services.
 
 ## Operational Rules
@@ -410,17 +409,16 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
   the `skill` tools reach the model (mirrors the MCP provider). The CLI
   `--skills-directory` does all of this.
 - **Definition** (`SkillDefinition`): `name`, `description` (both advertised at L1),
-  `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (**advisory** for
-  inline skills — a hint, not enforced; **enforced** for fork skills, see below), `context`
+  `instructions` (the SKILL.md body, delivered at L2), `allowed_tools` (advisory for
+  inline skills and enforced for fork skills, see below), `context`
   (`"inline"` default | `"fork"`), `directory` (bundle root for L3), `metadata`.
-- **Fork skills** (`context: fork`): instead of loading instructions inline, the skill runs
-  as an isolated **subagent** (reusing the subagent machine) and only its final message
-  returns — heavy skills keep their working noise out of the main context. The model calls
-  `skill(name, task)` with `task` describing the goal; the subagent's persona is the skill's
-  instructions and `task` is its first user message. A **non-empty** `allowed_tools` becomes the
-  subagent's tool **allowlist** — resolved against the parent's bindings, so it is a hard
-  ceiling (here `allowed-tools` is genuinely *enforced*, unlike inline skills); an empty
-  `allowed_tools` inherits all of the parent's tools (no narrowing). Enable by
+- **Fork skills** (`context: fork`): the skill runs as an isolated **subagent** (reusing
+  the subagent machine) and only its final message returns. Heavy skills keep their working
+  noise out of the main context. The model calls `skill(name, task)` with `task` describing
+  the goal; the subagent's persona is the skill's instructions and `task` is its first user
+  message. A **non-empty** `allowed_tools` becomes the subagent's tool **allowlist**,
+  resolved against the parent's bindings as a hard ceiling. An empty `allowed_tools`
+  inherits all of the parent's tools. Enable by
   merging `SkillProvider.subagent_definitions()` (namespaced `skill:<name>` ids) into
   `AgentLoop(subagent_definitions=...)`; the CLI does this automatically. The delegated run
   is reported in the usual `subagent_count`/`subagent.*` events and metrics.
@@ -457,7 +455,7 @@ through the existing `ContextProvider` + `ToolProvider` seams with **no core-loo
   recursively for `SKILL.md` files (the `<skills>/<skill-name>/SKILL.md` convention); the
   skill name is the frontmatter `name` (falling back to the directory name) and the
   SKILL.md's parent directory is the bundle root. Frontmatter fields: `name`, `description`,
-  `allowed-tools` (space-separated per the spec, or an inline list), `metadata`. Parsed by
+  `allowed-tools` (space-separated per the spec, or an inline list), `context`, `metadata`. Parsed by
   the same zero-dependency `parse_frontmatter` used for subagents.
 
 ### Session Lifecycle (`AgentSession` + FSM)
@@ -469,11 +467,15 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
 - `SessionState` — the formal lifecycle FSM (a `str`-enum): `created`, `idle`, `running`,
   `awaiting_input`, `awaiting_tasks`, `paused`, `interrupted`, `turn_failed`, `limited`,
   `cancelled`, `completed`, `failed`. `cancelled`/`completed`/`failed` are terminal.
+  Public run lifecycle payloads expose `state` plus `terminal`. A terminal limit result is
+  represented as `state="limited", terminal=true`; a live budget-limited park is
+  `state="limited", terminal=false`.
 - `state_from_suspension(suspension)` projects a pump `Suspension` onto a state (the seam that
   keeps the FSM in sync with the engine without the engine knowing about it). `LEGAL_TRANSITIONS`
-  + `can_transition` / `assert_transition` define the legal edges. `to_session_state(status,
-  error_code=...)` reconciles the legacy status strings (`BackendRunState` / `status.json` /
-  `project_run_status`) onto the one enum.
+  + `can_transition` / `assert_transition` define the legal edges.
+  `session_state_value(state)` serializes the lifecycle value, and
+  `session_state_from_run_status(status, error_code=..., terminal=...)` is the tolerant reader for
+  older `status.json` payloads.
 - `LoopSession.open() / submit() / run_until_suspended() / close()` delegate to the loop and
   re-derive `state` at each boundary. `inspect() -> SessionInspection` and `health() ->
   SessionHealth` are recomputed from live loop state on every call (never stale).
@@ -494,6 +496,8 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   `unsupported` / `error`). `ControlDispatcher.dispatch(command) -> ControlResult` is the contract;
   `RunnerBackend.dispatch` is the reference impl, routing each command to the in-process method it
   already exposes.
+  `ControlResult.status` is command outcome. Run lifecycle appears as `state` plus `terminal` in
+  successful command data when the command returns lifecycle information.
 - Command types: `pause`, `resume`, `cancel`, `approve`, `deny`, `interrupt`, `inspect`,
   `health`, `send_message`, `runtime_config`, `replace_runtime_config`, `create_task`,
   `report_task_result`, `status`, `revoke_capability`. `approve` and `deny` are explicit
@@ -522,7 +526,7 @@ for subagent event streams authorized through an ancestor run token.
 ### Diagnostics
 
 `GET /v1/runs/{run_id}/diagnostics?event_limit=N` returns one token-scoped operational aggregate:
-`status`, `failure` (`failure.json` when present), `recovery` attempt state, bounded recent event
+`status` (the run lifecycle payload with `state` and `terminal`), `failure` (`failure.json` when present), `recovery` attempt state, bounded recent event
 summaries, control-command audit summaries, and trace ids found in recent events. Diagnostics uses
 event summaries rather than raw event payloads so model text, tool arguments, bearer tokens, and
 lease material do not get a new broad read surface.
@@ -995,7 +999,7 @@ the active watchdog lives only in the reference backend (the operational layer).
 - **Failure bundle on every failure.** Beyond the core's own `failure.json`, the reference
   backend's `_record_run_failure` also writes `run_dir/failure.json`
   (`monoid.failure.v1`: `error, error_code, type, last_good_seq, restore_hint,
-  failed_at`) — the durable mark is written *before* the in-memory terminal status, so a
+  failed_at`) — the durable mark is written *before* the in-memory terminal state, so a
   worker crash that bypassed the loop's own bundle still leaves a mark and a restart never
   resumes a crashed run into a loop.
 - **Bounded recovery.** `recover_runs()` logs (not swallows) a resume failure and tracks

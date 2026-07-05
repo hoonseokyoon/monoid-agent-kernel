@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import Any, Literal
+from typing import Any
 
 from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.cancellation import CancellationToken
@@ -42,7 +42,6 @@ from monoid_agent_kernel.core.media import (
 from monoid_agent_kernel.core.context import (
     ContextProvider,
     TurnContext,
-    render_workspace_index_segment,
 )
 from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
@@ -61,15 +60,10 @@ from monoid_agent_kernel.core.agents import (
     transcript_config_snapshot,
     validate_runtime_config,
 )
-from monoid_agent_kernel.core.manifest import build_run_manifest
 from monoid_agent_kernel.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
-from monoid_agent_kernel.core.result import AgentArtifact, AgentRunResult, AgentTurnResult, Suspension
+from monoid_agent_kernel.core.result import AgentRunResult, AgentTurnResult, Suspension
 from monoid_agent_kernel.core.output_validator import (
-    FinalOutputView,
-    OutputRetry,
     OutputValidator,
-    OutputValidatorError,
-    ValidationOutcome,
 )
 from monoid_agent_kernel.core.streaming import QueueEventSink, RunStream
 from monoid_agent_kernel.core.subagent_runtime import SubagentRuntimeContext
@@ -87,7 +81,6 @@ from monoid_agent_kernel.core.tool_surface import (
     ToolSearchEntry,
     ToolSurfaceResolver,
     ToolSurfaceSnapshot,
-    tool_surface_manifest,
 )
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
@@ -104,7 +97,6 @@ from monoid_agent_kernel.core.side_effect_policy import (
     side_effect_policy_from_config,
     verify_outbox_side_effect,
 )
-from monoid_agent_kernel.core.workspace_index import build_workspace_index
 from monoid_agent_kernel.errors import (
     ModelAdapterError,
     AgentConfigError,
@@ -118,6 +110,13 @@ from monoid_agent_kernel.errors import (
     error_code_for_exception,
 )
 from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.loop_phases import (
+    LoopBootstrapper,
+    LoopFinalizer,
+    LoopSettleCoordinator,
+    SettleDecision,
+    _RunResources,
+)
 from monoid_agent_kernel.core.capability import (
     CapabilityBroker,
     CapabilityDenial,
@@ -128,6 +127,7 @@ from monoid_agent_kernel.core.capability import (
 )
 from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.trace_context import new_traceparent
+from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.tasks import (
     HostedResultInjector,
     HostedTask,
@@ -169,8 +169,6 @@ from monoid_agent_kernel.tools.base import (
 from monoid_agent_kernel.tool_loader import FunctionToolProvider
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.web import WebGatewayClient, domain_allowed, domain_from_url
-from monoid_agent_kernel.core.workspace import Workspace
-from monoid_agent_kernel.workspace.local import default_local_workspace_factory
 
 CheckpointPersistCallback = Callable[[RunCheckpoint, Mapping[str, bytes]], None]
 
@@ -220,98 +218,6 @@ def _failure_result(exc: Exception, *, error_code: str | None = None) -> ToolRes
         retryable=bool(retryable),
         category=str(category),
     )
-
-
-def _output_repair_message(failures: list[tuple[str, str]]) -> str:
-    """The user-role message re-prompted to the model after a failed output validation. Combines
-    every failing validator's feedback so the model can fix them all in one re-prompt."""
-    lines = [
-        "Your final response did not satisfy the required output format. "
-        "Correct it and respond again:"
-    ]
-    for validator_id, feedback in failures:
-        lines.append(f"- ({validator_id}) {feedback}" if feedback else f"- ({validator_id}) invalid output")
-    return "\n".join(lines)
-
-
-def _run_output_validators(
-    validators: tuple[OutputValidator, ...], view: FinalOutputView
-) -> tuple[list[tuple[str, str]], list[tuple[str, Any]], tuple[str, BaseException] | None]:
-    """Run the active validators against the view. PURE — no recorder, no state mutation — so it
-    is safe to offload to a thread (validators may block on file reads / heavy regex). Returns
-    ``(failures, ok_values, defect)``: ``failures`` are ``(validator_id, feedback)`` for rejections
-    (``OutputRetry`` / ``ValueError``, incl. ``JSONDecodeError`` / pydantic ``ValidationError``);
-    ``ok_values`` are ``(validator_id, value)`` for passes; ``defect`` is ``(validator_id, exc)`` for
-    the first validator that raised an unexpected exception (a bug the model cannot fix), else None.
-    """
-    failures: list[tuple[str, str]] = []
-    ok_values: list[tuple[str, Any]] = []
-    for validator in validators:
-        try:
-            outcome = validator.validate(view)
-            # Guard the return shape INSIDE the try so a validator that returns None / a malformed
-            # object (no ``ok``/``feedback``) is classified as a defect with the validator id, not
-            # an uncaught AttributeError downstream that surfaces as a generic internal error.
-            if not isinstance(outcome, ValidationOutcome):
-                raise TypeError(
-                    f"validate() must return a ValidationOutcome, got {type(outcome).__name__}"
-                )
-        except OutputRetry as exc:
-            outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
-        except ValueError as exc:
-            outcome = ValidationOutcome(ok=False, feedback=str(exc))
-        except Exception as exc:  # validator defect — stop and report it to the caller (loop thread)
-            return failures, ok_values, (validator.id, exc)
-        if outcome.ok:
-            ok_values.append((validator.id, outcome.value))
-        else:
-            failures.append((validator.id, outcome.feedback))
-    return failures, ok_values, None
-
-
-def _failures_by_validator(history: list[dict[str, Any]]) -> dict[str, int]:
-    """Roll up how many attempts each validator failed across the history. An oscillating
-    contradiction (validators that cannot be jointly satisfied) shows as several ids with equal,
-    non-trivial counts — the signal a developer needs when a run exhausts its retries."""
-    counts: dict[str, int] = {}
-    for attempt in history:
-        for failure in attempt.get("failures", ()):
-            vid = str(failure.get("validator_id", ""))
-            counts[vid] = counts.get(vid, 0) + 1
-    return counts
-
-
-_OUTPUT_CONTRACT_STOPPED = "Stopped: the final response did not satisfy the output contract."
-
-
-@dataclass(frozen=True)
-class SettleDecision:
-    """The classified outcome of a settle point, produced by the pure ``_decide_settle`` and applied
-    by the single ``_apply_settle``. ``kind`` discriminates (mirrors ``Suspension.reason``):
-
-    - ``accept``   — settle successfully; ``ok_values`` are the validated (id, value) pairs (empty
-      when no validators ran).
-    - ``reprompt`` — a validator rejected; re-prompt with ``failures`` and continue the pump.
-    - ``exhausted``— rejected with the retry budget spent; terminal ``limited``.
-    - ``terminal`` — refusal/truncation (non-conforming by construction); ``terminal_reason`` keys
-      the ``output.validation.failed`` emit.
-    - ``defect``   — a validator raised an unexpected exception (``defect`` = (id, exc)); apply
-      emits ``output.validator.error`` and raises ``OutputValidatorError``.
-
-    Fields beyond ``kind`` are only meaningful for the kinds that use them. ``new_history_entry``
-    (reprompt|exhausted) is the ``{attempt, failures}`` record that also serves as the
-    ``output.validation.failed`` emit payload.
-    """
-
-    kind: Literal["accept", "reprompt", "exhausted", "terminal", "defect"]
-    reason: str = "settled"  # Suspension reason: "settled" | "limited"
-    status: str = "completed"
-    error_code: str = ""
-    ok_values: tuple[tuple[str, Any], ...] = ()
-    failures: tuple[tuple[str, str], ...] = ()
-    new_history_entry: dict[str, Any] | None = None
-    terminal_reason: str | None = None
-    defect: tuple[str, BaseException] | None = None
 
 
 @dataclass(frozen=True)
@@ -509,7 +415,8 @@ class AgentToolContext(ToolContext):
             self.tool_search_max_results,
             int(requested_max) if requested_max is not None else self.tool_search_max_results,
         )
-        ranked = _rank_tool_search_entries(query, self.tool_search_entries)
+        entries = _filter_tool_search_entries(self.tool_search_entries, args)
+        ranked = _rank_tool_search_entries(query, entries)
         results = [entry.to_json() for entry in ranked[:max_results]]
         for item in results:
             binding_id = str(item.get("binding_id") or "")
@@ -659,19 +566,6 @@ class RunState:
 
 
 @dataclass
-class _RunResources:
-    """Objects assembled by bootstrap and reused across a run's phases."""
-
-    workspace: Workspace
-    recorder: AgentRecorder
-    context: AgentToolContext
-    base_tool_specs: tuple[ToolSpec, ...]
-    started: float
-    deadline: float | None
-    static_segments: tuple[str, ...]
-
-
-@dataclass
 class _Session:
     """Live state for an open run, threaded across multiple submit() calls."""
 
@@ -770,11 +664,17 @@ class AgentLoop:
     # checkpointed — on restore leases are re-brokered, so a stale handle never survives on disk.
     _capability_vault: CapabilityVault = field(default_factory=CapabilityVault, init=False, repr=False)
     _outbox: Outbox = field(default_factory=Outbox, init=False, repr=False)
+    _bootstrapper: LoopBootstrapper = field(init=False, repr=False)
+    _settle_coordinator: LoopSettleCoordinator = field(init=False, repr=False)
+    _finalizer: LoopFinalizer = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
         # can pass any of the three forms without hand-wrapping a StaticRuntimeConfigProvider.
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
+        self._bootstrapper = LoopBootstrapper(self)
+        self._settle_coordinator = LoopSettleCoordinator(self)
+        self._finalizer = LoopFinalizer(self)
 
     @classmethod
     def from_config(
@@ -2133,153 +2033,7 @@ class AgentLoop:
         )
 
     def _bootstrap(self) -> _RunResources:
-        if self.permission_policy == PermissionPolicy() and self.spec.permission_policy != PermissionPolicy():
-            self.permission_policy = self.spec.permission_policy
-        workspace_factory = self.workspace_factory or default_local_workspace_factory
-        workspace = workspace_factory(self.spec)
-        # A dormant stream sink rides on the EventBus for the whole run; astream activates it
-        # per stream (no EventBus mutation, supports sequential streams). Inert otherwise.
-        self._stream_sink = QueueEventSink()
-        recorder = AgentRecorder(
-            self.spec.run_root,
-            self.spec.run_id,
-            extra_event_sinks=(*self.event_sinks, self._stream_sink),
-            status_file=self.status_file,
-            reopen=self._restoring,
-        )
-        job_manager = TaskManager(
-            run_id=self.spec.run_id,
-            workspace=workspace,
-            recorder=recorder,
-            permission_policy=self.permission_policy,
-        )
-        shell_service = ShellService(
-            run_id=self.spec.run_id,
-            workspace=workspace,
-            recorder=recorder,
-            job_manager=job_manager,
-            permission_policy=self.permission_policy,
-            approval_provider=self.shell_approval_provider,
-        )
-        web_service = WebService(
-            recorder=recorder,
-            web_gateway_client=self.web_gateway_client,
-        )
-        jobs_service = JobsService(job_manager=job_manager)
-        context = AgentToolContext(
-            self.spec.run_id,
-            workspace,
-            recorder,
-            job_manager,
-            shell_service,
-            web_service,
-            jobs_service,
-            permission_policy=self.permission_policy,
-            capability_vault=self._capability_vault,
-            outbox=self._outbox,
-        )
-        base_registry = ToolRegistry()
-        base_registry.register_many(builtin_tools(workspace))
-        for provider in self.tool_providers:
-            base_registry.register_many(provider.get_tools(context))
-        if self.subagent_definitions:
-            self._install_subagent_capability(base_registry, context, job_manager)
-
-        started = time.time()
-        deadline = (
-            started + self.spec.limits.max_duration_s
-            if self.spec.limits.max_duration_s is not None
-            else None
-        )
-        self._bootstrap_resources = _RunResources(
-            workspace=workspace,
-            recorder=recorder,
-            context=context,
-            base_tool_specs=tuple(base_registry.specs()),
-            started=started,
-            deadline=deadline,
-            static_segments=(),
-        )
-        initial_runtime_config = self._current_runtime_config(base_registry)
-        initial_bound_catalog = compile_bound_tool_catalog(initial_runtime_config, base_registry)
-        initial_turn = TurnContext(
-            step=1,
-            remaining_steps=max(0, self.spec.limits.max_steps - 1),
-            remaining_tool_calls=self.spec.limits.max_tool_calls,
-            deadline_s=(deadline - time.time()) if deadline is not None else None,
-            plan=(),
-            pending_observation_count=0,
-        )
-        initial_surface = self.tool_surface_resolver.resolve(
-            bound_catalog=initial_bound_catalog,
-            turn=initial_turn,
-        )
-        initial_visible_tool_specs = list(initial_surface.immediate_tools)
-        workspace_index = build_workspace_index(workspace, run_id=self.spec.run_id)
-        workspace_index_path = recorder.write_workspace_index(workspace_index)
-        static_segments: list[str] = []
-        if self.inject_workspace_index:
-            index_segment = render_workspace_index_segment(workspace_index)
-            if index_segment:
-                static_segments.append(index_segment)
-        for provider in self.context_providers:
-            segment = provider.static_segment()
-            if segment and segment.strip():
-                static_segments.append(segment)
-        # On restore (_rehydrate) the run dir already holds workspace.base.json,
-        # manifest.json, and a recorded run.started. Re-writing the base would reset
-        # the diff baseline; re-emitting run.started would double the lifecycle. Skip
-        # all bootstrap side-effects and reuse what is already on disk.
-        if not self._restoring:
-            workspace_base_path = recorder.write_workspace_base(
-                workspace.workspace_base_payload(self.spec.run_id)
-            )
-            manifest = build_run_manifest(
-                self.spec,
-                model_config=initial_runtime_config.model or ModelConfig(),
-                tool_specs=initial_visible_tool_specs,
-                permission_policy=self.permission_policy,
-                tool_surface=tool_surface_manifest(
-                    resolver=self.tool_surface_resolver,
-                    tool_search=initial_runtime_config.tool_search,
-                    dynamic_enabled=bool(self._dynamic_providers()),
-                    initial_catalog_count=len(initial_bound_catalog.tools),
-                ),
-                agent_config={
-                    "definition_id": initial_runtime_config.definition_id,
-                    "config_version": initial_runtime_config.config_version,
-                    "config_hash": initial_runtime_config.config_hash,
-                },
-                workspace_index_path=str(workspace_index_path.relative_to(recorder.run_dir).as_posix()),
-                workspace_base_path=str(workspace_base_path.relative_to(recorder.run_dir).as_posix()),
-            )
-            recorder.write_manifest(manifest)
-            recorder.emit(
-                "run.started",
-                data={
-                    "workspace": str(self.spec.workspace_root),
-                    "run_dir": str(recorder.run_dir),
-                    "manifest_path": "manifest.json",
-                    "mode": self.spec.mode,
-                    "workspace_backend": self.spec.workspace_backend,
-                    "workspace_base_path": "workspace.base.json",
-                    "model_provider": (initial_runtime_config.model or ModelConfig()).provider,
-                    "model": (initial_runtime_config.model or ModelConfig()).model,
-                    "reasoning_effort": (initial_runtime_config.model or ModelConfig()).reasoning.effort,
-                    "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
-                    "agent_config_hash": initial_runtime_config.config_hash,
-                },
-            )
-        self._emit_bootstrap_validator_skips(initial_runtime_config, recorder)
-        return _RunResources(
-            workspace=workspace,
-            recorder=recorder,
-            context=context,
-            base_tool_specs=tuple(base_registry.specs()),
-            started=started,
-            deadline=deadline,
-            static_segments=tuple(static_segments),
-        )
+        return self._bootstrapper.bootstrap()
 
     def _active_output_validators(
         self, config: AgentRuntimeConfig | None
@@ -2343,50 +2097,7 @@ class AgentLoop:
         turn: ModelTurn,
         runtime_config: AgentRuntimeConfig,
     ) -> SettleDecision:
-        """Classify a settle point into a :class:`SettleDecision` — PURE: no recorder, no ``state``
-        mutation. It reads ``state.output_retries``/``output_failure_history`` and the retry limit
-        read-only to pick ``reprompt`` vs ``exhausted``; all side effects happen in
-        :meth:`_apply_settle`. Validators run off the event loop (``asyncio.to_thread``) so a
-        slow/blocking validator never stalls the loop.
-        """
-        # Refusal / truncation: never validate output that is non-conforming by construction.
-        if turn.stop_reason == "refusal":
-            return SettleDecision(
-                kind="terminal", reason="settled", status="failed",
-                error_code="output_refused", terminal_reason="refusal",
-            )
-        if turn.stop_reason == "length":
-            return SettleDecision(
-                kind="terminal", reason="limited", status="limited",
-                error_code="output_truncated", terminal_reason="truncation",
-            )
-
-        validators = self._active_output_validators(runtime_config)  # per-turn (honors hot-swap)
-        if not validators:
-            # None registered, or all disabled this turn. An accept with no values: the result keeps
-            # its reset final_output=None / outputs={}, and a run.finish's tool output is still logged
-            # by apply (the from_finish bookkeeping) so a by-value continuation isn't left dangling.
-            return SettleDecision(kind="accept")
-
-        view = self._build_final_output_view(state, res, context)
-        failures, ok_values, defect = await asyncio.to_thread(_run_output_validators, validators, view)
-        if defect is not None:
-            return SettleDecision(kind="defect", defect=defect)
-        if not failures:
-            return SettleDecision(kind="accept", ok_values=tuple(ok_values))
-
-        # A failed attempt. The entry doubles as the ``output.validation.failed`` emit payload.
-        attempt = len(state.output_failure_history) + 1
-        entry = {
-            "attempt": attempt,
-            "failures": [{"validator_id": vid, "feedback": fb} for vid, fb in failures],
-        }
-        if state.output_retries >= self.spec.limits.max_output_retries:
-            return SettleDecision(
-                kind="exhausted", reason="limited", status="limited",
-                error_code="output_validator_unsatisfied", new_history_entry=entry,
-            )
-        return SettleDecision(kind="reprompt", failures=tuple(failures), new_history_entry=entry)
+        return await self._settle_coordinator.decide(state, res, context, turn, runtime_config)
 
     def _apply_settle(
         self,
@@ -2397,108 +2108,14 @@ class AgentLoop:
         *,
         from_finish: bool,
     ) -> Suspension | None:
-        """The SINGLE place that applies a :class:`SettleDecision`: all ``state`` mutation, all
-        recorder emits, the finish bookkeeping, and the ``Suspension``. Returns the ``Suspension``
-        to settle on, or ``None`` to continue the pump (a re-prompt was queued). Raises
-        ``OutputValidatorError`` on a validator *defect* (terminalized by the loop's broad boundary).
-
-        Centralizing the finish bookkeeping here is the point: a new outcome cannot forget to clear
-        ``pending_finish`` / log the finish observations, because exactly one branch does it.
-        """
-        recorder = res.recorder
-
-        if decision.kind == "defect":
-            validator_id, exc = decision.defect  # type: ignore[misc]
-            recorder.emit(
-                "output.validator.error",
-                data={"validator_id": validator_id, "error": str(exc)},
-                level="error",
-            )
-            raise OutputValidatorError(f"output validator {validator_id!r} raised: {exc}") from exc
-
-        # Record the failed attempt FIRST (reprompt + exhausted), so the exhausted roll-up and the
-        # validation.failed emit see the same history ordering as before the split.
-        if decision.new_history_entry is not None:
-            state.output_failure_history.append(decision.new_history_entry)
-            recorder.emit("output.validation.failed", data=decision.new_history_entry, level="warning")
-
-        # Per-kind state mutation + kind-specific emits.
-        if decision.kind == "accept":
-            state.output_values = dict(decision.ok_values)  # keyed by validator id
-            state.final_output = decision.ok_values[-1][1] if decision.ok_values else None  # last ok wins
-            for validator_id, _value in decision.ok_values:
-                recorder.emit("output.validator.satisfied", data={"validator_id": validator_id})
-        elif decision.kind == "terminal":
-            state.status = decision.status  # type: ignore[assignment]
-            state.error_code = decision.error_code
-            recorder.emit("output.validation.failed", data={"reason": decision.terminal_reason}, level="warning")
-        elif decision.kind == "exhausted":
-            # output_retries counts re-prompts actually made — NOT this terminal failed attempt, so
-            # the emit reports it un-incremented (the history length records the total attempts).
-            state.status = decision.status  # type: ignore[assignment]
-            state.final_text = state.final_text or _OUTPUT_CONTRACT_STOPPED
-            state.error_code = decision.error_code
-            recorder.emit(
-                "output.validator.exhausted",
-                data={
-                    "retries": state.output_retries,
-                    "failures_by_validator": _failures_by_validator(state.output_failure_history),
-                    "history": list(state.output_failure_history),
-                },
-                level="warning",
-            )
-        elif decision.kind == "reprompt":
-            state.output_retries += 1  # an actual re-prompt is about to be queued
-
-        # Finish bookkeeping — the ONE place. When the settle came from run.finish: always log its
-        # tool output (a by-value continuation must not carry a dangling function_call), and clear
-        # pending_finish IFF the finish was rejected (reprompt|exhausted) so its outputs/notes don't
-        # leak into close() or re-settle the next turn; on a reprompt also blank the rejected summary.
-        if from_finish:
-            if decision.kind in ("reprompt", "exhausted"):
-                self._clear_finish_metadata(context)
-                if decision.kind == "reprompt":
-                    state.final_text = ""
-            self._log_finish_observations(state)
-
-        if decision.kind == "reprompt":
-            state.pending_observations = ()
-            state.messages.append({"role": "user", "content": _output_repair_message(list(decision.failures))})
-            return None
-
-        if decision.kind == "accept":
-            return Suspension(reason="settled", status=state.status, final_text=state.final_text)  # type: ignore[arg-type]
-        return Suspension(
-            reason=decision.reason, status=state.status, final_text=state.final_text, error_code=state.error_code  # type: ignore[arg-type]
+        return self._settle_coordinator.apply(
+            decision, state, res, context, from_finish=from_finish
         )
 
     def _build_final_output_view(
         self, state: RunState, res: _RunResources, context: AgentToolContext
-    ) -> FinalOutputView:
-        """The read-only composite (text + files) handed to a validator. ``read_bytes`` goes
-        through ``workspace.read_bytes`` so it inherits the path jail + ``max_bytes_read`` cap;
-        a validator may pass ``max_bytes`` to raise the cap for a legit large artifact."""
-        workspace = res.workspace
-
-        def _read(path: str, *, max_bytes: int | None = None) -> bytes:
-            data, _digest = workspace.read_bytes(path, max_bytes=max_bytes)
-            return data
-
-        artifacts = tuple(
-            AgentArtifact(
-                artifact_id=getattr(a, "artifact_id", ""),
-                path=getattr(a, "path", ""),
-                kind=getattr(a, "kind", ""),
-                label=getattr(a, "label", None),
-            )
-            for a in res.recorder.artifacts
-        )
-        return FinalOutputView(
-            final_text=state.final_text,
-            artifacts=artifacts,
-            final_outputs=(context.pending_finish.outputs if context.pending_finish else ()),
-            read_bytes=_read,
-        )
+    ) -> Any:
+        return self._settle_coordinator.build_final_output_view(state, res, context)
 
     def _warn_on_unforwarded_multimodal(
         self, parts: tuple[ContentPart, ...], recorder: AgentRecorder
@@ -3181,152 +2798,13 @@ class AgentLoop:
         return None
 
     def _build_metrics(self, state: RunState, res: _RunResources) -> dict[str, Any]:
-        context = res.context
-        model = (
-            state.previous_runtime_config.model
-            if state.previous_runtime_config is not None and state.previous_runtime_config.model is not None
-            else ModelConfig()
-        )
-        metrics = {
-            "status": state.status,
-            "duration_s": time.time() - res.started,
-            "steps_limit": self.spec.limits.max_steps,
-            "tool_calls": state.total_tool_calls,
-            "changed_paths": res.workspace.changed_paths(),
-            "workspace_backend": self.spec.workspace_backend,
-            "requested_reasoning_effort": model.reasoning.effort,
-            "effective_reasoning_effort": model.reasoning.effort,
-            "error_code": state.error_code,
-            **context.shell_service.metrics(),
-            **context.jobs_service.background_metrics(),
-            **context.web_service.metrics(),
-            **state.total_usage,
-        }
-        if context.subagent_count:
-            metrics["subagent_count"] = context.subagent_count
-            metrics["subagent_usage"] = dict(context.subagent_usage)
-        if context.skill_activation_count:
-            metrics["skill_activation_count"] = context.skill_activation_count
-            metrics["skills_activated"] = list(context.skills_activated)
-        if state.output_failure_history:
-            # Output-validation diagnostics surfaced in the run result: how many re-prompts were
-            # spent and which validators kept failing (a contradiction shows as equal counts).
-            metrics["output_validation"] = {
-                "retries": state.output_retries,
-                "failures_by_validator": _failures_by_validator(state.output_failure_history),
-            }
-        if state.provider_error_code:
-            metrics["provider_error_code"] = state.provider_error_code
-        if state.provider_http_status is not None:
-            metrics["provider_http_status"] = state.provider_http_status
-        if state.error:
-            metrics["error"] = state.error
-        return metrics
+        return self._finalizer.build_metrics(state, res)
 
     def _finalize(self, state: RunState, res: _RunResources) -> AgentRunResult:
-        context = res.context
-        recorder = res.recorder
-        workspace = res.workspace
-        context.job_manager.cancel_all()
-        diff_path = recorder.write_diff(workspace.diff_patch())
-        proposal_payload = recorder.write_proposal_snapshot(workspace, diff_path)
-        metrics = self._build_metrics(state, res)
-        recorder.write_metrics(metrics)
-        recorder.emit(
-            "workspace.proposal.updated",
-            data=public_proposal_payload(proposal_payload, self.permission_policy),
-        )
-        recorder.emit(
-            "proposal.ready",
-            data={
-                "proposal_hash": proposal_payload.get("proposal_hash"),
-                "diff_sha256": proposal_payload.get("diff_sha256"),
-                "changed_paths": [
-                    public_path(str(path), self.permission_policy)
-                    for path in proposal_payload.get("changed_paths", [])
-                ],
-            },
-        )
-        recorder.emit(
-            "run.finished",
-            data={
-                "status": state.status,
-                "error": public_error_message(state.error),
-                "error_code": state.error_code,
-                "final_text": state.final_text,
-                "duration_s": metrics["duration_s"],
-                "diff_path": str(diff_path.relative_to(recorder.run_dir)),
-                "proposal_path": "proposal.json",
-                "metrics_path": "metrics.json",
-            },
-            level="error" if state.status == "failed" else "info",
-        )
-        artifacts = tuple(recorder.artifacts)
-        run_dir = recorder.run_dir
-        recorder.close()
-        return AgentRunResult(
-            run_id=self.spec.run_id,
-            status=state.status,  # type: ignore[arg-type]
-            final_text=state.final_text,
-            run_dir=run_dir,
-            diff_path=diff_path,
-            proposal_path=run_dir / "proposal.json",
-            artifacts=artifacts,
-            final_outputs=(context.pending_finish.outputs if context.pending_finish else ()),
-            final_notes=(context.pending_finish.notes if context.pending_finish else None),
-            final_output=state.final_output,
-            outputs=dict(state.output_values),
-            metrics=metrics,
-            error=state.error,
-            error_code=state.error_code,
-            final_turn_handle=state.previous_turn_handle,
-        )
+        return self._finalizer.finalize(state, res)
 
     def _checkpoint_on_settle(self, state: RunState, res: _RunResources) -> AgentTurnResult:
-        """Preview-only checkpoint at a settle point: flush the accumulated proposal
-        and metrics, emit ``turn.settled``, and keep the run open. Repeatable — it
-        does not cancel jobs, emit ``proposal.ready``/``run.finished``, or close the
-        recorder. Those happen once in close()/``_finalize``."""
-        recorder = res.recorder
-        workspace = res.workspace
-        diff_path = recorder.write_diff(workspace.diff_patch())
-        proposal_payload = recorder.write_proposal_snapshot(workspace, diff_path)
-        metrics = self._build_metrics(state, res)
-        recorder.write_metrics(metrics)
-        recorder.emit(
-            "workspace.proposal.updated",
-            data=public_proposal_payload(proposal_payload, self.permission_policy),
-        )
-        public_changed = [
-            public_path(str(path), self.permission_policy)
-            for path in proposal_payload.get("changed_paths", [])
-        ]
-        recorder.emit(
-            "turn.settled",
-            data={
-                "status": state.status,
-                "final_text": state.final_text,
-                "error_code": state.error_code,
-                "changed_paths": public_changed,
-                # Output-validation summary for this settle: how many validators were active and
-                # how many re-prompts the run spent satisfying them (0 when none ran).
-                "output_validators": len(self._active_output_validators(state.previous_runtime_config)),
-                "output_retries": state.output_retries,
-            },
-        )
-        return AgentTurnResult(
-            status=state.status,  # type: ignore[arg-type]
-            final_text=state.final_text,
-            proposal_path=recorder.run_dir / "proposal.json",
-            proposal_hash=str(proposal_payload.get("proposal_hash") or ""),
-            changed_paths=tuple(workspace.changed_paths()),
-            turn_handle=state.previous_turn_handle,
-            error=state.error,
-            error_code=state.error_code,
-            final_output=state.final_output,
-            outputs=dict(state.output_values),
-            metrics=metrics,
-        )
+        return self._finalizer.checkpoint_on_settle(state, res)
 
     def _pop_background_observations(
         self,
@@ -4548,12 +4026,48 @@ def _rank_tool_search_entries(
                 entry.summary,
                 entry.guidance.summary,
                 entry.guidance.policy,
+                entry.namespace,
+                " ".join(entry.groups),
+                " ".join(entry.tags),
             ]
         ).lower()
         return sum(1 for term in terms if term in haystack)
 
     scored = [(score(entry), index, entry) for index, entry in enumerate(entries)]
     return [entry for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1])) if value > 0]
+
+
+def _filter_tool_search_entries(
+    entries: tuple[ToolSearchEntry, ...],
+    args: Mapping[str, Any],
+) -> tuple[ToolSearchEntry, ...]:
+    namespace = str(args.get("namespace") or "").strip()
+    groups = _filter_values(args.get("groups", args.get("group")))
+    tags = _filter_values(args.get("tags", args.get("tag")))
+    if not namespace and not groups and not tags:
+        return entries
+
+    def matches(entry: ToolSearchEntry) -> bool:
+        if namespace and entry.namespace != namespace:
+            return False
+        if groups and not groups.intersection(entry.groups):
+            return False
+        if tags and not tags.intersection(entry.tags):
+            return False
+        return True
+
+    return tuple(entry for entry in entries if matches(entry))
+
+
+def _filter_values(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        text = value.strip()
+        return {text} if text else set()
+    if isinstance(value, list | tuple):
+        return {text for item in value if (text := str(item).strip())}
+    return set()
 
 
 def _is_tool_search_call(name: str, catalog: BoundToolCatalog) -> bool:

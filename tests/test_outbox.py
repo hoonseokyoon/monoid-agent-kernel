@@ -21,7 +21,6 @@ from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
-from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.reference.outbox import (
     FailingOutboxSender,
@@ -71,26 +70,16 @@ def test_outbox_holder_pending_mark_export_import() -> None:
 
 
 def _outbox_backend(
-    tmp_path: Path,
+    backend_factory: Any,
     turns: list[ModelTurn],
     *,
     sender: Any,
     broker: Any = None,
 ) -> tuple[RunnerBackend, Path]:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    workspace.joinpath("notes.md").write_text("n\n", encoding="utf-8")
-
-    def factory(spec: Any, llm_gateway_token: str) -> FakeModelAdapter:
-        del spec, llm_gateway_token
-        return FakeModelAdapter(turns=list(turns))
-
-    backend = RunnerBackend(
-        run_root=tmp_path / "runs",
-        token_manager=TokenManager.from_secret("x" * 32),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=factory,
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(
+        workspace=workspace,
+        turns=turns,
         tool_providers=(OutboxToolProvider(),),
         capability_broker_factory=(lambda req: broker) if broker is not None else None,
         outbox_sender_factory=lambda req: sender,
@@ -122,9 +111,9 @@ _SEND_ACK = ModelTurn(
 _DONE = ModelTurn(response_id="rN", final_text="done")
 
 
-def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(tmp_path: Path) -> None:
+def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(backend_factory: Any) -> None:
     sender = RecordingOutboxSender()
-    backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
     run_id, _token = _run(backend, workspace)
     assert backend.wait_for_run(run_id, timeout_s=20) == "completed"
 
@@ -149,9 +138,9 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(tmp_path: Path)
     assert child["span_id"] != parse_traceparent(tp)["span_id"]
 
 
-def test_strict_outbox_side_effect_stages_and_dispatches(tmp_path: Path) -> None:
+def test_strict_outbox_side_effect_stages_and_dispatches(backend_factory: Any) -> None:
     sender = RecordingOutboxSender()
-    backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
     binding = tool_binding(
         "outbox.send",
         runtime={
@@ -187,22 +176,22 @@ def test_strict_outbox_side_effect_stages_and_dispatches(tmp_path: Path) -> None
     assert any(event["type"] == "outbox.dispatched" for event in events)
 
 
-def test_outbox_not_staged_when_capability_denied(tmp_path: Path) -> None:
+def test_outbox_not_staged_when_capability_denied(backend_factory: Any) -> None:
     from monoid_agent_kernel.reference.capability import DenyAllBroker
 
     sender = RecordingOutboxSender()
-    backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=DenyAllBroker())
+    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=DenyAllBroker())
     run_id, _token = _run(backend, workspace)
     backend.wait_for_run(run_id, timeout_s=20)
     # The gate denied the capability -> the tool never ran -> nothing was staged or dispatched.
     assert sender.sent == []
 
 
-def test_outbox_retryable_failure_then_dead_letters(tmp_path: Path) -> None:
+def test_outbox_retryable_failure_then_dead_letters(backend_factory: Any) -> None:
     # A retryable sender keeps the request pending across drains; bound the attempts so it
     # eventually dead-letters as failed rather than looping forever.
     sender = FailingOutboxSender(retryable=True)
-    backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
     backend.outbox_max_attempts = 1  # fail on the first attempt
     run_id, _token = _run(backend, workspace)
     backend.wait_for_run(run_id, timeout_s=20)
@@ -264,9 +253,9 @@ def test_outbox_request_next_attempt_at_round_trips() -> None:
     assert OutboxRequest.from_json({"destination": "email", "id": "o2"}).next_attempt_at == 0.0
 
 
-def test_backoff_delay_is_capped_with_full_jitter(tmp_path: Path) -> None:
+def test_backoff_delay_is_capped_with_full_jitter(backend_factory: Any) -> None:
     sender = RecordingOutboxSender()
-    backend, _ws = _outbox_backend(tmp_path, [_DONE], sender=sender)
+    backend, _ws = _outbox_backend(backend_factory, [_DONE], sender=sender)
     backend.outbox_retry_base_s, backend.outbox_retry_factor, backend.outbox_retry_cap_s = 1.0, 2.0, 10.0
     backend._outbox_rng.seed(1234)
     # Full jitter: each delay lands within [0, ceiling]; the ceiling grows with attempts but is capped.
@@ -302,7 +291,7 @@ def test_retryable_failure_stamps_future_schedule_and_is_not_due(tmp_path: Path)
     loop.close()
 
 
-def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None:
+def test_watchdog_redrives_due_request_while_run_is_idle(backend_factory: Any) -> None:
     # The first send fails (retryable); with base=0 the retry is immediately due. The run then parks
     # (idle) — and the watchdog redrive tick dispatches the due request without any run activity.
     class _FlakyOnce:
@@ -316,7 +305,7 @@ def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None
 
     sender = _FlakyOnce()
     backend, workspace = _outbox_backend(
-        tmp_path,
+        backend_factory,
         [_SEND, ModelTurn(response_id="rw", final_text="staged")],
         sender=sender,
         broker=AutoGrantBroker(),
@@ -324,7 +313,7 @@ def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None
     backend.outbox_retry_base_s = 0.0  # next_attempt_at == now -> immediately due on redrive
     backend.watchdog_interval_s = 0.05
     run_id, token = _run(backend, workspace, multi_turn=True)
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
     assert eventually(lambda: sender.calls >= 1)  # the park-time drain attempted (and failed) once
 
     backend.start_watchdog()
@@ -339,16 +328,18 @@ def test_watchdog_redrives_due_request_while_run_is_idle(tmp_path: Path) -> None
 # --- ack-back (non-park): the receipt comes back as a correlated inbox message ------------
 
 
-def test_outbox_ack_delivered_to_run_inbox_and_consumed(tmp_path: Path) -> None:
+def test_outbox_ack_delivered_to_run_inbox_and_consumed(backend_factory: Any) -> None:
     from monoid_agent_kernel.core.inbox import is_inbox_envelope
 
     sender = RecordingOutboxSender()
-    backend, workspace = _outbox_backend(tmp_path, [_SEND_ACK, _DONE, _DONE], sender=sender, broker=AutoGrantBroker())
+    backend, workspace = _outbox_backend(
+        backend_factory, [_SEND_ACK, _DONE, _DONE], sender=sender, broker=AutoGrantBroker()
+    )
 
     # Capture the exact ack envelope at staging (wrap put_nowait around the original call — no race,
     # since the put happens synchronously on the shared loop before the parked driver can consume it).
     captured: list[dict] = []
-    original_stage = backend._stage_outbox_ack
+    original_stage = backend._outbox_dispatch.stage_outbox_ack
 
     def stage_spy(record: Any, request: Any, status: str, receipt: Any) -> None:
         real_put = record.message_queue.put_nowait
@@ -364,7 +355,7 @@ def test_outbox_ack_delivered_to_run_inbox_and_consumed(tmp_path: Path) -> None:
         finally:
             record.message_queue.put_nowait = real_put  # type: ignore[method-assign]
 
-    backend._stage_outbox_ack = stage_spy  # type: ignore[method-assign]
+    backend._outbox_dispatch.stage_outbox_ack = stage_spy  # type: ignore[method-assign]
 
     run_id, token = _run(backend, workspace, multi_turn=True)
     request_id = sender.sent[0].id if eventually(lambda: sender.sent) else ""
@@ -383,9 +374,9 @@ def test_outbox_ack_delivered_to_run_inbox_and_consumed(tmp_path: Path) -> None:
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_outbox_without_expect_ack_delivers_no_inbox_message(tmp_path: Path) -> None:
+def test_outbox_without_expect_ack_delivers_no_inbox_message(backend_factory: Any) -> None:
     sender = RecordingOutboxSender()
-    backend, workspace = _outbox_backend(tmp_path, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
     run_id, _token = _run(backend, workspace)
     assert backend.wait_for_run(run_id, timeout_s=20) == "completed"
     assert sender.sent and not sender.sent[0].expect_ack
@@ -402,7 +393,9 @@ def _send_to(peer: str, text: str, call_id: str) -> ModelTurn:
     )
 
 
-def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None:
+def test_a2a_outbox_routes_into_peer_inbox_bidirectional(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     """Agent-to-agent over the durable fabric: planner stages an ``outbox.send`` to ``worker``; the
     routing sender delivers it into worker's idempotent inbox, worker consumes it as a turn and
     replies, and the reply is routed back into planner's inbox. Proven by each peer emitting an
@@ -447,11 +440,9 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
         del spec, llm_gateway_token
         return FakeModelAdapter(turns=list(pending.pop(0) if pending else []))
 
-    backend = RunnerBackend(
+    backend = backend_factory.create(
         run_root=tmp_path / "runs",
-        token_manager=TokenManager.from_secret("x" * 32),
-        allowed_workspace_roots=(workspace,),
-        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        workspace=workspace,
         model_adapter_factory=factory,
         tool_providers=(OutboxToolProvider(),),
         capability_broker_factory=lambda req: AutoGrantBroker(),
@@ -478,7 +469,7 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(tmp_path: Path) -> None
     try:
         worker_id = spawn("worker", "stand by for planner")
         directory["worker"] = worker_id
-        assert eventually(lambda: backend.status(worker_id, tokens[worker_id]).get("status") == "awaiting_input")
+        assert eventually(lambda: backend.status(worker_id, tokens[worker_id]).get("state") == "awaiting_input")
         planner_id = spawn("planner", "collaborate with worker")
         directory["planner"] = planner_id
 

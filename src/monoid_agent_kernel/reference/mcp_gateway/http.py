@@ -82,6 +82,30 @@ def make_mcp_handler(
                     return
                 self._write_result(rid, result)
                 return
+            if method == "resources/list":
+                self._write_result(rid, server.list_resources())
+                return
+            if method == "resources/read":
+                params = message.get("params") or {}
+                try:
+                    result = server.read_resource(str(params.get("uri") or ""))
+                except FakeMcpError as exc:
+                    self._write_jsonrpc_error(rid, exc.code, exc.message)
+                    return
+                self._write_result(rid, result)
+                return
+            if method == "prompts/list":
+                self._write_result(rid, server.list_prompts())
+                return
+            if method == "prompts/get":
+                params = message.get("params") or {}
+                try:
+                    result = server.get_prompt(str(params.get("name") or ""), params.get("arguments"))
+                except FakeMcpError as exc:
+                    self._write_jsonrpc_error(rid, exc.code, exc.message)
+                    return
+                self._write_result(rid, result)
+                return
             self._write_jsonrpc_error(rid, _METHOD_NOT_FOUND, f"method not found: {method}")
 
         # -- auth + logging -------------------------------------------------------------

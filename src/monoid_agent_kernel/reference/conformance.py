@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,18 @@ class ReferenceConformanceFactory:
     def new_backend(self) -> ReferenceBackendHarness:
         return ReferenceBackendHarness(self._next_root("backend"))
 
+    def new_tool_agent(self) -> ReferenceBackendHarness:
+        return ReferenceBackendHarness(self._next_root("tool-agent"))
+
+    def new_control_plane(self) -> ReferenceBackendHarness:
+        return ReferenceBackendHarness(self._next_root("control-plane"))
+
+    def new_durable_runner(self) -> ReferenceBackendHarness:
+        return ReferenceBackendHarness(self._next_root("durable-runner"))
+
+    def new_multi_agent(self) -> ReferenceBackendHarness:
+        return ReferenceBackendHarness(self._next_root("multi-agent"))
+
     def new_side_effect(self) -> ReferenceBackendHarness:
         return ReferenceBackendHarness(self._next_root("side-effect"))
 
@@ -96,10 +109,11 @@ class ReferenceConformanceFactory:
             submitted = server.start_chat("hello from reference-full smoke")
             run_id = str(submitted["run_id"])
             events = _wait_for_event(server, run_id, "turn.settled")
-            assert _eventually(lambda: server.run_status(run_id)["status"] == "awaiting_input")
+            assert _eventually(lambda: server.run_status(run_id)["state"] == "awaiting_input")
             status = server.run_status(run_id)
             sessions = server.sessions()
-            assert status["status"] == "awaiting_input"
+            assert status["state"] == "awaiting_input"
+            assert status["terminal"] is False
             assert any(session["run_id"] == run_id for session in sessions["sessions"])
             return {"run_id": run_id, "event_count": len(events)}
         finally:
@@ -410,6 +424,16 @@ class ReferenceBackendHarness:
         self.backend.idle_timeout_s = 30.0
         self.backend.max_recover_attempts = 10_000
 
+    def __enter__(self) -> ReferenceBackendHarness:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        del exc_type, exc, tb
+        self.close()
+
+    def close(self) -> None:
+        self.backend.shutdown(drain=True)
+
     def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
         scenario = str(request.metadata.get("scenario") or "")
         if scenario == "tool-side-effect-pending-recovery":
@@ -479,7 +503,9 @@ class ReferenceBackendHarness:
         }:
             assert self.backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
         elif multi_turn:
-            assert _eventually(lambda: self.backend._record(submission.run_id).status == "awaiting_input")
+            task_waiting = {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}
+            expected_state = "awaiting_tasks" if scenario in task_waiting else "awaiting_input"
+            assert _eventually(lambda: self.backend._record(submission.run_id).state.value == expected_state)
             if scenario == "recoverable-multi-turn":
                 assert _eventually(lambda: self.checkpoint_store.latest(submission.run_id) is not None)
             elif scenario == "tool-side-effect-pending-recovery":
@@ -527,6 +553,398 @@ class ReferenceBackendHarness:
             raise AssertionError(f"unsupported backend scenario: {scenario}")
         return {"run_id": submission.run_id, "token": submission.run_token}
 
+    def run_tool_surface_admission_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "tool-quota-denied"})
+        run_id = str(submitted["run_id"])
+        token = str(submitted["token"])
+        events = list(self.events(run_id, token)["events"])
+        result = self.result(run_id, token)
+        denied = [
+            event
+            for event in events
+            if event["type"] == "permission.denied"
+            and event["data"].get("error_code") == "tool_quota_exceeded"
+        ]
+        return {
+            "permission_denied": bool(denied),
+            "denial_code": denied[0]["data"].get("error_code") if denied else "",
+            "run_completed": result["status"] == "completed",
+        }
+
+    def run_generic_ask_approval_case(self) -> dict[str, Any]:
+        approved = self.submit_run({"scenario": "tool-ask-approved"})
+        denied = self.submit_run({"scenario": "tool-ask-denied"})
+        stale = self.submit_run({"scenario": "tool-ask-stale-denied"})
+        try:
+            approved_events = _wait_for_events(
+                self,
+                approved,
+                lambda events: _has_event(events, "tool.approval.requested")
+                and _has_event(events, "tool.approval.approved")
+                and _has_successful_approval_replay(events),
+            )
+            denied_events = _wait_for_events(
+                self,
+                denied,
+                lambda events: _has_event(events, "tool.approval.requested")
+                and _has_event(events, "tool.approval.denied"),
+            )
+            stale_events = _wait_for_events(
+                self,
+                stale,
+                lambda events: _has_event(events, "tool.approval.approved")
+                and _has_stale_approval_rejection(events),
+            )
+            return {
+                "approved_requested": _has_event(approved_events, "tool.approval.requested"),
+                "approved_recorded": _has_event(approved_events, "tool.approval.approved"),
+                "approved_replayed_once": _has_successful_approval_replay(approved_events),
+                "denied_requested": _has_event(denied_events, "tool.approval.requested"),
+                "denied_recorded": _has_event(denied_events, "tool.approval.denied"),
+                "denied_replayed": _has_successful_approval_replay(denied_events),
+                "stale_approved_recorded": _has_event(stale_events, "tool.approval.approved"),
+                "stale_replay_rejected": _has_stale_approval_rejection(stale_events),
+            }
+        finally:
+            for submitted in (approved, denied, stale):
+                _cancel_backend_run(self, str(submitted["run_id"]), str(submitted["token"]))
+
+    def run_control_decision_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "parked-hitl"})
+        run_id = str(submitted["run_id"])
+        token = str(submitted["token"])
+        try:
+            approve_task = _create_hitl_task(self, run_id, token, command_id="cmd_profile_create_approve")
+            approved = self.dispatch(
+                {
+                    "type": "approve",
+                    "run_id": run_id,
+                    "args": {"token": approve_task["callback_token"], "task_id": approve_task["task_id"]},
+                    "issuer": "callback_worker",
+                    "reason": "approved by profile",
+                    "command_id": "cmd_profile_approve",
+                }
+            )
+            deny_task = _create_hitl_task(self, run_id, token, command_id="cmd_profile_create_deny")
+            denied = self.dispatch(
+                {
+                    "type": "deny",
+                    "run_id": run_id,
+                    "args": {
+                        "token": token,
+                        "task_id": deny_task["task_id"],
+                        "result": {
+                            "answer": "Approve",
+                            "approved": True,
+                            "granted": True,
+                            "lease": {"capability": "web.search", "token_ref": "secret-ref://lease"},
+                            "token_ref": "secret-ref://lease",
+                        },
+                    },
+                    "issuer": "operator_a",
+                    "reason": "policy denied",
+                    "command_id": "cmd_profile_deny",
+                }
+            )
+            result = self.task_result(run_id, token, str(deny_task["task_id"]))["result"]
+            events = list(self.events(run_id, token)["events"])
+            by_id = {
+                (event["type"], event["data"].get("command_id")): event["data"]
+                for event in events
+                if str(event["type"]).startswith("control.command.")
+            }
+            return {
+                "approve_delivered": approved["status"] == "ok" and approved["data"]["delivered"] is True,
+                "deny_delivered": denied["status"] == "ok" and denied["data"]["delivered"] is True,
+                "denied_result_sanitized": (
+                    result["answer"] == "Deny"
+                    and result["approved"] is False
+                    and result["granted"] is False
+                    and result["reason"] == "policy denied"
+                    and "lease" not in result
+                    and "token_ref" not in result
+                ),
+                "approve_audit_recorded": (
+                    by_id[("control.command.received", "cmd_profile_approve")]["command"] == "approve"
+                    and by_id[("control.command.completed", "cmd_profile_approve")]["result_code"] == "ok"
+                ),
+                "deny_audit_recorded": (
+                    by_id[("control.command.received", "cmd_profile_deny")]["command"] == "deny"
+                    and by_id[("control.command.completed", "cmd_profile_deny")]["result_code"] == "ok"
+                ),
+            }
+        finally:
+            _cancel_backend_run(self, run_id, token)
+
+    def run_control_audit_sequence_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "multi-turn"})
+        run_id = str(submitted["run_id"])
+        token = str(submitted["token"])
+        terminal = self.submit_run({"scenario": "completed"})
+        terminal_run_id = str(terminal["run_id"])
+        terminal_token = str(terminal["token"])
+        try:
+            status = self.dispatch(
+                {
+                    "type": "status",
+                    "run_id": run_id,
+                    "args": {"token": token},
+                    "issuer": "operator_a",
+                    "reason": "audit ok",
+                    "command_id": "cmd_profile_audit_status",
+                }
+            )
+            current = self.runtime_config(run_id, token)
+            failed = self.dispatch(
+                {
+                    "type": "replace_runtime_config",
+                    "run_id": run_id,
+                    "args": {"token": token, "expected_version": 999, "config": current["config"]},
+                    "issuer": "operator_a",
+                    "reason": "audit failure",
+                    "command_id": "cmd_profile_audit_bad_replace",
+                }
+            )
+            try:
+                rejected = self.dispatch(
+                    {
+                        "type": "inspect",
+                        "run_id": run_id,
+                        "args": {"token": "bad-token"},
+                        "issuer": "operator_b",
+                        "reason": "bad auth",
+                        "command_id": "cmd_profile_audit_bad_auth",
+                    }
+                )
+                unauthorized_failed = rejected["status"] != "ok"
+            except Exception:
+                unauthorized_failed = True
+
+            events = list(self.events(run_id, token)["events"])
+            control = [
+                event for event in events if str(event.get("type") or "").startswith("control.command.")
+            ]
+            by_id = {(event["type"], event["data"].get("command_id")): event["data"] for event in control}
+
+            terminal_status = self.dispatch(
+                {
+                    "type": "status",
+                    "run_id": terminal_run_id,
+                    "args": {"token": terminal_token},
+                    "issuer": "operator_a",
+                    "reason": "terminal audit",
+                    "command_id": "cmd_profile_audit_terminal_status",
+                }
+            )
+            terminal_events = list(self.events(terminal_run_id, terminal_token)["events"])
+            return {
+                "authorized_completed": (
+                    status["status"] == "ok"
+                    and by_id[("control.command.received", "cmd_profile_audit_status")]["args_keys"] == []
+                    and by_id[("control.command.completed", "cmd_profile_audit_status")]["result_code"] == "ok"
+                ),
+                "failed_audit_recorded": (
+                    failed["status"] == "error"
+                    and bool(by_id[("control.command.failed", "cmd_profile_audit_bad_replace")]["failure_code"])
+                ),
+                "unauthorized_excluded": unauthorized_failed
+                and all(event["data"].get("command_id") != "cmd_profile_audit_bad_auth" for event in control),
+                "terminal_audit_appended": (
+                    terminal_status["status"] == "ok"
+                    and any(
+                        event["type"] == "control.command.completed"
+                        and event["data"].get("command_id") == "cmd_profile_audit_terminal_status"
+                        for event in terminal_events
+                    )
+                ),
+                "sequence_monotonic": _sequence_monotonic_unique(events)
+                and _sequence_monotonic_unique(terminal_events),
+                "secrets_redacted": token not in repr(control) and "bad-token" not in repr(control),
+            }
+        finally:
+            _cancel_backend_run(self, run_id, token)
+            _cancel_backend_run(self, terminal_run_id, terminal_token)
+
+    def run_event_sequence_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "multi-turn"})
+        run_id = str(submitted["run_id"])
+        token = str(submitted["token"])
+        try:
+            result = self.dispatch(
+                {
+                    "type": "status",
+                    "run_id": run_id,
+                    "args": {"token": token},
+                    "issuer": "profile",
+                    "reason": "sequence profile",
+                    "command_id": "cmd_profile_sequence_status",
+                }
+            )
+            events = list(self.events(run_id, token)["events"])
+            control_completed = [
+                event
+                for event in events
+                if event["type"] == "control.command.completed"
+                and event["data"].get("command_id") == "cmd_profile_sequence_status"
+            ]
+            diagnostics = self.diagnostics(run_id, token, event_limit=1)
+            items = list(diagnostics["events"]["items"])
+            latest_seq = max(int(event["seq"]) for event in events)
+            return {
+                "sequence_monotonic": _sequence_monotonic_unique(events),
+                "control_completed": result["status"] == "ok" and bool(control_completed),
+                "diagnostics_latest_seq_projected": bool(items)
+                and items[-1]["seq"] == latest_seq
+                and diagnostics["events"]["next_seq"] >= items[-1]["seq"],
+            }
+        finally:
+            _cancel_backend_run(self, run_id, token)
+
+    def run_recovery_metadata_case(self) -> dict[str, Any]:
+        same_run = self.submit_run({"scenario": "recoverable-multi-turn"})
+        same_run_id = str(same_run["run_id"])
+        same_token = str(same_run["token"])
+        empty_run_id = ""
+        empty_token = ""
+        same_restart: ReferenceBackendHarness | None = None
+        empty_restart: ReferenceBackendHarness | None = None
+        try:
+            same_update = _replace_with_next_config(
+                self,
+                same_run_id,
+                same_token,
+                command_label="same",
+            )
+            same_restart = self.restart(local_state="same")
+            resumed = same_restart.resume_run(same_run_id, same_token)
+            same_recovered = (
+                resumed["resumed"] is True
+                and same_restart.runtime_config(same_run_id, same_token)["config_hash"]
+                == same_update["config_hash"]
+            )
+
+            empty_run = self.submit_run({"scenario": "recoverable-multi-turn"})
+            empty_run_id = str(empty_run["run_id"])
+            empty_token = str(empty_run["token"])
+            empty_update = _replace_with_next_config(
+                self,
+                empty_run_id,
+                empty_token,
+                command_label="empty",
+            )
+            empty_restart = self.restart(local_state="empty")
+            materialized = empty_restart.resume_run(empty_run_id, empty_token)
+            empty_recovered = (
+                materialized["resumed"] is True
+                and empty_restart.runtime_config(empty_run_id, empty_token)["config_hash"]
+                == empty_update["config_hash"]
+            )
+            return {
+                "same_restart_resumed": resumed["resumed"] is True,
+                "same_runtime_config_recovered": same_recovered,
+                "empty_restart_resumed": materialized["resumed"] is True,
+                "empty_runtime_config_recovered": empty_recovered,
+            }
+        finally:
+            _cancel_backend_run(self, same_run_id, same_token)
+            if same_restart is not None:
+                _cancel_backend_run(same_restart, same_run_id, same_token)
+            if empty_run_id:
+                _cancel_backend_run(self, empty_run_id, empty_token)
+            if empty_restart is not None and empty_run_id:
+                _cancel_backend_run(empty_restart, empty_run_id, empty_token)
+
+    def run_subagent_diagnostics_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "subagent-foreground"})
+        run_id = str(submitted["run_id"])
+        token = str(submitted["token"])
+        events = list(self.events(run_id, token)["events"])
+        started = _one_event(events, "subagent.started")
+        started_data = dict(started["data"])
+        child_run_id = str(started_data["child_run_id"])
+        traceparent = str(started_data["traceparent"])
+        diagnostics = self.diagnostics(run_id, token, event_limit=50)
+        item = _diagnostic_subagent(diagnostics, child_run_id)
+        started_usage = item["usage"].get("total_tokens")
+        return {
+            "diagnostics_summary_present": bool(item),
+            "identity_projected": (
+                item["task_id"] == started_data["task_id"]
+                and item["definition_id"] == started_data["definition_id"]
+                and item["depth"] == started_data["depth"]
+            ),
+            "trace_linked": item["traceparent"] == traceparent,
+            "status_completed": item["status"] == "completed",
+            "usage_rollup_matches": isinstance(started_usage, (int, float)) and started_usage > 0,
+        }
+
+    def run_subagent_boundary_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "subagent-foreground"})
+        run_id = str(submitted["run_id"])
+        token = str(submitted["token"])
+        events = list(self.events(run_id, token)["events"])
+        started = _one_event(events, "subagent.started")
+        terminal = _one_event(events, "subagent.finished")
+        started_data = dict(started["data"])
+        terminal_data = dict(terminal["data"])
+        child_run_id = str(started_data["child_run_id"])
+        task_id = str(started_data["task_id"])
+        traceparent = str(started_data["traceparent"])
+        child_events = list(self.descendant_events(run_id, token, child_run_id)["events"])
+        task = self.task_result(run_id, token, task_id)["result"]
+        diagnostics = self.diagnostics(run_id, token, event_limit=50)
+        item = _diagnostic_subagent(diagnostics, child_run_id)
+        result = self.result(run_id, token)
+        expected_tokens = item["usage"].get("total_tokens")
+        return {
+            "parent_stream_isolated": all(event["run_id"] == run_id for event in events),
+            "child_identity_valid": (
+                child_run_id.startswith(f"{run_id}.sub.")
+                and started_data["parent_run_id"] == run_id
+                and started_data["root_run_id"] == run_id
+                and terminal_data["child_run_id"] == child_run_id
+                and terminal["parent_id"] == started["event_id"]
+            ),
+            "descendant_events_readable": bool(child_events)
+            and all(event["run_id"] == child_run_id for event in child_events),
+            "non_descendant_rejected": _operation_raises(
+                lambda: self.descendant_events(run_id, token, "some.other.run")
+            ),
+            "path_traversal_rejected": _operation_raises(
+                lambda: self.descendant_events(run_id, token, f"{run_id}.sub.../escape")
+            ),
+            "trace_linked": (
+                terminal_data["traceparent"] == traceparent
+                and task["traceparent"] == traceparent
+                and item["traceparent"] == traceparent
+            ),
+            "task_result_linked": task["child_run_id"] == child_run_id,
+            "diagnostics_summary_present": (
+                item["task_id"] == task_id and item["status"] == "completed"
+            ),
+            "usage_rollup_matches": (
+                result["metrics"]["subagent_count"] == 1
+                and result["metrics"]["subagent_usage"].get("total_tokens") == expected_tokens
+                and result["metrics"].get("total_tokens") == expected_tokens
+            ),
+        }
+
+    def run_subagent_capability_boundary_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "subagent-capability-revoked"})
+        run_id = str(submitted["run_id"])
+        token = str(submitted["token"])
+        events = list(self.events(run_id, token)["events"])
+        started = _one_event(events, "subagent.started")
+        child_run_id = str(started["data"]["child_run_id"])
+        task_id = str(started["data"]["task_id"])
+        child_events = list(self.descendant_events(run_id, token, child_run_id)["events"])
+        task = self.task_result(run_id, token, task_id)["result"]
+        return {
+            "revoked_event_observed": any(event["type"] == "capability.revoked" for event in child_events),
+            "child_result_observed_revoked": "capability_revoked" in json.dumps(task, sort_keys=True),
+            "gated_handler_not_called": self.gated_provider.calls == 0,
+        }
+
     def _submit_backend_scenario(
         self,
         scenario: str,
@@ -559,7 +977,7 @@ class ReferenceBackendHarness:
         )
         self.message_fabric_directory["worker"] = worker["run_id"]
         self.message_fabric_tokens[worker["run_id"]] = worker["token"]
-        assert _eventually(lambda: self.backend._record(worker["run_id"]).status == "awaiting_input")
+        assert _eventually(lambda: self.backend._record(worker["run_id"]).state.value == "awaiting_input")
 
         planner = self._submit_backend_scenario(
             "message-fabric-planner",
@@ -595,7 +1013,7 @@ class ReferenceBackendHarness:
             instruction="receive external agent messages",
             multi_turn=True,
         )
-        assert _eventually(lambda: self.backend._record(receiver["run_id"]).status == "awaiting_input")
+        assert _eventually(lambda: self.backend._record(receiver["run_id"]).state.value == "awaiting_input")
         envelope = _external_agent_envelope("mf-duplicate-1", peer_id="planner", text="hello worker")
         first = self.deliver_external_agent_message(receiver["run_id"], receiver["token"], envelope)
         assert first["status"] == "queued"
@@ -1178,6 +1596,130 @@ def _external_agent_envelope(message_id: str, *, peer_id: str, text: str) -> dic
         "causation_id": "message-fabric-cause-1",
         "parts": [{"type": "text", "text": text}],
     }
+
+
+def _create_hitl_task(
+    harness: ReferenceBackendHarness,
+    run_id: str,
+    token: str,
+    *,
+    command_id: str,
+) -> dict[str, Any]:
+    created = harness.dispatch(
+        {
+            "type": "create_task",
+            "run_id": run_id,
+            "args": {
+                "token": token,
+                "kind": "hitl",
+                "request": {"prompt": "Approve profile action?", "choices": ["Approve", "Deny"]},
+            },
+            "issuer": "profile",
+            "command_id": command_id,
+        }
+    )
+    if created["status"] != "ok":
+        raise AssertionError(f"failed to create HITL task: {created!r}")
+    return dict(created["data"])
+
+
+def _replace_with_next_config(
+    harness: ReferenceBackendHarness,
+    run_id: str,
+    token: str,
+    *,
+    command_label: str,
+) -> dict[str, Any]:
+    current = harness.runtime_config(run_id, token)
+    config = dict(current["config"])
+    current_version = int(current["config_version"])
+    config["config_version"] = current_version + 1
+    config.pop("config_hash", None)
+    updated = harness.replace_runtime_config(
+        run_id,
+        token,
+        config,
+        expected_version=current_version,
+        issuer="profile",
+        reason=f"{command_label} recovery config",
+    )
+    if updated["config_version"] != current_version + 1:
+        raise AssertionError("runtime config version did not advance")
+    return dict(updated)
+
+
+def _wait_for_events(
+    harness: ReferenceBackendHarness,
+    submitted: dict[str, Any],
+    predicate: Callable[[list[dict[str, Any]]], bool],
+    *,
+    timeout_s: float = 20.0,
+) -> list[dict[str, Any]]:
+    run_id = str(submitted["run_id"])
+    token = str(submitted["token"])
+    deadline = time.time() + timeout_s
+    events: list[dict[str, Any]] = []
+    while time.time() < deadline:
+        events = list(harness.events(run_id, token, limit=200)["events"])
+        if predicate(events):
+            return events
+        time.sleep(0.05)
+    return events
+
+
+def _has_successful_approval_replay(events: list[dict[str, Any]]) -> bool:
+    return (
+        sum(
+            1
+            for event in events
+            if (
+                event["type"] == "tool.call.finished"
+                and event["data"].get("tool") == "demo_approval"
+                and event["data"].get("ok") is True
+            )
+        )
+        >= 2
+    )
+
+
+def _has_stale_approval_rejection(events: list[dict[str, Any]]) -> bool:
+    return any(
+        event["data"].get("error_code") in {
+            "tool_not_in_surface",
+            "tool_binding_denied",
+            "tool_unknown",
+        }
+        and event["type"] in {"permission.denied", "tool.call.failed"}
+        for event in events
+    )
+
+
+def _sequence_monotonic_unique(events: list[dict[str, Any]]) -> bool:
+    seqs = [int(event["seq"]) for event in events]
+    return seqs == sorted(seqs) and len(seqs) == len(set(seqs))
+
+
+def _one_event(events: list[dict[str, Any]], event_type: str) -> dict[str, Any]:
+    matches = [event for event in events if event["type"] == event_type]
+    if not matches:
+        raise AssertionError(f"missing event {event_type}")
+    return matches[0]
+
+
+def _diagnostic_subagent(diagnostics: dict[str, Any], child_run_id: str) -> dict[str, Any]:
+    items = list(diagnostics["subagents"]["items"])
+    matches = [item for item in items if item["child_run_id"] == child_run_id]
+    if not matches:
+        raise AssertionError(f"missing diagnostics subagent {child_run_id}")
+    return dict(matches[0])
+
+
+def _operation_raises(fn: Callable[[], Any]) -> bool:
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
 
 
 def _cancel_backend_run(harness: ReferenceBackendHarness, run_id: str, token: str) -> None:

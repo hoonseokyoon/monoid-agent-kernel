@@ -8,8 +8,10 @@ from monoid_agent_kernel.reference.conformance import ReferenceBackendHarness
 
 
 def test_reference_backend_satisfies_tool_agent_surface_admission_profile(tmp_path) -> None:
-    assert_tool_agent_surface_admission_profile(ReferenceBackendHarness(tmp_path))
+    with ReferenceBackendHarness(tmp_path) as harness:
+        assert_tool_agent_surface_admission_profile(harness)
 
 
 def test_reference_backend_satisfies_tool_agent_generic_ask_approval_profile(tmp_path) -> None:
-    assert_tool_agent_generic_ask_approval_profile(ReferenceBackendHarness(tmp_path))
+    with ReferenceBackendHarness(tmp_path) as harness:
+        assert_tool_agent_generic_ask_approval_profile(harness)

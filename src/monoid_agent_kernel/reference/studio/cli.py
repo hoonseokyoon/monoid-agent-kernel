@@ -12,10 +12,12 @@ Three launch shapes, matching the two lifecycle models:
 from __future__ import annotations
 
 import os
+import json
 import socket
 import tempfile
 import time
 from pathlib import Path
+from urllib import request as urlrequest
 
 import click
 
@@ -27,6 +29,108 @@ from monoid_agent_kernel.reference.studio.server import (
     load_env_file,
 )
 from monoid_agent_kernel.reference.studio.window import open_app_window
+
+
+def _http_json(url: str, *, method: str = "GET", payload: dict | None = None, timeout: float = 5.0) -> dict:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(url, data=data, method=method)
+    if payload is not None:
+        req.add_header("Content-Type", "application/json")
+    with urlrequest.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+    return json.loads(raw) if raw else {}
+
+
+def _http_text(url: str, *, timeout: float = 5.0) -> str:
+    with urlrequest.urlopen(url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+
+def run_acceptance(
+    *,
+    workspace: Path,
+    run_root: Path,
+    host: str = "127.0.0.1",
+    timeout_s: float = 10.0,
+) -> dict:
+    """Run Studio's deterministic offline acceptance check and return a JSON-serializable result."""
+    server = StudioServer(
+        StudioConfig(
+            workspace=workspace,
+            host=host,
+            port=0,
+            provider="offline",
+            run_root=run_root,
+        )
+    )
+    checks: list[dict] = []
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(ok), **({"detail": detail} if detail else {})})
+
+    try:
+        base_url = server.start()
+        check("healthz", _http_json(f"{base_url}/healthz").get("ok") is True)
+        index_html = _http_text(f"{base_url}/")
+        check("index-static-hooks", "data-testid=\"studio-shell\"" in index_html)
+        settings_html = _http_text(f"{base_url}/settings")
+        check("settings-static-hooks", "data-testid=\"settings-popup\"" in settings_html)
+        cfg = _http_json(f"{base_url}/api/config")
+        check("config-route", cfg.get("offline") is True and cfg.get("provider") == "offline")
+        settings = _http_json(f"{base_url}/api/settings")
+        check("settings-route", bool(settings.get("available")) and "read" in settings.get("capabilities", []))
+        catalog = _http_json(f"{base_url}/api/capabilities-catalog")
+        check("capabilities-catalog-route", "skills" in catalog and "mcp_tools" in catalog)
+        profiles = _http_json(f"{base_url}/api/profiles")
+        default_profile = str(profiles.get("default_profile_id") or "default")
+        check("profiles-route", any(p.get("id") == default_profile for p in profiles.get("profiles", [])))
+        before_sessions = _http_json(f"{base_url}/api/sessions?profile_id={default_profile}")
+        check("profile-sessions-route", before_sessions.get("profile_id") == default_profile)
+        chat = _http_json(
+            f"{base_url}/api/chat",
+            method="POST",
+            payload={"message": "Studio acceptance ping", "profile_id": default_profile},
+        )
+        run_id = str(chat.get("run_id") or "")
+        check("chat-start", bool(run_id) and "run_token" not in chat)
+        deadline = time.time() + timeout_s
+        final_text = ""
+        state = ""
+        while run_id and time.time() < deadline:
+            events = server.poll_events(run_id, 0).get("events", [])
+            settled = [event for event in events if event.get("type") == "turn.settled"]
+            if settled:
+                final_text = str((settled[-1].get("data") or {}).get("final_text") or "")
+                state = str(server.run_status(run_id).get("state") or "")
+                break
+            time.sleep(0.1)
+        check("deterministic-chat", bool(final_text), final_text[:120])
+        scoped_sessions = _http_json(f"{base_url}/api/sessions?profile_id={default_profile}")
+        check(
+            "profile-history",
+            any(s.get("run_id") == run_id and s.get("profile_id") == default_profile for s in scoped_sessions.get("sessions", [])),
+        )
+        ok = all(item["ok"] for item in checks)
+        return {
+            "ok": ok,
+            "base_url": base_url,
+            "workspace": str(server.workspace),
+            "run_root": str(run_root),
+            "checks": checks,
+            "chat": {"run_id": run_id, "state": state, "final_text": final_text},
+        }
+    except Exception as exc:  # pragma: no cover - defensive CLI surface
+        checks.append({"name": "acceptance", "ok": False, "detail": str(exc)})
+        return {
+            "ok": False,
+            "base_url": server.base_url,
+            "workspace": str(workspace),
+            "run_root": str(run_root),
+            "checks": checks,
+            "chat": {},
+        }
+    finally:
+        server.shutdown()
 
 
 def _workspace_option(fn):
@@ -212,6 +316,35 @@ def studio_settings(*, url: str) -> None:
     if win is None:
         raise click.ClickException(f"No Chromium browser found; open {url}/settings manually.")
     win.wait()
+
+
+@studio.command("accept")
+@click.option("--host", type=str, default="127.0.0.1", show_default=True)
+@click.option(
+    "--run-root",
+    type=click.Path(path_type=Path),
+    default=Path("runs/studio-acceptance"),
+    show_default=True,
+)
+@click.option("--timeout", "timeout_s", type=float, default=10.0, show_default=True)
+@_workspace_option
+def studio_accept(
+    *,
+    workspace: Path,
+    host: str,
+    run_root: Path,
+    timeout_s: float,
+) -> None:
+    """Run deterministic offline Studio acceptance checks and print JSON."""
+    result = run_acceptance(
+        workspace=workspace,
+        run_root=run_root,
+        host=host,
+        timeout_s=timeout_s,
+    )
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    if not result.get("ok"):
+        raise SystemExit(1)
 
 
 def _port_free(host: str, port: int) -> bool:

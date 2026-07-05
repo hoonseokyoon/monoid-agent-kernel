@@ -75,7 +75,7 @@ def test_backend_replace_runtime_config_accepts_provider_tool(tmp_path: Path) ->
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
 
     current = backend.current_runtime_config(run_id)
     result = backend.replace_runtime_config(
@@ -111,7 +111,7 @@ def test_replace_runtime_config_preserves_output_validators(tmp_path: Path) -> N
         )
     )
     run_id, token = submission.run_id, submission.run_token
-    assert eventually(lambda: backend._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
 
     current = backend.current_runtime_config(run_id)
     binding = OutputValidatorBinding(validator_id="x", enabled=False)
@@ -265,7 +265,7 @@ def test_backend_resume_carries_providers(tmp_path: Path) -> None:
     )
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
-    assert eventually(lambda: backend1._record(run_id).status == "awaiting_input")
+    assert eventually(lambda: backend1._record(run_id).state.value == "awaiting_input")
 
     # Fresh backend (empty _records) with its own provider instance resumes the run, then a
     # follow-up triggers a skill call that must resolve against the re-attached provider.

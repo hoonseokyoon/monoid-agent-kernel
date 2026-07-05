@@ -10,8 +10,10 @@ from monoid_agent_kernel.reference.conformance import ReferenceBackendHarness
 
 
 def test_reference_backend_satisfies_control_plane_decision_profile(tmp_path: Path) -> None:
-    assert_control_plane_decision_profile(ReferenceBackendHarness(tmp_path))
+    with ReferenceBackendHarness(tmp_path) as harness:
+        assert_control_plane_decision_profile(harness)
 
 
 def test_reference_backend_satisfies_control_plane_audit_sequence_profile(tmp_path: Path) -> None:
-    assert_control_plane_audit_sequence_profile(ReferenceBackendHarness(tmp_path))
+    with ReferenceBackendHarness(tmp_path) as harness:
+        assert_control_plane_audit_sequence_profile(harness)

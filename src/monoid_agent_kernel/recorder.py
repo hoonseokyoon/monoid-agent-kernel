@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, TextIO
 
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes, write_json_atomic
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
+from monoid_agent_kernel.core.lifecycle import SessionState, session_state_from_run_status, session_state_value
 from monoid_agent_kernel.core.manifest import RunManifest
 from monoid_agent_kernel.core.result import AgentArtifact
 from monoid_agent_kernel.identifiers import namespaced_id
@@ -58,7 +59,8 @@ class StatusJsonSink:
             self.state.update(
                 {
                     "run_id": event.run_id,
-                    "status": "running",
+                    "state": session_state_value(SessionState.RUNNING),
+                    "terminal": False,
                     "started_at": event.timestamp,
                     "workspace": data.get("workspace"),
                     "workspace_backend": data.get("workspace_backend"),
@@ -70,9 +72,15 @@ class StatusJsonSink:
                 }
             )
         elif event.type == "run.finished":
+            state = session_state_from_run_status(
+                str(data.get("status", "completed") or "completed"),
+                error_code=str(data.get("error_code") or ""),
+                terminal=True,
+            )
             self.state.update(
                 {
-                    "status": data.get("status", "completed"),
+                    "state": session_state_value(state),
+                    "terminal": True,
                     "finished_at": event.timestamp,
                     "final_text": data.get("final_text", ""),
                     "error": data.get("error", ""),
@@ -82,22 +90,26 @@ class StatusJsonSink:
         elif event.type == "run.failed":
             self.state.update(
                 {
-                    "status": "failed",
+                    "state": session_state_value(SessionState.FAILED),
+                    "terminal": True,
                     "error": data.get("error", ""),
                     "error_code": data.get("error_code", ""),
                     "error_type": data.get("type", ""),
                 }
             )
         elif event.type == "run.waiting":
-            self.state["status"] = "waiting_for_background_jobs"
+            self.state["state"] = session_state_value(SessionState.AWAITING_TASKS)
+            self.state["terminal"] = False
             self.state["waiting_for_background_jobs"] = True
             self.state["waiting_jobs"] = data.get("jobs", [])
         elif event.type == "run.resumed":
-            self.state["status"] = "running"
+            self.state["state"] = session_state_value(SessionState.RUNNING)
+            self.state["terminal"] = False
             self.state["waiting_for_background_jobs"] = False
             self.state["resumed_jobs"] = data.get("job_ids", [])
         elif event.type == "run.awaiting_input":
-            self.state["status"] = "awaiting_input"
+            self.state["state"] = session_state_value(SessionState.AWAITING_INPUT)
+            self.state["terminal"] = False
             self.state["awaiting_input"] = {
                 "reason": data.get("reason"),
                 "task_ids": data.get("task_ids", []),
@@ -112,8 +124,9 @@ class StatusJsonSink:
         elif event.type == "model.turn.started":
             self.state["current_turn_id"] = event.turn_id
             self.state["current_step"] = data.get("step")
-            if self.state.get("status") == "awaiting_input":
-                self.state["status"] = "running"
+            if self.state.get("state") == SessionState.AWAITING_INPUT.value:
+                self.state["state"] = session_state_value(SessionState.RUNNING)
+                self.state["terminal"] = False
                 self.state.pop("awaiting_input", None)
         elif event.type == "tool.call.started":
             self.state["current_tool"] = data.get("tool")

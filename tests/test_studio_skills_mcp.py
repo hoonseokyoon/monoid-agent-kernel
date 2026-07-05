@@ -25,6 +25,12 @@ def test_skills_capability_offered_and_enabled_by_default(studio: StudioServer) 
     assert "skill" in refs
 
 
+def test_bundled_review_skill_can_read_its_checklist(studio: StudioServer) -> None:
+    assert studio._skill_provider is not None
+    definition = studio._skill_provider.subagent_definitions()["skill:code-review-checklist"]
+    assert "skill.read_file" in definition.tools
+
+
 def test_skill_catalog_injected_into_system_prompt(tmp_path: Path) -> None:
     # The L1 catalog (skill name + description) is a context-provider static segment, so it must
     # reach the model's system prompt — proving the SkillProvider is wired as a context provider.
@@ -118,6 +124,67 @@ def test_mcp_boot_discovers_tools_before_serving(tmp_path: Path) -> None:
         server.shutdown()
 
 
+def test_builtin_profiles_include_provider_capabilities_when_saved(tmp_path: Path) -> None:
+    (tmp_path / "ws").mkdir()
+    server = _mcp_studio(tmp_path)
+    server.start()
+    try:
+        profiles = {profile["id"]: profile for profile in server.profiles()["profiles"]}
+        default_profile = dict(profiles["default"])
+        assert {"skills", "mcp"} <= set(default_profile["capabilities"])
+
+        default_profile["description"] = "Edited default profile."
+        saved = server.save_profile(default_profile)["profile"]
+        assert {"skills", "mcp"} <= set(saved["capabilities"])
+        assert {"skill", "mcp.studio.echo"} <= {binding.ref.tool_id for binding in server._build_config("default").tools}
+    finally:
+        server.shutdown()
+
+
+def test_saved_profile_preserves_unavailable_provider_capabilities(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with_mcp = _mcp_studio(tmp_path)
+    with_mcp.start()
+    try:
+        profile = with_mcp.save_profile(
+            {
+                "id": "researcher",
+                "name": "Researcher",
+                "capabilities": ["read", "mcp"],
+            }
+        )["profile"]
+        assert "mcp" in profile["capabilities"]
+    finally:
+        with_mcp.shutdown()
+
+    without_mcp = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs", mcp=False)
+    )
+    without_mcp.start()
+    try:
+        profile = {item["id"]: item for item in without_mcp.profiles()["profiles"]}["researcher"]
+        assert "mcp" in profile["capabilities"]
+        saved = without_mcp.save_profile(
+            {
+                "id": "researcher",
+                "name": "Researcher edited",
+                "capabilities": ["read"],
+            }
+        )["profile"]
+        assert "mcp" in saved["capabilities"]
+    finally:
+        without_mcp.shutdown()
+
+    with_mcp_again = _mcp_studio(tmp_path)
+    with_mcp_again.start()
+    try:
+        config = with_mcp_again._build_config("researcher")
+        assert "mcp.studio.echo" in {binding.ref.tool_id for binding in config.tools}
+    finally:
+        with_mcp_again.shutdown()
+
+
 def test_mcp_tool_call_flows_end_to_end(tmp_path: Path) -> None:
     (tmp_path / "ws").mkdir()
     fake = FakeModelAdapter(
@@ -136,6 +203,21 @@ def test_mcp_tool_call_flows_end_to_end(tmp_path: Path) -> None:
         assert any(e["data"].get("tool") == "mcp_studio_echo" for e in started)
         # The tool ran against the real fake MCP server (loopback), then the turn settled.
         assert [e for e in events if e.get("type") == "turn.settled"]
+    finally:
+        server.shutdown()
+
+
+def test_mcp_catalog_context_reaches_model_when_helpers_bound(tmp_path: Path) -> None:
+    (tmp_path / "ws").mkdir()
+    fake = FakeModelAdapter(turns=[ModelTurn(final_text="ok")])
+    server = _mcp_studio(tmp_path, provider_factory=lambda _claims, _config: fake)
+    server.start()
+    try:
+        run_id = server.start_chat("what MCP context is available?")["run_id"]
+        _wait_settled(server, run_id, 1)
+        assert fake.requests, "the model was never called"
+        assert "fake://studio/guide" in fake.requests[0].system_prompt
+        assert "summarize" in fake.requests[0].system_prompt
     finally:
         server.shutdown()
 
@@ -194,6 +276,8 @@ def test_capabilities_catalog_lists_skills_and_mcp_tools(tmp_path: Path) -> None
         catalog = server.capabilities_catalog()
         assert any(s["name"] == "commit-message" for s in catalog["skills"])
         assert {t["id"] for t in catalog["mcp_tools"]} >= {"mcp.studio.echo", "mcp.studio.uppercase"}
+        assert {r["uri"] for r in catalog["mcp_resources"]} == {"fake://studio/guide"}
+        assert {p["name"] for p in catalog["mcp_prompts"]} == {"summarize"}
     finally:
         server.shutdown()
 

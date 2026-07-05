@@ -3,9 +3,8 @@
 ``AgentLoop`` is the engine; an embedder (Agent Cell / Daemon) should be able to
 *control* a session without importing the loop's internals. This module provides:
 
-- ``SessionState`` — the formal lifecycle FSM (the single state vocabulary that the
-  four ad-hoc ones — ``Suspension.reason``, ``status.json``, ``project_run_status``,
-  and the backend's ``BackendRunState`` — fold onto; that reconciliation is staged).
+- ``SessionState`` — the formal lifecycle FSM. Backend lifecycle payloads expose this
+  vocabulary as ``state`` plus a separate ``terminal`` boolean.
 - ``state_from_suspension`` — the projection core: how a pump ``Suspension`` maps to a
   state. This is what keeps the FSM in sync with the engine without the engine knowing
   about the FSM.
@@ -23,7 +22,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.result import AgentTurnResult, Suspension
@@ -126,15 +125,20 @@ TERMINAL_STATES: frozenset[SessionState] = frozenset(
 )
 
 
-#: Maps the ad-hoc status strings the four legacy vocabularies emit — ``BackendRunState``,
-#: ``status.json`` (StatusJsonSink), and ``project_run_status`` — onto the one ``SessionState``.
-#: ``Suspension.reason`` has its own richer projection in :func:`state_from_suspension`.
+#: Maps legacy lifecycle status strings from older backend payloads and ``status.json`` onto the
+#: one ``SessionState``. ``Suspension.reason`` has its own richer projection in
+#: :func:`state_from_suspension`.
 _STATUS_STRING_TO_STATE: dict[str, SessionState] = {
     "queued": SessionState.CREATED,
+    "created": SessionState.CREATED,
+    "idle": SessionState.IDLE,
     "running": SessionState.RUNNING,
     "awaiting_input": SessionState.AWAITING_INPUT,
+    "awaiting_tasks": SessionState.AWAITING_TASKS,
     "waiting_for_background_jobs": SessionState.AWAITING_TASKS,
     "paused": SessionState.PAUSED,
+    "interrupted": SessionState.INTERRUPTED,
+    "turn_failed": SessionState.TURN_FAILED,
     "completed": SessionState.COMPLETED,
     "failed": SessionState.FAILED,
     "limited": SessionState.LIMITED,
@@ -142,14 +146,69 @@ _STATUS_STRING_TO_STATE: dict[str, SessionState] = {
 }
 
 
-def to_session_state(status: str, *, error_code: str = "") -> SessionState:
-    """Reconcile a legacy status string (from ``BackendRunState`` / ``status.json`` /
-    ``project_run_status``) onto a :class:`SessionState`. A ``"limited"`` status with
-    ``error_code="cancelled"`` folds to ``CANCELLED`` (the backend records cancel that way).
-    Unknown strings fall back to ``CREATED`` rather than raising — the projection is advisory."""
+def session_state_value(state: SessionState | str) -> str:
+    """Return the canonical wire value for a lifecycle state."""
+    return state.value if isinstance(state, SessionState) else SessionState(str(state)).value
+
+
+def session_state_from_run_status(
+    status: str | SessionState,
+    *,
+    error_code: str = "",
+    terminal: bool = False,
+) -> SessionState:
+    """Project run lifecycle strings onto :class:`SessionState`.
+
+    ``status`` may be an existing ``SessionState`` value or one of the legacy lifecycle status
+    strings read from ``status.json`` / older backend payloads. ``terminal`` disambiguates the
+    public lifecycle payload, but ``SessionState.LIMITED`` remains the vocabulary value for both a
+    live budget-limited park and a terminal limited result.
+    """
+    if isinstance(status, SessionState):
+        return status
     if error_code == "cancelled" and status in {"limited", "failed"}:
         return SessionState.CANCELLED
-    return _STATUS_STRING_TO_STATE.get(status, SessionState.CREATED)
+    return _STATUS_STRING_TO_STATE.get(str(status), SessionState.CREATED)
+
+
+def lifecycle_from_status_artifact(
+    payload: Mapping[str, Any] | None,
+    *,
+    failure_present: bool = False,
+) -> tuple[SessionState, bool]:
+    """Project a durable ``status.json`` payload onto ``(state, terminal)``.
+
+    New artifacts carry ``state`` plus an explicit ``terminal`` flag. Legacy artifacts carry
+    ``status`` only, so terminal result statuses are inferred there, including bare
+    ``status="limited"`` from pre-``state`` terminal-limited runs.
+    """
+    status_payload = payload or {}
+    state_value = status_payload.get("state")
+    status_value = status_payload.get("status")
+    raw_state = state_value or status_value
+    if raw_state:
+        terminal = bool(status_payload.get("terminal"))
+        state = session_state_from_run_status(
+            str(raw_state),
+            error_code=str(status_payload.get("error_code") or ""),
+            terminal=terminal,
+        )
+        if "terminal" not in status_payload:
+            state_text = str(state_value or "")
+            status_text = str(status_value or "")
+            if state_text in {"completed", "failed", "cancelled"} or (
+                not state_text and status_text in {"completed", "failed", "limited", "cancelled"}
+            ):
+                terminal = True
+        return state, terminal
+    if failure_present:
+        return SessionState.FAILED, True
+    return SessionState.CREATED, False
+
+
+def to_session_state(status: str, *, error_code: str = "") -> SessionState:
+    """Compatibility wrapper for legacy status readers."""
+    return session_state_from_run_status(status, error_code=error_code)
 
 
 def can_transition(src: SessionState, dst: SessionState) -> bool:

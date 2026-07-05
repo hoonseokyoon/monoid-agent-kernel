@@ -80,12 +80,14 @@ def test_jsonl_and_status_sinks_flush_and_update(tmp_path: Path) -> None:
     bus.emit("run.started", data={"workspace": "w", "mode": "propose", "model": "gpt-5.5"})
     assert events_path.read_text(encoding="utf-8").strip()
     status = json.loads(status_path.read_text(encoding="utf-8"))
-    assert status["status"] == "running"
+    assert status["state"] == "running"
+    assert status["terminal"] is False
 
     bus.emit("run.finished", data={"status": "completed", "final_text": "done"})
     bus.close()
     status = json.loads(status_path.read_text(encoding="utf-8"))
-    assert status["status"] == "completed"
+    assert status["state"] == "completed"
+    assert status["terminal"] is True
     assert status["last_event_type"] == "run.finished"
 
 
@@ -141,7 +143,8 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     assert "workspace.proposal.updated" in types
     assert types[-1] == "run.finished"
     status = json.loads(result.run_dir.joinpath("status.json").read_text(encoding="utf-8"))
-    assert status["status"] == "completed"
+    assert status["state"] == "completed"
+    assert status["terminal"] is True
     assert status["proposal"]["path"] == "proposal.json"
     assert "+Clean summary" in result.diff_path.read_text(encoding="utf-8")
     proposal = json.loads(result.run_dir.joinpath("proposal.json").read_text(encoding="utf-8"))
@@ -152,7 +155,8 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     assert workspace_index["schema_version"] == "monoid.workspace-index.v1"
     assert any(entry["path"] == "notes.md" for entry in workspace_index["entries"])
     projection = project_run_status(result.run_dir)
-    assert projection["status"] == "completed"
+    assert projection["state"] == "completed"
+    assert projection["terminal"] is True
     assert projection["proposal_hash"] == proposal["proposal_hash"]
     assert projection["changed_paths"] == ["SUMMARY.md"]
 
@@ -164,7 +168,7 @@ def test_otel_event_sink_emits_genai_span_tree(tmp_path: Path) -> None:
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-    from monoid_agent_kernel import OtelEventSink
+    from monoid_agent_kernel.observability.otel import OtelEventSink
 
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -489,7 +493,8 @@ def make_sink():
     )
     assert status_result.exit_code == 0
     status_payload = json.loads(status_result.stdout)
-    assert status_payload["status"] == "completed"
+    assert status_payload["state"] == "completed"
+    assert status_payload["terminal"] is True
     assert status_payload["last_event_type"] == "run.finished"
 
 

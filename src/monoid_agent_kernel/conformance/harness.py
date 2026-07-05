@@ -22,7 +22,7 @@ class ConformanceHarness(Protocol):
 
 @runtime_checkable
 class BackendHarness(ConformanceHarness, Protocol):
-    """Backend operations used by durable-runner and control-plane profiles."""
+    """Raw backend operations kept for compatibility and custom harnesses."""
 
     def submit_run(self, request: JsonObject) -> JsonObject:
         """Submit a run and return a handle containing at least run id and token."""
@@ -79,6 +79,53 @@ class BackendHarness(ConformanceHarness, Protocol):
 
     def dispatch(self, command: JsonObject) -> JsonObject:
         """Dispatch one backend control command."""
+
+
+@runtime_checkable
+class ToolAgentHarness(ConformanceHarness, Protocol):
+    """Tool-agent behavior cases."""
+
+    def run_tool_surface_admission_case(self) -> JsonObject:
+        """Run a tool surface admission case with a denied unavailable/quota-limited tool."""
+
+    def run_generic_ask_approval_case(self) -> JsonObject:
+        """Run generic authorization='ask' approval, denial, and stale replay cases."""
+
+
+@runtime_checkable
+class ControlPlaneHarness(ConformanceHarness, Protocol):
+    """Control-plane behavior cases."""
+
+    def run_control_decision_case(self) -> JsonObject:
+        """Run approve/deny decision handling and decision audit behavior."""
+
+    def run_control_audit_sequence_case(self) -> JsonObject:
+        """Run authorized, failed, unauthorized, and terminal audit sequencing behavior."""
+
+
+@runtime_checkable
+class DurableRunnerHarness(ConformanceHarness, Protocol):
+    """Durable-runner behavior cases."""
+
+    def run_event_sequence_case(self) -> JsonObject:
+        """Run event sequencing and diagnostics projection behavior."""
+
+    def run_recovery_metadata_case(self) -> JsonObject:
+        """Run recovery metadata and restart materialization behavior."""
+
+    def run_subagent_diagnostics_case(self) -> JsonObject:
+        """Run subagent diagnostics summary behavior."""
+
+
+@runtime_checkable
+class MultiAgentBackendHarness(ConformanceHarness, Protocol):
+    """Backend-visible multi-agent behavior cases."""
+
+    def run_subagent_boundary_case(self) -> JsonObject:
+        """Run subagent identity, trace, diagnostics, and accounting behavior."""
+
+    def run_subagent_capability_boundary_case(self) -> JsonObject:
+        """Run child capability-boundary behavior after parent revocation."""
 
 
 @runtime_checkable

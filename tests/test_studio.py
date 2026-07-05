@@ -73,6 +73,46 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
     # A failed run surfaces the provider error detail (shared by the run.failed + turn.failed paths).
     assert "function providerDetail" in html
     assert "provider_error_code" in html
+    for hook in (
+        'data-testid="studio-shell"',
+        'data-testid="left-config-panel"',
+        'data-testid="profile-switcher"',
+        'data-testid="profile-add"',
+        'data-testid="profile-list"',
+        'data-testid="profile-editor-popup"',
+        'class="profile-editor-panel profile-preview-panel"',
+        'id="prompt-preview-system"',
+        'id="prompt-preview-tools"',
+        'id="prompt-preview-tool-count"',
+        'id="prompt-preview-settings"',
+        'id="prompt-preview-notes"',
+        'data-testid="chat-log"',
+        'data-testid="composer"',
+        'data-testid="right-panel-tabs"',
+        'data-testid="settings-config-popup"',
+        'data-testid="capability-toggles"',
+    ):
+        assert hook in html
+    # Saving a profile activates that profile and clears the current run so the next message does
+    # not continue a session created under another profile.
+    assert "activeProfileId = body.profile.id;" in html
+    assert "runId = null;" in html
+    assert "resetChatView();" in html
+    assert "function refreshPromptPreview" in html
+    assert 'fetch("/api/profile-preview"' in html
+    assert "#body { flex: 1; display: grid;" in html
+    assert "#sidebar { overflow: hidden;" in html
+    assert "#sessions { list-style: none;" in html and "overflow: auto;" in html
+
+
+def test_settings_page_serves_static_test_hooks(studio: StudioServer) -> None:
+    import urllib.request
+
+    with urllib.request.urlopen(f"{studio.base_url}/settings") as resp:
+        html = resp.read().decode("utf-8")
+    assert 'data-testid="settings-popup"' in html
+    assert 'data-testid="capability-toggles"' in html
+    assert 'data-testid="capability-toggle-' in html
 
 
 def test_offline_chat_produces_assistant_reply(studio: StudioServer) -> None:
@@ -83,6 +123,125 @@ def test_offline_chat_produces_assistant_reply(studio: StudioServer) -> None:
     assert settled[0]["data"]["final_text"]
 
 
+def test_studio_profiles_can_be_saved_and_reloaded(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    run_root = tmp_path / "runs"
+    server = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root))
+
+    saved = server.save_profile(
+        {
+            "name": "Release Reviewer",
+            "description": "Checks release risk.",
+            "instructions": "Always call out release blockers.",
+            "capabilities": ["read", "web"],
+            "model": "gpt-profile",
+            "effort": "high",
+            "summary": "off",
+        }
+    )["profile"]
+
+    assert saved["id"] == "release-reviewer"
+    assert saved["capabilities"] == ["read", "web"]
+    assert saved["built_in"] is False
+
+    reloaded = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root))
+    profiles = {profile["id"]: profile for profile in reloaded.profiles()["profiles"]}
+    assert profiles["release-reviewer"]["instructions"] == "Always call out release blockers."
+    assert profiles["release-reviewer"]["model"] == "gpt-profile"
+
+
+def test_studio_start_chat_uses_selected_profile_runtime_config(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    fake = FakeModelAdapter(turns=[ModelTurn(final_text="profile ok")])
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        profile = server.save_profile(
+            {
+                "name": "Read Only Reviewer",
+                "description": "Focused read-only review.",
+                "instructions": "Mention the profile sentinel.",
+                "capabilities": ["read"],
+                "model": "gpt-profile",
+                "effort": "high",
+                "summary": "off",
+            }
+        )["profile"]
+        run_id = server.start_chat("use the profile", profile_id=profile["id"])["run_id"]
+        _wait_settled(server, run_id, 1)
+        request = fake.requests[0]
+        tool_ids = {tool.id for tool in request.tools}
+        assert "Mention the profile sentinel." in request.system_prompt
+        assert request.model is not None
+        assert request.model.model == "gpt-profile"
+        assert request.model.reasoning.effort == "high"
+        assert request.model.reasoning.summary == "off"
+        assert {"run.update_plan", "fs.read"} <= tool_ids
+        assert "fs.write" not in tool_ids
+        assert "shell.exec" not in tool_ids
+    finally:
+        server.shutdown()
+
+
+def test_studio_settings_hot_swap_preserves_run_profiles(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    server = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"))
+    server.start()
+    try:
+        profile = server.save_profile(
+            {
+                "name": "Read Only Reviewer",
+                "description": "Focused read-only review.",
+                "instructions": "PROFILE_SENTINEL",
+                "capabilities": ["read"],
+                "model": "gpt-profile",
+                "effort": "high",
+                "summary": "off",
+            }
+        )["profile"]
+        server._run_tokens["profile-run"] = "profile-token"
+        server._remember_run_profile("profile-run", profile["id"])
+        server._run_tokens["default-run"] = "default-token"
+        server._remember_run_profile("default-run", "default")
+
+        current_by_run = {
+            "profile-run": server._build_config(profile["id"]),
+            "default-run": server._build_config("default"),
+        }
+        replaced: dict[str, object] = {}
+
+        def current_runtime_config(run_id: str):
+            return current_by_run[run_id]
+
+        def replace_runtime_config(run_id: str, _token: str, **kwargs):
+            replaced[run_id] = kwargs["config"]
+
+        assert server._backend is not None
+        server._backend.current_runtime_config = current_runtime_config  # type: ignore[method-assign]
+        server._backend.replace_runtime_config = replace_runtime_config  # type: ignore[method-assign]
+
+        all_caps = [item["key"] for item in server.settings()["available"]]
+        server.update_settings(capabilities=all_caps, model="gpt-global", effort="low", summary="auto")
+
+        profile_config = replaced["profile-run"]
+        default_config = replaced["default-run"]
+        assert profile_config.model is not None
+        assert profile_config.model.model == "gpt-profile"
+        assert "PROFILE_SENTINEL" in profile_config.prompt.system_prompt_base
+        assert {binding.ref.tool_id for binding in profile_config.tools} == {"run.update_plan", "fs.read"}
+        assert default_config.model is not None
+        assert default_config.model.model == "gpt-global"
+        assert "fs.write" in {binding.ref.tool_id for binding in default_config.tools}
+    finally:
+        server.shutdown()
+
+
 def test_multi_turn_session_yields_a_reply_per_message(studio: StudioServer) -> None:
     run_id = studio.start_chat("first")["run_id"]
     assert len(_wait_settled(studio, run_id, 1)) == 1
@@ -91,13 +250,13 @@ def test_multi_turn_session_yields_a_reply_per_message(studio: StudioServer) -> 
     studio.continue_chat(run_id, "third")
     assert len(_wait_settled(studio, run_id, 3)) == 3
     # The session stays open for the next message rather than going terminal.
-    assert studio.run_status(run_id)["status"] not in {"completed", "failed", "limited"}
+    assert studio.run_status(run_id)["terminal"] is False
 
 
 def test_run_tokens_are_not_exposed_to_callers(studio: StudioServer) -> None:
-    # The BFF holds run tokens server-side; start_chat returns only the run id + status.
+    # The BFF holds run tokens server-side; start_chat returns only lifecycle metadata.
     result = studio.start_chat("hello")
-    assert set(result) == {"run_id", "status"}
+    assert set(result) == {"run_id", "state", "terminal"}
     assert "run_token" not in result
 
 

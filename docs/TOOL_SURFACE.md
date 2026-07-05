@@ -36,7 +36,13 @@ as an agent-facing tool.
   "title": "Read notes",
   "summary": "Read a workspace file.",
   "risk": "read",
-  "metadata": {}
+  "metadata": {
+    "tool_search": {
+      "namespace": "workspace",
+      "groups": ["files"],
+      "tags": ["text"]
+    }
+  }
 }
 ```
 
@@ -48,6 +54,8 @@ as an agent-facing tool.
 - `authorization` controls execution: `allow`, `ask`, or `deny`.
 - `guidance` enriches model-facing descriptions and search entries.
 - `scope`, `quota`, and `runtime` drive enforcement.
+- `metadata.tool_search` can label searchable bindings with `namespace`, `group` or
+  `groups`, and `tag` or `tags` for search filtering.
 
 The same registry tool can be bound multiple times. Each binding can have a
 different name, guidance, scope, quota, and runtime. Duplicate `binding_id` and
@@ -163,11 +171,12 @@ Example web binding:
 ```
 
 `tool.search` appears only when search is enabled and at least one binding is
-searchable. Results use binding identity:
+searchable. Results use binding identity. `binding_id` is the load key; grouping
+metadata only filters and describes results.
 
 ```json
 {
-  "matches": [
+  "results": [
     {
       "binding_id": "search_docs",
       "tool_id": "web.search",
@@ -176,11 +185,47 @@ searchable. Results use binding identity:
       "summary": "Search trusted documentation.",
       "risk": "read",
       "requires_approval": false,
+      "namespace": "docs",
+      "groups": ["reference"],
+      "tags": ["read", "web.search"],
       "load_hint": "available_next_turn"
     }
   ]
 }
 ```
+
+`metadata.tool_search` accepts:
+
+```json
+{
+  "namespace": "docs",
+  "group": "reference",
+  "groups": ["reference", "api"],
+  "tag": "python",
+  "tags": ["python", "stable"]
+}
+```
+
+`group` and `tag` are shorthand for one-item lists. Missing metadata gets stable
+defaults: the namespace comes from the binding id or registry tool id prefix, the group
+comes from the capability prefix, and tags include risk, side effect, and capability.
+
+The `tool.search` input accepts optional filters:
+
+```json
+{
+  "query": "search",
+  "namespace": "docs",
+  "groups": ["reference"],
+  "tags": ["python"],
+  "max_results": 3
+}
+```
+
+Filters are additive. A result must match the namespace when supplied, at least one group
+when groups are supplied, and at least one tag when tags are supplied. The query ranking
+runs after filtering. Selected results become pending `binding_id` loads for the next
+turn, preserving the same turn-boundary semantics as unfiltered search.
 
 ## Snapshot
 

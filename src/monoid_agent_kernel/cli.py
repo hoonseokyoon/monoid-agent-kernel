@@ -67,6 +67,7 @@ from monoid_agent_kernel.reference.web_gateway.providers import (
 )
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.reference.studio.cli import studio as studio_group
+from monoid_agent_kernel.builder import builder_group
 
 
 @click.group()
@@ -75,6 +76,7 @@ def main() -> None:
 
 
 main.add_command(studio_group)
+main.add_command(builder_group)
 
 
 @main.command()
@@ -378,7 +380,8 @@ def status_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> Non
         click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return
     click.echo(f"run_id: {payload.get('run_id', '')}")
-    click.echo(f"status: {payload.get('status', '')}")
+    click.echo(f"state: {payload.get('state', '')}")
+    click.echo(f"terminal: {str(bool(payload.get('terminal'))).lower()}")
     if payload.get("error_code"):
         click.echo(f"error_code: {payload['error_code']}")
     if payload.get("current_step") is not None:

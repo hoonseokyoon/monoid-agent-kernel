@@ -17,6 +17,9 @@ from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     assert_transition,
     can_transition,
+    lifecycle_from_status_artifact,
+    session_state_from_run_status,
+    session_state_value,
     state_from_suspension,
     to_session_state,
 )
@@ -330,8 +333,39 @@ def test_to_session_state_folds_cancel_to_cancelled() -> None:
     assert to_session_state("failed", error_code="cancelled") is SessionState.CANCELLED
 
 
+def test_session_state_helpers_serialize_and_project_lifecycle_values() -> None:
+    assert session_state_value(SessionState.AWAITING_TASKS) == "awaiting_tasks"
+    assert session_state_from_run_status("awaiting_tasks") is SessionState.AWAITING_TASKS
+    assert session_state_from_run_status("limited", terminal=False) is SessionState.LIMITED
+    assert session_state_from_run_status("limited", terminal=True) is SessionState.LIMITED
+    assert session_state_from_run_status("limited", error_code="cancelled", terminal=True) is SessionState.CANCELLED
+
+
 def test_to_session_state_unknown_falls_back_to_created() -> None:
     assert to_session_state("nonsense") is SessionState.CREATED
+
+
+def test_lifecycle_from_status_artifact_projects_new_state_and_terminal() -> None:
+    assert lifecycle_from_status_artifact({"state": "limited"}) == (SessionState.LIMITED, False)
+    assert lifecycle_from_status_artifact({"state": "limited", "terminal": True}) == (
+        SessionState.LIMITED,
+        True,
+    )
+    assert lifecycle_from_status_artifact({"state": "completed"}) == (SessionState.COMPLETED, True)
+
+
+def test_lifecycle_from_status_artifact_projects_legacy_status() -> None:
+    assert lifecycle_from_status_artifact({"status": "limited"}) == (SessionState.LIMITED, True)
+    assert lifecycle_from_status_artifact({"status": "running"}) == (SessionState.RUNNING, False)
+    assert lifecycle_from_status_artifact({"status": "failed", "error_code": "cancelled"}) == (
+        SessionState.CANCELLED,
+        True,
+    )
+
+
+def test_lifecycle_from_status_artifact_uses_failure_fallback() -> None:
+    assert lifecycle_from_status_artifact(None) == (SessionState.CREATED, False)
+    assert lifecycle_from_status_artifact(None, failure_present=True) == (SessionState.FAILED, True)
 
 
 def test_cancelled_is_terminal() -> None:

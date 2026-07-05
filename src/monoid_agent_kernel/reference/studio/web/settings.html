@@ -36,7 +36,7 @@
   .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
 </style>
 </head>
-<body>
+<body data-testid="settings-popup">
   <div class="topbar">
     <h1>Settings</h1>
     <button class="close" id="close" type="button" title="Back to chat" aria-label="Back to chat">✕</button>
@@ -51,7 +51,7 @@
 
   <div class="group">
     <h2>Agent capabilities</h2>
-    <div id="caps"></div>
+    <div id="caps" data-testid="capability-toggles"></div>
     <div class="hint">Uncheck to take a capability away from the agent.</div>
   </div>
 
@@ -81,7 +81,7 @@ async function load() {
     row.className = "row";
     const id = "cap_" + cap.key;
     const checked = enabled.has(cap.key) ? "checked" : "";
-    row.innerHTML = `<input type="checkbox" id="${id}" value="${cap.key}" ${checked}/>` +
+    row.innerHTML = `<input type="checkbox" id="${id}" value="${cap.key}" data-testid="capability-toggle-${cap.key}" ${checked}/>` +
       `<label for="${id}">${cap.label}</label>`;
     capsEl.appendChild(row);
   }
