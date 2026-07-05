@@ -80,7 +80,6 @@ Reference scenario names stay inside `monoid_agent_kernel.reference.conformance`
 
 | Target | Why it remains |
 | --- | --- |
-| Closure docs | Public docs should link this responsibility map and summarize the Phase 4 facade/service boundary. |
 | CI hardening | Xdist and coverage jobs are advisory. Promote them only after their signal is consistently clean. |
 | Streaming transport adapters | HTTP SSE and Studio consumers sit outside the backend service split. Keep them transport-owned. |
 
@@ -96,5 +95,6 @@ The current structure matches the Phase 4 target:
 - Core, helper, and conformance surfaces do not require this Reference backend
   decomposition or any specific storage/product deployment choice.
 
-The next cleanup should focus on conformance fixture decoupling and documentation
-closure, not more public API movement.
+Phase 4 closure is recorded in `docs/PHASE_4_CLOSURE.md`. The next cleanup
+should focus on CI hardening, streaming transport adapters, or product-facing
+behavior, not more public API movement.

@@ -119,6 +119,7 @@ focused on edge-case parser coverage.
 16. Phase 2S 4차: coverage closure and validation/library policy documentation.
 17. Phase 4-4P: profile-specific harness protocols, Reference fixture decoupling, and conformance
     import-boundary guards.
+18. Phase 4-4Q: Phase 4 structural closure docs and CI/advisory risk position.
 
 ## Acceptance
 
