@@ -8,9 +8,13 @@ from typing import Any, Callable
 from monoid_agent_kernel.conformance.harness import (
     BackendHarness,
     CapabilityHarness,
+    ControlPlaneHarness,
+    DurableRunnerHarness,
     GatewayHarness,
     MessageFabricHarness,
+    MultiAgentBackendHarness,
     SideEffectHarness,
+    ToolAgentHarness,
 )
 
 from .capability_security import (
@@ -67,6 +71,18 @@ class ReferenceFullFactory(Protocol):
     def new_backend(self) -> BackendHarness:
         """Return a fresh Reference backend harness."""
 
+    def new_tool_agent(self) -> ToolAgentHarness:
+        """Return a fresh Reference tool-agent harness."""
+
+    def new_control_plane(self) -> ControlPlaneHarness:
+        """Return a fresh Reference control-plane harness."""
+
+    def new_durable_runner(self) -> DurableRunnerHarness:
+        """Return a fresh Reference durable-runner harness."""
+
+    def new_multi_agent(self) -> MultiAgentBackendHarness:
+        """Return a fresh Reference multi-agent backend harness."""
+
     def new_side_effect(self) -> SideEffectHarness:
         """Return a fresh Reference side-effect harness."""
 
@@ -91,20 +107,20 @@ def assert_reference_full_profile(factory: ReferenceFullFactory) -> None:
     assert_capability_security_revocation_profile(factory.new_capability())
     assert_multi_agent_shared_revocation_profile(factory.new_capability())
 
-    _run_with_close(factory.new_backend(), assert_control_plane_decision_profile)
-    _run_with_close(factory.new_backend(), assert_control_plane_audit_sequence_profile)
+    _run_with_close(factory.new_control_plane(), assert_control_plane_decision_profile)
+    _run_with_close(factory.new_control_plane(), assert_control_plane_audit_sequence_profile)
 
-    _run_with_close(factory.new_backend(), assert_tool_agent_surface_admission_profile)
-    _run_with_close(factory.new_backend(), assert_tool_agent_generic_ask_approval_profile)
+    _run_with_close(factory.new_tool_agent(), assert_tool_agent_surface_admission_profile)
+    _run_with_close(factory.new_tool_agent(), assert_tool_agent_generic_ask_approval_profile)
     _run_with_close(factory.new_side_effect(), assert_side_effect_tool_agent_profile)
     _run_with_close(factory.new_message_fabric(), assert_message_fabric_profile)
 
-    _run_with_close(factory.new_backend(), assert_durable_runner_event_sequence_profile)
-    _run_with_close(factory.new_backend(), assert_durable_runner_recovery_metadata_profile)
-    _run_with_close(factory.new_backend(), assert_durable_runner_subagent_diagnostics_profile)
+    _run_with_close(factory.new_durable_runner(), assert_durable_runner_event_sequence_profile)
+    _run_with_close(factory.new_durable_runner(), assert_durable_runner_recovery_metadata_profile)
+    _run_with_close(factory.new_durable_runner(), assert_durable_runner_subagent_diagnostics_profile)
 
-    _run_with_close(factory.new_backend(), assert_multi_agent_backend_boundary_profile)
-    _run_with_close(factory.new_backend(), assert_multi_agent_backend_capability_boundary_profile)
+    _run_with_close(factory.new_multi_agent(), assert_multi_agent_backend_boundary_profile)
+    _run_with_close(factory.new_multi_agent(), assert_multi_agent_backend_capability_boundary_profile)
 
     smoke = factory.run_studio_smoke()
     assert smoke["run_id"]

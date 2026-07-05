@@ -22,4 +22,3 @@ def test_reference_backend_satisfies_multi_agent_boundary_profile(tmp_path: Path
 def test_reference_backend_satisfies_multi_agent_capability_boundary_profile(tmp_path: Path) -> None:
     with ReferenceBackendHarness(tmp_path) as harness:
         assert_multi_agent_backend_capability_boundary_profile(harness)
-        assert harness.gated_provider.calls == 0

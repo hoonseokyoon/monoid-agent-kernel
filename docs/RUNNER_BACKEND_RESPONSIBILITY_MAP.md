@@ -73,12 +73,13 @@ Compatibility wrappers remain on `RunnerBackend` where tests or internal call
 sites use private methods. The implementation delegates through services.
 Circular service callbacks have been removed: recovery resume/reclaim and
 outbox ack staging call their owning service methods directly.
+Conformance profile assertions call profile-specific harness case methods.
+Reference scenario names stay inside `monoid_agent_kernel.reference.conformance`.
 
 ## Remaining Cleanup Targets
 
 | Target | Why it remains |
 | --- | --- |
-| Conformance fixture decoupling | Generic profiles still name Reference scenarios in a few assertions. Those scenarios should move behind Reference harness case methods. |
 | Closure docs | Public docs should link this responsibility map and summarize the Phase 4 facade/service boundary. |
 | CI hardening | Xdist and coverage jobs are advisory. Promote them only after their signal is consistently clean. |
 | Streaming transport adapters | HTTP SSE and Studio consumers sit outside the backend service split. Keep them transport-owned. |
