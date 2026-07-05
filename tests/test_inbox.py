@@ -134,17 +134,17 @@ def test_send_message_propagates_trace_context_onto_envelope(backend_factory: An
     assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
 
     # Capture the enqueued envelope synchronously (the parked run would otherwise consume + unwrap it
-    # before the test thread could read the queue). _call_soon receives the to_json() dict verbatim.
+    # before the test thread could read the queue). The backend enqueue boundary receives the to_json()
+    # dict verbatim before making the queue snapshot durable.
     captured: list[dict] = []
-    original = backend._call_soon
+    original = backend._session_boundary._context.enqueue_message_and_checkpoint
 
-    def spy(fn: Any, *args: Any) -> None:
-        for a in args:
-            if is_inbox_envelope(a):
-                captured.append(a)
-        original(fn, *args)
+    def spy(record: Any, message: Any) -> None:
+        if is_inbox_envelope(message):
+            captured.append(message)
+        original(record, message)
 
-    backend._call_soon = spy  # type: ignore[method-assign]
+    object.__setattr__(backend._session_boundary._context, "enqueue_message_and_checkpoint", spy)
     tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     backend.send_message(run_id, token, content="go", message_id="m1", traceparent=tp, tracestate="v=1")
     assert captured and captured[0]["traceparent"] == tp and captured[0]["tracestate"] == "v=1"

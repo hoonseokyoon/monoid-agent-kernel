@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -597,6 +597,7 @@ class RunnerBackend:
                 active_record=self._active_record,
                 run_dir_for=lambda run_id: self.run_root / run_id,
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
+                enqueue_message_and_checkpoint=self._enqueue_message_and_checkpoint,
                 persist_checkpoint_from_any_thread=self._persist_run_checkpoint_from_any_thread,
                 checkpoint_store_provider=lambda: self.checkpoint_store,
                 read_recovery_meta=self._read_recovery_meta,
@@ -846,6 +847,34 @@ class RunnerBackend:
     def _call_soon(self, fn: Callable[..., Any], *args: Any) -> None:
         """Run a thread-safe callback on the process-shared run loop (fire-and-forget)."""
         _get_shared_loop().call_soon_threadsafe(fn, *args)
+
+    def _enqueue_message_and_checkpoint(self, record: BackendRunRecord, message: Any) -> None:
+        """Enqueue an inbox message on the shared loop and persist the queue snapshot before returning."""
+
+        def _enqueue_and_persist() -> None:
+            record.message_queue.put_nowait(message)
+            self._persist_run_checkpoint(record)
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is _get_shared_loop():
+            _enqueue_and_persist()
+            return
+
+        done: Future[None] = Future()
+
+        def _complete() -> None:
+            try:
+                _enqueue_and_persist()
+            except BaseException as exc:
+                done.set_exception(exc)
+            else:
+                done.set_result(None)
+
+        _get_shared_loop().call_soon_threadsafe(_complete)
+        done.result(timeout=10.0)
 
     def spawn_coroutine(self, coro: Any) -> Any:
         """Schedule a coroutine on the process-shared run loop; returns a

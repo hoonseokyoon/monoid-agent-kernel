@@ -40,6 +40,7 @@ class BackendSessionContext:
     active_record: Callable[[str], MutableRunRecordPort | None]
     run_dir_for: Callable[[str], Path]
     call_soon: Callable[..., None]
+    enqueue_message_and_checkpoint: Callable[[MutableRunRecordPort, Any], None]
     persist_checkpoint_from_any_thread: Callable[[MutableRunRecordPort], None]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     read_recovery_meta: Callable[[Path, str], dict[str, Any] | None]
@@ -181,7 +182,7 @@ class BackendSessionService:
         if wire_bytes > max_message_bytes:
             raise ValueError(f"message exceeds the {max_message_bytes}-byte limit")
         self._context.ensure_message_enqueue_allowed(record)
-        self._context.call_soon(record.message_queue.put_nowait, envelope.to_json())
+        self._context.enqueue_message_and_checkpoint(record, envelope.to_json())
         return {"run_id": run_id, "status": "queued", "message_id": envelope.id}
 
     def report_task_result(

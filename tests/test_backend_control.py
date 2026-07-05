@@ -472,6 +472,37 @@ def test_checkpoint_persist_carries_pending_messages_and_seen_inbox_ids(
     assert stored.checkpoint.inbox_seen_ids == ["msg_1", "msg_2"]
 
 
+def test_send_message_enqueue_persists_queue_snapshot_before_return(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_enqueue_checkpoint"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    envelope = InboxMessage(content="queued before task result", id="msg_review").to_json()
+
+    class _SnapshotLoop:
+        def snapshot(self) -> RunCheckpoint:
+            return RunCheckpoint(run_id=run_id, seq=1)
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+        def due_outbox(self, now: float) -> list[Any]:
+            del now
+            return []
+
+    record.loop = _SnapshotLoop()  # type: ignore[assignment]
+
+    backend._enqueue_message_and_checkpoint(record, envelope)  # noqa: SLF001 - enqueue durability regression
+
+    assert backend.checkpoint_store is not None
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.queued_messages == [envelope]
+
+
 class _UnopenedLoop:
     def __init__(self) -> None:
         self.calls = 0
