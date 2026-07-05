@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -74,8 +74,24 @@ class LoopPort(Protocol):
     def restore(self, checkpoint: RunCheckpoint, *, blobs: Mapping[str, bytes]) -> None: ...
 
 
+class RunStreamPort(Protocol):
+    suspension: Suspension | None
+
+    async def __aenter__(self) -> RunStreamPort: ...
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None: ...
+
+    def __aiter__(self) -> AsyncIterator[Any]: ...
+
+
+class RunExecutionLoopPort(LoopPort, Protocol):
+    async def aopen(self) -> None: ...
+
+    def astream(self, user_input: Any) -> RunStreamPort: ...
+
+
 class LoopBuildPort(Protocol):
-    loop: LoopPort
+    loop: RunExecutionLoopPort
     outbox_sender: Any
 
 
@@ -108,6 +124,15 @@ class MutableRunRecordPort(RunRecordPort, Protocol):
     cancellation_token: CancellationTokenPort
     seen_inbox_ids: set[str]
     outbox_sender: Any
+
+
+class PreparedRunPort(Protocol):
+    run_id: str
+    record: MutableRunRecordPort
+    workspace_root: Path
+    run_token: str
+    llm_gateway_token: str
+    web_gateway_token: str
 
 
 class RunRequestPort(Protocol):

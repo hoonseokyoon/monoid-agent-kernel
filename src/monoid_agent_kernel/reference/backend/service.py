@@ -63,7 +63,7 @@ from monoid_agent_kernel.core.spec import (
     WorkspaceBackendKind,
 )
 from monoid_agent_kernel.core.workspace import Workspace
-from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
+from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelAdapter
@@ -99,6 +99,11 @@ from monoid_agent_kernel.reference.backend.projection import (
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
 from monoid_agent_kernel.reference.backend.recovery import RecoveryContext, RecoveryService
 from monoid_agent_kernel.reference.backend.runtime_config import RuntimeConfigContext, RuntimeConfigService
+from monoid_agent_kernel.reference.backend.run_execution import (
+    RunExecutionContext,
+    RunExecutionService,
+    stream_item_frame,
+)
 from monoid_agent_kernel.reference.backend.session import (
     BackendSessionContext,
     BackendSessionService,
@@ -530,6 +535,7 @@ class RunnerBackend:
     _jobs: JobService = field(init=False, repr=False)
     _recovery: RecoveryService = field(init=False, repr=False)
     _outbox_dispatch: OutboxDispatchService = field(init=False, repr=False)
+    _run_execution: RunExecutionService = field(init=False, repr=False)
     _session_boundary: BackendSessionService = field(init=False, repr=False)
     _session_drive: SessionDriveService = field(init=False, repr=False)
     _commands: BackendCommandService = field(init=False, repr=False)
@@ -560,6 +566,7 @@ class RunnerBackend:
         self._outbox_dispatch = self._build_outbox_dispatch_service()
         assert self.checkpoint_store is not None
         self._session_drive = self._build_session_drive_service()
+        self._run_execution = self._build_run_execution_service()
         self._session_boundary = self._build_session_boundary_service()
         self._commands = self._build_command_service()
 
@@ -655,7 +662,7 @@ class RunnerBackend:
                 issue_web_gateway_token=self._issue_recovery_web_gateway_token,
                 build_loop=self._build_loop_build,
                 register_record=self._register_recovered_record,
-                attach_loop=self._attach_recovered_loop,
+                attach_loop=self._attach_loop_build,
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
                 spawn=self._spawn,
                 drive_open_session=self._drive_open_session,
@@ -698,6 +705,22 @@ class RunnerBackend:
                 drain_outbox=self._drain_outbox,
                 close_signal=_CLOSE_SESSION,
                 resume_signal=_RESUME_SESSION,
+            )
+        )
+
+    def _build_run_execution_service(self) -> RunExecutionService:
+        return RunExecutionService(
+            RunExecutionContext(
+                build_loop=self._build_loop_build,
+                attach_loop=self._attach_loop_build,
+                record=self._record,
+                write_run_meta=self._write_run_meta,
+                drive_open_session=self._drive_open_session,
+                record_run_result=self._record_run_result,
+                record_run_failure=self._record_run_failure,
+                acquire_run_slot=self._acquire_run_slot,
+                release_run_slot=self._release_run_slot,
+                submission_json=lambda prepared: self._submission_for(prepared).to_json(),
             )
         )
 
@@ -871,7 +894,7 @@ class RunnerBackend:
         with self._lock:
             self._records[record.run_id] = record
 
-    def _attach_recovered_loop(
+    def _attach_loop_build(
         self,
         record: BackendRunRecord,
         loop_build: BackendLoopBuild,
@@ -879,6 +902,13 @@ class RunnerBackend:
         with self._lock:
             record.loop = loop_build.loop
             record.outbox_sender = loop_build.outbox_sender
+
+    def _attach_recovered_loop(
+        self,
+        record: BackendRunRecord,
+        loop_build: BackendLoopBuild,
+    ) -> None:
+        self._attach_loop_build(record, loop_build)
 
     async def _acquire_run_slot(self) -> None:
         if self._run_semaphore is not None:
@@ -1529,17 +1559,7 @@ class RunnerBackend:
         raise TimeoutError(f"run did not finish before timeout: {run_id}")
 
     async def _drive_session(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> AgentRunResult:
-        """Cold-start driver: open the run, take the first turn, then hand off to the
-        shared open-session loop (also used by checkpoint recovery)."""
-        record = self._record(run_id)
-        await loop.aopen()
-        first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
-        try:
-            suspension = await loop.arun_until_suspended(first_input)
-        except NativeAgentError:
-            # Bootstrap failed (terminal session already recorded); just finalize.
-            return await loop.aclose()
-        return await self._drive_open_session(record, request, loop, suspension, started=time.time(), turns=1)
+        return await self._run_execution.drive_session(run_id, request, loop)
 
     async def _drive_open_session(
         self,
@@ -1609,30 +1629,15 @@ class RunnerBackend:
         llm_gateway_token: str,
         web_gateway_token: str,
     ) -> None:
-        # Bound concurrent active runs: at capacity this awaits (without holding a thread),
-        # so the run stays ``queued`` until a slot frees rather than piling work onto a
-        # saturated process.
-        if self._run_semaphore is not None:
-            await self._run_semaphore.acquire()
-        try:
-            try:
-                loop_build = self._build_loop_build(
-                    run_id, request, workspace_root, llm_gateway_token, web_gateway_token
-                )
-                loop = loop_build.loop
-                with self._lock:
-                    self._records[run_id].loop = loop
-                    self._records[run_id].outbox_sender = loop_build.outbox_sender
-                # Persist the recovery metadata before the first turn so a crash at any park
-                # point can be resumed (the checkpoint itself is written by the driver).
-                self._write_run_meta(self._record(run_id), request)
-                result = await self._drive_session(run_id, request, loop)
-                self._record_run_result(run_id, result)
-            except Exception as exc:
-                self._record_run_failure(run_id, exc)
-        finally:
-            if self._run_semaphore is not None:
-                self._run_semaphore.release()
+        prepared = _PreparedRun(
+            run_id=run_id,
+            record=self._record(run_id),
+            workspace_root=workspace_root,
+            run_token="",
+            llm_gateway_token=llm_gateway_token,
+            web_gateway_token=web_gateway_token,
+        )
+        await self._run_execution.run_prepared(prepared, request)
 
     def _capability_broker_for(self, request: BackendRunRequest) -> Any:
         """Build the run's capability broker from the factory (scoped to run identity), or None
@@ -1693,64 +1698,12 @@ class RunnerBackend:
         deferred), so this never leaves a resumable run dangling.
         """
         prepared = self._prepare_run_record(request)
-        run_id = prepared.run_id
-        if self._run_semaphore is not None:
-            await self._run_semaphore.acquire()
-        loop: AgentLoop | None = None
-        closed = False
-        try:
-            yield {"kind": "meta", **self._submission_for(prepared).to_json()}
-            loop_build = self._build_loop_build(
-                run_id, request, prepared.workspace_root, prepared.llm_gateway_token, prepared.web_gateway_token
-            )
-            loop = loop_build.loop
-            with self._lock:
-                self._records[run_id].loop = loop
-                self._records[run_id].outbox_sender = loop_build.outbox_sender
-            self._write_run_meta(prepared.record, request)
-            await loop.aopen()
-            suspension: Suspension | None = None
-            first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
-            async with loop.astream(first_input) as stream:
-                async for item in stream:
-                    yield self._frame(item)
-                suspension = stream.suspension
-            result = await loop.aclose()
-            closed = True
-            self._record_run_result(run_id, result)
-            frame: dict[str, Any] = {
-                "kind": "result",
-                "status": result.status,
-                "final_text": result.final_text,
-                "error": result.error,
-                "error_code": result.error_code,
-            }
-            if suspension is not None and suspension.has_external:
-                frame["awaiting_task_ids"] = list(suspension.awaiting_task_ids)
-                frame["note"] = "run closed; hosted task cancelled (HITL streaming deferred)"
+        async for frame in self._run_execution.stream_prepared(prepared, request):
             yield frame
-        except Exception as exc:
-            if loop is not None and not closed:
-                try:
-                    await loop.aclose()
-                except Exception:  # noqa: BLE001 - finalization best-effort; the failure is recorded below
-                    pass
-            self._record_run_failure(run_id, exc)
-            yield {
-                "kind": "result",
-                "status": "failed",
-                "error": str(exc),
-                "error_code": getattr(exc, "error_code", "internal_error"),
-            }
-        finally:
-            if self._run_semaphore is not None:
-                self._run_semaphore.release()
 
     def _frame(self, item: Any) -> dict[str, Any]:
         """Wrap one astream item as a neutral wire frame (reference framing on core to_json)."""
-        if isinstance(item, AgentEvent):
-            return {"kind": "event", **item.to_json()}
-        return {"kind": "delta", **item.to_json()}  # ModelStreamChunk
+        return stream_item_frame(item)
 
     def _record_run_result(self, run_id: str, result: AgentRunResult) -> None:
         with self._lock:

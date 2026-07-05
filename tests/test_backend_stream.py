@@ -16,12 +16,13 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from monoid_agent_kernel.core.content import TextPart
 from support.http import serving
 from support.runtime import runtime_config
 
 from monoid_agent_kernel.errors import ModelAdapterError
-from monoid_agent_kernel.providers.base import ModelRequest, ModelStreamChunk, TextDelta, TurnComplete
-from monoid_agent_kernel.providers.fake import FakeStreamingModelAdapter
+from monoid_agent_kernel.providers.base import ModelRequest, ModelStreamChunk, ModelTurn, TextDelta, TurnComplete
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, FakeStreamingModelAdapter
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 
@@ -142,6 +143,28 @@ def test_astream_run_programmatic_seam(tmp_path: Path, backend_factory: Any) -> 
     assert frames[-1]["final_text"] == "done"
 
 
+def test_astream_run_result_projection_ready_when_result_frame_emits(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _streaming_backend(
+        backend_factory,
+        workspace,
+        [TextDelta("ok"), TurnComplete(response_id="prov", usage={"total_tokens": 7})],
+    )
+    frames = asyncio.run(_collect(backend, _request(workspace)))
+    meta = frames[0]
+
+    result = backend.result(meta["run_id"], meta["run_token"])
+
+    assert frames[-1]["kind"] == "result"
+    assert result["ready"] is True
+    assert result["terminal"] is True
+    assert result["state"] == "completed"
+    assert result["final_text"] == "ok"
+    assert result["metrics"]["total_tokens"] == 7
+
+
 def test_astream_run_emits_failed_result_on_adapter_error(
     tmp_path: Path, backend_factory: Any
 ) -> None:
@@ -163,3 +186,99 @@ def test_astream_run_emits_failed_result_on_adapter_error(
     assert sum(1 for f in frames if f["kind"] == "result") == 1
     assert frames[-1]["kind"] == "result"
     assert frames[-1]["status"] == "failed"
+    assert frames[-1]["error_code"] == "model_error"
+    meta = frames[0]
+    result = backend.result(meta["run_id"], meta["run_token"])
+    assert result["ready"] is True
+    assert result["terminal"] is True
+    assert result["state"] == "failed"
+    assert result["error_code"] == "model_error"
+    assert (backend._record(meta["run_id"]).run_dir / "failure.json").exists()
+
+
+def test_astream_run_worker_failure_after_meta_releases_slot(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    workspace = _workspace(tmp_path)
+    calls = 0
+
+    def factory(spec: Any, token: str) -> FakeStreamingModelAdapter:
+        nonlocal calls
+        del spec, token
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("factory blew up")
+        return FakeStreamingModelAdapter(chunk_turns=[[TextDelta("next"), TurnComplete(response_id="ok")]])
+
+    backend = backend_factory.create(
+        workspace=workspace,
+        model_adapter_factory=factory,
+        max_concurrent_runs=1,
+    )
+
+    failed = asyncio.run(_collect(backend, _request(workspace)))
+    failed_meta = failed[0]
+    assert failed[-1]["kind"] == "result"
+    assert failed[-1]["status"] == "failed"
+    assert failed[-1]["error_code"] == "internal_error"
+    failed_result = backend.result(failed_meta["run_id"], failed_meta["run_token"])
+    assert failed_result["ready"] is False
+    assert failed_result["terminal"] is True
+    assert failed_result["state"] == "failed"
+    assert (backend._record(failed_meta["run_id"]).run_dir / "failure.json").exists()
+
+    completed = asyncio.run(_collect(backend, _request(workspace)))
+    assert completed[-1]["kind"] == "result"
+    assert completed[-1]["status"] == "completed"
+    assert completed[-1]["final_text"] == "next"
+
+
+def test_first_turn_input_parts_reach_submit_and_stream_paths(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    workspace = _workspace(tmp_path)
+    submit_adapters: list[FakeModelAdapter] = []
+    stream_adapters: list[FakeStreamingModelAdapter] = []
+
+    submit_backend = backend_factory.create(
+        workspace=workspace,
+        model_adapter_factory=lambda spec, token: submit_adapters.append(
+            FakeModelAdapter(turns=[ModelTurn(response_id="submit", final_text="submit done")])
+        )
+        or submit_adapters[-1],
+    )
+    submission = submit_backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="ignored title",
+            input_parts=(TextPart("from parts"),),
+            runtime_config=runtime_config("run.finish"),
+        )
+    )
+    assert submit_backend.wait_for_run(submission.run_id, timeout_s=20) == "completed"
+    assert submit_adapters[0].requests[0].messages[0]["content"] == "from parts"
+
+    stream_backend = backend_factory.create(
+        workspace=workspace,
+        model_adapter_factory=lambda spec, token: stream_adapters.append(
+            FakeStreamingModelAdapter(chunk_turns=[[TextDelta("stream done"), TurnComplete()]])
+        )
+        or stream_adapters[-1],
+    )
+    frames = asyncio.run(
+        _collect(
+            stream_backend,
+            BackendRunRequest(
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=workspace,
+                instruction="ignored title",
+                input_parts=(TextPart("stream parts"),),
+                runtime_config=runtime_config("run.finish"),
+            ),
+        )
+    )
+    assert frames[-1]["status"] == "completed"
+    assert stream_adapters[0].requests[0].messages[0]["content"] == "stream parts"
