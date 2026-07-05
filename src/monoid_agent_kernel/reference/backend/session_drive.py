@@ -13,7 +13,12 @@ from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.lifecycle import state_from_suspension
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
-from monoid_agent_kernel.reference.backend.ports import LoopPort, MutableRunRecordPort, RunRequestPort
+from monoid_agent_kernel.reference.backend.ports import (
+    LoopPort,
+    MutableRunRecordPort,
+    RunRequestPort,
+    queued_message_snapshot,
+)
 from monoid_agent_kernel.reference.backend.run_state import set_record_state as _set_record_state
 
 
@@ -209,9 +214,7 @@ class SessionDriveService:
         loop = record.loop
         if loop is None:
             return
-        checkpoint.queued_messages = [
-            message for message in list(record.message_queue._queue) if isinstance(message, (str, list, dict))
-        ]
+        checkpoint.queued_messages = queued_message_snapshot(record.message_queue)
         checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
         self._context.checkpoint_store_provider().put(checkpoint, blobs)
         self._context.drain_outbox(record, loop)

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
@@ -18,26 +18,111 @@ from monoid_agent_kernel.reference.backend.ports import LoopPort, TokenClaimsPor
 _CONTROL_AUDIT_POLICY = ControlAuditPolicy()
 
 
+class ControlAuditEventPort(Protocol):
+    def __call__(
+        self,
+        run_id: str,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        level: str = "info",
+    ) -> None: ...
+
+
+class CommandRunControlPort(Protocol):
+    def pause_run(self, run_id: str, token: str) -> dict[str, Any]: ...
+
+    def signal_resume(self, run_id: str, token: str) -> dict[str, Any]: ...
+
+    def resume_run(self, run_id: str, token: str) -> dict[str, Any]: ...
+
+    def cancel_run(self, run_id: str, token: str) -> dict[str, Any]: ...
+
+    def interrupt_turn(self, run_id: str, token: str) -> dict[str, Any]: ...
+
+
+class CommandTaskMessagePort(Protocol):
+    def report_task_result(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        task_id: str,
+        result: dict[str, Any],
+        status: str = "answered",
+    ) -> dict[str, Any]: ...
+
+    def send_message(
+        self,
+        run_id: str,
+        token: str,
+        content: str | Sequence[Any],
+        *,
+        message_id: str = "",
+        source: str = "api",
+        correlation_id: str = "",
+        causation_id: str = "",
+        traceparent: str = "",
+        tracestate: str = "",
+        message_type: str = "user_message",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
+
+    def create_task(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        kind: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+
+class CommandCapabilityPort(Protocol):
+    def revoke_capability(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        capability: str | None = None,
+        lease_id: str | None = None,
+        before: float | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]: ...
+
+
+class CommandProjectionPort(Protocol):
+    def status(self, run_id: str, token: str) -> dict[str, Any]: ...
+
+
+class CommandRuntimeConfigPort(Protocol):
+    def runtime_config(self, run_id: str, token: str) -> dict[str, Any]: ...
+
+    def replace_runtime_config(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        expected_version: int,
+        issuer: str,
+        reason: str,
+        config: AgentRuntimeConfig,
+    ) -> dict[str, Any]: ...
+
+
 @dataclass(frozen=True)
 class BackendCommandContext:
-    emit_control_audit_event: Callable[..., None]
+    emit_control_audit_event: ControlAuditEventPort
     verify_run_token: Callable[[str, str], TokenClaimsPort]
     verify_task_callback_token: Callable[[str, str, str], None]
     authorize_claim_subject: Callable[[str, TokenClaimsPort], None]
     is_live_run: Callable[[str], bool]
     active_loop_session: Callable[[str, str], tuple[LoopPort, SessionState]]
-    pause_run: Callable[[str, str], dict[str, Any]]
-    signal_resume: Callable[[str, str], dict[str, Any]]
-    resume_run: Callable[[str, str], dict[str, Any]]
-    cancel_run: Callable[[str, str], dict[str, Any]]
-    interrupt_turn: Callable[[str, str], dict[str, Any]]
-    report_task_result: Callable[..., dict[str, Any]]
-    send_message: Callable[..., dict[str, Any]]
-    create_task: Callable[..., dict[str, Any]]
-    revoke_capability: Callable[..., dict[str, Any]]
-    status: Callable[[str, str], dict[str, Any]]
-    runtime_config: Callable[[str, str], dict[str, Any]]
-    replace_runtime_config: Callable[..., dict[str, Any]]
+    run_control: CommandRunControlPort
+    task_messages: CommandTaskMessagePort
+    capability_control: CommandCapabilityPort
+    projection: CommandProjectionPort
+    runtime_config: CommandRuntimeConfigPort
 
 
 class BackendCommandService:
@@ -166,15 +251,15 @@ class BackendCommandService:
             return ControlResult(run_id=run_id, type=ctype, status="ok", state=state, data=dict(data))
 
         if ctype == "pause":
-            return ok(self._context.pause_run(run_id, token))
+            return ok(self._context.run_control.pause_run(run_id, token))
         if ctype == "resume":
             return ok(
-                self._context.signal_resume(run_id, token)
+                self._context.run_control.signal_resume(run_id, token)
                 if self._context.is_live_run(run_id)
-                else self._context.resume_run(run_id, token)
+                else self._context.run_control.resume_run(run_id, token)
             )
         if ctype == "cancel":
-            return ok(self._context.cancel_run(run_id, token))
+            return ok(self._context.run_control.cancel_run(run_id, token))
         if ctype in {"approve", "deny"}:
             result = args.get("result") if isinstance(args.get("result"), dict) else {}
             approval_result = dict(result)
@@ -188,7 +273,7 @@ class BackendCommandService:
                     reason=command.reason or str(args.get("reason") or approval_result.get("reason") or "denied"),
                 )
             return ok(
-                self._context.report_task_result(
+                self._context.task_messages.report_task_result(
                     run_id,
                     token,
                     task_id=str(args.get("task_id") or ""),
@@ -197,7 +282,7 @@ class BackendCommandService:
                 )
             )
         if ctype == "interrupt":
-            return ok(self._context.interrupt_turn(run_id, token))
+            return ok(self._context.run_control.interrupt_turn(run_id, token))
         if ctype in {"inspect", "health"}:
             loop, state = self._context.active_loop_session(run_id, token)
             session = LoopSession(loop, _state=state)
@@ -207,12 +292,12 @@ class BackendCommandService:
             health = session.health()
             return ok(health.to_json(), state=health.state.value)
         if ctype == "status":
-            return ok(self._context.status(run_id, token))
+            return ok(self._context.projection.status(run_id, token))
         if ctype == "runtime_config":
-            return ok(self._context.runtime_config(run_id, token))
+            return ok(self._context.runtime_config.runtime_config(run_id, token))
         if ctype == "replace_runtime_config":
             return ok(
-                self._context.replace_runtime_config(
+                self._context.runtime_config.replace_runtime_config(
                     run_id,
                     token,
                     expected_version=int(args.get("expected_version", 0)),
@@ -223,7 +308,7 @@ class BackendCommandService:
             )
         if ctype == "send_message":
             return ok(
-                self._context.send_message(
+                self._context.task_messages.send_message(
                     run_id,
                     token,
                     content=args.get("content") or "",
@@ -233,7 +318,7 @@ class BackendCommandService:
             )
         if ctype == "create_task":
             return ok(
-                self._context.create_task(
+                self._context.task_messages.create_task(
                     run_id,
                     token,
                     kind=str(args.get("kind") or ""),
@@ -242,7 +327,7 @@ class BackendCommandService:
             )
         if ctype == "report_task_result":
             return ok(
-                self._context.report_task_result(
+                self._context.task_messages.report_task_result(
                     run_id,
                     token,
                     task_id=str(args.get("task_id") or ""),
@@ -253,7 +338,7 @@ class BackendCommandService:
         if ctype == "revoke_capability":
             before = args.get("before")
             return ok(
-                self._context.revoke_capability(
+                self._context.capability_control.revoke_capability(
                     run_id,
                     token,
                     capability=(str(args["capability"]) if args.get("capability") else None),

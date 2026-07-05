@@ -13,7 +13,7 @@ uses instead of depending on the whole facade.
 
 | Service | Current responsibility |
 | --- | --- |
-| `RunProjectionService` | Read-only projections: `status`, `result`, `events`, `diagnostics`, `list_runs`. |
+| `RunProjectionService` | Read-only projections: `status`, `result`, `events`, `descendant_events`, `diagnostics`, `list_runs`. |
 | `RunPreparationService` | Request validation, workspace admission, initial runtime config validation, run token issuance, record creation, initial run metadata materialization, and submission payload assembly. |
 | `RunStateMutationService` | Live run state mutation, backend/control event append decisions, terminal result/failure recording, and process-local tenant usage aggregation. |
 | `BackendCommandService` | Control command dispatch and audit result mapping. |
@@ -31,7 +31,9 @@ These services are private implementation modules under
 `monoid_agent_kernel.reference.backend`. They are not stable contract exports.
 Their context objects use private Protocol/port types from
 `monoid_agent_kernel.reference.backend.ports` for stable internal shapes such as
-run records, run requests, loop operations, token claims, and lease stores.
+run records, run requests, loop operations, token claims, queue snapshots, and
+lease stores. Shared file readers such as proposal snapshot loading live in
+private helper modules used by the services that need them.
 
 ## Responsibilities That Stay On RunnerBackend
 
@@ -58,6 +60,7 @@ The main Reference product-specific surfaces have been moved out of the facade:
 | --- | --- |
 | `RunPreparationService` | `_prepare_run_record`, `_submission_for`, `_validate_request`, `_check_workspace_allowed`, `_write_run_meta`. |
 | `RunStateMutationService` | `record_event`, `_emit_backend_event`, `_record_run_result`, `_record_run_failure`, `tenant_usage`, lifecycle helper interpretation, `BackendRunStateSink`. |
+| `RunProjectionService` | `status`, `result`, `events`, `descendant_events`, `diagnostics`, `list_runs`. |
 | `ProposalService` | `proposal`, `proposal_diff`, `proposal_file`, `export_proposal_package`, `read_run_artifact`, `approve_proposal`, `reject_proposal`, `apply_proposal`. |
 | `RuntimeConfigService` | `current_runtime_config`, `runtime_config`, `replace_runtime_config`, `_write_runtime_config_run_meta`. |
 | `JobService` | `jobs`, `job_status`, `job_logs`, `cancel_job`. |
@@ -67,15 +70,18 @@ The main Reference product-specific surfaces have been moved out of the facade:
 | `RunExecutionService` | `_run_run`, `_drive_session`, `astream_run` body, `_frame`. |
 
 Compatibility wrappers remain on `RunnerBackend` where tests or internal call
-sites use private methods. The implementation now delegates through services.
+sites use private methods. The implementation delegates through services.
+Circular service callbacks have been removed: recovery resume/reclaim and
+outbox ack staging call their owning service methods directly.
 
 ## Remaining Cleanup Targets
 
 | Target | Why it remains |
 | --- | --- |
-| Service port typing | Private ports now cover the main internal shapes. Remaining `Any` usage is concentrated in dynamic JSON/tool/provider payloads and test-facing monkeypatch seams. |
-| Composition root size | Service context wiring now lives in `_build_*_service` helpers. Future cleanup should keep each helper small rather than adding wiring back to `__post_init__`. |
-| Streaming transport adapters | HTTP SSE and Studio consumers still sit outside the backend service split. Future cleanup should keep them transport-owned. |
+| Conformance fixture decoupling | Generic profiles still name Reference scenarios in a few assertions. Those scenarios should move behind Reference harness case methods. |
+| Closure docs | Public docs should link this responsibility map and summarize the Phase 4 facade/service boundary. |
+| CI hardening | Xdist and coverage jobs are advisory. Promote them only after their signal is consistently clean. |
+| Streaming transport adapters | HTTP SSE and Studio consumers sit outside the backend service split. Keep them transport-owned. |
 
 ## Design Position
 
@@ -84,8 +90,10 @@ The current structure matches the Phase 4 target:
 - External callers use one stable `RunnerBackend` facade.
 - Internal behavior is split by responsibility into private services.
 - Services depend on explicit context/port objects.
+- Private ports hide implementation details such as queue internals and service
+  callback wiring.
 - Core, helper, and conformance surfaces do not require this Reference backend
   decomposition or any specific storage/product deployment choice.
 
-The next cleanup should focus on private type/port clarity, not more public API
-movement.
+The next cleanup should focus on conformance fixture decoupling and documentation
+closure, not more public API movement.

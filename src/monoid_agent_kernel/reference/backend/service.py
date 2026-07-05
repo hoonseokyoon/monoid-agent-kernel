@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import json
 import logging
 import random
 import threading
@@ -27,14 +26,14 @@ from monoid_agent_kernel.core.durable_metadata import (
     read_run_metadata,
     validate_run_metadata,
 )
+from monoid_agent_kernel.core.capability import CapabilityBroker
+from monoid_agent_kernel.core.context import ContextProvider
+from monoid_agent_kernel.core.events import AgentEvent, EventSink
 from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
 )
-from monoid_agent_kernel.core.subagent_runtime import (
-    validate_descendant_run_id,
-)
-from monoid_agent_kernel.core.events import AgentEvent
-from monoid_agent_kernel.core.outbox import OutboxReceipt
+from monoid_agent_kernel.core.outbox import OutboxSender, OutboxReceipt
+from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
 )
@@ -81,9 +80,9 @@ from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
     _json_safe as _json_safe,
-    _read_event_page,
 )
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
+from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
 from monoid_agent_kernel.reference.backend.recovery import RecoveryContext, RecoveryService
 from monoid_agent_kernel.reference.backend.runtime_config import RuntimeConfigContext, RuntimeConfigService
 from monoid_agent_kernel.reference.backend.run_execution import (
@@ -119,6 +118,7 @@ from monoid_agent_kernel.reference.backend.session_drive import (
     _queued_message_to_loop_input as _queued_message_to_loop_input,
 )
 from monoid_agent_kernel.recorder import append_event_to_run
+from monoid_agent_kernel.tools.base import ToolProvider
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.web import WebGatewayClient
 
@@ -147,7 +147,7 @@ def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
 
 def _backend_builtin_tool_specs(
     subagent_definitions: Mapping[str, SubagentDefinition] | None = None,
-    tool_providers: Sequence[Any] = (),
+    tool_providers: Sequence[ToolProvider] = (),
 ) -> tuple[Any, ...]:
     specs = list(builtin_tools(cast(Workspace, None)))
     # agent.spawn is registered dynamically by the loop bootstrap (only when the run carries
@@ -288,7 +288,7 @@ class RunnerBackend:
     # required for stateful sinks like OtelEventSink (per-run span state). The seam an embedder
     # uses to attach observability without a core dep — e.g. studio sets ``(OtelEventSink,)`` when
     # OTel is toggled on. Read at loop-build time so it can change at runtime. Empty → no deps.
-    extra_event_sink_factories: tuple[Any, ...] = ()
+    extra_event_sink_factories: tuple[Callable[[], EventSink], ...] = ()
     # Tool/context providers attached to every run the backend builds (Skills, MCP, custom).
     # The embedder-facing seam for the loop's tool_providers/context_providers (the CLI passes
     # these to AgentLoop directly; without these fields an out-of-process embedder could not
@@ -298,23 +298,23 @@ class RunnerBackend:
     # client is documented thread-safe; SkillProvider is read-only). Read at loop-build time so
     # a parked run re-attaches them on resume/restart. Their tools must also be declared to
     # config validation — see _backend_builtin_tool_specs. Empty → no providers.
-    tool_providers: tuple[Any, ...] = ()
-    context_providers: tuple[Any, ...] = ()
+    tool_providers: tuple[ToolProvider, ...] = ()
+    context_providers: tuple[ContextProvider, ...] = ()
     # Output validators attached to every run the backend builds. Default-on: each runs unless a
     # run's config disables it via OutputValidatorBinding(enabled=False). Read at loop-build time
     # so a parked run re-attaches them on resume/restart, exactly like tool/context providers.
     # Empty → no validators.
-    output_validators: tuple[Any, ...] = ()
+    output_validators: tuple[OutputValidator, ...] = ()
     # Per-run capability broker factory: ``(request) -> CapabilityBroker | None``. Called at
     # loop-build time so a broker can be scoped to the run's identity (tenant/user/run id) — e.g.
     # a GatewayCapabilityBroker minting per-tenant tokens. None (or a None return) leaves capability
     # gating off for that run. A factory (not an instance) because a broker is typically per-run
     # identity-bound, unlike the shared tool/context providers above.
-    capability_broker_factory: Callable[[BackendRunRequest], Any] | None = None
+    capability_broker_factory: Callable[[BackendRunRequest], CapabilityBroker | None] | None = None
     # Per-run outbox sender (drains staged outbound sends at the edge — see core/outbox.py). A
     # factory like capability_broker_factory; None (or a None return) leaves staged requests pending
     # (durable, never dispatched). The drain performs the actual IO; the core only stages.
-    outbox_sender_factory: Callable[[BackendRunRequest], Any] | None = None
+    outbox_sender_factory: Callable[[BackendRunRequest], OutboxSender | None] | None = None
     # An outbox request is redispatched (at-least-once + idempotency_key) at most this many times on
     # a retryable failure before it is dead-lettered as failed.
     outbox_max_attempts: int = 5
@@ -477,7 +477,6 @@ class RunnerBackend:
                 authorize_run=self._authorize_run,
                 record=self._record,
                 active_record=self._active_record,
-                read_proposal=self._read_proposal,
                 read_recover_attempts=self._read_recover_attempts,
                 run_root_provider=lambda: self.run_root,
                 checkpoint_store_provider=lambda: self.checkpoint_store,
@@ -491,7 +490,6 @@ class RunnerBackend:
             ProposalServiceContext(
                 authorize_run=self._authorize_run,
                 record=self._record,
-                read_proposal=self._read_proposal,
                 checkpoint_store_provider=lambda: self.checkpoint_store,
                 emit_backend_event=self._emit_backend_event,
                 allowed_apply_roots_provider=lambda: self.allowed_apply_roots,
@@ -527,8 +525,6 @@ class RunnerBackend:
                 lease_ttl_s_provider=lambda: self.lease_ttl_s,
                 is_record_tracked=self._is_live_run,
                 record=self._record,
-                attempt_resume=lambda run_dir, run_id: self._attempt_resume(run_dir, run_id),
-                resume_from_checkpoint=lambda stored, meta: self._resume_from_checkpoint(stored, meta),
                 make_request=self._recovery_request,
                 make_record=self._recovery_record,
                 issue_llm_gateway_token=self._issue_recovery_llm_gateway_token,
@@ -561,12 +557,6 @@ class RunnerBackend:
                 live_outbox_runs=self._live_outbox_runs,
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
                 record_terminal=lambda record: _record_terminal(record),
-                stage_outbox_ack=lambda record, request, status, receipt: self._stage_outbox_ack(
-                    record,
-                    request,
-                    status,
-                    receipt,
-                ),
             )
         )
 
@@ -631,18 +621,11 @@ class RunnerBackend:
                 authorize_claim_subject=self._authorize_claim_subject,
                 is_live_run=self._is_live_run,
                 active_loop_session=self._active_loop_session,
-                pause_run=self.pause_run,
-                signal_resume=self.signal_resume,
-                resume_run=self.resume_run,
-                cancel_run=self.cancel_run,
-                interrupt_turn=self.interrupt_turn,
-                report_task_result=self.report_task_result,
-                send_message=self.send_message,
-                create_task=self.create_task,
-                revoke_capability=self.revoke_capability,
-                status=self.status,
-                runtime_config=self.runtime_config,
-                replace_runtime_config=self.replace_runtime_config,
+                run_control=self._session_boundary,
+                task_messages=self._session_boundary,
+                capability_control=self._session_boundary,
+                projection=self._projection,
+                runtime_config=self._runtime_config,
             )
         )
 
@@ -1230,22 +1213,13 @@ class RunnerBackend:
         from_seq: int = 0,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """Stream a descendant (subagent) run's events, authorized via the ancestor's run token.
-
-        A spawned subagent is an isolated child run (id ``<parent>.sub.<task>``) under the same
-        run_root but with NO backend record/token, so :meth:`events` can't reach it. The owner of
-        an ancestor run reads a descendant's events.jsonl here — its tool calls + token deltas —
-        for live subagent observability, without touching the filesystem itself. Authorization is
-        the ancestor's token plus an id-prefix descendant check (a subagent id always extends its
-        parent's with ``.sub.<task>``, at any depth)."""
-        self._authorize_run(run_id, token)
-        try:
-            validate_descendant_run_id(run_id, descendant_run_id)
-        except ValueError as exc:
-            raise PermissionDenied(str(exc)) from exc
-        events_path = self.run_root / descendant_run_id / "events.jsonl"
-        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
-        return {"run_id": descendant_run_id, **page}
+        return self._projection.descendant_events(
+            run_id,
+            token,
+            descendant_run_id,
+            from_seq=from_seq,
+            limit=limit,
+        )
 
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:
         return self._jobs.jobs(run_id, token)
@@ -1658,10 +1632,4 @@ class RunnerBackend:
                 raise KeyError(f"unknown run: {run_id}") from exc
 
     def _read_proposal(self, record: BackendRunRecord) -> dict[str, Any] | None:
-        proposal_path = record.run_dir / "proposal.json"
-        if not proposal_path.exists():
-            return None
-        payload = json.loads(proposal_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("proposal snapshot must be a JSON object")
-        return payload
+        return read_proposal_snapshot(record)

@@ -17,6 +17,7 @@ from monoid_agent_kernel.core.packages import (
 from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.reference.backend.ports import RunRecordPort
+from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
 from monoid_agent_kernel.reference.backend.run_state import (
     record_lifecycle_payload as _record_lifecycle_payload,
 )
@@ -29,7 +30,6 @@ _ARTIFACT_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
 class ProposalServiceContext:
     authorize_run: Callable[[str, str], None]
     record: Callable[[str], RunRecordPort]
-    read_proposal: Callable[[RunRecordPort], dict[str, Any] | None]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     emit_backend_event: Callable[..., None]
     allowed_apply_roots_provider: Callable[[], tuple[Path, ...]]
@@ -44,7 +44,7 @@ class ProposalService:
     def proposal(self, run_id: str, token: str) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
-        payload = self._context.read_proposal(record)
+        payload = read_proposal_snapshot(record)
         if payload is None:
             return {
                 "run_id": record.run_id,
@@ -71,7 +71,7 @@ class ProposalService:
     def proposal_file(self, run_id: str, token: str, path: str) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
-        proposal = self._context.read_proposal(record)
+        proposal = read_proposal_snapshot(record)
         if proposal is None:
             raise ValueError("proposal snapshot is not ready")
         try:

@@ -18,9 +18,14 @@ from monoid_agent_kernel.core.lifecycle import (
     lifecycle_from_status_artifact,
     session_state_value,
 )
-from monoid_agent_kernel.core.subagent_runtime import subagent_diagnostics_from_events
+from monoid_agent_kernel.core.subagent_runtime import (
+    subagent_diagnostics_from_events,
+    validate_descendant_run_id,
+)
 from monoid_agent_kernel.core.trace_context import trace_id_of
+from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.reference.backend.ports import RunRecordPort
+from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
 from monoid_agent_kernel.reference.backend.run_state import (
     record_lifecycle_payload as _record_lifecycle_payload,
 )
@@ -79,7 +84,6 @@ class RunProjectionContext:
     authorize_run: Callable[[str, str], None]
     record: Callable[[str], RunRecordPort]
     active_record: Callable[[str], RunRecordPort | None]
-    read_proposal: Callable[[RunRecordPort], dict[str, Any] | None]
     read_recover_attempts: Callable[[Path], int]
     run_root_provider: Callable[[], Path]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
@@ -143,7 +147,7 @@ class RunProjectionService:
             }
         result = record.result
         diff_text = result.diff_path.read_text(encoding="utf-8") if result.diff_path.exists() else ""
-        proposal_payload = self._context.read_proposal(record)
+        proposal_payload = read_proposal_snapshot(record)
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
@@ -170,6 +174,24 @@ class RunProjectionService:
         events_path = self._context.authorized_run_dir(run_id, token) / "events.jsonl"
         page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
         return {"run_id": run_id, **page}
+
+    def descendant_events(
+        self,
+        run_id: str,
+        token: str,
+        descendant_run_id: str,
+        *,
+        from_seq: int = 0,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        self._context.authorize_run(run_id, token)
+        try:
+            validate_descendant_run_id(run_id, descendant_run_id)
+        except ValueError as exc:
+            raise PermissionDenied(str(exc)) from exc
+        events_path = self._context.run_root_provider() / descendant_run_id / "events.jsonl"
+        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
+        return {"run_id": descendant_run_id, **page}
 
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
         if event_limit < 1:

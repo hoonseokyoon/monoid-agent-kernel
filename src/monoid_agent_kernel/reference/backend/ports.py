@@ -7,6 +7,7 @@ from typing import Any, Protocol
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.outbox import OutboxSender
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 
 
@@ -21,13 +22,16 @@ class CancellationTokenPort(Protocol):
 
 
 class MessageQueuePort(Protocol):
-    _queue: Any
-
     def qsize(self) -> int: ...
 
     def put_nowait(self, item: Any) -> None: ...
 
     def get(self) -> Awaitable[Any]: ...
+
+
+def queued_message_snapshot(queue: MessageQueuePort) -> list[str | list[Any] | dict[str, Any]]:
+    raw_queue = getattr(queue, "_queue", ())
+    return [message for message in list(raw_queue) if isinstance(message, (str, list, dict))]
 
 
 class LoopPort(Protocol):
@@ -100,7 +104,7 @@ class RunExecutionLoopPort(LoopPort, Protocol):
 
 class LoopBuildPort(Protocol):
     loop: RunExecutionLoopPort
-    outbox_sender: Any
+    outbox_sender: OutboxSender | None
 
 
 class RunRecordPort(Protocol):
@@ -131,7 +135,7 @@ class MutableRunRecordPort(RunRecordPort, Protocol):
     loop: LoopPort | None
     cancellation_token: CancellationTokenPort
     seen_inbox_ids: set[str]
-    outbox_sender: Any
+    outbox_sender: OutboxSender | None
 
 
 class PreparedRunPort(Protocol):

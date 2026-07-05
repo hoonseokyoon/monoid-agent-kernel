@@ -10,7 +10,7 @@ from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.outbox import OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.trace_context import new_traceparent
-from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort
+from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort, queued_message_snapshot
 
 
 class OutboxLoopPort(Protocol):
@@ -47,7 +47,6 @@ class OutboxDispatchContext:
     live_outbox_runs: Callable[[], list[tuple[MutableRunRecordPort, OutboxLoopPort]]]
     call_soon: Callable[..., None]
     record_terminal: Callable[[MutableRunRecordPort], bool]
-    stage_outbox_ack: Callable[[MutableRunRecordPort, Any, str, OutboxReceipt], None]
 
 
 class OutboxDispatchService:
@@ -87,13 +86,11 @@ class OutboxDispatchService:
             )
             changed = True
             if request.expect_ack and status in {"dispatched", "failed"}:
-                self._context.stage_outbox_ack(record, request, status, receipt)
+                self.stage_outbox_ack(record, request, status, receipt)
         if changed:
             checkpoint = loop.snapshot()
             if checkpoint is not None:
-                checkpoint.queued_messages = [
-                    message for message in list(record.message_queue._queue) if isinstance(message, (str, list, dict))
-                ]
+                checkpoint.queued_messages = queued_message_snapshot(record.message_queue)
                 checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
                 self._context.checkpoint_store_provider().put(checkpoint, loop.collect_checkpoint_blobs())
 

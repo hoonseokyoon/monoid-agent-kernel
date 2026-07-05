@@ -9,6 +9,7 @@ from monoid_agent_kernel.core.agents import AgentDefinition, AgentRuntimeConfig
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.content import ContentPart
 from monoid_agent_kernel.core.lifecycle import SessionState, session_state_value
+from monoid_agent_kernel.core.outbox import OutboxSender
 from monoid_agent_kernel.core.result import AgentRunResult
 from monoid_agent_kernel.core.spec import RunMode, WorkspaceBackendKind
 from monoid_agent_kernel.loop import AgentLoop
@@ -124,4 +125,4 @@ class BackendRunRecord:
     # shared loop (dequeue), so no extra lock is needed.
     seen_inbox_ids: set[str] = field(default_factory=set, repr=False)
     # The run's outbox sender (drains staged sends), or None to leave staged requests pending.
-    outbox_sender: Any = field(default=None, repr=False)
+    outbox_sender: OutboxSender | None = field(default=None, repr=False)

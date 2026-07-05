@@ -7,8 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, RuntimeConfigProvider
+from monoid_agent_kernel.core.capability import CapabilityBroker
 from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
-from monoid_agent_kernel.core.events import AgentEvent
+from monoid_agent_kernel.core.context import ContextProvider
+from monoid_agent_kernel.core.events import AgentEvent, EventSink
+from monoid_agent_kernel.core.outbox import OutboxSender
+from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelAdapter
@@ -16,6 +20,7 @@ from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.reference._shared.tokens import TokenKind, TokenManager
 from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort, RunRequestPort
 from monoid_agent_kernel.reference.backend.run_state import BackendRunStateSink
+from monoid_agent_kernel.tools.base import ToolProvider
 from monoid_agent_kernel.web import WebGatewayClient
 
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
@@ -27,8 +32,8 @@ class BackendLoopBuild:
     model_adapter: ModelAdapter
     web_gateway_client: WebGatewayClient | None
     runtime_config_provider: RuntimeConfigProvider
-    capability_broker: Any
-    outbox_sender: Any
+    capability_broker: CapabilityBroker | None
+    outbox_sender: OutboxSender | None
     loop: AgentLoop
 
 
@@ -42,13 +47,13 @@ class BackendLoopFactoryContext:
     llm_gateway_token_ttl_s_provider: Callable[[], int]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     emit_output_deltas_provider: Callable[[], bool]
-    extra_event_sink_factories_provider: Callable[[], tuple[Any, ...]]
+    extra_event_sink_factories_provider: Callable[[], tuple[Callable[[], EventSink], ...]]
     subagent_definitions_provider: Callable[[], Mapping[str, Any] | None]
-    tool_providers_provider: Callable[[], tuple[Any, ...]]
-    context_providers_provider: Callable[[], tuple[Any, ...]]
-    output_validators_provider: Callable[[], tuple[Any, ...]]
-    capability_broker_factory_provider: Callable[[], Callable[[Any], Any] | None]
-    outbox_sender_factory_provider: Callable[[], Callable[[Any], Any] | None]
+    tool_providers_provider: Callable[[], tuple[ToolProvider, ...]]
+    context_providers_provider: Callable[[], tuple[ContextProvider, ...]]
+    output_validators_provider: Callable[[], tuple[OutputValidator, ...]]
+    capability_broker_factory_provider: Callable[[], Callable[[RunRequestPort], CapabilityBroker | None] | None]
+    outbox_sender_factory_provider: Callable[[], Callable[[RunRequestPort], OutboxSender | None] | None]
     current_runtime_config: Callable[[str], AgentRuntimeConfig | None]
     record: Callable[[str], MutableRunRecordPort]
     record_event: Callable[[str, AgentEvent], None]
@@ -195,13 +200,13 @@ class BackendLoopFactory:
             },
         )
 
-    def capability_broker_for(self, request: RunRequestPort) -> Any:
+    def capability_broker_for(self, request: RunRequestPort) -> CapabilityBroker | None:
         factory = self._context.capability_broker_factory_provider()
         if factory is None:
             return None
         return factory(request)
 
-    def outbox_sender_for(self, request: RunRequestPort) -> Any:
+    def outbox_sender_for(self, request: RunRequestPort) -> OutboxSender | None:
         factory = self._context.outbox_sender_factory_provider()
         if factory is None:
             return None

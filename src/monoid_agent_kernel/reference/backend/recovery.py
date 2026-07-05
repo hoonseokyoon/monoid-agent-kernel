@@ -37,8 +37,6 @@ class RecoveryContext:
     lease_ttl_s_provider: Callable[[], float]
     is_record_tracked: Callable[[str], bool]
     record: Callable[[str], MutableRunRecordPort]
-    attempt_resume: Callable[[Path, str], bool]
-    resume_from_checkpoint: Callable[[CheckpointRecord, dict[str, Any]], None]
     make_request: Callable[[Mapping[str, Any], AgentRuntimeConfig], RunRequestPort]
     make_record: Callable[
         [str, RunRequestPort, Path, str, str, AgentRuntimeConfig, Mapping[str, Any]],
@@ -78,7 +76,7 @@ class RecoveryService:
             stored = self._checkpoint_store().latest(run_id)
             if stored is None or stored.checkpoint.terminal:
                 continue
-            if self._context.attempt_resume(run_dir, run_id):
+            if self.attempt_resume(run_dir, run_id):
                 recovered.append(run_id)
         return recovered
 
@@ -99,7 +97,7 @@ class RecoveryService:
                 continue
             if not lease_store.try_claim(run_id, worker_id, lease_ttl_s):
                 continue
-            if self._context.attempt_resume(run_dir, run_id):
+            if self.attempt_resume(run_dir, run_id):
                 _LOGGER.info("watchdog: reclaimed orphaned run %s", run_id)
                 reclaimed.append(run_id)
             elif not (run_dir / "failure.json").exists():
@@ -114,7 +112,7 @@ class RecoveryService:
         if meta is None:
             return False
         try:
-            self._context.resume_from_checkpoint(stored, meta)
+            self.resume_from_checkpoint(stored, meta)
         except Exception as exc:
             attempts = self.bump_recover_attempts(run_dir)
             max_recover_attempts = self._context.max_recover_attempts_provider()
