@@ -9,7 +9,7 @@ from monoid_agent_kernel.core.agents import AgentRuntimeConfig, validate_runtime
 from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.durable_metadata import DurableMetadataCommitter, runtime_config_from_metadata
 from monoid_agent_kernel.reference.backend.ports import RunRecordPort
-from monoid_agent_kernel.reference.backend.projection import _record_terminal
+from monoid_agent_kernel.reference.backend.run_state import record_terminal as _record_terminal
 
 
 def runtime_config_from_meta(meta: Mapping[str, Any]) -> AgentRuntimeConfig:

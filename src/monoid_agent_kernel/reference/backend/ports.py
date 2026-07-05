@@ -35,6 +35,14 @@ class LoopPort(Protocol):
 
     def has_pending_tasks(self) -> bool: ...
 
+    def emit_external_event(
+        self,
+        event_type: str,
+        *,
+        data: dict[str, Any] | None = None,
+        level: str = "info",
+    ) -> bool: ...
+
     async def arun_until_suspended(self, user_input: Any | None = None) -> Suspension: ...
 
     def fail_recoverable(self, error: str, *, error_code: str) -> None: ...

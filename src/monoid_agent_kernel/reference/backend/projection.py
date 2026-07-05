@@ -15,15 +15,15 @@ from monoid_agent_kernel.core.event_sequencing import (
     read_event_page,
 )
 from monoid_agent_kernel.core.lifecycle import (
-    TERMINAL_STATES,
-    SessionState,
     lifecycle_from_status_artifact,
-    session_state_from_run_status,
     session_state_value,
 )
 from monoid_agent_kernel.core.subagent_runtime import subagent_diagnostics_from_events
 from monoid_agent_kernel.core.trace_context import trace_id_of
 from monoid_agent_kernel.reference.backend.ports import RunRecordPort
+from monoid_agent_kernel.reference.backend.run_state import (
+    record_lifecycle_payload as _record_lifecycle_payload,
+)
 
 _RUN_EVENT_SEQUENCER = RunEventSequencer()
 
@@ -60,28 +60,6 @@ def _json_safe(value: Any) -> Any:
         return json.loads(json.dumps(value, default=repr))
     except (TypeError, ValueError):
         return repr(value)
-
-
-def _set_record_state(
-    record: RunRecordPort,
-    state: SessionState | str,
-    *,
-    terminal: bool | None = None,
-) -> None:
-    session_state = session_state_from_run_status(state)
-    record.state = session_state
-    record.terminal = bool(terminal) if terminal is not None else session_state in TERMINAL_STATES
-
-
-def _record_terminal(record: RunRecordPort) -> bool:
-    return record.terminal or record.state in TERMINAL_STATES
-
-
-def _record_lifecycle_payload(record: RunRecordPort) -> dict[str, Any]:
-    return {
-        "state": session_state_value(record.state),
-        "terminal": _record_terminal(record),
-    }
 
 
 def _status_payload_lifecycle(

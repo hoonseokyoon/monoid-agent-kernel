@@ -15,6 +15,7 @@ uses instead of depending on the whole facade.
 | --- | --- |
 | `RunProjectionService` | Read-only projections: `status`, `result`, `events`, `diagnostics`, `list_runs`. |
 | `RunPreparationService` | Request validation, workspace admission, initial runtime config validation, run token issuance, record creation, initial run metadata materialization, and submission payload assembly. |
+| `RunStateMutationService` | Live run state mutation, backend/control event append decisions, terminal result/failure recording, and process-local tenant usage aggregation. |
 | `BackendCommandService` | Control command dispatch and audit result mapping. |
 | `BackendSessionService` | Session control actions, task callbacks, inbound messages, and `resume_run` entrypoint. |
 | `SessionDriveService` | Open multi-turn session driving, message waits, checkpoint park points. |
@@ -44,8 +45,7 @@ run records, run requests, loop operations, token claims, and lease stores.
 | Run execution wiring | `submit_run`, `_run_run`, `_drive_session`, `astream_run`, and `_frame` stay as facade compatibility and public API wrappers around `RunExecutionService`. |
 | Streaming public API | `astream_run` remains the embedder-facing stream seam; stream frame construction and run driving delegate to `RunExecutionService`. |
 | Outbox dispatch wiring | `_build_outbox_dispatch_service`, `_drain_outbox`, `_stage_outbox_ack`, `_outbox_backoff_delay`, and `_redrive_outbox` stay as facade compatibility and composition-root wrappers around `OutboxDispatchService`. |
-| Event sink integration | `BackendRunStateSink`, `record_event`, `_emit_backend_event`, and run state mutation keep live record state aligned with recorded events. |
-| Usage accounting | `tenant_usage` and terminal result metric aggregation remain on the backend-owned in-memory usage ledger. |
+| Event/state wiring | `record_event`, `_emit_backend_event`, `_record_run_result`, `_record_run_failure`, and `tenant_usage` stay as facade compatibility and public API wrappers around `RunStateMutationService`. |
 | Watchdog heartbeat | `start_watchdog`, `stop_watchdog`, `_watchdog_loop`, and `_heartbeat_own_runs` stay with process ownership. Stale reclaim delegates to `RecoveryService`; outbox redrive delegates to `OutboxDispatchService`. |
 | Shared auth/record ports | `_authorize_run`, `_verify_run_token`, `_authorized_run_dir`, `_record`, `_active_record`, and token issuance helpers are backend-owned ports shared by services. |
 | Recovery factories | Recovery request/record reconstruction and gateway-token reissue factories stay in the composition root; `RecoveryService` drives the recovery flow through those ports. |
@@ -57,6 +57,7 @@ The main Reference product-specific surfaces have been moved out of the facade:
 | Extracted service | Former backend surface |
 | --- | --- |
 | `RunPreparationService` | `_prepare_run_record`, `_submission_for`, `_validate_request`, `_check_workspace_allowed`, `_write_run_meta`. |
+| `RunStateMutationService` | `record_event`, `_emit_backend_event`, `_record_run_result`, `_record_run_failure`, `tenant_usage`, lifecycle helper interpretation, `BackendRunStateSink`. |
 | `ProposalService` | `proposal`, `proposal_diff`, `proposal_file`, `export_proposal_package`, `read_run_artifact`, `approve_proposal`, `reject_proposal`, `apply_proposal`. |
 | `RuntimeConfigService` | `current_runtime_config`, `runtime_config`, `replace_runtime_config`, `_write_runtime_config_run_meta`. |
 | `JobService` | `jobs`, `job_status`, `job_logs`, `cancel_job`. |
@@ -74,7 +75,6 @@ sites use private methods. The implementation now delegates through services.
 | --- | --- |
 | Service port typing | Private ports now cover the main internal shapes. Remaining `Any` usage is concentrated in dynamic JSON/tool/provider payloads and test-facing monkeypatch seams. |
 | Composition root size | Service context wiring now lives in `_build_*_service` helpers. Future cleanup should keep each helper small rather than adding wiring back to `__post_init__`. |
-| Event sink/state mutation | `record_event`, `_record_run_result`, `_record_run_failure`, and backend event append remain coherent as live-state ownership. They can be revisited after service port typing is stable. |
 | Streaming transport adapters | HTTP SSE and Studio consumers still sit outside the backend service split. Future cleanup should keep them transport-owned. |
 
 ## Design Position

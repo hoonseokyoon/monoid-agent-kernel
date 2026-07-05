@@ -14,8 +14,8 @@ from monoid_agent_kernel.core.media import normalize_inline_media_dicts
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.reference._shared.tokens import TokenError
 from monoid_agent_kernel.reference.backend.ports import LoopPort, MutableRunRecordPort, TokenClaimsPort
-from monoid_agent_kernel.reference.backend.projection import (
-    _record_lifecycle_payload,
+from monoid_agent_kernel.reference.backend.run_state import (
+    record_lifecycle_payload as _record_lifecycle_payload,
 )
 
 

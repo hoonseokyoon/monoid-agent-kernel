@@ -135,6 +135,157 @@ def test_task_resume_events_promote_awaiting_tasks_to_running(
     record.terminal = True
 
 
+def test_run_finished_event_defers_terminal_until_result_is_recorded(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_finish_deferred"
+    run_dir = tmp_path / "runs" / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=1,
+            event_type="run.finished",
+            data={"error": "", "error_code": ""},
+        ),
+    )
+
+    assert record.finished_at is not None
+    assert record.terminal is False
+    assert record.result is None
+    assert backend.tenant_usage("tenant_a")["runs"] == 0
+
+    result = AgentRunResult(
+        run_id=run_id,
+        status="completed",
+        final_text="done",
+        run_dir=run_dir,
+        diff_path=run_dir / "diff.patch",
+        proposal_path=run_dir / "proposal.json",
+        metrics={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+    )
+    backend._record_run_result(run_id, result)
+
+    assert record.result is result
+    assert record.state is SessionState.COMPLETED
+    assert record.terminal is True
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 5
+
+
+def test_record_run_failure_writes_bundle_before_terminal_flip(
+    tmp_path: Path,
+    backend_factory: Any,
+    monkeypatch: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_order"
+    run_dir = tmp_path / "runs" / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    def _raise_before_terminal(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RuntimeError("bundle write failed")
+
+    monkeypatch.setattr(backend, "_write_failure_bundle", _raise_before_terminal)
+
+    with pytest.raises(RuntimeError, match="bundle write failed"):
+        backend._record_run_failure(run_id, RuntimeError("worker boom"))
+
+    assert record.state is SessionState.RUNNING
+    assert record.terminal is False
+    assert record.error == ""
+    assert not (run_dir / "failure.json").exists()
+    with backend._lock:
+        backend._records.pop(run_id, None)
+
+
+def test_usage_comes_from_terminal_result_not_metric_events(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_usage_terminal"
+    run_dir = tmp_path / "runs" / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=1,
+            event_type="metrics.updated",
+            data={"metrics": {"total_tokens": 999}},
+        ),
+    )
+    assert backend.tenant_usage("tenant_a")["total_tokens"] == 0
+
+    backend._record_run_result(
+        run_id,
+        AgentRunResult(
+            run_id=run_id,
+            status="limited",
+            final_text="",
+            run_dir=run_dir,
+            diff_path=run_dir / "diff.patch",
+            proposal_path=run_dir / "proposal.json",
+            metrics={"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
+            error="limited",
+            error_code="cancelled",
+        ),
+    )
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 10
+
+
+def test_tenant_usage_is_process_local_after_backend_restart(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend1 = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        turns=[ModelTurn(response_id="r1", final_text="done", usage={"total_tokens": 7})],
+    )
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="finish",
+            runtime_config=_config(),
+        )
+    )
+    assert backend1.wait_for_run(submission.run_id, timeout_s=20) is SessionState.COMPLETED
+    assert backend1.tenant_usage("tenant_a")["runs"] == 1
+
+    backend2 = backend_factory.create(run_root=run_root, workspace=workspace, turns=[])
+
+    assert backend2.tenant_usage("tenant_a")["runs"] == 0
+    assert backend2.tenant_usage("tenant_a")["total_tokens"] == 0
+
+
 def test_limited_suspension_marks_record_terminal_before_close(
     tmp_path: Path,
     backend_factory: Any,

@@ -14,7 +14,7 @@ from monoid_agent_kernel.core.lifecycle import state_from_suspension
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
 from monoid_agent_kernel.reference.backend.ports import LoopPort, MutableRunRecordPort, RunRequestPort
-from monoid_agent_kernel.reference.backend.projection import _set_record_state
+from monoid_agent_kernel.reference.backend.run_state import set_record_state as _set_record_state
 
 
 @dataclass(frozen=True)

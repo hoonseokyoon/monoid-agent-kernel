@@ -28,7 +28,6 @@ from monoid_agent_kernel.core.durable_metadata import (
     validate_run_metadata,
 )
 from monoid_agent_kernel.core.event_sequencing import (
-    DIRECT_AUDIT_APPEND_STATUSES,
     RunEventSequencer,
 )
 from monoid_agent_kernel.core.subagent_runtime import (
@@ -38,7 +37,6 @@ from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.outbox import OutboxReceipt
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
-    session_state_from_run_status,
 )
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
@@ -83,9 +81,7 @@ from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
     _json_safe as _json_safe,
-    _record_terminal,
     _read_event_page,
-    _set_record_state,
 )
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
 from monoid_agent_kernel.reference.backend.recovery import RecoveryContext, RecoveryService
@@ -99,6 +95,11 @@ from monoid_agent_kernel.reference.backend.run_preparation import (
     RunPreparationContext,
     RunPreparationService,
     runtime_config_uses_web as _runtime_config_uses_web,
+)
+from monoid_agent_kernel.reference.backend.run_state import (
+    RunStateMutationContext,
+    RunStateMutationService,
+    record_terminal as _record_terminal,
 )
 from monoid_agent_kernel.reference.backend.run_types import (
     BackendRunRecord,
@@ -142,61 +143,6 @@ def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
 
 def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
     return validate_run_metadata(payload)
-
-
-_DIRECT_AUDIT_APPEND_STATUSES = DIRECT_AUDIT_APPEND_STATUSES
-
-
-def _run_dir_allows_direct_audit_append(run_dir: Path) -> bool:
-    return _RUN_EVENT_SEQUENCER.run_dir_allows_direct_append(run_dir)
-
-
-@dataclass
-class TenantUsage:
-    tenant_id: str
-    runs: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    web_search_calls: int = 0
-    web_fetch_calls: int = 0
-    web_context_calls: int = 0
-    web_failed_calls: int = 0
-    web_result_count: int = 0
-    web_bytes_returned: int = 0
-    web_context_source_count: int = 0
-    web_context_bytes_returned: int = 0
-
-    def add_metrics(self, metrics: dict[str, Any]) -> None:
-        self.runs += 1
-        self.input_tokens += int(metrics.get("input_tokens") or 0)
-        self.output_tokens += int(metrics.get("output_tokens") or 0)
-        self.total_tokens += int(metrics.get("total_tokens") or 0)
-        self.web_search_calls += int(metrics.get("web_search_calls") or 0)
-        self.web_fetch_calls += int(metrics.get("web_fetch_calls") or 0)
-        self.web_context_calls += int(metrics.get("web_context_calls") or 0)
-        self.web_failed_calls += int(metrics.get("web_failed_calls") or 0)
-        self.web_result_count += int(metrics.get("web_result_count") or 0)
-        self.web_bytes_returned += int(metrics.get("web_bytes_returned") or 0)
-        self.web_context_source_count += int(metrics.get("web_context_source_count") or 0)
-        self.web_context_bytes_returned += int(metrics.get("web_context_bytes_returned") or 0)
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "tenant_id": self.tenant_id,
-            "runs": self.runs,
-            "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens,
-            "total_tokens": self.total_tokens,
-            "web_search_calls": self.web_search_calls,
-            "web_fetch_calls": self.web_fetch_calls,
-            "web_context_calls": self.web_context_calls,
-            "web_failed_calls": self.web_failed_calls,
-            "web_result_count": self.web_result_count,
-            "web_bytes_returned": self.web_bytes_returned,
-            "web_context_source_count": self.web_context_source_count,
-            "web_context_bytes_returned": self.web_context_bytes_returned,
-        }
 
 
 def _backend_builtin_tool_specs(
@@ -404,7 +350,6 @@ class RunnerBackend:
     # on another process/host reclaim a crashed peer's run.
     lease_store: LeaseStore | None = None
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
-    _usage: dict[str, TenantUsage] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _worker_id: str = field(default="", init=False, repr=False)
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -420,6 +365,7 @@ class RunnerBackend:
     _jobs: JobService = field(init=False, repr=False)
     _recovery: RecoveryService = field(init=False, repr=False)
     _run_preparation: RunPreparationService = field(init=False, repr=False)
+    _run_state: RunStateMutationService = field(init=False, repr=False)
     _outbox_dispatch: OutboxDispatchService = field(init=False, repr=False)
     _run_execution: RunExecutionService = field(init=False, repr=False)
     _session_boundary: BackendSessionService = field(init=False, repr=False)
@@ -444,6 +390,7 @@ class RunnerBackend:
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
         self._run_preparation = self._build_run_preparation_service()
+        self._run_state = self._build_run_state_mutation_service()
         self._loop_factory = self._build_loop_factory()
         self._projection = self._build_projection_service()
         self._proposal = self._build_proposal_service()
@@ -476,6 +423,25 @@ class RunnerBackend:
                 checkpoint_store_provider=self._checkpoint_store,
                 register_record=self._register_record,
                 now=time.time,
+            )
+        )
+
+    def _build_run_state_mutation_service(self) -> RunStateMutationService:
+        return RunStateMutationService(
+            RunStateMutationContext(
+                with_record_lock=self._with_record_lock,
+                active_record=self._active_record,
+                record=self._record,
+                run_root_provider=lambda: self.run_root,
+                now=time.time,
+                write_failure_bundle=lambda run_id, run_dir, **kwargs: self._write_failure_bundle(
+                    run_id,
+                    run_dir,
+                    **kwargs,
+                ),
+                append_event=append_event_to_run,
+                event_sequencer=_RUN_EVENT_SEQUENCER,
+                logger=_LOGGER,
             )
         )
 
@@ -1065,30 +1031,7 @@ class RunnerBackend:
         *,
         level: str = "info",
     ) -> None:
-        if any(sep in run_id for sep in ("/", "\\")) or ".." in run_id:
-            return
-        with self._lock:
-            record = self._records.get(run_id)
-            loop = record.loop if record is not None else None
-            run_dir = record.run_dir if record is not None else self.run_root / run_id
-        direct_append_allowed = False
-        if record is not None:
-            if loop is not None and loop.emit_external_event(event_type, data=data, level=level):
-                return
-            direct_append_allowed = _RUN_EVENT_SEQUENCER.is_queued_before_recorder(record.state)
-            if not direct_append_allowed and _RUN_EVENT_SEQUENCER.requires_live_sequence_owner(
-                record.state,
-                terminal=record.terminal,
-            ):
-                return
-        if not run_dir.exists():
-            return
-        if not direct_append_allowed and not _run_dir_allows_direct_audit_append(run_dir):
-            return
-        try:
-            append_event_to_run(run_dir, event_type, data=data, level=level)
-        except OSError:
-            _LOGGER.debug("backend event write skipped", exc_info=True)
+        self._run_state.emit_backend_event(run_id, event_type, data, level=level)
 
     def _authorize_control_audit_target(
         self,
@@ -1333,42 +1276,10 @@ class RunnerBackend:
         return self._jobs.cancel_job(run_id, token, job_id)
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
-        with self._lock:
-            usage = self._usage.get(tenant_id) or TenantUsage(tenant_id)
-            return usage.to_json()
+        return self._run_state.tenant_usage(tenant_id)
 
     def record_event(self, run_id: str, event: AgentEvent) -> None:
-        with self._lock:
-            record = self._records.get(run_id)
-            if record is None:
-                return
-            record.last_event_seq = event.seq
-            record.last_event_type = event.type
-            if event.type == "run.started":
-                _set_record_state(record, SessionState.RUNNING, terminal=False)
-                record.started_at = time.time()
-            elif event.type == "run.awaiting_input":
-                # Parked waiting for the next user message or a hosted-task result.
-                if not _record_terminal(record):
-                    _set_record_state(record, SessionState.AWAITING_INPUT, terminal=False)
-            elif event.type in {"run.resumed", "model.turn.started"}:
-                if record.state in {SessionState.AWAITING_INPUT, SessionState.AWAITING_TASKS}:
-                    _set_record_state(record, SessionState.RUNNING, terminal=False)
-            elif event.type == "run.finished":
-                # Record terminal metadata, but DO NOT flip the gating status here. The
-                # run.finished event fires inside loop.close() (on the loop's thread), while
-                # record.result is only set afterward by _record_run_result on the worker
-                # thread. Marking the run terminal here would let wait_for_run/result() observe
-                # terminal lifecycle before the result is recorded (result() would KeyError on
-                # final_text). _record_run_result owns terminal lifecycle so it flips together
-                # with record.result, under the same lock.
-                record.finished_at = time.time()
-                record.error = str(event.data.get("error") or "")
-                record.error_code = str(event.data.get("error_code") or "")
-            elif event.type == "run.failed":
-                _set_record_state(record, SessionState.FAILED, terminal=True)
-                record.error = str(event.data.get("error") or "")
-                record.error_code = str(event.data.get("error_code") or "")
+        self._run_state.record_event(run_id, event)
 
     def wait_for_run(self, run_id: str, *, timeout_s: float = 10.0) -> SessionState:
         deadline = time.time() + timeout_s
@@ -1527,43 +1438,10 @@ class RunnerBackend:
         return stream_item_frame(item)
 
     def _record_run_result(self, run_id: str, result: AgentRunResult) -> None:
-        with self._lock:
-            record = self._records[run_id]
-            record.result = result
-            _set_record_state(
-                record,
-                session_state_from_run_status(result.status, error_code=result.error_code, terminal=True),
-                terminal=True,
-            )
-            record.error = result.error
-            record.error_code = result.error_code
-            record.finished_at = time.time()
-            self._usage.setdefault(record.tenant_id, TenantUsage(record.tenant_id)).add_metrics(
-                result.metrics
-            )
+        self._run_state.record_run_result(run_id, result)
 
     def _record_run_failure(self, run_id: str, exc: Exception) -> None:
-        # Durable failure mark FIRST — before the in-memory lifecycle flips to terminal
-        # value. A worker-level crash that bypassed the loop's own bundle would otherwise
-        # leave no failure.json, and the restart scanner would treat the run as merely
-        # parked and resume it into a crash loop. Writing the bundle before the terminal
-        # state also closes the race where an observer sees ``failed`` but no bundle yet.
-        # ``overwrite=False`` preserves the loop's richer bundle when it already wrote one.
-        # There is still no auto-recovery: the bundle is purely an operator restore aid.
-        self._write_failure_bundle(
-            run_id,
-            self.run_root / run_id,
-            error=str(exc),
-            error_code=getattr(exc, "error_code", "internal_error"),
-            exc_type=type(exc).__name__,
-            overwrite=False,
-        )
-        with self._lock:
-            record = self._records[run_id]
-            _set_record_state(record, SessionState.FAILED, terminal=True)
-            record.error = str(exc)
-            record.error_code = getattr(exc, "error_code", "internal_error")
-            record.finished_at = time.time()
+        self._run_state.record_run_failure(run_id, exc)
 
     def _write_failure_bundle(
         self,

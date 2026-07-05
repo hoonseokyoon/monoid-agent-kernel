@@ -15,6 +15,7 @@ from monoid_agent_kernel.providers.base import ModelAdapter
 from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.reference._shared.tokens import TokenKind, TokenManager
 from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort, RunRequestPort
+from monoid_agent_kernel.reference.backend.run_state import BackendRunStateSink
 from monoid_agent_kernel.web import WebGatewayClient
 
 ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
@@ -52,18 +53,6 @@ class BackendLoopFactoryContext:
     record: Callable[[str], MutableRunRecordPort]
     record_event: Callable[[str, AgentEvent], None]
     persist_checkpoint_payload: Callable[[MutableRunRecordPort, RunCheckpoint, Mapping[str, bytes]], None]
-
-
-class BackendRunStateSink:
-    def __init__(self, emit_event: Callable[[str, AgentEvent], None], run_id: str) -> None:
-        self._emit_event = emit_event
-        self._run_id = run_id
-
-    def emit(self, event: AgentEvent) -> None:
-        self._emit_event(self._run_id, event)
-
-    def close(self) -> None:
-        return None
 
 
 class BackendRuntimeConfigProvider(RuntimeConfigProvider):
