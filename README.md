@@ -20,18 +20,19 @@ replaceable contracts.
 ## See it run
 
 The bundled **Agent Studio** reference app (`monoid studio serve`) drives the kernel
-through its Python API behind a single-page UI.
+through its Python API behind a single-page UI. A profile chooses the model, reasoning
+level, prompt instructions, and tool surface; each profile keeps its own chat history.
 
-![Agent Studio: an agent reasons, runs Python, and produces a result in the workspace](docs/img/hero.png)
+![Agent Studio: a Visual Analyst profile reads sales data, writes insights, and generates an annotated revenue chart](docs/img/studio-v016-main.png)
 
-*A real agent — it plans, writes and runs code in a workspace, and reports back; every step is
-observable, and generated output (here, a plot) previews inline.*
+*A real Studio run: the agent reads `sales.csv`, writes `INSIGHTS.md`, generates an
+annotated `revenue_trend.svg`, and previews the artifact directly in the workspace panel.*
 
-![Two agents collaborating over the durable outbox→inbox fabric](docs/img/a2a.png)
+![Agent Studio profile builder showing the exact system prompt and tool schema preview](docs/img/studio-v016-profile-builder.png)
 
-*Two independently-configured agent profiles, running on one kernel, collaborate by passing
-messages over a durable, capability-gated **outbox→inbox** fabric — the capability and outbox
-events are visible in the trace on the right.*
+*The profile editor shows the exact first-turn model request boundary: system prompt,
+tool schemas, model settings, and preview notes. Users can edit the profile on the left
+and see what the model will receive on the right.*
 
 ## Architecture: Contract / Conformance Test / Core Helper Kit / Reference
 

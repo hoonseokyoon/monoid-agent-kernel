@@ -19,6 +19,8 @@ out in commit messages and here.
 - Phase 4-3 test/CI readiness: backend tests now have a managed factory seam for
   spawned future cleanup, Studio shutdown joins owned server threads, and CI runs
   xdist plus coverage as advisory checks.
+- README screenshots now show the v0.16 Studio profile workflow, including a
+  data-analysis run and the exact model request preview in the profile editor.
 - `AudioPart` and `VideoPart` are now exported from the contract surface to match
   the core content contract.
 
