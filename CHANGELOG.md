@@ -7,6 +7,16 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-07-05
+
+### Fixed
+- Updated the README quickstart so the snippet works with the current `AgentRunSpec`
+  API by supplying `Path`-based `workspace_root` and `run_root` values.
+- Switched README Studio screenshots to GitHub raw image URLs so the PyPI long
+  description can render them.
+- Ignored local Studio/log artifacts to keep source distributions clean when built
+  from a working checkout.
+
 ## [0.16.0] - 2026-07-05
 
 ### Changed
