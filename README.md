@@ -23,12 +23,12 @@ The bundled **Agent Studio** reference app (`monoid studio serve`) drives the ke
 through its Python API behind a single-page UI. A profile chooses the model, reasoning
 level, prompt instructions, and tool surface; each profile keeps its own chat history.
 
-![Agent Studio: a Visual Analyst profile reads sales data, writes insights, and generates an annotated revenue chart](docs/img/studio-v016-main.png)
+![Agent Studio: a Visual Analyst profile reads sales data, writes insights, and generates an annotated revenue chart](https://raw.githubusercontent.com/hoonseokyoon/monoid-agent-kernel/main/docs/img/studio-v016-main.png)
 
 *A real Studio run: the agent reads `sales.csv`, writes `INSIGHTS.md`, generates an
 annotated `revenue_trend.svg`, and previews the artifact directly in the workspace panel.*
 
-![Agent Studio profile builder showing the exact system prompt and tool schema preview](docs/img/studio-v016-profile-builder.png)
+![Agent Studio profile builder showing the exact system prompt and tool schema preview](https://raw.githubusercontent.com/hoonseokyoon/monoid-agent-kernel/main/docs/img/studio-v016-profile-builder.png)
 
 *The profile editor shows the exact first-turn model request boundary: system prompt,
 tool schemas, model settings, and preview notes. Users can edit the profile on the left
@@ -79,18 +79,45 @@ config — and `from_config` wires them in one call. `FakeModelAdapter` (a scrip
 makes the first turn run offline, with no gateway or API key:
 
 ```python
+from pathlib import Path
+
 from monoid_agent_kernel import AgentLoop, AgentRunSpec, AgentRuntimeConfig, RegistryToolRef, ToolBinding
 from monoid_agent_kernel.providers.base import ModelTurn
-from monoid_agent_kernel.providers.fake import FakeModelAdapter
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
-spec = AgentRunSpec(workspace_root="./workspace", mode="apply")
+workspace = Path("workspace")
+run_root = Path("runs")
+workspace.mkdir(exist_ok=True)
+run_root.mkdir(exist_ok=True)
+(workspace / "notes.md").write_text("alpha\nbeta\n", encoding="utf-8")
+
+spec = AgentRunSpec(workspace_root=workspace, run_root=run_root, mode="apply")
 config = AgentRuntimeConfig(
     definition_id="quickstart",
-    tools=(ToolBinding(binding_id="fs.write", ref=RegistryToolRef("fs.write")),),
+    tools=(
+        ToolBinding(binding_id="fs.read", ref=RegistryToolRef("fs.read")),
+        ToolBinding(binding_id="fs.write", ref=RegistryToolRef("fs.write")),
+    ),
 )
-adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+adapter = FakeModelAdapter(
+    turns=[
+        ModelTurn(tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "read1"),)),
+        ModelTurn(
+            tool_calls=(
+                fake_tool_call(
+                    "fs_write",
+                    {"path": "SUMMARY.md", "content": "alpha and beta\n"},
+                    "write1",
+                ),
+            )
+        ),
+        ModelTurn(final_text="Wrote SUMMARY.md."),
+    ]
+)
 
 result = AgentLoop.from_config(spec, adapter, config).run_once("Summarize notes.md")
+print(result.final_text)
+print((workspace / "SUMMARY.md").read_text(encoding="utf-8"))
 ```
 
 `from_config`'s `runtime_config` accepts a bare `AgentRuntimeConfig`, a
