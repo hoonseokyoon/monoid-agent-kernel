@@ -7,6 +7,8 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-05
+
 ### Changed
 - Phase 4-1 public-surface cleanup: `monoid_agent_kernel.contracts` and the
   top-level `monoid_agent_kernel` package now export only the contract surface.
