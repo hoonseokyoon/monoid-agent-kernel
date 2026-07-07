@@ -234,7 +234,16 @@ def test_studio_settings_hot_swap_preserves_run_profiles(tmp_path: Path) -> None
         assert profile_config.model is not None
         assert profile_config.model.model == "gpt-profile"
         assert "PROFILE_SENTINEL" in profile_config.prompt.system_prompt_base
-        assert {binding.ref.tool_id for binding in profile_config.tools} == {"run.update_plan", "fs.read"}
+        assert {binding.ref.tool_id for binding in profile_config.tools} == {
+            "fs.glob",
+            "fs.list",
+            "fs.read",
+            "fs.read_media",
+            "fs.stat",
+            "fs.tree",
+            "run.update_plan",
+            "text.search",
+        }
         assert default_config.model is not None
         assert default_config.model.model == "gpt-global"
         assert "fs.write" in {binding.ref.tool_id for binding in default_config.tools}

@@ -107,6 +107,7 @@ from monoid_agent_kernel.errors import (
     ToolExecutionError,
     TurnInterrupted,
     TurnPaused,
+    WorkspaceError,
     error_code_for_exception,
 )
 from monoid_agent_kernel.identifiers import namespaced_id

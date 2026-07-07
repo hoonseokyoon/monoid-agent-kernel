@@ -23,9 +23,6 @@ from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.memory import (
     MEMORY_CREATE_TOOL_ID,
-    MEMORY_DELETE_TOOL_ID,
-    MEMORY_INSERT_TOOL_ID,
-    MEMORY_RENAME_TOOL_ID,
     MEMORY_SEARCH_TOOL_ID,
     MEMORY_STR_REPLACE_TOOL_ID,
     MEMORY_TOOL_IDS,
