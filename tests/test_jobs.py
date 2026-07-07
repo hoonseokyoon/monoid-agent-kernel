@@ -166,6 +166,24 @@ def test_hosted_task_cancel_marks_ready_for_reentry(tmp_path: Path) -> None:
     assert any(event.type == "task.cancelled" and event.data["task_id"] == task.job_id for event in sink.events)
 
 
+def test_mark_ready_is_idempotent_for_cancelled_task(tmp_path: Path) -> None:
+    manager, _recorder, sink = _manager(tmp_path)
+    task = manager.start_task("hitl", {"prompt": "Approve?", "resume_on_exit": True})
+    manager.cancel(task.job_id)
+
+    manager.mark_ready(task)
+
+    observations = manager.pop_reentry_observations()
+    assert [obs.output["task_id"] for obs in observations] == [task.job_id]
+    assert manager.pop_reentry_observations() == []
+    cancelled_events = [
+        event
+        for event in sink.events
+        if event.type == "task.cancelled" and event.data["task_id"] == task.job_id
+    ]
+    assert len(cancelled_events) == 1
+
+
 def test_non_resume_job_is_not_offered_for_reentry(tmp_path: Path) -> None:
     manager, _recorder, _sink = _manager(tmp_path)
     job = _start(manager, _python_command("print('quiet')"), resume_on_exit=False)

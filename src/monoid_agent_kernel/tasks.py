@@ -1049,8 +1049,10 @@ class TaskManager:
 
         Called by the in-process shell monitor and (for hosted kinds) by an
         external reporter that has already set ``status``/``result``/``finished_at``."""
-        job.ready_for_reentry = True
         with self._condition:
+            if job.ready_for_reentry:
+                return
+            job.ready_for_reentry = True
             self._write_job(job)
             self._emit_terminal_event(job)
             if job.resume_on_exit:
