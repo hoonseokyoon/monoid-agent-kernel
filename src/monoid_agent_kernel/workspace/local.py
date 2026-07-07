@@ -795,6 +795,9 @@ class LocalWorkspaceBackend:
         max_entries: int,
         max_bytes: int,
     ) -> _TreeSnapshot:
+        raw_rel = self.normalize(path)
+        if raw_rel != "." and self._effective_kind(raw_rel, self.root / raw_rel) == "symlink":
+            raise WorkspaceError(f"symlink file operations are not supported: {raw_rel}")
         rel, abs_path = self.resolve_existing_or_parent(path)
         if rel == ".":
             raise WorkspaceError("workspace root is not a valid file operation target")

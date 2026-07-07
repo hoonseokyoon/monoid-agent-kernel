@@ -930,6 +930,7 @@ def _normalize_memory_path(path: str) -> str:
 
 def _resolve_candidate(root: Path, candidate: Path) -> Path:
     root_resolved = root.resolve()
+    _reject_symlink_path(root_resolved, candidate)
     if candidate.exists():
         resolved = candidate.resolve()
         if not _is_within(root_resolved, resolved):
@@ -951,6 +952,20 @@ def _resolve_candidate(root: Path, candidate: Path) -> Path:
     if not _is_within(root_resolved, resolved):
         raise MemoryToolError("memory path escapes its mount", code="memory_path_escape", retryable=True)
     return resolved
+
+
+def _reject_symlink_path(root: Path, candidate: Path) -> None:
+    probe = candidate
+    while True:
+        if probe.is_symlink():
+            raise MemoryToolError(
+                "memory symlinks are not supported",
+                code="memory_symlink_unsupported",
+                retryable=True,
+            )
+        if probe == root or probe.parent == probe:
+            return
+        probe = probe.parent
 
 
 def _is_within(root: Path, candidate: Path) -> bool:

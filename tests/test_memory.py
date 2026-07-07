@@ -112,7 +112,17 @@ def test_local_memory_store_rejects_traversal_binary_and_symlink_escape(tmp_path
         pytest.skip("symlink creation is not available in this environment")
     with pytest.raises(MemoryToolError) as escape:
         store.view("/memories/escape")
-    assert escape.value.code == "memory_path_escape"
+    assert escape.value.code == "memory_symlink_unsupported"
+
+    target = tmp_path / "memory" / "target.md"
+    target.write_text("safe\n", encoding="utf-8")
+    link = tmp_path / "memory" / "target-link.md"
+    os.symlink(target, link)
+    with pytest.raises(MemoryToolError) as symlink:
+        store.delete("/memories/target-link.md")
+    assert symlink.value.code == "memory_symlink_unsupported"
+    assert target.exists()
+    assert link.is_symlink()
 
 
 def test_local_memory_store_supports_multiple_mounts(tmp_path: Path) -> None:

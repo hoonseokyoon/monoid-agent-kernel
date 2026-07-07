@@ -178,6 +178,26 @@ def test_directory_replace_mode_and_symlink_safety(tmp_path: Path) -> None:
     entries = registry.resolve("fs.list").handler(context, {"path": "source", "recursive": True})
     assert any(entry["path"] == "source/link.txt" and entry["kind"] == "symlink" for entry in entries.content["entries"])
 
+    top_target = tmp_path / "top-target.txt"
+    top_target.write_text("inside\n", encoding="utf-8")
+    top_link = tmp_path / "top-link.txt"
+    os.symlink(top_target, top_link)
+
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        registry.resolve("fs.copy").handler(
+            context,
+            {"source_path": "top-link.txt", "destination_path": "top-copy.txt"},
+        )
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        registry.resolve("fs.move").handler(
+            context,
+            {"source_path": "top-link.txt", "destination_path": "top-moved.txt"},
+        )
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        registry.resolve("fs.delete").handler(context, {"path": "top-link.txt"})
+    assert top_target.exists()
+    assert top_link.is_symlink()
+
     with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
         registry.resolve("fs.copy").handler(
             context,
