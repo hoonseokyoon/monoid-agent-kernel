@@ -2314,10 +2314,11 @@ class AgentLoop:
                 turn_id=turn_id,
                 parent_id=turn_started.event_id,
             )
+            pending_binding_loads = state.pending_binding_loads
             surface_snapshot = self.tool_surface_resolver.resolve(
                 bound_catalog=bound_catalog,
                 turn=turn_context,
-                pending_binding_loads=state.pending_binding_loads,
+                pending_binding_loads=pending_binding_loads,
                 previous_snapshot=state.previous_surface_snapshot,
                 call_counts=state.tool_call_counts,
             )
@@ -2342,6 +2343,7 @@ class AgentLoop:
             )
             state.previous_surface_snapshot = surface_snapshot
             state.pending_binding_loads = ()
+            call_counts_before_replays = dict(state.tool_call_counts)
             # Auto-redispatch (⑤): run any gated calls whose capability was just granted, now that
             # this turn's context (catalog/surface/turn_id) exists. Each goes through the normal
             # _execute_tool_call (real permission/quota/events); the result is injected as a
@@ -2397,6 +2399,34 @@ class AgentLoop:
                 )
                 if replay_obs:
                     state.pending_observations = (*state.pending_observations, *replay_obs)
+            # Replays run before the model request. If they consumed quota, rebuild the
+            # model-facing surface so context providers and tools see the post-replay limits.
+            if state.tool_call_counts != call_counts_before_replays:
+                refreshed_surface_snapshot = self.tool_surface_resolver.resolve(
+                    bound_catalog=bound_catalog,
+                    turn=turn_context,
+                    pending_binding_loads=pending_binding_loads,
+                    previous_snapshot=surface_snapshot,
+                    call_counts=state.tool_call_counts,
+                )
+                if not refreshed_surface_snapshot.turn_id:
+                    refreshed_surface_snapshot = replace(refreshed_surface_snapshot, turn_id=turn_id)
+                context.configure_tool_search(
+                    refreshed_surface_snapshot.search_entries,
+                    runtime_config.tool_search.top_k,
+                )
+                if refreshed_surface_snapshot.surface_hash != surface_snapshot.surface_hash:
+                    snapshot_payload = refreshed_surface_snapshot.to_transcript_json()
+                    snapshot_payload["step"] = step
+                    recorder.transcript(snapshot_payload)
+                    recorder.emit(
+                        "tool.surface.updated",
+                        turn_id=turn_id,
+                        parent_id=turn_started.event_id,
+                        data=refreshed_surface_snapshot.to_public_json(),
+                    )
+                    state.previous_surface_snapshot = refreshed_surface_snapshot
+                surface_snapshot = refreshed_surface_snapshot
             turn_context = replace(
                 turn_context,
                 bound_tools=visible_registry_tool_ids(surface_snapshot, bound_catalog),
