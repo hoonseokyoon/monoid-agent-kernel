@@ -944,6 +944,12 @@ def _resolve_candidate(root: Path, candidate: Path) -> Path:
     parent_resolved = parent.resolve()
     if not _is_within(root_resolved, parent_resolved):
         raise MemoryToolError("memory path escapes its mount", code="memory_path_escape", retryable=True)
+    if not parent.is_dir():
+        raise MemoryToolError(
+            "memory path parent is not a directory",
+            code="memory_parent_not_directory",
+            retryable=True,
+        )
     try:
         suffix = candidate.relative_to(parent)
     except ValueError:

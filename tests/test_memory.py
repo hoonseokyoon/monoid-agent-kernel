@@ -92,6 +92,15 @@ def test_local_memory_store_rejects_recoverable_edit_errors(tmp_path: Path) -> N
         store.rename("/memories/notes.md", "/memories/target.md")
     assert collision.value.code == "memory_destination_exists"
 
+    with pytest.raises(MemoryToolError) as file_parent_create:
+        store.create("/memories/notes.md/child.md", "child")
+    assert file_parent_create.value.code == "memory_parent_not_directory"
+
+    with pytest.raises(MemoryToolError) as file_parent_rename:
+        store.rename("/memories/target.md", "/memories/notes.md/child.md")
+    assert file_parent_rename.value.code == "memory_parent_not_directory"
+    assert "target" in store.view("/memories/target.md")["content"]
+
 
 def test_local_memory_store_rejects_traversal_binary_and_symlink_escape(tmp_path: Path) -> None:
     store = LocalFilesystemMemoryStore(tmp_path / "memory")
