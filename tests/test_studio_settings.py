@@ -26,7 +26,8 @@ def test_settings_lists_capabilities_and_provider(tmp_path: Path) -> None:
     s = server.settings()
     assert s["provider"] == "offline" and s["offline"] is True
     assert set(s["capabilities"]) == set(_ALL_CAPABILITIES)
-    assert {a["key"] for a in s["available"]} == set(_ALL_CAPABILITIES)
+    assert "memory" not in s["capabilities"]
+    assert {a["key"] for a in s["available"]} == set(_ALL_CAPABILITIES) | {"memory"}
 
 
 def test_read_file_returns_workspace_content(tmp_path: Path) -> None:
@@ -71,6 +72,29 @@ def test_settings_model_and_effort_apply_to_new_chats(studio: StudioServer) -> N
     assert config.model is not None
     assert config.model.model == "gpt-x-test"
     assert config.model.reasoning.effort == "high"
+
+
+def test_memory_capability_is_available_but_disabled_by_default(studio: StudioServer) -> None:
+    settings = studio.settings()
+    assert "memory" not in settings["capabilities"]
+    assert "memory" in {item["key"] for item in settings["available"]}
+
+    profile = next(item for item in studio.profiles()["profiles"] if item["id"] == "default")
+    assert "memory" not in profile["capabilities"]
+
+    studio.update_settings(capabilities=["memory"])
+    run_id = studio.start_chat("hi")["run_id"]
+    config = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
+    refs = {binding.ref.tool_id for binding in config.tools}
+    assert {
+        "memory.view",
+        "memory.search",
+        "memory.create",
+        "memory.str_replace",
+        "memory.insert",
+        "memory.delete",
+        "memory.rename",
+    } <= refs
 
 
 def test_settings_reasoning_summary_visibility(studio: StudioServer) -> None:

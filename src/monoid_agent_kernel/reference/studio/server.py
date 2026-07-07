@@ -18,6 +18,7 @@ Not part of the supported surface — a reference example you copy and own.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -65,6 +66,7 @@ from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, W
 from monoid_agent_kernel.reference.studio.activity import describe_event
 from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer, wait_http_ready
 from monoid_agent_kernel.reference.mcp_gateway import FakeMcpServer, create_mcp_server
+from monoid_agent_kernel.memory import LocalFilesystemMemoryProvider
 from monoid_agent_kernel.mcp import McpError, McpToolProvider
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
 from monoid_agent_kernel.tools.base import ToolRegistry, ToolSpec
@@ -132,7 +134,9 @@ _CAPABILITY_LABELS = {
 _PROVIDER_CAPABILITY_LABELS = {
     "skills": "Use Agent Skills (progressive-disclosure playbooks)",
     "mcp": "Use tools from the connected MCP server",
+    "memory": "Use persistent memory",
 }
+_DEFAULT_DISABLED_PROVIDER_CAPABILITIES = {"memory"}
 # Bundled sample skill, so `studio serve` demonstrates Skills with zero configuration.
 _SAMPLE_SKILLS_DIR = Path(__file__).parent / "sample-skills"
 
@@ -329,6 +333,15 @@ def _normalize_profile_id(profile_id: str | None) -> str:
     return out[:64] or _DEFAULT_PROFILE_ID
 
 
+def _default_enabled_capabilities(available: Sequence[str]) -> list[str]:
+    return [cap for cap in available if cap not in _DEFAULT_DISABLED_PROVIDER_CAPABILITIES]
+
+
+def _studio_memory_directory(run_root: Path, workspace: Path) -> Path:
+    key = hashlib.sha256(str(workspace.resolve()).encode("utf-8")).hexdigest()[:16]
+    return run_root / "studio-memory" / key
+
+
 def _runtime_config_for(
     capabilities: list[str],
     model: str = _DEFAULT_MODEL,
@@ -390,6 +403,10 @@ class StudioConfig:
     skills_directory: Path | None = field(default_factory=lambda: _SAMPLE_SKILLS_DIR)
     # Attach the bundled offline reference MCP server (fake, loopback) and expose its tools.
     mcp: bool = False
+    # Attach the local filesystem memory provider. It is offered in settings but disabled by
+    # default so a profile must opt into persistent writes.
+    memory: bool = True
+    memory_directory: Path | None = None
     # Optional env file loaded at server start without overriding process env.
     env_file: Path | None = None
 
@@ -412,11 +429,12 @@ class StudioServer:
         self._ui_server: ThreadingHTTPServer | None = None
         self._ui_thread: threading.Thread | None = None
         self._backend: RunnerBackend | None = None
-        # Tool/context providers attached at boot (Skills, MCP). The MCP server is a bundled fake
-        # gateway on a loopback port (see start()); its provider holds a live connection closed on
-        # shutdown. Both are instances shared across runs (the backend's provider seam).
+        # Tool/context providers attached at boot (Skills, MCP, Memory). The MCP server is a
+        # bundled fake gateway on a loopback port (see start()); its provider holds a live
+        # connection closed on shutdown. Provider instances are shared across runs.
         self._skill_provider: SkillProvider | None = None
         self._mcp_provider: Any = None
+        self._memory_provider: LocalFilesystemMemoryProvider | None = self._load_memory_provider()
         self._mcp_server: ThreadingHTTPServer | None = None
         self._mcp_thread: threading.Thread | None = None
         # The live-editable Agent capability set (Settings window, R6). Defaults to every available
@@ -455,10 +473,11 @@ class StudioServer:
         defaults: dict[str, dict[str, Any]] = {}
         all_static = tuple(_ALL_CAPABILITIES)
         available = tuple(self._available_capabilities())
+        default_enabled = tuple(_default_enabled_capabilities(available))
         for profile in _DEFAULT_PROFILES:
             normalized = dict(profile)
             if tuple(normalized.get("capabilities") or ()) == all_static:
-                normalized["capabilities"] = available
+                normalized["capabilities"] = default_enabled
             defaults[str(normalized["id"])] = normalized
         return defaults
 
@@ -677,12 +696,20 @@ class StudioServer:
         return definitions
 
     def _tool_providers_for_runtime(self) -> tuple[Any, ...]:
-        return tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None) + (
+        return tuple(
+            p
+            for p in (self._skill_provider, self._mcp_provider, self._memory_provider)
+            if p is not None
+        ) + (
             OutboxToolProvider(),
         )
 
     def _context_providers(self) -> tuple[Any, ...]:
-        return tuple(p for p in (self._skill_provider, self._mcp_provider) if p is not None)
+        return tuple(
+            p
+            for p in (self._skill_provider, self._mcp_provider, self._memory_provider)
+            if p is not None
+        )
 
     def _preview_tool_registry(self) -> ToolRegistry:
         registry = ToolRegistry()
@@ -785,6 +812,8 @@ class StudioServer:
             bindings["skills"] = self._skill_provider.tool_bindings()
         if self._mcp_provider is not None:
             bindings["mcp"] = self._mcp_provider.tool_bindings()
+        if self._memory_provider is not None:
+            bindings["memory"] = self._memory_provider.tool_bindings()
         return bindings
 
     def _available_capabilities(self) -> list[str]:
@@ -838,6 +867,16 @@ class StudioServer:
             return None
         _LOGGER.info("loaded %d skill(s) from %s", len(definitions), directory)
         return SkillProvider(definitions)
+
+    def _load_memory_provider(self) -> LocalFilesystemMemoryProvider | None:
+        """Create the local memory provider. It is cheap and has no network dependencies."""
+        if not self.config.memory:
+            return None
+        root = self.config.memory_directory or _studio_memory_directory(
+            self.config.run_root,
+            self.workspace,
+        )
+        return LocalFilesystemMemoryProvider(root)
 
     def _start_fake_mcp(self) -> McpToolProvider | None:
         """Boot the bundled offline MCP gateway on a loopback port and connect a provider to it.
@@ -915,8 +954,9 @@ class StudioServer:
         if self.config.mcp:
             self._mcp_provider = self._start_fake_mcp()
 
-        # Enable the provider-backed capabilities by default when their provider is attached.
-        self._capabilities = self._available_capabilities()
+        # Enable provider-backed capabilities by default except memory, which persists data and
+        # should be explicitly enabled by a profile or settings change.
+        self._capabilities = _default_enabled_capabilities(self._available_capabilities())
 
         # Fork skills (context: fork) run as subagents; register their synthesized definitions
         # (namespaced ids, so no collision with the built-in researcher). No-op for the sample.
@@ -1399,17 +1439,20 @@ class StudioServer:
 
     def capabilities_catalog(self) -> dict[str, Any]:
         """Read-only catalog of the attached providers' offerings, for a UI list: the available
-        Agent Skills, the connected MCP server's tools/resources/prompts, and the output validators
-        registered on the backend (id). Each empty when none is attached."""
+        Agent Skills, the connected MCP server's tools/resources/prompts, memory provider metadata,
+        and the output validators registered on the backend (id). Each empty when none is attached."""
         skills = self._skill_provider.catalog() if self._skill_provider is not None else []
         mcp_tools: list[dict[str, str]] = []
         mcp_resources: list[dict[str, Any]] = []
         mcp_prompts: list[dict[str, Any]] = []
+        memory: dict[str, Any] = {}
         if self._mcp_provider is not None:
             catalog = self._mcp_provider.catalog()
             mcp_tools = catalog.get("tools", [])
             mcp_resources = catalog.get("resources", [])
             mcp_prompts = catalog.get("prompts", [])
+        if self._memory_provider is not None:
+            memory = self._memory_provider.catalog()
         output_validators = [
             {"id": validator.id}
             for validator in (self._backend.output_validators if self._backend is not None else ())
@@ -1419,6 +1462,7 @@ class StudioServer:
             "mcp_tools": mcp_tools,
             "mcp_resources": mcp_resources,
             "mcp_prompts": mcp_prompts,
+            "memory": memory,
             "output_validators": output_validators,
         }
 
