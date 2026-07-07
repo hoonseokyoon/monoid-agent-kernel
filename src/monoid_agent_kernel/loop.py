@@ -81,6 +81,7 @@ from monoid_agent_kernel.core.tool_surface import (
     ToolSearchEntry,
     ToolSurfaceResolver,
     ToolSurfaceSnapshot,
+    visible_registry_tool_ids,
 )
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
@@ -2299,9 +2300,9 @@ class AgentLoop:
             runtime_config = self._current_runtime_config(turn_registry)
             side_effect_policy = side_effect_policy_from_config(runtime_config)
             bound_catalog = compile_bound_tool_catalog(runtime_config, turn_registry)
-            # Now that the active tool set for this turn is known, expose it on the turn context so
-            # a context provider's dynamic_segment can gate itself on the live config (e.g. the
-            # Skills catalog tracks the skill tool binding across a hot-swap).
+            # Expose the runtime-bound candidate set while the surface resolver runs. After
+            # authorization, exposure, and quota filtering, this is replaced with the visible
+            # surface's registry tool ids before context providers see the turn.
             turn_context = replace(
                 turn_context, bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools)
             )
@@ -2396,6 +2397,10 @@ class AgentLoop:
                 )
                 if replay_obs:
                     state.pending_observations = (*state.pending_observations, *replay_obs)
+            turn_context = replace(
+                turn_context,
+                bound_tools=visible_registry_tool_ids(surface_snapshot, bound_catalog),
+            )
             dynamic_segment = self._dynamic_context_segment(res, turn_context)
             if surface_snapshot.delta_notice:
                 dynamic_segment = (

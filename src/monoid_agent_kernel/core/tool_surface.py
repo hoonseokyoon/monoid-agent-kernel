@@ -258,6 +258,22 @@ class ToolSurfaceSnapshot:
         }
 
 
+def visible_registry_tool_ids(
+    snapshot: ToolSurfaceSnapshot,
+    bound_catalog: Any,
+) -> frozenset[str]:
+    """Return registry tool ids for bindings visible in the model-facing surface."""
+    visible_binding_ids = {
+        tool.id for tool in (*snapshot.immediate_tools, *snapshot.searchable_tools)
+    }
+    by_binding_id = getattr(bound_catalog, "by_binding_id", {})
+    return frozenset(
+        bound.base_spec.id
+        for binding_id in visible_binding_ids
+        if (bound := by_binding_id.get(binding_id)) is not None
+    )
+
+
 @runtime_checkable
 class ToolSurfaceResolver(Protocol):
     name: str

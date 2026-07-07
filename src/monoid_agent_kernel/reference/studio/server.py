@@ -52,7 +52,11 @@ from monoid_agent_kernel.core.external_agent_envelope import (
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
 from monoid_agent_kernel.core.subagent_runtime import root_run_id_from_descendant
 from monoid_agent_kernel.core.prompt import compose_system_prompt
-from monoid_agent_kernel.core.tool_surface import DefaultToolSurfaceResolver, ToolScope
+from monoid_agent_kernel.core.tool_surface import (
+    DefaultToolSurfaceResolver,
+    ToolScope,
+    visible_registry_tool_ids,
+)
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -638,6 +642,10 @@ class StudioServer:
         surface = DefaultToolSurfaceResolver().resolve(
             bound_catalog=bound_catalog,
             turn=turn_context,
+        )
+        turn_context = replace(
+            turn_context,
+            bound_tools=visible_registry_tool_ids(surface, bound_catalog),
         )
         static_system_prompt = compose_system_prompt(
             runtime_config.prompt.system_prompt_base or _SYSTEM_PROMPT,

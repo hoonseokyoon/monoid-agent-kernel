@@ -28,9 +28,12 @@ MEMORY_STR_REPLACE_TOOL_ID = "memory.str_replace"
 MEMORY_INSERT_TOOL_ID = "memory.insert"
 MEMORY_DELETE_TOOL_ID = "memory.delete"
 MEMORY_RENAME_TOOL_ID = "memory.rename"
-MEMORY_TOOL_IDS = (
+MEMORY_READ_TOOL_IDS = (
     MEMORY_SEARCH_TOOL_ID,
     MEMORY_VIEW_TOOL_ID,
+)
+MEMORY_TOOL_IDS = (
+    *MEMORY_READ_TOOL_IDS,
     MEMORY_CREATE_TOOL_ID,
     MEMORY_STR_REPLACE_TOOL_ID,
     MEMORY_INSERT_TOOL_ID,
@@ -619,7 +622,7 @@ class MemoryProvider:
         return None
 
     def dynamic_segment(self, turn: TurnContext) -> str | None:
-        if not (set(MEMORY_TOOL_IDS) & set(turn.bound_tools)):
+        if not (set(MEMORY_READ_TOOL_IDS) & set(turn.bound_tools)):
             return None
         lines = [
             "# Memory",

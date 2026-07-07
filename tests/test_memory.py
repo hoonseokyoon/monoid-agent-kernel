@@ -20,6 +20,7 @@ from monoid_agent_kernel.core.agents import AgentRuntimeConfig, ToolBinding
 from monoid_agent_kernel.core.context import TurnContext
 from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.tool_surface import ToolQuota
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.memory import (
     MEMORY_CREATE_TOOL_ID,
@@ -199,11 +200,74 @@ def test_memory_provider_tools_bindings_and_context_gate(tmp_path: Path) -> None
     provider.store.create("/memories/MEMORY.md", "## Index\n- progress.md\n")
     turn_without_memory = TurnContext(1, 9, 20, None, (), 0, frozenset({"fs.read"}))
     assert provider.dynamic_segment(turn_without_memory) is None
+    turn_with_write_only_memory = TurnContext(1, 9, 20, None, (), 0, frozenset({MEMORY_CREATE_TOOL_ID}))
+    assert provider.dynamic_segment(turn_with_write_only_memory) is None
     turn_with_memory = TurnContext(1, 9, 20, None, (), 0, frozenset({MEMORY_VIEW_TOOL_ID}))
     segment = provider.dynamic_segment(turn_with_memory)
     assert segment is not None
     assert "Persistent memory is available under /memories" in segment
     assert "## Index" in segment
+
+
+def _first_prompt_with_memory_bindings(
+    tmp_path: Path,
+    provider: LocalFilesystemMemoryProvider,
+    bindings: tuple[ToolBinding, ...],
+) -> str:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "done"}, "c1"),),
+            )
+        ]
+    )
+    config = AgentRuntimeConfig(
+        definition_id="memory-context-agent",
+        tools=(*bindings, ToolBinding.for_tool("run.finish")),
+    )
+    AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+        context_providers=(provider,),
+    ).run_once("finish")
+    return adapter.requests[0].system_prompt
+
+
+def test_memory_context_requires_authorized_read_surface(tmp_path: Path) -> None:
+    provider = LocalFilesystemMemoryProvider(tmp_path / "memory")
+    provider.store.create("/memories/MEMORY.md", "## Secret Index\n- hidden.md\n")
+
+    prompts = [
+        _first_prompt_with_memory_bindings(
+            tmp_path,
+            provider,
+            (ToolBinding.for_tool(MEMORY_CREATE_TOOL_ID),),
+        ),
+        _first_prompt_with_memory_bindings(
+            tmp_path,
+            provider,
+            (ToolBinding.for_tool(MEMORY_VIEW_TOOL_ID, authorization="deny"),),
+        ),
+        _first_prompt_with_memory_bindings(
+            tmp_path,
+            provider,
+            (ToolBinding.for_tool(MEMORY_SEARCH_TOOL_ID, exposure="hidden"),),
+        ),
+        _first_prompt_with_memory_bindings(
+            tmp_path,
+            provider,
+            (ToolBinding.for_tool(MEMORY_VIEW_TOOL_ID, quota=ToolQuota(max_calls_per_run=0)),),
+        ),
+    ]
+
+    for prompt in prompts:
+        assert "Persistent memory is available under /memories" not in prompt
+        assert "## Secret Index" not in prompt
 
 
 def test_memory_tool_results_return_structured_failures(tmp_path: Path) -> None:
