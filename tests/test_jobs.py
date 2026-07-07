@@ -78,6 +78,7 @@ def _start(
 _RESULT_OBSERVATION_KEYS = {
     "type",
     "job_id",
+    "kind",
     "command_preview",
     "status",
     "exit_code",
@@ -148,6 +149,21 @@ def test_reentry_is_idempotent_and_clears_has_resume(tmp_path: Path) -> None:
     # Draining is idempotent: a second pop yields nothing and clears the flag.
     assert manager.pop_reentry_observations() == []
     assert manager.has_resume_jobs() is False
+
+
+def test_hosted_task_cancel_marks_ready_for_reentry(tmp_path: Path) -> None:
+    manager, _recorder, sink = _manager(tmp_path)
+    task = manager.start_task("hitl", {"prompt": "Approve?", "resume_on_exit": True})
+
+    result = manager.cancel(task.job_id)
+
+    assert result["status"] == "cancelled"
+    assert task.ready_for_reentry is True
+    assert task.result is not None and task.result["status"] == "cancelled"
+    observations = manager.pop_reentry_observations()
+    assert observations
+    assert observations[0].output["status"] == "cancelled"
+    assert any(event.type == "task.cancelled" and event.data["task_id"] == task.job_id for event in sink.events)
 
 
 def test_non_resume_job_is_not_offered_for_reentry(tmp_path: Path) -> None:

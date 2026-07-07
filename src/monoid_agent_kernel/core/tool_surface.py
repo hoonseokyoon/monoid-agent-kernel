@@ -208,12 +208,36 @@ class ToolSurfaceSnapshot:
         return self.authorizations.get(binding_id)
 
     def to_public_json(self) -> dict[str, Any]:
+        def _tool_payload(tool: ToolSpec) -> dict[str, Any]:
+            auth = self.authorizations.get(tool.id)
+            return {
+                "binding_id": tool.id,
+                "tool_id": auth.tool_id if auth is not None else tool.id,
+                "exported_name": tool.exported_name,
+                "capability": tool.capability,
+                "side_effect": tool.side_effect,
+                "authorization": auth.decision if auth is not None else None,
+                "exposure": auth.exposure if auth is not None else None,
+                "summary": str(tool.guidance.get("summary") or tool.description.split("\n", 1)[0]),
+                "risk": str(tool.guidance.get("risk") or _risk_for(tool)),
+                "tags": list(tool.guidance.get("tags") or ()),
+                "annotations": dict(tool.annotations),
+            }
+
         return {
             "surface_hash": self.surface_hash,
             "immediate_binding_ids": [tool.id for tool in self.immediate_tools],
+            "immediate_tools": [_tool_payload(tool) for tool in self.immediate_tools],
             "searchable_count": len(self.searchable_tools),
+            "searchable_tools": [entry.to_json() for entry in self.search_entries],
             "hidden_count": len(self.hidden_tool_ids),
+            "hidden_binding_ids": list(self.hidden_tool_ids),
+            "authorizations": {
+                binding_id: authorization.to_json()
+                for binding_id, authorization in sorted(self.authorizations.items())
+            },
             "delta_notice": self.delta_notice,
+            "surface_warnings": list(self.surface_warnings),
         }
 
     def to_transcript_json(self) -> dict[str, Any]:
@@ -263,7 +287,7 @@ class DefaultToolSurfaceResolver:
         previous_snapshot: ToolSurfaceSnapshot | None = None,
         call_counts: Mapping[str, int] | None = None,
     ) -> ToolSurfaceSnapshot:
-        del call_counts
+        counts = call_counts or {}
         pending = set(pending_binding_loads)
         available_binding_ids = {tool.binding_id for tool in bound_catalog.tools}
         hidden: list[str] = []
@@ -272,10 +296,24 @@ class DefaultToolSurfaceResolver:
         search_entries: list[ToolSearchEntry] = []
         authorizations: dict[str, ToolAuthorization] = {}
         refused_loads: list[str] = sorted(pending - available_binding_ids)
+        surface_warnings: list[str] = []
 
         for bound in bound_catalog.tools:
             auth = bound.authorization
             exposure = bound.exposure
+            max_calls = auth.quota.max_calls_per_run
+            if max_calls is not None and counts.get(bound.binding_id, 0) >= max_calls:
+                hidden.append(bound.binding_id)
+                authorizations[bound.binding_id] = replace(
+                    auth,
+                    decision="deny",
+                    exposure="hidden",
+                    reason="quota_exhausted",
+                )
+                surface_warnings.append(f"{bound.binding_id} hidden because its quota is exhausted")
+                if bound.binding_id in pending:
+                    refused_loads.append(bound.binding_id)
+                continue
             if auth.decision == "deny" or exposure == "hidden":
                 hidden.append(bound.binding_id)
                 authorizations[bound.binding_id] = replace(auth, exposure="hidden")
@@ -332,6 +370,7 @@ class DefaultToolSurfaceResolver:
             authorizations=authorizations,
             delta_notice=delta_notice,
             surface_hash=canonical_sha256(payload),
+            surface_warnings=tuple(surface_warnings),
         )
 
 

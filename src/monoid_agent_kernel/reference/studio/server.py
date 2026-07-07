@@ -71,6 +71,7 @@ from monoid_agent_kernel.mcp import McpError, McpToolProvider
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
 from monoid_agent_kernel.tools.base import ToolRegistry, ToolSpec
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
+from monoid_agent_kernel.tools.defaults import default_tool_bindings
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.studio")
 
@@ -118,7 +119,7 @@ _SHELL_DENY_PREFIXES = (
 
 # The Agent's capabilities, each mapping to the tool bindings it enables. Editable live from the
 # Settings window (R6) — toggling one hot-swaps the running session's runtime config.
-_ALL_CAPABILITIES = ("read", "write", "hitl", "shell", "web", "delegate")
+_ALL_CAPABILITIES = ("read", "write", "hitl", "shell", "web", "delegate", "artifact")
 _CAPABILITY_LABELS = {
     "read": "Read files",
     "write": "Write files (staged as a proposal)",
@@ -126,6 +127,7 @@ _CAPABILITY_LABELS = {
     "shell": "Run shell commands + background jobs",
     "web": "Search & fetch the web",
     "delegate": "Delegate subtasks to a subagent",
+    "artifact": "Emit run artifacts",
 }
 # Provider-backed capabilities (Skills, MCP) — present only when their provider is attached at
 # boot. Unlike the static capabilities above, their bindings come from a provider instance
@@ -190,21 +192,15 @@ def load_env_file(path: Path | None) -> dict[str, str]:
 
 
 def _capability_bindings(capability: str) -> tuple[ToolBinding, ...]:
-    # ToolBinding.for_tool derives binding_id + model_name from the tool id; only the shell
-    # binding needs extra scope/runtime, which pass through as keyword arguments.
-    if capability == "read":
-        return (ToolBinding.for_tool("fs.read"),)
-    if capability == "write":
-        return (ToolBinding.for_tool("fs.write"),)
+    if capability in {"read", "write", "artifact"}:
+        return default_tool_bindings(capability)
     if capability == "hitl":
         return (ToolBinding.for_tool("hitl.request"),)
     if capability == "shell":
-        return (
-            ToolBinding.for_tool(
-                "shell.exec",
-                scope=ToolScope(command_deny_prefixes=_SHELL_DENY_PREFIXES),
-                runtime={"shell": {"approval_mode": "auto-approve"}},
-            ),
+        return default_tool_bindings(
+            "shell",
+            shell_scope=ToolScope(command_deny_prefixes=_SHELL_DENY_PREFIXES),
+            shell_runtime={"approval_mode": "auto-approve"},
         )
     if capability == "web":
         return (
@@ -663,6 +659,7 @@ class StudioServer:
             "system_prompt": system_prompt,
             "tools": tools,
             "tool_count": len(tools),
+            "tool_surface": surface.to_public_json(),
             "request_config": {
                 "model": str(profile["model"]),
                 "reasoning": {"effort": str(profile["effort"]), "summary": str(profile["summary"])},

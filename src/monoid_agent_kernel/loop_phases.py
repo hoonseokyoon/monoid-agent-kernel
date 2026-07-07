@@ -400,6 +400,7 @@ class LoopSettleCoordinator:
                 path=getattr(a, "path", ""),
                 kind=getattr(a, "kind", ""),
                 label=getattr(a, "label", None),
+                metadata=dict(getattr(a, "metadata", {}) or {}),
             )
             for a in res.recorder.artifacts
         )

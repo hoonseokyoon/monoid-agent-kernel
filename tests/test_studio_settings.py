@@ -17,7 +17,16 @@ pytestmark = pytest.mark.integration
 def test_runtime_config_for_subset() -> None:
     # run.update_plan is always bound (observability); capability toggles add the rest.
     refs = {b.ref.tool_id for b in _runtime_config_for(["read"]).tools}
-    assert refs == {"fs.read", "run.update_plan"}
+    assert {
+        "fs.read",
+        "fs.list",
+        "fs.tree",
+        "fs.stat",
+        "fs.glob",
+        "text.search",
+        "fs.read_media",
+        "run.update_plan",
+    } == refs
     assert {b.ref.tool_id for b in _runtime_config_for([]).tools} == {"run.update_plan"}
 
 
@@ -62,7 +71,16 @@ def test_settings_change_applies_to_new_chats(studio: StudioServer) -> None:
     studio.update_settings(capabilities=["read"])
     run_id = studio.start_chat("hi")["run_id"]
     config = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
-    assert {b.ref.tool_id for b in config.tools} == {"fs.read", "run.update_plan"}
+    assert {
+        "fs.read",
+        "fs.list",
+        "fs.tree",
+        "fs.stat",
+        "fs.glob",
+        "text.search",
+        "fs.read_media",
+        "run.update_plan",
+    } == {b.ref.tool_id for b in config.tools}
 
 
 def test_settings_model_and_effort_apply_to_new_chats(studio: StudioServer) -> None:
@@ -133,5 +151,14 @@ def test_settings_hot_swaps_active_session(studio: StudioServer) -> None:
     result = studio.update_settings(capabilities=["read"])
     assert result["applied_runs"] == 1
     after = studio._backend.current_runtime_config(run_id)  # type: ignore[union-attr]
-    assert {b.ref.tool_id for b in after.tools} == {"fs.read", "run.update_plan"}
+    assert {
+        "fs.read",
+        "fs.list",
+        "fs.tree",
+        "fs.stat",
+        "fs.glob",
+        "text.search",
+        "fs.read_media",
+        "run.update_plan",
+    } == {b.ref.tool_id for b in after.tools}
     assert after.config_version > before.config_version

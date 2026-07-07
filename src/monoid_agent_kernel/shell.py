@@ -394,6 +394,7 @@ def execute_shell(
             raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
         if not cwd_abs.exists() or not cwd_abs.is_dir():
             raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
+        before_changes = _changed_entry_fingerprints(workspace)
         proc_result = _run_subprocess(
             argv,
             cwd=cwd_abs,
@@ -401,9 +402,10 @@ def execute_shell(
             timeout_s=timeout_s,
             max_output_bytes=max_output_bytes,
         )
+        after_changes = _changed_entry_fingerprints(workspace)
         return _execution_result_from_proc(
             proc_result,
-            changed_paths=tuple(workspace.changed_paths()),
+            changed_paths=tuple(_changed_entry_delta(before_changes, after_changes)),
             requested_timeout_s=requested_timeout_s,
             effective_timeout_s=timeout_s,
             requested_max_output_bytes=requested_max_output_bytes,
@@ -411,7 +413,7 @@ def execute_shell(
             execution_workspace=resolved_execution_workspace,
         )
 
-    with tempfile.TemporaryDirectory(prefix="monoid-shell-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="monoid-shell-", ignore_cleanup_errors=True) as tmp:
         tmp_root = Path(tmp)
         before = materialize_workspace(workspace, tmp_root, permission_policy)
         cwd_abs = (tmp_root / cwd_rel).resolve()
@@ -538,8 +540,10 @@ def scan_materialized_workspace(
         resolved = item.resolve()
         if not is_within(root, resolved):
             raise WorkspaceError(f"shell produced a path escaping workspace: {item}")
-        rel = resolved.relative_to(root).as_posix()
+        rel = item.relative_to(root).as_posix()
         _check_shell_path_allowed(rel, permission_policy)
+        if item.is_symlink():
+            raise WorkspaceError(f"shell produced a symlink, which is not supported: {rel}")
         if item.is_dir():
             dirs.add(rel)
         elif item.is_file():
@@ -579,6 +583,28 @@ def sync_workspace_changes(
             workspace.write_bytes(rel, data, create_dirs=True)
             changed.add(rel)
     return sorted(changed)
+
+
+def _changed_entry_fingerprints(workspace: Workspace) -> dict[str, tuple[object, ...]]:
+    return {
+        entry.path: (
+            entry.kind,
+            entry.size,
+            entry.sha256,
+            entry.base_sha256,
+            entry.proposed_sha256,
+            entry.change_kind,
+        )
+        for entry in workspace.changed_entries()
+    }
+
+
+def _changed_entry_delta(
+    before: dict[str, tuple[object, ...]],
+    after: dict[str, tuple[object, ...]],
+) -> list[str]:
+    paths = set(before) | set(after)
+    return sorted(path for path in paths if before.get(path) != after.get(path))
 
 
 def _run_subprocess(
@@ -630,8 +656,8 @@ def _run_subprocess(
     stdout = _read_output(stdout_path, max_output_bytes)
     remaining = max(1, max_output_bytes - len(stdout.encode("utf-8", errors="replace")))
     stderr = _read_output(stderr_path, remaining)
-    stdout_path.unlink(missing_ok=True)
-    stderr_path.unlink(missing_ok=True)
+    _safe_unlink(stdout_path)
+    _safe_unlink(stderr_path)
     return {
         "exit_code": exit_code,
         "stdout": stdout,
@@ -642,6 +668,13 @@ def _run_subprocess(
         "stdout_bytes": stdout_bytes,
         "stderr_bytes": stderr_bytes,
     }
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        return
 
 
 def build_env(policy: ShellExecutionOptions, requested: Mapping[str, Any]) -> dict[str, str]:

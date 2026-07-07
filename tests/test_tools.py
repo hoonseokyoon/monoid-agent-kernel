@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from monoid_agent_kernel.errors import ToolExecutionError, WorkspaceError
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.tools.base import ToolRegistry
 from monoid_agent_kernel.tools.builtin import builtin_tools
+from monoid_agent_kernel.tools.defaults import default_tool_bindings
 from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend, sha256_bytes
 
 
@@ -24,6 +28,19 @@ class DummyContext:
         self.summary = summary
         self.outputs = outputs
         self.notes = notes
+
+
+class FilteringContext(DummyContext):
+    def __init__(self, policy: PermissionPolicy) -> None:
+        self.policy = policy
+
+    def path_allowed(self, path: str, operation: str = "read") -> bool:
+        try:
+            op = operation if operation in {"read", "write", "artifact", "run"} else "read"
+            self.policy.check_paths(op, (path,))  # type: ignore[arg-type]
+        except Exception:
+            return False
+        return True
 
 
 def _registry(workspace: LocalWorkspaceBackend) -> ToolRegistry:
@@ -91,6 +108,98 @@ def test_search_includes_secret_looking_files_by_default(tmp_path: Path) -> None
     assert {match["path"] for match in matches.content["matches"]} == {".env", "notes.md"}
 
 
+def test_read_tools_filter_denied_descendant_paths(tmp_path: Path) -> None:
+    tmp_path.joinpath(".env").write_text("SECRET_TOKEN=abc\n", encoding="utf-8")
+    tmp_path.joinpath("notes.md").write_text("SECRET_TOKEN appears here\n", encoding="utf-8")
+    workspace = LocalWorkspaceBackend(tmp_path, mode="propose")
+    registry = _registry(workspace)
+    context = FilteringContext(PermissionPolicy(deny_patterns=(".env",)))
+
+    search = registry.resolve("text.search").handler(context, {"pattern": "SECRET_TOKEN", "root": "."})
+    listed = registry.resolve("fs.list").handler(context, {"path": ".", "recursive": True})
+    globbed = registry.resolve("fs.glob").handler(context, {"pattern": "*", "root": "."})
+    tree = registry.resolve("fs.tree").handler(context, {"path": "."})
+
+    assert {match["path"] for match in search.content["matches"]} == {"notes.md"}
+    assert ".env" not in {entry["path"] for entry in listed.content["entries"]}
+    assert ".env" not in globbed.content["matches"]
+    assert ".env" not in tree.content["tree"]
+    assert search.content["skipped_reasons"]["permission_denied"] == 1
+
+
+def test_read_range_stat_write_and_patch_options(tmp_path: Path) -> None:
+    tmp_path.joinpath("notes.md").write_bytes(b"alpha\nbeta\n")
+    workspace = LocalWorkspaceBackend(tmp_path, mode="propose", max_bytes_read=1)
+    registry = _registry(workspace)
+    context = DummyContext()
+
+    stat = registry.resolve("fs.stat").handler(context, {"path": "notes.md"})
+    ranged = registry.resolve("fs.read").handler(
+        context,
+        {"path": "notes.md", "start_line": 2, "end_line": 2, "max_bytes": 100},
+    )
+
+    assert stat.content["size"] == len("alpha\nbeta\n".encode("utf-8"))
+    assert ranged.content["content"] == "beta\n"
+    assert ranged.content["total_lines"] == 2
+
+    with pytest.raises(WorkspaceError, match="destination already exists"):
+        registry.resolve("fs.write").handler(
+            context,
+            {"path": "notes.md", "content": "replacement", "if_exists": "fail", "max_bytes": 100},
+        )
+    workspace.max_bytes_read = 100
+    with pytest.raises(WorkspaceError, match="must not be empty"):
+        registry.resolve("fs.patch").handler(
+            context,
+            {"path": "notes.md", "replacements": [{"old": "", "new": "x"}]},
+        )
+
+
+def test_directory_replace_mode_and_symlink_safety(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    source.joinpath("fresh.txt").write_text("fresh\n", encoding="utf-8")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    dest.joinpath("stale.txt").write_text("stale\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside.joinpath("target.txt").write_text("outside\n", encoding="utf-8")
+    try:
+        os.symlink(outside / "target.txt", source / "link.txt")
+    except OSError:
+        pytest.skip("symlink creation is not available in this environment")
+
+    workspace = LocalWorkspaceBackend(tmp_path, mode="propose")
+    registry = _registry(workspace)
+    context = DummyContext()
+
+    entries = registry.resolve("fs.list").handler(context, {"path": "source", "recursive": True})
+    assert any(entry["path"] == "source/link.txt" and entry["kind"] == "symlink" for entry in entries.content["entries"])
+
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        registry.resolve("fs.copy").handler(
+            context,
+            {"source_path": "source", "destination_path": "copy", "recursive": True},
+        )
+
+    (source / "link.txt").unlink()
+    copied = registry.resolve("fs.copy").handler(
+        context,
+        {
+            "source_path": "source",
+            "destination_path": "dest",
+            "recursive": True,
+            "overwrite": True,
+            "directory_mode": "replace",
+        },
+    )
+    assert copied.ok
+    assert workspace.exists("dest/fresh.txt")
+    assert not workspace.exists("dest/stale.txt")
+
+
 def test_tool_registry_rejects_duplicate_export_names(tmp_path: Path) -> None:
     workspace = LocalWorkspaceBackend(tmp_path)
     registry = ToolRegistry()
@@ -99,6 +208,37 @@ def test_tool_registry_rejects_duplicate_export_names(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         registry.register(first)
+
+
+def test_default_tool_binding_presets_have_expected_policy() -> None:
+    read = default_tool_bindings("read")
+    write = default_tool_bindings("write")
+    shell = default_tool_bindings("shell")
+
+    assert {"fs.read", "fs.list", "fs.tree", "fs.stat", "fs.glob", "text.search", "fs.read_media"} == {
+        binding.ref.tool_id for binding in read
+    }
+    assert next(binding for binding in write if binding.ref.tool_id == "fs.delete").authorization == "ask"
+    assert {"shell.exec", "job.status", "job.logs", "job.cancel", "job.wait"} == {
+        binding.ref.tool_id for binding in shell
+    }
+    assert all(binding.title and binding.summary for binding in (*read, *write, *shell))
+
+
+def test_artifact_recorder_preserves_metadata(tmp_path: Path) -> None:
+    recorder = AgentRecorder(tmp_path / "runs", "run_artifacts", status_file=False)
+    try:
+        artifact = recorder.emit_artifact_bytes(
+            workspace_path="chart.svg",
+            content=b"<svg />",
+            kind="image/svg+xml",
+            label="Chart",
+            metadata={"source": "unit"},
+        )
+    finally:
+        recorder.close()
+
+    assert artifact.metadata == {"source": "unit"}
 
 
 def test_file_copy_move_delete_tools_in_propose_mode(tmp_path: Path) -> None:

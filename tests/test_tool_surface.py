@@ -49,6 +49,28 @@ def test_resolver_uses_bound_catalog_and_binding_authorization() -> None:
     assert snapshot.search_entries[0].binding_id == "gamma_search"
 
 
+def test_resolver_hides_exhausted_quota_and_public_json_has_metadata() -> None:
+    registry = ToolRegistry()
+    registry.register_many((_simple_tool("fs.read", capability="fs.read"),))
+    config = runtime_config(
+        bindings=(tool_binding("fs.read", quota=ToolQuota(max_calls_per_run=1), guidance="Read files."),)
+    )
+    catalog = compile_bound_tool_catalog(config, registry)
+
+    snapshot = DefaultToolSurfaceResolver().resolve(
+        bound_catalog=catalog,
+        turn=type("Turn", (), {"turn_id": "t1"})(),
+        call_counts={"fs.read": 1},
+    )
+    public = snapshot.to_public_json()
+
+    assert "fs.read" in snapshot.hidden_tool_ids
+    assert snapshot.authorization_for("fs.read").reason == "quota_exhausted"  # type: ignore[union-attr]
+    assert public["hidden_binding_ids"] == ["fs.read"]
+    assert public["authorizations"]["fs.read"]["decision"] == "deny"
+    assert public["surface_warnings"]
+
+
 def test_search_entries_include_grouping_metadata_and_defaults() -> None:
     registry = ToolRegistry()
     registry.register_many(

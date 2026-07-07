@@ -124,6 +124,7 @@ class LocalWorkspaceBackend:
         *,
         create_dirs: bool = False,
         expected_sha256: str | None = None,
+        overwrite: bool = True,
     ) -> str:
         if self.mode == "read-only":
             raise WorkspaceError("workspace is read-only")
@@ -131,7 +132,7 @@ class LocalWorkspaceBackend:
         current = self._read_optional_bytes(rel, abs_path)
         if expected_sha256 is not None and sha256_bytes(current or b"") != expected_sha256:
             raise WorkspaceError(f"expected_sha256 mismatch for {rel}")
-        self._write_file(rel, data, create_dirs=create_dirs, overwrite=True)
+        self._write_file(rel, data, create_dirs=create_dirs, overwrite=overwrite)
         return sha256_bytes(data)
 
     def mkdir(self, path: str | None) -> str:
@@ -162,6 +163,7 @@ class LocalWorkspaceBackend:
         recursive: bool = False,
         max_entries: int = 1000,
         max_bytes: int = 50_000_000,
+        directory_mode: str = "merge",
     ) -> dict[str, int | str]:
         if self.mode == "read-only":
             raise WorkspaceError("workspace is read-only")
@@ -176,6 +178,9 @@ class LocalWorkspaceBackend:
             self._write_file(dest_rel, data, create_dirs=create_dirs, overwrite=overwrite)
             return {"path": dest_rel, "files": 1, "dirs": 0, "bytes": len(data)}
 
+        self._validate_directory_mode(directory_mode)
+        if directory_mode == "replace" and overwrite and self._effective_kind(dest_rel, self.root / dest_rel) == "dir":
+            self.delete_path(dest_rel, recursive=True, max_entries=max_entries, max_bytes=max_bytes)
         self._preflight_tree_destination(snapshot, dest_rel, overwrite=overwrite, create_dirs=create_dirs)
         dirs_written = 0
         for source_dir in snapshot.dirs:
@@ -202,6 +207,7 @@ class LocalWorkspaceBackend:
         recursive: bool = False,
         max_entries: int = 1000,
         max_bytes: int = 50_000_000,
+        directory_mode: str = "merge",
     ) -> dict[str, int | str]:
         if self.mode == "read-only":
             raise WorkspaceError("workspace is read-only")
@@ -224,6 +230,7 @@ class LocalWorkspaceBackend:
             recursive=recursive,
             max_entries=max_entries,
             max_bytes=max_bytes,
+            directory_mode=directory_mode,
         )
         self._delete_snapshot(snapshot)
         return copied
@@ -263,6 +270,9 @@ class LocalWorkspaceBackend:
                 item_rel = self._to_rel(item)
                 if self._disk_hidden(item_rel):
                     continue
+                if item.is_symlink():
+                    entries[item_rel] = FileEntry(path=item_rel, kind="symlink", size=0)
+                    continue
                 entries[item_rel] = FileEntry(
                     path=item_rel,
                     kind="dir" if item.is_dir() else "file" if item.is_file() else "other",
@@ -293,6 +303,8 @@ class LocalWorkspaceBackend:
         base_pattern = pattern.replace("\\", "/")
         if self._effective_kind(root_rel, root_abs) == "dir" and root_abs.exists():
             for item in sorted(root_abs.rglob("*"), key=lambda child: child.as_posix()):
+                if item.is_symlink() and not is_within(self.root, item.resolve()):
+                    continue
                 item_rel = self._to_rel(item)
                 if self._disk_hidden(item_rel):
                     continue
@@ -322,9 +334,30 @@ class LocalWorkspaceBackend:
                 yield rel
                 continue
             path = self.root / rel
-            if not self._is_effectively_deleted(rel) and path.is_file():
+            if not self._is_effectively_deleted(rel) and not path.is_symlink() and path.is_file():
                 count += 1
                 yield rel
+
+    def stat_path(self, path: str | None) -> dict[str, Any]:
+        rel, abs_path = self.resolve_existing_or_parent(path)
+        kind = self._effective_kind(rel, abs_path)
+        if kind is None:
+            return {"path": rel, "exists": False}
+        if kind == "file":
+            if rel in self._overlay:
+                size = len(self._overlay[rel])
+                return {"path": rel, "exists": True, "kind": "file", "size": size}
+            stat = abs_path.stat()
+            return {
+                "path": rel,
+                "exists": True,
+                "kind": "file",
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+            }
+        if kind == "symlink":
+            return {"path": rel, "exists": True, "kind": "symlink", "size": 0}
+        return {"path": rel, "exists": True, "kind": "dir", "size": 0}
 
     def diff_patch(self) -> str:
         if self.backend_kind == "staging":
@@ -768,6 +801,8 @@ class LocalWorkspaceBackend:
         kind = self._effective_kind(rel, abs_path)
         if kind is None:
             raise WorkspaceError(f"path does not exist: {rel}")
+        if kind == "symlink":
+            raise WorkspaceError(f"symlink file operations are not supported: {rel}")
         if kind == "file":
             data, _digest = self.read_bytes(rel, max_bytes=max_bytes)
             return _TreeSnapshot(root=rel, kind="file", files={rel: data}, dirs=(), total_bytes=len(data))
@@ -788,6 +823,8 @@ class LocalWorkspaceBackend:
                 if total_bytes > max_bytes:
                     raise WorkspaceError(f"operation exceeds max bytes: {max_bytes}")
                 files[child_rel] = data
+            elif child_kind == "symlink":
+                raise WorkspaceError(f"symlink file operations are not supported: {child_rel}")
         entry_count = len(files) + max(0, len(dirs) - 1)
         if entry_count > max_entries:
             raise WorkspaceError(f"operation exceeds max entries: {max_entries}")
@@ -803,6 +840,9 @@ class LocalWorkspaceBackend:
                     raise WorkspaceError(f"path escapes workspace through symlink: {self._to_rel(item)}")
                 item_rel = self._to_rel(item)
                 if self._disk_hidden(item_rel):
+                    continue
+                if item.is_symlink():
+                    descendants[item_rel] = "symlink"
                     continue
                 descendants[item_rel] = "dir" if item.is_dir() else "file" if item.is_file() else "other"
         prefix = rel.rstrip("/") + "/"
@@ -891,6 +931,8 @@ class LocalWorkspaceBackend:
             return "dir"
         if self._is_effectively_deleted(rel):
             return None
+        if abs_path.is_symlink():
+            return "symlink"
         if abs_path.exists() and abs_path.is_dir():
             return "dir"
         if abs_path.exists() and abs_path.is_file():
@@ -929,7 +971,7 @@ class LocalWorkspaceBackend:
             parent = self._parent_rel(parent)
 
     def _to_rel(self, path: Path) -> str:
-        return path.resolve().relative_to(self.root).as_posix()
+        return path.relative_to(self.root).as_posix()
 
     @staticmethod
     def _parent_rel(rel: str) -> str:
@@ -946,6 +988,11 @@ class LocalWorkspaceBackend:
             return dest_root
         suffix = source_path.removeprefix(source_root.rstrip("/") + "/")
         return f"{dest_root.rstrip('/')}/{suffix}"
+
+    @staticmethod
+    def _validate_directory_mode(value: str) -> None:
+        if value not in {"merge", "replace"}:
+            raise WorkspaceError("directory_mode must be 'merge' or 'replace'")
 
     @staticmethod
     def _add_entry(

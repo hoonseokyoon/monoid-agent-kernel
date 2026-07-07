@@ -73,6 +73,7 @@ class Workspace(Protocol):
         *,
         create_dirs: bool = False,
         expected_sha256: str | None = None,
+        overwrite: bool = True,
     ) -> str:
         ...
 
@@ -89,6 +90,7 @@ class Workspace(Protocol):
         recursive: bool = False,
         max_entries: int = 1000,
         max_bytes: int = 50_000_000,
+        directory_mode: str = "merge",
     ) -> dict[str, int | str]:
         ...
 
@@ -102,7 +104,11 @@ class Workspace(Protocol):
         recursive: bool = False,
         max_entries: int = 1000,
         max_bytes: int = 50_000_000,
+        directory_mode: str = "merge",
     ) -> dict[str, int | str]:
+        ...
+
+    def stat_path(self, path: str | None) -> dict[str, Any]:
         ...
 
     def delete_path(

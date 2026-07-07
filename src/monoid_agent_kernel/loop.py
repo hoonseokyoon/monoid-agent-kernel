@@ -277,23 +277,29 @@ class AgentToolContext(ToolContext):
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
     ) -> dict[str, Any]:
-        del metadata
         data, _digest = self.workspace.read_bytes(path)
         artifact = self.recorder.emit_artifact_bytes(
             workspace_path=self.workspace.normalize(path),
             content=data,
             kind=kind,
             label=label,
+            metadata=metadata,
         )
         self.recorder.emit(
             "artifact.emitted",
-            data={"artifact_id": artifact.artifact_id, "path": artifact.path, "kind": kind},
+            data={
+                "artifact_id": artifact.artifact_id,
+                "path": artifact.path,
+                "kind": kind,
+                "metadata": dict(artifact.metadata),
+            },
         )
         return {
             "artifact_id": artifact.artifact_id,
             "path": artifact.path,
             "kind": artifact.kind,
             "label": artifact.label,
+            "metadata": dict(artifact.metadata),
         }
 
     def list_artifacts(self) -> list[dict[str, Any]]:
@@ -303,9 +309,24 @@ class AgentToolContext(ToolContext):
                 "path": artifact.path,
                 "kind": artifact.kind,
                 "label": artifact.label,
+                "metadata": dict(artifact.metadata),
             }
             for artifact in self.recorder.artifacts
         ]
+
+    def path_allowed(self, path: str, operation: str = "read") -> bool:
+        try:
+            rel = self.workspace.normalize(path)
+            permission_operation = operation if operation in {"read", "write", "artifact", "run"} else "read"
+            self.permission_policy.check_paths(permission_operation, (rel,))  # type: ignore[arg-type]
+            scope = self._current_call.scope
+            if scope.allowed_paths and not matches_path_patterns(rel, scope.allowed_paths):
+                return False
+            if scope.denied_paths and matches_path_patterns(rel, scope.denied_paths):
+                return False
+            return True
+        except (PermissionDenied, WorkspaceError, ValueError):
+            return False
 
     def update_plan(self, items: list[dict[str, Any]]) -> None:
         self.plan = items
