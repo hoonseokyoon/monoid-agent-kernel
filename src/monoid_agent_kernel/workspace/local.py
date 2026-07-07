@@ -218,7 +218,9 @@ class LocalWorkspaceBackend:
         if dest_rel == snapshot.root or self._is_descendant(dest_rel, snapshot.root):
             raise WorkspaceError("destination cannot be the source path or inside the source tree")
         if snapshot.kind == "dir":
-            self._preflight_tree_destination(snapshot, dest_rel, overwrite=overwrite, create_dirs=create_dirs)
+            self._validate_directory_mode(directory_mode)
+            if not (directory_mode == "replace" and overwrite):
+                self._preflight_tree_destination(snapshot, dest_rel, overwrite=overwrite, create_dirs=create_dirs)
         else:
             self._preflight_file_destination(dest_rel, create_dirs=create_dirs, overwrite=overwrite)
 
