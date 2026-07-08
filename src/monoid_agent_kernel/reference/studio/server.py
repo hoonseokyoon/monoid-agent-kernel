@@ -1319,6 +1319,7 @@ class StudioServer:
         token = self._token_for(run_id)
         parts = self._parts_from_attachments(message, attachments)
         payload: str | tuple[ContentPart, ...] = parts if parts else message
+        user_created_at = time.time()
         try:
             result = self._backend.send_message(run_id, token, payload, message_id=client_message_id)
         except KeyError:
@@ -1329,6 +1330,7 @@ class StudioServer:
                 content=message,
                 attachments=attachments,
                 client_message_id=str(result.get("message_id") or client_message_id),
+                created_at=user_created_at,
             )
         return result
 

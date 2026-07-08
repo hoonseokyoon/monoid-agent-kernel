@@ -384,6 +384,20 @@ def test_studio_initial_user_timestamp_precedes_fast_reply(studio: StudioServer)
     assert user["created_at"] <= assistant["created_at"]
 
 
+def test_studio_followup_user_timestamp_precedes_fast_reply(studio: StudioServer) -> None:
+    run_id = studio.start_chat("first", client_message_id="client-followup-1")["run_id"]
+    _wait_settled(studio, run_id, 1)
+    studio.continue_chat(run_id, "second", client_message_id="client-followup-2")
+    _wait_settled(studio, run_id, 2)
+
+    messages = studio.chat_transcript(run_id)["messages"]
+    users = [message for message in messages if message["role"] == "user"]
+    assistants = [message for message in messages if message["role"] == "assistant"]
+
+    assert [message["role"] for message in messages[:4]] == ["user", "assistant", "user", "assistant"]
+    assert users[1]["created_at"] <= assistants[1]["created_at"]
+
+
 def test_studio_chat_transcript_http_route(studio: StudioServer) -> None:
     run_id = studio.start_chat("route check", client_message_id="client-route")["run_id"]
     _wait_settled(studio, run_id, 1)
