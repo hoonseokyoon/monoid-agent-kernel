@@ -260,17 +260,18 @@ class LocalFilesystemMemoryStore:
                 code="memory_ambiguous_replace",
                 retryable=True,
             )
-        changed = text.replace(old_str, new_str, 1)
+        replacement_index = text.find(old_str)
+        changed = text[:replacement_index] + new_str + text[replacement_index + len(old_str) :]
         data = changed.encode("utf-8")
         resolved.path.write_bytes(data)
-        replacement_index = changed.find(new_str) if new_str else max(0, text.find(old_str) - 1)
+        snippet_index = replacement_index if new_str else max(0, replacement_index - 1)
         return {
             "operation": "str_replace",
             "path": resolved.virtual,
             "status": "edited",
             "message": "The memory file has been edited.",
             "sha256": _sha256(data),
-            "snippet": _snippet_around_index(changed, replacement_index),
+            "snippet": _snippet_around_index(changed, snippet_index),
         }
 
     def insert(self, path: str, insert_line: int, insert_text: str) -> dict[str, Any]:

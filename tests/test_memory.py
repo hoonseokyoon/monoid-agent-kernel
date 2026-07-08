@@ -108,6 +108,16 @@ def test_local_memory_store_rejects_recoverable_edit_errors(tmp_path: Path) -> N
     assert "target" in store.view("/memories/target.md")["content"]
 
 
+def test_local_memory_store_str_replace_snippet_anchors_replaced_occurrence(tmp_path: Path) -> None:
+    store = LocalFilesystemMemoryStore(tmp_path / "memory")
+    store.create("/memories/notes.md", "alpha\none\ntwo\nthree\nbeta\n")
+
+    replaced = store.str_replace("/memories/notes.md", "beta", "alpha")
+
+    assert "     5\talpha" in replaced["snippet"]
+    assert "     1\talpha" not in replaced["snippet"]
+
+
 def test_local_memory_store_rejects_traversal_binary_and_symlink_escape(tmp_path: Path) -> None:
     store = LocalFilesystemMemoryStore(tmp_path / "memory")
     with pytest.raises(MemoryToolError) as traversal:
