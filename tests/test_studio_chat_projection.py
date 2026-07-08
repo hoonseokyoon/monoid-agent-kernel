@@ -67,6 +67,38 @@ def test_chat_projection_projects_assistant_and_non_retryable_errors_once(tmp_pa
     assert projection.event_cursor() == 5
 
 
+def test_chat_projection_orders_catchup_events_between_existing_user_turns(tmp_path: Path) -> None:
+    projection = ChatProjection(tmp_path)
+    projection.append_user(content="first", client_message_id="client-1", created_at=10.0)
+    projection.append_user(content="second", client_message_id="client-2", created_at=30.0)
+
+    projection.project_events(
+        [
+            {
+                "type": "turn.settled",
+                "event_id": "evt-first",
+                "seq": 3,
+                "timestamp": "1970-01-01T00:00:20Z",
+                "data": {"final_text": "first answer"},
+            },
+            {
+                "type": "turn.settled",
+                "event_id": "evt-second",
+                "seq": 7,
+                "timestamp": "1970-01-01T00:00:40Z",
+                "data": {"final_text": "second answer"},
+            },
+        ]
+    )
+
+    assert [(record["role"], record["content"]) for record in projection.read()] == [
+        ("user", "first"),
+        ("assistant", "first answer"),
+        ("user", "second"),
+        ("assistant", "second answer"),
+    ]
+
+
 def test_chat_projection_backfills_legacy_title_and_events(tmp_path: Path) -> None:
     (tmp_path / "run.json").write_text(
         json.dumps({"title": "legacy prompt", "created_at": 123.0}),

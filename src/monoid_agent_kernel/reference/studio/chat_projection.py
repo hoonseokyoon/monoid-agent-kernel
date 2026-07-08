@@ -39,6 +39,18 @@ def _write_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
         handle.write(json.dumps(dict(payload), sort_keys=True, ensure_ascii=False) + "\n")
 
 
+def _sorted_chat_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def key(item: tuple[int, dict[str, Any]]) -> tuple[float, int]:
+        index, record = item
+        try:
+            created_at = float(record.get("created_at"))
+        except (TypeError, ValueError):
+            created_at = float("inf")
+        return (created_at, index)
+
+    return [record for _, record in sorted(enumerate(records), key=key)]
+
+
 def _event_time(event: Mapping[str, Any]) -> float:
     raw = event.get("timestamp")
     if isinstance(raw, str) and raw:
@@ -80,7 +92,7 @@ class ChatProjection:
         self.path = run_dir / CHAT_FILE_NAME
 
     def read(self) -> list[dict[str, Any]]:
-        return _read_jsonl(self.path)
+        return _sorted_chat_records(_read_jsonl(self.path))
 
     def event_cursor(self) -> int:
         cursor = -1
