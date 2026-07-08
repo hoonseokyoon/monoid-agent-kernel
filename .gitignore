@@ -30,6 +30,8 @@ runs/
 runs-*/
 studio-workspace/
 proposal.tar
+.codex-studio/
+*.log
 
 # IDE / OS
 .idea/

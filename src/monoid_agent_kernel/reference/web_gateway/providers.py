@@ -10,11 +10,12 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode, urljoin
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
+from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.web import WebGatewayError, domain_allowed, domain_from_url
 
 DEFAULT_BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 DEFAULT_BRAVE_LLM_CONTEXT_ENDPOINT = "https://api.search.brave.com/res/v1/llm/context"
-DEFAULT_HTTP_USER_AGENT = "monoid-agent-kernel-webgateway/0.13"
+DEFAULT_HTTP_USER_AGENT = user_agent("monoid-agent-kernel-webgateway")
 
 
 class SearchProvider(Protocol):

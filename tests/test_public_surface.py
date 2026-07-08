@@ -197,6 +197,42 @@ def test_helpers_and_conveniences_are_not_root_or_contract_exports() -> None:
         assert not hasattr(root, name), name
 
 
+def test_memory_surface_is_explicit_module_only() -> None:
+    import monoid_agent_kernel as root
+    import monoid_agent_kernel.contracts as contracts
+    import monoid_agent_kernel.memory as memory
+
+    assert memory.__all__ == [
+        "MEMORY_ROOT",
+        "MEMORY_TOOL_IDS",
+        "MEMORY_SEARCH_TOOL_ID",
+        "MEMORY_VIEW_TOOL_ID",
+        "MEMORY_CREATE_TOOL_ID",
+        "MEMORY_STR_REPLACE_TOOL_ID",
+        "MEMORY_INSERT_TOOL_ID",
+        "MEMORY_DELETE_TOOL_ID",
+        "MEMORY_RENAME_TOOL_ID",
+        "MemoryToolError",
+        "MemoryStore",
+        "MemoryProvider",
+        "LocalFilesystemMemoryStore",
+        "LocalFilesystemMemoryProvider",
+    ]
+    assert memory.MEMORY_TOOL_IDS == (
+        "memory.search",
+        "memory.view",
+        "memory.create",
+        "memory.str_replace",
+        "memory.insert",
+        "memory.delete",
+        "memory.rename",
+    )
+
+    for name in memory.__all__:
+        assert not hasattr(contracts, name), name
+        assert not hasattr(root, name), name
+
+
 def test_removed_names_remain_available_from_explicit_modules() -> None:
     from monoid_agent_kernel.core.agents import (
         coerce_runtime_config_provider,

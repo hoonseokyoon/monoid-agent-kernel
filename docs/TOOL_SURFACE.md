@@ -61,6 +61,28 @@ The same registry tool can be bound multiple times. Each binding can have a
 different name, guidance, scope, quota, and runtime. Duplicate `binding_id` and
 duplicate resolved `model_name` values are invalid.
 
+## Default Tool Bundles
+
+`monoid_agent_kernel.tools.defaults.default_tool_bindings(capability)` returns the
+standard helper bindings used by Studio and the builder:
+
+| Capability | Default bindings |
+|---|---|
+| `read` | `fs.read`, `fs.list`, `fs.tree`, `fs.stat`, `fs.glob`, `text.search`, `fs.read_media` |
+| `write` | `fs.write`, `fs.patch`, `fs.mkdir`, `fs.copy`, `fs.move`, `fs.delete` |
+| `shell` | `shell.exec`, `job.list`, `job.status`, `job.logs`, `job.cancel`, `job.wait` |
+| `artifact` | `artifact.emit`, `artifact.list` |
+
+The generated write bundle allows ordinary create/edit helpers and asks for approval for
+`fs.copy`, `fs.move`, and `fs.delete`. That approval policy is intentionally coarse until
+tool authorization can inspect call arguments.
+
+Memory uses a provider-backed surface. `monoid_agent_kernel.memory.MemoryProvider` registers
+`memory.search`, `memory.view`, `memory.create`, `memory.str_replace`, `memory.insert`,
+`memory.delete`, and `memory.rename` when an app attaches the provider. Memory tools stay out of
+`builtin_tools(workspace)` because storage ownership, mounts, and retention policy belong to the
+provider. The default memory bindings allow read operations and ask for write operations.
+
 ## BoundToolCatalog
 
 `compile_bound_tool_catalog(config, registry)` validates runtime config and

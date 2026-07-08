@@ -167,4 +167,6 @@ def test_accept_runs_offline_deterministic_checks(tmp_path: Path) -> None:
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["chat"]["run_id"]
+    assert payload["chat"]["transcript_messages"] >= 2
     assert any(check["name"] == "deterministic-chat" and check["ok"] for check in payload["checks"])
+    assert any(check["name"] == "chat-transcript" and check["ok"] for check in payload["checks"])

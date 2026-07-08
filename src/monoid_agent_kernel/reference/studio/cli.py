@@ -17,6 +17,7 @@ import socket
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import quote
 from urllib import request as urlrequest
 
 import click
@@ -105,6 +106,16 @@ def run_acceptance(
                 break
             time.sleep(0.1)
         check("deterministic-chat", bool(final_text), final_text[:120])
+        transcript = _http_json(f"{base_url}/api/chat-transcript?run_id={quote(run_id)}") if run_id else {}
+        transcript_messages = transcript.get("messages") if isinstance(transcript.get("messages"), list) else []
+        transcript_roles = [str(message.get("role") or "") for message in transcript_messages]
+        check(
+            "chat-transcript",
+            transcript.get("schema_version") == "studio.chat.v1"
+            and transcript.get("run_id") == run_id
+            and transcript_roles[:2] == ["user", "assistant"],
+            ",".join(transcript_roles),
+        )
         scoped_sessions = _http_json(f"{base_url}/api/sessions?profile_id={default_profile}")
         check(
             "profile-history",
@@ -117,7 +128,12 @@ def run_acceptance(
             "workspace": str(server.workspace),
             "run_root": str(run_root),
             "checks": checks,
-            "chat": {"run_id": run_id, "state": state, "final_text": final_text},
+            "chat": {
+                "run_id": run_id,
+                "state": state,
+                "final_text": final_text,
+                "transcript_messages": len(transcript_messages),
+            },
         }
     except Exception as exc:  # pragma: no cover - defensive CLI surface
         checks.append({"name": "acceptance", "ok": False, "detail": str(exc)})
