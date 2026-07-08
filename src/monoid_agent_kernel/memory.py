@@ -660,19 +660,21 @@ class MemoryProvider:
         return None
 
     def dynamic_segment(self, turn: TurnContext) -> str | None:
-        if not (set(MEMORY_READ_TOOL_IDS) & set(turn.bound_tools)):
+        bound_tools = set(turn.bound_tools)
+        if not (set(MEMORY_READ_TOOL_IDS) & bound_tools):
             return None
         lines = [
             "# Memory",
             "Persistent memory is available under /memories. Use memory tools when stored context helps the task or future sessions.",
         ]
-        index = self.store.startup_index(
-            self.startup_index_path,
-            max_lines=self.startup_index_max_lines,
-            max_bytes=self.startup_index_max_bytes,
-        )
-        if index:
-            lines.extend(("", index))
+        if self.read_authorization == "allow" and MEMORY_VIEW_TOOL_ID in bound_tools:
+            index = self.store.startup_index(
+                self.startup_index_path,
+                max_lines=self.startup_index_max_lines,
+                max_bytes=self.startup_index_max_bytes,
+            )
+            if index:
+                lines.extend(("", index))
         return "\n".join(lines)
 
     def get_tools(self, context: Any = None) -> Iterable[ToolSpec]:  # noqa: ARG002 - provider seam

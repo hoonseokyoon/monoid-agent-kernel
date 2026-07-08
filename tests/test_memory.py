@@ -286,6 +286,22 @@ def test_memory_provider_tools_bindings_and_context_gate(tmp_path: Path) -> None
     assert "Persistent memory is available under /memories" in segment
     assert "## Index" in segment
 
+    turn_with_search_only = TurnContext(1, 9, 20, None, (), 0, frozenset({MEMORY_SEARCH_TOOL_ID}))
+    search_segment = provider.dynamic_segment(turn_with_search_only)
+    assert search_segment is not None
+    assert "Persistent memory is available under /memories" in search_segment
+    assert "## Index" not in search_segment
+
+    approval_gated_provider = LocalFilesystemMemoryProvider(
+        tmp_path / "ask-memory",
+        read_authorization="ask",
+    )
+    approval_gated_provider.store.create("/memories/MEMORY.md", "## Ask Index\n- gated.md\n")
+    gated_segment = approval_gated_provider.dynamic_segment(turn_with_memory)
+    assert gated_segment is not None
+    assert "Persistent memory is available under /memories" in gated_segment
+    assert "## Ask Index" not in gated_segment
+
 
 def _first_prompt_with_memory_bindings(
     tmp_path: Path,
