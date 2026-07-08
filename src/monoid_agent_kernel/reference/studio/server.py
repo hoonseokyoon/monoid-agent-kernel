@@ -69,6 +69,7 @@ from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.reference.web_gateway.http import create_web_gateway_server
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.reference.studio.activity import describe_event
+from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
 from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer, wait_http_ready
 from monoid_agent_kernel.reference.mcp_gateway import FakeMcpServer, create_mcp_server
 from monoid_agent_kernel.memory import LocalFilesystemMemoryProvider
@@ -1096,6 +1097,7 @@ class StudioServer:
         attachments: Sequence[dict[str, Any]] = (),
         *,
         profile_id: str = _DEFAULT_PROFILE_ID,
+        client_message_id: str = "",
     ) -> dict[str, Any]:
         """Open a new multi-turn session in the workspace and deliver the first message (with any
         image/document attachments as multimodal content parts)."""
@@ -1103,6 +1105,7 @@ class StudioServer:
         profile_id = self._known_profile_id(profile_id)
         runtime_config = self._build_config(profile_id)
         parts = self._parts_from_attachments(message, attachments)
+        user_created_at = time.time()
         request = BackendRunRequest(
             tenant_id=_TENANT,
             user_id=_USER,
@@ -1128,6 +1131,13 @@ class StudioServer:
                 },
             )
         self._remember_run_profile(submission.run_id, profile_id)
+        with self._lock:
+            ChatProjection(submission.run_dir).append_user(
+                content=message,
+                attachments=attachments,
+                client_message_id=client_message_id,
+                created_at=user_created_at,
+            )
         return {"run_id": submission.run_id, "state": submission.state.value, "terminal": submission.terminal}
 
     # --- A2A demo (agent-to-agent durable messaging) ------------------------------------
@@ -1294,7 +1304,12 @@ class StudioServer:
         return {"sessions": out, "profile_id": selected_profile}
 
     def continue_chat(
-        self, run_id: str, message: str, attachments: Sequence[dict[str, Any]] = ()
+        self,
+        run_id: str,
+        message: str,
+        attachments: Sequence[dict[str, Any]] = (),
+        *,
+        client_message_id: str = "",
     ) -> dict[str, Any]:
         """Deliver a follow-up message (optionally with image/document attachments). If the run is
         no longer live in memory (a parked session surviving a restart), transparently resume it
@@ -1304,11 +1319,20 @@ class StudioServer:
         token = self._token_for(run_id)
         parts = self._parts_from_attachments(message, attachments)
         payload: str | tuple[ContentPart, ...] = parts if parts else message
+        user_created_at = time.time()
         try:
-            return self._backend.send_message(run_id, token, payload)
+            result = self._backend.send_message(run_id, token, payload, message_id=client_message_id)
         except KeyError:
             self._backend.resume_run(run_id, token)
-            return self._backend.send_message(run_id, token, payload)
+            result = self._backend.send_message(run_id, token, payload, message_id=client_message_id)
+        with self._lock:
+            ChatProjection(self._run_dir_for(run_id)).append_user(
+                content=message,
+                attachments=attachments,
+                client_message_id=str(result.get("message_id") or client_message_id),
+                created_at=user_created_at,
+            )
+        return result
 
     def cancel_chat(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None
@@ -1325,7 +1349,16 @@ class StudioServer:
     def poll_events(self, run_id: str, from_seq: int) -> dict[str, Any]:
         assert self._backend is not None
         token = self._token_for(run_id)
-        return self._backend.events(run_id, token, from_seq=from_seq)
+        payload = self._backend.events(run_id, token, from_seq=from_seq)
+        events = payload.get("events", [])
+        if isinstance(events, list):
+            with self._lock:
+                ChatProjection(self._run_dir_for(run_id)).project_events(events)
+        return payload
+
+    def chat_transcript(self, run_id: str) -> dict[str, Any]:
+        with self._lock:
+            return ChatProjection(self._run_dir_for(run_id)).catch_up(run_id)
 
     def subagent_events(self, child_run_id: str, from_seq: int = 0) -> dict[str, Any]:
         """Stream a child subagent run's work for the parent UI.
@@ -1612,8 +1645,17 @@ class StudioServer:
         with self._lock:
             token = self._run_tokens.get(run_id)
         if token is None:
+            self.sessions()
+            with self._lock:
+                token = self._run_tokens.get(run_id)
+        if token is None:
             raise NativeAgentError(f"unknown run_id: {run_id}")
         return token
+
+    def _run_dir_for(self, run_id: str) -> Path:
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        return self._backend._authorized_run_dir(run_id, token)
 
 
 def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
@@ -1733,6 +1775,13 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 except NativeAgentError as exc:
                     self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
+            if parsed.path == "/api/chat-transcript":
+                run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
+                try:
+                    self._write_json(studio.chat_transcript(run_id))
+                except NativeAgentError as exc:
+                    self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
             if parsed.path == "/api/events":
                 self._stream_events(parse_qs(parsed.query))
                 return
@@ -1764,13 +1813,20 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                         self._write_json({"error": "message or attachment is required"}, HTTPStatus.BAD_REQUEST)
                         return
                     run_id = body.get("run_id")
+                    client_message_id = str(body.get("client_message_id") or "").strip()
                     if run_id:
-                        result = studio.continue_chat(str(run_id), message, attachments)
+                        result = studio.continue_chat(
+                            str(run_id),
+                            message,
+                            attachments,
+                            client_message_id=client_message_id,
+                        )
                     else:
                         result = studio.start_chat(
                             message,
                             attachments,
                             profile_id=str(body.get("profile_id") or _DEFAULT_PROFILE_ID),
+                            client_message_id=client_message_id,
                         )
                     self._write_json(result)
                     return

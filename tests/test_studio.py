@@ -103,6 +103,9 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
     assert "#body { flex: 1; display: grid;" in html
     assert "#sidebar { overflow: hidden;" in html
     assert "#sessions { list-style: none;" in html and "overflow: auto;" in html
+    assert "if (seq >= 0 && seq <= replayEventCursor) return;" in html
+    assert 'if (type === "turn.failed") return true;' in html
+    assert 'source.event_type === "turn.failed"' in html
 
 
 def test_settings_page_serves_static_test_hooks(studio: StudioServer) -> None:

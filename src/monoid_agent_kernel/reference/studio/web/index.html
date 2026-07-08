@@ -522,6 +522,11 @@ function readFileAsBase64(file) {
   });
 }
 
+function makeClientMessageId() {
+  const rand = Math.random().toString(36).slice(2, 10);
+  return "studio_" + Date.now().toString(36) + "_" + rand;
+}
+
 attachInput.addEventListener("change", async () => {
   for (const file of attachInput.files) {
     try {
@@ -534,6 +539,7 @@ attachInput.addEventListener("change", async () => {
 });
 let evtSource = null;
 let seenSeq = -1;
+let replayEventCursor = -1;  // chat events at/below this seq already came from studio.chat.jsonl
 let typingEl = null;
 let lastUserMessage = "";
 let pendingConfigFix = false;  // a non-retryable turn.failed is awaiting a model/effort change
@@ -640,6 +646,26 @@ function bubble(cls, text) {
   log.appendChild(el);
   log.scrollTop = log.scrollHeight;
   return el;
+}
+
+function chatLabel(message) {
+  const text = String((message && message.content) || "");
+  const attachments = Array.isArray(message && message.attachments) ? message.attachments : [];
+  const names = attachments.map((a) => String((a && a.name) || "file"));
+  if (!names.length) return text;
+  return (text ? text + " " : "") + "📎 " + names.join(", ");
+}
+
+function renderTranscriptMessage(message, isLatest) {
+  const role = String((message && message.role) || "");
+  if (role !== "user" && role !== "assistant" && role !== "error") return;
+  const el = bubble(role, chatLabel(message));
+  if (role === "user") lastUserMessage = String((message && message.content) || "");
+  const source = (message && typeof message.source === "object") ? message.source : {};
+  if (isLatest && role === "error" && source.event_type === "turn.failed" && Number(source.seq) === replayEventCursor) {
+    pendingConfigFix = true;
+    showRetry(el);
+  }
 }
 
 // Send a suggested prompt as if the user typed it (used by the onboarding panel).
@@ -758,7 +784,11 @@ function handleEvent(ev) {
     runEvents.push(ev);
     if (activeSidePanel === "trace-panel") renderTrace();
   }
-  if (ev.studio_activity) { hideTyping(); activity(ev.studio_activity); return; }
+  if (projectedChatReplay(type, data, seq)) return;
+  if (ev.studio_activity) {
+    if (seq >= 0 && seq <= replayEventCursor) return;
+    hideTyping(); activity(ev.studio_activity); return;
+  }
   if (type === "proposal.ready" || type === "workspace.diff.updated" || type === "workspace.proposal.updated") {
     refreshProposal();
     return;
@@ -1202,6 +1232,7 @@ async function send(message) {
   const attachments = pendingAttachments;
   pendingAttachments = [];
   renderAttachments();
+  const clientMessageId = makeClientMessageId();
   lastUserMessage = message;
   pendingConfigFix = false;
   const label = attachments.length
@@ -1212,7 +1243,13 @@ async function send(message) {
   try {
     const res = await fetch("/api/chat", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id: runId, message, attachments, profile_id: activeProfileId }),
+      body: JSON.stringify({
+        run_id: runId,
+        message,
+        attachments,
+        profile_id: activeProfileId,
+        client_message_id: clientMessageId,
+      }),
     });
     const body = await res.json();
     if (body.error) { bubble("error", body.error); return; }
@@ -1422,6 +1459,16 @@ const _TRACE_SKIP = new Set([
   "model.output.delta", "model.reasoning.delta", "metrics.updated", "workspace.file.read",
   "workspace.file.changed", "workspace.diff.updated", "workspace.proposal.updated", "checkpoint.committed",
 ]);
+const _PROJECTED_CHAT_REPLAY = new Set([
+  "model.turn.started", "model.reasoning.delta", "model.output.delta", "model.turn.finished",
+  "turn.settled", "run.failed", "ModelAdapterError",
+]);
+
+function projectedChatReplay(type, data, seq) {
+  if (seq < 0 || seq > replayEventCursor) return false;
+  if (type === "turn.failed") return true;
+  return _PROJECTED_CHAT_REPLAY.has(type);
+}
 
 function showSidePanel(panelId) {
   activeSidePanel = panelId;
@@ -1710,13 +1757,24 @@ profileForm.addEventListener("submit", async (event) => {
 function resetChatView() {
   if (evtSource) { evtSource.close(); evtSource = null; }
   log.innerHTML = "";
-  seenSeq = -1; typingEl = null; streamingEl = null; streamingText = "";
+  seenSeq = -1; replayEventCursor = -1; typingEl = null; streamingEl = null; streamingText = "";
   reasoningWrap = null; reasoningEl = null; reasoningText = "";
   runEvents = []; pendingConfigFix = false;
   for (const cid in subagents) { if (subagents[cid].timer) clearTimeout(subagents[cid].timer); delete subagents[cid]; }
   renderPlan([]); setGenerating(false);
   usageEl.textContent = "";
   if (activeSidePanel === "trace-panel") renderTrace();
+}
+
+async function loadChatTranscript(id) {
+  replayEventCursor = -1;
+  try {
+    const body = await (await fetch("/api/chat-transcript?run_id=" + encodeURIComponent(id))).json();
+    if (id !== runId || body.error) return;
+    replayEventCursor = Number.isInteger(body.event_cursor) ? body.event_cursor : -1;
+    const messages = body.messages || [];
+    messages.forEach((message, index) => renderTranscriptMessage(message, index === messages.length - 1));
+  } catch (_) {}
 }
 
 function newChat() {
@@ -1726,10 +1784,12 @@ function newChat() {
   input.focus();
 }
 
-function loadSession(id) {
+async function loadSession(id) {
   if (id === runId) return;
   runId = id;
   resetChatView();
+  await loadChatTranscript(id);
+  if (id !== runId) return;
   openStream();       // replays from seq 0, then streams live
   refreshSessions();  // highlight the active session
 }

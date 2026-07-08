@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from urllib.request import urlopen
+
 from support.studio_harness import (
     FakeModelAdapter,
     FakeStreamingModelAdapter,
@@ -344,8 +347,68 @@ def test_studio_history_survives_restart(tmp_path: Path) -> None:
         # the past transcript is readable even though s2 has no live record for it
         events = s2.poll_events(rid, 0)["events"]
         assert any(e.get("type") == "turn.settled" for e in events)
+        transcript = s2.chat_transcript(rid)
+        assert [message["role"] for message in transcript["messages"][:2]] == ["user", "assistant"]
+        assert transcript["messages"][0]["content"] == "remember me"
+        assert transcript["event_cursor"] >= 0
     finally:
         s2.shutdown()
+
+
+def test_studio_chat_transcript_preserves_multi_turn_order(studio: StudioServer) -> None:
+    run_id = studio.start_chat("first", client_message_id="client-1")["run_id"]
+    _wait_settled(studio, run_id, 1)
+    studio.continue_chat(run_id, "second", client_message_id="client-2")
+    _wait_settled(studio, run_id, 2)
+
+    first = studio.chat_transcript(run_id)
+    second = studio.chat_transcript(run_id)
+
+    assert len(first["messages"]) == len(second["messages"])
+    assert [(m["role"], m["content"]) for m in first["messages"] if m["role"] == "user"] == [
+        ("user", "first"),
+        ("user", "second"),
+    ]
+    assert len([m for m in first["messages"] if m["role"] == "assistant"]) >= 2
+
+
+def test_studio_initial_user_timestamp_precedes_fast_reply(studio: StudioServer) -> None:
+    run_id = studio.start_chat("fast reply", client_message_id="client-fast")["run_id"]
+    _wait_settled(studio, run_id, 1)
+
+    messages = studio.chat_transcript(run_id)["messages"]
+    user = next(message for message in messages if message["role"] == "user")
+    assistant = next(message for message in messages if message["role"] == "assistant")
+
+    assert [message["role"] for message in messages[:2]] == ["user", "assistant"]
+    assert user["created_at"] <= assistant["created_at"]
+
+
+def test_studio_followup_user_timestamp_precedes_fast_reply(studio: StudioServer) -> None:
+    run_id = studio.start_chat("first", client_message_id="client-followup-1")["run_id"]
+    _wait_settled(studio, run_id, 1)
+    studio.continue_chat(run_id, "second", client_message_id="client-followup-2")
+    _wait_settled(studio, run_id, 2)
+
+    messages = studio.chat_transcript(run_id)["messages"]
+    users = [message for message in messages if message["role"] == "user"]
+    assistants = [message for message in messages if message["role"] == "assistant"]
+
+    assert [message["role"] for message in messages[:4]] == ["user", "assistant", "user", "assistant"]
+    assert users[1]["created_at"] <= assistants[1]["created_at"]
+
+
+def test_studio_chat_transcript_http_route(studio: StudioServer) -> None:
+    run_id = studio.start_chat("route check", client_message_id="client-route")["run_id"]
+    _wait_settled(studio, run_id, 1)
+
+    with urlopen(f"{studio.base_url}/api/chat-transcript?run_id={run_id}", timeout=5) as response:
+        body = json.loads(response.read().decode("utf-8"))
+
+    assert body["schema_version"] == "studio.chat.v1"
+    assert body["run_id"] == run_id
+    assert body["messages"][0]["content"] == "route check"
+    assert body["event_cursor"] >= 0
 
 
 def test_a2a_demo_preset_wires_two_peers(studio: StudioServer) -> None:

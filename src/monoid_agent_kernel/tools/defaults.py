@@ -17,6 +17,9 @@ READ_TOOL_IDS = (
 WRITE_TOOL_IDS = ("fs.write", "fs.patch", "fs.mkdir", "fs.copy", "fs.move", "fs.delete")
 SHELL_TOOL_IDS = ("shell.exec", "job.list", "job.status", "job.logs", "job.cancel", "job.wait")
 ARTIFACT_TOOL_IDS = ("artifact.emit", "artifact.list")
+# TODO: Replace this coarse policy with argument-sensitive approval once tool
+# authorization can inspect calls. fs.copy is destructive only for replace-mode
+# directory copies, and fs.move deletes the source after copying.
 DESTRUCTIVE_WRITE_TOOL_IDS = frozenset({"fs.copy", "fs.move", "fs.delete"})
 
 _TOOL_METADATA: dict[str, dict[str, Any]] = {
