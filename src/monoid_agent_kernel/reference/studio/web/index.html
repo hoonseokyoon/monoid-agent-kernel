@@ -1460,7 +1460,7 @@ const _PROJECTED_CHAT_REPLAY = new Set([
 
 function projectedChatReplay(type, data, seq) {
   if (seq < 0 || seq > replayEventCursor) return false;
-  if (type === "turn.failed") return !data.retryable;
+  if (type === "turn.failed") return true;
   return _PROJECTED_CHAT_REPLAY.has(type);
 }
 
