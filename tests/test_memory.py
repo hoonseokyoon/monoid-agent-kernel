@@ -357,6 +357,11 @@ def test_memory_context_requires_authorized_read_surface(tmp_path: Path) -> None
             provider,
             (ToolBinding.for_tool(MEMORY_VIEW_TOOL_ID, quota=ToolQuota(max_calls_per_run=0)),),
         ),
+        _first_prompt_with_memory_bindings(
+            tmp_path,
+            provider,
+            (ToolBinding.for_tool(MEMORY_VIEW_TOOL_ID, exposure="searchable"),),
+        ),
     ]
 
     for prompt in prompts:

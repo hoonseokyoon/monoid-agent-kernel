@@ -8,7 +8,12 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import compile_bound_tool_catalog
 from monoid_agent_kernel.core.spec import AgentRunSpec
-from monoid_agent_kernel.core.tool_surface import DefaultToolSurfaceResolver, ToolQuota
+from monoid_agent_kernel.core.tool_surface import (
+    DefaultToolSurfaceResolver,
+    ToolQuota,
+    immediate_registry_tool_ids,
+    visible_registry_tool_ids,
+)
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -47,6 +52,8 @@ def test_resolver_uses_bound_catalog_and_binding_authorization() -> None:
     assert snapshot.authorization_for("alpha_read").decision == "ask"  # type: ignore[union-attr]
     assert "beta_hidden" in snapshot.hidden_tool_ids
     assert snapshot.search_entries[0].binding_id == "gamma_search"
+    assert visible_registry_tool_ids(snapshot, catalog) == frozenset({"alpha", "gamma"})
+    assert immediate_registry_tool_ids(snapshot, catalog) == frozenset({"alpha"})
 
 
 def test_resolver_hides_exhausted_quota_and_public_json_has_metadata() -> None:

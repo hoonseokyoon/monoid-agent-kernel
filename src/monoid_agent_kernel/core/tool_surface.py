@@ -266,10 +266,23 @@ def visible_registry_tool_ids(
     visible_binding_ids = {
         tool.id for tool in (*snapshot.immediate_tools, *snapshot.searchable_tools)
     }
+    return _registry_tool_ids_for_bindings(visible_binding_ids, bound_catalog)
+
+
+def immediate_registry_tool_ids(
+    snapshot: ToolSurfaceSnapshot,
+    bound_catalog: Any,
+) -> frozenset[str]:
+    """Return registry tool ids for bindings immediately callable this turn."""
+    immediate_binding_ids = {tool.id for tool in snapshot.immediate_tools}
+    return _registry_tool_ids_for_bindings(immediate_binding_ids, bound_catalog)
+
+
+def _registry_tool_ids_for_bindings(binding_ids: set[str], bound_catalog: Any) -> frozenset[str]:
     by_binding_id = getattr(bound_catalog, "by_binding_id", {})
     return frozenset(
         bound.base_spec.id
-        for binding_id in visible_binding_ids
+        for binding_id in binding_ids
         if (bound := by_binding_id.get(binding_id)) is not None
     )
 
