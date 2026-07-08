@@ -218,7 +218,7 @@ class LocalFilesystemMemoryStore:
 
     def create(self, path: str, file_text: str) -> dict[str, Any]:
         resolved = self._resolve(path, for_write=True)
-        self._reject_root_operation(resolved.virtual, "create")
+        self._reject_root_operation(resolved, "create")
         if resolved.path.exists():
             raise MemoryToolError(
                 f"File {resolved.virtual} already exists",
@@ -294,7 +294,7 @@ class LocalFilesystemMemoryStore:
 
     def delete(self, path: str) -> dict[str, Any]:
         resolved = self._resolve(path)
-        self._reject_root_operation(resolved.virtual, "delete")
+        self._reject_root_operation(resolved, "delete")
         if not resolved.path.exists():
             raise MemoryToolError(
                 f"The path {resolved.virtual} does not exist",
@@ -314,7 +314,7 @@ class LocalFilesystemMemoryStore:
 
     def rename(self, old_path: str, new_path: str) -> dict[str, Any]:
         source = self._resolve(old_path)
-        self._reject_root_operation(source.virtual, "rename")
+        self._reject_root_operation(source, "rename")
         if not source.path.exists():
             raise MemoryToolError(
                 f"The path {source.virtual} does not exist",
@@ -322,7 +322,7 @@ class LocalFilesystemMemoryStore:
                 retryable=True,
             )
         destination = self._resolve(new_path, for_write=True)
-        self._reject_root_operation(destination.virtual, "rename")
+        self._reject_root_operation(destination, "rename")
         if destination.path.exists():
             raise MemoryToolError(
                 f"The destination {destination.virtual} already exists",
@@ -589,10 +589,10 @@ class LocalFilesystemMemoryStore:
             ) from exc
 
     @staticmethod
-    def _reject_root_operation(virtual: str, operation: str) -> None:
-        if virtual == MEMORY_ROOT:
+    def _reject_root_operation(resolved: _ResolvedPath, operation: str) -> None:
+        if resolved.virtual == MEMORY_ROOT or not resolved.relative_parts:
             raise MemoryToolError(
-                f"Cannot {operation} the memory root",
+                f"Cannot {operation} the memory root: {resolved.virtual}",
                 code="memory_root_operation_rejected",
                 retryable=True,
             )

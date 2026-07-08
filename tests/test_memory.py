@@ -154,6 +154,29 @@ def test_local_memory_store_supports_multiple_mounts(tmp_path: Path) -> None:
     assert {entry["path"] for entry in root["entries"]} >= {"/memories/project", "/memories/user"}
 
 
+def test_local_memory_store_rejects_destructive_mount_root_operations(tmp_path: Path) -> None:
+    project = tmp_path / "project-memory"
+    user = tmp_path / "user-memory"
+    store = LocalFilesystemMemoryStore(
+        mounts={
+            "/memories/project": project,
+            "/memories/user": user,
+        }
+    )
+    store.create("/memories/project/progress.md", "done\n")
+    store.create("/memories/user/preferences.md", "short answers\n")
+
+    with pytest.raises(MemoryToolError) as mount_delete:
+        store.delete("/memories/project")
+    assert mount_delete.value.code == "memory_root_operation_rejected"
+    assert (project / "progress.md").exists()
+
+    with pytest.raises(MemoryToolError) as mount_rename:
+        store.rename("/memories/user", "/memories/project/user")
+    assert mount_rename.value.code == "memory_root_operation_rejected"
+    assert (user / "preferences.md").exists()
+
+
 def test_local_memory_store_searches_namespace_with_limit_and_filters(tmp_path: Path) -> None:
     store = LocalFilesystemMemoryStore(tmp_path / "memory")
     store.create("/memories/project/progress.md", "Alpha shipped\nbeta later\n")
