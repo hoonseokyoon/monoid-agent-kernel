@@ -278,6 +278,19 @@ def immediate_registry_tool_ids(
     return _registry_tool_ids_for_bindings(immediate_binding_ids, bound_catalog)
 
 
+def allowed_immediate_registry_tool_ids(
+    snapshot: ToolSurfaceSnapshot,
+    bound_catalog: Any,
+) -> frozenset[str]:
+    """Return immediate registry tool ids whose effective authorization is allow."""
+    allowed_binding_ids = {
+        tool.id
+        for tool in snapshot.immediate_tools
+        if (auth := snapshot.authorization_for(tool.id)) is not None and auth.decision == "allow"
+    }
+    return _registry_tool_ids_for_bindings(allowed_binding_ids, bound_catalog)
+
+
 def _registry_tool_ids_for_bindings(binding_ids: set[str], bound_catalog: Any) -> frozenset[str]:
     by_binding_id = getattr(bound_catalog, "by_binding_id", {})
     return frozenset(

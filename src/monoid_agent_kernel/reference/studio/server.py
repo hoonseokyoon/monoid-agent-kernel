@@ -55,6 +55,7 @@ from monoid_agent_kernel.core.prompt import compose_system_prompt
 from monoid_agent_kernel.core.tool_surface import (
     DefaultToolSurfaceResolver,
     ToolScope,
+    allowed_immediate_registry_tool_ids,
     immediate_registry_tool_ids,
 )
 from monoid_agent_kernel.core.workspace import Workspace
@@ -646,6 +647,7 @@ class StudioServer:
         turn_context = replace(
             turn_context,
             bound_tools=immediate_registry_tool_ids(surface, bound_catalog),
+            allowed_tools=allowed_immediate_registry_tool_ids(surface, bound_catalog),
         )
         static_system_prompt = compose_system_prompt(
             runtime_config.prompt.system_prompt_base or _SYSTEM_PROMPT,

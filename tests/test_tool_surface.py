@@ -11,6 +11,7 @@ from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_surface import (
     DefaultToolSurfaceResolver,
     ToolQuota,
+    allowed_immediate_registry_tool_ids,
     immediate_registry_tool_ids,
     visible_registry_tool_ids,
 )
@@ -54,6 +55,7 @@ def test_resolver_uses_bound_catalog_and_binding_authorization() -> None:
     assert snapshot.search_entries[0].binding_id == "gamma_search"
     assert visible_registry_tool_ids(snapshot, catalog) == frozenset({"alpha", "gamma"})
     assert immediate_registry_tool_ids(snapshot, catalog) == frozenset({"alpha"})
+    assert allowed_immediate_registry_tool_ids(snapshot, catalog) == frozenset()
 
 
 def test_resolver_hides_exhausted_quota_and_public_json_has_metadata() -> None:

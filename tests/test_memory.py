@@ -368,6 +368,26 @@ def test_memory_context_requires_authorized_read_surface(tmp_path: Path) -> None
         assert "Persistent memory is available under /memories" not in prompt
         assert "## Secret Index" not in prompt
 
+    ask_prompt = _first_prompt_with_memory_bindings(
+        tmp_path,
+        provider,
+        (ToolBinding.for_tool(MEMORY_VIEW_TOOL_ID, authorization="ask"),),
+    )
+    assert "Persistent memory is available under /memories" in ask_prompt
+    assert "## Secret Index" not in ask_prompt
+
+    approval_gated_provider = LocalFilesystemMemoryProvider(
+        tmp_path / "approval-gated-memory",
+        read_authorization="ask",
+    )
+    approval_gated_provider.store.create("/memories/MEMORY.md", "## Allowed Override Index\n")
+    allow_prompt = _first_prompt_with_memory_bindings(
+        tmp_path,
+        approval_gated_provider,
+        (ToolBinding.for_tool(MEMORY_VIEW_TOOL_ID, authorization="allow"),),
+    )
+    assert "## Allowed Override Index" in allow_prompt
+
 
 def test_memory_tool_results_return_structured_failures(tmp_path: Path) -> None:
     provider = LocalFilesystemMemoryProvider(tmp_path / "memory")

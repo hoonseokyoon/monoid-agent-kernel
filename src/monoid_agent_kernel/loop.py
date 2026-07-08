@@ -81,6 +81,7 @@ from monoid_agent_kernel.core.tool_surface import (
     ToolSearchEntry,
     ToolSurfaceResolver,
     ToolSurfaceSnapshot,
+    allowed_immediate_registry_tool_ids,
     immediate_registry_tool_ids,
 )
 from monoid_agent_kernel.core.tool_approval import (
@@ -2430,6 +2431,7 @@ class AgentLoop:
             turn_context = replace(
                 turn_context,
                 bound_tools=immediate_registry_tool_ids(surface_snapshot, bound_catalog),
+                allowed_tools=allowed_immediate_registry_tool_ids(surface_snapshot, bound_catalog),
             )
             dynamic_segment = self._dynamic_context_segment(res, turn_context)
             if surface_snapshot.delta_notice:
