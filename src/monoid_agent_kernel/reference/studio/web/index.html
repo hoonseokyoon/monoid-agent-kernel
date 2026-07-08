@@ -793,7 +793,12 @@ function handleEvent(ev) {
     refreshProposal();
     return;
   }
-  if (type === "task.started" && (data.kind === "hitl" || data.kind === "tool_approval")) { hideTyping(); renderHitl(data); return; }
+  if (type === "task.started" && (data.kind === "hitl" || data.kind === "tool_approval")) {
+    if (seq >= 0 && seq <= replayEventCursor) return;
+    hideTyping();
+    renderHitl(data);
+    return;
+  }
   if (type.indexOf("job.") === 0) { refreshJobs(); return; }
   if (type === "plan.updated") { renderPlan(data.items); return; }
   if (type === "subagent.started") { startSubagent(data); return; }
