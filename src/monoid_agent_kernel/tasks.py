@@ -526,6 +526,7 @@ class HostedTask:
     error: str = ""
     result: dict[str, Any] | None = None
     ready_for_reentry: bool = field(default=False, repr=False)
+    runtime_future: Any = field(default=None, repr=False, compare=False)
 
     @property
     def duration_s(self) -> float:
@@ -825,7 +826,7 @@ class SubagentTaskExecutor:
         # Run the child on the always-on job loop; the worker thread that called
         # start() (a tool handler offloaded via to_thread) is free to block on
         # wait() for a foreground spawn without stalling the loop.
-        manager.schedule_job_coroutine(self._arun(manager, task))
+        task.runtime_future = manager.schedule_job_coroutine(self._arun(manager, task))
         return task
 
     async def _arun(self, manager: TaskManager, task: HostedTask) -> None:
@@ -833,6 +834,9 @@ class SubagentTaskExecutor:
             await self.run_child(manager, task)
             if task.status == "running":
                 task.status = "answered"
+        except asyncio.CancelledError:
+            self._set_cancelled_result(task)
+            raise
         except Exception as exc:  # noqa: BLE001 - surface as a failed subagent result
             task.status = "failed"
             task.error = str(exc)
@@ -849,10 +853,20 @@ class SubagentTaskExecutor:
             manager.mark_ready(task)
 
     def cancel(self, manager: TaskManager, job: HostedTask) -> None:
-        del manager
+        if job.status == "running":
+            future = job.runtime_future
+            if future is not None and not future.done():
+                future.cancel()
+            else:
+                self._set_cancelled_result(job)
+                job.finished_at = time.time()
+                manager.mark_ready(job)
+
+    @staticmethod
+    def _set_cancelled_result(job: HostedTask) -> None:
         if job.status == "running":
             job.status = "cancelled"
-            job.finished_at = time.time()
+        if job.result is None:
             job.result = {
                 "type": "subagent_result",
                 "task_id": job.job_id,
@@ -1130,7 +1144,12 @@ class TaskManager:
             executor = self.executors.get(job.kind)
             if executor is not None:
                 executor.cancel(self, job)
-            if job.status != "running" and job.finished_at is not None and not job.ready_for_reentry:
+            if (
+                (executor is None or not executor.in_process)
+                and job.status != "running"
+                and job.finished_at is not None
+                and not job.ready_for_reentry
+            ):
                 self.mark_ready(job)
             self._condition.notify_all()
         return {"job_id": job_id, "cancel_requested": True, "status": job.status}

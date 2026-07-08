@@ -8,14 +8,16 @@ preserving.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from monoid_agent_kernel.core.events import AgentEvent
-from monoid_agent_kernel.tasks import BackgroundJob, TaskManager
+from monoid_agent_kernel.tasks import BackgroundJob, SubagentTaskExecutor, TaskManager
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.shell import ShellExecutionOptions
@@ -182,6 +184,52 @@ def test_mark_ready_is_idempotent_for_cancelled_task(tmp_path: Path) -> None:
         if event.type == "task.cancelled" and event.data["task_id"] == task.job_id
     ]
     assert len(cancelled_events) == 1
+
+
+def test_subagent_cancel_waits_for_child_coroutine_to_stop_before_reentry(tmp_path: Path) -> None:
+    manager, _recorder, sink = _manager(tmp_path)
+    started = threading.Event()
+    cancellation_seen = threading.Event()
+
+    async def run_child(_manager: TaskManager, _task) -> None:
+        started.set()
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await asyncio.sleep(0.2)
+            raise
+
+    manager.executors["subagent"] = SubagentTaskExecutor(run_child=run_child)
+    manager.injectors["subagent"] = manager.injectors["hitl"]
+    task = manager.executors["subagent"].start(
+        manager,
+        definition_id="reviewer",
+        prompt="keep working",
+        background=True,
+    )
+
+    try:
+        assert started.wait(timeout=2)
+        result = manager.cancel(task.job_id)
+
+        assert result["cancel_requested"] is True
+        assert cancellation_seen.wait(timeout=2)
+        assert task.ready_for_reentry is False
+        assert manager.pop_reentry_observations() == []
+
+        manager.wait(task.job_id, timeout_s=5)
+
+        assert task.status == "cancelled"
+        assert task.ready_for_reentry is True
+        assert task.result is not None and task.result["status"] == "cancelled"
+        observations = manager.pop_reentry_observations()
+        assert observations
+        assert observations[0].output["status"] == "cancelled"
+        assert any(event.type == "task.cancelled" and event.data["task_id"] == task.job_id for event in sink.events)
+    finally:
+        manager._shutdown_task_loop()
 
 
 def test_non_resume_job_is_not_offered_for_reentry(tmp_path: Path) -> None:

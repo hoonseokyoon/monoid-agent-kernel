@@ -11,6 +11,7 @@ from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_surface import (
     DefaultToolSurfaceResolver,
     ToolQuota,
+    ToolScope,
     allowed_immediate_registry_tool_ids,
     immediate_registry_tool_ids,
     visible_registry_tool_ids,
@@ -78,6 +79,40 @@ def test_resolver_hides_exhausted_quota_and_public_json_has_metadata() -> None:
     assert public["hidden_binding_ids"] == ["fs.read"]
     assert public["authorizations"]["fs.read"]["decision"] == "deny"
     assert public["surface_warnings"]
+
+
+def test_public_tool_surface_redacts_authorization_runtime_and_scope() -> None:
+    registry = ToolRegistry()
+    registry.register_many((_simple_tool("web.search", capability="web.search"),))
+    config = runtime_config(
+        bindings=(
+            tool_binding(
+                "web.search",
+                runtime={"web": {"token": "secret-provider-token"}},
+                scope=ToolScope(allowed_domains=("private.example",)),
+            ),
+        )
+    )
+    catalog = compile_bound_tool_catalog(config, registry)
+
+    snapshot = DefaultToolSurfaceResolver().resolve(bound_catalog=catalog, turn=type("Turn", (), {"turn_id": "t1"})())
+    public = snapshot.to_public_json()
+    auth = public["authorizations"]["web.search"]
+
+    assert auth == {
+        "tool_id": "web.search",
+        "binding_id": "web.search",
+        "model_name": "web_search",
+        "decision": "allow",
+        "reason": "allow_by_tool_binding",
+        "exposure": "immediate",
+    }
+    dumped = json.dumps(public)
+    assert "secret-provider-token" not in dumped
+    assert "private.example" not in dumped
+    assert "runtime" not in auth
+    assert "scope" not in auth
+    assert "surface_scope" not in auth
 
 
 def test_search_entries_include_grouping_metadata_and_defaults() -> None:

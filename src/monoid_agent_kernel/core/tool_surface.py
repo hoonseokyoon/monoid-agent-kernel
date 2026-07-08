@@ -208,6 +208,16 @@ class ToolSurfaceSnapshot:
         return self.authorizations.get(binding_id)
 
     def to_public_json(self) -> dict[str, Any]:
+        def _authorization_payload(authorization: ToolAuthorization) -> dict[str, Any]:
+            return {
+                "tool_id": authorization.tool_id,
+                "binding_id": authorization.binding_id,
+                "model_name": authorization.model_name,
+                "decision": authorization.decision,
+                "reason": authorization.reason,
+                "exposure": authorization.exposure,
+            }
+
         def _tool_payload(tool: ToolSpec) -> dict[str, Any]:
             auth = self.authorizations.get(tool.id)
             return {
@@ -233,7 +243,7 @@ class ToolSurfaceSnapshot:
             "hidden_count": len(self.hidden_tool_ids),
             "hidden_binding_ids": list(self.hidden_tool_ids),
             "authorizations": {
-                binding_id: authorization.to_json()
+                binding_id: _authorization_payload(authorization)
                 for binding_id, authorization in sorted(self.authorizations.items())
             },
             "delta_notice": self.delta_notice,
