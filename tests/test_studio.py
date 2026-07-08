@@ -234,7 +234,16 @@ def test_studio_settings_hot_swap_preserves_run_profiles(tmp_path: Path) -> None
         assert profile_config.model is not None
         assert profile_config.model.model == "gpt-profile"
         assert "PROFILE_SENTINEL" in profile_config.prompt.system_prompt_base
-        assert {binding.ref.tool_id for binding in profile_config.tools} == {"run.update_plan", "fs.read"}
+        assert {binding.ref.tool_id for binding in profile_config.tools} == {
+            "fs.glob",
+            "fs.list",
+            "fs.read",
+            "fs.read_media",
+            "fs.stat",
+            "fs.tree",
+            "run.update_plan",
+            "text.search",
+        }
         assert default_config.model is not None
         assert default_config.model.model == "gpt-global"
         assert "fs.write" in {binding.ref.tool_id for binding in default_config.tools}
@@ -297,7 +306,20 @@ def test_subagent_events_uses_root_ancestor_token_for_nested_child(tmp_path: Pat
 def test_runtime_config_binds_read_write_hitl_shell_and_web() -> None:
     config = _agent_runtime_config()
     refs = {binding.ref.tool_id for binding in config.tools}
-    assert {"fs.read", "fs.write", "hitl.request", "shell.exec", "web.search", "web.context"} <= refs
+    assert {
+        "fs.read",
+        "fs.list",
+        "text.search",
+        "fs.write",
+        "fs.patch",
+        "fs.delete",
+        "hitl.request",
+        "shell.exec",
+        "job.status",
+        "web.search",
+        "web.context",
+        "artifact.emit",
+    } <= refs
     # The plan tool is always bound (observability) and the prompt nudges its use.
     assert "run.update_plan" in refs
     assert config.prompt.system_prompt_base and "run_update_plan" in config.prompt.system_prompt_base

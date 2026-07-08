@@ -81,6 +81,8 @@ from monoid_agent_kernel.core.tool_surface import (
     ToolSearchEntry,
     ToolSurfaceResolver,
     ToolSurfaceSnapshot,
+    allowed_immediate_registry_tool_ids,
+    immediate_registry_tool_ids,
 )
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
@@ -107,6 +109,7 @@ from monoid_agent_kernel.errors import (
     ToolExecutionError,
     TurnInterrupted,
     TurnPaused,
+    WorkspaceError,
     error_code_for_exception,
 )
 from monoid_agent_kernel.identifiers import namespaced_id
@@ -277,23 +280,29 @@ class AgentToolContext(ToolContext):
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
     ) -> dict[str, Any]:
-        del metadata
         data, _digest = self.workspace.read_bytes(path)
         artifact = self.recorder.emit_artifact_bytes(
             workspace_path=self.workspace.normalize(path),
             content=data,
             kind=kind,
             label=label,
+            metadata=metadata,
         )
         self.recorder.emit(
             "artifact.emitted",
-            data={"artifact_id": artifact.artifact_id, "path": artifact.path, "kind": kind},
+            data={
+                "artifact_id": artifact.artifact_id,
+                "path": artifact.path,
+                "kind": kind,
+                "metadata": dict(artifact.metadata),
+            },
         )
         return {
             "artifact_id": artifact.artifact_id,
             "path": artifact.path,
             "kind": artifact.kind,
             "label": artifact.label,
+            "metadata": dict(artifact.metadata),
         }
 
     def list_artifacts(self) -> list[dict[str, Any]]:
@@ -303,9 +312,24 @@ class AgentToolContext(ToolContext):
                 "path": artifact.path,
                 "kind": artifact.kind,
                 "label": artifact.label,
+                "metadata": dict(artifact.metadata),
             }
             for artifact in self.recorder.artifacts
         ]
+
+    def path_allowed(self, path: str, operation: str = "read") -> bool:
+        try:
+            rel = self.workspace.normalize(path)
+            permission_operation = operation if operation in {"read", "write", "artifact", "run"} else "read"
+            self.permission_policy.check_paths(permission_operation, (rel,))  # type: ignore[arg-type]
+            scope = self._current_call.scope
+            if scope.allowed_paths and not matches_path_patterns(rel, scope.allowed_paths):
+                return False
+            if scope.denied_paths and matches_path_patterns(rel, scope.denied_paths):
+                return False
+            return True
+        except (PermissionDenied, WorkspaceError, ValueError):
+            return False
 
     def update_plan(self, items: list[dict[str, Any]]) -> None:
         self.plan = items
@@ -2277,9 +2301,9 @@ class AgentLoop:
             runtime_config = self._current_runtime_config(turn_registry)
             side_effect_policy = side_effect_policy_from_config(runtime_config)
             bound_catalog = compile_bound_tool_catalog(runtime_config, turn_registry)
-            # Now that the active tool set for this turn is known, expose it on the turn context so
-            # a context provider's dynamic_segment can gate itself on the live config (e.g. the
-            # Skills catalog tracks the skill tool binding across a hot-swap).
+            # Expose the runtime-bound candidate set while the surface resolver runs. After
+            # authorization, exposure, and quota filtering, this is replaced with the visible
+            # surface's registry tool ids before context providers see the turn.
             turn_context = replace(
                 turn_context, bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools)
             )
@@ -2291,10 +2315,11 @@ class AgentLoop:
                 turn_id=turn_id,
                 parent_id=turn_started.event_id,
             )
+            pending_binding_loads = state.pending_binding_loads
             surface_snapshot = self.tool_surface_resolver.resolve(
                 bound_catalog=bound_catalog,
                 turn=turn_context,
-                pending_binding_loads=state.pending_binding_loads,
+                pending_binding_loads=pending_binding_loads,
                 previous_snapshot=state.previous_surface_snapshot,
                 call_counts=state.tool_call_counts,
             )
@@ -2319,6 +2344,7 @@ class AgentLoop:
             )
             state.previous_surface_snapshot = surface_snapshot
             state.pending_binding_loads = ()
+            call_counts_before_replays = dict(state.tool_call_counts)
             # Auto-redispatch (⑤): run any gated calls whose capability was just granted, now that
             # this turn's context (catalog/surface/turn_id) exists. Each goes through the normal
             # _execute_tool_call (real permission/quota/events); the result is injected as a
@@ -2374,6 +2400,39 @@ class AgentLoop:
                 )
                 if replay_obs:
                     state.pending_observations = (*state.pending_observations, *replay_obs)
+            # Replays run before the model request. If they consumed quota, rebuild the
+            # model-facing surface so context providers and tools see the post-replay limits.
+            if state.tool_call_counts != call_counts_before_replays:
+                refreshed_surface_snapshot = self.tool_surface_resolver.resolve(
+                    bound_catalog=bound_catalog,
+                    turn=turn_context,
+                    pending_binding_loads=pending_binding_loads,
+                    previous_snapshot=surface_snapshot,
+                    call_counts=state.tool_call_counts,
+                )
+                if not refreshed_surface_snapshot.turn_id:
+                    refreshed_surface_snapshot = replace(refreshed_surface_snapshot, turn_id=turn_id)
+                context.configure_tool_search(
+                    refreshed_surface_snapshot.search_entries,
+                    runtime_config.tool_search.top_k,
+                )
+                if refreshed_surface_snapshot.surface_hash != surface_snapshot.surface_hash:
+                    snapshot_payload = refreshed_surface_snapshot.to_transcript_json()
+                    snapshot_payload["step"] = step
+                    recorder.transcript(snapshot_payload)
+                    recorder.emit(
+                        "tool.surface.updated",
+                        turn_id=turn_id,
+                        parent_id=turn_started.event_id,
+                        data=refreshed_surface_snapshot.to_public_json(),
+                    )
+                    state.previous_surface_snapshot = refreshed_surface_snapshot
+                surface_snapshot = refreshed_surface_snapshot
+            turn_context = replace(
+                turn_context,
+                bound_tools=immediate_registry_tool_ids(surface_snapshot, bound_catalog),
+                allowed_tools=allowed_immediate_registry_tool_ids(surface_snapshot, bound_catalog),
+            )
             dynamic_segment = self._dynamic_context_segment(res, turn_context)
             if surface_snapshot.delta_notice:
                 dynamic_segment = (

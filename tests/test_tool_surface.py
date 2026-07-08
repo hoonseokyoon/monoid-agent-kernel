@@ -8,7 +8,13 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import compile_bound_tool_catalog
 from monoid_agent_kernel.core.spec import AgentRunSpec
-from monoid_agent_kernel.core.tool_surface import DefaultToolSurfaceResolver, ToolQuota
+from monoid_agent_kernel.core.tool_surface import (
+    DefaultToolSurfaceResolver,
+    ToolQuota,
+    allowed_immediate_registry_tool_ids,
+    immediate_registry_tool_ids,
+    visible_registry_tool_ids,
+)
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -47,6 +53,31 @@ def test_resolver_uses_bound_catalog_and_binding_authorization() -> None:
     assert snapshot.authorization_for("alpha_read").decision == "ask"  # type: ignore[union-attr]
     assert "beta_hidden" in snapshot.hidden_tool_ids
     assert snapshot.search_entries[0].binding_id == "gamma_search"
+    assert visible_registry_tool_ids(snapshot, catalog) == frozenset({"alpha", "gamma"})
+    assert immediate_registry_tool_ids(snapshot, catalog) == frozenset({"alpha"})
+    assert allowed_immediate_registry_tool_ids(snapshot, catalog) == frozenset()
+
+
+def test_resolver_hides_exhausted_quota_and_public_json_has_metadata() -> None:
+    registry = ToolRegistry()
+    registry.register_many((_simple_tool("fs.read", capability="fs.read"),))
+    config = runtime_config(
+        bindings=(tool_binding("fs.read", quota=ToolQuota(max_calls_per_run=1), guidance="Read files."),)
+    )
+    catalog = compile_bound_tool_catalog(config, registry)
+
+    snapshot = DefaultToolSurfaceResolver().resolve(
+        bound_catalog=catalog,
+        turn=type("Turn", (), {"turn_id": "t1"})(),
+        call_counts={"fs.read": 1},
+    )
+    public = snapshot.to_public_json()
+
+    assert "fs.read" in snapshot.hidden_tool_ids
+    assert snapshot.authorization_for("fs.read").reason == "quota_exhausted"  # type: ignore[union-attr]
+    assert public["hidden_binding_ids"] == ["fs.read"]
+    assert public["authorizations"]["fs.read"]["decision"] == "deny"
+    assert public["surface_warnings"]
 
 
 def test_search_entries_include_grouping_metadata_and_defaults() -> None:

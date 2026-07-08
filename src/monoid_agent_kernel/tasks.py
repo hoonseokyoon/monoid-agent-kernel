@@ -159,6 +159,7 @@ class BackgroundJob:
         return {
             "schema_version": namespaced_id("background-job.v1"),
             "job_id": self.job_id,
+            "kind": self.kind,
             "command": self.command,
             "command_preview": self.command_preview,
             "cwd": self.cwd,
@@ -226,6 +227,7 @@ class BackgroundJob:
         return {
             "type": "background_job_result",
             "job_id": self.job_id,
+            "kind": self.kind,
             "command_preview": self.command_preview,
             "status": self.status,
             "exit_code": self.exit_code,
@@ -349,7 +351,7 @@ class ShellTaskExecutor:
                 raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
             if not cwd_abs.exists() or not cwd_abs.is_dir():
                 raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
-            return cwd_abs, None, None
+            return cwd_abs, None, _changed_entry_fingerprints(manager.workspace)
 
         tmp_root = Path(tempfile.mkdtemp(prefix="monoid-shell-job-")).resolve()
         before = shell_runtime.materialize_workspace(manager.workspace, tmp_root, manager.permission_policy)
@@ -400,7 +402,9 @@ class ShellTaskExecutor:
                     changed = shell_runtime.sync_workspace_changes(manager.workspace, job.before_snapshot, after)
                     job.changed_paths = tuple(changed)
                 elif job.execution_workspace == "direct":
-                    job.changed_paths = tuple(manager.workspace.changed_paths())
+                    before = job.before_snapshot if isinstance(job.before_snapshot, dict) else {}
+                    after = _changed_entry_fingerprints(manager.workspace)
+                    job.changed_paths = tuple(_changed_entry_delta(before, after))
         except Exception as exc:
             job.status = "failed"
             job.error = str(exc)
@@ -695,6 +699,12 @@ class HostedTaskExecutor:
         if job.status == "running":
             job.status = "cancelled"
             job.finished_at = time.time()
+            job.result = {
+                "type": f"{job.kind}_result",
+                "task_id": job.job_id,
+                "status": "cancelled",
+                "message": f"{job.kind} task {job.job_id} was cancelled.",
+            }
 
 
 @dataclass
@@ -843,6 +853,12 @@ class SubagentTaskExecutor:
         if job.status == "running":
             job.status = "cancelled"
             job.finished_at = time.time()
+            job.result = {
+                "type": "subagent_result",
+                "task_id": job.job_id,
+                "status": "cancelled",
+                "message": f"subagent task {job.job_id} was cancelled.",
+            }
 
 
 Task = BackgroundJob | HostedTask
@@ -1033,8 +1049,10 @@ class TaskManager:
 
         Called by the in-process shell monitor and (for hosted kinds) by an
         external reporter that has already set ``status``/``result``/``finished_at``."""
-        job.ready_for_reentry = True
         with self._condition:
+            if job.ready_for_reentry:
+                return
+            job.ready_for_reentry = True
             self._write_job(job)
             self._emit_terminal_event(job)
             if job.resume_on_exit:
@@ -1112,6 +1130,8 @@ class TaskManager:
             executor = self.executors.get(job.kind)
             if executor is not None:
                 executor.cancel(self, job)
+            if job.status != "running" and job.finished_at is not None and not job.ready_for_reentry:
+                self.mark_ready(job)
             self._condition.notify_all()
         return {"job_id": job_id, "cancel_requested": True, "status": job.status}
 
@@ -1247,6 +1267,28 @@ class TaskManager:
 
     def _write_job(self, job: BackgroundJob) -> None:
         write_json_atomic(job.job_path, job.to_json(self.recorder.run_dir))
+
+
+def _changed_entry_fingerprints(workspace: Workspace) -> dict[str, tuple[object, ...]]:
+    return {
+        entry.path: (
+            entry.kind,
+            entry.size,
+            entry.sha256,
+            entry.base_sha256,
+            entry.proposed_sha256,
+            entry.change_kind,
+        )
+        for entry in workspace.changed_entries()
+    }
+
+
+def _changed_entry_delta(
+    before: dict[str, tuple[object, ...]],
+    after: dict[str, tuple[object, ...]],
+) -> list[str]:
+    paths = set(before) | set(after)
+    return sorted(path for path in paths if before.get(path) != after.get(path))
 
 
 def list_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:

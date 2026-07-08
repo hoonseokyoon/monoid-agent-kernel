@@ -43,6 +43,9 @@ class TurnContext:
     # Lets a dynamic_segment gate itself on what's actually available now — the seam that makes
     # a provider's context hot-swappable with the config. Empty by default (back-compat).
     bound_tools: frozenset[str] = frozenset()
+    # Registry tool ids that are immediately callable without approval. None means the caller
+    # did not provide authorization-aware data, preserving older provider tests and embedders.
+    allowed_tools: frozenset[str] | None = None
 
 
 class ContextProvider(Protocol):

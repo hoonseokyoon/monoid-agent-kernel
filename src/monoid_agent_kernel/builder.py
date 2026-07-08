@@ -18,6 +18,7 @@ from monoid_agent_kernel.subagent_loader import load_subagent_definitions
 from monoid_agent_kernel.tool_loader import load_tool_provider
 from monoid_agent_kernel.tools.base import ToolRegistry, ToolSpec
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool
+from monoid_agent_kernel.tools.defaults import default_tool_bindings
 from monoid_agent_kernel.tools.tool_ids import list_builtin_tools
 
 
@@ -293,6 +294,11 @@ def _tool_payload(spec: ToolSpec, binding_ids: tuple[str, ...]) -> dict[str, Any
 
 
 def _default_runtime_config() -> dict[str, Any]:
+    default_bindings = [
+        *(binding.to_json() for binding in default_tool_bindings("read")),
+        *(binding.to_json() for binding in default_tool_bindings("write")),
+        ToolBinding.for_tool("run.finish", binding_id="finish", model_name="finish").to_json(),
+    ]
     return {
         "definition_id": "builder-agent",
         "config_version": 1,
@@ -306,15 +312,7 @@ def _default_runtime_config() -> dict[str, Any]:
             "persona_segments": ["Work directly in the workspace and keep changes focused."],
             "runtime_segments": [],
         },
-        "tools": [
-            {"binding_id": "read_file", "model_name": "read_file", "ref": {"kind": "registry", "tool_id": "fs.read"}},
-            {
-                "binding_id": "write_file",
-                "model_name": "write_file",
-                "ref": {"kind": "registry", "tool_id": "fs.write"},
-            },
-            {"binding_id": "finish", "model_name": "finish", "ref": {"kind": "registry", "tool_id": "run.finish"}},
-        ],
+        "tools": default_bindings,
         "tool_search": {"enabled": True, "top_k": 5},
     }
 

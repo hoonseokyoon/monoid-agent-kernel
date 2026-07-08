@@ -224,7 +224,10 @@ def _shell_options_from_call(call: CallContext) -> ShellExecutionOptions:
     shell_runtime = runtime.get("shell", runtime) if isinstance(runtime, dict) else {}
     if not isinstance(shell_runtime, dict):
         shell_runtime = {}
-    command_rules = tuple(
+    runtime_payload = dict(shell_runtime)
+    runtime_payload["enabled"] = bool(runtime_payload.get("enabled", True))
+    runtime_options = ShellExecutionOptions.from_json(runtime_payload)
+    scoped_command_rules = tuple(
         ShellCommandRule(action="allow", prefix=prefix)
         for prefix in call.scope.command_allow_prefixes
     ) + tuple(
@@ -232,19 +235,25 @@ def _shell_options_from_call(call: CallContext) -> ShellExecutionOptions:
         for prefix in call.scope.command_deny_prefixes
     )
     return ShellExecutionOptions(
-        enabled=True,
-        approval_mode=str(shell_runtime.get("approval_mode") or "backend"),  # type: ignore[arg-type]
-        shell=str(shell_runtime.get("shell") or "auto"),  # type: ignore[arg-type]
-        default_timeout_s=int(shell_runtime.get("default_timeout_s", 120)),
-        max_timeout_s=int(shell_runtime.get("max_timeout_s", 900)),
-        default_startup_wait_s=int(shell_runtime.get("default_startup_wait_s", 0)),
-        max_startup_wait_s=int(shell_runtime.get("max_startup_wait_s", 30)),
-        default_max_output_bytes=int(shell_runtime.get("default_max_output_bytes", 100_000)),
-        max_output_bytes=int(shell_runtime.get("max_output_bytes", 1_000_000)),
-        execution_workspace=str(shell_runtime.get("execution_workspace") or "auto"),  # type: ignore[arg-type]
-        env_allowlist=call.scope.env_allowlist,
-        command_rules=command_rules,
+        enabled=runtime_options.enabled,
+        approval_mode=runtime_options.approval_mode,
+        shell=runtime_options.shell,
+        default_timeout_s=runtime_options.default_timeout_s,
+        max_timeout_s=runtime_options.max_timeout_s,
+        default_startup_wait_s=runtime_options.default_startup_wait_s,
+        max_startup_wait_s=runtime_options.max_startup_wait_s,
+        default_max_output_bytes=runtime_options.default_max_output_bytes,
+        max_output_bytes=runtime_options.max_output_bytes,
+        cwd_root=runtime_options.cwd_root,
+        execution_workspace=runtime_options.execution_workspace,
+        env_allowlist=_dedupe((*runtime_options.env_allowlist, *call.scope.env_allowlist)),
+        inherit_env_allowlist=runtime_options.inherit_env_allowlist,
+        command_rules=(*runtime_options.command_rules, *scoped_command_rules),
     ).validated()
+
+
+def _dedupe(items: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(items))
 
 
 def _approval_provider_for_options(options: ShellExecutionOptions) -> ShellApprovalProvider | None:

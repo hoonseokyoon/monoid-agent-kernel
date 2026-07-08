@@ -234,6 +234,7 @@ class AgentRecorder:
         content: bytes,
         kind: str,
         label: str | None,
+        metadata: dict[str, Any] | None = None,
     ) -> AgentArtifact:
         artifact_id = f"artifact_{len(self.artifacts) + 1:04d}"
         target = self.artifacts_dir / artifact_id / Path(workspace_path).name
@@ -244,6 +245,7 @@ class AgentRecorder:
             path=str(target.relative_to(self.run_dir).as_posix()),
             kind=kind,
             label=label,
+            metadata=dict(metadata or {}),
         )
         self.artifacts.append(artifact)
         return artifact
