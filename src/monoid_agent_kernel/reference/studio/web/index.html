@@ -793,7 +793,7 @@ function handleEvent(ev) {
     refreshProposal();
     return;
   }
-  if (type === "task.started" && data.kind === "hitl") { hideTyping(); renderHitl(data); return; }
+  if (type === "task.started" && (data.kind === "hitl" || data.kind === "tool_approval")) { hideTyping(); renderHitl(data); return; }
   if (type.indexOf("job.") === 0) { refreshJobs(); return; }
   if (type === "plan.updated") { renderPlan(data.items); return; }
   if (type === "subagent.started") { startSubagent(data); return; }
@@ -1164,11 +1164,20 @@ async function showJobLogs(jobId) {
 function renderHitl(data) {
   const taskId = data.task_id;
   const choices = (Array.isArray(data.choices) && data.choices.length) ? data.choices : ["Approve", "Deny"];
+  const request = data.request || {};
   const card = document.createElement("div");
   card.className = "hitl";
   const q = document.createElement("div");
   q.className = "q";
-  const prompt = (data.prompt || "Approve this action?")
+  let promptText = data.prompt || request.prompt || "Approve this action?";
+  if (data.kind === "tool_approval") {
+    const callName = request.call_name || request.model_name || request.tool_id || "tool call";
+    promptText = request.prompt || ("Approve tool call " + callName);
+    if (request.arguments_preview) {
+      promptText += "\n" + JSON.stringify(request.arguments_preview, null, 2);
+    }
+  }
+  const prompt = promptText
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   q.innerHTML = "<b>The agent needs your approval</b>\n" + prompt;
   card.appendChild(q);

@@ -106,6 +106,8 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
     assert "if (seq >= 0 && seq <= replayEventCursor) return;" in html
     assert 'if (type === "turn.failed") return true;' in html
     assert 'source.event_type === "turn.failed"' in html
+    assert 'data.kind === "hitl" || data.kind === "tool_approval"' in html
+    assert "arguments_preview" in html
 
 
 def test_settings_page_serves_static_test_hooks(studio: StudioServer) -> None:
