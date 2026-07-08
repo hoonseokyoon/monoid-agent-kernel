@@ -779,7 +779,10 @@ function handleEvent(ev) {
     if (activeSidePanel === "trace-panel") renderTrace();
   }
   if (projectedChatReplay(type, data, seq)) return;
-  if (ev.studio_activity) { hideTyping(); activity(ev.studio_activity); return; }
+  if (ev.studio_activity) {
+    if (seq >= 0 && seq <= replayEventCursor) return;
+    hideTyping(); activity(ev.studio_activity); return;
+  }
   if (type === "proposal.ready" || type === "workspace.diff.updated" || type === "workspace.proposal.updated") {
     refreshProposal();
     return;
