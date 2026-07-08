@@ -194,8 +194,9 @@ class LocalFilesystemMemoryStore:
         virtual = _normalize_memory_path(path)
         resolved = self._resolve_if_mounted(virtual)
         if resolved is None:
-            if virtual == MEMORY_ROOT:
-                return self._view_virtual_root()
+            virtual_view = self._view_virtual_namespace(virtual)
+            if virtual_view is not None:
+                return virtual_view
             raise MemoryToolError(
                 f"Memory path is not mounted: {virtual}",
                 code="memory_path_unmounted",
@@ -407,22 +408,30 @@ class LocalFilesystemMemoryStore:
             )
         return _ResolvedPath(virtual, mount, relative_parts, resolved_candidate)
 
-    def _view_virtual_root(self) -> dict[str, Any]:
+    def _view_virtual_namespace(self, virtual: str) -> dict[str, Any] | None:
+        mounts = [
+            mount
+            for mount in sorted(self._mounts, key=lambda item: item.virtual)
+            if _is_virtual_child(virtual, mount.virtual)
+        ]
+        if not mounts:
+            return None
         entries: dict[str, dict[str, Any]] = {
-            MEMORY_ROOT: {"path": MEMORY_ROOT, "kind": "dir", "size": 0}
+            virtual: {"path": virtual, "kind": "dir", "size": 0}
         }
-        for mount in sorted(self._mounts, key=lambda item: item.virtual):
-            child = _first_child_under_root(mount.virtual)
-            entries[child] = {
-                "path": child,
-                "kind": "dir",
-                "size": _tree_size(mount.root),
-            }
+        for mount in mounts:
+            child = _first_child_under(mount.virtual, virtual)
+            size = _tree_size(mount.root)
+            entries[virtual]["size"] += size
+            if child in entries:
+                entries[child]["size"] += size
+            else:
+                entries[child] = {"path": child, "kind": "dir", "size": size}
         return {
             "operation": "view",
-            "path": MEMORY_ROOT,
+            "path": virtual,
             "status": "ok",
-            "message": f"Listed memory directory: {MEMORY_ROOT}",
+            "message": f"Listed memory directory: {virtual}",
             "entries": list(entries.values()),
         }
 
@@ -992,11 +1001,14 @@ def _is_within(root: Path, candidate: Path) -> bool:
         return False
 
 
-def _first_child_under_root(virtual: str) -> str:
-    parts = virtual.strip("/").split("/")
-    if len(parts) <= 1:
-        return MEMORY_ROOT
-    return "/" + "/".join(parts[:2])
+def _is_virtual_child(parent: str, child: str) -> bool:
+    return child.startswith(parent.rstrip("/") + "/")
+
+
+def _first_child_under(virtual: str, parent: str) -> str:
+    suffix = virtual.removeprefix(parent.rstrip("/") + "/")
+    first_part = suffix.split("/", 1)[0]
+    return _join_virtual(parent, first_part)
 
 
 def _join_virtual(base: str, child: str) -> str:

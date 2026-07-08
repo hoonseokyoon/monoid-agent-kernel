@@ -159,6 +159,21 @@ def test_local_memory_store_supports_multiple_mounts(tmp_path: Path) -> None:
     assert {entry["path"] for entry in root["entries"]} >= {"/memories/project", "/memories/user"}
 
 
+def test_local_memory_store_views_nested_mount_virtual_parents(tmp_path: Path) -> None:
+    project = tmp_path / "team-project-memory"
+    store = LocalFilesystemMemoryStore(mounts={"/memories/team/project": project})
+    store.create("/memories/team/project/progress.md", "nested\n")
+
+    root = store.view("/memories")
+    assert {entry["path"] for entry in root["entries"]} == {"/memories", "/memories/team"}
+
+    team = store.view("/memories/team")
+    assert {entry["path"] for entry in team["entries"]} == {"/memories/team", "/memories/team/project"}
+
+    viewed = store.view("/memories/team/project/progress.md")
+    assert "     1\tnested" in viewed["content"]
+
+
 def test_local_memory_store_rejects_destructive_mount_root_operations(tmp_path: Path) -> None:
     project = tmp_path / "project-memory"
     user = tmp_path / "user-memory"
