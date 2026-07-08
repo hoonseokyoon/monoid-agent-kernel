@@ -220,6 +220,25 @@ def test_local_memory_store_searches_namespace_with_limit_and_filters(tmp_path: 
     limited = store.search("alpha", limit=1)
     assert limited["count"] == 1
 
+    root_memory = tmp_path / "root-memory"
+    nested_memory = tmp_path / "nested-memory"
+    overlapping = LocalFilesystemMemoryStore(
+        mounts={
+            "/memories": root_memory,
+            "/memories/project": nested_memory,
+        }
+    )
+    overlapping.create("/memories/root.md", "alpha root\n")
+    overlapping.create("/memories/project/progress.md", "alpha nested\n")
+    (root_memory / "project").mkdir()
+    (root_memory / "project" / "shadow.md").write_text("alpha shadow\n", encoding="utf-8")
+
+    aggregate = overlapping.search("alpha")
+    assert {match["path"] for match in aggregate["matches"]} == {
+        "/memories/root.md",
+        "/memories/project/progress.md",
+    }
+
 
 def test_memory_provider_tools_bindings_and_context_gate(tmp_path: Path) -> None:
     provider = LocalFilesystemMemoryProvider(tmp_path / "memory")

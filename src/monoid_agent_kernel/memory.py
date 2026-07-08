@@ -409,11 +409,7 @@ class LocalFilesystemMemoryStore:
         return _ResolvedPath(virtual, mount, relative_parts, resolved_candidate)
 
     def _view_virtual_namespace(self, virtual: str) -> dict[str, Any] | None:
-        mounts = [
-            mount
-            for mount in sorted(self._mounts, key=lambda item: item.virtual)
-            if _is_virtual_child(virtual, mount.virtual)
-        ]
+        mounts = self._child_mounts(virtual)
         if not mounts:
             return None
         entries: dict[str, dict[str, Any]] = {
@@ -503,24 +499,33 @@ class LocalFilesystemMemoryStore:
         }
 
     def _search_roots(self, virtual: str) -> tuple[_ResolvedPath, ...]:
+        child_mounts = self._child_mounts(virtual)
+        roots: list[_ResolvedPath] = []
         resolved = self._resolve_if_mounted(virtual)
         if resolved is not None:
             if not resolved.path.exists():
+                if child_mounts:
+                    return tuple(_ResolvedPath(mount.virtual, mount, (), mount.root) for mount in child_mounts)
                 raise MemoryToolError(
                     f"The path {virtual} does not exist. Please provide a valid namespace.",
                     code="memory_path_not_found",
                     retryable=True,
                 )
-            return (resolved,)
-        if virtual == MEMORY_ROOT:
-            return tuple(
-                _ResolvedPath(mount.virtual, mount, (), mount.root)
-                for mount in sorted(self._mounts, key=lambda item: item.virtual)
-            )
+            roots.append(resolved)
+        roots.extend(_ResolvedPath(mount.virtual, mount, (), mount.root) for mount in child_mounts)
+        if roots:
+            return tuple(roots)
         raise MemoryToolError(
             f"Memory namespace is not mounted: {virtual}",
             code="memory_path_unmounted",
             retryable=True,
+        )
+
+    def _child_mounts(self, virtual: str) -> tuple[_Mount, ...]:
+        return tuple(
+            mount
+            for mount in sorted(self._mounts, key=lambda item: item.virtual)
+            if mount.virtual != virtual and _is_virtual_child(virtual, mount.virtual)
         )
 
     def _iter_search_files(
@@ -535,15 +540,19 @@ class LocalFilesystemMemoryStore:
             return
         if not resolved.path.is_dir():
             return
+        child_mounts = self._child_mounts(resolved.virtual)
         for item in sorted(resolved.path.rglob("*"), key=lambda child: child.as_posix()):
             if item.is_symlink() or not item.is_file():
                 continue
             rel = item.relative_to(resolved.path)
+            virtual = _join_virtual(resolved.virtual, rel.as_posix())
+            if _is_shadowed_by_mount(virtual, child_mounts):
+                continue
             if any(part.startswith(".") or part == "node_modules" for part in rel.parts):
                 continue
             if not _search_file_selected(rel.as_posix(), file_glob):
                 continue
-            yield _join_virtual(resolved.virtual, rel.as_posix()), item
+            yield virtual, item
 
     def _search_file(
         self,
@@ -1003,6 +1012,10 @@ def _is_within(root: Path, candidate: Path) -> bool:
 
 def _is_virtual_child(parent: str, child: str) -> bool:
     return child.startswith(parent.rstrip("/") + "/")
+
+
+def _is_shadowed_by_mount(virtual: str, mounts: tuple[_Mount, ...]) -> bool:
+    return any(virtual == mount.virtual or _is_virtual_child(mount.virtual, virtual) for mount in mounts)
 
 
 def _first_child_under(virtual: str, parent: str) -> str:
