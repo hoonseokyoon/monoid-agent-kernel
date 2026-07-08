@@ -203,6 +203,9 @@ class LocalFilesystemMemoryStore:
                 retryable=True,
             )
         if not resolved.path.exists():
+            virtual_view = self._view_virtual_namespace(virtual)
+            if virtual_view is not None:
+                return virtual_view
             raise MemoryToolError(
                 f"The path {virtual} does not exist. Please provide a valid path.",
                 code="memory_path_not_found",
@@ -359,7 +362,8 @@ class LocalFilesystemMemoryStore:
             return None
         if not resolved.path.exists() or not resolved.path.is_file():
             return None
-        data = resolved.path.read_bytes()[:max_bytes]
+        with resolved.path.open("rb") as handle:
+            data = handle.read(max(0, int(max_bytes)))
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -432,27 +436,37 @@ class LocalFilesystemMemoryStore:
         }
 
     def _view_directory(self, resolved: _ResolvedPath) -> dict[str, Any]:
-        entries = [
-            {"path": resolved.virtual, "kind": "dir", "size": _tree_size(resolved.path)}
-        ]
+        entries: dict[str, dict[str, Any]] = {
+            resolved.virtual: {"path": resolved.virtual, "kind": "dir", "size": _tree_size(resolved.path)}
+        }
+        child_mounts = self._child_mounts(resolved.virtual)
         for item in sorted(resolved.path.rglob("*"), key=lambda child: child.as_posix()):
             rel = item.relative_to(resolved.path)
             if len(rel.parts) > 2:
+                continue
+            virtual = _join_virtual(resolved.virtual, rel.as_posix())
+            if _is_shadowed_by_mount(virtual, child_mounts):
                 continue
             if any(part.startswith(".") or part == "node_modules" for part in rel.parts):
                 continue
             if item.is_symlink():
                 continue
-            virtual = _join_virtual(resolved.virtual, rel.as_posix())
             kind = "dir" if item.is_dir() else "file" if item.is_file() else "other"
             size = item.stat().st_size if item.is_file() else _tree_size(item) if item.is_dir() else 0
-            entries.append({"path": virtual, "kind": kind, "size": size})
+            entries[virtual] = {"path": virtual, "kind": kind, "size": size}
+        for mount in child_mounts:
+            child = _first_child_under(mount.virtual, resolved.virtual)
+            size = _tree_size(mount.root)
+            if child in entries:
+                entries[child]["size"] += size
+            else:
+                entries[child] = {"path": child, "kind": "dir", "size": size}
         return {
             "operation": "view",
             "path": resolved.virtual,
             "status": "ok",
             "message": f"Listed memory directory: {resolved.virtual}",
-            "entries": entries,
+            "entries": list(entries.values()),
         }
 
     def _view_file(

@@ -233,6 +233,18 @@ def test_local_memory_store_searches_namespace_with_limit_and_filters(tmp_path: 
     (root_memory / "project").mkdir()
     (root_memory / "project" / "shadow.md").write_text("alpha shadow\n", encoding="utf-8")
 
+    root_view = overlapping.view("/memories")
+    assert {entry["path"] for entry in root_view["entries"]} == {
+        "/memories",
+        "/memories/root.md",
+        "/memories/project",
+    }
+    project_view = overlapping.view("/memories/project")
+    assert {entry["path"] for entry in project_view["entries"]} == {
+        "/memories/project",
+        "/memories/project/progress.md",
+    }
+
     aggregate = overlapping.search("alpha")
     assert {match["path"] for match in aggregate["matches"]} == {
         "/memories/root.md",
@@ -260,6 +272,10 @@ def test_memory_provider_tools_bindings_and_context_gate(tmp_path: Path) -> None
     assert bindings[MEMORY_CREATE_TOOL_ID].authorization == "ask"
 
     provider.store.create("/memories/MEMORY.md", "## Index\n- progress.md\n")
+    bounded_index = provider.store.startup_index(max_lines=10, max_bytes=len("## Index\n"))
+    assert bounded_index is not None
+    assert "## Index" in bounded_index
+    assert "progress.md" not in bounded_index
     turn_without_memory = TurnContext(1, 9, 20, None, (), 0, frozenset({"fs.read"}))
     assert provider.dynamic_segment(turn_without_memory) is None
     turn_with_write_only_memory = TurnContext(1, 9, 20, None, (), 0, frozenset({MEMORY_CREATE_TOOL_ID}))
