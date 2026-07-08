@@ -128,6 +128,7 @@ class LocalWorkspaceBackend:
     ) -> str:
         if self.mode == "read-only":
             raise WorkspaceError("workspace is read-only")
+        self._reject_symlink_components(self.normalize(path))
         rel, abs_path = self.resolve_existing_or_parent(path, for_write=True)
         current = self._read_optional_bytes(rel, abs_path)
         if expected_sha256 is not None and sha256_bytes(current or b"") != expected_sha256:
@@ -138,6 +139,7 @@ class LocalWorkspaceBackend:
     def mkdir(self, path: str | None) -> str:
         if self.mode == "read-only":
             raise WorkspaceError("workspace is read-only")
+        self._reject_symlink_components(self.normalize(path))
         rel, abs_path = self.resolve_existing_or_parent(path, for_write=True)
         kind = self._effective_kind(rel, abs_path)
         if kind == "file":
@@ -168,6 +170,7 @@ class LocalWorkspaceBackend:
         if self.mode == "read-only":
             raise WorkspaceError("workspace is read-only")
         snapshot = self._collect_tree(source_path, recursive=recursive, max_entries=max_entries, max_bytes=max_bytes)
+        self._reject_symlink_components(self.normalize(destination_path))
         dest_rel, _dest_abs = self.resolve_existing_or_parent(destination_path, for_write=True)
         if snapshot.root == ".":
             raise WorkspaceError("cannot copy workspace root")
@@ -212,6 +215,7 @@ class LocalWorkspaceBackend:
         if self.mode == "read-only":
             raise WorkspaceError("workspace is read-only")
         snapshot = self._collect_tree(source_path, recursive=recursive, max_entries=max_entries, max_bytes=max_bytes)
+        self._reject_symlink_components(self.normalize(destination_path))
         dest_rel, _dest_abs = self.resolve_existing_or_parent(destination_path, for_write=True)
         if snapshot.root == ".":
             raise WorkspaceError("cannot move workspace root")
@@ -798,6 +802,7 @@ class LocalWorkspaceBackend:
         max_bytes: int,
     ) -> _TreeSnapshot:
         raw_rel = self.normalize(path)
+        self._reject_symlink_components(raw_rel)
         if raw_rel != "." and self._effective_kind(raw_rel, self.root / raw_rel) == "symlink":
             raise WorkspaceError(f"symlink file operations are not supported: {raw_rel}")
         rel, abs_path = self.resolve_existing_or_parent(path)
@@ -862,6 +867,17 @@ class LocalWorkspaceBackend:
             if recursive or "/" not in item_rel[len(prefix) :]:
                 descendants[item_rel] = "file"
         return sorted(descendants.items())
+
+    def _reject_symlink_components(self, rel: str) -> None:
+        if rel == ".":
+            return
+        probe = self.root
+        for part in Path(rel).parts:
+            probe = probe / part
+            if probe.is_symlink():
+                raise WorkspaceError(f"symlink file operations are not supported: {rel}")
+            if not probe.exists():
+                return
 
     def _preflight_file_destination(self, rel: str, *, create_dirs: bool, overwrite: bool) -> None:
         kind = self._effective_kind(rel, self.root / rel)

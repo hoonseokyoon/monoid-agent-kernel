@@ -198,6 +198,39 @@ def test_directory_replace_mode_and_symlink_safety(tmp_path: Path) -> None:
     assert top_target.exists()
     assert top_link.is_symlink()
 
+    alias_target = tmp_path / "alias-target"
+    alias_target.mkdir()
+    alias_target.joinpath("file.txt").write_text("target\n", encoding="utf-8")
+    alias_dir = tmp_path / "alias-dir"
+    try:
+        os.symlink(alias_target, alias_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is not available in this environment")
+
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        registry.resolve("fs.copy").handler(
+            context,
+            {"source_path": "alias-dir/file.txt", "destination_path": "alias-copy.txt"},
+        )
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        registry.resolve("fs.move").handler(
+            context,
+            {"source_path": "alias-dir/file.txt", "destination_path": "alias-move.txt"},
+        )
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        registry.resolve("fs.delete").handler(context, {"path": "alias-dir/file.txt"})
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        registry.resolve("fs.copy").handler(
+            context,
+            {"source_path": "source/fresh.txt", "destination_path": "alias-dir/copied.txt"},
+        )
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        workspace.write_bytes("alias-dir/new.txt", b"new\n", create_dirs=True)
+    with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
+        workspace.mkdir("alias-dir/new-dir")
+    assert alias_target.joinpath("file.txt").read_text(encoding="utf-8") == "target\n"
+    assert not alias_target.joinpath("copied.txt").exists()
+
     with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
         registry.resolve("fs.copy").handler(
             context,
