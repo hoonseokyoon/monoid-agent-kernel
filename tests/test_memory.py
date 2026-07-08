@@ -49,6 +49,11 @@ def test_local_memory_store_view_create_edit_insert_delete_and_rename(tmp_path: 
     assert viewed["lines"] == {"start": 2, "end": 2, "total": 2}
     assert "     2\tbeta" in viewed["content"]
 
+    with pytest.raises(MemoryToolError) as bad_range:
+        store.view("/memories/notes.md", (10, 20))
+    assert bad_range.value.code == "memory_invalid_view_range"
+    assert bad_range.value.retryable is True
+
     replaced = store.str_replace("/memories/notes.md", "beta", "gamma")
     assert replaced["status"] == "edited"
     assert "gamma" in (tmp_path / "memory" / "notes.md").read_text(encoding="utf-8")

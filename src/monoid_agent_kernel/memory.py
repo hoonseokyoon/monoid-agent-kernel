@@ -467,6 +467,12 @@ class LocalFilesystemMemoryStore:
                     code="memory_invalid_view_range",
                     retryable=True,
                 )
+            if raw_start > len(lines):
+                raise MemoryToolError(
+                    "view_range start line exceeds the file length",
+                    code="memory_invalid_view_range",
+                    retryable=True,
+                )
             start = raw_start
             end = len(lines) if raw_end == -1 else raw_end
             if end < start:
