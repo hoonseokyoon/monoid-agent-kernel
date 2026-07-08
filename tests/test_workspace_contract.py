@@ -118,6 +118,28 @@ def test_copy_and_move(workspace: Workspace) -> None:
     assert workspace.read_bytes("moved.txt")[0] == b"payload"
 
 
+def test_move_directory_replace_mode_replaces_destination_tree(workspace: Workspace) -> None:
+    workspace.mkdir("source")
+    workspace.write_bytes("source/conflict", b"fresh")
+    workspace.mkdir("dest")
+    workspace.mkdir("dest/conflict")
+    workspace.write_bytes("dest/conflict/stale.txt", b"stale")
+
+    moved = workspace.move_path(
+        "source",
+        "dest",
+        recursive=True,
+        overwrite=True,
+        directory_mode="replace",
+    )
+
+    assert moved["path"] == "dest"
+    assert workspace.exists("source") is False
+    assert workspace.path_kind("dest/conflict") == "file"
+    assert workspace.read_bytes("dest/conflict")[0] == b"fresh"
+    assert workspace.exists("dest/conflict/stale.txt") is False
+
+
 def test_glob_and_list_entries(workspace: Workspace) -> None:
     workspace.write_bytes("a.txt", b"a")
     workspace.write_bytes("b.txt", b"b")

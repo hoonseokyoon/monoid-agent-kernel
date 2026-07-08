@@ -18,6 +18,8 @@ import json
 import threading
 from typing import Any
 
+from monoid_agent_kernel._version import package_version
+
 PROTOCOL_VERSION = "2025-06-18"
 
 
@@ -42,7 +44,7 @@ class McpHttpClient:
         url: str,
         token: str | None = None,
         *,
-        client_info: tuple[str, str] = ("monoid-agent-kernel", "0.13"),
+        client_info: tuple[str, str] | None = None,
         timeout_s: float = 30.0,
     ) -> None:
         try:
@@ -59,7 +61,7 @@ class McpHttpClient:
             headers["Authorization"] = f"Bearer {token}"
         self._url = url
         self._http = httpx.Client(headers=headers, timeout=timeout_s)
-        self._client_name, self._client_version = client_info
+        self._client_name, self._client_version = client_info or ("monoid-agent-kernel", package_version())
         self._ids = itertools.count(1)
         self._session_id: str | None = None
         self._initialized = False

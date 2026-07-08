@@ -93,6 +93,9 @@ class ToolContext(Protocol):
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def path_allowed(self, path: str, operation: str = "read") -> bool:
+        ...
+
     def search_tools(self, args: dict[str, Any]) -> dict[str, Any]:
         ...
 

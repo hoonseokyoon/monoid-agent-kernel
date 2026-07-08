@@ -11,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.env import env_name_for_error, getenv
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.identifiers import namespaced_id
@@ -204,7 +205,7 @@ class GatewayModelAdapter:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "monoid-agent-kernel/0.13",
+            "User-Agent": user_agent(),
         }
         token = self._resolve_gateway_token()
         if token:

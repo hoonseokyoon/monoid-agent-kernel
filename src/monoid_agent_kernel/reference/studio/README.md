@@ -63,6 +63,11 @@ Profile state is lightweight Studio metadata. The `studio-profiles.json` sidecar
 stores custom profile presets and maps run ids to profile ids so scoped history survives a restart.
 Profiles are Studio-owned presets; the kernel contract stays unchanged.
 
+Studio chat state is stored per run in `studio.chat.jsonl`. The chat panel restores user,
+assistant, and error messages from `/api/chat-transcript` before replaying `events.jsonl` for
+trace and activity state. `events.jsonl` remains the public trace stream, and `transcript.jsonl`
+remains the private model-call log.
+
 Stable test hooks are present on the main shell (`data-testid="studio-shell"`), left config panel,
 profile switcher/list, chat log, composer, right-panel tabs, settings/config surfaces, and
 capability toggles.
@@ -79,16 +84,21 @@ Studio's settings expose capabilities; toggling one binds its tools for the next
 
 | Capability | Tools it binds |
 |------------|----------------|
-| Read files | `fs.read` |
-| Write files (staged as a proposal) | `fs.write` |
+| Read files | `fs.read`, `fs.list`, `fs.tree`, `fs.stat`, `fs.glob`, `text.search`, `fs.read_media` |
+| Write files (staged as a proposal) | `fs.write`, `fs.patch`, `fs.mkdir`, `fs.copy`, `fs.move`, `fs.delete` |
 | Ask the human for approval | `hitl.request` |
-| Run shell commands + background jobs | `shell.exec` |
+| Run shell commands + background jobs | `shell.exec`, `job.list`, `job.status`, `job.logs`, `job.cancel`, `job.wait` |
+| Emit and list artifacts | `artifact.emit`, `artifact.list` |
+| Persistent memory *(available, disabled by default)* | `memory.search`, `memory.view`, `memory.create`, `memory.str_replace`, `memory.insert`, `memory.delete`, `memory.rename` |
 | Search & fetch the web | `web.search`, `web.fetch`, `web.context` |
 | Delegate subtasks to a subagent | `agent.spawn` |
 | Use Agent Skills *(when enabled)* | progressive-disclosure skill tools |
 | Use a connected MCP server *(with `--mcp`)* | the MCP server's tools |
 
 `run.update_plan` is always bound so the agent's plan is observable in the trace.
+When Memory is enabled, Studio uses a `LocalFilesystemMemoryProvider` rooted at
+`run_root/studio-memory/<workspace-key>/`. Memory read tools are allowed by default; memory write
+tools ask for approval.
 
 ## Observability
 

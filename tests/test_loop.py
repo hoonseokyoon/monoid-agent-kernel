@@ -412,6 +412,49 @@ def test_ask_authorization_parks_and_approved_call_executes_once(tmp_path: Path)
     assert result.status == "completed"
 
 
+def test_approval_replay_refreshes_surface_after_quota_consumed(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ApprovalToolProvider()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    config = runtime_config(
+        bindings=(
+            tool_binding(
+                "demo.approval",
+                authorization="ask",
+                quota=ToolQuota(max_calls_per_run=1),
+            ),
+            tool_binding("run.finish"),
+        )
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    loop.open()
+
+    suspended = loop.run_until_suspended("use the approval tool")
+    assert suspended.reason == "awaiting_tasks"
+    loop.report_task_result(suspended.awaiting_task_ids[0], {"approved": True})
+    resumed = loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert resumed.reason == "settled"
+    assert provider.calls == 1
+    assert "demo.approval" in {tool.id for tool in adapter.requests[0].tools}
+    assert "demo.approval" not in {tool.id for tool in adapter.requests[-1].tools}
+    transcript = result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
+    assert '"hidden_tool_ids": ["demo.approval"]' in transcript
+    assert result.status == "completed"
+
+
 def test_ask_authorization_reported_result_survives_restore_before_replay(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

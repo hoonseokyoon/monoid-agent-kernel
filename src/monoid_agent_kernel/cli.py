@@ -8,6 +8,7 @@ from typing import Any
 
 import click
 
+from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.core.agents import (
     AgentDefinition,
     AgentRuntimeConfig,
@@ -1085,7 +1086,7 @@ def _build_web_provider(
         fetch_provider = HttpFetchProvider(
             timeout_s=fetch_timeout_s,
             max_raw_bytes=fetch_max_raw_bytes,
-                user_agent=fetch_user_agent or "monoid-agent-kernel-webgateway/0.13",
+            user_agent=fetch_user_agent or user_agent("monoid-agent-kernel-webgateway"),
         )
         selected_context_provider = None
         if context_provider == "search-fetch":

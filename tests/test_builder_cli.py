@@ -78,11 +78,23 @@ def test_builder_init_writes_minimal_run_files(tmp_path: Path) -> None:
     runtime_payload = json.loads((target / "runtime-config.json").read_text(encoding="utf-8"))
     spec_payload = json.loads((target / "run-spec.json").read_text(encoding="utf-8"))
     assert runtime_payload["definition_id"] == "builder-agent"
-    assert [item["ref"]["tool_id"] for item in runtime_payload["tools"]] == [
+    tool_ids = [item["ref"]["tool_id"] for item in runtime_payload["tools"]]
+    assert {
         "fs.read",
+        "fs.list",
+        "fs.tree",
+        "fs.stat",
+        "fs.glob",
+        "text.search",
+        "fs.read_media",
         "fs.write",
+        "fs.patch",
+        "fs.mkdir",
+        "fs.copy",
+        "fs.move",
+        "fs.delete",
         "run.finish",
-    ]
+    } == set(tool_ids)
     assert spec_payload["workspace_root"] == "."
     assert spec_payload["run_root"] == "runs"
     assert "created:" in result.output

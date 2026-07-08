@@ -7,6 +7,7 @@ import pytest
 
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.tool_services import CallContext, JobsService, ShellService, WebService
+from monoid_agent_kernel.tool_services.shell import _shell_options_from_call
 
 
 @dataclass
@@ -74,6 +75,35 @@ def test_shell_service_metrics_start_at_zero() -> None:
         "failed_shell_calls": 0,
         "total_shell_duration_s": 0.0,
     }
+
+
+def test_shell_options_merge_runtime_and_binding_scope() -> None:
+    call = CallContext(
+        tool_call_id="call_1",
+        turn_id="turn_1",
+        tool_event_id="event_1",
+        runtime={
+            "shell": {
+                "approval_mode": "auto-approve",
+                "default_timeout_s": 7,
+                "inherit_env_allowlist": ["PATH"],
+                "env_allowlist": ["SAFE_VAR"],
+                "command_rules": [{"action": "deny", "prefix": "rm "}],
+            }
+        },
+        scope=ToolScope(command_allow_prefixes=("python ",), env_allowlist=("EXTRA_VAR",)),
+    )
+
+    options = _shell_options_from_call(call)
+
+    assert options.approval_mode == "auto-approve"
+    assert options.default_timeout_s == 7
+    assert options.inherit_env_allowlist == ("PATH",)
+    assert options.env_allowlist == ("SAFE_VAR", "EXTRA_VAR")
+    assert [(rule.action, rule.prefix) for rule in options.command_rules] == [
+        ("deny", "rm "),
+        ("allow", "python "),
+    ]
 
 
 def test_web_service_metrics_keys() -> None:

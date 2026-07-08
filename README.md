@@ -59,6 +59,24 @@ The package is organized around four roles:
 For the dynamic binding-based tool surface, see
 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md).
 
+## Memory and default tools
+
+`monoid_agent_kernel.memory` provides an optional provider-backed Memory tool surface. The
+kernel treats memory as ordinary tools and context supplied by a provider; the provider owns the
+storage shape. The bundled `LocalFilesystemMemoryProvider` maps the Claude-style `/memories`
+virtual tree to local files and exposes `memory.search`, `memory.view`, `memory.create`,
+`memory.str_replace`, `memory.insert`, `memory.delete`, and `memory.rename`. Read tools default
+to `allow`; write tools default to `ask`.
+
+Memory providers are attached explicitly by an app, backend, or Studio profile. They are
+available from `monoid_agent_kernel.memory` and stay out of the top-level contract exports and
+`builtin_tools(workspace)`.
+
+The helper `default_tool_bindings(...)` in `monoid_agent_kernel.tools.defaults` creates the
+standard read, write, shell, and artifact tool bundles used by Studio and the builder. The write
+bundle includes `fs.write`, `fs.patch`, `fs.mkdir`, `fs.copy`, `fs.move`, and `fs.delete`;
+`fs.copy`, `fs.move`, and `fs.delete` require approval by default.
+
 ## Install
 
 ```bash
@@ -526,6 +544,11 @@ Each run writes:
 `events.jsonl` remains public/redacted. Proposed file contents are exposed only
 through the run directory snapshot or run-token protected backend proposal APIs.
 
+Studio adds `studio.chat.jsonl` inside each Studio run directory as the browser-facing chat
+projection. The Studio UI restores user, assistant, and error messages from
+`/api/chat-transcript`, then replays `events.jsonl` for trace and activity panels.
+`transcript.jsonl` remains the private model-call log.
+
 ## Event Sinks
 
 Programmatic callers can pass sinks to
@@ -631,10 +654,12 @@ for existing durable artifacts and gateway requests.
 - default model inside `ModelConfig`: `gpt-5.5`
 - default reasoning effort inside `ModelConfig`: `medium`
 - mode: `propose`
-- shell is available only through an exposed `shell.exec` binding
-- web.search/web.fetch/web.context are available only through exposed web bindings and WebGateway
+- default tool bundles are available through `monoid_agent_kernel.tools.defaults.default_tool_bindings`
+- shell is available through exposed shell bindings such as `shell.exec`
+- web.search/web.fetch/web.context are available through exposed web bindings and WebGateway
 - file mutation tools include write, patch, mkdir, copy, move, and delete in
   `propose` and `apply` modes when bound in runtime config
+- memory tools are available through an explicitly attached `MemoryProvider`
 - no path deny/redact policy unless explicitly provided
 
 ## Contributing

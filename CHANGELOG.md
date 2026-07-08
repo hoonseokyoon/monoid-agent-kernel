@@ -7,6 +7,30 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-08
+
+### Added
+- Optional provider-backed Memory tools via `monoid_agent_kernel.memory`, including
+  `MemoryProvider`, `LocalFilesystemMemoryProvider`, filesystem-style memory operations,
+  provider-owned storage, and `memory.search`.
+- Default tool binding bundles for read, write, shell, and artifact capabilities, plus
+  stronger builtin filesystem, shell/job, and artifact tools.
+- Studio durable chat projection in `studio.chat.jsonl`, with `/api/chat-transcript`
+  restoring browser-facing user, assistant, and error messages across reloads and restarts.
+
+### Changed
+- Studio exposes Memory as an available capability, disabled by default and stored under
+  `run_root/studio-memory/<workspace-key>/` when enabled.
+- Destructive workspace helpers `fs.copy`, `fs.move`, and `fs.delete` require approval by
+  default in the generated write tool bundle.
+- Studio chat replay now reads durable chat messages before replaying trace events, while
+  `events.jsonl` remains the trace stream and `transcript.jsonl` remains the private
+  model-call log.
+
+### Fixed
+- Reopened Studio chats preserve the initial user messages and later conversation turns
+  created after this release's durable chat projection.
+
 ## [0.16.1] - 2026-07-05
 
 ### Fixed

@@ -76,6 +76,33 @@ def _text_from_bytes(data: bytes, path: str) -> str:
     raise WorkspaceError(f"file is not utf-8 text: {path}")
 
 
+def _path_allowed(context: ToolContext, path: str, operation: str = "read") -> bool:
+    checker = getattr(context, "path_allowed", None)
+    if not callable(checker):
+        return True
+    return bool(checker(path, operation))
+
+
+def _skip_reasons(permission_denied: int = 0, unreadable: int = 0) -> dict[str, int]:
+    reasons: dict[str, int] = {}
+    if permission_denied:
+        reasons["permission_denied"] = permission_denied
+    if unreadable:
+        reasons["unreadable"] = unreadable
+    return reasons
+
+
+def _short_snippet(text: str, needle: str, *, radius: int = 80) -> str:
+    index = text.find(needle)
+    if index < 0:
+        return ""
+    start = max(0, index - radius)
+    end = min(len(text), index + len(needle) + radius)
+    prefix = "..." if start else ""
+    suffix = "..." if end < len(text) else ""
+    return prefix + text[start:end] + suffix
+
+
 def _tool_search() -> ToolSpec:
     def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
         return ToolResult(ok=True, content=context.search_tools(args))
@@ -105,15 +132,33 @@ def _tool_search() -> ToolSpec:
 
 
 def _fs_list(workspace: Workspace) -> ToolSpec:
-    def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
-        entries = workspace.list_entries(
+    def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
+        max_entries = int(args.get("max_entries", 200))
+        raw_limit = min(max(max_entries * 5, max_entries), 5000)
+        raw_entries = workspace.list_entries(
             args.get("path", "."),
             recursive=bool(args.get("recursive", False)),
-            max_entries=int(args.get("max_entries", 200)),
+            max_entries=raw_limit,
         )
+        entries = []
+        skipped = 0
+        for entry in raw_entries:
+            if _path_allowed(context, entry.path, "read"):
+                entries.append(entry)
+            else:
+                skipped += 1
+        visible = entries[:max_entries]
         return ToolResult(
             ok=True,
-            content={"entries": [entry.__dict__ for entry in entries], "count": len(entries)},
+            content={
+                "entries": [entry.__dict__ for entry in visible],
+                "count": len(visible),
+                "limit": max_entries,
+                "searched_count": len(raw_entries),
+                "skipped_count": skipped,
+                "skipped_reasons": _skip_reasons(permission_denied=skipped),
+                "truncated": len(entries) > max_entries or len(raw_entries) >= raw_limit,
+            },
         )
 
     return ToolSpec(
@@ -134,21 +179,56 @@ def _fs_list(workspace: Workspace) -> ToolSpec:
 
 
 def _fs_tree(workspace: Workspace) -> ToolSpec:
-    def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
+    def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = args.get("path", ".")
         depth = int(args.get("depth", 2))
         max_entries = int(args.get("max_entries", 200))
-        entries = workspace.list_entries(path, recursive=True, max_entries=max_entries)
-        root_depth = 0 if path in {None, "", "."} else len(workspace.normalize(path).split("/"))
+        normalized_path = workspace.normalize(path)
+        if workspace.path_kind(path) == "file":
+            name = normalized_path.split("/")[-1]
+            return ToolResult(
+                ok=True,
+                content={
+                    "tree": name,
+                    "entries": 1,
+                    "limit": max_entries,
+                    "searched_count": 1,
+                    "skipped_count": 0,
+                    "skipped_reasons": {},
+                    "truncated": False,
+                },
+            )
+        raw_limit = min(max(max_entries * 5, max_entries), 5000)
+        raw_entries = workspace.list_entries(path, recursive=True, max_entries=raw_limit)
+        root_depth = 0 if path in {None, "", "."} else len(normalized_path.split("/"))
         lines: list[str] = []
-        for entry in entries:
+        skipped = 0
+        searched = 0
+        for entry in raw_entries:
+            searched += 1
+            if not _path_allowed(context, entry.path, "read"):
+                skipped += 1
+                continue
             entry_depth = len(entry.path.split("/")) - root_depth
             if entry_depth > depth:
                 continue
             indent = "  " * max(0, entry_depth - 1)
             suffix = "/" if entry.kind == "dir" else ""
             lines.append(f"{indent}{entry.path.split('/')[-1]}{suffix}")
-        return ToolResult(ok=True, content={"tree": "\n".join(lines), "entries": len(lines)})
+            if len(lines) >= max_entries:
+                break
+        return ToolResult(
+            ok=True,
+            content={
+                "tree": "\n".join(lines),
+                "entries": len(lines),
+                "limit": max_entries,
+                "searched_count": searched,
+                "skipped_count": skipped,
+                "skipped_reasons": _skip_reasons(permission_denied=skipped),
+                "truncated": len(lines) >= max_entries or len(raw_entries) >= raw_limit,
+            },
+        )
 
     return ToolSpec(
         id="fs.tree",
@@ -170,6 +250,9 @@ def _fs_tree(workspace: Workspace) -> ToolSpec:
 def _fs_stat(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
+        stat_path = getattr(workspace, "stat_path", None)
+        if callable(stat_path):
+            return ToolResult(ok=True, content=stat_path(path))
         rel, _abs_path = workspace.resolve_existing_or_parent(path)
         kind = workspace.path_kind(path)
         if kind is None:
@@ -177,15 +260,7 @@ def _fs_stat(workspace: Workspace) -> ToolSpec:
         if kind == "file":
             data, _digest = workspace.read_bytes(rel)
             return ToolResult(ok=True, content={"path": rel, "exists": True, "kind": "file", "size": len(data)})
-        return ToolResult(
-            ok=True,
-            content={
-                "path": rel,
-                "exists": True,
-                "kind": "dir",
-                "size": 0,
-            },
-        )
+        return ToolResult(ok=True, content={"path": rel, "exists": True, "kind": kind, "size": 0})
 
     return ToolSpec(
         id="fs.stat",
@@ -211,18 +286,37 @@ def _fs_read(workspace: Workspace) -> ToolSpec:
             raise WorkspaceError(
                 f"{path!r} is not UTF-8 text; use fs.read_media to read images or PDFs."
             )
-        lines = text.splitlines()
+        lines = text.splitlines(keepends=True)
+        total_lines = len(lines)
         start_line = args.get("start_line")
         end_line = args.get("end_line")
+        applied_start: int | None = None
+        applied_end: int | None = None
         if start_line is not None or end_line is not None:
-            start = max(1, int(start_line or 1))
-            end = min(len(lines), int(end_line or len(lines)))
-            selected = "\n".join(lines[start - 1 : end])
+            start = int(start_line or 1)
+            end = int(end_line or max(total_lines, start))
+            if start < 1 or end < start:
+                raise WorkspaceError(f"invalid line range for {workspace.normalize(path)}")
+            if total_lines and start > total_lines:
+                raise WorkspaceError(f"line range starts past end of file: {workspace.normalize(path)}")
+            end = min(total_lines, end)
+            applied_start = start
+            applied_end = end
+            selected = "".join(lines[start - 1 : end])
         else:
             selected = text
         return ToolResult(
             ok=True,
-            content={"path": workspace.normalize(path), "content": selected, "sha256": digest, "size": len(data)},
+            content={
+                "path": workspace.normalize(path),
+                "content": selected,
+                "sha256": digest,
+                "size": len(data),
+                "line_start": applied_start,
+                "line_end": applied_end,
+                "total_lines": total_lines,
+                "truncated": False,
+            },
         )
 
     return ToolSpec(
@@ -316,13 +410,34 @@ def _fs_read_media(workspace: Workspace) -> ToolSpec:
 
 
 def _fs_glob(workspace: Workspace) -> ToolSpec:
-    def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
-        matches = workspace.glob(
+    def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
+        max_matches = int(args.get("max_matches", 200))
+        raw_limit = min(max(max_matches * 5, max_matches), 5000)
+        raw_matches = workspace.glob(
             str(args["pattern"]),
             root=str(args.get("root", ".")),
-            max_matches=int(args.get("max_matches", 200)),
+            max_matches=raw_limit,
         )
-        return ToolResult(ok=True, content={"matches": matches, "count": len(matches)})
+        skipped = 0
+        matches: list[str] = []
+        for rel in raw_matches:
+            if _path_allowed(context, rel, "read"):
+                matches.append(rel)
+            else:
+                skipped += 1
+        visible = matches[:max_matches]
+        return ToolResult(
+            ok=True,
+            content={
+                "matches": visible,
+                "count": len(visible),
+                "limit": max_matches,
+                "searched_count": len(raw_matches),
+                "skipped_count": skipped,
+                "skipped_reasons": _skip_reasons(permission_denied=skipped),
+                "truncated": len(matches) > max_matches or len(raw_matches) >= raw_limit,
+            },
+        )
 
     return ToolSpec(
         id="fs.glob",
@@ -343,7 +458,7 @@ def _fs_glob(workspace: Workspace) -> ToolSpec:
 
 
 def _text_search(workspace: Workspace) -> ToolSpec:
-    def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
+    def handler(context: ToolContext, args: dict[str, Any]) -> ToolResult:
         pattern = str(args["pattern"])
         root = str(args.get("root", "."))
         file_glob = args.get("file_glob")
@@ -351,13 +466,21 @@ def _text_search(workspace: Workspace) -> ToolSpec:
         max_matches = int(args.get("max_matches", 100))
         needle = pattern if case_sensitive else pattern.lower()
         matches: list[dict[str, Any]] = []
+        searched = 0
+        permission_skipped = 0
+        unreadable = 0
         for rel in workspace.text_files(root=root, file_glob=file_glob):
             if len(matches) >= max_matches:
                 break
+            searched += 1
+            if not _path_allowed(context, rel, "read"):
+                permission_skipped += 1
+                continue
             try:
                 data, _digest = workspace.read_bytes(rel)
                 text = _text_from_bytes(data, rel)
             except WorkspaceError:
+                unreadable += 1
                 continue
             for lineno, line in enumerate(text.splitlines(), start=1):
                 haystack = line if case_sensitive else line.lower()
@@ -365,7 +488,18 @@ def _text_search(workspace: Workspace) -> ToolSpec:
                     matches.append({"path": rel, "line": lineno, "text": line})
                     if len(matches) >= max_matches:
                         break
-        return ToolResult(ok=True, content={"matches": matches, "count": len(matches)})
+        return ToolResult(
+            ok=True,
+            content={
+                "matches": matches,
+                "count": len(matches),
+                "limit": max_matches,
+                "searched_count": searched,
+                "skipped_count": permission_skipped + unreadable,
+                "skipped_reasons": _skip_reasons(permission_denied=permission_skipped, unreadable=unreadable),
+                "truncated": len(matches) >= max_matches,
+            },
+        )
 
     return ToolSpec(
         id="text.search",
@@ -391,13 +525,17 @@ def _fs_write(workspace: Workspace) -> ToolSpec:
     def handler(_context: ToolContext, args: dict[str, Any]) -> ToolResult:
         path = str(args["path"])
         content = str(args["content"])
+        if_exists = str(args.get("if_exists") or "overwrite")
+        if if_exists not in {"overwrite", "fail"}:
+            raise WorkspaceError("if_exists must be 'overwrite' or 'fail'")
         digest = workspace.write_bytes(
             path,
             content.encode("utf-8"),
             create_dirs=bool(args.get("create_dirs", False)),
             expected_sha256=args.get("expected_sha256"),
+            overwrite=if_exists == "overwrite",
         )
-        return ToolResult(ok=True, content={"path": workspace.normalize(path), "sha256": digest})
+        return ToolResult(ok=True, content={"path": workspace.normalize(path), "sha256": digest, "if_exists": if_exists})
 
     return ToolSpec(
         id="fs.write",
@@ -408,6 +546,7 @@ def _fs_write(workspace: Workspace) -> ToolSpec:
                 "content": {"type": "string"},
                 "create_dirs": {"type": "boolean", "default": False},
                 "expected_sha256": {"type": ["string", "null"]},
+                "if_exists": {"type": "string", "enum": ["overwrite", "fail"], "default": "overwrite"},
             },
             required=["path", "content"],
         ),
@@ -429,13 +568,24 @@ def _fs_patch(workspace: Workspace) -> ToolSpec:
         replacements = args["replacements"]
         changed = text
         applied = 0
+        snippets: list[dict[str, Any]] = []
         for replacement in replacements:
             old = str(replacement["old"])
             new = str(replacement["new"])
             count = int(replacement.get("count", 1))
+            if old == "":
+                raise WorkspaceError(f"patch old text must not be empty in {workspace.normalize(path)}")
             occurrences = changed.count(old)
             if occurrences < count:
                 raise WorkspaceError(f"patch text not found enough times in {workspace.normalize(path)}")
+            snippets.append(
+                {
+                    "old": _short_snippet(changed, old),
+                    "new": new[:200],
+                    "count": count,
+                    "occurrences": occurrences,
+                }
+            )
             changed = changed.replace(old, new, count)
             applied += count
         new_digest = workspace.write_bytes(
@@ -445,7 +595,12 @@ def _fs_patch(workspace: Workspace) -> ToolSpec:
         )
         return ToolResult(
             ok=True,
-            content={"path": workspace.normalize(path), "sha256": new_digest, "replacements": applied},
+            content={
+                "path": workspace.normalize(path),
+                "sha256": new_digest,
+                "replacements": applied,
+                "snippets": snippets,
+            },
         )
 
     return ToolSpec(
@@ -503,6 +658,7 @@ def _file_operation_schema(required: list[str]) -> dict[str, Any]:
             "recursive": {"type": "boolean", "default": False},
             "max_entries": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000},
             "max_bytes": {"type": "integer", "minimum": 1, "maximum": 500_000_000, "default": 50_000_000},
+            "directory_mode": {"type": "string", "enum": ["merge", "replace"], "default": "merge"},
         },
         required=required,
     )
@@ -518,6 +674,7 @@ def _fs_copy(workspace: Workspace) -> ToolSpec:
             recursive=bool(args.get("recursive", False)),
             max_entries=int(args.get("max_entries", 1000)),
             max_bytes=int(args.get("max_bytes", 50_000_000)),
+            directory_mode=str(args.get("directory_mode") or "merge"),
         )
         return ToolResult(ok=True, content=result)
 
@@ -542,6 +699,7 @@ def _fs_move(workspace: Workspace) -> ToolSpec:
             recursive=bool(args.get("recursive", False)),
             max_entries=int(args.get("max_entries", 1000)),
             max_bytes=int(args.get("max_bytes", 50_000_000)),
+            directory_mode=str(args.get("directory_mode") or "merge"),
         )
         return ToolResult(ok=True, content=result)
 

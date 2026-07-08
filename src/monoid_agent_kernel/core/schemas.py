@@ -222,9 +222,14 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         {
             "surface_hash": _STR,
             "immediate_binding_ids": _STR_ARRAY,
+            "immediate_tools": _OBJ_ARRAY,
             "searchable_count": _INT,
+            "searchable_tools": _OBJ_ARRAY,
             "hidden_count": _INT,
+            "hidden_binding_ids": _STR_ARRAY,
+            "authorizations": _OBJ,
             "delta_notice": _STR,
+            "surface_warnings": _STR_ARRAY,
         },
         required=("surface_hash", "immediate_binding_ids", "searchable_count", "hidden_count"),
     ),
@@ -422,7 +427,7 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "proposal.stale": _data_schema({}, additional=True),
     "artifact.emitted": _data_schema(
-        {"artifact_id": _STR, "path": _STR, "kind": _STR},
+        {"artifact_id": _STR, "path": _STR, "kind": _STR, "metadata": {"type": "object"}},
         required=("artifact_id",),
     ),
     "plan.updated": _data_schema(

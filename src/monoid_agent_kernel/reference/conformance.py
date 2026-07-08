@@ -1417,7 +1417,7 @@ def _runtime_config_for_scenario(scenario: str) -> AgentRuntimeConfig:
         return AgentRuntimeConfig(
             definition_id="tool-agent",
             tools=(
-                ToolBinding.for_tool("demo.approval", quota=ToolQuota(max_calls_per_run=0)),
+                ToolBinding.for_tool("demo.approval", quota=ToolQuota(max_calls_per_run=1)),
                 ToolBinding.for_tool("run.finish"),
             ),
         )
@@ -1557,7 +1557,12 @@ def _turns_for_scenario(scenario: str) -> list[ModelTurn]:
         ]
     if scenario == "tool-quota-denied":
         return [
-            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "quota"}, "approval_1"),)),
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call("demo_approval", {"value": "quota-allowed"}, "approval_1"),
+                    fake_tool_call("demo_approval", {"value": "quota-denied"}, "approval_2"),
+                )
+            ),
             ModelTurn(final_text="quota denied completed"),
         ]
     return [ModelTurn(response_id=f"r_{uuid.uuid4().hex[:8]}", final_text="first")]

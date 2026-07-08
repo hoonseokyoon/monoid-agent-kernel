@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 RunStatus = Literal["completed", "failed", "limited"]
 
@@ -33,6 +33,7 @@ class AgentArtifact:
     path: str
     kind: str
     label: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
