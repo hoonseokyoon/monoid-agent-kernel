@@ -1105,6 +1105,7 @@ class StudioServer:
         profile_id = self._known_profile_id(profile_id)
         runtime_config = self._build_config(profile_id)
         parts = self._parts_from_attachments(message, attachments)
+        user_created_at = time.time()
         request = BackendRunRequest(
             tenant_id=_TENANT,
             user_id=_USER,
@@ -1135,6 +1136,7 @@ class StudioServer:
                 content=message,
                 attachments=attachments,
                 client_message_id=client_message_id,
+                created_at=user_created_at,
             )
         return {"run_id": submission.run_id, "state": submission.state.value, "terminal": submission.terminal}
 

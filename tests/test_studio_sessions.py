@@ -372,6 +372,18 @@ def test_studio_chat_transcript_preserves_multi_turn_order(studio: StudioServer)
     assert len([m for m in first["messages"] if m["role"] == "assistant"]) >= 2
 
 
+def test_studio_initial_user_timestamp_precedes_fast_reply(studio: StudioServer) -> None:
+    run_id = studio.start_chat("fast reply", client_message_id="client-fast")["run_id"]
+    _wait_settled(studio, run_id, 1)
+
+    messages = studio.chat_transcript(run_id)["messages"]
+    user = next(message for message in messages if message["role"] == "user")
+    assistant = next(message for message in messages if message["role"] == "assistant")
+
+    assert [message["role"] for message in messages[:2]] == ["user", "assistant"]
+    assert user["created_at"] <= assistant["created_at"]
+
+
 def test_studio_chat_transcript_http_route(studio: StudioServer) -> None:
     run_id = studio.start_chat("route check", client_message_id="client-route")["run_id"]
     _wait_settled(studio, run_id, 1)
