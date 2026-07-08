@@ -200,6 +200,7 @@ class ChatProjection:
         seq = event.get("seq")
         source: dict[str, Any] = {
             "kind": "event",
+            "event_type": event_type,
             "event_id": str(event.get("event_id") or ""),
             "seq": int(seq) if isinstance(seq, int) else seq,
         }

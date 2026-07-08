@@ -64,6 +64,7 @@ def test_chat_projection_projects_assistant_and_non_retryable_errors_once(tmp_pa
         ("assistant", "done"),
         ("error", "unsupported effort - bad_request · HTTP 400"),
     ]
+    assert records[1]["source"]["event_type"] == "turn.failed"
     assert projection.event_cursor() == 5
 
 

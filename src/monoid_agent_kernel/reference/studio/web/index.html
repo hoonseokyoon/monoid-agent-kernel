@@ -656,10 +656,16 @@ function chatLabel(message) {
   return (text ? text + " " : "") + "📎 " + names.join(", ");
 }
 
-function renderTranscriptMessage(message) {
+function renderTranscriptMessage(message, isLatest) {
   const role = String((message && message.role) || "");
   if (role !== "user" && role !== "assistant" && role !== "error") return;
-  bubble(role, chatLabel(message));
+  const el = bubble(role, chatLabel(message));
+  if (role === "user") lastUserMessage = String((message && message.content) || "");
+  const source = (message && typeof message.source === "object") ? message.source : {};
+  if (isLatest && role === "error" && source.event_type === "turn.failed" && Number(source.seq) === replayEventCursor) {
+    pendingConfigFix = true;
+    showRetry(el);
+  }
 }
 
 // Send a suggested prompt as if the user typed it (used by the onboarding panel).
@@ -1766,7 +1772,8 @@ async function loadChatTranscript(id) {
     const body = await (await fetch("/api/chat-transcript?run_id=" + encodeURIComponent(id))).json();
     if (id !== runId || body.error) return;
     replayEventCursor = Number.isInteger(body.event_cursor) ? body.event_cursor : -1;
-    for (const message of (body.messages || [])) renderTranscriptMessage(message);
+    const messages = body.messages || [];
+    messages.forEach((message, index) => renderTranscriptMessage(message, index === messages.length - 1));
   } catch (_) {}
 }
 
