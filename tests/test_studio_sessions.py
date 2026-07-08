@@ -267,6 +267,8 @@ def test_studio_profile_preview_resolves_model_request_surface(studio: StudioSer
     tool_names = {tool["name"] for tool in preview["tools"]}
     assert {"run_update_plan", "fs_read", "fs_list", "fs_patch", "fs_delete", "agent_spawn"} <= tool_names
     assert "tool_surface" in preview
+    assert preview["tool_surface"]["authorizations"]["fs.copy"]["decision"] == "ask"
+    assert preview["tool_surface"]["authorizations"]["fs.move"]["decision"] == "ask"
     assert preview["tool_surface"]["authorizations"]["fs.delete"]["decision"] == "ask"
     read_tool = next(tool for tool in preview["tools"] if tool["name"] == "fs_read")
     assert read_tool["input_schema"]["type"] == "object"

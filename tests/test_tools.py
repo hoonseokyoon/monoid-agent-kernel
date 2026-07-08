@@ -238,7 +238,17 @@ def test_default_tool_binding_presets_have_expected_policy() -> None:
     assert {"fs.read", "fs.list", "fs.tree", "fs.stat", "fs.glob", "text.search", "fs.read_media"} == {
         binding.ref.tool_id for binding in read
     }
-    assert next(binding for binding in write if binding.ref.tool_id == "fs.delete").authorization == "ask"
+    write_authorizations = {binding.ref.tool_id: binding.authorization for binding in write}
+    write_approvals = {binding.ref.tool_id: binding.requires_approval for binding in write}
+    assert write_authorizations["fs.write"] == "allow"
+    assert write_authorizations["fs.patch"] == "allow"
+    assert write_authorizations["fs.mkdir"] == "allow"
+    assert write_authorizations["fs.copy"] == "ask"
+    assert write_authorizations["fs.move"] == "ask"
+    assert write_authorizations["fs.delete"] == "ask"
+    assert write_approvals["fs.copy"] is True
+    assert write_approvals["fs.move"] is True
+    assert write_approvals["fs.delete"] is True
     assert {"shell.exec", "job.status", "job.logs", "job.cancel", "job.wait"} == {
         binding.ref.tool_id for binding in shell
     }

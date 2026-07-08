@@ -17,6 +17,7 @@ READ_TOOL_IDS = (
 WRITE_TOOL_IDS = ("fs.write", "fs.patch", "fs.mkdir", "fs.copy", "fs.move", "fs.delete")
 SHELL_TOOL_IDS = ("shell.exec", "job.status", "job.logs", "job.cancel", "job.wait")
 ARTIFACT_TOOL_IDS = ("artifact.emit", "artifact.list")
+DESTRUCTIVE_WRITE_TOOL_IDS = frozenset({"fs.copy", "fs.move", "fs.delete"})
 
 _TOOL_METADATA: dict[str, dict[str, Any]] = {
     "fs.read": {"title": "Read file", "summary": "Read UTF-8 workspace text.", "risk": "low", "tags": ("fs", "read")},
@@ -29,8 +30,8 @@ _TOOL_METADATA: dict[str, dict[str, Any]] = {
     "fs.write": {"title": "Write file", "summary": "Write UTF-8 workspace text.", "risk": "side_effect", "tags": ("fs", "write")},
     "fs.patch": {"title": "Patch file", "summary": "Apply exact text replacements.", "risk": "side_effect", "tags": ("fs", "write", "patch")},
     "fs.mkdir": {"title": "Create directory", "summary": "Create a workspace directory.", "risk": "side_effect", "tags": ("fs", "write")},
-    "fs.copy": {"title": "Copy path", "summary": "Copy a workspace file or directory.", "risk": "side_effect", "tags": ("fs", "write")},
-    "fs.move": {"title": "Move path", "summary": "Move a workspace file or directory.", "risk": "side_effect", "tags": ("fs", "write")},
+    "fs.copy": {"title": "Copy path", "summary": "Copy a workspace file or directory.", "risk": "destructive", "tags": ("fs", "write")},
+    "fs.move": {"title": "Move path", "summary": "Move a workspace file or directory.", "risk": "destructive", "tags": ("fs", "write")},
     "fs.delete": {"title": "Delete path", "summary": "Delete a workspace file or directory.", "risk": "destructive", "tags": ("fs", "write", "delete")},
     "shell.exec": {"title": "Run shell", "summary": "Run a shell command in the workspace.", "risk": "high", "tags": ("shell", "execute")},
     "job.status": {"title": "Job status", "summary": "Inspect a background task.", "risk": "low", "tags": ("job", "read")},
@@ -55,8 +56,8 @@ def default_tool_bindings(
             _binding(
                 tool_id,
                 group="write",
-                authorization="ask" if tool_id == "fs.delete" else "allow",
-                requires_approval=tool_id == "fs.delete",
+                authorization="ask" if tool_id in DESTRUCTIVE_WRITE_TOOL_IDS else "allow",
+                requires_approval=tool_id in DESTRUCTIVE_WRITE_TOOL_IDS,
             )
             for tool_id in WRITE_TOOL_IDS
         )
