@@ -346,7 +346,8 @@ class LocalWorkspaceBackend:
 
     def stat_path(self, path: str | None) -> dict[str, Any]:
         rel, abs_path = self.resolve_existing_or_parent(path)
-        kind = self._effective_kind(rel, abs_path)
+        raw_path = self.root / Path(rel)
+        kind = self._effective_kind(rel, raw_path if raw_path.is_symlink() else abs_path)
         if kind is None:
             return {"path": rel, "exists": False}
         if kind == "file":

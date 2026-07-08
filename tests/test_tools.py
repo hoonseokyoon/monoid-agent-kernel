@@ -182,6 +182,9 @@ def test_directory_replace_mode_and_symlink_safety(tmp_path: Path) -> None:
     top_target.write_text("inside\n", encoding="utf-8")
     top_link = tmp_path / "top-link.txt"
     os.symlink(top_target, top_link)
+    stat = registry.resolve("fs.stat").handler(context, {"path": "top-link.txt"})
+    assert stat.ok
+    assert stat.content["kind"] == "symlink"
 
     with pytest.raises(WorkspaceError, match="symlink file operations are not supported"):
         registry.resolve("fs.copy").handler(
@@ -282,7 +285,7 @@ def test_default_tool_binding_presets_have_expected_policy() -> None:
     assert write_approvals["fs.copy"] is True
     assert write_approvals["fs.move"] is True
     assert write_approvals["fs.delete"] is True
-    assert {"shell.exec", "job.status", "job.logs", "job.cancel", "job.wait"} == {
+    assert {"shell.exec", "job.list", "job.status", "job.logs", "job.cancel", "job.wait"} == {
         binding.ref.tool_id for binding in shell
     }
     assert all(binding.title and binding.summary for binding in (*read, *write, *shell))

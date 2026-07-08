@@ -15,7 +15,7 @@ READ_TOOL_IDS = (
     "fs.read_media",
 )
 WRITE_TOOL_IDS = ("fs.write", "fs.patch", "fs.mkdir", "fs.copy", "fs.move", "fs.delete")
-SHELL_TOOL_IDS = ("shell.exec", "job.status", "job.logs", "job.cancel", "job.wait")
+SHELL_TOOL_IDS = ("shell.exec", "job.list", "job.status", "job.logs", "job.cancel", "job.wait")
 ARTIFACT_TOOL_IDS = ("artifact.emit", "artifact.list")
 DESTRUCTIVE_WRITE_TOOL_IDS = frozenset({"fs.copy", "fs.move", "fs.delete"})
 
@@ -34,6 +34,7 @@ _TOOL_METADATA: dict[str, dict[str, Any]] = {
     "fs.move": {"title": "Move path", "summary": "Move a workspace file or directory.", "risk": "destructive", "tags": ("fs", "write")},
     "fs.delete": {"title": "Delete path", "summary": "Delete a workspace file or directory.", "risk": "destructive", "tags": ("fs", "write", "delete")},
     "shell.exec": {"title": "Run shell", "summary": "Run a shell command in the workspace.", "risk": "high", "tags": ("shell", "execute")},
+    "job.list": {"title": "List jobs", "summary": "List background tasks for this run.", "risk": "low", "tags": ("job", "read", "discover")},
     "job.status": {"title": "Job status", "summary": "Inspect a background task.", "risk": "low", "tags": ("job", "read")},
     "job.logs": {"title": "Job logs", "summary": "Read background task logs.", "risk": "low", "tags": ("job", "read")},
     "job.cancel": {"title": "Cancel job", "summary": "Cancel a background task.", "risk": "side_effect", "tags": ("job", "write")},
