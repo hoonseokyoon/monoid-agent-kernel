@@ -127,3 +127,30 @@ def test_chat_projection_backfills_legacy_title_and_events(tmp_path: Path) -> No
         ("assistant", "legacy answer"),
     ]
     assert body["messages"][0]["source"]["legacy"] is True
+
+
+def test_chat_projection_backfills_legacy_title_after_event_only_projection(tmp_path: Path) -> None:
+    (tmp_path / "run.json").write_text(
+        json.dumps({"title": "legacy prompt", "created_at": 10.0}),
+        encoding="utf-8",
+    )
+    projection = ChatProjection(tmp_path)
+    projection.project_events(
+        [
+            {
+                "type": "turn.settled",
+                "event_id": "evt-final",
+                "seq": 7,
+                "timestamp": "1970-01-01T00:00:20Z",
+                "data": {"final_text": "legacy answer"},
+            }
+        ]
+    )
+
+    body = projection.catch_up("run-1")
+
+    assert [(message["role"], message["content"]) for message in body["messages"]] == [
+        ("user", "legacy prompt"),
+        ("assistant", "legacy answer"),
+    ]
+    assert body["messages"][0]["source"]["legacy"] is True

@@ -143,7 +143,7 @@ class ChatProjection:
         return record
 
     def ensure_legacy_user_from_run_meta(self) -> None:
-        if self.path.exists():
+        if any(record.get("role") == "user" for record in self.read()):
             return
         meta_path = self.run_dir / "run.json"
         try:
