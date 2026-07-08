@@ -366,8 +366,10 @@ class LocalFilesystemMemoryStore:
             data = handle.read(max(0, int(max_bytes)))
         try:
             text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
+        except UnicodeDecodeError as exc:
+            if exc.reason != "unexpected end of data":
+                return None
+            text = data[: exc.start].decode("utf-8")
         lines = text.splitlines()[:max_lines]
         if not lines:
             return None

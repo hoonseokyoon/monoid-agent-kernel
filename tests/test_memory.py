@@ -276,6 +276,11 @@ def test_memory_provider_tools_bindings_and_context_gate(tmp_path: Path) -> None
     assert bounded_index is not None
     assert "## Index" in bounded_index
     assert "progress.md" not in bounded_index
+    provider.store.str_replace("/memories/MEMORY.md", "## Index\n- progress.md\n", "## Index\n한글\n")
+    multibyte_cut_index = provider.store.startup_index(max_lines=10, max_bytes=len("## Index\n한".encode("utf-8")) - 1)
+    assert multibyte_cut_index is not None
+    assert "## Index" in multibyte_cut_index
+    assert "한" not in multibyte_cut_index
     turn_without_memory = TurnContext(1, 9, 20, None, (), 0, frozenset({"fs.read"}))
     assert provider.dynamic_segment(turn_without_memory) is None
     turn_with_write_only_memory = TurnContext(1, 9, 20, None, (), 0, frozenset({MEMORY_CREATE_TOOL_ID}))
