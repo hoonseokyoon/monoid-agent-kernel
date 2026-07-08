@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.env import getenv
 
@@ -73,7 +74,7 @@ class WebGatewayClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "monoid-agent-kernel/0.13",
+            "User-Agent": user_agent(),
         }
         # A per-call capability lease handle (when web tools are routed through the capability gate)
         # overrides the static run-start credential; otherwise fall back to the configured token.
