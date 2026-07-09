@@ -3,8 +3,8 @@
 *A lightweight durable agent kernel for embedding product-grade agents anywhere: contract-first, observable, permission-aware, and replaceable at every seam.*
 
 [![CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/pyproject.toml)
 
 Monoid is the small runtime core you put inside a larger product when you need
 agents to run reliably. It owns the loop, durable artifacts, tool execution,
@@ -45,22 +45,22 @@ The package is organized around four roles:
   and re-exported from the top-level `monoid_agent_kernel`. These are the specs and protocols you
   depend on and implement: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig`, `ModelAdapter`,
   `ToolSpec` / `@tool`, `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest. See
-  [docs/CONTRACTS.md](docs/CONTRACTS.md) for the Python, HTTP, wiring, and operational rules.
+  [docs/CONTRACTS.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONTRACTS.md) for the Python, HTTP, wiring, and operational rules.
 - **Conformance Test** — profile-based tests that check contract behavior for a chosen runtime
-  shape. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the profile model and
-  [docs/OPERATIONAL_RULE_COVERAGE.md](docs/OPERATIONAL_RULE_COVERAGE.md) for the
+  shape. See [docs/CONFORMANCE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONFORMANCE.md) for the profile model and
+  [docs/OPERATIONAL_RULE_COVERAGE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OPERATIONAL_RULE_COVERAGE.md) for the
   rule-to-test and Phase 2S hardening coverage matrix.
 - **Core Helper Kit** — the supported runtime and helper modules that make the contract easy to
   satisfy (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). See
-  [docs/CORE_HELPER_KIT.md](docs/CORE_HELPER_KIT.md) for the helper boundary and
+  [docs/CORE_HELPER_KIT.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CORE_HELPER_KIT.md) for the helper boundary and
   validation/library policy.
 - **Reference** — example services under `monoid_agent_kernel.reference` (`backend`,
   `llm_gateway`, `web_gateway`, `mcp_gateway`, `stores`, `studio`, `conformance`) assembled from
-  the public contract and helper kit. See [docs/REFERENCE.md](docs/REFERENCE.md) for the reference
+  the public contract and helper kit. See [docs/REFERENCE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/REFERENCE.md) for the reference
   role, harnesses, and smoke targets.
 
 For the dynamic binding-based tool surface, see
-[docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md).
+[docs/TOOL_SURFACE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/TOOL_SURFACE.md).
 
 ## Install
 
@@ -125,10 +125,10 @@ print((workspace / "SUMMARY.md").read_text(encoding="utf-8"))
 
 `from_config`'s `runtime_config` accepts a bare `AgentRuntimeConfig`, a
 `RuntimeConfigProvider`, or a `callable(run_id) -> AgentRuntimeConfig` (hot-reload). See
-[`examples/minimal_quickstart.py`](examples/minimal_quickstart.py) for a complete file and
-[`examples/custom_model_adapter.py`](examples/custom_model_adapter.py) for implementing
+[`examples/minimal_quickstart.py`](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/examples/minimal_quickstart.py) for a complete file and
+[`examples/custom_model_adapter.py`](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/examples/custom_model_adapter.py) for implementing
 your own `ModelAdapter`. Author tools from typed functions with the `@tool` decorator
-(see [`examples/custom_tools/word_count_tool.py`](examples/custom_tools/word_count_tool.py));
+(see [`examples/custom_tools/word_count_tool.py`](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/examples/custom_tools/word_count_tool.py));
 `generated_tool_bindings(...)` then turns a set of `ToolSpec`s into bindings.
 
 ## Memory and default tools
@@ -193,12 +193,12 @@ monoid run \
   directly.
 - **Permissions are permissive by default** — dotfiles and keys are treated as normal files.
   Pass `--deny-path` / `--redact-path` if the workspace holds secrets.
-  **See the [Threat Model](docs/security/THREAT_MODEL.md#permissive-by-default) before exposing secret-bearing workspaces.**
+  **See the [Threat Model](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/THREAT_MODEL.md#permissive-by-default) before exposing secret-bearing workspaces.**
 - **Optional surfaces, each off unless flagged:** `--agents-directory` (subagents via
   `agent.spawn`), `--skills-directory` (Agent Skills), `--capability-broker` (leased tools).
 
 Full CLI reference — `run`, `builder`, `watch`, `proposal`, `jobs`, custom workspace
-backends, streaming JSON — is in **[docs/CLI.md](docs/CLI.md)**.
+backends, streaming JSON — is in **[docs/CLI.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CLI.md)**.
 
 ## Hosted backend and gateways
 
@@ -207,7 +207,7 @@ kernel runs, while the LLM and Web gateways hold provider credentials and valida
 tokens. The kernel never receives OpenAI, Anthropic, or search-provider keys.
 
 The end-to-end walkthrough — starting the gateways, creating a run with `curl`, and polling
-status/result/events/proposal — is in **[docs/BACKEND.md](docs/BACKEND.md)**.
+status/result/events/proposal — is in **[docs/BACKEND.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/BACKEND.md)**.
 
 ## Model Provider Boundary
 
@@ -222,7 +222,7 @@ can be enforced.
 
 To target your own LLM gateway, implement the `ModelAdapter` protocol or the
 `monoid.llm-turn.v1` HTTP contract documented in
-[docs/CONTRACTS.md](docs/CONTRACTS.md). Current protocol and schema identifiers
+[docs/CONTRACTS.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONTRACTS.md). Current protocol and schema identifiers
 use `monoid.*`; `native-agent-runner.*` identifiers are accepted during migration
 for existing durable artifacts and gateway requests.
 
@@ -234,7 +234,7 @@ mirror that stream to OpenTelemetry — all without the core capturing prompt/re
 with counters, timing, and token usage.
 
 The run-directory artifact set, custom event sinks (including secret redaction), OTel tracing,
-live streaming, and metrics are all documented in **[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)**.
+live streaming, and metrics are all documented in **[docs/OBSERVABILITY.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OBSERVABILITY.md)**.
 
 ## Defaults
 
@@ -253,20 +253,20 @@ live streaming, and metrics are all documented in **[docs/OBSERVABILITY.md](docs
 
 ## Documentation
 
-Start with **[docs/README.md](docs/README.md)** — it routes you to the right docs by role
+Start with **[docs/README.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/README.md)** — it routes you to the right docs by role
 (app developer, tool author, backend/gateway operator, security reviewer, contributor).
 Quick links:
 
-- **Use it:** [CLI reference](docs/CLI.md) · [Hosted backend](docs/BACKEND.md) · [Observability](docs/OBSERVABILITY.md)
-- **Build against it:** [Contracts](docs/CONTRACTS.md) · [Tool surface](docs/TOOL_SURFACE.md) · [Conformance](docs/CONFORMANCE.md)
-- **Extend it:** [Subagents](docs/SUBAGENT_DESIGN.md) · [Skills](docs/SKILLS_DESIGN.md) · [First skill tutorial](docs/FIRST_SKILL_TUTORIAL.md)
-- **Secure it:** [Security model](docs/security/SECURITY_MODEL.md) · [Threat model](docs/security/THREAT_MODEL.md) · [Production checklist](docs/security/PRODUCTION_CHECKLIST.md) · [Security policy](SECURITY.md)
+- **Use it:** [CLI reference](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CLI.md) · [Hosted backend](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/BACKEND.md) · [Observability](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OBSERVABILITY.md)
+- **Build against it:** [Contracts](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONTRACTS.md) · [Tool surface](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/TOOL_SURFACE.md) · [Conformance](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONFORMANCE.md)
+- **Extend it:** [Subagents](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/SUBAGENT_DESIGN.md) · [Skills](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/SKILLS_DESIGN.md) · [First skill tutorial](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/FIRST_SKILL_TUTORIAL.md)
+- **Secure it:** [Security model](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/SECURITY_MODEL.md) · [Threat model](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/THREAT_MODEL.md) · [Production checklist](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/PRODUCTION_CHECKLIST.md) · [Security policy](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/SECURITY.md)
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
-development setup and the lint/test workflow, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
-For security issues, follow [SECURITY.md](SECURITY.md) (do not open a public issue).
+Issues and pull requests are welcome. See [CONTRIBUTING.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/CONTRIBUTING.md) for
+development setup and the lint/test workflow, and [CODE_OF_CONDUCT.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/CODE_OF_CONDUCT.md).
+For security issues, follow [SECURITY.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/SECURITY.md) (do not open a public issue).
 
 Fast local confidence checks:
 
@@ -278,9 +278,9 @@ python -m pytest -q --cov=monoid_agent_kernel --cov=native_agent_runner
 
 CI keeps the serial suite as the required gate and runs xdist plus coverage as
 advisory checks while the test seams stabilize. See
-[docs/PHASE_4_CLOSURE.md](docs/PHASE_4_CLOSURE.md) for the current Phase 4
+[docs/PHASE_4_CLOSURE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/PHASE_4_CLOSURE.md) for the current Phase 4
 structure closure and CI promotion criteria.
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/LICENSE).
