@@ -1,11 +1,41 @@
 # Monoid Documentation
 
 Start with the top-level [README](../README.md) for the product position,
-install, quickstart, and run model. These docs go deeper on the contracts that
-make Monoid embeddable in different products and runtimes:
+install, and the no-server quickstart. This index goes deeper on using,
+building against, and securing the kernel.
+
+## Find your path
+
+- **I want to run an agent** → [Quickstart](../README.md#quickstart-no-servers),
+  then [CLI.md](CLI.md) for the full `run` / `watch` / `jobs` surface.
+- **I'm embedding the kernel in a product** → [CONTRACTS.md](CONTRACTS.md) for the
+  stable Python/HTTP surface, [CONFORMANCE.md](CONFORMANCE.md) to check your
+  implementation, [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) for the helper boundary.
+- **I'm writing tools** → [TOOL_SURFACE.md](TOOL_SURFACE.md) for `ToolBinding`,
+  exposure, authorization, scope, and quota.
+- **I'm running a backend/gateway** → [BACKEND.md](BACKEND.md) for the reference
+  wiring and token boundary, [OBSERVABILITY.md](OBSERVABILITY.md) for outputs,
+  event sinks, and OTel.
+- **I'm reviewing security** → [security/SECURITY_MODEL.md](security/SECURITY_MODEL.md)
+  for verified invariants and boundaries, [security/THREAT_MODEL.md](security/THREAT_MODEL.md)
+  for the threat-by-threat breakdown, [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md)
+  before deploying, [SECURITY.md](../SECURITY.md) for reporting.
+- **I'm extending with delegation/skills** → [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md),
+  [SKILLS_DESIGN.md](SKILLS_DESIGN.md), [FIRST_SKILL_TUTORIAL.md](FIRST_SKILL_TUTORIAL.md).
+- **I'm contributing** → [CONTRIBUTING.md](../CONTRIBUTING.md), then
+  [OPERATIONAL_RULE_COVERAGE.md](OPERATIONAL_RULE_COVERAGE.md) and
+  [PHASE_4_CLOSURE.md](PHASE_4_CLOSURE.md) for how behavior is verified.
+
+## All documents
 
 | Doc | What it covers |
 |-----|----------------|
+| [CLI.md](CLI.md) | Full `monoid` CLI: `run`, `builder`, `watch`, `proposal`, `jobs`, modes, custom workspace backends, streaming, and path permissions. |
+| [BACKEND.md](BACKEND.md) | Reference backend + LLM/Web gateway walkthrough: starting the services, creating a run over HTTP, and the token boundary. |
+| [OBSERVABILITY.md](OBSERVABILITY.md) | Run-directory artifact set, custom event sinks, OpenTelemetry tracing, live streaming, and metrics. |
+| [security/SECURITY_MODEL.md](security/SECURITY_MODEL.md) | Intended security boundaries, non-goals, actors/trust zones, and verified core invariants (each mapped to an operational rule and its tests). |
+| [security/THREAT_MODEL.md](security/THREAT_MODEL.md) | Trust boundaries, the permissive-by-default warning, threat-by-threat defenses, and integrator responsibilities. |
+| [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md) | Actionable pre-deployment checklist for gateways, workspace, tool surface, artifacts, and conformance. |
 | [CONTRACTS.md](CONTRACTS.md) | The stable integration surface: Python contracts, HTTP wire contracts, wiring rules, operational rules, and the contract/core/reference boundary. |
 | [CONFORMANCE.md](CONFORMANCE.md) | Profile-based conformance tests, harness roles, executable assertions, testing policy, and the Reference full profile. |
 | [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) | Supported helper modules and validation/library policy for contract-aligned implementations. |
@@ -18,7 +48,3 @@ make Monoid embeddable in different products and runtimes:
 | [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |
 | [SKILLS_DESIGN.md](SKILLS_DESIGN.md) | Agent Skills — procedural knowledge delivered through a `ContextProvider`, complementing subagents (execution) and MCP (integration). |
 | [FIRST_SKILL_TUTORIAL.md](FIRST_SKILL_TUTORIAL.md) | Create and smoke-test a minimal `SKILL.md` skill locally. |
-
-For observability (OpenTelemetry tracing, the streaming surface, `metrics.json`), see the
-[Observability](../README.md#observability) section of the top-level README and the runnable
-[`examples/otel_tracing.py`](../examples/otel_tracing.py).

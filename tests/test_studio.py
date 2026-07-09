@@ -67,6 +67,7 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
 
     with urllib.request.urlopen(f"{studio.base_url}/") as resp:
         html = resp.read().decode("utf-8")
+    html_lf = html.replace("\r\n", "\n")
     assert "#onboarding" in html  # the empty-state styles ship in the page
     assert "function showOnboarding" in html  # the panel is built on a fresh chat
     assert "function sendPrompt" in html  # suggested-prompt buttons call it
@@ -113,7 +114,7 @@ def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
         "    renderHitl(data);\n"
         "    return;\n"
         "  }"
-    ) in html
+    ) in html_lf
     assert "arguments_preview" in html
 
 

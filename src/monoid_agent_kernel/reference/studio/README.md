@@ -104,4 +104,4 @@ tools ask for approval.
 
 Toggle OpenTelemetry export in settings to emit GenAI spans (`invoke_agent → chat / execute_tool`)
 to an OTLP collector; install the exporter with `pip install 'monoid-agent-kernel[otel-export]'`.
-See the top-level [Observability](../../../../README.md#observability) section for the full story.
+See [docs/OBSERVABILITY.md](../../../../docs/OBSERVABILITY.md) for the full story.
