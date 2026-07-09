@@ -7,6 +7,17 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Documentation
+- Split the top-level README (686 → ~290 lines) into role-focused guides: the full CLI
+  reference moved to `docs/CLI.md`, the backend/gateway walkthrough to `docs/BACKEND.md`,
+  and outputs/event-sinks/observability to `docs/OBSERVABILITY.md`. The README now focuses
+  on positioning, install, the no-server quickstart, core concepts, and a documentation map.
+- Added `docs/THREAT_MODEL.md`: trust boundaries, a prominent permissive-by-default warning,
+  a threat-by-threat table of kernel defenses vs. integrator responsibilities, and explicit
+  out-of-scope notes. Expanded `SECURITY.md` to link it and surface the permissive default.
+- Reorganized `docs/README.md` around a "Find your path" persona navigation
+  (app developer / integrator / tool author / operator / security reviewer / contributor).
+
 ## [0.17.0] - 2026-07-08
 
 ### Added
