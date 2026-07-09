@@ -16,9 +16,10 @@ building against, and securing the kernel.
 - **I'm running a backend/gateway** → [BACKEND.md](BACKEND.md) for the reference
   wiring and token boundary, [OBSERVABILITY.md](OBSERVABILITY.md) for outputs,
   event sinks, and OTel.
-- **I'm reviewing security** → [THREAT_MODEL.md](THREAT_MODEL.md) for trust
-  boundaries and integrator responsibilities, [SECURITY.md](../SECURITY.md) for
-  reporting.
+- **I'm reviewing security** → [security/SECURITY_MODEL.md](security/SECURITY_MODEL.md)
+  for verified invariants and boundaries, [security/THREAT_MODEL.md](security/THREAT_MODEL.md)
+  for the threat-by-threat breakdown, [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md)
+  before deploying, [SECURITY.md](../SECURITY.md) for reporting.
 - **I'm extending with delegation/skills** → [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md),
   [SKILLS_DESIGN.md](SKILLS_DESIGN.md), [FIRST_SKILL_TUTORIAL.md](FIRST_SKILL_TUTORIAL.md).
 - **I'm contributing** → [CONTRIBUTING.md](../CONTRIBUTING.md), then
@@ -32,7 +33,9 @@ building against, and securing the kernel.
 | [CLI.md](CLI.md) | Full `monoid` CLI: `run`, `builder`, `watch`, `proposal`, `jobs`, modes, custom workspace backends, streaming, and path permissions. |
 | [BACKEND.md](BACKEND.md) | Reference backend + LLM/Web gateway walkthrough: starting the services, creating a run over HTTP, and the token boundary. |
 | [OBSERVABILITY.md](OBSERVABILITY.md) | Run-directory artifact set, custom event sinks, OpenTelemetry tracing, live streaming, and metrics. |
-| [THREAT_MODEL.md](THREAT_MODEL.md) | Trust boundaries, the permissive-by-default warning, threat-by-threat defenses, and integrator responsibilities. |
+| [security/SECURITY_MODEL.md](security/SECURITY_MODEL.md) | Intended security boundaries, non-goals, actors/trust zones, and verified core invariants (each mapped to an operational rule and its tests). |
+| [security/THREAT_MODEL.md](security/THREAT_MODEL.md) | Trust boundaries, the permissive-by-default warning, threat-by-threat defenses, and integrator responsibilities. |
+| [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md) | Actionable pre-deployment checklist for gateways, workspace, tool surface, artifacts, and conformance. |
 | [CONTRACTS.md](CONTRACTS.md) | The stable integration surface: Python contracts, HTTP wire contracts, wiring rules, operational rules, and the contract/core/reference boundary. |
 | [CONFORMANCE.md](CONFORMANCE.md) | Profile-based conformance tests, harness roles, executable assertions, testing policy, and the Reference full profile. |
 | [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) | Supported helper modules and validation/library policy for contract-aligned implementations. |

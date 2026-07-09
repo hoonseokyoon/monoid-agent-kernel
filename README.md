@@ -193,7 +193,7 @@ monoid run \
   directly.
 - **Permissions are permissive by default** — dotfiles and keys are treated as normal files.
   Pass `--deny-path` / `--redact-path` if the workspace holds secrets.
-  **See the [Threat Model](docs/THREAT_MODEL.md#permissive-by-default) before exposing secret-bearing workspaces.**
+  **See the [Threat Model](docs/security/THREAT_MODEL.md#permissive-by-default) before exposing secret-bearing workspaces.**
 - **Optional surfaces, each off unless flagged:** `--agents-directory` (subagents via
   `agent.spawn`), `--skills-directory` (Agent Skills), `--capability-broker` (leased tools).
 
@@ -260,7 +260,7 @@ Quick links:
 - **Use it:** [CLI reference](docs/CLI.md) · [Hosted backend](docs/BACKEND.md) · [Observability](docs/OBSERVABILITY.md)
 - **Build against it:** [Contracts](docs/CONTRACTS.md) · [Tool surface](docs/TOOL_SURFACE.md) · [Conformance](docs/CONFORMANCE.md)
 - **Extend it:** [Subagents](docs/SUBAGENT_DESIGN.md) · [Skills](docs/SKILLS_DESIGN.md) · [First skill tutorial](docs/FIRST_SKILL_TUTORIAL.md)
-- **Secure it:** [Threat model](docs/THREAT_MODEL.md) · [Security policy](SECURITY.md)
+- **Secure it:** [Security model](docs/security/SECURITY_MODEL.md) · [Threat model](docs/security/THREAT_MODEL.md) · [Production checklist](docs/security/PRODUCTION_CHECKLIST.md) · [Security policy](SECURITY.md)
 
 ## Contributing
 

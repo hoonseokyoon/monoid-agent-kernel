@@ -10,7 +10,13 @@ defends by design** and **what is the integrator's responsibility**. If a row
 below is an integrator responsibility, the kernel does not protect you from it
 out of the box.
 
-For how to report a vulnerability, see [SECURITY.md](../SECURITY.md).
+For the boundaries and invariants this threat model assumes, see
+[SECURITY_MODEL.md](SECURITY_MODEL.md); for deployment steps,
+[PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md); for how to report a
+vulnerability, [SECURITY.md](../../SECURITY.md). Where a kernel defense below is
+verified by a test, the invariant it maps to (and its
+[operational-rule](../OPERATIONAL_RULE_COVERAGE.md) coverage) is named in
+[SECURITY_MODEL.md](SECURITY_MODEL.md#core-invariants).
 
 ## Trust boundaries at a glance
 
@@ -56,7 +62,7 @@ Mitigate per run with `--deny-path` / `--redact-path`, or a
 
 `deny_patterns` blocks tool and shell access; `redact_patterns` only masks paths
 in the public event/status stream (private run artifacts keep real paths and
-contents). See [CLI.md](CLI.md#path-permissions).
+contents). See [CLI.md](../CLI.md#path-permissions).
 
 ## Threat-by-threat
 
@@ -65,7 +71,7 @@ contents). See [CLI.md](CLI.md#path-permissions).
 | **Provider key theft** | Kernel never receives provider keys; they stay in your gateway. | Secure the gateway process, its env, and its logs. |
 | **Gateway / run token theft** | Tokens are short-lived and scoped; reference tokens carry `kid` and support rotation + revocation. | Set a strong `MONOID_BACKEND_TOKEN_SECRET`; rotate keys; keep token TTLs short. |
 | **Token scope widening** | Payload-level domain/binding/call-limit values can only *narrow* a signed scope, never widen it. | Issue minimally-scoped tokens per run. |
-| **Capability lease replay / secret leak** | Leases carry handles (`token_ref`), never raw secrets; the edge resolves them; leases are scoped and short-lived. | Implement a `CapabilityBroker` that fails closed; do not auto-grant in production (`--auto-grant-capabilities` is dev-only). |
+| **Capability lease replay / secret leak** | A lease carries a `token_ref` **handle**, resolved to the real secret only at the gateway/tool edge — the raw provider/tenant secret never enters the core. Public payloads are further reduced to redacted summaries; scope only ever narrows (OR-01/03). | Implement a `CapabilityBroker` that fails closed; do not auto-grant in production (`--auto-grant-capabilities` is dev-only). Note: private checkpoints retain the full lease record (handle + scope), so protect run storage. |
 | **Workspace secret leakage** | `redact_patterns` masks paths in the public stream; file contents are kept out of `events.jsonl`. | Provide deny/redact policy; add a redacting event sink for secret-bearing tool args / shell commands. |
 | **Path traversal / escape** | Workspace access is mediated through the `Workspace` contract, rooted at the run workspace. | Use a workspace backend whose contract suite passes; do not mount host-sensitive roots as the workspace. |
 | **Prompt injection from files / web** | Kernel isolates runs and keeps provider egress behind the gateway. | Treat model output as untrusted; gate side-effecting tools behind `ask`/approval and capability leases. |
@@ -80,11 +86,11 @@ contents). See [CLI.md](CLI.md#path-permissions).
 
 - **`reference/*` is example code.** The reference backend, gateways, Studio, and
   stores demonstrate wiring; they are not hardened production services. Build
-  production services against the contracts in [CONTRACTS.md](CONTRACTS.md).
+  production services against the contracts in [CONTRACTS.md](../CONTRACTS.md).
 - **Sandboxing the shell / execution host.** The kernel does not containerize or
   jail shell execution. Run it in an environment you have already sandboxed.
 - **Network egress control beyond the gateway seam.** The kernel does not perform
   direct web egress, but it cannot stop a misconfigured gateway from doing so.
 
 If you are evaluating Monoid for a sensitive deployment and have questions about
-these boundaries, reach out via the contact in [SECURITY.md](../SECURITY.md).
+these boundaries, reach out via the contact in [SECURITY.md](../../SECURITY.md).

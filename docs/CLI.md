@@ -112,7 +112,7 @@ the kernel feeds the job's result back to the model when it finishes (inspect jo
 
 Path permission defaults are permissive: the kernel treats every root-contained file as a
 normal workspace file, including dotfiles and keys. **Read the
-[Threat Model](THREAT_MODEL.md) before exposing a workspace that holds secrets.**
+[Threat Model](security/THREAT_MODEL.md) before exposing a workspace that holds secrets.**
 Backends can explicitly deny or redact paths per run:
 
 ```bash

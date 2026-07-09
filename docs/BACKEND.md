@@ -7,7 +7,7 @@
 This walkthrough wires the reference backend, LLM gateway, and Web gateway
 together so you can create a run over HTTP with a real token boundary. Provider
 credentials live only in the gateway processes; the kernel never receives them.
-For the security rationale, see [THREAT_MODEL.md](THREAT_MODEL.md).
+For the security rationale, see [security/THREAT_MODEL.md](security/THREAT_MODEL.md).
 
 The reference backend issues run tokens, starts kernel runs, and exposes lifecycle,
 result, event, and tenant usage APIs. Lifecycle payloads use `state` plus `terminal`;

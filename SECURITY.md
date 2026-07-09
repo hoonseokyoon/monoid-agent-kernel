@@ -17,9 +17,12 @@ window to address the issue before public disclosure.
 This project is a **pre-1.0 agent kernel** (`0.x`). Treat it as a building
 block and review the security model before deploying it.
 
-**Read the full [Threat Model](docs/THREAT_MODEL.md)** for a threat-by-threat
-breakdown of what the kernel defends and what is the integrator's
-responsibility.
+The `docs/security/` cluster covers this in depth:
+[SECURITY_MODEL.md](docs/security/SECURITY_MODEL.md) (intended boundaries and
+verified invariants), [THREAT_MODEL.md](docs/security/THREAT_MODEL.md)
+(threat-by-threat: what the kernel defends vs. the integrator's responsibility),
+and [PRODUCTION_CHECKLIST.md](docs/security/PRODUCTION_CHECKLIST.md) (pre-deploy
+steps).
 
 Key boundaries the design relies on (see `README.md` and `docs/CONTRACTS.md`):
 
@@ -27,7 +30,7 @@ Key boundaries the design relies on (see `README.md` and `docs/CONTRACTS.md`):
   root-contained file — including dotfiles, `.env`, and keys — as a normal
   workspace file. There is no default deny/redact policy. If a run's workspace
   holds secrets, pass a deny/redact policy or the model can read them. See
-  [Threat Model → permissive by default](docs/THREAT_MODEL.md#permissive-by-default).
+  [Threat Model → permissive by default](docs/security/THREAT_MODEL.md#permissive-by-default).
 - **Provider credentials stay outside the kernel.** The default `GatewayModelAdapter`
   talks to a gateway you operate; OpenAI/Anthropic/Brave keys stay in that gateway.
 - **Secrets never enter the core.** Capability leases carry handles (`token_ref`),
