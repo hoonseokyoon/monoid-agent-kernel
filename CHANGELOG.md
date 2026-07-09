@@ -7,8 +7,14 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-07-09
+
+### Added
+- Added a GitHub Actions PyPI publishing workflow for GitHub Releases, using PyPI
+  Trusted Publishing with the `pypi` environment and release-tag/version validation.
+
 ### Documentation
-- Split the top-level README (686 → ~290 lines) into role-focused guides: the full CLI
+- Split the top-level README into role-focused guides: the full CLI
   reference moved to `docs/CLI.md`, the backend/gateway walkthrough to `docs/BACKEND.md`,
   and outputs/event-sinks/observability to `docs/OBSERVABILITY.md`. The README now focuses
   on positioning, install, the no-server quickstart, core concepts, and a documentation map.
@@ -20,6 +26,11 @@ out in commit messages and here.
   link the cluster and surface the permissive default.
 - Reorganized `docs/README.md` around a "Find your path" persona navigation
   (app developer / integrator / tool author / operator / security reviewer / contributor).
+- Updated README repository-file links to absolute GitHub URLs so the PyPI long
+  description links resolve to GitHub.
+- Clarified the subagent fan-out threat model to cover registered subagent definitions,
+  exposed `agent.spawn` bindings/capabilities, CLI-provided subagents, fork skills, and
+  Studio's `delegate` capability.
 
 ## [0.17.0] - 2026-07-08
 
