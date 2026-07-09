@@ -17,15 +17,27 @@ window to address the issue before public disclosure.
 This project is a **pre-1.0 agent kernel** (`0.x`). Treat it as a building
 block and review the security model before deploying it.
 
+The `docs/security/` cluster covers this in depth:
+[SECURITY_MODEL.md](docs/security/SECURITY_MODEL.md) (intended boundaries and
+verified invariants), [THREAT_MODEL.md](docs/security/THREAT_MODEL.md)
+(threat-by-threat: what the kernel defends vs. the integrator's responsibility),
+and [PRODUCTION_CHECKLIST.md](docs/security/PRODUCTION_CHECKLIST.md) (pre-deploy
+steps).
+
 Key boundaries the design relies on (see `README.md` and `docs/CONTRACTS.md`):
 
+- **The default is permissive by design.** Path permission defaults treat every
+  root-contained file — including dotfiles, `.env`, and keys — as a normal
+  workspace file. There is no default deny/redact policy. If a run's workspace
+  holds secrets, pass a deny/redact policy or the model can read them. See
+  [Threat Model → permissive by default](docs/security/THREAT_MODEL.md#permissive-by-default).
 - **Provider credentials stay outside the kernel.** The default `GatewayModelAdapter`
   talks to a gateway you operate; OpenAI/Anthropic/Brave keys stay in that gateway.
 - **Secrets never enter the core.** Capability leases carry handles (`token_ref`),
   never raw secrets; the edge resolves them.
 - **Public event streams keep file contents out by design.** The core honors
   `redact_patterns`; integrators own extra redaction for secret-bearing tool arguments
-  or shell commands (see the Event Sinks section of the README).
+  or shell commands (see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md#event-sinks)).
 - **`reference/*` is example code.** Build production services against the contracts.
 
 If you are evaluating this for a sensitive deployment and have questions about the
