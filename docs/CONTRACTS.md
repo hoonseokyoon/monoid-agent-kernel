@@ -557,6 +557,29 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   the bearer token itself. A control `send_message` uses the command id as its inbox idempotency
   key.
 
+### Durable Command Inbox
+
+`CommandStore` is the Reference multi-instance transport for control commands. The bundled
+`InMemoryCommandStore` serves one-process deployments; `SqliteCommandStore` supplies transactional
+idempotent append, ordered claim, stale-claim recovery, acknowledgement, result receipts, and
+per-run queue limits across backend instances. Configure every instance with a command store over
+the same database used by its shared checkpoint and lease stores.
+
+`POST /v1/runs/{run_id}/control` authenticates the submitted bearer token before enqueueing. The
+stored `monoid.command-inbox.v1` envelope contains the command ID, sanitized arguments, reason, and
+authenticated tenant/user principal. It never contains the bearer token. The owner mints a fresh
+short-lived internal run token when it drains the command. A local owner drains immediately and
+the route preserves the historical `ControlResult` response. A remote owner yields a `202`
+`monoid.command-receipt.v1`; poll
+`GET /v1/runs/{run_id}/control/{command_id}` until `completed` or `failed`.
+
+Append is idempotent by `(run_id, command_id)`. A duplicate receives the existing receipt and does
+not execute a second command. Claims are oldest-first per run. A crashed claimant becomes eligible
+after `command_claim_ttl_s`; command handlers therefore retain their existing idempotency
+obligations under crash-after-effect/before-ack recovery. `command_queue_limit` bounds pending plus
+claimed commands per run. Owner watchdogs drain inboxes alongside lease recovery and outbox
+redrive.
+
 ### Event Reads
 
 `GET /v1/runs/{run_id}/events?from_seq=N&limit=M` returns `{run_id, events, next_seq, has_more}`.

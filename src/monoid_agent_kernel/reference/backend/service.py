@@ -63,6 +63,15 @@ from monoid_agent_kernel.identifiers import (
     TASK_CALLBACK_AUDIENCES,
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManager
+from monoid_agent_kernel.reference.command_inbox import (
+    CommandPrincipal,
+    CommandReceipt,
+    CommandStore,
+    InMemoryCommandStore,
+    StoredCommand,
+    redact_command_credential,
+    sanitize_command_data,
+)
 from monoid_agent_kernel.reference.backend.commands import BackendCommandContext, BackendCommandService
 from monoid_agent_kernel.reference.backend.jobs import JobService, JobServiceContext
 from monoid_agent_kernel.reference.backend.loop_factory import (
@@ -350,6 +359,11 @@ class RunnerBackend:
     # shared store (SqliteLeaseStore over the same db as the checkpoint store) lets a worker
     # on another process/host reclaim a crashed peer's run.
     lease_store: LeaseStore | None = None
+    # Durable control-command transport. Use SqliteCommandStore on every instance for
+    # cross-worker delivery; the in-memory default preserves single-process simplicity.
+    command_store: CommandStore | None = None
+    command_queue_limit: int = 100
+    command_claim_ttl_s: float = 30.0
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _worker_id: str = field(default="", init=False, repr=False)
@@ -390,6 +404,10 @@ class RunnerBackend:
             self.checkpoint_store = LocalFsCheckpointStore(self.run_root)
         if self.lease_store is None:
             self.lease_store = LocalFsLeaseStore(self.run_root)
+        if self.command_store is None:
+            self.command_store = InMemoryCommandStore()
+        if self.command_queue_limit < 1 or self.command_claim_ttl_s <= 0:
+            raise ValueError("command queue limit and claim ttl must be positive")
         self._run_preparation = self._build_run_preparation_service()
         self._run_state = self._build_run_state_mutation_service()
         self._loop_factory = self._build_loop_factory()
@@ -1011,6 +1029,95 @@ class RunnerBackend:
     def dispatch(self, command: ControlCommand) -> ControlResult:
         return self._commands.dispatch(command)
 
+    def enqueue_control(self, command: ControlCommand) -> CommandReceipt:
+        """Authenticate, sanitize, and durably enqueue one idempotent command."""
+
+        args = dict(command.args)
+        token = str(args.pop("token", "") or "")
+        claims = self._authorize_command_target(command.run_id, token)
+        command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
+        assert self.command_store is not None
+        receipt = self.command_store.append(
+            StoredCommand(
+                run_id=command.run_id,
+                command_id=command_id,
+                type=command.type,
+                args=dict(
+                    redact_command_credential(sanitize_command_data(args), token)
+                ),
+                principal=CommandPrincipal(
+                    tenant_id=claims.tenant_id,
+                    user_id=claims.user_id,
+                    issuer=str(redact_command_credential(command.issuer, token)),
+                ),
+                reason=str(redact_command_credential(command.reason, token)),
+            ),
+            max_pending=self.command_queue_limit,
+        )
+        self._drain_command_inbox(command.run_id)
+        return self.command_store.receipt(command.run_id, command_id) or receipt
+
+    def _authorize_command_target(self, run_id: str, token: str) -> Any:
+        claims = self._verify_run_token(run_id, token)
+        run_dir = self._authorized_run_dir(run_id, token)
+        with self._lock:
+            local_record = self._records.get(run_id)
+        if local_record is None:
+            metadata = self._read_recovery_meta(run_dir, run_id)
+            if metadata is None:
+                raise KeyError(run_id)
+            if (
+                str(metadata.get("tenant_id") or "") != claims.tenant_id
+                or str(metadata.get("user_id") or "") != claims.user_id
+            ):
+                raise PermissionDenied("token subject mismatch")
+        return claims
+
+    def command_receipt(self, run_id: str, token: str, command_id: str) -> CommandReceipt:
+        self._authorize_command_target(run_id, token)
+        assert self.command_store is not None
+        receipt = self.command_store.receipt(run_id, command_id)
+        if receipt is None:
+            raise KeyError(command_id)
+        return receipt
+
+    def _drain_command_inbox(self, run_id: str) -> list[str]:
+        """Claim and execute commands only on the instance that owns the target run."""
+
+        with self._lock:
+            if run_id not in self._records:
+                return []
+        assert self.command_store is not None
+        completed: list[str] = []
+        while True:
+            stored = self.command_store.claim(
+                run_id,
+                self._worker_id,
+                claim_ttl_s=self.command_claim_ttl_s,
+            )
+            if stored is None:
+                return completed
+            token = self.token_manager.issue(
+                kind="run_access",
+                audience=BACKEND_AUDIENCE,
+                run_id=run_id,
+                tenant_id=stored.principal.tenant_id,
+                user_id=stored.principal.user_id,
+                ttl_s=60,
+            )
+            try:
+                result = self.dispatch(stored.control_command(token=token))
+            except Exception as exc:  # owner records a durable failure receipt
+                result = ControlResult(
+                    run_id=run_id,
+                    type=stored.type,  # type: ignore[arg-type]
+                    status="error",
+                    error=str(exc),
+                    error_code=getattr(exc, "error_code", "command_execution_error"),
+                )
+            self.command_store.acknowledge(run_id, stored.command_id, self._worker_id, result)
+            completed.append(stored.command_id)
+
     def _dispatch_control_command(
         self,
         command: ControlCommand,
@@ -1599,11 +1706,18 @@ class RunnerBackend:
                 self._heartbeat_own_runs()
                 self._reclaim_stale_runs()
                 self._redrive_outbox()
+                self._drain_command_inboxes()
             except Exception:  # pragma: no cover - the watchdog must never die on a tick
                 _LOGGER.exception("watchdog tick failed")
 
     def _redrive_outbox(self) -> None:
         self._outbox_dispatch.redrive_outbox()
+
+    def _drain_command_inboxes(self) -> None:
+        with self._lock:
+            run_ids = tuple(self._records)
+        for run_id in run_ids:
+            self._drain_command_inbox(run_id)
 
     def _heartbeat_own_runs(self) -> None:
         assert self.lease_store is not None

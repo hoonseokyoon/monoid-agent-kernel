@@ -11,10 +11,18 @@ from __future__ import annotations
 
 from monoid_agent_kernel.reference.stores.lease import LeaseStore, LocalFsLeaseStore
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
+from monoid_agent_kernel.reference.command_inbox import (
+    CommandStore,
+    InMemoryCommandStore,
+    SqliteCommandStore,
+)
 
 __all__ = [
     "LeaseStore",
     "LocalFsLeaseStore",
     "SqliteCheckpointStore",
     "SqliteLeaseStore",
+    "CommandStore",
+    "InMemoryCommandStore",
+    "SqliteCommandStore",
 ]

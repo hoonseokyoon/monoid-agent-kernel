@@ -284,6 +284,22 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         notes="Diagnostics consume fields without enforcing schema_version.",
     ),
     _monoid_artifact(
+        "command-inbox.v1",
+        kind="durable",
+        reader_policy="strict",
+        source=("reference/command_inbox.py:COMMAND_ENVELOPE_VERSION",),
+        legacy_reader=False,
+        notes="Reference command stores persist sanitized envelopes without bearer credentials.",
+    ),
+    _monoid_artifact(
+        "command-receipt.v1",
+        kind="wire",
+        reader_policy="writer-only",
+        source=("reference/command_inbox.py:COMMAND_RECEIPT_VERSION",),
+        legacy_reader=False,
+        notes="HTTP and Python receipt projection for queued command state and results.",
+    ),
+    _monoid_artifact(
         "conformance-report.v1",
         kind="reference",
         reader_policy="writer-only",
