@@ -2,11 +2,24 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
 
 jobs:
-  test:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint tooling
+        run: python -m pip install ruff
+      - name: Lint
+        run: ruff check src tests
+
+  fast-contract:
+    name: Fast + contract (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -14,59 +27,108 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,openai]"
-          pip install ruff
-      - name: Lint
-        run: ruff check src tests
-      - name: Test
-        run: pytest -q
+        run: python -m pip install -e ".[dev,openai]"
+      - name: Run deterministic parallel shard
+        run: python -m pytest -q -n 4 -m "(unit or contract) and not serial" --durations=25
 
-  xdist-advisory:
+  integration:
+    name: Serial integration (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: python -m pip install -e ".[dev,openai]"
+      - name: Run bounded serial shard
+        run: python -m pytest -q -m "(integration or serial) and not live" --durations=25
+
+  coverage:
+    name: Coverage floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,openai]"
-          pip install ruff
-      - name: Xdist advisory
-        run: python -m pytest -q -n 4 -m "not live"
-
-  coverage-advisory:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,openai]"
-      - name: Coverage advisory
+        run: python -m pip install -e ".[dev,openai]"
+      - name: Measure parallel unit and contract coverage
         run: >
-          python -m pytest -q
+          python -m pytest -q -n 4 -m "(unit or contract) and not serial"
           --cov=monoid_agent_kernel
           --cov=native_agent_runner
+          --cov-report=
+      - name: Append serial integration coverage and enforce floor
+        run: >
+          python -m pytest -q -m "(integration or serial) and not live"
+          --cov=monoid_agent_kernel
+          --cov=native_agent_runner
+          --cov-append
           --cov-report=term-missing:skip-covered
           --cov-report=xml
-      - name: Upload coverage XML
-        uses: actions/upload-artifact@v4
+          --cov-fail-under=80
+      - uses: actions/upload-artifact@v4
         with:
           name: coverage-xml
           path: coverage.xml
+
+  platform-smoke:
+    name: ${{ matrix.os }} smoke
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Run platform-sensitive smoke
+        run: >
+          python -m pytest -q
+          tests/test_workspace_paths_properties.py
+          tests/test_workspace_contract.py
+          tests/test_file_lock.py
+          tests/test_spec_serialization.py
+
+  install-smoke:
+    name: Install smoke (${{ matrix.install }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - install: minimal
+            requirement: "."
+          - install: all-extras
+            requirement: ".[openai,http-async,otel-export,mcp]"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package
+        run: python -m pip install "${{ matrix.requirement }}"
+      - name: Import public and optional surfaces
+        run: >
+          python -c "import monoid_agent_kernel;
+          import monoid_agent_kernel.providers.openai;
+          import monoid_agent_kernel.providers.gateway;
+          import monoid_agent_kernel.observability.otel;
+          import monoid_agent_kernel.mcp"
+      - name: Verify optional dependencies
+        if: matrix.install == 'all-extras'
+        run: python -c "import openai, httpx, opentelemetry.sdk"

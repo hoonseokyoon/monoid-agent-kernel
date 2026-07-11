@@ -48,20 +48,21 @@ contracts or conformance profiles.
 `docs/RUNNER_BACKEND_RESPONSIBILITY_MAP.md` is the current detailed map for the
 facade/service split.
 
-## CI Status
+## CI Status (updated for v0.18.0)
 
-The required CI gate remains:
+The required CI gates are:
 
-- `ruff check src tests`
-- serial `pytest -q` on Python 3.11 and 3.12
+- lint with `ruff check src tests`;
+- parallel unit/contract tests on Python 3.11 and 3.12;
+- deterministic serial integration tests;
+- branch coverage with an 80% ratchetable floor;
+- Windows and macOS platform-sensitive smoke tests;
+- minimal and all-supported-extras installation smoke tests.
 
-The advisory CI signals remain:
-
-- `python -m pytest -q -n 4 -m "not live"`
-- `python -m pytest -q --cov=monoid_agent_kernel --cov=native_agent_runner --cov-report=term-missing:skip-covered --cov-report=xml`
-
-Coverage has no `fail-under` threshold yet. A fail-under threshold should be set
-after a baseline and ratchet policy are agreed.
+Every collected test receives exactly one primary tier (`unit`, `contract`, or
+`integration`) through the repository tier policy. `slow`, `live`, and `serial`
+remain orthogonal traits. CI publishes slow-test data and coverage XML so the
+coverage floor can rise with the measured baseline.
 
 ## Remaining Flake Risk
 
@@ -74,10 +75,10 @@ external timing:
 - CI-only `xdist` scheduling differences
 - live-provider tests outside default gates
 
-`xdist` should become required after it stays green across several PRs, worker
-unsafe tests are marked `serial`, and the team agrees that remaining timing risk
-is low enough for a required gate. Coverage should become required after the
-first baseline is recorded and a ratcheting `fail-under` policy is agreed.
+Integration tests remain serial because they exercise shared event loops, threaded
+servers, and subprocesses. Unit and contract tests are the required xdist shard.
+The coverage floor is a regression guard rather than a completeness claim and
+should be raised deliberately as additional behavior moves behind reusable seams.
 
 ## Phase 4 Position
 
