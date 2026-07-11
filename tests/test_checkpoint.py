@@ -14,6 +14,7 @@ from monoid_agent_kernel.core.checkpoint import (
     SCHEMA_VERSION,
     LocalFsCheckpointStore,
     RunCheckpoint,
+    decode_checkpoint,
     read_checkpoint,
     read_checkpoint_checked,
     write_checkpoint,
@@ -480,6 +481,48 @@ def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
     assert restored is not None
     assert restored == cp
     assert restored.schema_version == SCHEMA_VERSION
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("run_id", ""),
+        ("run_id", []),
+        ("seq", True),
+        ("seq", -1),
+        ("terminal", "no"),
+        ("pending_observations", {}),
+        ("pending_binding_loads", [1]),
+        ("tool_call_counts", {"fs.read": True}),
+        ("queued_messages", [1]),
+        ("active_input", {"input_id": "input", "phase": "running", "source_seq": True}),
+        ("applied_input_receipts", {"input": {"terminal": "false"}}),
+    ),
+)
+def test_checkpoint_decoder_rejects_malformed_current_payload(field: str, value: object) -> None:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": "run_1",
+        "seq": 1,
+        "unknown_additive_field": {"preserved_by_format": True},
+    }
+    payload[field] = value
+
+    assert decode_checkpoint(payload).status == "corrupt"
+
+
+def test_checkpoint_decoder_allows_unknown_additive_fields() -> None:
+    checked = decode_checkpoint(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": "run_1",
+            "seq": 1,
+            "future_additive_field": {"value": True},
+        }
+    )
+
+    assert checked.status == "loaded"
+    assert checked.value is not None and checked.value.run_id == "run_1"
 
 
 def test_checkpoint_writer_canonicalizes_accepted_legacy_namespace(tmp_path: Path) -> None:

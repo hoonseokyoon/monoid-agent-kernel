@@ -10,9 +10,18 @@ from typing import Any
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core._util import write_json_atomic
-from monoid_agent_kernel.core.checkpoint import CheckpointRecord, CheckpointStore, load_latest_checked
+from monoid_agent_kernel.core.checkpoint import (
+    CHECKPOINT_CODEC,
+    CheckpointRecord,
+    CheckpointStore,
+    load_latest_checked,
+)
 from monoid_agent_kernel.core.durable_codec import DurableLoadResult
-from monoid_agent_kernel.core.durable_metadata import DurableMetadataCommitter
+from monoid_agent_kernel.core.durable_metadata import (
+    RUN_METADATA_CODEC,
+    DurableMetadataCommitter,
+    validate_recovery_metadata,
+)
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference.backend.ports import (
@@ -113,6 +122,16 @@ class RecoveryService:
             return False
         stored = checkpoint_result.value
         assert stored is not None
+        if stored.checkpoint.run_id != run_id or stored.checkpoint.seq != stored.seq:
+            self._record_checked_load_failure(
+                run_dir,
+                run_id,
+                CHECKPOINT_CODEC.corrupt(
+                    "checkpoint identity changed after checked load",
+                    sequence=stored.seq,
+                ),
+            )
+            return False
         if stored.checkpoint.terminal:
             return False
         try:
@@ -125,6 +144,17 @@ class RecoveryService:
             return False
         meta = metadata_result.value
         assert meta is not None
+        try:
+            validate_recovery_metadata(meta, expected_run_id=run_id)
+        except (TypeError, ValueError) as exc:
+            self._record_checked_load_failure(
+                run_dir,
+                run_id,
+                RUN_METADATA_CODEC.corrupt(
+                    f"backend-run recovery metadata validation failed ({exc})"
+                ),
+            )
+            return False
         try:
             self.resume_from_checkpoint(stored, meta)
         except Exception as exc:
@@ -154,6 +184,9 @@ class RecoveryService:
     def resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> None:
         checkpoint = stored.checkpoint
         run_id = checkpoint.run_id
+        if checkpoint.seq != stored.seq:
+            raise ValueError("checkpoint manifest sequence does not match its committed record")
+        validate_recovery_metadata(meta, expected_run_id=run_id)
         runtime_config = runtime_config_from_meta(meta)
         request = self._context.make_request(meta, runtime_config)
         workspace_root = request.workspace_root.resolve()

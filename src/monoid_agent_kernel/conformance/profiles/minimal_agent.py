@@ -10,6 +10,7 @@ from monoid_agent_kernel.conformance.report import (
     ConformanceRuleOutcome,
     observation,
     outcome_from_observations,
+    safe_exception_summary,
 )
 
 from ._metadata import ProfileMetadata
@@ -42,7 +43,7 @@ def run_minimal_agent_profile(harness: MinimalAgentHarness) -> tuple[Conformance
                 rule_id=rule_id,
                 profile_id=PROFILE.profile_id,
                 status="error",
-                error=f"{type(exc).__name__}: {exc}",
+                error=safe_exception_summary(exc),
             )
             for rule_id in MINIMAL_AGENT_RULE_IDS
         )

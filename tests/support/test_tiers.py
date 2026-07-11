@@ -53,6 +53,7 @@ _INTEGRATION_MODULES = frozenset(
 _SERIAL_CONTRACT_MODULES = frozenset(
     {
         "test_checkpoint_store_contract.py",
+        "test_command_store_contract.py",
         "test_lease_store_contract.py",
     }
 )

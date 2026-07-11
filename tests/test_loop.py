@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
+
+import pytest
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.cancellation import CancellationToken
+from monoid_agent_kernel.core.checkpoint import CheckpointRecord, CheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolQuota
@@ -363,6 +367,87 @@ class _ApprovalToolProvider:
         ]
 
 
+class _ReplayProcessExit(BaseException):
+    """Crash sentinel that bypasses the loop's controlled Exception boundary."""
+
+
+class _ReplayApprovalToolProvider:
+    def __init__(self, *, crash_on_value: str | None = None) -> None:
+        self.crash_on_value = crash_on_value
+        self.calls: list[str] = []
+
+    def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+        del context
+
+        def handler(ctx: ToolContext, args: dict) -> ToolResult:
+            del ctx
+            value = str(args.get("value") or "")
+            self.calls.append(value)
+            if value == self.crash_on_value:
+                raise _ReplayProcessExit()
+            return ToolResult(ok=True, content={"value": value})
+
+        return [
+            ToolSpec(
+                id="demo.approval",
+                description="approval replay crash demo",
+                input_schema={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "additionalProperties": True,
+                },
+                capability="",
+                side_effect="write",
+                handler=handler,
+            )
+        ]
+
+
+def _seed_approved_replays(
+    tmp_path: Path, values: tuple[str, ...]
+) -> tuple[Path, AgentRuntimeConfig, CheckpointStore, CheckpointRecord]:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ReplayApprovalToolProvider()
+    config = runtime_config(
+        bindings=(tool_binding("demo.approval", authorization="ask"), tool_binding("run.finish"))
+    )
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "seed-runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(
+                    tool_calls=tuple(
+                        fake_tool_call("demo_approval", {"value": value}, f"call_{index}")
+                        for index, value in enumerate(values, start=1)
+                    )
+                )
+            ]
+        ),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+    )
+    loop.open()
+    suspended = loop.run_until_suspended("approve the calls")
+    assert suspended.reason == "awaiting_tasks"
+    assert len(suspended.awaiting_task_ids) == len(values)
+    manager = loop._require_open().res.context.job_manager
+    task_by_call_id = {
+        str(getattr(task, "request").get("call_id") or ""): task_id
+        for task_id, task in manager.jobs.items()
+        if getattr(task, "request", {}).get("call_id")
+    }
+    for index in range(1, len(values) + 1):
+        loop.report_task_result(task_by_call_id[f"call_{index}"], {"approved": True})
+    assert loop.checkpoint_store is not None
+    store = loop.checkpoint_store
+    source = store.latest(loop.spec.run_id)
+    assert source is not None
+    assert source.checkpoint.pending_tool_approval_replays == []
+    loop.release_parked()
+    return workspace, config, store, source
+
+
 def test_ask_authorization_parks_and_approved_call_executes_once(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -563,6 +648,118 @@ def test_ask_authorization_replay_consumed_checkpoint_precedes_handler(tmp_path:
     assert provider.calls == 1
     assert task_holder["task_id"] in observed["delivered"]
     assert observed["pending_replays"] == []
+
+
+@pytest.mark.parametrize("crash_point", ("before_first_handler", "during_first_handler"))
+def test_approval_replay_crash_preserves_unstarted_tail_once(
+    tmp_path: Path, crash_point: str
+) -> None:
+    workspace, config, store, source = _seed_approved_replays(tmp_path, ("first", "second"))
+    persisted = False
+
+    def persist_then_maybe_crash(checkpoint: RunCheckpoint, blobs: Mapping[str, bytes]) -> None:
+        nonlocal persisted
+        store.put(checkpoint, blobs)
+        if crash_point == "before_first_handler" and not persisted:
+            persisted = True
+            raise _ReplayProcessExit()
+        persisted = True
+
+    crashing_provider = _ReplayApprovalToolProvider(
+        crash_on_value="first" if crash_point == "during_first_handler" else None
+    )
+    crashed = AgentLoop(
+        spec=AgentRunSpec(
+            run_id=source.checkpoint.run_id,
+            workspace_root=workspace,
+            run_root=tmp_path / "crashed-runs",
+        ),
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(final_text="unreachable")]),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(crashing_provider,),
+        checkpoint_store=store,
+        checkpoint_persist_callback=persist_then_maybe_crash,
+    )
+    crashed.restore(source.checkpoint, blobs=source.blob)
+    try:
+        with pytest.raises(_ReplayProcessExit):
+            crashed.run_until_suspended(None)
+    finally:
+        crashed.discard_uncommitted()
+
+    committed = store.latest(source.checkpoint.run_id)
+    assert committed is not None
+    assert [
+        replay["arguments"]["value"]
+        for replay in committed.checkpoint.pending_tool_approval_replays
+    ] == ["second"]
+    assert crashing_provider.calls == ([] if crash_point == "before_first_handler" else ["first"])
+
+    recovery_provider = _ReplayApprovalToolProvider()
+    recovered = AgentLoop(
+        spec=AgentRunSpec(
+            run_id=source.checkpoint.run_id,
+            workspace_root=workspace,
+            run_root=tmp_path / "recovered-runs",
+        ),
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(final_text="recovered")]),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(recovery_provider,),
+        checkpoint_store=store,
+    )
+    recovered.restore(committed.checkpoint, blobs=committed.blob)
+    try:
+        resumed = recovered.run_until_suspended(None)
+        assert resumed.reason == "settled"
+    finally:
+        recovered.discard_uncommitted()
+
+    assert recovery_provider.calls == ["second"]
+    recovered_checkpoint = store.latest(source.checkpoint.run_id)
+    assert recovered_checkpoint is not None
+    assert recovered_checkpoint.checkpoint.pending_tool_approval_replays == []
+
+
+def test_approval_replay_next_head_checkpoint_carries_prior_observation(tmp_path: Path) -> None:
+    workspace, config, store, source = _seed_approved_replays(tmp_path, ("first", "second"))
+    committed: list[RunCheckpoint] = []
+
+    def record_checkpoint(checkpoint: RunCheckpoint, blobs: Mapping[str, bytes]) -> None:
+        store.put(checkpoint, blobs)
+        committed.append(checkpoint)
+
+    provider = _ReplayApprovalToolProvider()
+    restored = AgentLoop(
+        spec=AgentRunSpec(
+            run_id=source.checkpoint.run_id,
+            workspace_root=workspace,
+            run_root=tmp_path / "observation-runs",
+        ),
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+        runtime_config_provider=runtime_provider(config),
+        tool_providers=(provider,),
+        checkpoint_store=store,
+        checkpoint_persist_callback=record_checkpoint,
+    )
+    restored.restore(source.checkpoint, blobs=source.blob)
+    try:
+        resumed = restored.run_until_suspended(None)
+        assert resumed.reason == "settled"
+    finally:
+        restored.discard_uncommitted()
+
+    assert provider.calls == ["first", "second"]
+    assert len(committed) >= 2
+    first_barrier = committed[0]
+    second_barrier = committed[1]
+    assert [
+        replay["arguments"]["value"] for replay in first_barrier.pending_tool_approval_replays
+    ] == ["second"]
+    assert second_barrier.pending_tool_approval_replays == []
+    assert any(
+        observation["call_id"] == "tool_approval_replay:call_1"
+        for observation in second_barrier.pending_observations
+    )
 
 
 def test_ask_authorization_denial_never_invokes_handler(tmp_path: Path) -> None:

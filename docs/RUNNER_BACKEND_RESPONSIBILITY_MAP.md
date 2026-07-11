@@ -81,8 +81,8 @@ Reference scenario names stay inside `monoid_agent_kernel.reference.conformance`
 
 | Target | Why it remains |
 | --- | --- |
-| CI hardening | Xdist and coverage jobs are advisory. Promote them only after their signal is consistently clean. |
 | Streaming transport adapters | Cursor ownership and final draining use `core.event_subscription`; HTTP SSE framing and Studio rendering remain transport-owned. |
+| Long-run event tail indexing | The Reference JSONL reader rescans from the beginning for each page. A future indexed or byte-offset reader can bound polling I/O without changing subscription semantics. |
 
 ## Design Position
 
@@ -96,6 +96,6 @@ The current structure matches the Phase 4 target:
 - Core, helper, and conformance surfaces do not require this Reference backend
   decomposition or any specific storage/product deployment choice.
 
-Phase 4 closure is recorded in `docs/PHASE_4_CLOSURE.md`. The next cleanup
-should focus on CI hardening, streaming transport adapters, or product-facing
-behavior, not more public API movement.
+Phase 4 closure is recorded in `docs/PHASE_4_CLOSURE.md`. CI hardening landed in
+v0.18. Further cleanup should focus on streaming transport efficiency or
+product-facing behavior, not more public API movement.

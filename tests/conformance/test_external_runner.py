@@ -102,9 +102,11 @@ def test_module_runner_writes_json_and_junit_for_reference_backend(tmp_path: Pat
 def test_runner_reports_close_failure_without_overriding_result(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    secret = "close-secret-must-not-reach-stderr"
+
     class CloseFailingHarness(_MinimalHarness):
         def close(self) -> None:
-            raise OSError("cleanup failed")
+            raise OSError(secret)
 
     monkeypatch.setattr(runner, "load_harness", lambda factory_ref: CloseFailingHarness())
 
@@ -113,4 +115,64 @@ def test_runner_reports_close_failure_without_overriding_result(
     captured = capsys.readouterr()
     assert exit_code == 0
     assert json.loads(captured.out)["passed"] is True
-    assert "conformance runner close error: OSError: cleanup failed" in captured.err
+    assert "conformance runner close error: OSError: details redacted" in captured.err
+    assert secret not in captured.err
+
+
+def test_runner_redacts_harness_exception_from_json_junit_and_stdio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "Authorization: Bearer conformance-secret"
+    secret_named_error = type(secret, (RuntimeError,), {})
+
+    class FailingHarness(_MinimalHarness):
+        def run_minimal_lifecycle_case(self) -> dict[str, object]:
+            raise secret_named_error(secret)
+
+    monkeypatch.setattr(runner, "load_harness", lambda factory_ref: FailingHarness())
+    json_path = tmp_path / "failed.json"
+    junit_path = tmp_path / "failed.xml"
+
+    exit_code = runner.main(
+        [
+            "--harness",
+            "external.module:create_harness",
+            "--json-out",
+            str(json_path),
+            "--junit-out",
+            str(junit_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    serialized = "\n".join(
+        (
+            captured.out,
+            captured.err,
+            json_path.read_text(encoding="utf-8"),
+            junit_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert exit_code == 1
+    assert secret not in serialized
+    assert "RuntimeError: details redacted" in serialized
+
+
+def test_runner_redacts_top_level_exception_from_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "top-level-loader-secret"
+
+    def fail_load(factory_ref: str) -> object:
+        del factory_ref
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(runner, "load_harness", fail_load)
+
+    assert runner.main(["--harness", "external.module:create_harness"]) == 2
+    captured = capsys.readouterr()
+    assert secret not in captured.err
+    assert "conformance runner error: RuntimeError: details redacted" in captured.err

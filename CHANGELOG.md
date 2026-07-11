@@ -53,6 +53,21 @@ out in commit messages and here.
   replaced advisory xdist/coverage jobs with required deterministic shards, a
   coverage floor, cross-platform smoke tests, and minimal/all-extras install smoke.
 
+### Fixed
+- Hardened checkpoint and run-metadata readers with structural validation, lookup-key and
+  committed-sequence binding, recovery-shape checks, and generation-based reconciliation between
+  local and shared metadata copies.
+- Preserved every unstarted approval replay across a process loss by consuming one durable head at
+  a time and carrying completed observations into the next safety checkpoint.
+- Applied cancellation and the session deadline to native async model calls and streams with
+  bounded provider cleanup; synchronous adapters retain their documented provider-timeout
+  responsibility.
+- Closed a Reference inbox redaction gap where JSON coercion of bytes or custom objects could
+  reintroduce a bearer into durable command arguments, and fenced watchdog restart after a stop
+  timeout.
+- Redacted raw exception bodies from conformance JSON, JUnit, and console diagnostics; strengthened
+  the reusable checkpoint-store contract to prove persistence across a fresh store instance.
+
 ## [0.17.1] - 2026-07-09
 
 ### Added

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from monoid_agent_kernel.conformance.harness import ConformanceHarness, MinimalAgentHarness
 from monoid_agent_kernel.conformance.profiles.minimal_agent import run_minimal_agent_profile
-from monoid_agent_kernel.conformance.report import ConformanceReport
+from monoid_agent_kernel.conformance.report import ConformanceReport, safe_exception_summary
 
 SUPPORTED_RUNNER_PROFILES = ("minimal-agent",)
 
@@ -80,7 +80,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(report.to_json(), sort_keys=True))
         return 0 if report.passed else 1
     except Exception as exc:
-        print(f"conformance runner error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"conformance runner error: {safe_exception_summary(exc)}", file=sys.stderr)
         return 2
     finally:
         close = getattr(harness, "close", None)
@@ -89,7 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 close()
             except Exception as exc:
                 print(
-                    f"conformance runner close error: {type(exc).__name__}: {exc}",
+                    f"conformance runner close error: {safe_exception_summary(exc)}",
                     file=sys.stderr,
                 )
 

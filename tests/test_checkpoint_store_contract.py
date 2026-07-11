@@ -20,11 +20,14 @@ from pathlib import Path
 import pytest
 
 from monoid_agent_kernel.core.checkpoint import (
+    CHECKPOINT_CODEC,
+    CheckpointRecord,
     CheckpointStore,
     LocalFsCheckpointStore,
     RunCheckpoint,
     load_latest_checked,
 )
+from monoid_agent_kernel.core.durable_codec import DurableLoadResult
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore
 
 StoreFactory = Callable[[Path], CheckpointStore]
@@ -80,6 +83,24 @@ def test_legacy_store_read_failure_is_not_classified_as_corrupt(tmp_path: Path) 
 
     with pytest.raises(OSError, match="store unavailable"):
         load_latest_checked(UnavailableLegacyStore(tmp_path), "run_1")
+
+
+def test_load_latest_checked_defensively_rejects_misbound_checked_store(tmp_path: Path) -> None:
+    class MisboundCheckedStore(LocalFsCheckpointStore):
+        def latest_checked(self, run_id: str):
+            del run_id
+            return DurableLoadResult(
+                status="loaded",
+                family=CHECKPOINT_CODEC.family,
+                current_schema=CHECKPOINT_CODEC.current_schema,
+                value=CheckpointRecord(seq=1, checkpoint=RunCheckpoint(run_id="run_other", seq=1)),
+                sequence=1,
+            )
+
+    checked = load_latest_checked(MisboundCheckedStore(tmp_path), "run_1")
+
+    assert checked.status == "corrupt"
+    assert checked.sequence == 1
 
 
 def test_latest_is_monotonic(store: CheckpointStore) -> None:
@@ -146,6 +167,17 @@ def test_checked_run_metadata_load_is_consistent(store: CheckpointStore) -> None
     assert loaded.value == payload
     store.put_run_metadata("run_1", {**payload, "schema_version": "monoid.backend-run.v99"})
     assert checked_reader("run_1").status == "unsupported_version"
+
+
+def test_checked_run_metadata_binds_payload_to_lookup_key(store: CheckpointStore) -> None:
+    payload = {
+        "schema_version": "monoid.backend-run.v1",
+        "run_id": "run_other",
+    }
+    store.put_run_metadata("run_1", payload)
+
+    assert getattr(store, "run_metadata_checked")("run_1").status == "corrupt"
+    assert store.run_metadata("run_1") is None
 
 
 def _replace_latest_manifest(store: CheckpointStore, text: str) -> None:
