@@ -9,9 +9,29 @@ from pathlib import Path
 
 import pytest
 
+from monoid_agent_kernel.reference.dbos.control_plane import _is_uninitialized_queue_table
 from support.waiting import eventually
 
 pytest.importorskip("dbos")
+
+
+def test_dbos_preflight_recognizes_fresh_sqlite_and_postgres_queue_tables() -> None:
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    errors = (
+        OperationalError(
+            "SELECT * FROM queues",
+            {},
+            Exception("no such table: main.queues"),
+        ),
+        ProgrammingError(
+            "SELECT * FROM dbos.queues",
+            {},
+            Exception('relation "dbos.queues" does not exist'),
+        ),
+    )
+
+    assert all(_is_uninitialized_queue_table(error) for error in errors)
 
 
 def _worker_env(root: Path) -> dict[str, str]:

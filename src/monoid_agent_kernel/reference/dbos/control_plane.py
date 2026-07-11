@@ -310,7 +310,7 @@ class DbosControlPlane:
             self._accepting = True
 
     def _preflight_queue_configuration(self) -> None:
-        from sqlalchemy.exc import OperationalError
+        from sqlalchemy.exc import DBAPIError
 
         client = self._dbos_module.DBOSClient(
             system_database_url=self.config.system_database_url
@@ -318,7 +318,7 @@ class DbosControlPlane:
         try:
             try:
                 queue = self._register_control_queue(client)
-            except OperationalError as exc:
+            except DBAPIError as exc:
                 if _is_uninitialized_queue_table(exc):
                     return
                 raise
