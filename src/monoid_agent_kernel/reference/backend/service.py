@@ -1108,6 +1108,7 @@ class RunnerBackend:
                         if resumable:
                             self.resume_run(command.run_id, token)
                             keep_lease = True
+                            self._drain_command_inbox(command.run_id)
                         return replace(
                             receipt,
                             transient_result=(
@@ -1143,6 +1144,8 @@ class RunnerBackend:
                         result,
                     )
                     keep_lease = result.status == "ok"
+                    if keep_lease:
+                        self._drain_command_inbox(command.run_id)
                     return replace(acknowledged, transient_result=result.to_json())
                 finally:
                     if not keep_lease:

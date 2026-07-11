@@ -599,8 +599,10 @@ an owner crash and the checkpoint remains resumable, the next owner rehydrates i
 the receipt. A terminal or otherwise non-resumable run returns the completed receipt and releases
 the temporary lease. This authenticated recovery reservation is outside the normal pending-command
 limit, allowing `resume` to recreate an owner and drain a full inbox. Other command types cannot use
-the reservation. A failed recovery releases the run lease. With a fresh remote owner, `resume`
-follows the regular durable inbox path.
+the reservation. After materialization and recovery-command acknowledgement, the new owner drains
+the existing inbox before returning; deployments do not depend on a later watchdog tick to clear
+the backlog. A failed recovery releases the run lease. With a fresh remote owner, `resume` follows
+the regular durable inbox path.
 
 Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
 receipt and does not execute a second command. Reusing the ID for a different type, sanitized

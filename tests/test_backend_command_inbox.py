@@ -469,6 +469,11 @@ def test_http_resume_recovers_ownerless_run_with_full_command_inbox(
     )
     assert durable_receipt is not None
     assert durable_receipt.status == "completed"
+    blocked_receipt = restarted.command_store.receipt(
+        submission.run_id, "cmd_blocked_head"
+    )
+    assert blocked_receipt is not None
+    assert blocked_receipt.status == "completed"
     audits = [
         event
         for event in restarted.events(submission.run_id, submission.run_token)["events"]
