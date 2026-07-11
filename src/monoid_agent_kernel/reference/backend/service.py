@@ -1137,13 +1137,13 @@ class RunnerBackend:
                         direct_command,
                         audit_token_sha256=TokenManager.token_sha256(token),
                     )
+                    keep_lease = result.status == "ok"
                     acknowledged = self.command_store.acknowledge(
                         command.run_id,
                         command_id,
                         self._worker_id,
                         result,
                     )
-                    keep_lease = result.status == "ok"
                     if keep_lease:
                         self._drain_command_inbox(command.run_id)
                     return replace(acknowledged, transient_result=result.to_json())

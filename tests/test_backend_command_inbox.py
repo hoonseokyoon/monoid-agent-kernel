@@ -614,3 +614,69 @@ def test_completed_ownerless_resume_preserves_receipt_and_rehydrates_only_if_res
     if not terminal_after_ack:
         restarted.cancel_run(submission.run_id, submission.run_token)
         first.cancel_run(submission.run_id, submission.run_token)
+
+
+def test_ownerless_resume_keeps_lease_when_receipt_acknowledgement_fails(
+    backend_factory: Any, tmp_path: Path
+) -> None:
+    workspace = backend_factory.workspace()
+    run_root = tmp_path / "runs"
+    token_manager = backend_factory.token_manager()
+    first = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=token_manager,
+        turns=[ModelTurn(response_id="parked", final_text="parked")],
+    )
+    submission = first.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="park",
+            runtime_config=runtime_config("run.finish"),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: first._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+
+    restarted = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=token_manager,
+        turns=[ModelTurn(response_id="resumed", final_text="resumed")],
+    )
+    assert restarted.command_store is not None
+    original_acknowledge = restarted.command_store.acknowledge
+
+    def fail_resume_acknowledgement(
+        run_id: str,
+        command_id: str,
+        worker_id: str,
+        result: ControlResult,
+    ) -> Any:
+        if command_id == "cmd_ack_failure":
+            raise RuntimeError("simulated durable acknowledgement failure")
+        return original_acknowledge(run_id, command_id, worker_id, result)
+
+    restarted.command_store.acknowledge = fail_resume_acknowledgement  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="simulated durable acknowledgement failure"):
+        restarted.enqueue_control(
+            ControlCommand(
+                type="resume",
+                run_id=submission.run_id,
+                args={"token": submission.run_token},
+                command_id="cmd_ack_failure",
+            )
+        )
+
+    assert submission.run_id in restarted._records
+    assert restarted.lease_store is not None
+    assert restarted.lease_store.owner(submission.run_id) == restarted._worker_id
+
+    restarted.command_store.acknowledge = original_acknowledge  # type: ignore[method-assign]
+    restarted.cancel_run(submission.run_id, submission.run_token)
+    first.cancel_run(submission.run_id, submission.run_token)
