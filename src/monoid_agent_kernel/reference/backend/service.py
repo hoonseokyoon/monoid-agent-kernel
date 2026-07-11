@@ -1099,6 +1099,11 @@ class RunnerBackend:
                         max_pending=self.command_queue_limit,
                         recovery_reservation=True,
                     )
+                    repaired = self._repair_command_acknowledgement(
+                        command.run_id, command_id
+                    )
+                    if repaired is not None:
+                        receipt = repaired
                     if receipt.status == "completed":
                         run_dir = self.run_root / command.run_id
                         latest = self._checkpoint_store().latest(command.run_id)
@@ -1149,9 +1154,8 @@ class RunnerBackend:
                             result,
                         )
                     except Exception:
-                        if keep_lease:
-                            with self._lock:
-                                self._command_ack_repairs[(command.run_id, command_id)] = result
+                        with self._lock:
+                            self._command_ack_repairs[(command.run_id, command_id)] = result
                         raise
                     if keep_lease:
                         self._drain_command_inbox(command.run_id)
@@ -1305,18 +1309,17 @@ class RunnerBackend:
             assert self.command_store is not None
             completed: dict[str, ControlResult] = {}
             with self._lock:
-                repairs = [
-                    (command_id, result)
-                    for (repair_run_id, command_id), result in self._command_ack_repairs.items()
+                repair_ids = [
+                    command_id
+                    for repair_run_id, command_id in self._command_ack_repairs
                     if repair_run_id == run_id
                 ]
-            for command_id, result in repairs:
-                self.command_store.acknowledge(
-                    run_id, command_id, self._worker_id, result
-                )
+            for command_id in repair_ids:
                 with self._lock:
-                    self._command_ack_repairs.pop((run_id, command_id), None)
-                completed[command_id] = result
+                    result = self._command_ack_repairs.get((run_id, command_id))
+                if result is not None:
+                    self._repair_command_acknowledgement(run_id, command_id)
+                    completed[command_id] = result
             while True:
                 stored = self.command_store.claim(
                     run_id,
@@ -1353,6 +1356,22 @@ class RunnerBackend:
                     run_id, stored.command_id, self._worker_id, result
                 )
                 completed[stored.command_id] = result
+
+    def _repair_command_acknowledgement(
+        self, run_id: str, command_id: str
+    ) -> CommandReceipt | None:
+        with self._lock:
+            result = self._command_ack_repairs.get((run_id, command_id))
+        if result is None:
+            return None
+        assert self.command_store is not None
+        receipt = self.command_store.acknowledge(
+            run_id, command_id, self._worker_id, result
+        )
+        with self._lock:
+            if self._command_ack_repairs.get((run_id, command_id)) is result:
+                self._command_ack_repairs.pop((run_id, command_id), None)
+        return receipt
 
     def _command_drain_lock(self, run_id: str) -> threading.RLock:
         with self._lock:

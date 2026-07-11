@@ -607,7 +607,9 @@ lease even if durable receipt acknowledgement or backlog drain fails; retry and 
 can then repair the command transport without creating a second live owner. The live owner retains
 the successful result in a bounded in-memory repair entry and retries acknowledgement before
 claiming more commands, preserving the original command effect and audit. If that owner also
-crashes, the configured claim TTL makes the reservation recoverable by its successor.
+crashes, the configured claim TTL makes the reservation recoverable by its successor. Failed
+resume results use the same repair entry: a same-backend retry persists and returns the failed
+receipt without redispatch, while the unsuccessful run lease remains released.
 
 Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
 receipt and does not execute a second command. Reusing the ID for a different type, sanitized

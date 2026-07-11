@@ -699,3 +699,91 @@ def test_ownerless_resume_keeps_lease_when_receipt_acknowledgement_fails(
     restarted.command_store.acknowledge = original_acknowledge  # type: ignore[method-assign]
     restarted.cancel_run(submission.run_id, submission.run_token)
     first.cancel_run(submission.run_id, submission.run_token)
+
+
+def test_failed_ownerless_resume_repairs_receipt_without_redispatch(
+    backend_factory: Any, tmp_path: Path
+) -> None:
+    workspace = backend_factory.workspace()
+    run_root = tmp_path / "runs"
+    token_manager = backend_factory.token_manager()
+    first = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=token_manager,
+        turns=[ModelTurn(response_id="parked", final_text="parked")],
+    )
+    submission = first.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="park",
+            runtime_config=runtime_config("run.finish"),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: first._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+
+    restarted = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=token_manager,
+    )
+    assert restarted.command_store is not None
+    dispatch_calls = 0
+
+    def fail_resume_dispatch(command: ControlCommand, **kwargs: Any) -> ControlResult:
+        del kwargs
+        nonlocal dispatch_calls
+        dispatch_calls += 1
+        return ControlResult(
+            run_id=command.run_id,
+            type=command.type,
+            status="error",
+            error="simulated resume failure",
+            error_code="resume_failed",
+        )
+
+    restarted._commands.dispatch = fail_resume_dispatch  # type: ignore[method-assign]
+    original_acknowledge = restarted.command_store.acknowledge
+    failures_remaining = 1
+
+    def fail_first_acknowledgement(
+        run_id: str,
+        command_id: str,
+        worker_id: str,
+        result: ControlResult,
+    ) -> Any:
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise RuntimeError("simulated durable acknowledgement failure")
+        return original_acknowledge(run_id, command_id, worker_id, result)
+
+    restarted.command_store.acknowledge = fail_first_acknowledgement  # type: ignore[method-assign]
+    command = ControlCommand(
+        type="resume",
+        run_id=submission.run_id,
+        args={"token": submission.run_token},
+        command_id="cmd_failed_ack",
+    )
+    with pytest.raises(RuntimeError, match="simulated durable acknowledgement failure"):
+        restarted.enqueue_control(command)
+    assert restarted.lease_store is not None
+    assert restarted.lease_store.owner(submission.run_id) is None
+    assert submission.run_id not in restarted._records
+
+    repaired = restarted.enqueue_control(command)
+
+    assert repaired.status == "failed"
+    assert repaired.result is not None
+    assert repaired.result["error_code"] == "resume_failed"
+    assert dispatch_calls == 1
+    assert restarted.lease_store.owner(submission.run_id) is None
+
+    restarted.command_store.acknowledge = original_acknowledge  # type: ignore[method-assign]
+    first.cancel_run(submission.run_id, submission.run_token)
