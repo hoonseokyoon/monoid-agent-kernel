@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -139,12 +140,12 @@ class ModelAdapter(Protocol):
     ones.
 
     Async: the engine runs an async core. A sync ``next_turn`` is offloaded to a thread
-    automatically, so existing sync adapters keep working. To be awaited natively (no
-    thread), an adapter may instead define ``async def anext_turn(request) -> ModelTurn``;
-    the engine prefers it when present. A coroutine ``next_turn`` is also awaited directly.
+    automatically, so existing sync adapters keep working. Native async-only adapters implement
+    :class:`AsyncModelAdapter`; the engine prefers ``anext_turn`` when an adapter exposes both.
+    A coroutine ``next_turn`` is also awaited directly for compatibility.
 
-    Streaming: to feed ``AgentLoop.astream`` token-by-token, an adapter may define
-    ``async def astream_turn(request) -> AsyncIterator[ModelStreamChunk]`` yielding
+    Streaming: to feed ``AgentLoop.astream`` token-by-token, an adapter implements
+    :class:`StreamingModelAdapter` and yields
     :class:`TextDelta` / :class:`ToolCallDelta` / :class:`TurnComplete` chunks. The engine
     prefers it only while a stream is active and folds the chunks back into a ``ModelTurn``
     (see :func:`assemble_streamed_turn`) so a streamed turn produces the same orchestration
@@ -165,6 +166,26 @@ class ModelAdapter(Protocol):
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         ...
+
+
+class AsyncModelAdapter(Protocol):
+    """Native async one-shot model adapter contract.
+
+    An adapter may implement this contract without a synchronous ``next_turn`` method. The
+    engine awaits ``anext_turn`` directly and preserves the same retry, event, and checkpoint
+    behavior as the synchronous adapter path.
+    """
+
+    supports_multimodal: bool = False
+    wire_image_encoding: str = "base64"
+
+    async def anext_turn(self, request: ModelRequest) -> ModelTurn: ...
+
+
+class StreamingModelAdapter(Protocol):
+    """Optional token-streaming extension for a sync or async model adapter."""
+
+    def astream_turn(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]: ...
 
 
 # --- Streaming chunks ------------------------------------------------------------------
@@ -309,4 +330,3 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         reasoning=reasoning,
         stop_reason=stop_reason,
     )
-

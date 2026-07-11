@@ -7,7 +7,7 @@ import inspect
 import json
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any
 
@@ -139,6 +139,7 @@ from monoid_agent_kernel.tasks import (
 )
 from monoid_agent_kernel.permissions import PermissionPolicy, matches_path_patterns
 from monoid_agent_kernel.providers.base import (
+    AsyncModelAdapter,
     ModelAdapter,
     ModelRequest,
     ModelStreamChunk,
@@ -605,7 +606,7 @@ class _Session:
 @dataclass
 class AgentLoop:
     spec: AgentRunSpec
-    model_adapter: ModelAdapter
+    model_adapter: ModelAdapter | AsyncModelAdapter
     _: KW_ONLY
     # Accepts a RuntimeConfigProvider, a bare AgentRuntimeConfig, or a
     # callable(run_id) -> AgentRuntimeConfig; __post_init__ coerces to a provider.
@@ -704,7 +705,7 @@ class AgentLoop:
     def from_config(
         cls,
         spec: AgentRunSpec,
-        model_adapter: ModelAdapter,
+        model_adapter: ModelAdapter | AsyncModelAdapter,
         runtime_config: RuntimeConfigSource,
         **kwargs: Any,
     ) -> AgentLoop:
@@ -724,7 +725,7 @@ class AgentLoop:
     def from_tools(
         cls,
         spec: AgentRunSpec,
-        model_adapter: ModelAdapter,
+        model_adapter: ModelAdapter | AsyncModelAdapter,
         tools: Iterable[ToolSpec],
         *,
         definition_id: str = "custom-agent",
@@ -2347,30 +2348,29 @@ class AgentLoop:
             call_counts_before_replays = dict(state.tool_call_counts)
             # Auto-redispatch (⑤): run any gated calls whose capability was just granted, now that
             # this turn's context (catalog/surface/turn_id) exists. Each goes through the normal
-            # _execute_tool_call (real permission/quota/events); the result is injected as a
+            # _aexecute_tool_call (real permission/quota/events); the result is injected as a
             # user-message observation so the model sees the outcome without retrying. A replay that
             # can't run cleanly (no valid lease) is skipped — the model then retries (fallback).
             if state.pending_capability_replays:
                 pending_replays = state.pending_capability_replays
                 state.pending_capability_replays = ()
-                replay_obs = tuple(
-                    obs
-                    for replay in pending_replays
-                    if (
-                        obs := self._execute_capability_replay(
-                            replay,
-                            bound_catalog=bound_catalog,
-                            surface_snapshot=surface_snapshot,
-                            call_counts=state.tool_call_counts,
-                            context=context,
-                            recorder=recorder,
-                            turn_id=turn_id,
-                            step=step,
-                            side_effect_policy=side_effect_policy,
-                        )
+                replay_obs_list: list[ToolObservation] = []
+                for replay in pending_replays:
+                    obs = await self._aexecute_capability_replay(
+                        replay,
+                        bound_catalog=bound_catalog,
+                        surface_snapshot=surface_snapshot,
+                        call_counts=state.tool_call_counts,
+                        context=context,
+                        recorder=recorder,
+                        turn_id=turn_id,
+                        step=step,
+                        side_effect_policy=side_effect_policy,
+                        deadline=deadline,
                     )
-                    is not None
-                )
+                    if obs is not None:
+                        replay_obs_list.append(obs)
+                replay_obs = tuple(replay_obs_list)
                 if replay_obs:
                     state.pending_observations = (*state.pending_observations, *replay_obs)
             if state.pending_tool_approval_replays:
@@ -2380,24 +2380,23 @@ class AgentLoop:
                 # process exits during the handler, restore must not re-deliver the same approval and
                 # execute a write/side-effecting tool twice.
                 self._persist_checkpoint(session)
-                replay_obs = tuple(
-                    obs
-                    for replay in pending_replays
-                    if (
-                        obs := self._execute_tool_approval_replay(
-                            replay,
-                            bound_catalog=bound_catalog,
-                            surface_snapshot=surface_snapshot,
-                            call_counts=state.tool_call_counts,
-                            context=context,
-                            recorder=recorder,
-                            turn_id=turn_id,
-                            step=step,
-                            side_effect_policy=side_effect_policy,
-                        )
+                replay_obs_list = []
+                for replay in pending_replays:
+                    obs = await self._aexecute_tool_approval_replay(
+                        replay,
+                        bound_catalog=bound_catalog,
+                        surface_snapshot=surface_snapshot,
+                        call_counts=state.tool_call_counts,
+                        context=context,
+                        recorder=recorder,
+                        turn_id=turn_id,
+                        step=step,
+                        side_effect_policy=side_effect_policy,
+                        deadline=deadline,
                     )
-                    is not None
-                )
+                    if obs is not None:
+                        replay_obs_list.append(obs)
+                replay_obs = tuple(replay_obs_list)
                 if replay_obs:
                     state.pending_observations = (*state.pending_observations, *replay_obs)
             # Replays run before the model request. If they consumed quota, rebuild the
@@ -2707,11 +2706,10 @@ class AgentLoop:
                     state.final_text = "Stopped after reaching max tool calls."
                     state.error_code = "max_tool_calls_exceeded"
                     break
-                # Offload the (sync) tool handler — which may block on shell/web/fs — to a
-                # thread so the event loop stays free. Awaited sequentially, so there is no
-                # concurrent access to the shared context/state it mutates.
-                observation = await asyncio.to_thread(
-                    self._execute_tool_call,
+                # Each call completes before the next starts. Native async handlers stay on
+                # this loop; synchronous handlers are offloaded inside the shared execution
+                # path so approvals, capability gates, events, and error mapping remain aligned.
+                observation = await self._aexecute_tool_call(
                     call_name=call.name,
                     call_id=call.id,
                     arguments=call.arguments,
@@ -2724,6 +2722,7 @@ class AgentLoop:
                     parent_id=turn_started.event_id,
                     step=step,
                     side_effect_policy=side_effect_policy,
+                    deadline=deadline,
                 )
                 observations.append(observation)
                 self._check_run_boundary(deadline)
@@ -3034,7 +3033,7 @@ class AgentLoop:
                 },
             )
 
-    def _execute_capability_replay(
+    async def _aexecute_capability_replay(
         self,
         replay: dict[str, Any],
         *,
@@ -3046,6 +3045,7 @@ class AgentLoop:
         turn_id: str,
         step: int,
         side_effect_policy: ToolSideEffectPolicy,
+        deadline: float | None,
     ) -> ToolObservation | None:
         """Re-execute one gated tool call after its capability was granted, returning the result as
         a user-message observation (so it never collides with the original call's pending tool
@@ -3054,7 +3054,7 @@ class AgentLoop:
         capability = str(replay.get("capability") or "")
         if not capability or self._capability_vault.token_for(capability, now=time.time()) is None:
             return None  # lease missing/expired -> let the model retry (the granted message stands)
-        observation = self._execute_tool_call(
+        observation = await self._aexecute_tool_call(
             call_name=str(replay.get("call_name") or ""),
             call_id=str(replay.get("call_id") or ""),
             arguments=dict(replay.get("arguments") or {}),
@@ -3072,6 +3072,7 @@ class AgentLoop:
                 else None
             ),
             side_effect_policy=side_effect_policy,
+            deadline=deadline,
         )
         # Deliver as a user message (is_background) under a distinct call_id — the original call_id
         # already carries the "pending" tool result, so a second tool result there would be malformed.
@@ -3087,7 +3088,7 @@ class AgentLoop:
             is_background=True,
         )
 
-    def _execute_tool_approval_replay(
+    async def _aexecute_tool_approval_replay(
         self,
         replay: dict[str, Any],
         *,
@@ -3099,11 +3100,12 @@ class AgentLoop:
         turn_id: str,
         step: int,
         side_effect_policy: ToolSideEffectPolicy,
+        deadline: float | None,
     ) -> ToolObservation | None:
         call_name = str(replay.get("call_name") or "")
         if not call_name:
             return None
-        observation = self._execute_tool_call(
+        observation = await self._aexecute_tool_call(
             call_name=call_name,
             call_id=str(replay.get("call_id") or ""),
             arguments=dict(replay.get("arguments") or {}),
@@ -3117,6 +3119,7 @@ class AgentLoop:
             step=step,
             approved_tool_approval=replay,
             side_effect_policy=side_effect_policy,
+            deadline=deadline,
         )
         return ToolObservation(
             call_id=f"tool_approval_replay:{replay.get('call_id') or ''}",
@@ -3320,7 +3323,7 @@ class AgentLoop:
                     error_code="tool_scope_denied",
                 )
 
-    def _invoke_handler(
+    async def _ainvoke_handler(
         self,
         bound_tool: BoundTool,
         context: AgentToolContext,
@@ -3331,6 +3334,7 @@ class AgentLoop:
         recorder: AgentRecorder,
         started_event: AgentEvent,
         authorization: ToolAuthorization,
+        deadline: float | None,
     ) -> ToolResult:
         spec = bound_tool.base_spec
         context._current_call = CallContext(
@@ -3345,10 +3349,69 @@ class AgentLoop:
             runtime=bound_tool.runtime,
         )
         try:
-            result = spec.handler(context, arguments)
+            handler = spec.handler
+            async_call = inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(
+                getattr(handler, "__call__", None)
+            )
+            if async_call:
+                pending = handler(context, arguments)
+                result = await self._await_native_tool_handler(pending, deadline)
+            else:
+                result = await asyncio.to_thread(handler, context, arguments)
+                if inspect.isawaitable(result):
+                    result = await self._await_native_tool_handler(result, deadline)
+            if not isinstance(result, ToolResult):
+                raise TypeError("tool handler must return ToolResult")
         finally:
             context._current_call = CallContext("", None, None)
         return result
+
+    async def _await_native_tool_handler(
+        self,
+        pending: Awaitable[ToolResult],
+        deadline: float | None,
+    ) -> ToolResult:
+        """Await a native handler with run cancellation and deadline propagation."""
+
+        task = asyncio.ensure_future(pending)
+        loop = asyncio.get_running_loop()
+        cancelled: asyncio.Future[None] = loop.create_future()
+
+        def signal_cancelled() -> None:
+            def resolve() -> None:
+                if not cancelled.done():
+                    cancelled.set_result(None)
+
+            loop.call_soon_threadsafe(resolve)
+
+        remove_callback = (
+            self.cancellation_token.add_cancel_callback(signal_cancelled)
+            if self.cancellation_token is not None
+            else lambda: None
+        )
+        timeout = None if deadline is None else max(0.0, deadline - time.time())
+        try:
+            done, _pending = await asyncio.wait(
+                {task, cancelled},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            self._check_run_boundary(deadline)
+            if task in done:
+                return task.result()
+            if cancelled in done:
+                raise RunCancelled("run cancelled")
+            raise RunTimeout("run exceeded max duration")
+        finally:
+            remove_callback()
+            if not cancelled.done():
+                cancelled.cancel()
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     def _finalize_tool_call(
         self,
@@ -3465,7 +3528,7 @@ class AgentLoop:
                 error_code="tool_approval_stale",
             )
 
-    def _execute_tool_call(
+    async def _aexecute_tool_call(
         self,
         *,
         call_name: str,
@@ -3480,6 +3543,7 @@ class AgentLoop:
         parent_id: str | None,
         step: int,
         side_effect_policy: ToolSideEffectPolicy,
+        deadline: float | None,
         approved_tool_approval: Mapping[str, Any] | None = None,
     ) -> ToolObservation:
         spec: ToolSpec | None = None
@@ -3595,7 +3659,7 @@ class AgentLoop:
                         outbox_count = (
                             len(self._outbox.export()) if side_effect_admission.requires_outbox else 0
                         )
-                        result = self._invoke_handler(
+                        result = await self._ainvoke_handler(
                             bound_tool,
                             context,
                             arguments,
@@ -3604,6 +3668,7 @@ class AgentLoop:
                             recorder=recorder,
                             started_event=started_event,
                             authorization=authorization,
+                            deadline=deadline,
                         )
                         if result.ok:
                             if side_effect_admission.requires_outbox:
@@ -3626,6 +3691,8 @@ class AgentLoop:
                                 turn_id,
                                 started_event.event_id,
                             )
+        except (RunCancelled, RunTimeout, TurnInterrupted):
+            raise
         except ToolExecutionError as exc:
             if started_event is None:
                 started_event = self._emit_tool_started(

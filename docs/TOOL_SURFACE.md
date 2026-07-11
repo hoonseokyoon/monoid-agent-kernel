@@ -96,6 +96,25 @@ produces:
 
 The model sees `model_spec`. Execution uses `base_spec.handler`.
 
+## Sync and async handlers
+
+`ToolSpec.handler` accepts `SyncToolHandler` and `AsyncToolHandler`. The `@tool` decorator detects
+`async def` and keeps it native:
+
+```python
+@tool(id="catalog.lookup", side_effect="read")
+async def lookup(query: str) -> dict:
+    return await catalog.lookup(query)
+```
+
+The loop awaits async handlers on its event loop and offloads synchronous handlers to a worker.
+Calls stay sequential, including multiple calls in one model response and approval/capability
+replays. This preserves context mutation, quota accounting, durable events, and side-effect order.
+
+Cancellation and run deadlines preempt native async handlers. Synchronous handlers reach those
+boundaries after their worker call returns, so blocking integrations must configure an operation
+timeout at their I/O edge.
+
 Unbound registry tools stay outside the catalog. The kernel leaves unbound tools
 unrepresented instead of creating hidden deny rules.
 

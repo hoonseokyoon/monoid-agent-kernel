@@ -253,7 +253,17 @@ results and pending loads.
 
 ### Model Adapter
 
-Implement `ModelAdapter.next_turn(request: ModelRequest) -> ModelTurn`.
+Choose one one-shot contract:
+
+- `ModelAdapter.next_turn(request: ModelRequest) -> ModelTurn` for synchronous adapters. The
+  loop executes it in a worker thread.
+- `AsyncModelAdapter.anext_turn(request: ModelRequest) -> ModelTurn` for native async adapters.
+  The loop awaits it directly. An adapter that exposes both uses `anext_turn`.
+
+Add `StreamingModelAdapter.astream_turn(request) -> AsyncIterator[ModelStreamChunk]` to either
+one-shot contract for token streaming. `AgentLoop.astream` prefers the streaming method and folds
+its chunks into the same `ModelTurn`, event, error, and checkpoint path. Autonomous runs use the
+stream when `emit_output_deltas=True`.
 
 `ModelRequest` carries:
 
@@ -276,6 +286,33 @@ side-effect class, handler, provider name, path args, preview hints, guidance,
 examples, and annotations. Registry specs are implementation tools. Bindings
 decide model-facing names, guidance, exposure, authorization, scope, quota, and
 runtime settings.
+
+Handlers implement either `SyncToolHandler` or `AsyncToolHandler`:
+
+```python
+def handler(context: ToolContext, args: dict) -> ToolResult: ...
+
+async def handler(context: ToolContext, args: dict) -> ToolResult: ...
+```
+
+The `@tool` decorator preserves `async def` functions and normalizes their awaited return value
+the same way as synchronous functions. Native async handlers run on the run loop. Synchronous
+handlers run in a worker thread. Tool calls from one model turn execute sequentially in model
+order.
+
+Authorization, scope, quota, approval, capability leases, and side-effect admission complete
+before the handler starts. `tool.call.started` precedes handler execution; one
+`tool.call.finished` or `tool.call.failed` event follows it. Approved and capability-granted
+replays use the same async execution path.
+
+Run cancellation and the run deadline cancel an in-flight native async handler and preserve the
+run-level `cancelled` or `run_timeout` result. A synchronous Python call cannot be force-stopped
+safely; its worker completes before the next run-boundary check. Sync tools that perform external
+I/O should apply their own operation timeout and idempotency policy.
+
+`ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
+errors become failed tool observations. Unexpected handler exceptions fail the run through the
+normal recording boundary. Cancellation cleanup runs before the call context is cleared.
 
 `ToolResult.to_observation()` returns:
 

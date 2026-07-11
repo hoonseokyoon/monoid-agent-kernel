@@ -29,6 +29,7 @@ _CONTRACT_MODULES = frozenset(
 _INTEGRATION_MODULES = frozenset(
     {
         "test_async_loop.py",
+        "test_async_tools.py",
         "test_capability.py",
         "test_cli_and_openai.py",
         "test_examples.py",
