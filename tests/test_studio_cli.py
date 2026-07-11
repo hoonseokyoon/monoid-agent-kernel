@@ -170,3 +170,45 @@ def test_accept_runs_offline_deterministic_checks(tmp_path: Path) -> None:
     assert payload["chat"]["transcript_messages"] >= 2
     assert any(check["name"] == "deterministic-chat" and check["ok"] for check in payload["checks"])
     assert any(check["name"] == "chat-transcript" and check["ok"] for check in payload["checks"])
+
+
+def test_accept_falls_back_without_http_async_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.server._gateway_streaming_available",
+        lambda: False,
+    )
+    result = CliRunner().invoke(
+        studio,
+        [
+            "accept",
+            "--workspace",
+            str(tmp_path / "ws"),
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--timeout",
+            "10",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["chat"]["state"] == "awaiting_input"
+    assert payload["chat"]["final_text"]
+    assert payload["chat"]["transcript_messages"] >= 2
+
+    run_dir = tmp_path / "runs" / payload["chat"]["run_id"]
+    events = [
+        json.loads(line)
+        for line in run_dir.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    event_types = {event["type"] for event in events}
+    assert "model.output.delta" not in event_types
+    assert {"model.turn.finished", "turn.settled"} <= event_types
+    transcript = [
+        json.loads(line)
+        for line in run_dir.joinpath("studio.chat.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [message["role"] for message in transcript] == ["user", "assistant"]

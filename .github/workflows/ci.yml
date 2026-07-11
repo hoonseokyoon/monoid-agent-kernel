@@ -157,3 +157,11 @@ jobs:
       - name: Verify optional dependencies
         if: matrix.install == 'all-extras'
         run: python -c "import dbos, openai, httpx, opentelemetry.sdk"
+      - name: Run minimal Studio acceptance from installed package
+        if: matrix.install == 'minimal'
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import importlib.util; assert importlib.util.find_spec('httpx') is None"
+          monoid studio accept \
+            --workspace "${{ runner.temp }}/studio-workspace" \
+            --run-root "${{ runner.temp }}/studio-runs"

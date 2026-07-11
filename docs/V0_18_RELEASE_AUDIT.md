@@ -74,3 +74,8 @@ request evidence.
 Final clean validation found workspace-local `.tmp/` scratch files in the source distribution.
 The release follow-up explicitly excludes that root and adds a packaging-configuration regression
 test; the rebuilt source distribution receives the same member and metadata checks.
+
+Installed-wheel validation also found that minimal Studio selected its optional async gateway
+transport unconditionally. The release follow-up keeps live token deltas behind `[http-async]`,
+falls back to complete one-shot gateway turns in the minimal install, and runs Studio acceptance
+from the installed minimal package in CI.
