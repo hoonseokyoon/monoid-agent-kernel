@@ -203,22 +203,21 @@ class InMemoryCommandStore:
     def claim(self, run_id: str, worker_id: str, *, claim_ttl_s: float) -> StoredCommand | None:
         now = time.time()
         with self._lock:
-            eligible = [
-                item
-                for item in self._commands.values()
-                if item.run_id == run_id
-                and (
-                    item.status == "pending"
-                    or (
-                        item.status == "claimed"
-                        and item.claimed_by != worker_id
-                        and now - item.claimed_at > claim_ttl_s
-                    )
-                )
-            ]
-            if not eligible:
+            selected = next(
+                (
+                    item
+                    for item in self._commands.values()
+                    if item.run_id == run_id and item.status in {"pending", "claimed"}
+                ),
+                None,
+            )
+            if selected is None:
                 return None
-            selected = min(eligible, key=lambda item: (item.created_at, item.command_id))
+            if selected.status == "claimed" and (
+                selected.claimed_by == worker_id
+                or now - selected.claimed_at <= claim_ttl_s
+            ):
+                return None
             claimed = StoredCommand(
                 **{
                     **selected.__dict__,
@@ -341,12 +340,17 @@ class SqliteCommandStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT * FROM command_inbox WHERE run_id=? AND "
-                "(status='pending' OR (status='claimed' AND claimed_by<>? AND claimed_at<?)) "
+                "SELECT * FROM command_inbox WHERE run_id=? AND status IN ('pending','claimed') "
                 "ORDER BY ordinal LIMIT 1",
-                (run_id, worker_id, now - claim_ttl_s),
+                (run_id,),
             ).fetchone()
             if row is None:
+                conn.commit()
+                return None
+            if row["status"] == "claimed" and (
+                row["claimed_by"] == worker_id
+                or now - float(row["claimed_at"]) <= claim_ttl_s
+            ):
                 conn.commit()
                 return None
             conn.execute(

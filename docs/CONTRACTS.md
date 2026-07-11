@@ -586,7 +586,8 @@ Task callback credentials may poll the receipt for the same callback command and
 do not gain access to receipts for ordinary run-token commands or commands for another task.
 
 Append is idempotent by `(run_id, command_id)`. A duplicate receives the existing receipt and does
-not execute a second command. Claims are oldest-first per run. A crashed claimant becomes eligible
+not execute a second command. Claims follow append order per run, with one in-flight command; a
+later command cannot skip an unacknowledged head command. A crashed claimant becomes eligible
 after `command_claim_ttl_s`; command handlers therefore retain their existing idempotency
 obligations under crash-after-effect/before-ack recovery. `command_queue_limit` bounds pending plus
 claimed commands per run. Owner watchdogs drain inboxes alongside lease recovery and outbox

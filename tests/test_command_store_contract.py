@@ -99,6 +99,18 @@ def test_stale_claim_is_not_reclaimed_by_same_worker(store: CommandStore) -> Non
     assert recovered is not None and recovered.claimed_by == "replacement"
 
 
+def test_claim_does_not_skip_in_flight_head_command(store: CommandStore) -> None:
+    store.append(_command("cmd_first", created_at=2.0), max_pending=10)
+    store.append(_command("cmd_second", created_at=1.0), max_pending=10)
+    claimed = store.claim("run_1", "worker_a", claim_ttl_s=30)
+    assert claimed is not None and claimed.command_id == "cmd_first"
+
+    assert store.claim("run_1", "worker_a", claim_ttl_s=30) is None
+    assert store.claim("run_1", "worker_b", claim_ttl_s=30) is None
+    recovered = store.claim("run_1", "worker_b", claim_ttl_s=-1)
+    assert recovered is not None and recovered.command_id == "cmd_first"
+
+
 def test_queue_limit_counts_only_unacknowledged_commands(store: CommandStore) -> None:
     store.append(_command("cmd_1"), max_pending=1)
     with pytest.raises(CommandQueueFull):
