@@ -366,6 +366,9 @@ class RunnerBackend:
     command_claim_ttl_s: float = 30.0
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _command_drain_locks: dict[str, threading.RLock] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _worker_id: str = field(default="", init=False, repr=False)
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _watchdog_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
@@ -1050,25 +1053,32 @@ class RunnerBackend:
             )
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         assert self.command_store is not None
-        receipt = self.command_store.append(
-            StoredCommand(
-                run_id=command.run_id,
-                command_id=command_id,
-                type=command.type,
-                args=dict(
-                    redact_command_credential(sanitize_command_data(args), token)
-                ),
-                principal=CommandPrincipal(
-                    tenant_id=principal.tenant_id,
-                    user_id=principal.user_id,
-                    issuer=str(redact_command_credential(command.issuer, token)),
-                ),
-                token_sha256=TokenManager.token_sha256(token),
-                reason=str(redact_command_credential(command.reason, token)),
+        stored_command = StoredCommand(
+            run_id=command.run_id,
+            command_id=command_id,
+            type=command.type,
+            args=dict(redact_command_credential(sanitize_command_data(args), token)),
+            principal=CommandPrincipal(
+                tenant_id=principal.tenant_id,
+                user_id=principal.user_id,
+                issuer=str(redact_command_credential(command.issuer, token)),
             ),
-            max_pending=self.command_queue_limit,
+            token_sha256=TokenManager.token_sha256(token),
+            reason=str(redact_command_credential(command.reason, token)),
         )
-        executed = self._drain_command_inbox(command.run_id)
+        if locally_owned:
+            # Secret-producing local commands must be appended and drained by this caller before
+            # the watchdog can claim them, or only the redacted durable result would survive.
+            with self._command_drain_lock(command.run_id):
+                receipt = self.command_store.append(
+                    stored_command, max_pending=self.command_queue_limit
+                )
+                executed = self._drain_command_inbox(command.run_id)
+        else:
+            receipt = self.command_store.append(
+                stored_command, max_pending=self.command_queue_limit
+            )
+            executed = {}
         current = self.command_store.receipt(command.run_id, command_id) or receipt
         local_result = executed.get(command_id)
         return (
@@ -1179,42 +1189,49 @@ class RunnerBackend:
     def _drain_command_inbox(self, run_id: str) -> dict[str, ControlResult]:
         """Claim and execute commands only on the instance that owns the target run."""
 
-        with self._lock:
-            if run_id not in self._records:
-                return {}
-        assert self.command_store is not None
-        completed: dict[str, ControlResult] = {}
-        while True:
-            stored = self.command_store.claim(
-                run_id,
-                self._worker_id,
-                claim_ttl_s=self.command_claim_ttl_s,
-            )
-            if stored is None:
-                return completed
-            token = self.token_manager.issue(
-                kind="run_access",
-                audience=BACKEND_AUDIENCE,
-                run_id=run_id,
-                tenant_id=stored.principal.tenant_id,
-                user_id=stored.principal.user_id,
-                ttl_s=60,
-            )
-            try:
-                result = self._commands.dispatch(
-                    stored.control_command(token=token),
-                    audit_token_sha256=stored.token_sha256,
+        with self._command_drain_lock(run_id):
+            with self._lock:
+                if run_id not in self._records:
+                    return {}
+            assert self.command_store is not None
+            completed: dict[str, ControlResult] = {}
+            while True:
+                stored = self.command_store.claim(
+                    run_id,
+                    self._worker_id,
+                    claim_ttl_s=self.command_claim_ttl_s,
                 )
-            except Exception as exc:  # owner records a durable failure receipt
-                result = ControlResult(
+                if stored is None:
+                    return completed
+                token = self.token_manager.issue(
+                    kind="run_access",
+                    audience=BACKEND_AUDIENCE,
                     run_id=run_id,
-                    type=stored.type,  # type: ignore[arg-type]
-                    status="error",
-                    error=str(exc),
-                    error_code=getattr(exc, "error_code", "command_execution_error"),
+                    tenant_id=stored.principal.tenant_id,
+                    user_id=stored.principal.user_id,
+                    ttl_s=60,
                 )
-            self.command_store.acknowledge(run_id, stored.command_id, self._worker_id, result)
-            completed[stored.command_id] = result
+                try:
+                    result = self._commands.dispatch(
+                        stored.control_command(token=token),
+                        audit_token_sha256=stored.token_sha256,
+                    )
+                except Exception as exc:  # owner records a durable failure receipt
+                    result = ControlResult(
+                        run_id=run_id,
+                        type=stored.type,  # type: ignore[arg-type]
+                        status="error",
+                        error=str(exc),
+                        error_code=getattr(exc, "error_code", "command_execution_error"),
+                    )
+                self.command_store.acknowledge(
+                    run_id, stored.command_id, self._worker_id, result
+                )
+                completed[stored.command_id] = result
+
+    def _command_drain_lock(self, run_id: str) -> threading.RLock:
+        with self._lock:
+            return self._command_drain_locks.setdefault(run_id, threading.RLock())
 
     def _dispatch_control_command(
         self,

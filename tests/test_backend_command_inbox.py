@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 from urllib.error import HTTPError
 from pathlib import Path
 from typing import Any
@@ -278,6 +280,28 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
         timeout_s=10,
     )
 
+    assert backend.command_store is not None
+    original_append = backend.command_store.append
+    competing_drains: list[threading.Thread] = []
+
+    def append_with_watchdog_race(command: Any, *, max_pending: int) -> Any:
+        receipt = original_append(command, max_pending=max_pending)
+        if command.type == "create_task":
+            started = threading.Event()
+
+            def compete() -> None:
+                started.set()
+                backend._drain_command_inbox(command.run_id)
+
+            thread = threading.Thread(target=compete, daemon=True)
+            competing_drains.append(thread)
+            thread.start()
+            assert started.wait(timeout=1)
+            time.sleep(0.05)
+        return receipt
+
+    backend.command_store.append = append_with_watchdog_race  # type: ignore[method-assign]
+
     server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
     with serving(server) as base_url:
         created = http_json(
@@ -296,6 +320,9 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
         callback_token = created["data"]["callback_token"]
         task_id = created["data"]["task_id"]
         assert callback_token and callback_token != "[redacted]"
+        for thread in competing_drains:
+            thread.join(timeout=2)
+            assert not thread.is_alive()
 
         reported = http_json(
             f"{base_url}/v1/runs/{submission.run_id}/control",
