@@ -85,7 +85,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         close = getattr(harness, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception as exc:
+                print(
+                    f"conformance runner close error: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":  # pragma: no cover - subprocess entry point

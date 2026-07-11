@@ -7,6 +7,9 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import pytest
+
+from monoid_agent_kernel.conformance import runner
 from monoid_agent_kernel.conformance.profiles.minimal_agent import MINIMAL_AGENT_RULE_IDS
 from monoid_agent_kernel.conformance.report import CONFORMANCE_REPORT_VERSION
 from monoid_agent_kernel.conformance.runner import run_conformance
@@ -94,3 +97,20 @@ def test_module_runner_writes_json_and_junit_for_reference_backend(tmp_path: Pat
     assert [case.attrib["name"] for case in suite.findall("testcase")] == list(
         MINIMAL_AGENT_RULE_IDS
     )
+
+
+def test_runner_reports_close_failure_without_overriding_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class CloseFailingHarness(_MinimalHarness):
+        def close(self) -> None:
+            raise OSError("cleanup failed")
+
+    monkeypatch.setattr(runner, "load_harness", lambda factory_ref: CloseFailingHarness())
+
+    exit_code = runner.main(["--harness", "external.module:create_harness"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out)["passed"] is True
+    assert "conformance runner close error: OSError: cleanup failed" in captured.err
