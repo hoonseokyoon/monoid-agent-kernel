@@ -651,6 +651,7 @@ def test_ownerless_resume_keeps_lease_when_receipt_acknowledgement_fails(
     )
     assert restarted.command_store is not None
     original_acknowledge = restarted.command_store.acknowledge
+    failures_remaining = 1
 
     def fail_resume_acknowledgement(
         run_id: str,
@@ -658,7 +659,9 @@ def test_ownerless_resume_keeps_lease_when_receipt_acknowledgement_fails(
         worker_id: str,
         result: ControlResult,
     ) -> Any:
-        if command_id == "cmd_ack_failure":
+        nonlocal failures_remaining
+        if command_id == "cmd_ack_failure" and failures_remaining:
+            failures_remaining -= 1
             raise RuntimeError("simulated durable acknowledgement failure")
         return original_acknowledge(run_id, command_id, worker_id, result)
 
@@ -676,6 +679,22 @@ def test_ownerless_resume_keeps_lease_when_receipt_acknowledgement_fails(
     assert submission.run_id in restarted._records
     assert restarted.lease_store is not None
     assert restarted.lease_store.owner(submission.run_id) == restarted._worker_id
+    repaired = restarted.enqueue_control(
+        ControlCommand(
+            type="resume",
+            run_id=submission.run_id,
+            args={"token": submission.run_token},
+            command_id="cmd_ack_failure",
+        )
+    )
+    assert repaired.status == "completed"
+    audits = [
+        event["type"]
+        for event in restarted.events(submission.run_id, submission.run_token)["events"]
+        if event["type"].startswith("control.command.")
+        and event["data"].get("command_id") == "cmd_ack_failure"
+    ]
+    assert audits == ["control.command.completed"]
 
     restarted.command_store.acknowledge = original_acknowledge  # type: ignore[method-assign]
     restarted.cancel_run(submission.run_id, submission.run_token)

@@ -604,7 +604,10 @@ the existing inbox before returning; deployments do not depend on a later watchd
 the backlog. A failed recovery releases the run lease. With a fresh remote owner, `resume` follows
 the regular durable inbox path. Once recovery materializes a live record, the owner retains its
 lease even if durable receipt acknowledgement or backlog drain fails; retry and watchdog recovery
-can then repair the command transport without creating a second live owner.
+can then repair the command transport without creating a second live owner. The live owner retains
+the successful result in a bounded in-memory repair entry and retries acknowledgement before
+claiming more commands, preserving the original command effect and audit. If that owner also
+crashes, the configured claim TTL makes the reservation recoverable by its successor.
 
 Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
 receipt and does not execute a second command. Reusing the ID for a different type, sanitized

@@ -369,6 +369,9 @@ class RunnerBackend:
     _command_drain_locks: dict[str, threading.RLock] = field(
         default_factory=dict, init=False, repr=False
     )
+    _command_ack_repairs: dict[tuple[str, str], ControlResult] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _worker_id: str = field(default="", init=False, repr=False)
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _watchdog_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
@@ -1138,12 +1141,18 @@ class RunnerBackend:
                         audit_token_sha256=TokenManager.token_sha256(token),
                     )
                     keep_lease = result.status == "ok"
-                    acknowledged = self.command_store.acknowledge(
-                        command.run_id,
-                        command_id,
-                        self._worker_id,
-                        result,
-                    )
+                    try:
+                        acknowledged = self.command_store.acknowledge(
+                            command.run_id,
+                            command_id,
+                            self._worker_id,
+                            result,
+                        )
+                    except Exception:
+                        if keep_lease:
+                            with self._lock:
+                                self._command_ack_repairs[(command.run_id, command_id)] = result
+                        raise
                     if keep_lease:
                         self._drain_command_inbox(command.run_id)
                     return replace(acknowledged, transient_result=result.to_json())
@@ -1295,6 +1304,19 @@ class RunnerBackend:
                     return {}
             assert self.command_store is not None
             completed: dict[str, ControlResult] = {}
+            with self._lock:
+                repairs = [
+                    (command_id, result)
+                    for (repair_run_id, command_id), result in self._command_ack_repairs.items()
+                    if repair_run_id == run_id
+                ]
+            for command_id, result in repairs:
+                self.command_store.acknowledge(
+                    run_id, command_id, self._worker_id, result
+                )
+                with self._lock:
+                    self._command_ack_repairs.pop((run_id, command_id), None)
+                completed[command_id] = result
             while True:
                 stored = self.command_store.claim(
                     run_id,
