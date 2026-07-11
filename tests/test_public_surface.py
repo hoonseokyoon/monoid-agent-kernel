@@ -413,10 +413,11 @@ import monoid_agent_kernel
 blocked = [
     name for name in sys.modules
     if name.startswith('monoid_agent_kernel.reference.')
-    or name in {'openai', 'httpx', 'opentelemetry'}
+    or name in {'openai', 'httpx', 'opentelemetry', 'dbos'}
     or name.startswith('openai.')
     or name.startswith('httpx.')
     or name.startswith('opentelemetry.')
+    or name.startswith('dbos.')
 ]
 if blocked:
     raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))
