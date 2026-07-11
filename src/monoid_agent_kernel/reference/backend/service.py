@@ -1046,6 +1046,7 @@ class RunnerBackend:
                 error_code="invalid_command_id",
             )
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
+        execution_args = dict(redact_command_credential(args, token))
         if command.type == "create_task" and not locally_owned:
             raise NativeAgentError(
                 "create_task must be routed to the run owner so its callback token can be "
@@ -1059,7 +1060,35 @@ class RunnerBackend:
                 and not self.lease_store.is_stale(command.run_id)
             )
             if command.type == "resume" and not owner_available:
-                result = self.dispatch(replace(command, command_id=command_id))
+                if not self.lease_store.try_claim(
+                    command.run_id, self._worker_id, self.lease_ttl_s
+                ):
+                    raise NativeAgentError(
+                        "another worker claimed the run before resume",
+                        error_code="command_owner_unavailable",
+                    )
+                direct_command = ControlCommand(
+                    type="resume",
+                    run_id=command.run_id,
+                    args={**execution_args, "token": token},
+                    issuer=CommandPrincipal(
+                        tenant_id=principal.tenant_id,
+                        user_id=principal.user_id,
+                        issuer=str(redact_command_credential(command.issuer, token)),
+                    ).actor,
+                    reason=str(redact_command_credential(command.reason, token)),
+                    command_id=command_id,
+                )
+                try:
+                    result = self._commands.dispatch(
+                        direct_command,
+                        audit_token_sha256=TokenManager.token_sha256(token),
+                    )
+                except BaseException:
+                    self.lease_store.release(command.run_id)
+                    raise
+                if result.status != "ok":
+                    self.lease_store.release(command.run_id)
                 now = time.time()
                 status = "completed" if result.status == "ok" else "failed"
                 return CommandReceipt(
@@ -1077,7 +1106,6 @@ class RunnerBackend:
                     error_code="command_owner_unavailable",
                 )
         assert self.command_store is not None
-        execution_args = dict(redact_command_credential(args, token))
         stored_command = StoredCommand(
             run_id=command.run_id,
             command_id=command_id,

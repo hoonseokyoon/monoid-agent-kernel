@@ -426,17 +426,37 @@ def test_http_resume_recovers_ownerless_run_without_command_inbox(
     with serving(server) as base_url:
         resumed = http_json(
             f"{base_url}/v1/runs/{submission.run_id}/control",
-            {"type": "resume", "command_id": "cmd_ownerless_resume"},
+            {
+                "type": "resume",
+                "command_id": "cmd_ownerless_resume",
+                "issuer": f"restart-worker-{submission.run_token}",
+                "reason": f"recover with {submission.run_token}",
+            },
             token=submission.run_token,
         )
 
     assert resumed["status"] == "ok"
     assert resumed["data"]["resumed"] is True
     assert submission.run_id in restarted._records
+    assert restarted.lease_store is not None
+    assert restarted.lease_store.owner(submission.run_id) == restarted._worker_id
     assert restarted.command_store is not None
     assert restarted.command_store.receipt(
         submission.run_id, "cmd_ownerless_resume"
     ) is None
+    audits = [
+        event
+        for event in restarted.events(submission.run_id, submission.run_token)["events"]
+        if event["type"].startswith("control.command.")
+        and event["data"].get("command_id") == "cmd_ownerless_resume"
+    ]
+    assert audits
+    assert submission.run_token not in str(audits)
+    assert all(event["data"]["actor"].startswith("tenant/user") for event in audits)
+    assert all(
+        event["data"]["token_sha256"] == TokenManager.token_sha256(submission.run_token)
+        for event in audits
+    )
 
     restarted.cancel_run(submission.run_id, submission.run_token)
     first.cancel_run(submission.run_id, submission.run_token)

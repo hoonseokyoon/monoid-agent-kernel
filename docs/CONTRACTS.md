@@ -592,8 +592,9 @@ for credential-shaped domain data that must cross that boundary.
 be returned by the submitting owner thread. Peers accept durable commands only while the run has a
 fresh ownership lease; an absent or stale owner returns `command_owner_unavailable` before append.
 `resume` is the recovery exception: when no fresh owner exists, the authenticated receiving backend
-executes it directly so it can materialize the run from its checkpoint. With a fresh remote owner,
-`resume` follows the durable inbox like other control commands.
+first claims the lease atomically, then executes it directly so it can materialize the run from its
+checkpoint. A failed recovery releases that claim. With a fresh remote owner, `resume` follows the
+durable inbox like other control commands.
 
 Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
 receipt and does not execute a second command. Reusing the ID for a different type, sanitized
