@@ -10,7 +10,8 @@ building against, and securing the kernel.
   then [CLI.md](CLI.md) for the full `run` / `watch` / `jobs` surface.
 - **I'm embedding the kernel in a product** → [CONTRACTS.md](CONTRACTS.md) for the
   stable Python/HTTP surface, [CONFORMANCE.md](CONFORMANCE.md) to check your
-  implementation, [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) for the helper boundary.
+  implementation, [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) for the helper boundary,
+  [COMPATIBILITY.md](COMPATIBILITY.md) for version and upgrade obligations.
 - **I'm writing tools** → [TOOL_SURFACE.md](TOOL_SURFACE.md) for `ToolBinding`,
   exposure, authorization, scope, and quota.
 - **I'm running a backend/gateway** → [BACKEND.md](BACKEND.md) for the reference
@@ -39,6 +40,7 @@ building against, and securing the kernel.
 | [CONTRACTS.md](CONTRACTS.md) | The stable integration surface: Python contracts, HTTP wire contracts, wiring rules, operational rules, and the contract/core/reference boundary. |
 | [CONFORMANCE.md](CONFORMANCE.md) | Profile-based conformance tests, harness roles, executable assertions, testing policy, and the Reference full profile. |
 | [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) | Supported helper modules and validation/library policy for contract-aligned implementations. |
+| [COMPATIBILITY.md](COMPATIBILITY.md) | Machine-checked wire/durable version ledger, aliases, deprecation policy, mixed-version operation, and upgrade/rollback playbooks. |
 | [REFERENCE.md](REFERENCE.md) | Runnable Reference services, Studio, gateway examples, and the public Reference conformance harness. |
 | [OPERATIONAL_RULE_COVERAGE.md](OPERATIONAL_RULE_COVERAGE.md) | Current rule-to-helper-to-profile-to-test coverage matrix and Phase 2S hardening matrix for OR-01 through OR-13. |
 | [RUNNER_BACKEND_RESPONSIBILITY_MAP.md](RUNNER_BACKEND_RESPONSIBILITY_MAP.md) | RunnerBackend facade/service split, private service responsibilities, and remaining runtime ownership. |
