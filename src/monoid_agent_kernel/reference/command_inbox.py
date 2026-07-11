@@ -160,7 +160,9 @@ def redact_command_credential(value: Any, credential: str) -> Any:
         return value
     if isinstance(value, dict):
         return {
-            str(item_key): redact_command_credential(item, credential)
+            str(item_key).replace(credential, "[redacted]"): redact_command_credential(
+                item, credential
+            )
             for item_key, item in value.items()
         }
     if isinstance(value, list):

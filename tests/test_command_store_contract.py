@@ -15,6 +15,7 @@ from monoid_agent_kernel.reference.command_inbox import (
     InMemoryCommandStore,
     SqliteCommandStore,
     StoredCommand,
+    redact_command_credential,
 )
 
 
@@ -42,6 +43,20 @@ def _command(command_id: str, *, created_at: float = 1.0) -> StoredCommand:
         principal=CommandPrincipal("tenant", "user", "operator"),
         created_at=created_at,
     )
+
+
+def test_bearer_redaction_covers_nested_keys_and_values() -> None:
+    credential = "signed-bearer-value"
+    redacted = redact_command_credential(
+        {credential: "marker", "nested": {f"prefix-{credential}": credential}},
+        credential,
+    )
+
+    assert credential not in str(redacted)
+    assert redacted == {
+        "[redacted]": "marker",
+        "nested": {"prefix-[redacted]": "[redacted]"},
+    }
 
 
 def test_append_is_idempotent_and_claims_in_order(store: CommandStore) -> None:
