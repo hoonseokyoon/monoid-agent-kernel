@@ -18,13 +18,14 @@ from monoid_agent_kernel.reference.backend.service import BackendRunRequest
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.command_inbox import (
     CommandPrincipal,
+    InMemoryCommandStore,
     SqliteCommandStore,
     StoredCommand,
 )
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE, TASK_CALLBACK_AUDIENCE
-from monoid_agent_kernel.core.control import ControlCommand
+from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.providers.base import ModelTurn
 
 
@@ -481,6 +482,98 @@ def test_http_resume_recovers_ownerless_run_with_full_command_inbox(
         event["data"]["token_sha256"] == TokenManager.token_sha256(submission.run_token)
         for event in audits
     )
+
+    restarted.cancel_run(submission.run_id, submission.run_token)
+    first.cancel_run(submission.run_id, submission.run_token)
+
+
+def test_completed_ownerless_resume_rehydrates_without_repeating_command_effect(
+    backend_factory: Any, tmp_path: Path
+) -> None:
+    workspace = backend_factory.workspace()
+    run_root = tmp_path / "runs"
+    token_manager = backend_factory.token_manager()
+    first = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=token_manager,
+        turns=[ModelTurn(response_id="parked", final_text="parked")],
+    )
+    submission = first.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="park",
+            runtime_config=runtime_config("run.finish"),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: first._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+
+    command_store = InMemoryCommandStore()
+    stored = StoredCommand(
+        run_id=submission.run_id,
+        command_id="cmd_completed_resume",
+        type="resume",
+        args={},
+        principal=CommandPrincipal("tenant", "user", "previous-worker"),
+        token_sha256=TokenManager.token_sha256(submission.run_token),
+        reason="recover",
+    )
+    command_store.append(stored, max_pending=1, recovery_reservation=True)
+    assert command_store.claim_command(
+        submission.run_id,
+        stored.command_id,
+        "crashed-worker",
+        claim_ttl_s=30,
+    ) is not None
+    previous_result = ControlResult(
+        run_id=submission.run_id,
+        type="resume",
+        status="ok",
+        data={"run_id": submission.run_id, "resumed": True},
+    )
+    command_store.acknowledge(
+        submission.run_id,
+        stored.command_id,
+        "crashed-worker",
+        previous_result,
+    )
+
+    restarted = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=token_manager,
+        turns=[ModelTurn(response_id="resumed", final_text="resumed")],
+        command_store=command_store,
+    )
+    receipt = restarted.enqueue_control(
+        ControlCommand(
+            type="resume",
+            run_id=submission.run_id,
+            args={"token": submission.run_token},
+            issuer="previous-worker",
+            reason="recover",
+            command_id=stored.command_id,
+        )
+    )
+
+    assert receipt.status == "completed"
+    assert receipt.transient_result == previous_result.to_json()
+    assert submission.run_id in restarted._records
+    assert restarted.lease_store is not None
+    assert restarted.lease_store.owner(submission.run_id) == restarted._worker_id
+    audits = [
+        event
+        for event in restarted.events(submission.run_id, submission.run_token)["events"]
+        if event["type"].startswith("control.command.")
+        and event["data"].get("command_id") == stored.command_id
+    ]
+    assert audits == []
 
     restarted.cancel_run(submission.run_id, submission.run_token)
     first.cancel_run(submission.run_id, submission.run_token)

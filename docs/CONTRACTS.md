@@ -594,10 +594,11 @@ fresh ownership lease; an absent or stale owner returns `command_owner_unavailab
 `resume` is the recovery exception: when no fresh owner exists, the authenticated receiving backend
 first claims the lease atomically, then executes it directly so it can materialize the run from its
 checkpoint. It reserves and acknowledges the supplied command ID in the durable store, so retries
-return the same receipt without repeating recovery. This authenticated recovery reservation is
-outside the normal pending-command limit, allowing `resume` to recreate an owner and drain a full
-inbox. Other command types cannot use the reservation. A failed recovery releases the run lease.
-With a fresh remote owner, `resume` follows the regular durable inbox path.
+return the same receipt without repeating the command effect. If that completed receipt survives
+an owner crash, the next owner rehydrates the checkpoint before returning it. This authenticated
+recovery reservation is outside the normal pending-command limit, allowing `resume` to recreate an
+owner and drain a full inbox. Other command types cannot use the reservation. A failed recovery
+releases the run lease. With a fresh remote owner, `resume` follows the regular durable inbox path.
 
 Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
 receipt and does not execute a second command. Reusing the ID for a different type, sanitized

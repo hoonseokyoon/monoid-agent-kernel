@@ -1096,7 +1096,16 @@ class RunnerBackend:
                         max_pending=self.command_queue_limit,
                         recovery_reservation=True,
                     )
-                    if receipt.status in {"completed", "failed"}:
+                    if receipt.status == "completed":
+                        self.resume_run(command.run_id, token)
+                        keep_lease = True
+                        return replace(
+                            receipt,
+                            transient_result=(
+                                dict(receipt.result) if receipt.result is not None else None
+                            ),
+                        )
+                    if receipt.status == "failed":
                         return replace(
                             receipt,
                             transient_result=(
