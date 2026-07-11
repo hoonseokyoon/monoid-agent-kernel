@@ -3411,7 +3411,13 @@ class AgentLoop:
             )
             self._check_run_boundary(deadline)
             if task in done:
-                return task.result()
+                try:
+                    return task.result()
+                except asyncio.CancelledError as exc:
+                    raise ToolExecutionError(
+                        "async tool handler was cancelled",
+                        error_code="tool_handler_cancelled",
+                    ) from exc
             if cancelled in done:
                 raise RunCancelled("run cancelled")
             raise RunTimeout("run exceeded max duration")

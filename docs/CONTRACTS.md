@@ -313,8 +313,10 @@ force-stopped safely; its worker completes before the next run-boundary check. S
 perform external I/O should apply their own operation timeout and idempotency policy.
 
 `ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
-errors become failed tool observations. Unexpected handler exceptions fail the run through the
-normal recording boundary. Cancellation cleanup runs before the call context is cleared.
+errors become failed tool observations. A handler-local `CancelledError` maps to
+`tool_handler_cancelled`; run-token cancellation and deadlines retain their run-level outcome.
+Unexpected handler exceptions fail the run through the normal recording boundary. Cancellation
+cleanup runs before the call context is cleared.
 
 `ToolResult.to_observation()` returns:
 

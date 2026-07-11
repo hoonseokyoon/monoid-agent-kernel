@@ -122,6 +122,28 @@ def test_async_tool_controlled_error_becomes_ordered_failed_observation(tmp_path
     assert "tool.call.failed" in _event_types(result.run_dir)
 
 
+def test_tool_local_cancelled_error_becomes_failed_observation(tmp_path: Path) -> None:
+    @tool(id="async.self_cancel")
+    async def self_cancel() -> dict:
+        raise asyncio.CancelledError
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("async_self_cancel", {}, "c1"),)),
+            ModelTurn(final_text="continued"),
+        ]
+    )
+    result = asyncio.run(
+        AgentLoop.from_tools(_spec(tmp_path), adapter, [self_cancel]).arun_once("go")
+    )
+
+    assert result.status == "completed"
+    error = adapter.requests[1].observations[0].output["error"]
+    assert error["code"] == "tool_handler_cancelled"
+    assert error["retryable"] is True
+    assert "tool.call.failed" in _event_types(result.run_dir)
+
+
 def test_unexpected_async_tool_error_fails_run_and_clears_call_context(tmp_path: Path) -> None:
     cleared = asyncio.Event()
 
