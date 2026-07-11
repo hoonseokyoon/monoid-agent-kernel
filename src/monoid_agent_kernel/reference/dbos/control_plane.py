@@ -293,6 +293,7 @@ class DbosControlPlane:
                 raise RuntimeError("a closed DBOS control plane cannot be relaunched")
             try:
                 self._preflight_queue_configuration()
+                self._runtime.listen_queues([self._queue_name])
                 self._runtime.launch()
                 # DBOS applies global concurrency per partition. That limit is the
                 # cross-executor ordering invariant; worker concurrency is pinned too.

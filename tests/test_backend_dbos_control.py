@@ -268,6 +268,10 @@ def test_dbos_control_plane_repairs_and_verifies_persisted_queue_configuration(
     result = json.loads(output_path.read_text(encoding="utf-8"))
     assert result == {
         "concurrency": 1,
+        "listening_queues": [
+            "monoid/control-queue/monoid-reference-control"
+            "/version/monoid-dbos-control-test-v1"
+        ],
         "partition_queue": True,
         "priority_enabled": False,
         "queue_name": (

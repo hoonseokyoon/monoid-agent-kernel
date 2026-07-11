@@ -31,7 +31,9 @@ adapter scopes the queue name by `application_version`, fixes global concurrency
 partition, repairs and verifies the persisted queue configuration through `DBOSClient` before
 runtime listeners start, and verifies it again before accepting commands. Global per-partition
 concurrency is the cross-executor ordering invariant; worker concurrency is also pinned to one.
-The workflow result is projected to the existing `monoid.command-receipt.v1` receipt shape.
+Before launch, the runtime is restricted to that control queue so it cannot dequeue unrelated
+database-backed queues in a shared DBOS system database. The workflow result is projected to the
+existing `monoid.command-receipt.v1` receipt shape.
 
 ```python
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult

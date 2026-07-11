@@ -382,6 +382,12 @@ def queue_config_phase(db_path: Path, output_path: Path) -> None:
         polling_interval_sec=config.polling_interval_s,
         on_conflict="always_update",
     )
+    runtime.register_queue(
+        "unrelated-queue",
+        concurrency=4,
+        polling_interval_sec=config.polling_interval_s,
+        on_conflict="always_update",
+    )
     runtime.destroy(destroy_registry=True, workflow_completion_timeout_sec=1)
 
     plane = DbosControlPlane(config, _ok)
@@ -392,6 +398,7 @@ def queue_config_phase(db_path: Path, output_path: Path) -> None:
         output_path,
         {
             "concurrency": queue.concurrency,
+            "listening_queues": list(plane._runtime._listening_queues or ()),
             "partition_queue": queue.partition_queue,
             "priority_enabled": queue.priority_enabled,
             "queue_name": plane.registered_queue_name,
