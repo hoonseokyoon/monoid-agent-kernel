@@ -16,7 +16,7 @@ from monoid_agent_kernel.reference.backend.service import BackendRunRequest
 from monoid_agent_kernel.reference.command_inbox import SqliteCommandStore
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 from monoid_agent_kernel.errors import PermissionDenied
-from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE
+from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE, TASK_CALLBACK_AUDIENCE
 from monoid_agent_kernel.core.control import ControlCommand
 
 
@@ -83,6 +83,24 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
                 run_id=submission.run_id,
                 args={"token": wrong_subject, "task_id": "task_unknown"},
                 command_id="cmd_wrong_callback_subject",
+            )
+        )
+    wrong_callback_subject = token_manager.issue(
+        kind="task_callback",
+        audience=TASK_CALLBACK_AUDIENCE,
+        run_id=submission.run_id,
+        tenant_id="other_tenant",
+        user_id="other_user",
+        ttl_s=60,
+        metadata={"task_id": "task_unknown"},
+    )
+    with pytest.raises(PermissionDenied, match="subject mismatch"):
+        peer.enqueue_control(
+            ControlCommand(
+                type="approve",
+                run_id=submission.run_id,
+                args={"token": wrong_callback_subject, "task_id": "task_unknown"},
+                command_id="cmd_wrong_callback_credential_subject",
             )
         )
     server = create_backend_server(peer, host="127.0.0.1", port=0, admin_token="admin")
