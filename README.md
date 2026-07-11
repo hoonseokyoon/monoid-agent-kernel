@@ -68,6 +68,13 @@ For the dynamic binding-based tool surface, see
 pip install monoid-agent-kernel
 ```
 
+The default install runs Studio with complete one-shot gateway turns. Add the async HTTP extra
+to render live token deltas in Studio:
+
+```bash
+pip install "monoid-agent-kernel[http-async]"
+```
+
 Core has no provider SDK dependency. The direct OpenAI adapter is for local smoke tests;
 hosted/product runs use `GatewayModelAdapter` through your gateway:
 

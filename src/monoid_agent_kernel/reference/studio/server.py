@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from importlib.util import find_spec
 import json
 import logging
 import os
@@ -91,6 +92,12 @@ _MAX_BODY_BYTES = _MAX_ATTACH_BYTES + 2 * 1024 * 1024  # room for base64 inflati
 # Studio is a single-user local app; the tenant/user are fixed placeholders.
 _TENANT = "studio"
 _USER = "local"
+
+
+def _gateway_streaming_available() -> bool:
+    """Return whether Studio can use the optional async gateway transport."""
+    return find_spec("httpx") is not None
+
 
 # Directories never shown in the file tree (and not worth walking).
 _TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".ruff_cache", ".pytest_cache"}
@@ -976,6 +983,13 @@ class StudioServer:
         # validation through the same provider seam as Skills/MCP.
         provider_instances = self._tool_providers_for_runtime()
 
+        stream_gateway_output = _gateway_streaming_available()
+        if not stream_gateway_output:
+            _LOGGER.info(
+                "httpx is unavailable; Studio will use one-shot gateway turns "
+                "(install monoid-agent-kernel[http-async] for live token deltas)"
+            )
+
         self._backend = RunnerBackend(
             run_root=self.config.run_root,
             token_manager=self._token_manager,
@@ -986,7 +1000,7 @@ class StudioServer:
             web_gateway_url=f"http://127.0.0.1:{web_port}",
             # Stream tokens live: emit model.output.delta events the UI renders incrementally
             # (effective for adapters that support astream_turn — the gateway/openai path).
-            emit_output_deltas=True,
+            emit_output_deltas=stream_gateway_output,
             # Follow-up attachments ride a base64 data: URI through send_message, so the message
             # size limit must clear an inline image (the core normalizes it to a blob downstream).
             max_message_bytes=_MAX_BODY_BYTES,
