@@ -1040,6 +1040,12 @@ class RunnerBackend:
         principal = self._authorize_command_principal(command, args=args, token=token)
         with self._lock:
             locally_owned = command.run_id in self._records
+        if token and token in command.command_id:
+            raise NativeAgentError(
+                "command_id must not contain the authenticated credential",
+                error_code="invalid_command_id",
+            )
+        command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         if command.type == "create_task" and not locally_owned:
             raise NativeAgentError(
                 "create_task must be routed to the run owner so its callback token can be "
@@ -1048,19 +1054,28 @@ class RunnerBackend:
             )
         if not locally_owned:
             assert self.lease_store is not None
-            if self.lease_store.owner(command.run_id) is None or self.lease_store.is_stale(
-                command.run_id
-            ):
+            owner_available = (
+                self.lease_store.owner(command.run_id) is not None
+                and not self.lease_store.is_stale(command.run_id)
+            )
+            if command.type == "resume" and not owner_available:
+                result = self.dispatch(replace(command, command_id=command_id))
+                now = time.time()
+                status = "completed" if result.status == "ok" else "failed"
+                return CommandReceipt(
+                    run_id=command.run_id,
+                    command_id=command_id,
+                    status=status,
+                    result=dict(sanitize_command_data(result.to_json())),
+                    transient_result=result.to_json(),
+                    created_at=now,
+                    updated_at=now,
+                )
+            if not owner_available:
                 raise NativeAgentError(
                     "run has no live owner available to drain durable commands",
                     error_code="command_owner_unavailable",
                 )
-        if token and token in command.command_id:
-            raise NativeAgentError(
-                "command_id must not contain the authenticated credential",
-                error_code="invalid_command_id",
-            )
-        command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         assert self.command_store is not None
         execution_args = dict(redact_command_credential(args, token))
         stored_command = StoredCommand(

@@ -21,6 +21,7 @@ from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, S
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE, TASK_CALLBACK_AUDIENCE
 from monoid_agent_kernel.core.control import ControlCommand
+from monoid_agent_kernel.providers.base import ModelTurn
 
 
 def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
@@ -386,3 +387,56 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
     assert callback_token not in str(report_receipt.to_json())
 
     backend.cancel_run(submission.run_id, submission.run_token)
+
+
+def test_http_resume_recovers_ownerless_run_without_command_inbox(
+    backend_factory: Any, tmp_path: Path
+) -> None:
+    workspace = backend_factory.workspace()
+    run_root = tmp_path / "runs"
+    token_manager = backend_factory.token_manager()
+    first = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=token_manager,
+        turns=[ModelTurn(response_id="parked", final_text="parked")],
+    )
+    submission = first.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="park",
+            runtime_config=runtime_config("run.finish"),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: first._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+
+    restarted = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=token_manager,
+        turns=[ModelTurn(response_id="resumed", final_text="resumed")],
+    )
+    server = create_backend_server(restarted, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        resumed = http_json(
+            f"{base_url}/v1/runs/{submission.run_id}/control",
+            {"type": "resume", "command_id": "cmd_ownerless_resume"},
+            token=submission.run_token,
+        )
+
+    assert resumed["status"] == "ok"
+    assert resumed["data"]["resumed"] is True
+    assert submission.run_id in restarted._records
+    assert restarted.command_store is not None
+    assert restarted.command_store.receipt(
+        submission.run_id, "cmd_ownerless_resume"
+    ) is None
+
+    restarted.cancel_run(submission.run_id, submission.run_token)
+    first.cancel_run(submission.run_id, submission.run_token)
