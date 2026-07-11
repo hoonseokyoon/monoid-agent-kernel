@@ -102,6 +102,20 @@ def test_corrupt_local_metadata_is_not_treated_as_missing_or_replaced_from_share
     assert (run_dir / "run.json").read_text(encoding="utf-8") == "{"
 
 
+def test_legacy_shared_metadata_read_failure_is_retryable(tmp_path) -> None:
+    class UnavailableLegacyStore(LocalFsCheckpointStore):
+        run_metadata_checked = None
+
+        def run_metadata(self, run_id: str):
+            del run_id
+            raise OSError("metadata store unavailable")
+
+    committer = DurableMetadataCommitter(UnavailableLegacyStore(tmp_path / "shared"))
+
+    with pytest.raises(OSError, match="metadata store unavailable"):
+        committer.read_recovery_metadata_checked(tmp_path / "local" / "run_1", "run_1")
+
+
 def test_runtime_config_metadata_store_failure_keeps_local_descriptor_unchanged(tmp_path) -> None:
     class FailingStore(LocalFsCheckpointStore):
         def put_run_metadata(self, run_id: str, metadata: dict) -> None:

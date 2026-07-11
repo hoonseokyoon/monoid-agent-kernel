@@ -147,12 +147,9 @@ class DurableMetadataCommitter:
                 shared = RUN_METADATA_CODEC.corrupt("metadata store returned an invalid checked result")
         else:
             raw_reader = getattr(self.checkpoint_store, "run_metadata", None)
-            try:
-                stored = raw_reader(run_id) if callable(raw_reader) else None
-            except Exception as exc:
-                return RUN_METADATA_CODEC.corrupt(
-                    f"legacy metadata store read failed ({type(exc).__name__})"
-                )
+            # Legacy readers have no checked result that can prove an artifact is
+            # corrupt. Let read failures propagate so recovery can retry them.
+            stored = raw_reader(run_id) if callable(raw_reader) else None
             shared = RUN_METADATA_CODEC.missing() if stored is None else decode_run_metadata(stored)
         if not shared.ok:
             return shared

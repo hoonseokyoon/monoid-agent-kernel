@@ -103,7 +103,11 @@ class RecoveryService:
         return reclaimed
 
     def attempt_resume(self, run_dir: Path, run_id: str) -> bool:
-        checkpoint_result = load_latest_checked(self._checkpoint_store(), run_id)
+        try:
+            checkpoint_result = load_latest_checked(self._checkpoint_store(), run_id)
+        except Exception as exc:
+            _LOGGER.warning("checkpoint read for run %s deferred: %s", run_id, exc)
+            return False
         if not checkpoint_result.ok:
             self._record_checked_load_failure(run_dir, run_id, checkpoint_result)
             return False
@@ -111,7 +115,11 @@ class RecoveryService:
         assert stored is not None
         if stored.checkpoint.terminal:
             return False
-        metadata_result = self.read_recovery_meta_checked(run_dir, run_id)
+        try:
+            metadata_result = self.read_recovery_meta_checked(run_dir, run_id)
+        except Exception as exc:
+            _LOGGER.warning("recovery metadata read for run %s deferred: %s", run_id, exc)
+            return False
         if not metadata_result.ok:
             self._record_checked_load_failure(run_dir, run_id, metadata_result)
             return False

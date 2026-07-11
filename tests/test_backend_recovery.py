@@ -361,6 +361,58 @@ def test_recover_runs_records_corrupt_metadata_instead_of_treating_it_as_missing
     assert failure["error_code"] == "backend_run_corrupt"
 
 
+def test_transient_checkpoint_read_failure_does_not_quarantine_run(tmp_path: Path, monkeypatch) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _recoverable_backend(
+        tmp_path / "runs", _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    run_id = "run_checkpoint_store_unavailable"
+    run_dir = tmp_path / "runs" / run_id
+    calls = 0
+
+    def unavailable(store, requested_run_id):
+        nonlocal calls
+        del store
+        assert requested_run_id == run_id
+        calls += 1
+        raise OSError("checkpoint store unavailable")
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.backend.recovery.load_latest_checked", unavailable
+    )
+
+    assert backend._recovery.attempt_resume(run_dir, run_id) is False
+    assert backend._recovery.attempt_resume(run_dir, run_id) is False
+    assert calls == 2
+    assert not (run_dir / "failure.json").exists()
+
+
+def test_transient_metadata_read_failure_does_not_quarantine_run(tmp_path: Path, monkeypatch) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    run_id = "run_metadata_store_unavailable"
+    run_dir = run_root / run_id
+    backend.checkpoint_store.put(RunCheckpoint(run_id=run_id, seq=1, terminal=False))
+    calls = 0
+
+    def unavailable(requested_run_dir, requested_run_id):
+        nonlocal calls
+        assert requested_run_dir == run_dir
+        assert requested_run_id == run_id
+        calls += 1
+        raise OSError("metadata store unavailable")
+
+    monkeypatch.setattr(backend._recovery, "read_recovery_meta_checked", unavailable)
+
+    assert backend._recovery.attempt_resume(run_dir, run_id) is False
+    assert backend._recovery.attempt_resume(run_dir, run_id) is False
+    assert calls == 2
+    assert not (run_dir / "failure.json").exists()
+
+
 def test_backend_worker_failure_writes_failure_bundle(tmp_path: Path) -> None:
     # A worker-level crash (here the model-adapter factory raises before the loop is even
     # built) must still leave a durable failure.json. Without it, a restart's recover_runs

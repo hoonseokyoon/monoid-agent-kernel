@@ -254,16 +254,10 @@ def load_latest_checked(store: CheckpointStore, run_id: str) -> DurableLoadResul
         return CHECKPOINT_CODEC.corrupt("checkpoint store returned an invalid checked result").map(
             lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
         )
-    try:
-        record = store.latest(run_id)
-    except Exception as exc:
-        return DurableLoadResult(
-            status="corrupt",
-            family=CHECKPOINT_CODEC.family,
-            current_schema=CHECKPOINT_CODEC.current_schema,
-            error_code="checkpoint_corrupt",
-            message=f"legacy checkpoint store read failed ({type(exc).__name__})",
-        )
+    # A legacy store cannot distinguish malformed durable state from a transient
+    # transport failure. Preserve its exception so recovery can defer and retry;
+    # only checked stores may authoritatively classify an artifact as corrupt.
+    record = store.latest(run_id)
     if record is None:
         return DurableLoadResult(
             status="missing",

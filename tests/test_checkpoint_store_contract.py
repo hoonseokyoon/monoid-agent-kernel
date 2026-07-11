@@ -70,6 +70,18 @@ def test_put_latest_seq_isolation_and_delete(store: CheckpointStore) -> None:
     assert store.latest("run_2") is not None
 
 
+def test_legacy_store_read_failure_is_not_classified_as_corrupt(tmp_path: Path) -> None:
+    class UnavailableLegacyStore(LocalFsCheckpointStore):
+        latest_checked = None
+
+        def latest(self, run_id: str):
+            del run_id
+            raise OSError("store unavailable")
+
+    with pytest.raises(OSError, match="store unavailable"):
+        load_latest_checked(UnavailableLegacyStore(tmp_path), "run_1")
+
+
 def test_latest_is_monotonic(store: CheckpointStore) -> None:
     # A late writer with a lower seq (e.g. a reclaim racing a slow original worker) must
     # never regress latest() and unpublish a newer committed checkpoint.
