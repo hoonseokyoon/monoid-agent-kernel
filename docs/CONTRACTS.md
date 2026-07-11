@@ -588,6 +588,9 @@ Owner-local commands execute from a transient payload after removing the authent
 legitimate domain fields such as `password` remain intact without entering the inbox. Cross-worker
 commands execute from the durable sanitized payload; use durable references such as `token_ref`
 for credential-shaped domain data that must cross that boundary.
+`create_task` also requires an empty per-run command lane so its one-time callback credential can
+be returned by the submitting owner thread. Peers accept durable commands only while the run has a
+fresh ownership lease; an absent or stale owner returns `command_owner_unavailable` before append.
 
 Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
 receipt and does not execute a second command. Reusing the ID for a different type, sanitized

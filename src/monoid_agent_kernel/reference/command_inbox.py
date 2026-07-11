@@ -129,7 +129,9 @@ class CommandReceipt:
 
 
 class CommandStore(Protocol):
-    def append(self, command: StoredCommand, *, max_pending: int) -> CommandReceipt: ...
+    def append(
+        self, command: StoredCommand, *, max_pending: int, require_empty: bool = False
+    ) -> CommandReceipt: ...
 
     def read_command(self, run_id: str, command_id: str) -> StoredCommand | None: ...
 
@@ -174,7 +176,7 @@ def redact_command_credential(value: Any, credential: str) -> Any:
             )
             for item_key, item in value.items()
         }
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [redact_command_credential(item, credential) for item in value]
     if isinstance(value, str):
         return value.replace(credential, "[redacted]")
@@ -200,7 +202,9 @@ class InMemoryCommandStore:
         self._commands: dict[tuple[str, str], StoredCommand] = {}
         self._results: dict[tuple[str, str], dict[str, Any]] = {}
 
-    def append(self, command: StoredCommand, *, max_pending: int) -> CommandReceipt:
+    def append(
+        self, command: StoredCommand, *, max_pending: int, require_empty: bool = False
+    ) -> CommandReceipt:
         key = (command.run_id, command.command_id)
         with self._lock:
             existing = self._commands.get(key)
@@ -212,6 +216,10 @@ class InMemoryCommandStore:
                 item.run_id == command.run_id and item.status in {"pending", "claimed"}
                 for item in self._commands.values()
             )
+            if require_empty and pending:
+                raise CommandQueueFull(
+                    f"command lane is busy for immediate command {command.command_id}"
+                )
             if pending >= max_pending:
                 raise CommandQueueFull(f"command queue is full for run {command.run_id}")
             persisted = StoredCommand(
@@ -325,7 +333,9 @@ class SqliteCommandStore:
                 )
             conn.commit()
 
-    def append(self, command: StoredCommand, *, max_pending: int) -> CommandReceipt:
+    def append(
+        self, command: StoredCommand, *, max_pending: int, require_empty: bool = False
+    ) -> CommandReceipt:
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._row(conn, command.run_id, command.command_id)
@@ -339,6 +349,11 @@ class SqliteCommandStore:
                 "SELECT COUNT(*) FROM command_inbox WHERE run_id=? AND status IN ('pending','claimed')",
                 (command.run_id,),
             ).fetchone()[0]
+            if require_empty and int(pending):
+                conn.rollback()
+                raise CommandQueueFull(
+                    f"command lane is busy for immediate command {command.command_id}"
+                )
             if int(pending) >= max_pending:
                 conn.rollback()
                 raise CommandQueueFull(f"command queue is full for run {command.run_id}")

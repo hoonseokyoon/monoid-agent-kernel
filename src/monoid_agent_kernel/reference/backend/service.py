@@ -1046,6 +1046,15 @@ class RunnerBackend:
                 "returned without durable persistence",
                 error_code="command_requires_owner",
             )
+        if not locally_owned:
+            assert self.lease_store is not None
+            if self.lease_store.owner(command.run_id) is None or self.lease_store.is_stale(
+                command.run_id
+            ):
+                raise NativeAgentError(
+                    "run has no live owner available to drain durable commands",
+                    error_code="command_owner_unavailable",
+                )
         if token and token in command.command_id:
             raise NativeAgentError(
                 "command_id must not contain the authenticated credential",
@@ -1072,7 +1081,9 @@ class RunnerBackend:
             # the watchdog can claim them, or only the redacted durable result would survive.
             with self._command_drain_lock(command.run_id):
                 receipt = self.command_store.append(
-                    stored_command, max_pending=self.command_queue_limit
+                    stored_command,
+                    max_pending=self.command_queue_limit,
+                    require_empty=command.type == "create_task",
                 )
                 executed = self._drain_command_inbox(
                     command.run_id,
@@ -1080,7 +1091,8 @@ class RunnerBackend:
                 )
         else:
             receipt = self.command_store.append(
-                stored_command, max_pending=self.command_queue_limit
+                stored_command,
+                max_pending=self.command_queue_limit,
             )
             executed = {}
         current = self.command_store.receipt(command.run_id, command_id) or receipt
@@ -1811,6 +1823,7 @@ class RunnerBackend:
         reclaim runs orphaned by a crashed peer (a stale lease). Opt-in and idempotent."""
         if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
             return
+        self._heartbeat_own_runs()
         self._watchdog_stop.clear()
         thread = threading.Thread(
             target=self._watchdog_loop,

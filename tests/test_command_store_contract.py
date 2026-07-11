@@ -49,7 +49,11 @@ def _command(command_id: str, *, created_at: float = 1.0) -> StoredCommand:
 def test_bearer_redaction_covers_nested_keys_and_values() -> None:
     credential = "signed-bearer-value"
     redacted = redact_command_credential(
-        {credential: "marker", "nested": {f"prefix-{credential}": credential}},
+        {
+            credential: "marker",
+            "nested": {f"prefix-{credential}": credential},
+            "tuple": ("safe", credential),
+        },
         credential,
     )
 
@@ -57,6 +61,7 @@ def test_bearer_redaction_covers_nested_keys_and_values() -> None:
     assert redacted == {
         "[redacted]": "marker",
         "nested": {"prefix-[redacted]": "[redacted]"},
+        "tuple": ["safe", "[redacted]"],
     }
 
 
@@ -139,6 +144,13 @@ def test_queue_limit_counts_only_unacknowledged_commands(store: CommandStore) ->
         ControlResult(run_id="run_1", type="status", status="ok"),
     )
     assert store.append(_command("cmd_2"), max_pending=1).status == "pending"
+
+
+def test_immediate_command_requires_an_empty_lane(store: CommandStore) -> None:
+    store.append(_command("cmd_head"), max_pending=10)
+
+    with pytest.raises(CommandQueueFull, match="lane is busy"):
+        store.append(_command("cmd_secret"), max_pending=10, require_empty=True)
 
 
 def test_persisted_command_redacts_credential_shaped_fields(store: CommandStore) -> None:

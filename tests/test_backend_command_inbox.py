@@ -259,6 +259,17 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
     assert '"user_id": "user_a"' in row[1]
     assert row[3] == TokenManager.token_sha256(submission.run_token)
 
+    owner._heartbeat_own_runs()
+    with pytest.raises(NativeAgentError, match="no live owner"):
+        peer.enqueue_control(
+            ControlCommand(
+                type="status",
+                run_id=submission.run_id,
+                args={"token": submission.run_token},
+                command_id="cmd_ownerless",
+            )
+        )
+
 
 def test_local_command_returns_transient_callback_and_callback_token_can_enqueue(
     backend_factory: Any,
@@ -283,10 +294,16 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
     assert backend.command_store is not None
     original_append = backend.command_store.append
     competing_drains: list[threading.Thread] = []
+    immediate_requirements: list[bool] = []
 
-    def append_with_watchdog_race(command: Any, *, max_pending: int) -> Any:
-        receipt = original_append(command, max_pending=max_pending)
+    def append_with_watchdog_race(
+        command: Any, *, max_pending: int, require_empty: bool = False
+    ) -> Any:
+        receipt = original_append(
+            command, max_pending=max_pending, require_empty=require_empty
+        )
         if command.type == "create_task":
+            immediate_requirements.append(require_empty)
             started = threading.Event()
 
             def compete() -> None:
@@ -328,6 +345,7 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
         callback_token = created["data"]["callback_token"]
         task_id = created["data"]["task_id"]
         assert callback_token and callback_token != "[redacted]"
+        assert immediate_requirements == [True]
         for thread in competing_drains:
             thread.join(timeout=2)
             assert not thread.is_alive()
