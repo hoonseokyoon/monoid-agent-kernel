@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
+
 from monoid_agent_kernel import tool
 from monoid_agent_kernel.tools.base import ToolContext, ToolRegistry, ToolResult, ToolSpec
 
@@ -67,3 +70,17 @@ def test_tool_spec_registers_and_validates_args() -> None:
     registry.register(echo)
     resolved = registry.resolve("skill.echo")
     registry.validate_args(resolved, {"text": "ok"})  # no raise
+
+
+def test_tool_preserves_async_function_and_normalizes_awaited_result() -> None:
+    @tool(id="skill.async_add")
+    async def add(a: int, b: int = 0) -> dict:
+        await asyncio.sleep(0)
+        return {"sum": a + b}
+
+    assert inspect.iscoroutinefunction(add.handler)
+    result = asyncio.run(add.handler(None, {"a": 2, "b": 3}))
+    invalid = asyncio.run(add.handler(None, {"a": "not-an-int"}))
+
+    assert result.ok and result.content == {"sum": 5}
+    assert not invalid.ok and invalid.error_code == "invalid_tool_args"

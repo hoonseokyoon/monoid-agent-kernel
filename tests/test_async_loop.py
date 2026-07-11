@@ -79,15 +79,16 @@ def test_native_async_adapter_is_awaited(tmp_path: Path) -> None:
         supports_multimodal = False
         awaited = False
 
-        def next_turn(self, request: ModelRequest) -> ModelTurn:  # pragma: no cover
-            raise AssertionError("anext_turn should be preferred over next_turn")
-
         async def anext_turn(self, request: ModelRequest) -> ModelTurn:
             await asyncio.sleep(0)
             type(self).awaited = True
             return ModelTurn(response_id="a", final_text="native-async")
 
-    loop = _loop(tmp_path, AsyncAdapter())
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=AsyncAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
     result = asyncio.run(loop.arun_once("go"))
 
     assert result.status == "completed"

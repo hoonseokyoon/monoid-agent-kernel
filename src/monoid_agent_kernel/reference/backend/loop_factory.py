@@ -15,7 +15,7 @@ from monoid_agent_kernel.core.outbox import OutboxSender
 from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
-from monoid_agent_kernel.providers.base import ModelAdapter
+from monoid_agent_kernel.providers.base import AsyncModelAdapter, ModelAdapter
 from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.reference._shared.tokens import TokenKind, TokenManager
 from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort, RunRequestPort
@@ -23,13 +23,13 @@ from monoid_agent_kernel.reference.backend.run_state import BackendRunStateSink
 from monoid_agent_kernel.tools.base import ToolProvider
 from monoid_agent_kernel.web import WebGatewayClient
 
-ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter]
+ModelAdapterFactory = Callable[[AgentRunSpec, str], ModelAdapter | AsyncModelAdapter]
 
 
 @dataclass(frozen=True)
 class BackendLoopBuild:
     spec: AgentRunSpec
-    model_adapter: ModelAdapter
+    model_adapter: ModelAdapter | AsyncModelAdapter
     web_gateway_client: WebGatewayClient | None
     runtime_config_provider: RuntimeConfigProvider
     capability_broker: CapabilityBroker | None

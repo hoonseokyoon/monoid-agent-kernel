@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -123,7 +123,9 @@ class ToolContext(Protocol):
         ...
 
 
-ToolHandler = Callable[[ToolContext, dict[str, Any]], ToolResult]
+SyncToolHandler = Callable[[ToolContext, dict[str, Any]], ToolResult]
+AsyncToolHandler = Callable[[ToolContext, dict[str, Any]], Awaitable[ToolResult]]
+ToolHandler = SyncToolHandler | AsyncToolHandler
 
 
 @dataclass(frozen=True)
@@ -131,10 +133,11 @@ class ToolSpec:
     """A registered tool: its identity, JSON-Schema input, and handler.
 
     ``input_schema`` is a JSON Schema (Draft 2020-12) the registry validates calls against;
-    ``handler`` is a ``(ToolContext, args) -> ToolResult`` callable. ``side_effect`` and the
-    declarative hint fields let the engine drive previews/diffs without branching on tool
-    identity. Author one by hand, or generate it from a typed Python function with the
-    :func:`~monoid_agent_kernel.tool` decorator (``tools/decorator.py``).
+    ``handler`` is a synchronous or async ``(ToolContext, args) -> ToolResult`` callable.
+    Async handlers are awaited on the run loop; synchronous handlers run in a worker thread.
+    ``side_effect`` and the declarative hint fields let the engine drive previews/diffs without
+    branching on tool identity. Author one by hand, or generate it from a typed Python function
+    with the :func:`~monoid_agent_kernel.tool` decorator (``tools/decorator.py``).
     """
 
     id: str
@@ -205,4 +208,3 @@ class ToolRegistry:
 
     def specs(self) -> list[ToolSpec]:
         return list(self._by_id.values())
-

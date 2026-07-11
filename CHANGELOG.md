@@ -14,6 +14,9 @@ out in commit messages and here.
 - Added a machine-readable compatibility registry and matching ledger for public wire and
   durable artifacts, aliases, mixed-version operation, schema evolution, and coordinated
   upgrade/rollback procedures.
+- Added explicit native async model, streaming model, and async tool-handler contracts;
+  async tools now execute on the run loop with deadline/cancellation propagation while
+  synchronous handlers retain worker-thread compatibility.
 
 ### Changed
 - Classified every test into an enforced unit, contract, or integration tier and

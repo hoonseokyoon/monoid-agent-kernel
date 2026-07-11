@@ -138,10 +138,12 @@ from monoid_agent_kernel.core.content import (
 
 # Model adapter contract
 from monoid_agent_kernel.providers.base import (
+    AsyncModelAdapter,
     ModelAdapter,
     ModelRequest,
     ModelStreamChunk,
     ModelTurn,
+    StreamingModelAdapter,
     TextDelta,
     ToolCall,
     ToolCallDelta,
@@ -152,7 +154,9 @@ from monoid_agent_kernel.core.streaming import RunStream
 
 # Tool contract
 from monoid_agent_kernel.tools.base import (
+    AsyncToolHandler,
     DynamicToolProvider,
+    SyncToolHandler,
     ToolContext,
     ToolHandler,
     ToolProvider,
@@ -303,6 +307,8 @@ __all__ = [
     "VideoPart",
     # model adapter contract
     "ModelAdapter",
+    "AsyncModelAdapter",
+    "StreamingModelAdapter",
     "ModelRequest",
     "ModelTurn",
     "ToolCall",
@@ -314,6 +320,8 @@ __all__ = [
     "ToolCallDelta",
     "TurnComplete",
     # tool contract
+    "SyncToolHandler",
+    "AsyncToolHandler",
     "DynamicToolProvider",
     "ToolContext",
     "ToolHandler",
