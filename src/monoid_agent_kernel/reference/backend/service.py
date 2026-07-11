@@ -1097,8 +1097,17 @@ class RunnerBackend:
                         recovery_reservation=True,
                     )
                     if receipt.status == "completed":
-                        self.resume_run(command.run_id, token)
-                        keep_lease = True
+                        run_dir = self.run_root / command.run_id
+                        latest = self._checkpoint_store().latest(command.run_id)
+                        resumable = (
+                            latest is not None
+                            and not latest.checkpoint.terminal
+                            and not (run_dir / "failure.json").exists()
+                            and self._read_recovery_meta(run_dir, command.run_id) is not None
+                        )
+                        if resumable:
+                            self.resume_run(command.run_id, token)
+                            keep_lease = True
                         return replace(
                             receipt,
                             transient_result=(

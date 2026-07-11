@@ -487,8 +487,9 @@ def test_http_resume_recovers_ownerless_run_with_full_command_inbox(
     first.cancel_run(submission.run_id, submission.run_token)
 
 
-def test_completed_ownerless_resume_rehydrates_without_repeating_command_effect(
-    backend_factory: Any, tmp_path: Path
+@pytest.mark.parametrize("terminal_after_ack", (False, True))
+def test_completed_ownerless_resume_preserves_receipt_and_rehydrates_only_if_resumable(
+    backend_factory: Any, tmp_path: Path, terminal_after_ack: bool
 ) -> None:
     workspace = backend_factory.workspace()
     run_root = tmp_path / "runs"
@@ -543,6 +544,12 @@ def test_completed_ownerless_resume_rehydrates_without_repeating_command_effect(
         "crashed-worker",
         previous_result,
     )
+    if terminal_after_ack:
+        first.cancel_run(submission.run_id, submission.run_token)
+        assert eventually(
+            lambda: first.status(submission.run_id, submission.run_token)["terminal"] is True,
+            timeout_s=10,
+        )
 
     restarted = backend_factory.create(
         run_root=run_root,
@@ -564,9 +571,13 @@ def test_completed_ownerless_resume_rehydrates_without_repeating_command_effect(
 
     assert receipt.status == "completed"
     assert receipt.transient_result == previous_result.to_json()
-    assert submission.run_id in restarted._records
     assert restarted.lease_store is not None
-    assert restarted.lease_store.owner(submission.run_id) == restarted._worker_id
+    if terminal_after_ack:
+        assert submission.run_id not in restarted._records
+        assert restarted.lease_store.owner(submission.run_id) is None
+    else:
+        assert submission.run_id in restarted._records
+        assert restarted.lease_store.owner(submission.run_id) == restarted._worker_id
     audits = [
         event
         for event in restarted.events(submission.run_id, submission.run_token)["events"]
@@ -575,5 +586,6 @@ def test_completed_ownerless_resume_rehydrates_without_repeating_command_effect(
     ]
     assert audits == []
 
-    restarted.cancel_run(submission.run_id, submission.run_token)
-    first.cancel_run(submission.run_id, submission.run_token)
+    if not terminal_after_ack:
+        restarted.cancel_run(submission.run_id, submission.run_token)
+        first.cancel_run(submission.run_id, submission.run_token)
