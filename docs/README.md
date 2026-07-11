@@ -9,7 +9,8 @@ building against, and securing the kernel.
 - **I want to run an agent** → [Quickstart](../README.md#quickstart-no-servers),
   then [CLI.md](CLI.md) for the full `run` / `watch` / `jobs` surface.
 - **I'm embedding the kernel in a product** → [CONTRACTS.md](CONTRACTS.md) for the
-  stable Python/HTTP surface, [CONFORMANCE.md](CONFORMANCE.md) to check your
+  stable Python/HTTP surface, [EMBEDDING.md](EMBEDDING.md) for executable local and hosted
+  production paths, [CONFORMANCE.md](CONFORMANCE.md) to check your
   implementation, [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) for the helper boundary,
   [COMPATIBILITY.md](COMPATIBILITY.md) for version and upgrade obligations.
 - **I'm writing tools** → [TOOL_SURFACE.md](TOOL_SURFACE.md) for `ToolBinding`,
@@ -40,6 +41,7 @@ building against, and securing the kernel.
 | [security/THREAT_MODEL.md](security/THREAT_MODEL.md) | Trust boundaries, the permissive-by-default warning, threat-by-threat defenses, and integrator responsibilities. |
 | [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md) | Actionable pre-deployment checklist for gateways, workspace, tool surface, artifacts, and conformance. |
 | [CONTRACTS.md](CONTRACTS.md) | The stable integration surface: Python contracts, HTTP wire contracts, wiring rules, operational rules, and the contract/core/reference boundary. |
+| [EMBEDDING.md](EMBEDDING.md) | Executable local and hosted/multi-tenant golden paths, ownership, durability, streaming, control, credentials, observability, and failure handling. |
 | [CONFORMANCE.md](CONFORMANCE.md) | Profile-based conformance tests, harness roles, executable assertions, testing policy, and the Reference full profile. |
 | [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) | Supported helper modules and validation/library policy for contract-aligned implementations. |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | Machine-checked wire/durable version ledger, aliases, deprecation policy, mixed-version operation, and upgrade/rollback playbooks. |

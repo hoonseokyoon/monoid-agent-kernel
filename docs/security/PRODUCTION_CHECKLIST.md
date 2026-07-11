@@ -1,5 +1,8 @@
 # Production Security Checklist
 
+Use the deployment and ownership paths in [the production embedding handbook](../EMBEDDING.md)
+alongside this checklist.
+
 Work through this before running Monoid outside local development. It is the
 actionable form of the integrator responsibilities in
 [SECURITY_MODEL.md](SECURITY_MODEL.md); the rationale for each item is in

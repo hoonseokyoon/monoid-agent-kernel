@@ -88,3 +88,30 @@ def test_full_stack_integration_fake_scenario(tmp_path: Path) -> None:
     assert result["result_ready"] is True, result.get("status")
     assert result["event_types"], "no events emitted"
     assert result["secret_leak_detected"] is False
+
+
+def test_local_product_embedding_golden_path(tmp_path: Path) -> None:
+    module = _load("embedding_local_product.py")
+    result = module.run_local_product(tmp_path)
+
+    assert result["status"] == "completed"
+    assert result["output_exists"] is True
+    assert result["checkpoint_seq"] >= 1
+    assert result["event_count"] > 0
+    assert result["network_required"] is False
+
+
+def test_hosted_product_embedding_golden_path(tmp_path: Path) -> None:
+    module = _load("embedding_hosted_product.py")
+    result = module.run_hosted_product(tmp_path)
+
+    assert result["status"] == "ok"
+    assert result["tenants"] == ["tenant_a", "tenant_b"]
+    assert result["initial_event_count"] > 0
+    assert result["replay_count"] == 0
+    assert result["status_receipt"] == "completed"
+    assert result["task_receipt"] == "completed"
+    assert result["approval_receipt"] == "completed"
+    assert result["historical_event_count"] >= result["initial_event_count"]
+    assert result["credential_leak_detected"] is False
+    assert result["network_required"] is False
