@@ -306,9 +306,11 @@ before the handler starts. `tool.call.started` precedes handler execution; one
 replays use the same async execution path.
 
 Run cancellation and the run deadline cancel an in-flight native async handler and preserve the
-run-level `cancelled` or `run_timeout` result. A synchronous Python call cannot be force-stopped
-safely; its worker completes before the next run-boundary check. Sync tools that perform external
-I/O should apply their own operation timeout and idempotency policy.
+run-level `cancelled` or `run_timeout` result. Cleanup has a bounded
+`AgentLoop.async_tool_cancel_grace_s` window; a handler that suppresses cancellation is detached
+after that window so it cannot block the run result. A synchronous Python call cannot be
+force-stopped safely; its worker completes before the next run-boundary check. Sync tools that
+perform external I/O should apply their own operation timeout and idempotency policy.
 
 `ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
 errors become failed tool observations. Unexpected handler exceptions fail the run through the

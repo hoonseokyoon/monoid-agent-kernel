@@ -177,6 +177,15 @@ from monoid_agent_kernel.web import WebGatewayClient, domain_allowed, domain_fro
 CheckpointPersistCallback = Callable[[RunCheckpoint, Mapping[str, bytes]], None]
 
 
+def _consume_task_outcome(task: asyncio.Future[Any]) -> None:
+    """Retrieve a detached task outcome so late cleanup cannot emit an unhandled warning."""
+
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     """True if a tool binding matches any fnmatch pattern. Matched against the binding's
     tool id, binding id, and model name, so subagent allow/deny lists accept ids
@@ -623,6 +632,10 @@ class AgentLoop:
     emit_output_deltas: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
+    # Native async handlers receive cancellation immediately. Cleanup gets a bounded grace
+    # window; a handler that suppresses cancellation is detached so the run-level outcome can
+    # still settle. Sync worker calls retain their existing non-preemptible boundary behavior.
+    async_tool_cancel_grace_s: float = 1.0
     shell_approval_provider: ShellApprovalProvider | None = None
     web_gateway_client: WebGatewayClient | None = None
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
@@ -3408,10 +3421,13 @@ class AgentLoop:
                 cancelled.cancel()
             if not task.done():
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                done, _pending = await asyncio.wait(
+                    {task}, timeout=max(0.0, self.async_tool_cancel_grace_s)
+                )
+                if task not in done:
+                    task.add_done_callback(_consume_task_outcome)
+                else:
+                    _consume_task_outcome(task)
 
     def _finalize_tool_call(
         self,

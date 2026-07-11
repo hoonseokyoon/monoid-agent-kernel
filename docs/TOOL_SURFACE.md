@@ -111,9 +111,10 @@ The loop awaits async handlers on its event loop and offloads synchronous handle
 Calls stay sequential, including multiple calls in one model response and approval/capability
 replays. This preserves context mutation, quota accounting, durable events, and side-effect order.
 
-Cancellation and run deadlines preempt native async handlers. Synchronous handlers reach those
-boundaries after their worker call returns, so blocking integrations must configure an operation
-timeout at their I/O edge.
+Cancellation and run deadlines preempt native async handlers. Cleanup is bounded by
+`AgentLoop.async_tool_cancel_grace_s`; cancellation-suppressing cleanup is detached when that
+window expires. Synchronous handlers reach run boundaries after their worker call returns, so
+blocking integrations must configure an operation timeout at their I/O edge.
 
 Unbound registry tools stay outside the catalog. The kernel leaves unbound tools
 unrepresented instead of creating hidden deny rules.

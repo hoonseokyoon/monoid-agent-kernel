@@ -200,6 +200,53 @@ def test_run_deadline_cancels_native_async_tool(tmp_path: Path) -> None:
     assert cleaned_up is True
 
 
+def test_stubborn_async_tool_cleanup_cannot_block_run_cancellation(tmp_path: Path) -> None:
+    token = CancellationToken()
+
+    async def run() -> tuple[object, bool]:
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+
+        @tool(id="async.stubborn")
+        async def stubborn() -> dict:
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                cleanup_finished.set()
+                return {"late": True}
+
+        adapter = FakeModelAdapter(
+            turns=[ModelTurn(tool_calls=(fake_tool_call("async_stubborn", {}, "c1"),))]
+        )
+        loop = AgentLoop.from_tools(
+            _spec(tmp_path),
+            adapter,
+            [stubborn],
+            cancellation_token=token,
+            async_tool_cancel_grace_s=0.01,
+        )
+        pending = asyncio.create_task(loop.arun_once("go"))
+        await started.wait()
+        token.cancel()
+        result = await asyncio.wait_for(pending, timeout=1)
+        assert cleanup_started.is_set()
+        assert not cleanup_finished.is_set()
+        release_cleanup.set()
+        await asyncio.wait_for(cleanup_finished.wait(), timeout=1)
+        return result, cleanup_finished.is_set()
+
+    result, cleanup_finished = asyncio.run(run())
+
+    assert result.status == "limited"
+    assert result.error_code == "cancelled"
+    assert cleanup_finished is True
+
+
 def test_async_tool_preserves_capability_gate_and_token_context(tmp_path: Path) -> None:
     seen_tokens: list[str | None] = []
 
