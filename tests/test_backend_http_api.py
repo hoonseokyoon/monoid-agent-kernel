@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from support.backend_harness import (
+    BackendRunRequest,
     HTTPError,
     ModelTurn,
     Path,
@@ -137,6 +138,54 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
         assert trace_id_of(traceparent) in diagnostics["trace_ids"]
         usage = _json_get(f"{base_url}/v1/tenants/tenant_a/usage", token="admin")
         assert usage["total_tokens"] == 10
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_backend_event_sse_resumes_from_last_event_id_without_duplicates(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Run.",
+            runtime_config=_default_config(),
+        )
+    )
+    assert backend.wait_for_run(submission.run_id, timeout_s=5).value == "completed"
+    server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def read(last_event_id: str | None = None) -> tuple[list[int], str]:
+        headers = {
+            "Authorization": f"Bearer {submission.run_token}",
+            "Accept": "text/event-stream",
+        }
+        if last_event_id is not None:
+            headers["Last-Event-ID"] = last_event_id
+        request = Request(
+            f"{base_url}/v1/runs/{submission.run_id}/events?from_seq=1",
+            headers=headers,
+        )
+        with urlopen(request, timeout=10) as response:
+            assert response.headers["Content-Type"].startswith("text/event-stream")
+            body = response.read().decode("utf-8")
+        ids = [int(line.removeprefix("id: ")) for line in body.splitlines() if line.startswith("id: ")]
+        return ids, body
+
+    try:
+        _wait_http_ready(base_url)
+        ids, body = read()
+        assert ids == sorted(set(ids))
+        assert "event: end" in body
+        resumed_ids, _ = read(str(ids[0]))
+        assert resumed_ids == ids[1:]
     finally:
         server.shutdown()
         server.server_close()

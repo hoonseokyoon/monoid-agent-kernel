@@ -81,7 +81,7 @@ Reference scenario names stay inside `monoid_agent_kernel.reference.conformance`
 | Target | Why it remains |
 | --- | --- |
 | CI hardening | Xdist and coverage jobs are advisory. Promote them only after their signal is consistently clean. |
-| Streaming transport adapters | HTTP SSE and Studio consumers sit outside the backend service split. Keep them transport-owned. |
+| Streaming transport adapters | Cursor ownership and final draining use `core.event_subscription`; HTTP SSE framing and Studio rendering remain transport-owned. |
 
 ## Design Position
 

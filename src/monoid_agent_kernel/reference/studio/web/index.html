@@ -858,7 +858,11 @@ function handleEvent(ev) {
     bubble("error", msg);
     return;
   }
-  if (type === "studio.stream.end") { hideTyping(); setGenerating(false); return; }
+  if (type === "studio.stream.end") {
+    hideTyping(); setGenerating(false);
+    if (evtSource) { evtSource.close(); evtSource = null; }
+    return;
+  }
 }
 
 function updateUsage(data) {

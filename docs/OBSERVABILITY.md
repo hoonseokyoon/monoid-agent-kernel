@@ -101,6 +101,13 @@ interleaved with `ModelStreamChunk` (token deltas: `TextDelta` / `ReasoningDelta
 after the stream drains. Gateway token streaming uses Server-Sent Events and needs the
 `[http-async]` extra.
 
+Durable event subscriptions use `EventSubscription` over the append-only `events.jsonl` sequence.
+They support page polling and SSE, sequence IDs, `Last-Event-ID` reconnects, heartbeat comments,
+terminal final-event draining, recovered runs, and ancestor-authorized descendant streams. Request
+`GET /v1/runs/{run_id}/events` with `Accept: text/event-stream`; a JSON request keeps the existing
+inclusive `from_seq` pagination response. Studio uses the same cursor abstraction for its root SSE
+feed and descendant event polling.
+
 ## Metrics
 
 Each run writes `metrics.json` (and emits a `metrics.updated` event per turn) with
