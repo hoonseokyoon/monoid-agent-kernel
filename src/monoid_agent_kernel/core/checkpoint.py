@@ -1,17 +1,13 @@
-"""Durable run checkpoint: a state-snapshot taken at a pump park point.
+"""Durable run checkpoint: a complete state snapshot at a safe recovery boundary.
 
-The kernel is already half-durable — the provider holds the conversation by
-reference (``turn_handle``), the workspace truth is on disk, and events/transcript
-are append-only. The only volatile state worth persisting is the small mutable
-``RunState`` (handle + counters + pending observations) plus the hosted tasks a run
-is parked on. This module is the serialized form of exactly that, written to
-``run_dir/checkpoint.json`` and read back to rehydrate a fresh ``AgentLoop`` after a
-process restart.
+The checkpoint carries the provider-neutral conversation, mutable run state, workspace delta,
+hosted tasks, counters, and durable activation observations needed to rehydrate a fresh
+``AgentLoop`` after process restart. Observable suspension boundaries and selected internal safety
+barriers can both publish snapshots.
 
-This is a *state-snapshot* (LangGraph style), not an event-sourcing journal
-(Temporal/Restate style): because the LLM transcript is by-reference, restore never
-replays the model, so there is no determinism constraint and no double-side-effect
-risk. Snapshots are only ever taken at clean park points, never mid-step.
+This persistence model uses state snapshots. Restore continues from the latest committed state
+instead of replaying earlier model turns. An external effect can still commit
+before the next snapshot, so such effects require a stable idempotency key or durable outbox.
 
 ``RunCheckpoint`` is a plain JSON container — the object<->dict conversions for
 observations, content parts, runtime config and hosted tasks live in the loop's
@@ -49,7 +45,6 @@ class RunCheckpoint:
     # Monotonic per-run checkpoint sequence; the store flips its "latest" pointer to
     # this only after the checkpoint is fully written (atomic commit / last-good).
     seq: int = 0
-
     # --- RunState (minus previous_surface_snapshot) ---
     status: str = "completed"
     error: str = ""
@@ -120,6 +115,23 @@ class RunCheckpoint:
     # Staged outbound side-effects (capability-gated). Persisted in full (handles only, never
     # secrets) so a pending request survives a restart and is (re)dispatched by the edge. Additive.
     outbox_requests: list[dict[str, Any]] = field(default_factory=list)
+
+    # --- additive v0.18 recovery observations (kept at the tail for positional compatibility) ---
+    # Portable observation of the suspension boundary that produced this checkpoint.
+    # Recovery drivers use it to return the same result when an input was committed before
+    # the driver's own receipt. Older checkpoints omit it and remain readable.
+    last_suspension: dict[str, Any] | None = None
+    # Generic activation/input identities whose resulting boundary is already committed. A
+    # recovery driver returns the stored boundary for a repeated id instead of driving effects
+    # again. This stays transport- and implementation-neutral; old checkpoints default to [].
+    applied_input_ids: list[str] = field(default_factory=list)
+    # The input currently advancing between durable boundaries. ``phase`` is driver-defined but
+    # portable values are "running" and "completed"; ``source_seq`` identifies the admitted
+    # source. A matching recovery can continue from an internal safety checkpoint.
+    active_input: dict[str, Any] | None = None
+    # Immutable boundary receipts keyed by applied input identity. They let an old duplicate return
+    # its own stored observation after newer inputs have advanced the run.
+    applied_input_receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -293,9 +305,8 @@ class LocalFsCheckpointStore:
 
     def put(self, checkpoint: RunCheckpoint, blobs: Mapping[str, bytes] = {}) -> None:
         cdir = self._dir(checkpoint.run_id)
-        # Serialize puts for this run across processes (e.g. a watchdog reclaim racing the
-        # original worker): without it, two writers could interleave blob writes and LATEST
-        # flips and tear a checkpoint.
+        # Serialize puts for this run across processes: without it, two writers could interleave
+        # blob writes and LATEST flips and tear a checkpoint.
         cdir.mkdir(parents=True, exist_ok=True)
         with file_lock(cdir / ".put.lock", timeout_s=self.lock_timeout_s, stale_s=self.lock_stale_s):
             # 0) GC orphaned blob temp files left by a crashed prior write (no LATEST was
@@ -397,8 +408,8 @@ class LocalFsCheckpointStore:
             return CHECKPOINT_CODEC.missing().map(
                 lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
             )
-        # A reader can race a concurrent put()'s atomic LATEST/manifest replace (especially
-        # cross-process, e.g. a watchdog reclaim reading while the original worker commits).
+        # A reader can race a concurrent put()'s atomic LATEST/manifest replace, including across
+        # processes.
         # Retry a few times so a transient read failure mid-commit is not mistaken for
         # "no checkpoint" — returning None here would wrongly skip a recoverable run.
         seq = -1

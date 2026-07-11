@@ -13,6 +13,14 @@ from monoid_agent_kernel.reference.dbos import (
     DbosControlConfig,
     DbosControlEnvelope,
     DbosControlPlane,
+    DbosDependencyError,
+    DbosProcessOwnershipError,
+)
+from monoid_agent_kernel.reference.dbos.control_plane import (
+    DbosDependencyError as LegacyDbosDependencyError,
+)
+from monoid_agent_kernel.reference.dbos.control_plane import (
+    DbosProcessOwnershipError as LegacyDbosProcessOwnershipError,
 )
 
 
@@ -37,6 +45,11 @@ assert 'dbos' not in sys.modules
     )
 
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_control_plane_exception_module_paths_remain_compatible() -> None:
+    assert LegacyDbosDependencyError is DbosDependencyError
+    assert LegacyDbosProcessOwnershipError is DbosProcessOwnershipError
 
 
 def test_dbos_envelope_removes_bearer_and_keeps_retry_identity_stable() -> None:

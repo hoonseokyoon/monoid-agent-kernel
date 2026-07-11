@@ -1029,17 +1029,36 @@ length is bounded by idle timeout, max lifetime, and max turns.
 A checkpoint is a **complete, self-contained "save file."** A parked run survives a
 process restart even when the agent's workspace is *not* durable: workspace, the
 conversation, and run state all roll back to one aligned instant. This is a
-**state-snapshot at the suspend points** (not event-sourcing replay); snapshots are
-only taken at clean park points, so there is no determinism constraint and no
-double-side-effect risk.
+**state snapshot at clean checkpointable recovery boundaries**. Recovery reads snapshots directly. An
+activation can publish internal safety checkpoints before returning its observable suspension
+boundary. Restore continues from the latest committed snapshot; work before that snapshot is
+already represented in it. A crash inside an activation can redeliver effects that completed
+before a later checkpoint commit.
+`OR-12-DURABLE-SIDE-EFFECT` requires a stable idempotency key or durable outbox for those effects.
 
 **Division of responsibility:** the core defines *what* a checkpoint contains
 (`RunCheckpoint`) and how to `restore()` it; the integrator decides *how* it is
-stored by implementing `CheckpointStore`. The core never does storage I/O or
-auto-recovery — on failure it surfaces a bundle and the last-good checkpoint, and
-recovery is the integrator's call.
+stored by implementing `CheckpointStore`. Checkpoint I/O crosses the explicit store seam.
+Auto-recovery belongs to the integrator. On failure, Core surfaces a bundle and the last-good
+checkpoint.
 
-- `AgentLoop.snapshot() -> RunCheckpoint | None` captures, at one quiescent park:
+**Portable recovery semantics:** every committed snapshot advances a monotonic checkpoint
+sequence. Each internal safety checkpoint for an admitted input records its identity, original
+source sequence, and `running` phase. Such checkpoints can advance from source `N` to
+`N+1 ... N+k-1` while retaining that same active-input identity. Recovery continues only that
+input and rejects stale or competing inputs. The returned suspension boundary commits `N+k` with
+the exact observable suspension
+(`reason`, status, awaiting task ids, terminal/error and retry classification), the applied input
+identity, a `completed` phase, and one immutable identity-bound receipt. Repeating an applied input
+returns its own stored receipt and performs zero new model/tool drives, including after later inputs
+have advanced the run. A terminal boundary therefore has one terminal receipt for that input.
+These observable rules are portable. Process placement, liveness, fencing, and recovery
+coordination are deployment policy outside the Core contract.
+An ambiguous checkpoint write remains unacknowledged until exact canonical readback proves the
+commit. A caller cannot convert an unknown write outcome into a terminal receipt or admit a
+competing input.
+
+- `AgentLoop.snapshot() -> RunCheckpoint | None` captures one safe recovery boundary:
   run state + counters + parked hosted tasks, the **workspace delta** (created/
   modified/deleted files; content travels as content-addressed blobs), the **by-value
   conversation** (`messages` — provider-neutral user/assistant/tool log, vendor-
@@ -1051,7 +1070,7 @@ recovery is the integrator's call.
   `latest(run_id)`; `delete(run_id)`. `LocalFsCheckpointStore` is the default
   (`run_root/<id>/checkpoints/<seq>/manifest.json` + content-addressed `blobs/<sha>`);
   swap it for a mounted-volume path or an object-store/DB store. The loop advances a
-  monotonic `seq` per park and deletes checkpoints only on a *completed* run — a
+  monotonic `seq` per committed snapshot and deletes checkpoints only on a *completed* run — a
   failed/limited run keeps its last-good checkpoint.
 - `CheckedCheckpointStore` is the additive checked-read extension. Its
   `latest_checked(run_id)` result distinguishes `loaded`, `migrated`, `missing`,
@@ -1070,15 +1089,22 @@ recovery is the integrator's call.
   `runtime_config` restored, remaining duration carried forward (downtime does not
   count against `max_duration_s`), and any shell job left `running` on disk folded in
   as a failed observation.
+- `AgentLoop.release_parked()` closes recorder/sink and process-local loop resources after a
+  durable boundary commit. It preserves the checkpoint and hosted-task state and emits no
+  `run.finished`. A non-terminal boundary can be restored by the next activation in a fresh
+  process. Terminal artifact finalization remains the caller's responsibility.
 - **Failure bundle:** on failure the core writes `run_dir/failure.json`
   (`{error, error_code, type, last_good_seq, restore_hint}`) — fail loud, name the
   checkpoint to restore from. No auto-recovery.
-- The reference backend writes `run_dir/run.json` and stores the same recovery descriptor in the
+
+#### Reference operational scopes
+
+- The legacy Reference backend writes `run_dir/run.json` and stores the same recovery descriptor in the
   configured `CheckpointStore`: identity, workspace, limits, policy, and the authoritative resolved
   runtime config. Runtime-config hot-swaps update both copies with `runtime_config_version`,
   `runtime_config_hash`, `runtime_config_issuer`, `runtime_config_reason`, and
   `runtime_config_committed_at`; recovery verifies the hash before rebuilding providers or gateway
-  token sources. A backend that never hosted the run can reclaim it from a shared lease/checkpoint
+  token sources. Its optional lease/watchdog profile allows a backend that never hosted the run to reclaim it from a shared lease/checkpoint
   store, read the shared descriptor when local `run.json` is absent, materialize a local copy, then
   resume. Checked metadata reads use the same five outcomes as checkpoints; corrupt or unsupported
   local metadata is never replaced from shared storage as though it were missing. `recover_runs()`
@@ -1088,6 +1114,12 @@ recovery is the integrator's call.
   each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
   is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved
   follow-up messages, and resumes.
+- The v0.18 DBOS Reference profile has a narrower operational scope. One stable executor slot has
+  one active process; a restart reuses the same executor identity and application version after the
+  prior process terminates or is fenced. The profile excludes automatic arbitrary-host takeover.
+  The current vertical slice commits the boundary receipt and releases process resources; its
+  terminal artifact finalizer remains an integration gate. This Reference scope does not change
+  the portable recovery semantics above.
 
 **Assumption (workspace):** the agent workspace is not durable; on restore the
 deployment re-provisions the base (re-clone/re-mount) and the checkpoint re-applies
@@ -1101,10 +1133,10 @@ Multimodal message parts (image/document) round-trip through the checkpoint, so 
 resumed run re-forwards the media. `transcript.jsonl` is a debug artifact (the
 by-value `messages` in the checkpoint are the load-bearing conversation record).
 
-## Production Hardening
+## Legacy Reference Production Hardening
 
-Operational safety net layered on durable persistence. The core still never auto-recovers;
-the active watchdog lives only in the reference backend (the operational layer).
+This section describes the legacy `RunnerBackend` lease/watchdog profile. The DBOS Reference path
+does not compose these services. The core never auto-recovers.
 
 ### Failure surfacing & bounded recovery
 
@@ -1119,7 +1151,7 @@ the active watchdog lives only in the reference backend (the operational layer).
   `failure.json` with `error_code="unrecoverable"`, so a poison checkpoint is permanently
   skipped instead of retried forever.
 
-### Active watchdog / lease (backend only)
+### Active watchdog / lease (legacy backend only)
 
 - `RunnerBackend.start_watchdog()` / `stop_watchdog()` run an opt-in heartbeat thread (tick
   `watchdog_interval_s`, default 5s). For each owned live run it refreshes
@@ -1147,7 +1179,7 @@ the active watchdog lives only in the reference backend (the operational layer).
 
 ### Pluggable durable stores
 
-Two seams make durability and multi-node recovery pluggable without touching the loop:
+The legacy backend uses two seams for pluggable durability and multi-node recovery:
 
 - **`CheckpointStore`** (core) — `put(checkpoint, blobs)` / `latest` / `delete`.
   `CheckpointRecord.blob(sha)` is a callable, not a directory, so a store can back blobs with
@@ -1161,7 +1193,7 @@ Every store must pass the parametrized contract suites (`tests/test_checkpoint_s
 blob dedup, run metadata round-trip, and a single-winner `try_claim`. Passing them makes a backend
 a drop-in.
 
-**SQLite reference stores** (`reference/stores/`, stdlib `sqlite3`, zero dependencies):
+**Legacy SQLite reference stores** (`reference/stores/`, stdlib `sqlite3`, zero dependencies):
 `SqliteCheckpointStore` and `SqliteLeaseStore`. A DB transaction supplies the invariants —
 `put` commits atomically (a crash rolls back, so `latest` never sees a torn checkpoint), the
 latest pointer advances monotonically via a conditional UPSERT, blobs are write-once, and
@@ -1179,9 +1211,10 @@ backend = RunnerBackend(
 )
 ```
 
-**Limitation / follow-up:** SQLite is single-host. A true cross-*host* deployment swaps in a
-networked `CheckpointStore` / `LeaseStore` (an object store or a networked DB) behind the same
-seams, as an optional dependency.
+**Legacy profile limitation / follow-up:** SQLite is single-host. A legacy cross-host deployment
+can supply a networked `CheckpointStore` / `LeaseStore` behind these seams. This capability is a
+Reference implementation option; the Core contract and the initial DBOS profile do not promise
+automatic host takeover.
 
 ### HTTP hardening & request bounds
 

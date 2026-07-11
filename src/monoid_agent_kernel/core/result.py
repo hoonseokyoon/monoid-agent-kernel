@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar
+
+from monoid_agent_kernel.core.wire_validation import (
+    optional_list,
+    parse_bool,
+    parse_int,
+    parse_str,
+)
 
 RunStatus = Literal["completed", "failed", "limited"]
 
@@ -102,6 +110,66 @@ class Suspension:
     turn: AgentTurnResult | None = None
     retryable: bool = False
     http_status: int | None = None
+
+
+_SUSPENSION_REASONS = frozenset(
+    {
+        "settled",
+        "awaiting_tasks",
+        "limited",
+        "terminal",
+        "turn_failed",
+        "interrupted",
+        "paused",
+    }
+)
+
+
+def suspension_checkpoint_payload(suspension: Suspension) -> dict[str, Any]:
+    """Return the portable, JSON-native observation of one durable park boundary.
+
+    ``turn`` is a projection artifact with local paths and metrics. The durable observation keeps
+    only the fields a recovery driver needs to return the same boundary result after a restart.
+    """
+
+    return {
+        "reason": suspension.reason,
+        "status": suspension.status,
+        "final_text": suspension.final_text,
+        "error": suspension.error,
+        "error_code": suspension.error_code,
+        "awaiting_task_ids": list(suspension.awaiting_task_ids),
+        "has_external": suspension.has_external,
+        "retryable": suspension.retryable,
+        "http_status": suspension.http_status,
+    }
+
+
+def suspension_from_checkpoint_payload(payload: Mapping[str, Any]) -> Suspension:
+    """Rebuild a :class:`Suspension` from its durable park observation."""
+
+    reason = parse_str(payload, "reason")
+    status = parse_str(payload, "status")
+    if reason not in _SUSPENSION_REASONS:
+        raise ValueError(f"unsupported durable suspension reason: {reason!r}")
+    if status not in {"completed", "failed", "limited"}:
+        raise ValueError(f"unsupported durable suspension status: {status!r}")
+    raw_task_ids = optional_list(payload, "awaiting_task_ids")
+    if any(not isinstance(task_id, str) for task_id in raw_task_ids):
+        raise ValueError("durable suspension task ids must be strings")
+    raw_http_status = payload.get("http_status")
+    http_status = None if raw_http_status is None else parse_int(payload, "http_status")
+    return Suspension(
+        reason=reason,  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
+        final_text=parse_str(payload, "final_text"),
+        error=parse_str(payload, "error"),
+        error_code=parse_str(payload, "error_code"),
+        awaiting_task_ids=tuple(raw_task_ids),
+        has_external=parse_bool(payload, "has_external"),
+        retryable=parse_bool(payload, "retryable"),
+        http_status=http_status,
+    )
 
 
 @dataclass(frozen=True)
