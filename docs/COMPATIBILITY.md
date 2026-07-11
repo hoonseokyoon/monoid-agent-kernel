@@ -51,6 +51,8 @@ write the current identifier.
 | `approval` | durable | `monoid.approval.v1` | json-schema | `monoid.approval.v1`<br>`native-agent-runner.approval.v1` |
 | `apply-result` | durable | `monoid.apply-result.v1` | json-schema | `monoid.apply-result.v1`<br>`native-agent-runner.apply-result.v1` |
 | `failure` | durable | `monoid.failure.v1` | permissive; missing id accepted | `monoid.failure.v1`<br>`native-agent-runner.failure.v1` |
+| `command-inbox` | durable | `monoid.command-inbox.v1` | strict | `monoid.command-inbox.v1` |
+| `command-receipt` | wire | `monoid.command-receipt.v1` | writer-only | None (writer-only) |
 | `conformance-report` | reference | `monoid.conformance-report.v1` | writer-only | None (writer-only) |
 | `conformance-fixtures` | reference | `monoid.conformance-fixtures.v1` | strict | `monoid.conformance-fixtures.v1` |
 | `studio-chat` | reference | `studio.chat.v1` | strict | `studio.chat.v1` |

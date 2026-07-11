@@ -7,6 +7,9 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+- Added a durable Reference command inbox with idempotent append, ordered and recoverable claims,
+  acknowledgements, result receipts, queue limits, authenticated principal attribution, sanitized
+  persistence, owner-side draining, and in-memory/SQLite implementations for cross-worker control.
 - Added cursor-correct event subscriptions with SSE event IDs, `Last-Event-ID` resume, heartbeat
   comments, terminal final-event draining, recovered-run support, and authorized descendant feeds;
   Reference backend HTTP and Studio now share the subscription abstraction.

@@ -43,6 +43,10 @@ from monoid_agent_kernel.core.schemas import (
 )
 from monoid_agent_kernel.core.workspace_index import WORKSPACE_INDEX_SCHEMA_VERSION
 from monoid_agent_kernel.reference.llm_gateway.service import LLM_TURN_PROTOCOL_VERSION
+from monoid_agent_kernel.reference.command_inbox import (
+    COMMAND_ENVELOPE_VERSION,
+    COMMAND_RECEIPT_VERSION,
+)
 from monoid_agent_kernel.reference._shared.tokens import (
     LEGACY_TOKEN_HEADER_TYPE,
     TOKEN_HEADER_TYPE,
@@ -69,7 +73,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 31
+    assert len(artifacts) == 33
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -109,6 +113,8 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "apply-result": APPLY_RESULT_SCHEMA_VERSION,
         "conformance-report": CONFORMANCE_REPORT_VERSION,
         "conformance-fixtures": "monoid.conformance-fixtures.v1",
+        "command-inbox": COMMAND_ENVELOPE_VERSION,
+        "command-receipt": COMMAND_RECEIPT_VERSION,
         "studio-chat": CHAT_SCHEMA_VERSION,
         "studio-chat-message": CHAT_MESSAGE_SCHEMA_VERSION,
     }

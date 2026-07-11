@@ -557,6 +557,51 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   the bearer token itself. A control `send_message` uses the command id as its inbox idempotency
   key.
 
+### Durable Command Inbox
+
+`CommandStore` is the Reference multi-instance transport for control commands. The bundled
+`InMemoryCommandStore` serves one-process deployments; `SqliteCommandStore` supplies transactional
+idempotent append, ordered claim, stale-claim recovery, acknowledgement, result receipts, and
+per-run queue limits across backend instances. Configure every instance with a command store over
+the same database used by its shared checkpoint and lease stores.
+
+`POST /v1/runs/{run_id}/control` authenticates the submitted bearer token before enqueueing. The
+stored `monoid.command-inbox.v1` envelope contains the command ID, sanitized arguments, reason, and
+authenticated tenant/user principal. It never contains the bearer token. The owner mints a fresh
+short-lived internal run token when it drains the command. A local owner drains immediately and
+the route preserves the historical `ControlResult` response. A remote owner yields a `202`
+`monoid.command-receipt.v1`; poll
+`GET /v1/runs/{run_id}/control/{command_id}` until `completed` or `failed`.
+
+Task callback bearer tokens are accepted for `approve`, `deny`, and `report_task_result` at enqueue
+time and are never stored; the owner executes with its fresh run token. Durable capability
+`token_ref` values remain executable handles, consistent with checkpoint durability. Credential
+fields in command results, including newly issued callback tokens, are redacted in durable
+receipts. The immediate local response returns the original callback token once; a lost secret
+response cannot be recovered from the command store.
+For that reason, `create_task` is accepted only by the instance currently owning the run; a peer
+returns `command_requires_owner` instead of creating a task whose callback credential cannot be
+delivered. Route that command to the owner or use the dedicated task API there.
+Task callback credentials may poll the receipt for the same callback command and task scope. They
+do not gain access to receipts for ordinary run-token commands or commands for another task.
+Owner-local commands execute from a transient payload after removing the authenticated bearer, so
+legitimate domain fields such as `password` remain intact without entering the inbox. Cross-worker
+commands execute from the durable sanitized payload; use durable references such as `token_ref`
+for credential-shaped domain data that must cross that boundary.
+`create_task` also requires an empty per-run command lane so its one-time callback credential can
+be returned by the submitting owner thread. Peers accept durable commands only while the run has a
+fresh ownership lease; an absent or stale owner returns `command_owner_unavailable` before append.
+
+Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
+receipt and does not execute a second command. Reusing the ID for a different type, sanitized
+arguments, principal, issuer, or reason returns `command_id_conflict`. Claims follow append order
+per run, with one in-flight command; a later command cannot skip an unacknowledged head command. A
+crashed claimant becomes eligible
+after `command_claim_ttl_s`; command handlers therefore retain their existing idempotency
+obligations under crash-after-effect/before-ack recovery. `command_queue_limit` bounds pending plus
+claimed commands per run. Owner watchdogs drain inboxes alongside lease recovery and outbox
+redrive.
+
 ### Event Reads
 
 `GET /v1/runs/{run_id}/events?from_seq=N&limit=M` returns `{run_id, events, next_seq, has_more}`.

@@ -70,6 +70,16 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     run_id = parts[2]
                     self._write_json(backend.result(run_id, self._bearer_token()))
                     return
+                if len(parts) == 5 and parts[:2] == ["v1", "runs"] and parts[3] == "control":
+                    run_id = parts[2]
+                    self._write_json(
+                        backend.command_receipt(
+                            run_id,
+                            self._bearer_token(),
+                            unquote(parts[4]),
+                        ).to_json()
+                    )
+                    return
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "events":
                     run_id = parts[2]
                     query = parse_qs(parsed.query)
@@ -224,7 +234,13 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                             "args": args,
                         }
                     )
-                    self._write_json(backend.dispatch(command).to_json())
+                    receipt = backend.enqueue_control(command)
+                    if receipt.transient_result is not None:
+                        self._write_json(dict(receipt.transient_result))
+                    elif receipt.result is not None:
+                        self._write_json(dict(receipt.result))
+                    else:
+                        self._write_json(receipt.to_json(), status=HTTPStatus.ACCEPTED)
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "tasks":
                     run_id = parts[2]
