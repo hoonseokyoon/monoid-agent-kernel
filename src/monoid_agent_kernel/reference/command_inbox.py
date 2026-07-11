@@ -65,6 +65,7 @@ class StoredCommand:
     type: str
     args: dict[str, Any]
     principal: CommandPrincipal
+    token_sha256: str = ""
     reason: str = ""
     created_at: float = field(default_factory=time.time)
     status: CommandStatus = "pending"
@@ -79,6 +80,7 @@ class StoredCommand:
             "type": self.type,
             "args": sanitize_command_data(self.args),
             "principal": self.principal.to_json(),
+            "token_sha256": self.token_sha256,
             "reason": self.reason,
             "created_at": self.created_at,
             "status": self.status,
@@ -275,6 +277,7 @@ CREATE TABLE IF NOT EXISTS command_inbox (
     result TEXT,
     updated_at REAL NOT NULL,
     schema_version TEXT NOT NULL,
+    token_sha256 TEXT NOT NULL DEFAULT '',
     UNIQUE(run_id, command_id)
 );
 CREATE INDEX IF NOT EXISTS command_inbox_pending
@@ -294,6 +297,10 @@ class SqliteCommandStore:
                     "ALTER TABLE command_inbox ADD COLUMN schema_version TEXT NOT NULL "
                     f"DEFAULT '{COMMAND_ENVELOPE_VERSION}'"
                 )
+            if "token_sha256" not in columns:
+                conn.execute(
+                    "ALTER TABLE command_inbox ADD COLUMN token_sha256 TEXT NOT NULL DEFAULT ''"
+                )
 
     def append(self, command: StoredCommand, *, max_pending: int) -> CommandReceipt:
         with self._lock, self._connect() as conn:
@@ -311,8 +318,8 @@ class SqliteCommandStore:
                 raise CommandQueueFull(f"command queue is full for run {command.run_id}")
             conn.execute(
                 "INSERT INTO command_inbox(run_id, command_id, command_type, args, principal, reason, "
-                "created_at, status, updated_at, schema_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                "created_at, status, updated_at, schema_version, token_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
                 (
                     command.run_id,
                     command.command_id,
@@ -323,6 +330,7 @@ class SqliteCommandStore:
                     command.created_at,
                     command.created_at,
                     COMMAND_ENVELOPE_VERSION,
+                    command.token_sha256,
                 ),
             )
             row = self._row(conn, command.run_id, command.command_id)
@@ -413,24 +421,25 @@ class SqliteCommandStore:
 
     @staticmethod
     def _command_from_row(row: sqlite3.Row) -> StoredCommand:
-        if str(row[13]) != COMMAND_ENVELOPE_VERSION:
-            raise ValueError(f"unsupported command inbox schema: {row[13]}")
-        principal = json.loads(row[5])
+        if str(row["schema_version"]) != COMMAND_ENVELOPE_VERSION:
+            raise ValueError(f"unsupported command inbox schema: {row['schema_version']}")
+        principal = json.loads(row["principal"])
         return StoredCommand(
-            run_id=str(row[1]),
-            command_id=str(row[2]),
-            type=str(row[3]),
-            args=dict(json.loads(row[4])),
+            run_id=str(row["run_id"]),
+            command_id=str(row["command_id"]),
+            type=str(row["command_type"]),
+            args=dict(json.loads(row["args"])),
             principal=CommandPrincipal(
                 tenant_id=str(principal["tenant_id"]),
                 user_id=str(principal["user_id"]),
                 issuer=str(principal.get("issuer") or ""),
             ),
-            reason=str(row[6]),
-            created_at=float(row[7]),
-            status=str(row[8]),  # type: ignore[arg-type]
-            claimed_by=str(row[9]),
-            claimed_at=float(row[10]),
+            token_sha256=str(row["token_sha256"]),
+            reason=str(row["reason"]),
+            created_at=float(row["created_at"]),
+            status=str(row["status"]),  # type: ignore[arg-type]
+            claimed_by=str(row["claimed_by"]),
+            claimed_at=float(row["claimed_at"]),
         )
 
     @staticmethod

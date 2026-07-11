@@ -13,6 +13,7 @@ from support.waiting import eventually
 
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.command_inbox import SqliteCommandStore
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
@@ -217,10 +218,13 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
     ]
     assert len(received) == 1
     assert received[0]["data"]["actor"] == "tenant_a/user_a (operator-name)"
+    assert received[0]["data"]["token_sha256"] == TokenManager.token_sha256(
+        submission.run_token
+    )
 
     with sqlite3.connect(db) as conn:
         row = conn.execute(
-            "SELECT args, principal, result FROM command_inbox WHERE command_id=?",
+            "SELECT args, principal, result, token_sha256 FROM command_inbox WHERE command_id=?",
             ("cmd_cross_worker",),
         ).fetchone()
     assert row is not None
@@ -229,6 +233,7 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
     assert submission.run_token not in persisted
     assert '"tenant_id": "tenant_a"' in row[1]
     assert '"user_id": "user_a"' in row[1]
+    assert row[3] == TokenManager.token_sha256(submission.run_token)
 
 
 def test_local_command_returns_transient_callback_and_callback_token_can_enqueue(

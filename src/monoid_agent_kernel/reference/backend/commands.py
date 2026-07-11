@@ -131,14 +131,16 @@ class BackendCommandService:
     def __init__(self, context: BackendCommandContext) -> None:
         self._context = context
 
-    def dispatch(self, command: ControlCommand) -> ControlResult:
+    def dispatch(
+        self, command: ControlCommand, *, audit_token_sha256: str = ""
+    ) -> ControlResult:
         args = dict(command.args)
         token = str(args.pop("token", "") or "")
         run_id = command.run_id
         ctype = command.type
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         idempotency_key = command.command_id or command_id
-        token_sha256 = TokenManager.token_sha256(token) if token else ""
+        token_sha256 = audit_token_sha256 or (TokenManager.token_sha256(token) if token else "")
         started = time.time()
 
         audit_authorized = False

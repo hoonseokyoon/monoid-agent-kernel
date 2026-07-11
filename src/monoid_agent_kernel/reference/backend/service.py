@@ -1063,6 +1063,7 @@ class RunnerBackend:
                     user_id=principal.user_id,
                     issuer=str(redact_command_credential(command.issuer, token)),
                 ),
+                token_sha256=TokenManager.token_sha256(token),
                 reason=str(redact_command_credential(command.reason, token)),
             ),
             max_pending=self.command_queue_limit,
@@ -1200,7 +1201,10 @@ class RunnerBackend:
                 ttl_s=60,
             )
             try:
-                result = self.dispatch(stored.control_command(token=token))
+                result = self._commands.dispatch(
+                    stored.control_command(token=token),
+                    audit_token_sha256=stored.token_sha256,
+                )
             except Exception as exc:  # owner records a durable failure receipt
                 result = ControlResult(
                     run_id=run_id,
