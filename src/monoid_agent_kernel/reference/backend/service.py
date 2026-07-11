@@ -1047,6 +1047,20 @@ class RunnerBackend:
             )
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         execution_args = dict(redact_command_credential(args, token))
+        assert self.command_store is not None
+        stored_command = StoredCommand(
+            run_id=command.run_id,
+            command_id=command_id,
+            type=command.type,
+            args=dict(sanitize_command_data(execution_args)),
+            principal=CommandPrincipal(
+                tenant_id=principal.tenant_id,
+                user_id=principal.user_id,
+                issuer=str(redact_command_credential(command.issuer, token)),
+            ),
+            token_sha256=TokenManager.token_sha256(token),
+            reason=str(redact_command_credential(command.reason, token)),
+        )
         if command.type == "create_task" and not locally_owned:
             raise NativeAgentError(
                 "create_task must be routed to the run owner so its callback token can be "
@@ -1067,58 +1081,58 @@ class RunnerBackend:
                         "another worker claimed the run before resume",
                         error_code="command_owner_unavailable",
                     )
+                keep_lease = False
                 direct_command = ControlCommand(
                     type="resume",
                     run_id=command.run_id,
                     args={**execution_args, "token": token},
-                    issuer=CommandPrincipal(
-                        tenant_id=principal.tenant_id,
-                        user_id=principal.user_id,
-                        issuer=str(redact_command_credential(command.issuer, token)),
-                    ).actor,
-                    reason=str(redact_command_credential(command.reason, token)),
+                    issuer=stored_command.principal.actor,
+                    reason=stored_command.reason,
                     command_id=command_id,
                 )
                 try:
+                    receipt = self.command_store.append(
+                        stored_command,
+                        max_pending=self.command_queue_limit,
+                    )
+                    if receipt.status in {"completed", "failed"}:
+                        return replace(
+                            receipt,
+                            transient_result=(
+                                dict(receipt.result) if receipt.result is not None else None
+                            ),
+                        )
+                    claimed = self.command_store.claim_command(
+                        command.run_id,
+                        command_id,
+                        self._worker_id,
+                        claim_ttl_s=0.0,
+                    )
+                    if claimed is None:
+                        raise NativeAgentError(
+                            "resume command could not be claimed after acquiring run ownership",
+                            error_code="command_owner_unavailable",
+                        )
                     result = self._commands.dispatch(
                         direct_command,
                         audit_token_sha256=TokenManager.token_sha256(token),
                     )
-                except BaseException:
-                    self.lease_store.release(command.run_id)
-                    raise
-                if result.status != "ok":
-                    self.lease_store.release(command.run_id)
-                now = time.time()
-                status = "completed" if result.status == "ok" else "failed"
-                return CommandReceipt(
-                    run_id=command.run_id,
-                    command_id=command_id,
-                    status=status,
-                    result=dict(sanitize_command_data(result.to_json())),
-                    transient_result=result.to_json(),
-                    created_at=now,
-                    updated_at=now,
-                )
+                    acknowledged = self.command_store.acknowledge(
+                        command.run_id,
+                        command_id,
+                        self._worker_id,
+                        result,
+                    )
+                    keep_lease = result.status == "ok"
+                    return replace(acknowledged, transient_result=result.to_json())
+                finally:
+                    if not keep_lease:
+                        self.lease_store.release(command.run_id)
             if not owner_available:
                 raise NativeAgentError(
                     "run has no live owner available to drain durable commands",
                     error_code="command_owner_unavailable",
                 )
-        assert self.command_store is not None
-        stored_command = StoredCommand(
-            run_id=command.run_id,
-            command_id=command_id,
-            type=command.type,
-            args=dict(sanitize_command_data(execution_args)),
-            principal=CommandPrincipal(
-                tenant_id=principal.tenant_id,
-                user_id=principal.user_id,
-                issuer=str(redact_command_credential(command.issuer, token)),
-            ),
-            token_sha256=TokenManager.token_sha256(token),
-            reason=str(redact_command_credential(command.reason, token)),
-        )
         if locally_owned:
             # Secret-producing local commands must be appended and drained by this caller before
             # the watchdog can claim them, or only the redacted durable result would survive.

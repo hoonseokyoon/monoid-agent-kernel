@@ -131,6 +131,24 @@ def test_claim_does_not_skip_in_flight_head_command(store: CommandStore) -> None
     assert recovered is not None and recovered.command_id == "cmd_first"
 
 
+def test_claim_command_can_reserve_recovery_out_of_order(store: CommandStore) -> None:
+    store.append(_command("cmd_older"), max_pending=10)
+    store.append(_command("cmd_resume"), max_pending=10)
+
+    reserved = store.claim_command(
+        "run_1", "cmd_resume", "recovery-worker", claim_ttl_s=30
+    )
+    assert reserved is not None and reserved.command_id == "cmd_resume"
+    store.acknowledge(
+        "run_1",
+        "cmd_resume",
+        "recovery-worker",
+        ControlResult(run_id="run_1", type="status", status="ok"),
+    )
+    head = store.claim("run_1", "ordinary-worker", claim_ttl_s=30)
+    assert head is not None and head.command_id == "cmd_older"
+
+
 def test_queue_limit_counts_only_unacknowledged_commands(store: CommandStore) -> None:
     store.append(_command("cmd_1"), max_pending=1)
     with pytest.raises(CommandQueueFull):

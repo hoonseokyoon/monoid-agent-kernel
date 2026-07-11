@@ -137,6 +137,15 @@ class CommandStore(Protocol):
 
     def claim(self, run_id: str, worker_id: str, *, claim_ttl_s: float) -> StoredCommand | None: ...
 
+    def claim_command(
+        self,
+        run_id: str,
+        command_id: str,
+        worker_id: str,
+        *,
+        claim_ttl_s: float,
+    ) -> StoredCommand | None: ...
+
     def acknowledge(
         self, run_id: str, command_id: str, worker_id: str, result: ControlResult
     ) -> CommandReceipt: ...
@@ -259,6 +268,36 @@ class InMemoryCommandStore:
                 }
             )
             self._commands[(run_id, selected.command_id)] = claimed
+            return claimed
+
+    def claim_command(
+        self,
+        run_id: str,
+        command_id: str,
+        worker_id: str,
+        *,
+        claim_ttl_s: float,
+    ) -> StoredCommand | None:
+        now = time.time()
+        key = (run_id, command_id)
+        with self._lock:
+            selected = self._commands.get(key)
+            if selected is None or selected.status not in {"pending", "claimed"}:
+                return None
+            if selected.status == "claimed" and (
+                selected.claimed_by == worker_id
+                or now - selected.claimed_at <= claim_ttl_s
+            ):
+                return None
+            claimed = StoredCommand(
+                **{
+                    **selected.__dict__,
+                    "status": "claimed",
+                    "claimed_by": worker_id,
+                    "claimed_at": now,
+                }
+            )
+            self._commands[key] = claimed
             return claimed
 
     def acknowledge(
@@ -394,6 +433,39 @@ class SqliteCommandStore:
                 (run_id,),
             ).fetchone()
             if row is None:
+                conn.commit()
+                return None
+            if row["status"] == "claimed" and (
+                row["claimed_by"] == worker_id
+                or now - float(row["claimed_at"]) <= claim_ttl_s
+            ):
+                conn.commit()
+                return None
+            conn.execute(
+                "UPDATE command_inbox SET status='claimed', claimed_by=?, claimed_at=?, updated_at=? "
+                "WHERE ordinal=?",
+                (worker_id, now, now, row[0]),
+            )
+            claimed = conn.execute(
+                "SELECT * FROM command_inbox WHERE ordinal=?", (row[0],)
+            ).fetchone()
+            conn.commit()
+            assert claimed is not None
+            return self._command_from_row(claimed)
+
+    def claim_command(
+        self,
+        run_id: str,
+        command_id: str,
+        worker_id: str,
+        *,
+        claim_ttl_s: float,
+    ) -> StoredCommand | None:
+        now = time.time()
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._row(conn, run_id, command_id)
+            if row is None or row["status"] not in {"pending", "claimed"}:
                 conn.commit()
                 return None
             if row["status"] == "claimed" and (

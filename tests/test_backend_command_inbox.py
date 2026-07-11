@@ -424,26 +424,35 @@ def test_http_resume_recovers_ownerless_run_without_command_inbox(
     )
     server = create_backend_server(restarted, host="127.0.0.1", port=0, admin_token="admin")
     with serving(server) as base_url:
+        resume_payload = {
+            "type": "resume",
+            "command_id": "cmd_ownerless_resume",
+            "issuer": f"restart-worker-{submission.run_token}",
+            "reason": f"recover with {submission.run_token}",
+        }
         resumed = http_json(
             f"{base_url}/v1/runs/{submission.run_id}/control",
-            {
-                "type": "resume",
-                "command_id": "cmd_ownerless_resume",
-                "issuer": f"restart-worker-{submission.run_token}",
-                "reason": f"recover with {submission.run_token}",
-            },
+            resume_payload,
+            token=submission.run_token,
+        )
+        repeated = http_json(
+            f"{base_url}/v1/runs/{submission.run_id}/control",
+            resume_payload,
             token=submission.run_token,
         )
 
     assert resumed["status"] == "ok"
     assert resumed["data"]["resumed"] is True
+    assert repeated == resumed
     assert submission.run_id in restarted._records
     assert restarted.lease_store is not None
     assert restarted.lease_store.owner(submission.run_id) == restarted._worker_id
     assert restarted.command_store is not None
-    assert restarted.command_store.receipt(
+    durable_receipt = restarted.command_store.receipt(
         submission.run_id, "cmd_ownerless_resume"
-    ) is None
+    )
+    assert durable_receipt is not None
+    assert durable_receipt.status == "completed"
     audits = [
         event
         for event in restarted.events(submission.run_id, submission.run_token)["events"]

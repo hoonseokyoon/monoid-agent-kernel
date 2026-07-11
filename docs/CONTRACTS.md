@@ -593,8 +593,9 @@ be returned by the submitting owner thread. Peers accept durable commands only w
 fresh ownership lease; an absent or stale owner returns `command_owner_unavailable` before append.
 `resume` is the recovery exception: when no fresh owner exists, the authenticated receiving backend
 first claims the lease atomically, then executes it directly so it can materialize the run from its
-checkpoint. A failed recovery releases that claim. With a fresh remote owner, `resume` follows the
-durable inbox like other control commands.
+checkpoint. It reserves and acknowledges the supplied command ID in the durable store, so retries
+return the same receipt without repeating recovery. A failed recovery releases the run lease. With
+a fresh remote owner, `resume` follows the regular durable inbox path.
 
 Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
 receipt and does not execute a second command. Reusing the ID for a different type, sanitized
