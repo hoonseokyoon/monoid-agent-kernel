@@ -10,7 +10,8 @@ from typing import Any
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core._util import write_json_atomic
-from monoid_agent_kernel.core.checkpoint import CheckpointRecord, CheckpointStore
+from monoid_agent_kernel.core.checkpoint import CheckpointRecord, CheckpointStore, load_latest_checked
+from monoid_agent_kernel.core.durable_codec import DurableLoadResult
 from monoid_agent_kernel.core.durable_metadata import DurableMetadataCommitter
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.identifiers import namespaced_id
@@ -73,9 +74,6 @@ class RecoveryService:
                 continue
             if (run_dir / "failure.json").exists():
                 continue
-            stored = self._checkpoint_store().latest(run_id)
-            if stored is None or stored.checkpoint.terminal:
-                continue
             if self.attempt_resume(run_dir, run_id):
                 recovered.append(run_id)
         return recovered
@@ -105,12 +103,28 @@ class RecoveryService:
         return reclaimed
 
     def attempt_resume(self, run_dir: Path, run_id: str) -> bool:
-        stored = self._checkpoint_store().latest(run_id)
-        if stored is None or stored.checkpoint.terminal:
+        try:
+            checkpoint_result = load_latest_checked(self._checkpoint_store(), run_id)
+        except Exception as exc:
+            _LOGGER.warning("checkpoint read for run %s deferred: %s", run_id, exc)
             return False
-        meta = self.read_recovery_meta(run_dir, run_id)
-        if meta is None:
+        if not checkpoint_result.ok:
+            self._record_checked_load_failure(run_dir, run_id, checkpoint_result)
             return False
+        stored = checkpoint_result.value
+        assert stored is not None
+        if stored.checkpoint.terminal:
+            return False
+        try:
+            metadata_result = self.read_recovery_meta_checked(run_dir, run_id)
+        except Exception as exc:
+            _LOGGER.warning("recovery metadata read for run %s deferred: %s", run_id, exc)
+            return False
+        if not metadata_result.ok:
+            self._record_checked_load_failure(run_dir, run_id, metadata_result)
+            return False
+        meta = metadata_result.value
+        assert meta is not None
         try:
             self.resume_from_checkpoint(stored, meta)
         except Exception as exc:
@@ -187,7 +201,32 @@ class RecoveryService:
             self._context.release_run_slot()
 
     def read_recovery_meta(self, run_dir: Path, run_id: str) -> dict[str, Any] | None:
-        return DurableMetadataCommitter(self._checkpoint_store()).read_recovery_metadata(run_dir, run_id)
+        return self.read_recovery_meta_checked(run_dir, run_id).value
+
+    def read_recovery_meta_checked(
+        self, run_dir: Path, run_id: str
+    ) -> DurableLoadResult[dict[str, Any]]:
+        return DurableMetadataCommitter(self._checkpoint_store()).read_recovery_metadata_checked(
+            run_dir, run_id
+        )
+
+    def _record_checked_load_failure(
+        self,
+        run_dir: Path,
+        run_id: str,
+        result: DurableLoadResult[Any],
+    ) -> None:
+        if result.status == "missing":
+            return
+        sequence = f" at checkpoint seq {result.sequence}" if result.sequence is not None else ""
+        self.write_failure_bundle(
+            run_id,
+            run_dir,
+            error=f"{result.message}{sequence}",
+            error_code=result.error_code or "durable_state_invalid",
+            exc_type="DurableLoadError",
+            overwrite=True,
+        )
 
     def read_recover_attempts(self, run_dir: Path) -> int:
         try:

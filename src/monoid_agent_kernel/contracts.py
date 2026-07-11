@@ -24,10 +24,12 @@ from monoid_agent_kernel.core.spec import (
 )
 from monoid_agent_kernel.core.result import AgentArtifact, AgentRunResult, AgentTurnResult, Suspension
 from monoid_agent_kernel.core.checkpoint import (
+    CheckedCheckpointStore,
     CheckpointRecord,
     CheckpointStore,
     RunCheckpoint,
 )
+from monoid_agent_kernel.core.durable_codec import ArtifactVersion, DurableLoadResult, DurableLoadStatus
 
 # Workspace seam (the file-storage surface the engine works through; the local backend is
 # the default, integrators supply their own via AgentLoop.workspace_factory)
@@ -214,7 +216,11 @@ __all__ = [
     "Suspension",
     "RunCheckpoint",
     "CheckpointStore",
+    "CheckedCheckpointStore",
     "CheckpointRecord",
+    "ArtifactVersion",
+    "DurableLoadResult",
+    "DurableLoadStatus",
     # workspace seam (file-storage surface; the local backend is the default)
     "Workspace",
     "WorkspaceFactory",

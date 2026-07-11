@@ -9,6 +9,7 @@ from typing import Any, Mapping, Protocol
 
 from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
+from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 RUN_METADATA_SCHEMA_VERSION = namespaced_id("backend-run.v1")
@@ -24,22 +25,50 @@ class RunMetadataStore(Protocol):
     def run_metadata(self, run_id: str) -> dict[str, Any] | None: ...
 
 
+RUN_METADATA_CODEC = DurableCodec[dict[str, Any]](
+    family="backend-run",
+    current_schema=RUN_METADATA_SCHEMA_VERSION,
+)
+
+
+def decode_run_metadata(payload: object) -> DurableLoadResult[dict[str, Any]]:
+    return RUN_METADATA_CODEC.decode(payload, lambda value: dict(value))
+
+
+def metadata_payload_for_write(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate accepted input and emit only the canonical current writer version."""
+    decoded = decode_run_metadata(dict(metadata))
+    if not decoded.ok or decoded.value is None:
+        raise ValueError(decoded.message or "run metadata is invalid")
+    canonical = dict(decoded.value)
+    canonical["schema_version"] = RUN_METADATA_SCHEMA_VERSION
+    return canonical
+
+
 def validate_run_metadata(payload: Any) -> dict[str, Any] | None:
-    """Return a copy of supported run recovery metadata."""
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("schema_version") not in ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS:
-        return None
-    return dict(payload)
+    """Compatibility wrapper returning supported run recovery metadata."""
+    return decode_run_metadata(payload).value
+
+
+def read_run_metadata_checked(run_dir: Path) -> DurableLoadResult[dict[str, Any]]:
+    """Read local recovery metadata without collapsing bad state into missing."""
+    path = run_dir / RUN_METADATA_FILENAME
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return RUN_METADATA_CODEC.missing()
+    except OSError:
+        return RUN_METADATA_CODEC.corrupt("backend-run metadata could not be read")
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return RUN_METADATA_CODEC.corrupt("backend-run metadata is not valid JSON")
+    return decode_run_metadata(payload)
 
 
 def read_run_metadata(run_dir: Path) -> dict[str, Any] | None:
     """Read local run recovery metadata if it is present and schema-compatible."""
-    try:
-        payload = json.loads((run_dir / RUN_METADATA_FILENAME).read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    return validate_run_metadata(payload)
+    return read_run_metadata_checked(run_dir).value
 
 
 def runtime_config_from_metadata(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
@@ -61,14 +90,14 @@ class DurableMetadataCommitter:
     checkpoint_store: Any | None = None
 
     def write_initial_metadata(self, run_dir: Path, run_id: str, metadata: Mapping[str, Any]) -> dict[str, Any]:
-        meta = dict(metadata)
+        meta = metadata_payload_for_write(metadata)
         run_dir.mkdir(parents=True, exist_ok=True)
         write_json_atomic(run_dir / RUN_METADATA_FILENAME, meta)
         self.store_shared_metadata(run_id, meta)
         return meta
 
     def commit_metadata_update(self, run_dir: Path, run_id: str, metadata: Mapping[str, Any]) -> dict[str, Any]:
-        meta = dict(metadata)
+        meta = metadata_payload_for_write(metadata)
         self.store_shared_metadata(run_id, meta)
         run_dir.mkdir(parents=True, exist_ok=True)
         write_json_atomic(run_dir / RUN_METADATA_FILENAME, meta)
@@ -103,14 +132,28 @@ class DurableMetadataCommitter:
             put_metadata(run_id, dict(metadata))
 
     def read_recovery_metadata(self, run_dir: Path, run_id: str) -> dict[str, Any] | None:
-        meta = read_run_metadata(run_dir)
-        if meta is not None or self.checkpoint_store is None:
-            return meta
-        read_metadata = getattr(self.checkpoint_store, "run_metadata", None)
-        stored = read_metadata(run_id) if callable(read_metadata) else None
-        meta = validate_run_metadata(stored)
-        if meta is None:
-            return None
+        return self.read_recovery_metadata_checked(run_dir, run_id).value
+
+    def read_recovery_metadata_checked(
+        self, run_dir: Path, run_id: str
+    ) -> DurableLoadResult[dict[str, Any]]:
+        local = read_run_metadata_checked(run_dir)
+        if local.status != "missing" or self.checkpoint_store is None:
+            return local
+        checked_reader = getattr(self.checkpoint_store, "run_metadata_checked", None)
+        if callable(checked_reader):
+            shared = checked_reader(run_id)
+            if not isinstance(shared, DurableLoadResult):
+                shared = RUN_METADATA_CODEC.corrupt("metadata store returned an invalid checked result")
+        else:
+            raw_reader = getattr(self.checkpoint_store, "run_metadata", None)
+            # Legacy readers have no checked result that can prove an artifact is
+            # corrupt. Let read failures propagate so recovery can retry them.
+            stored = raw_reader(run_id) if callable(raw_reader) else None
+            shared = RUN_METADATA_CODEC.missing() if stored is None else decode_run_metadata(stored)
+        if not shared.ok:
+            return shared
+        assert shared.value is not None
         run_dir.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(run_dir / RUN_METADATA_FILENAME, meta)
-        return meta
+        write_json_atomic(run_dir / RUN_METADATA_FILENAME, shared.value)
+        return shared

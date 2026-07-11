@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.checkpoint import (
     LocalFsCheckpointStore,
     RunCheckpoint,
     read_checkpoint,
+    read_checkpoint_checked,
     write_checkpoint,
 )
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
@@ -149,8 +150,23 @@ def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
     assert restored.schema_version == SCHEMA_VERSION
 
 
+def test_checkpoint_writer_canonicalizes_accepted_legacy_namespace(tmp_path: Path) -> None:
+    write_checkpoint(
+        tmp_path,
+        RunCheckpoint(
+            run_id="run_1",
+            schema_version="native-agent-runner.checkpoint.v1",
+        ),
+    )
+
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == SCHEMA_VERSION
+
+
 def test_read_checkpoint_missing_returns_none(tmp_path: Path) -> None:
     assert read_checkpoint(tmp_path) is None
+    assert read_checkpoint_checked(tmp_path).status == "missing"
 
 
 def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
@@ -159,6 +175,39 @@ def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
     # Corrupt the schema version on disk -> treated as no checkpoint, never raises.
     path = tmp_path / "checkpoint.json"
     path.write_text(path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "bogus.v0"), encoding="utf-8")
+    assert read_checkpoint(tmp_path) is None
+    checked = read_checkpoint_checked(tmp_path)
+    assert checked.status == "corrupt"
+    assert checked.error_code == "checkpoint_corrupt"
+
+
+def test_read_checkpoint_unicode_version_is_corrupt(tmp_path: Path) -> None:
+    write_checkpoint(tmp_path, RunCheckpoint(run_id="run_1"))
+    path = tmp_path / "checkpoint.json"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "monoid.checkpoint.v²"),
+        encoding="utf-8",
+    )
+
+    checked = read_checkpoint_checked(tmp_path)
+
+    assert checked.status == "corrupt"
+    assert checked.error_code == "checkpoint_corrupt"
+
+
+def test_read_checkpoint_future_schema_is_explicitly_unsupported(tmp_path: Path) -> None:
+    cp = RunCheckpoint(run_id="run_1")
+    write_checkpoint(tmp_path, cp)
+    path = tmp_path / "checkpoint.json"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "monoid.checkpoint.v99"),
+        encoding="utf-8",
+    )
+
+    checked = read_checkpoint_checked(tmp_path)
+
+    assert checked.status == "unsupported_version"
+    assert checked.observed_schema == "monoid.checkpoint.v99"
     assert read_checkpoint(tmp_path) is None
 
 
@@ -204,6 +253,17 @@ def test_local_fs_store_put_gcs_orphan_blob_tmp(tmp_path: Path) -> None:
     store.put(RunCheckpoint(run_id="run_1", seq=1), blobs={"b" * 64: b"data"})
     assert not orphan.exists()
     assert (blobs_dir / ("b" * 64)).read_bytes() == b"data"
+
+
+def test_local_fs_checked_latest_treats_metadata_and_blob_only_runs_as_missing(tmp_path: Path) -> None:
+    store = LocalFsCheckpointStore(tmp_path)
+    store.put_run_metadata("metadata_only", {"run_id": "metadata_only"})
+    store.put_blob("blob_only", b"artifact")
+
+    assert store.latest_checked("metadata_only").status == "missing"
+    assert store.latest_checked("blob_only").status == "missing"
+    assert store.latest("metadata_only") is None
+    assert store.latest("blob_only") is None
 
 
 def test_snapshot_writes_checkpoint_at_hosted_park(tmp_path: Path) -> None:

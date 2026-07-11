@@ -954,6 +954,16 @@ recovery is the integrator's call.
   swap it for a mounted-volume path or an object-store/DB store. The loop advances a
   monotonic `seq` per park and deletes checkpoints only on a *completed* run — a
   failed/limited run keeps its last-good checkpoint.
+- `CheckedCheckpointStore` is the additive checked-read extension. Its
+  `latest_checked(run_id)` result distinguishes `loaded`, `migrated`, `missing`,
+  `corrupt`, and `unsupported_version`, including the observed schema and committed
+  sequence when available. `load_latest_checked()` adapts legacy stores, so existing
+  `CheckpointStore` implementations remain source-compatible.
+- Durable readers use `core.durable_codec.DurableCodec`: artifact versions parse as
+  `<namespace>.<family>.vN`, accepted older versions migrate through pure ordered
+  `dict -> dict` steps, and writers always emit the canonical current `monoid.*`
+  version. A migration or validation failure performs no write and leaves `LATEST`
+  pointing at the prior committed checkpoint.
 - `AgentLoop.restore(checkpoint, *, blobs=...)` reopens the run: no second
   `run.started`/manifest, parked hosted tasks re-registered (so `report_task_result`
   still wakes it), the **workspace delta re-applied** on top of a re-provisioned base
@@ -971,7 +981,10 @@ recovery is the integrator's call.
   `runtime_config_committed_at`; recovery verifies the hash before rebuilding providers or gateway
   token sources. A backend that never hosted the run can reclaim it from a shared lease/checkpoint
   store, read the shared descriptor when local `run.json` is absent, materialize a local copy, then
-  resume. `recover_runs()` scans `run_root`; the active watchdog discovers cross-instance orphaned
+  resume. Checked metadata reads use the same five outcomes as checkpoints; corrupt or unsupported
+  local metadata is never replaced from shared storage as though it were missing. `recover_runs()`
+  writes an actionable failure bundle for corrupt or unsupported durable state. It scans
+  `run_root`; the active watchdog discovers cross-instance orphaned
   runs from the shared lease store. Recovery skips terminal checkpoints and failed runs, rebuilds
   each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
   is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved

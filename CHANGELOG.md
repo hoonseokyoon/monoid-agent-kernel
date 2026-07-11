@@ -7,6 +7,11 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added
+- Added versioned durable codecs with explicit loaded, migrated, missing, corrupt,
+  and unsupported-version outcomes; LocalFS and SQLite checkpoint stores and
+  Reference recovery now use checked checkpoint and run-metadata reads.
+
 ### Changed
 - Classified every test into an enforced unit, contract, or integration tier and
   replaced advisory xdist/coverage jobs with required deterministic shards, a

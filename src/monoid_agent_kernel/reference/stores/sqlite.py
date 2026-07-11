@@ -20,10 +20,19 @@ import sqlite3
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 from monoid_agent_kernel.core._util import sha256_bytes
-from monoid_agent_kernel.core.checkpoint import CheckpointRecord, RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import (
+    CHECKPOINT_CODEC,
+    CheckpointRecord,
+    RunCheckpoint,
+    checkpoint_payload_for_write,
+    decode_checkpoint,
+)
+from monoid_agent_kernel.core.durable_codec import DurableLoadResult
+from monoid_agent_kernel.core.durable_metadata import RUN_METADATA_CODEC, decode_run_metadata
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -81,7 +90,7 @@ class SqliteCheckpointStore:
         _ensure_schema(self._db_path)
 
     def put(self, checkpoint: RunCheckpoint, blobs: Mapping[str, bytes] = {}) -> None:
-        manifest = json.dumps(checkpoint.to_json(), ensure_ascii=False)
+        manifest = json.dumps(checkpoint_payload_for_write(checkpoint), ensure_ascii=False)
         with self._lock:
             conn = _connect(self._db_path)
             try:
@@ -107,14 +116,16 @@ class SqliteCheckpointStore:
             finally:
                 conn.close()
 
-    def latest(self, run_id: str) -> CheckpointRecord | None:
+    def latest_checked(self, run_id: str) -> DurableLoadResult[CheckpointRecord]:
         conn = _connect(self._db_path)
         try:
             row = conn.execute(
                 "SELECT seq FROM checkpoint_latest WHERE run_id=?", (run_id,)
             ).fetchone()
             if row is None:
-                return None
+                return CHECKPOINT_CODEC.missing().map(
+                    lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
+                )
             seq = int(row[0])
             mrow = conn.execute(
                 "SELECT manifest FROM checkpoints WHERE run_id=? AND seq=?", (run_id, seq)
@@ -122,11 +133,24 @@ class SqliteCheckpointStore:
         finally:
             conn.close()
         if mrow is None:
-            return None
-        checkpoint = RunCheckpoint.from_json(json.loads(mrow[0]))
-        if checkpoint is None:
-            return None
-        return CheckpointRecord(seq=seq, checkpoint=checkpoint, _blob_reader=self._read_blob)
+            return CHECKPOINT_CODEC.corrupt(
+                "checkpoint latest pointer references a missing manifest", sequence=seq
+            ).map(lambda checkpoint: CheckpointRecord(seq=seq, checkpoint=checkpoint))
+        try:
+            payload = json.loads(mrow[0])
+        except ValueError:
+            return CHECKPOINT_CODEC.corrupt(
+                "checkpoint manifest is not valid JSON", sequence=seq
+            ).map(lambda checkpoint: CheckpointRecord(seq=seq, checkpoint=checkpoint))
+        decoded = replace(decode_checkpoint(payload), sequence=seq)
+        return decoded.map(
+            lambda checkpoint: CheckpointRecord(
+                seq=seq, checkpoint=checkpoint, _blob_reader=self._read_blob
+            )
+        )
+
+    def latest(self, run_id: str) -> CheckpointRecord | None:
+        return self.latest_checked(run_id).value
 
     def put_blob(self, run_id: str, data: bytes) -> str:
         """Store a standalone content-addressed blob (write-once, shared ``blobs`` table — the same
@@ -177,6 +201,20 @@ class SqliteCheckpointStore:
             return None
         payload = json.loads(row[0])
         return dict(payload) if isinstance(payload, dict) else None
+
+    def run_metadata_checked(self, run_id: str) -> DurableLoadResult[dict[str, object]]:
+        conn = _connect(self._db_path)
+        try:
+            row = conn.execute("SELECT metadata FROM run_metadata WHERE run_id=?", (run_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return RUN_METADATA_CODEC.missing()
+        try:
+            payload = json.loads(row[0])
+        except ValueError:
+            return RUN_METADATA_CODEC.corrupt("backend-run metadata is not valid JSON")
+        return decode_run_metadata(payload)
 
     def _read_blob(self, sha256: str) -> bytes:
         conn = _connect(self._db_path)
