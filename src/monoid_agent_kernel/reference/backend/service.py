@@ -1270,6 +1270,11 @@ class RunnerBackend:
             limit=limit,
         )
 
+    def descendant_status(
+        self, run_id: str, token: str, descendant_run_id: str
+    ) -> dict[str, Any]:
+        return self._projection.descendant_status(run_id, token, descendant_run_id)
+
     def subscribe_descendant_events(
         self,
         run_id: str,
@@ -1291,6 +1296,9 @@ class RunnerBackend:
                 limit=limit,
             ),
             cursor=cursor,
+            read_lifecycle=lambda: self.descendant_status(
+                run_id, token, descendant_run_id
+            ),
         )
 
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:

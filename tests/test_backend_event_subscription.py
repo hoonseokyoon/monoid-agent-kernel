@@ -84,11 +84,29 @@ def test_descendant_subscription_preserves_ancestor_authorization(
         + "\n",
         encoding="utf-8",
     )
+    (child_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "run_id": child_id,
+                "status": "completed",
+                "last_event_seq": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     page = backend.subscribe_descendant_events(
         submission.run_id, submission.run_token, child_id
     ).poll()
     assert [event["seq"] for event in page["events"]] == [1, 2]
+    frames = list(
+        backend.subscribe_descendant_events(
+            submission.run_id, submission.run_token, child_id
+        ).frames()
+    )
+    assert [frame.kind for frame in frames] == ["event", "event", "end"]
+    assert frames[-1].lifecycle is not None
+    assert frames[-1].lifecycle["state"] == "completed"
     with pytest.raises(PermissionDenied):
         backend.subscribe_descendant_events(
             submission.run_id, submission.run_token, "unrelated.run"

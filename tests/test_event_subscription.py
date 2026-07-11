@@ -106,3 +106,18 @@ def test_terminal_subscription_performs_final_event_drain_before_end() -> None:
         "terminal": True,
         "state": "completed",
     }
+
+
+def test_empty_terminal_stream_with_zero_watermark_ends_cleanly() -> None:
+    frames = list(
+        EventSubscription(
+            _reader([]),
+            read_lifecycle=lambda: {
+                "terminal": True,
+                "state": "failed",
+                "last_event_seq": 0,
+            },
+        ).frames()
+    )
+
+    assert [frame.kind for frame in frames] == ["end"]

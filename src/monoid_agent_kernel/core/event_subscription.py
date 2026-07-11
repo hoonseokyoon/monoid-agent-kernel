@@ -168,7 +168,7 @@ class EventSubscription:
                         )
                     continue
                 watermark = _lifecycle_last_event_seq(lifecycle)
-                if watermark >= self.cursor.next_seq:
+                if watermark > 0 and watermark >= self.cursor.next_seq:
                     raise EventSequenceGap(
                         f"terminal lifecycle advertises sequence {watermark}, "
                         f"but cursor is waiting for {self.cursor.next_seq}"
