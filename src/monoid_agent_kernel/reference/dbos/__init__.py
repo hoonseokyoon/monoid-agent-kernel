@@ -1,4 +1,4 @@
-"""Optional DBOS-backed durable run-lifecycle Reference profile.
+"""Optional experimental DBOS activation-recovery Reference profile.
 
 Importing this package does not import DBOS. Constructing :class:`DbosControlPlane`
 or :class:`DbosRunDriver` requires the ``reference-dbos`` extra.

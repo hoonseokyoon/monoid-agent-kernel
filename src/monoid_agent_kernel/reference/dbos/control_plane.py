@@ -1,12 +1,14 @@
-"""Finite, partition-serialized DBOS workflows for durable Reference control commands.
+"""Experimental finite DBOS workflows for durable Reference control commands.
 
 This optional profile deliberately does not import or compose the legacy ``LeaseStore``,
 ``CommandStore``, recovery watchdog, or process-local owner registry. Each command is one
 finite DBOS workflow, workflow IDs provide idempotency, and a partitioned queue serializes
 commands for the same run while allowing different runs to progress concurrently.
 
-DBOS steps are at-least-once across a crash before their result is checkpointed. A production
-dispatcher must therefore retain Monoid's command/effect idempotency and durable outbox rules.
+This transport experiment is evaluated separately from the run driver. ``RunnerBackend`` remains
+the Reference HTTP/Studio facade. DBOS steps are at-least-once across a crash before their result
+is checkpointed. Any integrating dispatcher must therefore retain Monoid's command/effect
+idempotency and durable outbox rules.
 """
 
 from __future__ import annotations

@@ -548,8 +548,10 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   forward-compatible).
 - HTTP: `POST /v1/runs/{run_id}/control` with `{"type": ..., "args": {...}, "issuer": ...,
   "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
-  envelope stays credential-free). `resume` on a *live* paused run wakes it; on a run not in
-  memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
+  envelope stays credential-free). `resume` on a locally owned paused run wakes it immediately.
+  A peer with a fresh remote owner appends to the durable command inbox. An absent or stale owner
+  returns `command_owner_unavailable`; checkpoint recovery must establish a live owner before a
+  control command can be admitted.
 - Audit: `RunnerBackend.dispatch` appends `control.command.received` and then either
   `control.command.completed` or `control.command.failed` to the run event log. Events include
   `command_id`, command type, target run, `issuer` as actor, reason, idempotency key,
@@ -1114,12 +1116,14 @@ competing input.
   each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
   is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved
   follow-up messages, and resumes.
-- The v0.18 DBOS Reference profile has a narrower operational scope. One stable executor slot has
-  one active process; a restart reuses the same executor identity and application version after the
-  prior process terminates or is fenced. The profile excludes automatic arbitrary-host takeover.
-  The current vertical slice commits the boundary receipt and releases process resources; its
-  terminal artifact finalizer remains an integration gate. This Reference scope does not change
-  the portable recovery semantics above.
+- The experimental v0.18 DBOS activation-recovery profile has a narrower operational scope. One
+  stable executor slot has one active process; a restart reuses the same executor identity and
+  application version after the prior process terminates or is fenced. DBOS schedules and retries
+  one finite activation. The configured `CheckpointStore` remains authoritative for checkpoint
+  sequence, input deduplication, the committed boundary receipt, suspension, and terminal meaning.
+  The profile scope covers same-slot finite-activation recovery. The Reference backend, terminal
+  artifact finalization, HTTP, Studio, and arbitrary-host takeover remain separate. Portable
+  recovery semantics remain unchanged.
 
 **Assumption (workspace):** the agent workspace is not durable; on restore the
 deployment re-provisions the base (re-clone/re-mount) and the checkpoint re-applies

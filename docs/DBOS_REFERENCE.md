@@ -1,8 +1,13 @@
-# DBOS Reference Run-Lifecycle Profile
+# DBOS Reference Activation-Recovery Profile
 
 Status: experimental v0.18.0 Reference profile. The optional extra pins the validated DBOS 2.26
-minor line. DBOS owns finite activation, retry, serialization, and final workflow receipt
-lifecycle. The Core defines portable checkpoint, input-deduplication, and suspension semantics.
+minor line. DBOS owns the operational execution of one finite activation: admission, per-run
+serialization, retry, same-slot workflow recovery, and the workflow result. The Core-defined
+`CheckpointStore` owns the portable semantic state, including input deduplication, the committed
+boundary receipt, suspension, and terminal meaning.
+
+This profile is a recovery interoperability proof. Its v0.18 scope covers one finite activation;
+`RunnerBackend`, Studio, and production cutover remain separate.
 
 Install the profile with:
 
@@ -24,10 +29,16 @@ none of these legacy orchestration services:
 - the Reference watchdog;
 - `RunnerBackend._records` as durable ownership state.
 
-`CheckpointStore` remains the Core-defined persistence seam for portable run state. DBOS decides
-when one activation starts, retries, commits its boundary, and produces one immutable receipt for
-that input identity. DBOS dependencies and types stay inside the optional Reference profile; the
-checkpoint fields are runtime-neutral.
+`CheckpointStore` remains the canonical persistence seam for portable run state. DBOS decides
+when one activation starts and retries. The activation commits its semantic result to the
+checkpoint and verifies exact readback before the DBOS workflow first records `SUCCESS` with a
+copy of that receipt. Later workflow-result reads may use DBOS's cached output. The checkpoint
+remains the source of the semantic receipt.
+
+DBOS workflow IDs, queue state, executor identity, and application version are operational
+metadata. Checkpoint sequence, suspension, applied-input identity, semantic effect identity, and
+terminal state are Monoid semantics. DBOS dependencies and types stay inside the optional
+Reference profile; the checkpoint fields remain runtime-neutral.
 
 ## Finite resume workflow
 
@@ -94,9 +105,10 @@ driver.enqueue_resume(command)
 receipt = driver.wait_for_receipt(command)
 ```
 
-`DbosControlPlane` remains the authenticated, credential-sanitizing control transport spike. A
-shared host composition that registers control and run workflows into one process-global DBOS
-runtime is a remaining integration gate.
+`DbosControlPlane` remains the isolated authenticated, credential-sanitizing transport experiment
+from the earlier control-plane spike. v0.18 evaluates it separately from `DbosRunDriver`. The
+legacy Reference command inbox remains a separate valid multi-instance assembly. Shared DBOS host
+composition belongs to a future architecture decision.
 
 ## Stable executor slot
 
@@ -113,9 +125,9 @@ excludes Conductor. A later multi-host requirement can add a narrow Reference re
 coordinator that reassigns eligible DBOS work while preserving checkpoint sequence and slot
 fencing. That coordinator stays smaller than a general orchestration control plane.
 
-SQLite is the development and single-host acceptance database. PostgreSQL remains the production
-system-database choice for multi-process service deployments. PostgreSQL alone does not expand the
-automatic takeover contract.
+SQLite is the checked development and single-host acceptance database. v0.18 validates that
+configuration only. DBOS recommends PostgreSQL for production system-database deployments;
+PostgreSQL process qualification and any broader takeover contract belong to a future milestone.
 
 ## Verified recovery invariant
 
@@ -136,11 +148,13 @@ source checkpoint N restore
 
 The acceptance test asserts one semantic effect row, a monotonic final checkpoint `N+k`, one
 committed resume identity, one immutable receipt for that identity, one DBOS `SUCCESS` workflow
-row, and the same final workflow receipt for duplicate callers. Internal safety checkpoints may
-make `k` greater than one. `N+1` is the simple case; the general sequence contract is `N+k`.
+row, and the same finite-activation workflow result for duplicate callers. Internal safety
+checkpoints may make `k` greater than one. `N+1` is the simple case; the general sequence contract
+is `N+k`.
 
-Here "final workflow receipt" means the finite DBOS workflow has reached one durable result. Its
-`terminal` field separately reports whether the Monoid run boundary is terminal.
+The DBOS workflow result is an operational copy of the canonical checkpoint receipt. Its
+`terminal` field reports whether the Monoid boundary is terminal. A successful finite activation
+represents activation completion; the checkpoint records overall Monoid run terminality.
 
 ## Side-effect rule
 
@@ -151,8 +165,9 @@ that boundary checkpoint. Strict runs therefore use a stable explicit idempotenc
 outbox delivery for every external effect.
 
 The acceptance test uses `command_id` as an explicit unique effect key. A randomly generated
-outbox request ID does not supply replay stability across reconstruction. A later Core evolution
-should derive effect identities from stable run, activation, and effect-ordinal inputs.
+outbox request ID does not supply replay stability across reconstruction. Strict integrations must
+provide a replay-stable idempotency identity or durable outbox staging. Neither path requires DBOS
+workflow identity in Core.
 
 DBOS transactions cover database work performed through their transaction boundary. Model, tool,
 filesystem, and network effects retain their declared idempotent or outbox delivery semantics.
@@ -182,7 +197,7 @@ Official references:
 - [Workflow recovery](https://docs.dbos.dev/production/workflow-recovery)
 - [Workflow code upgrades](https://docs.dbos.dev/python/tutorials/upgrading-workflows)
 
-## Adoption status and remaining gates
+## v0.18 status and non-goals
 
 Completed vertical-slice gates:
 
@@ -192,27 +207,19 @@ Completed vertical-slice gates:
 2. Durable active-input ownership rejects stale or competing activation attempts. Workflow IDs and
    the immutable checkpoint receipt ledger return the original result for duplicate inputs.
 3. Kill/restart recovery under the same stable executor slot produces one semantic effect and one
-   final workflow receipt.
+   finite-activation workflow result copied from the committed checkpoint receipt.
 4. Core checkpoints carry the exact portable suspension observation, and `AgentLoop.release_parked`
    closes process resources without finalizing the run.
 
-Remaining integration gates:
+The v0.18 profile deliberately stops at that vertical slice. Its non-goals are:
 
-1. A host-owned composition root registers run and authenticated control workflows into one DBOS
-   runtime and owns launch failure and orderly close.
-2. A terminal suspension enters a finalization path that writes the final proposal,
-   `run.finished`, recorder output, and metrics once, with an explicit checkpoint retention or
-   deletion policy. The current run driver stops at `release_parked()` after every committed
-   boundary. `AgentLoop.close()` and terminal artifact finalization remain unintegrated.
-3. Submission, task-result, pause, cancel, status, and Studio projections move to the DBOS path.
-   Pause and cancel semantics must state whether they latch at the next suspension boundary or use
-   a portable live control-signal seam.
-4. Concurrent-producer ordering and per-run admission bounds are proven before the legacy inbox is
-   retired.
-5. PostgreSQL process tests validate production queue serialization and durable delivery under the
-   stable-slot model.
-6. Compatibility documentation covers workflow input/result schemas, `application_version`,
-   rolling upgrades, and rollback while pending work exists.
+- replacing `RunnerBackend`, its HTTP facade, or Studio;
+- composing the control-plane experiment and run driver into a production host;
+- migrating submission, task-result, pause, cancel, status, or terminal artifact projection;
+- claiming one physical write for proposal, metrics, `run.finished`, or other rebuildable views;
+- PostgreSQL production qualification, rolling upgrades, or arbitrary-host takeover;
+- retiring the accepted durable Reference command-inbox workstream.
 
-The production DBOS profile fails its adoption gate if it also needs the legacy `LeaseStore`,
-`CommandStore`, `RecoveryService`, watchdog, or in-memory receipt repair to own run lifecycle.
+These items sit outside the v0.18 release scope. A future DBOS milestone must first choose one
+explicit authority model. The portable model keeps `CheckpointStore` authoritative for
+boundary/terminal receipts and other semantic state while DBOS remains an activation scheduler.

@@ -1,8 +1,9 @@
 """Finite DBOS workflows that drive one restored run to one durable suspension boundary.
 
-The driver owns activation and receipt lifecycle through DBOS. A Core ``CheckpointStore`` keeps
-the portable run snapshot; the legacy Reference lease, command inbox, recovery service, watchdog,
-and process-local run registry are outside this import and construction path.
+DBOS owns operational admission, serialization, retry, and workflow recovery. A Core
+``CheckpointStore`` owns the portable semantic snapshot and committed boundary receipt. The
+legacy Reference lease, command inbox, recovery service, watchdog, and process-local run registry
+are outside this import and construction path.
 """
 
 from __future__ import annotations

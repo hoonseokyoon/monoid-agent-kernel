@@ -7,10 +7,13 @@ out in commit messages and here.
 
 ## [Unreleased]
 
-- Added an experimental optional DBOS Reference run-lifecycle profile. Its finite,
+- Added an experimental optional DBOS Reference activation-recovery profile. Its finite,
   run-partitioned resume workflows restore one checkpoint, drive one durable suspension boundary,
-  reject stale sources, commit duplicate markers, and recover after a same-slot process kill with
-  one semantic effect and one terminal receipt. DBOS dependencies and runtime types stay in the
+  reject stale sources, commit applied-input markers, return the stored receipt for duplicates,
+  and recover after a same-slot process kill with one semantic effect and one identity-bound
+  boundary receipt. `CheckpointStore` remains the
+  semantic authority while DBOS owns operational admission, serialization, retry, and workflow
+  recovery. DBOS dependencies and runtime types stay in the
   optional Reference profile; the path constructs no legacy lease, inbox, recovery, or watchdog
   services. Ambiguous checkpoint-store results reconcile by exact readback and remain pending
   instead of terminalizing an input whose internal or boundary checkpoint may already be durable.
