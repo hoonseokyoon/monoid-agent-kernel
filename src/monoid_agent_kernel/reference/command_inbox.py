@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -37,6 +38,10 @@ _SENSITIVE_COMPACT_KEYS = frozenset(key.replace("_", "") for key in _SENSITIVE_K
 
 class CommandQueueFull(NativeAgentError):
     error_code = "command_queue_full"
+
+
+class CommandConflict(NativeAgentError):
+    error_code = "command_id_conflict"
 
 
 @dataclass(frozen=True)
@@ -174,6 +179,19 @@ def redact_command_credential(value: Any, credential: str) -> Any:
     return value
 
 
+def _same_command_identity(existing: StoredCommand, submitted: StoredCommand) -> bool:
+    return (
+        existing.type == submitted.type
+        and existing.args == sanitize_command_data(submitted.args)
+        and existing.principal == submitted.principal
+        and existing.reason == submitted.reason
+    )
+
+
+def _raise_duplicate_conflict(command_id: str) -> None:
+    raise CommandConflict(f"command_id {command_id!r} already belongs to a different command")
+
+
 class InMemoryCommandStore:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -185,6 +203,8 @@ class InMemoryCommandStore:
         with self._lock:
             existing = self._commands.get(key)
             if existing is not None:
+                if not _same_command_identity(existing, command):
+                    _raise_duplicate_conflict(command.command_id)
                 return self._receipt(existing)
             pending = sum(
                 item.run_id == command.run_id and item.status in {"pending", "claimed"}
@@ -289,7 +309,7 @@ class SqliteCommandStore:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
         self._lock = threading.Lock()
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
             columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(command_inbox)")}
             if "schema_version" not in columns:
@@ -301,12 +321,16 @@ class SqliteCommandStore:
                 conn.execute(
                     "ALTER TABLE command_inbox ADD COLUMN token_sha256 TEXT NOT NULL DEFAULT ''"
                 )
+            conn.commit()
 
     def append(self, command: StoredCommand, *, max_pending: int) -> CommandReceipt:
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._row(conn, command.run_id, command.command_id)
             if row is not None:
+                if not _same_command_identity(self._command_from_row(row), command):
+                    conn.rollback()
+                    _raise_duplicate_conflict(command.command_id)
                 conn.commit()
                 return self._receipt_from_row(row)
             pending = conn.execute(
@@ -339,13 +363,13 @@ class SqliteCommandStore:
             return self._receipt_from_row(row)
 
     def read_command(self, run_id: str, command_id: str) -> StoredCommand | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = self._row(conn, run_id, command_id)
         return self._command_from_row(row) if row is not None else None
 
     def claim(self, run_id: str, worker_id: str, *, claim_ttl_s: float) -> StoredCommand | None:
         now = time.time()
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM command_inbox WHERE run_id=? AND status IN ('pending','claimed') "
@@ -378,7 +402,7 @@ class SqliteCommandStore:
     ) -> CommandReceipt:
         status = "completed" if result.status == "ok" else "failed"
         now = time.time()
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             changed = conn.execute(
                 "UPDATE command_inbox SET status=?, result=?, updated_at=? "
@@ -401,7 +425,7 @@ class SqliteCommandStore:
             return self._receipt_from_row(row)
 
     def receipt(self, run_id: str, command_id: str) -> CommandReceipt | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = self._row(conn, run_id, command_id)
         return self._receipt_from_row(row) if row is not None else None
 

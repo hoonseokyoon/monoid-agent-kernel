@@ -9,6 +9,7 @@ import pytest
 
 from monoid_agent_kernel.core.control import ControlResult
 from monoid_agent_kernel.reference.command_inbox import (
+    CommandConflict,
     CommandPrincipal,
     CommandQueueFull,
     CommandStore,
@@ -74,6 +75,20 @@ def test_append_is_idempotent_and_claims_in_order(store: CommandStore) -> None:
     assert receipt.status == "completed"
     assert receipt.result is not None and receipt.result["data"]["state"] == "running"
     assert store.claim("run_1", "worker", claim_ttl_s=30).command_id == "cmd_2"  # type: ignore[union-attr]
+
+
+def test_duplicate_id_rejects_a_different_authenticated_command(store: CommandStore) -> None:
+    store.append(_command("cmd_duplicate"), max_pending=10)
+    different = StoredCommand(
+        run_id="run_1",
+        command_id="cmd_duplicate",
+        type="report_task_result",
+        args={"task_id": "task_other"},
+        principal=CommandPrincipal("tenant", "user", "callback-worker"),
+    )
+
+    with pytest.raises(CommandConflict, match="already belongs"):
+        store.append(different, max_pending=10)
 
 
 def test_stale_claim_is_recoverable_and_wrong_worker_cannot_ack(store: CommandStore) -> None:

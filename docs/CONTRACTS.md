@@ -585,9 +585,11 @@ delivered. Route that command to the owner or use the dedicated task API there.
 Task callback credentials may poll the receipt for the same callback command and task scope. They
 do not gain access to receipts for ordinary run-token commands or commands for another task.
 
-Append is idempotent by `(run_id, command_id)`. A duplicate receives the existing receipt and does
-not execute a second command. Claims follow append order per run, with one in-flight command; a
-later command cannot skip an unacknowledged head command. A crashed claimant becomes eligible
+Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
+receipt and does not execute a second command. Reusing the ID for a different type, sanitized
+arguments, principal, issuer, or reason returns `command_id_conflict`. Claims follow append order
+per run, with one in-flight command; a later command cannot skip an unacknowledged head command. A
+crashed claimant becomes eligible
 after `command_claim_ttl_s`; command handlers therefore retain their existing idempotency
 obligations under crash-after-effect/before-ack recovery. `command_queue_limit` bounds pending plus
 claimed commands per run. Owner watchdogs drain inboxes alongside lease recovery and outbox

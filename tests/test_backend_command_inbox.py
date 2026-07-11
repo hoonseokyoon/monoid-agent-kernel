@@ -122,6 +122,15 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
         ttl_s=60,
         metadata={"task_id": "task_unknown"},
     )
+    other_callback = token_manager.issue(
+        kind="task_callback",
+        audience=TASK_CALLBACK_AUDIENCE,
+        run_id=submission.run_id,
+        tenant_id="tenant_a",
+        user_id="user_a",
+        ttl_s=60,
+        metadata={"task_id": "task_other"},
+    )
     server = create_backend_server(peer, host="127.0.0.1", port=0, admin_token="admin")
     try:
         with serving(server) as base_url:
@@ -158,6 +167,17 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
                 in {"completed", "failed"},
                 timeout_s=10,
             )
+            with pytest.raises(HTTPError) as duplicate_error:
+                http_json(
+                    f"{base_url}/v1/runs/{submission.run_id}/control",
+                    {
+                        "type": "report_task_result",
+                        "command_id": "cmd_remote_callback",
+                        "args": {"task_id": "task_other", "result": {"answer": "different"}},
+                    },
+                    token=other_callback,
+                )
+            assert duplicate_error.value.code == 400
 
             queued = http_json(
                 f"{base_url}/v1/runs/{submission.run_id}/control",
@@ -183,11 +203,13 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
 
             duplicate = http_json(
                 f"{base_url}/v1/runs/{submission.run_id}/control",
-                {
-                    "type": "status",
-                    "command_id": "cmd_cross_worker",
-                    "issuer": "operator-name",
-                },
+                    {
+                        "type": "status",
+                        "command_id": "cmd_cross_worker",
+                        "issuer": "operator-name",
+                        "reason": f"requested with {submission.run_token}",
+                        "args": {"access_token": "must-not-persist"},
+                    },
                 token=submission.run_token,
             )
             assert duplicate["status"] == "ok"
