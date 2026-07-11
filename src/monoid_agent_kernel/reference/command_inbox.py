@@ -122,6 +122,8 @@ class CommandReceipt:
 class CommandStore(Protocol):
     def append(self, command: StoredCommand, *, max_pending: int) -> CommandReceipt: ...
 
+    def read_command(self, run_id: str, command_id: str) -> StoredCommand | None: ...
+
     def claim(self, run_id: str, worker_id: str, *, claim_ttl_s: float) -> StoredCommand | None: ...
 
     def acknowledge(
@@ -191,6 +193,10 @@ class InMemoryCommandStore:
             )
             self._commands[key] = persisted
             return self._receipt(persisted)
+
+    def read_command(self, run_id: str, command_id: str) -> StoredCommand | None:
+        with self._lock:
+            return self._commands.get((run_id, command_id))
 
     def claim(self, run_id: str, worker_id: str, *, claim_ttl_s: float) -> StoredCommand | None:
         now = time.time()
@@ -322,6 +328,11 @@ class SqliteCommandStore:
             conn.commit()
             assert row is not None
             return self._receipt_from_row(row)
+
+    def read_command(self, run_id: str, command_id: str) -> StoredCommand | None:
+        with self._connect() as conn:
+            row = self._row(conn, run_id, command_id)
+        return self._command_from_row(row) if row is not None else None
 
     def claim(self, run_id: str, worker_id: str, *, claim_ttl_s: float) -> StoredCommand | None:
         now = time.time()

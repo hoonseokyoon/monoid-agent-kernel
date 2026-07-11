@@ -582,6 +582,8 @@ response cannot be recovered from the command store.
 For that reason, `create_task` is accepted only by the instance currently owning the run; a peer
 returns `command_requires_owner` instead of creating a task whose callback credential cannot be
 delivered. Route that command to the owner or use the dedicated task API there.
+Task callback credentials may poll the receipt for the same callback command and task scope. They
+do not gain access to receipts for ordinary run-token commands or commands for another task.
 
 Append is idempotent by `(run_id, command_id)`. A duplicate receives the existing receipt and does
 not execute a second command. Claims are oldest-first per run. A crashed claimant becomes eligible

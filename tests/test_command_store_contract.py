@@ -50,6 +50,8 @@ def test_append_is_idempotent_and_claims_in_order(store: CommandStore) -> None:
     store.append(_command("cmd_2", created_at=2.0), max_pending=10)
 
     assert duplicate.command_id == first.command_id
+    persisted = store.read_command("run_1", "cmd_1")
+    assert persisted is not None and persisted.created_at == 1.0
     claimed = store.claim("run_1", "worker", claim_ttl_s=30)
     assert claimed is not None and claimed.command_id == "cmd_1"
     result = ControlResult(run_id="run_1", type="status", status="ok", data={"state": "running"})

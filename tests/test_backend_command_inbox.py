@@ -103,6 +103,15 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
                 command_id="cmd_wrong_callback_credential_subject",
             )
         )
+    valid_callback = token_manager.issue(
+        kind="task_callback",
+        audience=TASK_CALLBACK_AUDIENCE,
+        run_id=submission.run_id,
+        tenant_id="tenant_a",
+        user_id="user_a",
+        ttl_s=60,
+        metadata={"task_id": "task_unknown"},
+    )
     server = create_backend_server(peer, host="127.0.0.1", port=0, admin_token="admin")
     try:
         with serving(server) as base_url:
@@ -120,6 +129,25 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
                     token=submission.run_token,
                 )
             assert exc_info.value.code == 400
+
+            callback_queued = http_json(
+                f"{base_url}/v1/runs/{submission.run_id}/control",
+                {
+                    "type": "report_task_result",
+                    "command_id": "cmd_remote_callback",
+                    "args": {"task_id": "task_unknown", "result": {"answer": "done"}},
+                },
+                token=valid_callback,
+            )
+            assert callback_queued["status"] in {"pending", "claimed"}
+            callback_receipt_url = (
+                f"{base_url}/v1/runs/{submission.run_id}/control/cmd_remote_callback"
+            )
+            assert eventually(
+                lambda: http_json(callback_receipt_url, token=valid_callback)["status"]
+                in {"completed", "failed"},
+                timeout_s=10,
+            )
 
             queued = http_json(
                 f"{base_url}/v1/runs/{submission.run_id}/control",

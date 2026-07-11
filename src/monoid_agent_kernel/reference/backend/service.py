@@ -1141,8 +1141,30 @@ class RunnerBackend:
         return claims
 
     def command_receipt(self, run_id: str, token: str, command_id: str) -> CommandReceipt:
-        self._authorize_command_target(run_id, token)
         assert self.command_store is not None
+        try:
+            self._authorize_command_target(run_id, token)
+        except PermissionDenied:
+            stored = self.command_store.read_command(run_id, command_id)
+            if stored is None:
+                raise KeyError(command_id) from None
+            if stored.type not in {"approve", "deny", "report_task_result"}:
+                raise
+            principal = self._authorize_command_principal(
+                ControlCommand(
+                    type=stored.type,  # type: ignore[arg-type]
+                    run_id=run_id,
+                    args={**stored.args, "token": token},
+                    command_id=command_id,
+                ),
+                args=dict(stored.args),
+                token=token,
+            )
+            if (
+                principal.tenant_id != stored.principal.tenant_id
+                or principal.user_id != stored.principal.user_id
+            ):
+                raise PermissionDenied("token subject mismatch")
         receipt = self.command_store.receipt(run_id, command_id)
         if receipt is None:
             raise KeyError(command_id)
