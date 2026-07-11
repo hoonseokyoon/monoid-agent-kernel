@@ -7,10 +7,16 @@ out in commit messages and here.
 
 ## [Unreleased]
 
-- Added an experimental optional DBOS Reference control-plane profile that uses finite,
-  run-partitioned workflows for durable command idempotency, serial per-run execution, receipts,
-  and same-executor process-restart recovery without importing the legacy lease/inbox/watchdog
-  path.
+- Added an experimental optional DBOS Reference run-lifecycle profile. Its finite,
+  run-partitioned resume workflows restore one checkpoint, drive one durable suspension boundary,
+  reject stale sources, commit duplicate markers, and recover after a same-slot process kill with
+  one semantic effect and one terminal receipt. DBOS dependencies and runtime types stay in the
+  optional Reference profile; the path constructs no legacy lease, inbox, recovery, or watchdog
+  services. Ambiguous checkpoint-store results reconcile by exact readback and remain pending
+  instead of terminalizing an input whose internal or boundary checkpoint may already be durable.
+- Added portable durable suspension observations and `AgentLoop.release_parked()` so recovery
+  drivers can return an already-committed boundary and release process resources without
+  finalizing a resumable run.
 - Added a durable Reference command inbox with idempotent append, ordered and recoverable claims,
   acknowledgements, result receipts, queue limits, authenticated principal attribution, sanitized
   persistence, owner-side draining, and in-memory/SQLite implementations for cross-worker control.

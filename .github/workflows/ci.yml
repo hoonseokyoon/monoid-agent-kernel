@@ -104,8 +104,8 @@ jobs:
           tests/test_file_lock.py
           tests/test_spec_serialization.py
 
-  dbos-control:
-    name: DBOS control-plane spike (Python ${{ matrix.python-version }})
+  dbos-reference:
+    name: DBOS Reference lifecycle (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -121,8 +121,11 @@ jobs:
       - name: Run DBOS process-restart and idempotency acceptance tests
         run: >-
           python -m pytest -q
+          tests/test_backend_dbos_run.py
           tests/test_backend_dbos_control.py
           tests/test_dbos_control_models.py
+          tests/test_dbos_run_driver.py
+          tests/test_dbos_run_models.py
           --durations=10
 
   install-smoke:

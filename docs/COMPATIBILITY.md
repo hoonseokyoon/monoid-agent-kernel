@@ -168,3 +168,18 @@ A checkpoint schema bump affects every non-terminal run. The release that first 
 version must also read the previous version and restore its message queue, inbox dedupe set,
 hosted tasks, continuation handle, runtime limits, and blob references. Keep that previous-version
 reader for the documented deprecation window.
+
+The v0.18 writer adds four optional recovery fields to `monoid.checkpoint.v1`:
+
+- `last_suspension` records the exact observable boundary represented by the checkpoint;
+- `active_input` records an admitted input's identity, original source sequence, and
+  `running`/`completed` phase across internal safety checkpoints;
+- `applied_input_ids` records identities whose boundary is already committed;
+- `applied_input_receipts` is the immutable identity-bound receipt ledger, so an old duplicate
+  still returns its own boundary after newer inputs advance the run.
+
+New readers default absent fields for older checkpoints. Older readers ignore the additive fields.
+A rollback that can resume pending DBOS work must retain a reader that understands all four fields.
+Dropping active-input state can admit a competing or stale activation; dropping the identity or
+receipt ledger can redrive an applied input or return the wrong boundary. Keep the DBOS
+`application_version` stable while same-slot recovery of pending work is required.

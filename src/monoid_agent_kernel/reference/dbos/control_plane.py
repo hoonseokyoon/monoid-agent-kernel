@@ -11,7 +11,6 @@ dispatcher must therefore retain Monoid's command/effect idempotency and durable
 
 from __future__ import annotations
 
-import importlib
 import math
 import threading
 import time
@@ -34,28 +33,20 @@ from monoid_agent_kernel.reference._shared.control_transport import (
     sanitize_command_data,
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.dbos.runtime import (
+    DbosShutdownTimeout,
+    claim_process_owner,
+    create_owned_runtime,
+    load_dbos,
+    release_process_owner,
+)
 
 _DBOS_CONTROL_ENVELOPE_VERSION = namespaced_id("dbos-control-envelope.v1")
 DBOS_CONTROL_WORKFLOW_NAME = namespaced_id("reference.dbos-control-workflow.v1")
 DBOS_CONTROL_STEP_NAME = namespaced_id("reference.dbos-control-step.v1")
 
-_PROCESS_OWNER_LOCK = threading.Lock()
-_PROCESS_OWNER_TOKEN: object | None = None
-
 DbosControlType = Literal["pause", "resume", "cancel", "status"]
 DbosDispatcher = Callable[["DbosControlEnvelope"], ControlResult]
-
-
-class DbosDependencyError(RuntimeError):
-    """Raised when the explicitly selected DBOS profile is unavailable."""
-
-
-class DbosProcessOwnershipError(RuntimeError):
-    """Raised when another control plane already owns the process-global DBOS runtime."""
-
-
-class DbosShutdownTimeout(RuntimeError):
-    """Raised when active dispatch effects outlive the configured shutdown grace."""
 
 
 @dataclass(frozen=True)
@@ -216,14 +207,14 @@ class DbosControlPlane:
         self._accepting = False
         self._closing = False
         self._closed = False
-        self._owner_token = _claim_process_owner()
+        self._owner_token = claim_process_owner()
         self._queue_name = self.versioned_queue_name(
             config.queue_name,
             config.application_version,
         )
         try:
-            self._dbos_module = _load_dbos()
-            self._runtime = _create_owned_runtime(self._dbos_module, config)
+            self._dbos_module = load_dbos()
+            self._runtime = create_owned_runtime(self._dbos_module, config)
             self._workflow = self._register_workflow(dispatcher)
         except Exception:
             runtime = getattr(self, "_runtime", None)
@@ -233,7 +224,7 @@ class DbosControlPlane:
                     workflow_completion_timeout_sec=0,
                 )
             self._closed = True
-            _release_process_owner(self._owner_token)
+            release_process_owner(self._owner_token)
             raise
 
     @property
@@ -307,7 +298,7 @@ class DbosControlPlane:
                     workflow_completion_timeout_sec=0,
                 )
                 self._closed = True
-                _release_process_owner(self._owner_token)
+                release_process_owner(self._owner_token)
                 raise
             self._launched = True
             self._accepting = True
@@ -438,7 +429,7 @@ class DbosControlPlane:
             )
         with self._state_lock:
             self._launched = False
-            _release_process_owner(self._owner_token)
+            release_process_owner(self._owner_token)
             self._closing = False
             self._closed = True
 
@@ -553,53 +544,8 @@ class DbosControlPlane:
         )
 
 
-def _claim_process_owner() -> object:
-    global _PROCESS_OWNER_TOKEN
-    with _PROCESS_OWNER_LOCK:
-        if _PROCESS_OWNER_TOKEN is not None:
-            raise DbosProcessOwnershipError(
-                "another DbosControlPlane already owns the process-global DBOS runtime"
-            )
-        token = object()
-        _PROCESS_OWNER_TOKEN = token
-        return token
-
-
-def _release_process_owner(token: object) -> None:
-    global _PROCESS_OWNER_TOKEN
-    with _PROCESS_OWNER_LOCK:
-        if _PROCESS_OWNER_TOKEN is token:
-            _PROCESS_OWNER_TOKEN = None
-
-
-def _create_owned_runtime(dbos_module: Any, config: DbosControlConfig) -> Any:
-    implementation = importlib.import_module("dbos._dbos")
-    if getattr(implementation, "_dbos_global_instance", None) is not None:
-        raise DbosProcessOwnershipError(
-            "an existing DBOS runtime is active; runtime injection is required for shared hosting"
-        )
-    return dbos_module.DBOS(
-        config={
-            "name": config.name,
-            "system_database_url": config.system_database_url,
-            "application_version": config.application_version,
-            "executor_id": config.executor_id,
-            "run_admin_server": False,
-        }
-    )
-
-
 def _is_uninitialized_queue_table(exc: Exception) -> bool:
     message = str(exc).lower()
     missing_relation = "no such table" in message or "does not exist" in message
     missing_queue_storage = "queues" in message or 'schema "dbos"' in message
     return missing_relation and missing_queue_storage
-
-
-def _load_dbos() -> Any:
-    try:
-        return importlib.import_module("dbos")
-    except ImportError as exc:
-        raise DbosDependencyError(
-            "DBOS Reference control plane requires the 'reference-dbos' extra"
-        ) from exc

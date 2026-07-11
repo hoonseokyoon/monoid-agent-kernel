@@ -1,151 +1,218 @@
-# DBOS Reference Control-Plane Profile
+# DBOS Reference Run-Lifecycle Profile
 
-Status: experimental adoption spike for v0.18.0. The default Reference backend remains unchanged
-while this profile is validated against the durable command-inbox and ownerless-recovery failure
-matrix. The extra pins the validated DBOS 2.26 minor line; upgrades require rerunning these
-acceptance and lifecycle probes.
+Status: experimental v0.18.0 Reference profile. The optional extra pins the validated DBOS 2.26
+minor line. DBOS owns finite activation, retry, serialization, and final workflow receipt
+lifecycle. The Core defines portable checkpoint, input-deduplication, and suspension semantics.
 
-Install the optional profile with:
+Install the profile with:
 
 ```bash
 python -m pip install "monoid-agent-kernel[reference-dbos]"
 ```
 
-Importing `monoid_agent_kernel` or `monoid_agent_kernel.reference.dbos` remains lazy. DBOS is loaded
-only when `DbosControlPlane` is constructed.
+Importing `monoid_agent_kernel` or `monoid_agent_kernel.reference.dbos` stays lazy. DBOS loads when
+`DbosRunDriver` or `DbosControlPlane` is constructed.
 
 ## Boundary
 
-The DBOS profile is a separate Reference orchestration path. It does not compose or import:
+The DBOS profile is a separate Reference composition path. Its run driver imports or constructs
+none of these legacy orchestration services:
 
 - `LeaseStore`;
-- `CommandStore` or its claim TTL;
+- `CommandStore` and claim TTL state;
 - `RecoveryService`;
 - the Reference watchdog;
 - `RunnerBackend._records` as durable ownership state.
 
-Each accepted control is a finite DBOS workflow. Its workflow ID is derived from
-`(run_id, command_id)`, and a partitioned queue uses `run_id` as the partition key. DBOS serializes
-commands for the same run while allowing different run partitions to progress concurrently. The
-adapter scopes the queue name by `application_version`, fixes global concurrency at one per
-partition, repairs and verifies the persisted queue configuration through `DBOSClient` before
-runtime listeners start, and verifies it again before accepting commands. Global per-partition
-concurrency is the cross-executor ordering invariant; worker concurrency is also pinned to one.
-Before launch, the runtime is restricted to that control queue so it cannot dequeue unrelated
-database-backed queues in a shared DBOS system database. The workflow result is projected to the
-existing `monoid.command-receipt.v1` receipt shape.
+`CheckpointStore` remains the Core-defined persistence seam for portable run state. DBOS decides
+when one activation starts, retries, commits its boundary, and produces one immutable receipt for
+that input identity. DBOS dependencies and types stay inside the optional Reference profile; the
+checkpoint fields are runtime-neutral.
+
+## Finite resume workflow
+
+`DbosRunDriver` accepts a `DbosResumeCommand(run_id, command_id, checkpoint_seq)`. One finite,
+run-partitioned DBOS workflow performs this sequence:
+
+1. Read the checked latest checkpoint.
+2. Return the immutable receipt in `applied_input_receipts` when the checkpoint already contains
+   this resume identity in `applied_input_ids`.
+3. For a fresh input, require the latest checkpoint to match its declared source sequence. For a
+   restarted input, require the durable `active_input` to contain the same identity and original
+   source sequence with `phase="running"`. Reject stale inputs and competing activations.
+4. Construct a fresh `AgentLoop`, restore the latest checkpoint and blobs, and drive through local
+   tasks until one durable suspension boundary.
+5. Persist each internal safety checkpoint produced by `AgentLoop` with the same `active_input`
+   and `phase="running"`. One activation can therefore advance from source `N` through multiple
+   monotonic checkpoints before it returns a boundary.
+6. Commit the returned boundary with `phase="completed"`, the exact portable suspension
+   observation, the applied identity, and its immutable identity-bound receipt.
+7. Read the committed checkpoint back, verify ownership, and return the same receipt as the DBOS
+   workflow result. If a store publishes the checkpoint and then raises while returning its
+   response, exact canonical readback reconciles the write as committed. Older, missing, or
+   transiently unreadable state keeps the same DBOS step pending and retrying; a same-sequence
+   mismatch or newer checkpoint fences the writer.
+8. Release the parked loop's process resources without finalizing the run or deleting its
+   checkpoint.
+
+The receipt ledger preserves the result for each applied identity after newer inputs advance the
+run. Retrying input A after input B returns A's stored boundary. The latest checkpoint's suspension
+continues to describe B.
+
+The queue uses `run_id` as its partition key. Queue and worker concurrency are one per partition,
+so resumes for one run serialize while different runs can progress concurrently. Queue names are
+scoped by `application_version`, and preflight repairs and verifies persisted queue configuration
+before listeners accept work.
 
 ```python
-from monoid_agent_kernel.core.control import ControlCommand, ControlResult
-from monoid_agent_kernel.reference.dbos import DbosControlConfig, DbosControlPlane
-
-config = DbosControlConfig(
-    system_database_url="sqlite:///monoid-dbos.sqlite",
-    executor_id="stable-local-slot",
-    application_version="my-product-v1",
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.reference.dbos import (
+    DbosResumeCommand,
+    DbosRunConfig,
+    DbosRunDriver,
 )
 
-def dispatch(envelope):
-    # A production implementation restores the run checkpoint and applies one idempotent
-    # suspension-to-suspension drive operation here.
-    return ControlResult(
-        run_id=envelope.run_id,
-        type=envelope.type,
-        status="ok",
-        data={"applied": True},
-    )
+store = LocalFsCheckpointStore(run_root)
 
-control = DbosControlPlane(config, dispatch)
-control.launch()
-receipt = control.enqueue_control(
-    ControlCommand(
-        type="resume",
-        run_id="run_123",
-        command_id="cmd_456",
-        args={"token": authenticated_bearer},
+def build_loop(command):
+    # Build an AgentLoop for command.run_id. Leave checkpoint_store and
+    # checkpoint_persist_callback unset; DbosRunDriver owns this activation's commit.
+    return make_agent_loop(command.run_id)
+
+driver = DbosRunDriver(
+    DbosRunConfig(
+        system_database_url="sqlite:///monoid-dbos.sqlite",
+        executor_id="stable-local-slot",
+        application_version="my-product-v1",
     ),
-    tenant_id=authenticated_claims.tenant_id,
-    user_id=authenticated_claims.user_id,
+    store,
+    build_loop,
 )
+driver.launch()
+command = DbosResumeCommand("run_123", "resume_456", checkpoint_seq=7)
+driver.enqueue_resume(command)
+receipt = driver.wait_for_receipt(command)
 ```
 
-The HTTP edge authenticates the bearer before calling `enqueue_control`. The control plane builds
-the durable envelope internally, removes the bearer, redacts repeated bearer text, sanitizes
-credential-shaped fields, and persists only its SHA-256 reference. The spike restricts the durable
-vocabulary to `pause`, `resume`, `cancel`, and `status`; commands that return one-time secrets
-remain outside this generic durable transport.
+`DbosControlPlane` remains the authenticated, credential-sanitizing control transport spike. A
+shared host composition that registers control and run workflows into one process-global DBOS
+runtime is a remaining integration gate.
 
-## Guarantees demonstrated by the spike
+## Stable executor slot
 
-- A repeated `(run_id, command_id)` with the same semantic payload returns the existing workflow
-  and produces one normal-case dispatch.
-- DBOS workflow IDs are first-writer-wins. The adapter compares the persisted workflow input's
-  canonical identity and raises `command_id_conflict` for the same ID with different content.
-- Queue concurrency is one per run partition, so finite command workflows serialize without a
-  process-local owner lease while different runs may progress concurrently.
-- A workflow interrupted inside its command step recovers after the same stable executor slot and
-  application version restart.
-- Durable workflow inputs and the SQLite system database contain no raw bearer credential.
+The initial operating model is one active process per stable executor slot. A restarted slot uses
+the same `executor_id` and `application_version`. The supervisor terminates and waits for the prior
+process, or supplies an equivalent fencing guarantee, before starting the replacement.
 
-## Deliberate limitations
+DBOS 2.26 recovers `PENDING` work assigned to that same executor identity and application version.
+The executor ID supplies recovery identity. The supervisor supplies single-process slot exclusion
+and fencing.
 
-DBOS workflows do not make arbitrary model, tool, filesystem, or network effects exactly once.
-Steps are retried when a process dies before their result is checkpointed. A dispatcher must use
-the command ID as its effect idempotency key and retain Monoid's checkpoint/outbox rules. DBOS
-database transactions are exactly once; arbitrary external effects are at least once.
+Automatic takeover by an arbitrary host is outside the initial Reference scope. This design
+excludes Conductor. A later multi-host requirement can add a narrow Reference recovery
+coordinator that reassigns eligible DBOS work while preserving checkpoint sequence and slot
+fencing. That coordinator stays smaller than a general orchestration control plane.
 
-DBOS 2.26 orders queued work by `(priority, created_at)`. This profile disables priority and
-demonstrates sequential-producer ordering. Concurrent submissions can share a timestamp, and the
-queue query has no unique ordering tie-breaker. Exact concurrent append-order parity with the
-legacy inbox requires an atomic per-run sequence or a stronger upstream DBOS guarantee before
-adoption. The spike also has no per-run queue-depth limit yet.
+SQLite is the development and single-host acceptance database. PostgreSQL remains the production
+system-database choice for multi-process service deployments. PostgreSQL alone does not expand the
+automatic takeover contract.
 
-SQLite is a development and single-host test system database. A production multi-server profile
-requires PostgreSQL. DBOS automatically recovers `PENDING` workflows only when the restarted
-process uses the same `executor_id` and `application_version`. A surviving executor does not take
-over another executor's pending work by itself. Automatic cross-executor recovery requires DBOS
-Conductor; without it, the deployment supervisor must recreate a stable executor slot and ID.
-Self-hosted production Conductor is separately licensed, so its operating cost belongs in the
-production-profile decision.
+## Verified recovery invariant
 
-DBOS owns a process-global runtime and workflow registry. This profile owns that lifecycle and
-enforces one live control-plane instance per process; a second constructor fails before workflow
-registration can replace the first dispatcher. `close()` stops admission and waits for active
-DBOS workflows for the positive whole-second `shutdown_grace_s`, then verifies both the dispatcher
-counter and DBOS 2.26 active-workflow registry are empty. A grace timeout keeps process ownership,
-raises `DbosShutdownTimeout`, and requires process termination because DBOS has already stopped its
-runtime resources. A future shared-host integration needs explicit runtime injection before
-multiple DBOS-backed services can share one process safely.
+The recovery model permits a single activation to commit multiple internal safety checkpoints:
 
-Long-lived workflow code also has version compatibility obligations. This spike uses finite command
-workflows to reduce old-version draining pressure. A production adopter must retain compatible
-workers or use DBOS workflow patch/version mechanisms during rolling upgrades.
+```text
+source checkpoint N restore
+  -> zero or more internal safety commits N+1 ... N+k-1
+     with active input phase="running"
+  -> semantic effect with stable idempotency key
+  -> boundary checkpoint N+k (k >= 1)
+     with phase="completed" + applied identity + identity-bound receipt
+  -> process kill
+  -> same executor slot/version restart
+  -> same resume retry
+  -> the identical stored boundary receipt, with no further checkpoint advance
+```
+
+The acceptance test asserts one semantic effect row, a monotonic final checkpoint `N+k`, one
+committed resume identity, one immutable receipt for that identity, one DBOS `SUCCESS` workflow
+row, and the same final workflow receipt for duplicate callers. Internal safety checkpoints may
+make `k` greater than one. `N+1` is the simple case; the general sequence contract is `N+k`.
+
+Here "final workflow receipt" means the finite DBOS workflow has reached one durable result. Its
+`terminal` field separately reports whether the Monoid run boundary is terminal.
+
+## Side-effect rule
+
+DBOS steps can run again when a process dies before DBOS records the step result. The Monoid
+boundary checkpoint commits the applied identity and its receipt together, so a recovered step
+returns that receipt without another model/tool drive. An external target can still commit before
+that boundary checkpoint. Strict runs therefore use a stable explicit idempotency key or durable
+outbox delivery for every external effect.
+
+The acceptance test uses `command_id` as an explicit unique effect key. A randomly generated
+outbox request ID does not supply replay stability across reconstruction. A later Core evolution
+should derive effect identities from stable run, activation, and effect-ordinal inputs.
+
+DBOS transactions cover database work performed through their transaction boundary. Model, tool,
+filesystem, and network effects retain their declared idempotent or outbox delivery semantics.
+
+A checkpoint-store timeout has an ambiguous commit outcome. The run driver keeps that uncertainty
+pending and retries the same canonical checkpoint inside the
+live DBOS step until readback proves the commit or a conflicting writer. If shutdown grace expires
+while storage remains uncertain, the supervisor terminates the process; same-slot startup recovery
+then resumes the still-pending DBOS workflow.
+
+## Runtime and version lifecycle
+
+DBOS owns a process-global runtime and workflow registry. Reference DBOS components claim one
+process owner before workflow registration. `close()` stops admission, waits for active workflows,
+verifies the DBOS active-workflow set, and releases ownership. A grace timeout requires process
+termination.
+
+Finite workflows keep version-drain pressure bounded. A deployment retains compatible workflow
+code for pending work, keeps `application_version` stable across a slot restart, and changes the
+version when workflow operation order or durable input/result compatibility changes.
 
 Official references:
 
 - [Workflow guarantees and idempotent workflow IDs](https://docs.dbos.dev/python/tutorials/workflow-tutorial)
 - [Queues, partition keys, and concurrency](https://docs.dbos.dev/python/tutorials/queue-tutorial)
 - [SQLite and PostgreSQL system databases](https://docs.dbos.dev/python/tutorials/database-connection)
-- [Executor recovery and Conductor](https://docs.dbos.dev/production/workflow-recovery)
-- [Conductor hosting and licensing](https://docs.dbos.dev/production/hosting-conductor)
+- [Workflow recovery](https://docs.dbos.dev/production/workflow-recovery)
 - [Workflow code upgrades](https://docs.dbos.dev/python/tutorials/upgrading-workflows)
 
-## Adoption gates
+## Adoption status and remaining gates
 
-This profile replaces the PR 31/33 orchestration only after all of the following pass:
+Completed vertical-slice gates:
 
-1. `DbosRunDriver` restores a Monoid checkpoint and drives one suspension boundary without
-   constructing the legacy lease, inbox, recovery, or watchdog services.
-2. Duplicate and conflicting command IDs retain the current receipt contract.
-3. Crash injection before and after workflow admission, checkpoint commit, external effects, and
-   receipt commit converges to one semantic effect and one terminal receipt.
-4. PostgreSQL two-process tests prove run-partition serialization and durable delivery.
-5. Concurrent-producer tests prove exact per-run append ordering and enforce a per-run admission
-   bound before the legacy inbox is retired.
-6. The chosen production deployment provides Conductor or stable executor-slot restart semantics.
-7. Host-owned runtime integration covers launch failure, shared registration, and orderly close.
-8. Compatibility documentation covers DBOS `application_version`, workflow input/result schemas,
-   and rollback to the legacy Reference profile.
+1. `DbosRunDriver` restores a checkpoint, persists internal safety checkpoints, and drives one
+   durable suspension boundary without legacy lease, inbox, recovery, watchdog, or record-registry
+   services.
+2. Durable active-input ownership rejects stale or competing activation attempts. Workflow IDs and
+   the immutable checkpoint receipt ledger return the original result for duplicate inputs.
+3. Kill/restart recovery under the same stable executor slot produces one semantic effect and one
+   final workflow receipt.
+4. Core checkpoints carry the exact portable suspension observation, and `AgentLoop.release_parked`
+   closes process resources without finalizing the run.
 
-If the implementation still needs the legacy `LeaseStore`, `CommandStore`, or in-memory receipt
-repair alongside DBOS, the spike fails and must not become the production profile.
+Remaining integration gates:
+
+1. A host-owned composition root registers run and authenticated control workflows into one DBOS
+   runtime and owns launch failure and orderly close.
+2. A terminal suspension enters a finalization path that writes the final proposal,
+   `run.finished`, recorder output, and metrics once, with an explicit checkpoint retention or
+   deletion policy. The current run driver stops at `release_parked()` after every committed
+   boundary. `AgentLoop.close()` and terminal artifact finalization remain unintegrated.
+3. Submission, task-result, pause, cancel, status, and Studio projections move to the DBOS path.
+   Pause and cancel semantics must state whether they latch at the next suspension boundary or use
+   a portable live control-signal seam.
+4. Concurrent-producer ordering and per-run admission bounds are proven before the legacy inbox is
+   retired.
+5. PostgreSQL process tests validate production queue serialization and durable delivery under the
+   stable-slot model.
+6. Compatibility documentation covers workflow input/result schemas, `application_version`,
+   rolling upgrades, and rollback while pending work exists.
+
+The production DBOS profile fails its adoption gate if it also needs the legacy `LeaseStore`,
+`CommandStore`, `RecoveryService`, watchdog, or in-memory receipt repair to own run lifecycle.
