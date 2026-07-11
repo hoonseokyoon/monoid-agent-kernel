@@ -97,6 +97,8 @@ def test_persisted_command_redacts_credential_shaped_fields(store: CommandStore)
             "access_token": "bearer-secret",
             "accessToken": "camel-bearer-secret",
             "apiKey": "camel-api-key",
+            "client_secret": "oauth-client-secret",
+            "secret_key": "signing-secret",
             "nested": {
                 "password": "do-not-store",
                 "safe": "visible",
@@ -113,6 +115,8 @@ def test_persisted_command_redacts_credential_shaped_fields(store: CommandStore)
     assert claimed.args["access_token"] == "[redacted]"
     assert claimed.args["accessToken"] == "[redacted]"
     assert claimed.args["apiKey"] == "[redacted]"
+    assert claimed.args["client_secret"] == "[redacted]"
+    assert claimed.args["secret_key"] == "[redacted]"
     assert claimed.args["nested"] == {
         "password": "[redacted]",
         "safe": "visible",
@@ -127,12 +131,17 @@ def test_persisted_command_redacts_credential_shaped_fields(store: CommandStore)
             run_id="run_1",
             type="status",
             status="ok",
-            data={"refreshToken": "result-secret", "safe": "visible"},
+            data={
+                "refreshToken": "result-secret",
+                "api_secret": "service-secret",
+                "safe": "visible",
+            },
         ),
     )
     assert receipt.result is not None
     assert receipt.result["data"] == {
         "refreshToken": "[redacted]",
+        "api_secret": "[redacted]",
         "safe": "visible",
     }
 

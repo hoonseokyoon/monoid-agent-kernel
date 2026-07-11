@@ -136,7 +136,8 @@ def sanitize_command_data(value: Any, *, key: str = "") -> Any:
 
     lowered = key.lower()
     compact = "".join(character for character in lowered if character.isalnum())
-    if key and (compact in _SENSITIVE_COMPACT_KEYS or compact.endswith("password")):
+    sensitive_suffix = compact.endswith(("password", "secret", "secretkey"))
+    if key and (compact in _SENSITIVE_COMPACT_KEYS or sensitive_suffix):
         return "[redacted]"
     if isinstance(value, dict):
         return {
