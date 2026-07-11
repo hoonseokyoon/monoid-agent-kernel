@@ -584,6 +584,10 @@ returns `command_requires_owner` instead of creating a task whose callback crede
 delivered. Route that command to the owner or use the dedicated task API there.
 Task callback credentials may poll the receipt for the same callback command and task scope. They
 do not gain access to receipts for ordinary run-token commands or commands for another task.
+Owner-local commands execute from a transient payload after removing the authenticated bearer, so
+legitimate domain fields such as `password` remain intact without entering the inbox. Cross-worker
+commands execute from the durable sanitized payload; use durable references such as `token_ref`
+for credential-shaped domain data that must cross that boundary.
 
 Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
 receipt and does not execute a second command. Reusing the ID for a different type, sanitized

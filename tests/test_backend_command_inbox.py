@@ -301,6 +301,14 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
         return receipt
 
     backend.command_store.append = append_with_watchdog_race  # type: ignore[method-assign]
+    dispatched_args: dict[str, dict[str, Any]] = {}
+    original_dispatch = backend._commands.dispatch
+
+    def capture_dispatch(command: ControlCommand, **kwargs: Any) -> Any:
+        dispatched_args[command.command_id] = command.args
+        return original_dispatch(command, **kwargs)
+
+    backend._commands.dispatch = capture_dispatch  # type: ignore[method-assign]
 
     server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
     with serving(server) as base_url:
@@ -334,6 +342,8 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
                     "result": {
                         "answer": "done",
                         "token_ref": "capability-handle",
+                        "password": "legitimate-task-data",
+                        "secret_key": "also-task-data",
                     },
                 },
                 "issuer": "callback-worker",
@@ -341,6 +351,12 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
             token=callback_token,
         )
         assert reported["status"] == "ok"
+        assert dispatched_args["cmd_callback_report"]["result"] == {
+            "answer": "done",
+            "token_ref": "capability-handle",
+            "password": "legitimate-task-data",
+            "secret_key": "also-task-data",
+        }
 
     persisted = backend.command_receipt(submission.run_id, submission.run_token, "cmd_create_task")
     assert persisted.result is not None

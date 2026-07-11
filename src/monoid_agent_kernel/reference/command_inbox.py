@@ -93,11 +93,13 @@ class StoredCommand:
             "claimed_at": self.claimed_at,
         }
 
-    def control_command(self, *, token: str) -> ControlCommand:
+    def control_command(
+        self, *, token: str, transient_args: dict[str, Any] | None = None
+    ) -> ControlCommand:
         return ControlCommand(
             type=self.type,  # type: ignore[arg-type]
             run_id=self.run_id,
-            args={**self.args, "token": token},
+            args={**(self.args if transient_args is None else transient_args), "token": token},
             issuer=self.principal.actor,
             reason=self.reason,
             command_id=self.command_id,

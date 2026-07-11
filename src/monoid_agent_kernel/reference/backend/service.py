@@ -1053,11 +1053,12 @@ class RunnerBackend:
             )
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         assert self.command_store is not None
+        execution_args = dict(redact_command_credential(args, token))
         stored_command = StoredCommand(
             run_id=command.run_id,
             command_id=command_id,
             type=command.type,
-            args=dict(redact_command_credential(sanitize_command_data(args), token)),
+            args=dict(sanitize_command_data(execution_args)),
             principal=CommandPrincipal(
                 tenant_id=principal.tenant_id,
                 user_id=principal.user_id,
@@ -1073,7 +1074,10 @@ class RunnerBackend:
                 receipt = self.command_store.append(
                     stored_command, max_pending=self.command_queue_limit
                 )
-                executed = self._drain_command_inbox(command.run_id)
+                executed = self._drain_command_inbox(
+                    command.run_id,
+                    transient_args={command_id: execution_args},
+                )
         else:
             receipt = self.command_store.append(
                 stored_command, max_pending=self.command_queue_limit
@@ -1186,7 +1190,12 @@ class RunnerBackend:
             raise KeyError(command_id)
         return receipt
 
-    def _drain_command_inbox(self, run_id: str) -> dict[str, ControlResult]:
+    def _drain_command_inbox(
+        self,
+        run_id: str,
+        *,
+        transient_args: Mapping[str, dict[str, Any]] | None = None,
+    ) -> dict[str, ControlResult]:
         """Claim and execute commands only on the instance that owns the target run."""
 
         with self._command_drain_lock(run_id):
@@ -1213,7 +1222,10 @@ class RunnerBackend:
                 )
                 try:
                     result = self._commands.dispatch(
-                        stored.control_command(token=token),
+                        stored.control_command(
+                            token=token,
+                            transient_args=(transient_args or {}).get(stored.command_id),
+                        ),
                         audit_token_sha256=stored.token_sha256,
                     )
                 except Exception as exc:  # owner records a durable failure receipt
