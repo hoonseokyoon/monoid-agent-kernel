@@ -76,6 +76,15 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
                 command_id="cmd_wrong_subject",
             )
         )
+    with pytest.raises(PermissionDenied, match="subject mismatch"):
+        peer.enqueue_control(
+            ControlCommand(
+                type="approve",
+                run_id=submission.run_id,
+                args={"token": wrong_subject, "task_id": "task_unknown"},
+                command_id="cmd_wrong_callback_subject",
+            )
+        )
     server = create_backend_server(peer, host="127.0.0.1", port=0, admin_token="admin")
     try:
         with serving(server) as base_url:

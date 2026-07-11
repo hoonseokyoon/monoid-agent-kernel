@@ -201,7 +201,11 @@ class InMemoryCommandStore:
                 if item.run_id == run_id
                 and (
                     item.status == "pending"
-                    or (item.status == "claimed" and now - item.claimed_at > claim_ttl_s)
+                    or (
+                        item.status == "claimed"
+                        and item.claimed_by != worker_id
+                        and now - item.claimed_at > claim_ttl_s
+                    )
                 )
             ]
             if not eligible:
@@ -325,9 +329,9 @@ class SqliteCommandStore:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM command_inbox WHERE run_id=? AND "
-                "(status='pending' OR (status='claimed' AND claimed_at<?)) "
+                "(status='pending' OR (status='claimed' AND claimed_by<>? AND claimed_at<?)) "
                 "ORDER BY ordinal LIMIT 1",
-                (run_id, now - claim_ttl_s),
+                (run_id, worker_id, now - claim_ttl_s),
             ).fetchone()
             if row is None:
                 conn.commit()

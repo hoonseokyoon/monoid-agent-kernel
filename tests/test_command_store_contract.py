@@ -73,6 +73,15 @@ def test_stale_claim_is_recoverable_and_wrong_worker_cannot_ack(store: CommandSt
         )
 
 
+def test_stale_claim_is_not_reclaimed_by_same_worker(store: CommandStore) -> None:
+    store.append(_command("cmd_in_flight"), max_pending=10)
+    assert store.claim("run_1", "worker", claim_ttl_s=30) is not None
+
+    assert store.claim("run_1", "worker", claim_ttl_s=-1) is None
+    recovered = store.claim("run_1", "replacement", claim_ttl_s=-1)
+    assert recovered is not None and recovered.claimed_by == "replacement"
+
+
 def test_queue_limit_counts_only_unacknowledged_commands(store: CommandStore) -> None:
     store.append(_command("cmd_1"), max_pending=1)
     with pytest.raises(CommandQueueFull):

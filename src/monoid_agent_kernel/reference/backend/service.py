@@ -1099,6 +1099,17 @@ class RunnerBackend:
             )
             if metadata is None:
                 raise KeyError(command.run_id)
+            try:
+                run_claims = self._verify_run_token(command.run_id, token)
+            except PermissionDenied:
+                # Callback credentials were already validated against their task above.
+                pass
+            else:
+                if (
+                    run_claims.tenant_id != str(metadata.get("tenant_id") or "")
+                    or run_claims.user_id != str(metadata.get("user_id") or "")
+                ):
+                    raise PermissionDenied("token subject mismatch")
             return CommandPrincipal(
                 str(metadata.get("tenant_id") or ""),
                 str(metadata.get("user_id") or ""),
