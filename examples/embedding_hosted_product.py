@@ -1,4 +1,4 @@
-"""Offline golden path for a hosted, multi-tenant Monoid control plane.
+"""Offline hosted golden path using the Reference durable-inbox assembly.
 
 Run from a checkout with::
 
@@ -16,23 +16,26 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from monoid_agent_kernel import AgentRuntimeConfig  # noqa: E402
-from monoid_agent_kernel.core.control import ControlCommand  # noqa: E402
-from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
-from monoid_agent_kernel.providers.fake import FakeModelAdapter  # noqa: E402
-from monoid_agent_kernel.reference._shared.tokens import TokenManager  # noqa: E402
-from monoid_agent_kernel.reference.backend.service import (  # noqa: E402
+from monoid_agent_kernel.contracts import (  # noqa: E402
+    AgentRuntimeConfig,
+    ControlCommand,
+    ModelTurn,
+)
+from monoid_agent_kernel.errors import PermissionDenied  # noqa: E402
+from monoid_agent_kernel.providers import FakeModelAdapter  # noqa: E402
+from monoid_agent_kernel.reference.backend import (  # noqa: E402
     BackendRunRequest,
     RunnerBackend,
+    TokenManager,
 )
-from monoid_agent_kernel.reference.command_inbox import SqliteCommandStore  # noqa: E402
-from monoid_agent_kernel.reference.stores.sqlite import (  # noqa: E402
+from monoid_agent_kernel.reference.stores import (  # noqa: E402
     SqliteCheckpointStore,
+    SqliteCommandStore,
     SqliteLeaseStore,
 )
 
 
-def _adapter_factory(_spec: Any, _gateway_token: str) -> FakeModelAdapter:
+def _offline_adapter() -> FakeModelAdapter:
     return FakeModelAdapter(
         turns=[
             ModelTurn(response_id="hosted-ready", final_text="Ready for product input."),
@@ -41,15 +44,24 @@ def _adapter_factory(_spec: Any, _gateway_token: str) -> FakeModelAdapter:
     )
 
 
-def _backend(
-    *, root: Path, database: Path, token_manager: TokenManager, workspaces: Path
+def _reference_inbox_backend(
+    *,
+    root: Path,
+    database: Path,
+    token_manager: TokenManager,
+    workspaces: Path,
+    observed_gateway_tokens: list[str],
 ) -> RunnerBackend:
+    def adapter_factory(_spec: Any, gateway_token: str) -> FakeModelAdapter:
+        observed_gateway_tokens.append(gateway_token)
+        return _offline_adapter()
+
     return RunnerBackend(
         run_root=root / "runs",
         token_manager=token_manager,
         allowed_workspace_roots=(workspaces,),
         llm_gateway_url="http://offline.invalid/internal/llm/turns",
-        model_adapter_factory=_adapter_factory,
+        model_adapter_factory=adapter_factory,
         checkpoint_store=SqliteCheckpointStore(database),
         lease_store=SqliteLeaseStore(database),
         command_store=SqliteCommandStore(database),
@@ -98,15 +110,15 @@ def _scan_for_credentials(root: Path, credentials: tuple[str, ...]) -> bool:
             continue
         try:
             data = path.read_bytes()
-        except OSError:
-            continue
+        except OSError as exc:
+            raise RuntimeError(f"durable credential scan could not read {path}") from exc
         if any(needle in data for needle in needles):
             return True
     return False
 
 
 def run_hosted_product(root: Path) -> dict[str, Any]:
-    """Exercise shared ownership, durable commands, receipts, and cursor streaming."""
+    """Exercise one Reference inbox assembly across two backend instances."""
 
     workspaces = root / "workspaces"
     tenant_a_workspace = workspaces / "tenant-a"
@@ -114,16 +126,29 @@ def run_hosted_product(root: Path) -> dict[str, Any]:
     tenant_a_workspace.mkdir(parents=True, exist_ok=True)
     tenant_b_workspace.mkdir(parents=True, exist_ok=True)
     database = root / "control-plane.db"
-    token_manager = TokenManager.from_secret("offline-hosted-example-secret-32b")
-    owner = _backend(
-        root=root, database=database, token_manager=token_manager, workspaces=workspaces
+    signing_secret = "offline-hosted-example-secret-32b"
+    token_manager = TokenManager.from_secret(signing_secret)
+    observed_gateway_tokens: list[str] = []
+    owner = _reference_inbox_backend(
+        root=root,
+        database=database,
+        token_manager=token_manager,
+        workspaces=workspaces,
+        observed_gateway_tokens=observed_gateway_tokens,
     )
-    peer = _backend(
-        root=root, database=database, token_manager=token_manager, workspaces=workspaces
+    peer = _reference_inbox_backend(
+        root=root,
+        database=database,
+        token_manager=token_manager,
+        workspaces=workspaces,
+        observed_gateway_tokens=observed_gateway_tokens,
     )
+    checked_store = SqliteCheckpointStore(database)
     submissions = []
+    checked_loads: dict[str, dict[str, str]] = {}
     callback_token = ""
     approval_callback_token = ""
+    cross_tenant_access_denied = False
     try:
         for tenant, user, workspace in (
             ("tenant_a", "user_a", tenant_a_workspace),
@@ -150,28 +175,55 @@ def run_hosted_product(root: Path) -> dict[str, Any]:
                 submission.run_token,
                 "awaiting_input",
             )
+            checkpoint_load = checked_store.latest_checked(submission.run_id)
+            metadata_load = checked_store.run_metadata_checked(submission.run_id)
+            if not checkpoint_load.ok or not metadata_load.ok:
+                raise RuntimeError(
+                    "hosted durable state could not be loaded: "
+                    f"checkpoint={checkpoint_load.status}, metadata={metadata_load.status}"
+                )
+            checked_loads[submission.run_id] = {
+                "checkpoint": checkpoint_load.status,
+                "run_metadata": metadata_load.status,
+            }
         owner.start_watchdog()
 
         primary = submissions[0]
+        try:
+            peer.enqueue_control(
+                ControlCommand(
+                    type="status",
+                    run_id=primary.run_id,
+                    args={"token": submissions[1].run_token},
+                    issuer="hosted-api",
+                    reason="prove cross-tenant denial",
+                    command_id="hosted-cross-tenant-status",
+                )
+            )
+        except PermissionDenied:
+            cross_tenant_access_denied = True
+        if not cross_tenant_access_denied:
+            raise RuntimeError("cross-tenant command unexpectedly passed authorization")
+
         subscription = owner.subscribe_events(
             primary.run_id, primary.run_token, from_seq=1
         )
         first_page = subscription.poll(limit=500)
         replay_free_page = subscription.poll(limit=500)
 
-        peer.enqueue_control(
-            ControlCommand(
-                type="status",
-                run_id=primary.run_id,
-                args={"token": primary.run_token},
-                issuer="hosted-api",
-                reason="offline golden path",
-                command_id="hosted-status-1",
-            )
+        status_command = ControlCommand(
+            type="status",
+            run_id=primary.run_id,
+            args={"token": primary.run_token},
+            issuer="hosted-api",
+            reason="offline golden path",
+            command_id="hosted-status-1",
         )
+        peer.enqueue_control(status_command)
         status_receipt = _wait_receipt(
             peer, primary.run_id, primary.run_token, "hosted-status-1"
         )
+        duplicate_status_receipt = peer.enqueue_control(status_command).to_json()
 
         created = owner.enqueue_control(
             ControlCommand(
@@ -261,8 +313,12 @@ def run_hosted_product(root: Path) -> dict[str, Any]:
         owner.shutdown(drain=False)
         peer.shutdown(drain=False)
 
-    historical = _backend(
-        root=root, database=database, token_manager=token_manager, workspaces=workspaces
+    historical = _reference_inbox_backend(
+        root=root,
+        database=database,
+        token_manager=token_manager,
+        workspaces=workspaces,
+        observed_gateway_tokens=observed_gateway_tokens,
     )
     try:
         historical_events = historical.subscribe_events(
@@ -273,15 +329,23 @@ def run_hosted_product(root: Path) -> dict[str, Any]:
 
     return {
         "status": "ok",
+        "runtime_profile": "reference-inbox",
         "tenants": ["tenant_a", "tenant_b"],
         "run_ids": [submission.run_id for submission in submissions],
+        "checked_loads": checked_loads,
         "initial_event_count": len(first_page["events"]),
         "replay_count": len(replay_free_page["events"]),
         "status_receipt": status_receipt["status"],
+        "status_result": status_receipt["result"],
+        "status_duplicate_matches": duplicate_status_receipt == status_receipt,
         "task_receipt": task_receipt["status"],
+        "task_result": task_receipt["result"],
         "approval_receipt": approval_receipt["status"],
+        "approval_result": approval_receipt["result"],
         "historical_event_count": len(historical_events),
         "tenant_usage": tenant_usage,
+        "cross_tenant_access_denied": cross_tenant_access_denied,
+        "observed_gateway_token_count": len(observed_gateway_tokens),
         "credential_leak_detected": _scan_for_credentials(
             root,
             (
@@ -289,6 +353,8 @@ def run_hosted_product(root: Path) -> dict[str, Any]:
                 submissions[1].run_token,
                 callback_token,
                 approval_callback_token,
+                signing_secret,
+                *observed_gateway_tokens,
             ),
         ),
         "network_required": False,

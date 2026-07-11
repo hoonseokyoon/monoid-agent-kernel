@@ -15,16 +15,17 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from monoid_agent_kernel import (  # noqa: E402
+from monoid_agent_kernel.contracts import (  # noqa: E402
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
+    LoopSession,
+    ModelTurn,
+    ToolCall,
     ToolBinding,
 )
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore  # noqa: E402
-from monoid_agent_kernel.core.lifecycle import LoopSession  # noqa: E402
-from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call  # noqa: E402
+from monoid_agent_kernel.providers import FakeModelAdapter  # noqa: E402
 from monoid_agent_kernel.tools import tool_ids  # noqa: E402
 
 
@@ -48,13 +49,13 @@ def run_local_product(root: Path) -> dict[str, Any]:
             ModelTurn(
                 response_id="local-write",
                 tool_calls=(
-                    fake_tool_call(
-                        "fs_write",
-                        {
+                    ToolCall(
+                        id="call-write",
+                        name="fs_write",
+                        arguments={
                             "path": "RELEASE_NOTE.md",
                             "content": "# Release note\n\nOffline embedding is ready.\n",
                         },
-                        "call-write",
                     ),
                 ),
             ),
@@ -71,16 +72,23 @@ def run_local_product(root: Path) -> dict[str, Any]:
     session = LoopSession(loop)
     session.open()
     session.submit("Create the requested release note.")
-    checkpoint = checkpoints.latest(loop.spec.run_id)
+    checkpoint_load = checkpoints.latest_checked(loop.spec.run_id)
+    if not checkpoint_load.ok or checkpoint_load.value is None:
+        raise RuntimeError(
+            f"local checkpoint could not be loaded: {checkpoint_load.status}"
+        )
+    checkpoint = checkpoint_load.value
     result = session.close()
 
     events_path = run_root / result.run_id / "events.jsonl"
     event_count = len(events_path.read_text(encoding="utf-8").splitlines())
     return {
         "status": result.status,
+        "runtime_profile": "embedded-local",
         "run_id": result.run_id,
         "output_exists": (workspace / "RELEASE_NOTE.md").is_file(),
-        "checkpoint_seq": checkpoint.seq if checkpoint is not None else 0,
+        "checkpoint_load_status": checkpoint_load.status,
+        "checkpoint_seq": checkpoint.seq,
         "event_count": event_count,
         "network_required": False,
     }

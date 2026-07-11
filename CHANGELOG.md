@@ -21,8 +21,8 @@ out in commit messages and here.
   drivers can return an already-committed boundary and release process resources without
   finalizing a resumable run.
 - Added an executable production embedding handbook with offline-tested local and hosted,
-  multi-tenant golden paths covering durable ownership, commands, streaming, callbacks, recovery,
-  observability, and credential boundaries.
+  multi-tenant golden paths, portable deployment responsibilities, one explicit Reference inbox
+  assembly, and clear separation from the optional experimental DBOS activation-recovery profile.
 - Added a durable Reference command inbox with idempotent append, ordered and recoverable claims,
   acknowledgements, result receipts, queue limits, authenticated principal attribution, sanitized
   persistence, owner-side draining, and in-memory/SQLite implementations for cross-worker control.
