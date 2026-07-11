@@ -130,9 +130,13 @@ def run_capability_broker_contract(
         outcome = factory().request(request)
     except Exception as exc:
         return (_error("BROKER-01-OUTCOME", BROKER_CONTRACT_PROFILE, exc),)
-    named_capability = (
-        outcome.request.capability if isinstance(outcome, CapabilityPending) else outcome.capability
-    )
+    valid_outcome = isinstance(outcome, (CapabilityLease, CapabilityDenial, CapabilityPending))
+    if isinstance(outcome, CapabilityPending):
+        named_capability: object = outcome.request.capability
+    elif isinstance(outcome, (CapabilityLease, CapabilityDenial)):
+        named_capability = outcome.capability
+    else:
+        named_capability = None
     outcomes = [
         outcome_from_observations(
             "BROKER-01-OUTCOME",
@@ -141,9 +145,7 @@ def run_capability_broker_contract(
                 observation(
                     "grant_union",
                     expected=True,
-                    actual=isinstance(
-                        outcome, (CapabilityLease, CapabilityDenial, CapabilityPending)
-                    ),
+                    actual=valid_outcome,
                 ),
                 observation(
                     "capability_identity",
@@ -153,6 +155,16 @@ def run_capability_broker_contract(
             ),
         )
     ]
+    if not valid_outcome:
+        outcomes.append(
+            ConformanceRuleOutcome(
+                rule_id="BROKER-02-LEASE-LEAST-PRIVILEGE",
+                profile_id=BROKER_CONTRACT_PROFILE,
+                status="skipped",
+                error="broker returned an invalid outcome",
+            )
+        )
+        return tuple(outcomes)
     if isinstance(outcome, CapabilityLease):
         now = time.time()
         outcomes.append(

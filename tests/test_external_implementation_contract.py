@@ -56,3 +56,17 @@ def test_reusable_capability_broker_contract(factory: Callable[[], CapabilityBro
 
     assert outcomes[0].status == "passed"
     assert outcomes[1].status in {"passed", "skipped"}
+
+
+def test_broker_contract_reports_invalid_result_without_raising() -> None:
+    class InvalidBroker:
+        def request(self, request: object) -> None:
+            del request
+            return None
+
+    outcomes = run_capability_broker_contract(InvalidBroker)  # type: ignore[arg-type]
+
+    assert [outcome.status for outcome in outcomes] == ["failed", "skipped"]
+    assert outcomes[0].observations[0].observation_id == "grant_union"
+    assert outcomes[0].observations[0].actual is False
+    assert outcomes[1].error == "broker returned an invalid outcome"
