@@ -27,8 +27,8 @@ pip install ruff                                     # linter (configured in pyp
 
 ```bash
 ruff check src tests       # lint (line-length 100, target py311)
-python -m pytest -n 4 -q -m "unit or contract"  # parallel fast/contract shard
-python -m pytest -q -m "integration and not live"  # deterministic serial shard
+python -m pytest -n 4 -q -m "(unit or contract) and not serial"  # parallel shard
+python -m pytest -q -m "(integration or serial) and not live"  # serial shard
 ```
 
 - Add or update tests for any behavior change. Custom adapters/workspaces/stores
@@ -42,7 +42,8 @@ python -m pytest -q -m "integration and not live"  # deterministic serial shard
   `unit`, `contract`, or `integration`. Update that policy when a new module crosses
   a different boundary. `slow`, `live`, and `serial` are orthogonal traits.
 - Mark deliberate timeout or live-provider coverage with `slow` or `live`. Integration
-  tests run in the required serial shard; unit and contract tests run under xdist.
+  and serial contract tests run in the required serial shard; worker-safe unit and
+  contract tests run under xdist.
 - CI requires both shards, branch coverage, minimal/all-extras install smoke, and a
   small Windows/macOS platform-sensitive smoke matrix.
 - To profile without unrelated pytest plugins, run

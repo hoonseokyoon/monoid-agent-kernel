@@ -33,7 +33,7 @@ jobs:
       - name: Install
         run: python -m pip install -e ".[dev,openai]"
       - name: Run deterministic parallel shard
-        run: python -m pytest -q -n 4 -m "unit or contract" --durations=25
+        run: python -m pytest -q -n 4 -m "(unit or contract) and not serial" --durations=25
 
   integration:
     name: Serial integration
@@ -46,7 +46,7 @@ jobs:
       - name: Install
         run: python -m pip install -e ".[dev,openai]"
       - name: Run bounded serial shard
-        run: python -m pytest -q -m "integration and not live" --durations=25
+        run: python -m pytest -q -m "(integration or serial) and not live" --durations=25
 
   coverage:
     name: Coverage floor
@@ -60,13 +60,13 @@ jobs:
         run: python -m pip install -e ".[dev,openai]"
       - name: Measure parallel unit and contract coverage
         run: >
-          python -m pytest -q -n 4 -m "unit or contract"
+          python -m pytest -q -n 4 -m "(unit or contract) and not serial"
           --cov=monoid_agent_kernel
           --cov=native_agent_runner
           --cov-report=
       - name: Append serial integration coverage and enforce floor
         run: >
-          python -m pytest -q -m "integration and not live"
+          python -m pytest -q -m "(integration or serial) and not live"
           --cov=monoid_agent_kernel
           --cov=native_agent_runner
           --cov-append

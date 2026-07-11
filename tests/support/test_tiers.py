@@ -29,17 +29,29 @@ _CONTRACT_MODULES = frozenset(
 _INTEGRATION_MODULES = frozenset(
     {
         "test_async_loop.py",
+        "test_capability.py",
         "test_cli_and_openai.py",
         "test_examples.py",
         "test_gateway_provider.py",
         "test_hitl.py",
+        "test_inbox.py",
         "test_jobs.py",
         "test_llm_gateway_backend.py",
         "test_llm_gateway_stream.py",
         "test_mcp.py",
         "test_mcp_gateway.py",
+        "test_memory.py",
+        "test_outbox.py",
+        "test_proposal_package.py",
         "test_shell.py",
         "test_web_gateway.py",
+    }
+)
+
+_SERIAL_CONTRACT_MODULES = frozenset(
+    {
+        "test_checkpoint_store_contract.py",
+        "test_lease_store_contract.py",
     }
 )
 
@@ -57,6 +69,16 @@ def primary_tier_for_path(path: Path) -> str:
     if name in _INTEGRATION_MODULES:
         return "integration"
     return "unit"
+
+
+def requires_serial_execution(path: Path) -> bool:
+    """Return whether a module owns threaded/process/service lifecycle."""
+    normalized = path.as_posix()
+    return (
+        primary_tier_for_path(path) == "integration"
+        or "/tests/conformance/" in f"/{normalized}"
+        or path.name in _SERIAL_CONTRACT_MODULES
+    )
 
 
 def classify_items(items: list[Any]) -> list[str]:
@@ -78,6 +100,8 @@ def classify_items(items: list[Any]) -> list[str]:
             item.add_marker(getattr(pytest.mark, expected))
         # Integration tests cross real component/process/thread boundaries.  Keep the
         # required PR shard deterministic; parallelism belongs to unit/contract tests.
-        if expected == "integration" and not list(item.iter_markers(name="serial")):
+        if requires_serial_execution(Path(str(item.path))) and not list(
+            item.iter_markers(name="serial")
+        ):
             item.add_marker(pytest.mark.serial)
     return errors
