@@ -370,7 +370,9 @@ Before production traffic:
 
 1. run both embedding golden paths offline;
 2. run fast, contract, serial integration, cross-platform, and install-smoke CI tiers;
-3. run the external conformance runner against each product implementation and replacement store;
+3. run the external `minimal-agent` profile against each product implementation, then call
+   `run_checkpoint_store_contract(factory, root)` and `run_capability_broker_contract(factory)`
+   directly for each replacement store or broker;
 4. execute the durability fault matrix for the selected checkpoint, activation, input, and effect
    paths;
 5. verify the compatibility ledger and package contents from the built wheel;

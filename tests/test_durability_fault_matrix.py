@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Barrier
 
 import pytest
+from support.runtime import runtime_config
 
 from monoid_agent_kernel.core.capability import (
     CapabilityLease,
@@ -134,6 +135,23 @@ def test_corrupt_truncated_and_future_checkpoint_matrix(
     assert checked.sequence == 1
 
 
+@pytest.mark.parametrize(("field", "value"), (("run_id", "run_other"), ("seq", 999)))
+def test_checkpoint_manifest_identity_must_match_lookup_and_committed_sequence(
+    fault_store: _FaultStore, field: str, value: object
+) -> None:
+    checkpoint = RunCheckpoint(run_id="run_bound", seq=1)
+    fault_store.store.put(checkpoint)
+    payload = checkpoint_payload_for_write(checkpoint)
+    payload[field] = value
+    fault_store.replace_manifest("run_bound", 1, json.dumps(payload))
+
+    checked = load_latest_checked(fault_store.store, "run_bound")
+
+    assert checked.status == "corrupt"
+    assert checked.sequence == 1
+    assert fault_store.store.latest("run_bound") is None
+
+
 def test_stale_latest_and_missing_blob_matrix(fault_store: _FaultStore) -> None:
     store = fault_store.store
     store.put(RunCheckpoint(run_id="run_pointer", seq=1, final_text="last-good"))
@@ -171,9 +189,15 @@ def test_interrupted_metadata_and_run_shared_divergence_matrix(
     fault_store: _FaultStore, tmp_path: Path
 ) -> None:
     run_id = "run_metadata"
+    config = runtime_config("fs.read", "run.finish")
     shared = {
         "schema_version": RUN_METADATA_SCHEMA_VERSION,
         "run_id": run_id,
+        "tenant_id": "tenant_a",
+        "user_id": "user_a",
+        "workspace_root": str(tmp_path),
+        "runtime_config": config.to_json(),
+        "runtime_config_hash": config.config_hash,
         "source": "shared",
     }
     fault_store.store.put_run_metadata(run_id, shared)  # type: ignore[attr-defined]
@@ -184,7 +208,8 @@ def test_interrupted_metadata_and_run_shared_divergence_matrix(
     fault_store.store.put_run_metadata(run_id, shared)  # type: ignore[attr-defined]
     run_dir = tmp_path / "local-run"
     local = {**shared, "source": "local"}
-    DurableMetadataCommitter(None).write_initial_metadata(run_dir, run_id, local)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps(local), encoding="utf-8")
     recovered = DurableMetadataCommitter(fault_store.store).read_recovery_metadata_checked(
         run_dir, run_id
     )

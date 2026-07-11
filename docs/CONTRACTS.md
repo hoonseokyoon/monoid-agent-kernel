@@ -265,6 +265,15 @@ one-shot contract for token streaming. `AgentLoop.astream` prefers the streaming
 its chunks into the same `ModelTurn`, event, error, and checkpoint path. Autonomous runs use the
 stream when `emit_output_deltas=True`.
 
+Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
+`next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
+cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provider task is detached
+so a cancellation-suppressing adapter cannot block the run result. Turn interrupt and pause remain
+step-boundary signals for non-streamed model calls. A synchronous adapter runs through
+`asyncio.to_thread`; Python cannot force-stop that worker thread, so cancellation and the run
+deadline take effect after `next_turn` returns. Sync adapters should enforce their own provider I/O
+timeout and idempotency policy.
+
 `ModelRequest` carries:
 
 - `instruction`
@@ -304,6 +313,13 @@ Authorization, scope, quota, approval, capability leases, and side-effect admiss
 before the handler starts. `tool.call.started` precedes handler execution; one
 `tool.call.finished` or `tool.call.failed` event follows it. Approved and capability-granted
 replays use the same async execution path.
+
+Approved calls use durable at-most-once replay delivery. Before each approved handler starts, the
+loop checkpoints consumption of that head only; unstarted approvals and observations from earlier
+completed heads remain in the durable tail. A process loss after the consume checkpoint does not
+retry the uncertain head, so its effect may have happened zero or one time. Handlers that need a
+stronger effect guarantee require a stable idempotency key or transactional outbox at their
+external boundary.
 
 Run cancellation and the run deadline cancel an in-flight native async handler and preserve the
 run-level `cancelled` or `run_timeout` result. Cleanup has a bounded
@@ -790,7 +806,9 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
   re-executes the gated call automatically at the next step (through the normal tool path, real
   permission/quota/events) and delivers the result to the model — no model retry needed. If a replay
   can't run cleanly (no valid lease), it falls back to model-retry. The gated tool never executed at
-  the gate, so the replay is its first and only execution (no double side effect).
+  the gate, so failure-free replay executes it once. Capability replay recovery is at-least-once: a
+  process loss before the next ordinary checkpoint restores the durable replay batch. Effectful
+  handlers therefore require a stable idempotency policy at their external boundary.
 - **Durable leases**: an escalation-approved lease is marked `durable` and checkpointed (the
   `token_ref` handle only, never a secret), so a restart does not re-prompt the approver; ephemeral
   sync grants are not persisted (re-brokered on restart). The gated call is captured in the durable
@@ -1077,8 +1095,10 @@ competing input.
 - `CheckedCheckpointStore` is the additive checked-read extension. Its
   `latest_checked(run_id)` result distinguishes `loaded`, `migrated`, `missing`,
   `corrupt`, and `unsupported_version`, including the observed schema and committed
-  sequence when available. `load_latest_checked()` adapts legacy stores, so existing
-  `CheckpointStore` implementations remain source-compatible.
+  sequence when available. A loaded record binds its embedded run ID and sequence to the lookup
+  key and committed pointer; structural or identity mismatches are `corrupt`.
+  `load_latest_checked()` adapts legacy stores, so existing `CheckpointStore` implementations
+  remain source-compatible.
 - Durable readers use `core.durable_codec.DurableCodec`: artifact versions parse as
   `<namespace>.<family>.vN`, accepted older versions migrate through pure ordered
   `dict -> dict` steps, and writers always emit the canonical current `monoid.*`
@@ -1101,15 +1121,19 @@ competing input.
 
 #### Reference operational scopes
 
-- The legacy Reference backend writes `run_dir/run.json` and stores the same recovery descriptor in the
-  configured `CheckpointStore`: identity, workspace, limits, policy, and the authoritative resolved
-  runtime config. Runtime-config hot-swaps update both copies with `runtime_config_version`,
-  `runtime_config_hash`, `runtime_config_issuer`, `runtime_config_reason`, and
-  `runtime_config_committed_at`; recovery verifies the hash before rebuilding providers or gateway
-  token sources. Its optional lease/watchdog profile allows a backend that never hosted the run to reclaim it from a shared lease/checkpoint
-  store, read the shared descriptor when local `run.json` is absent, materialize a local copy, then
-  resume. Checked metadata reads use the same five outcomes as checkpoints; corrupt or unsupported
-  local metadata is never replaced from shared storage as though it were missing. `recover_runs()`
+- The legacy Reference backend writes `run_dir/run.json` and stores the same recovery descriptor in
+  the configured `CheckpointStore`: identity, workspace, limits, policy, and the authoritative
+  resolved runtime config. Runtime-config hot-swaps update both copies with
+  `runtime_config_version`, `runtime_config_hash`, `runtime_config_issuer`,
+  `runtime_config_reason`, and `runtime_config_committed_at`; recovery verifies the hash before
+  rebuilding providers or gateway token sources. `metadata_generation` starts at one and advances
+  on each update. Recovery selects the higher generation, repairs the stale copy, and classifies
+  different payloads at the same generation as `corrupt`. Two legacy copies without a generation
+  retain local-authority behavior. Its optional lease/watchdog profile allows a backend that never
+  hosted the run to reclaim it from a shared lease/checkpoint store, read the shared descriptor
+  when local `run.json` is absent, materialize a local copy, then resume. Checked metadata reads
+  use the same five outcomes as checkpoints; corrupt or unsupported local metadata remains
+  authoritative bad state. `recover_runs()`
   writes an actionable failure bundle for corrupt or unsupported durable state. It scans
   `run_root`; the active watchdog discovers cross-instance orphaned
   runs from the shared lease store. Recovery skips terminal checkpoints and failed runs, rebuilds

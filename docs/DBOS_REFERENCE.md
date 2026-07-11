@@ -189,6 +189,11 @@ Finite workflows keep version-drain pressure bounded. A deployment retains compa
 code for pending work, keeps `application_version` stable across a slot restart, and changes the
 version when workflow operation order or durable input/result compatibility changes.
 
+The exported resume-command and run-receipt version constants describe this experimental
+Reference profile only. They are excluded from the stable Core compatibility inventory and carry
+no mixed-version rolling-reader guarantee in v0.18. Drain pending workflows before deploying an
+incompatible record or operation-order change.
+
 Official references:
 
 - [Workflow guarantees and idempotent workflow IDs](https://docs.dbos.dev/python/tutorials/workflow-tutorial)

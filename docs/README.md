@@ -49,6 +49,7 @@ building against, and securing the kernel.
 | [OPERATIONAL_RULE_COVERAGE.md](OPERATIONAL_RULE_COVERAGE.md) | Current rule-to-helper-to-profile-to-test coverage matrix and Phase 2S hardening matrix for OR-01 through OR-13. |
 | [RUNNER_BACKEND_RESPONSIBILITY_MAP.md](RUNNER_BACKEND_RESPONSIBILITY_MAP.md) | RunnerBackend facade/service split, private service responsibilities, and remaining runtime ownership. |
 | [PHASE_4_CLOSURE.md](PHASE_4_CLOSURE.md) | Phase 4 completion criteria, CI status, remaining flake risk, and structural closure position. |
+| [V0_18_RELEASE_AUDIT.md](V0_18_RELEASE_AUDIT.md) | Frozen-range multi-agent release audit, cross-challenges, dispositions, and hardening evidence. |
 | [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |
 | [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |

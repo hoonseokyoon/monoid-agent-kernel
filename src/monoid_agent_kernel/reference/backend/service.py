@@ -372,6 +372,7 @@ class RunnerBackend:
     _worker_id: str = field(default="", init=False, repr=False)
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _watchdog_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _watchdog_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _run_semaphore: asyncio.BoundedSemaphore | None = field(default=None, init=False, repr=False)
     # RNG for the outbox backoff jitter — a dedicated instance so a test can seed it deterministically
     # (backend._outbox_rng.seed(...)) without perturbing global random state.
@@ -1063,11 +1064,18 @@ class RunnerBackend:
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         assert self.command_store is not None
         execution_args = dict(redact_command_credential(args, token))
+        # Preserve the first-redacted payload for owner-local transient execution: legitimate
+        # credential-shaped domain fields must keep their value on that non-durable path. Durable
+        # storage gets a second bearer pass after JSON coercion because bytes/custom objects become
+        # repr strings and can reintroduce the authenticated credential.
+        stored_args = dict(
+            redact_command_credential(sanitize_command_data(execution_args), token)
+        )
         stored_command = StoredCommand(
             run_id=command.run_id,
             command_id=command_id,
             type=command.type,
-            args=dict(sanitize_command_data(execution_args)),
+            args=stored_args,
             principal=CommandPrincipal(
                 tenant_id=principal.tenant_id,
                 user_id=principal.user_id,
@@ -1821,24 +1829,39 @@ class RunnerBackend:
     def start_watchdog(self) -> None:
         """Begin the operational watchdog thread: heartbeat this backend's own runs and
         reclaim runs orphaned by a crashed peer (a stale lease). Opt-in and idempotent."""
-        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
-            return
-        self._heartbeat_own_runs()
-        self._watchdog_stop.clear()
-        thread = threading.Thread(
-            target=self._watchdog_loop,
-            name=f"monoid-watchdog-{self._worker_id[:8]}",
-            daemon=True,
-        )
-        self._watchdog_thread = thread
-        thread.start()
+        with self._watchdog_lock:
+            thread = self._watchdog_thread
+            if thread is not None and thread.is_alive():
+                return
+            self._heartbeat_own_runs()
+            self._watchdog_stop.clear()
+            thread = threading.Thread(
+                target=self._watchdog_loop,
+                name=f"monoid-watchdog-{self._worker_id[:8]}",
+                daemon=True,
+            )
+            self._watchdog_thread = thread
+            thread.start()
 
-    def stop_watchdog(self) -> None:
-        self._watchdog_stop.set()
-        thread = self._watchdog_thread
-        if thread is not None:
-            thread.join(timeout=5)
-        self._watchdog_thread = None
+    def stop_watchdog(self, *, timeout_s: float = 5.0) -> bool:
+        """Request watchdog shutdown and report whether its thread stopped within the bound.
+
+        A timed-out live thread remains registered, which fences a concurrent or later
+        ``start_watchdog`` call from creating a second operational owner.
+        """
+
+        with self._watchdog_lock:
+            self._watchdog_stop.set()
+            thread = self._watchdog_thread
+        if thread is None:
+            return True
+        thread.join(timeout=max(0.0, timeout_s))
+        stopped = not thread.is_alive()
+        if stopped:
+            with self._watchdog_lock:
+                if self._watchdog_thread is thread:
+                    self._watchdog_thread = None
+        return stopped
 
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.wait(self.watchdog_interval_s):

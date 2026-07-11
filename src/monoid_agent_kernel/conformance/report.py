@@ -16,6 +16,20 @@ CONFORMANCE_REPORT_VERSION = namespaced_id("conformance-report.v1")
 RuleStatus = Literal["passed", "failed", "error", "skipped"]
 
 
+def safe_exception_summary(exc: BaseException) -> str:
+    """Return a diagnostic category without copying exception text into CI artifacts."""
+
+    category = next(
+        (
+            cls.__name__
+            for cls in type(exc).__mro__
+            if cls.__module__ == "builtins" and issubclass(cls, BaseException)
+        ),
+        "Exception",
+    )
+    return f"{category}: details redacted"
+
+
 @dataclass(frozen=True)
 class ConformanceObservation:
     observation_id: str

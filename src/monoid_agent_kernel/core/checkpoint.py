@@ -17,6 +17,7 @@ observations, content parts, runtime config and hosted tasks live in the loop's
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import time
 from collections.abc import Callable, Mapping
@@ -142,7 +143,183 @@ class RunCheckpoint:
         return decode_checkpoint(payload).value
 
 
+_CHECKPOINT_STRING_FIELDS = frozenset(
+    {
+        "status",
+        "error",
+        "error_code",
+        "provider_error_code",
+        "final_text",
+    }
+)
+_CHECKPOINT_OPTIONAL_STRING_FIELDS = frozenset({"previous_turn_handle"})
+_CHECKPOINT_NONNEGATIVE_INT_FIELDS = frozenset(
+    {
+        "seq",
+        "provider_http_status",
+        "total_tool_calls",
+        "output_retries",
+        "session_step",
+        "submit_local_step",
+    }
+)
+_CHECKPOINT_BOOL_FIELDS = frozenset({"terminal", "revoked_all", "cancellation_requested"})
+_CHECKPOINT_LIST_OF_DICT_FIELDS = frozenset(
+    {
+        "pending_observations",
+        "messages",
+        "hosted_tasks",
+        "workspace_delta",
+        "capability_leases",
+        "pending_capability_replays",
+        "pending_tool_approval_replays",
+        "outbox_requests",
+    }
+)
+_CHECKPOINT_LIST_OF_STRING_FIELDS = frozenset(
+    {
+        "pending_binding_loads",
+        "reentry_queue",
+        "delivered_reentry_jobs",
+        "revoked_lease_ids",
+        "revoked_capabilities",
+        "inbox_seen_ids",
+        "applied_input_ids",
+    }
+)
+
+
+def _require_nonempty_string(value: object, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"checkpoint {field_name} must be a non-empty string")
+
+
+def _require_nonnegative_int(value: object, field_name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"checkpoint {field_name} must be a non-negative integer")
+
+
+def _require_finite_nonnegative_number(value: object, field_name: str) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value < 0
+    ):
+        raise ValueError(f"checkpoint {field_name} must be a finite non-negative number")
+
+
+def _require_list_of(value: object, item_type: type[object], field_name: str) -> None:
+    if not isinstance(value, list) or any(not isinstance(item, item_type) for item in value):
+        raise ValueError(f"checkpoint {field_name} has an invalid list shape")
+
+
+def _validate_counter_mapping(value: object, field_name: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"checkpoint {field_name} must be an object")
+    for key, count in value.items():
+        if not isinstance(key, str):
+            raise ValueError(f"checkpoint {field_name} keys must be strings")
+        _require_nonnegative_int(count, f"{field_name}.{key}")
+
+
+def _validate_active_input(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint active_input must be an object or null")
+    _require_nonempty_string(value.get("input_id"), "active_input.input_id")
+    if value.get("phase") not in {"running", "completed"}:
+        raise ValueError("checkpoint active_input.phase must be running or completed")
+    _require_nonnegative_int(value.get("source_seq"), "active_input.source_seq")
+
+
+def _validate_receipts(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint applied_input_receipts must be an object")
+    for input_id, receipt in value.items():
+        _require_nonempty_string(input_id, "applied_input_receipts key")
+        if not isinstance(receipt, dict):
+            raise ValueError("checkpoint applied_input_receipts values must be objects")
+        if "checkpoint_seq" in receipt:
+            _require_nonnegative_int(
+                receipt["checkpoint_seq"],
+                f"applied_input_receipts.{input_id}.checkpoint_seq",
+            )
+        if "terminal" in receipt and not isinstance(receipt["terminal"], bool):
+            raise ValueError(
+                f"checkpoint applied_input_receipts.{input_id}.terminal must be boolean"
+            )
+        if "suspension" in receipt and not isinstance(receipt["suspension"], dict):
+            raise ValueError(
+                f"checkpoint applied_input_receipts.{input_id}.suspension must be an object"
+            )
+        for field_name in ("checkpoint_sha256", "state", "error", "error_code"):
+            if field_name in receipt and not isinstance(receipt[field_name], str):
+                raise ValueError(
+                    f"checkpoint applied_input_receipts.{input_id}.{field_name} must be a string"
+                )
+
+
+def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
+    _require_nonempty_string(payload.get("run_id"), "run_id")
+    for field_name in _CHECKPOINT_STRING_FIELDS:
+        if field_name in payload and not isinstance(payload[field_name], str):
+            raise ValueError(f"checkpoint {field_name} must be a string")
+    for field_name in _CHECKPOINT_OPTIONAL_STRING_FIELDS:
+        if (
+            field_name in payload
+            and payload[field_name] is not None
+            and not isinstance(payload[field_name], str)
+        ):
+            raise ValueError(f"checkpoint {field_name} must be a string or null")
+    for field_name in _CHECKPOINT_NONNEGATIVE_INT_FIELDS:
+        if field_name in payload and payload[field_name] is not None:
+            _require_nonnegative_int(payload[field_name], field_name)
+    for field_name in _CHECKPOINT_BOOL_FIELDS:
+        if field_name in payload and not isinstance(payload[field_name], bool):
+            raise ValueError(f"checkpoint {field_name} must be boolean")
+    for field_name in _CHECKPOINT_LIST_OF_DICT_FIELDS:
+        if field_name in payload:
+            _require_list_of(payload[field_name], dict, field_name)
+    for field_name in _CHECKPOINT_LIST_OF_STRING_FIELDS:
+        if field_name in payload:
+            _require_list_of(payload[field_name], str, field_name)
+    if "pending_user_input" in payload and payload["pending_user_input"] is not None:
+        _require_list_of(payload["pending_user_input"], dict, "pending_user_input")
+    for field_name in ("previous_runtime_config", "workspace_base", "last_suspension"):
+        if (
+            field_name in payload
+            and payload[field_name] is not None
+            and not isinstance(payload[field_name], dict)
+        ):
+            raise ValueError(f"checkpoint {field_name} must be an object or null")
+    for field_name in ("tool_call_counts", "total_usage"):
+        if field_name in payload:
+            _validate_counter_mapping(payload[field_name], field_name)
+    for field_name in ("revoked_before", "remaining_duration_s"):
+        if field_name in payload and payload[field_name] is not None:
+            _require_finite_nonnegative_number(payload[field_name], field_name)
+    if "queued_messages" in payload:
+        messages = payload["queued_messages"]
+        if not isinstance(messages, list):
+            raise ValueError("checkpoint queued_messages must be a list")
+        for message in messages:
+            if isinstance(message, (str, dict)):
+                continue
+            if isinstance(message, list) and all(isinstance(part, dict) for part in message):
+                continue
+            raise ValueError(
+                "checkpoint queued_messages entries must be strings, envelopes, or content lists"
+            )
+    if "active_input" in payload:
+        _validate_active_input(payload["active_input"])
+    if "applied_input_receipts" in payload:
+        _validate_receipts(payload["applied_input_receipts"])
+
+
 def _checkpoint_from_payload(payload: dict[str, Any]) -> RunCheckpoint:
+    _validate_checkpoint_payload(payload)
     known = {name for name in RunCheckpoint.__dataclass_fields__}
     return RunCheckpoint(**{key: value for key, value in payload.items() if key in known})
 
@@ -161,6 +338,7 @@ def checkpoint_payload_for_write(checkpoint: RunCheckpoint) -> dict[str, Any]:
     """Return the canonical current writer shape regardless of a restored alias."""
     payload = checkpoint.to_json()
     payload["schema_version"] = SCHEMA_VERSION
+    _validate_checkpoint_payload(payload)
     return payload
 
 
@@ -256,13 +434,49 @@ class CheckedCheckpointStore(Protocol):
     def latest_checked(self, run_id: str) -> DurableLoadResult[CheckpointRecord]: ...
 
 
+def bind_checkpoint_record_result(
+    result: DurableLoadResult[CheckpointRecord], run_id: str
+) -> DurableLoadResult[CheckpointRecord]:
+    """Bind a checked record to its lookup key and committed sequence."""
+
+    if not result.ok:
+        return result
+    record = result.value
+    if not isinstance(record, CheckpointRecord):
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint store returned an invalid record",
+            sequence=result.sequence,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    if isinstance(record.seq, bool) or not isinstance(record.seq, int) or record.seq < 0:
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint store returned an invalid committed sequence",
+            sequence=result.sequence,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    if record.checkpoint.run_id != run_id:
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint manifest run_id does not match the requested run",
+            sequence=record.seq,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    if record.checkpoint.seq != record.seq:
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint manifest sequence does not match the committed sequence",
+            sequence=record.seq,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    if result.sequence is not None and result.sequence != record.seq:
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint checked result sequence does not match the committed record",
+            sequence=record.seq,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    return replace(result, sequence=record.seq)
+
+
 def load_latest_checked(store: CheckpointStore, run_id: str) -> DurableLoadResult[CheckpointRecord]:
     """Use a checked store when available and adapt legacy stores without breaking them."""
     checked = getattr(store, "latest_checked", None)
     if callable(checked):
         result = checked(run_id)
         if isinstance(result, DurableLoadResult):
-            return result
+            return bind_checkpoint_record_result(result, run_id)
         return CHECKPOINT_CODEC.corrupt("checkpoint store returned an invalid checked result").map(
             lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
         )
@@ -276,13 +490,16 @@ def load_latest_checked(store: CheckpointStore, run_id: str) -> DurableLoadResul
             family=CHECKPOINT_CODEC.family,
             current_schema=CHECKPOINT_CODEC.current_schema,
         )
-    return DurableLoadResult(
-        status="loaded",
-        family=CHECKPOINT_CODEC.family,
-        current_schema=CHECKPOINT_CODEC.current_schema,
-        value=record,
-        observed_schema=record.checkpoint.schema_version,
-        sequence=record.seq,
+    return bind_checkpoint_record_result(
+        DurableLoadResult(
+            status="loaded",
+            family=CHECKPOINT_CODEC.family,
+            current_schema=CHECKPOINT_CODEC.current_schema,
+            value=record,
+            observed_schema=record.checkpoint.schema_version,
+            sequence=record.seq,
+        ),
+        run_id,
     )
 
 @dataclass
@@ -365,10 +582,16 @@ class LocalFsCheckpointStore:
             payload = json.loads((self._dir(run_id) / "run_meta.json").read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError, OSError):
             return None
-        return dict(payload) if isinstance(payload, dict) else None
+        if not isinstance(payload, dict) or payload.get("run_id") != run_id:
+            return None
+        return dict(payload)
 
     def run_metadata_checked(self, run_id: str) -> DurableLoadResult[dict[str, Any]]:
-        from monoid_agent_kernel.core.durable_metadata import RUN_METADATA_CODEC, decode_run_metadata
+        from monoid_agent_kernel.core.durable_metadata import (
+            RUN_METADATA_CODEC,
+            bind_run_metadata_result,
+            decode_run_metadata,
+        )
 
         path = self._dir(run_id) / "run_meta.json"
         try:
@@ -381,7 +604,7 @@ class LocalFsCheckpointStore:
             payload = json.loads(raw)
         except ValueError:
             return RUN_METADATA_CODEC.corrupt("backend-run metadata is not valid JSON")
-        return decode_run_metadata(payload)
+        return bind_run_metadata_result(decode_run_metadata(payload), run_id)
 
     def _read_latest_seq(self, cdir: Path) -> int:
         try:
@@ -431,12 +654,15 @@ class LocalFsCheckpointStore:
             )
         decoded = replace(decode_checkpoint(manifest), sequence=seq)
         blobs_dir = cdir / "blobs"
-        return decoded.map(
-            lambda checkpoint: CheckpointRecord(
-                seq=seq,
-                checkpoint=checkpoint,
-                _blob_reader=lambda sha256: (blobs_dir / sha256).read_bytes(),
-            )
+        return bind_checkpoint_record_result(
+            decoded.map(
+                lambda checkpoint: CheckpointRecord(
+                    seq=seq,
+                    checkpoint=checkpoint,
+                    _blob_reader=lambda sha256: (blobs_dir / sha256).read_bytes(),
+                )
+            ),
+            run_id,
         )
 
     def latest(self, run_id: str) -> CheckpointRecord | None:

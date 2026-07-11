@@ -84,11 +84,14 @@ python -m monoid_agent_kernel.conformance.runner \
 Exit code `0` means every rule passed, `1` means at least one rule failed, and `2` means the runner
 could not load or execute the harness. Reports use stable rule IDs and typed expected/actual
 observations. `load_compatibility_fixtures()` supplies packaged historical wire and checkpoint
-payloads for downstream reader tests.
+payloads for downstream reader tests. JSON, JUnit, and console diagnostics retain a safe exception
+category and redact the exception body; keep raw stack traces in protected implementation logs.
 
-Store and broker implementers can call `run_checkpoint_store_contract(factory, root)` and
-`run_capability_broker_contract(factory)` directly from their own pytest suites or CI tools. These
-functions return the same typed rule outcomes and carry no pytest dependency.
+The v0.18 command-line runner executes the `minimal-agent` profile. Other profile harnesses remain
+Python test integrations. Store and broker implementers call
+`run_checkpoint_store_contract(factory, root)` and `run_capability_broker_contract(factory)`
+directly from their own pytest suites or CI tools. These functions return the same typed rule
+outcomes and carry no pytest dependency.
 
 ## Reference Full
 

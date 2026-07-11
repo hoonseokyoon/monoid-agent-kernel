@@ -105,7 +105,7 @@ jobs:
           tests/test_spec_serialization.py
 
   dbos-reference:
-    name: DBOS Reference lifecycle (Python ${{ matrix.python-version }})
+    name: Experimental DBOS activation recovery (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -116,7 +116,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install DBOS Reference profile
+      - name: Install experimental DBOS profile
         run: python -m pip install -e ".[dev,reference-dbos]"
       - name: Run DBOS process-restart and idempotency acceptance tests
         run: >-

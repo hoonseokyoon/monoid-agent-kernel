@@ -16,7 +16,7 @@ from support.waiting import eventually
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
-from monoid_agent_kernel.reference.command_inbox import SqliteCommandStore
+from monoid_agent_kernel.reference.command_inbox import InMemoryCommandStore, SqliteCommandStore
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE, TASK_CALLBACK_AUDIENCE
@@ -384,5 +384,117 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
     )
     assert report_receipt.result is not None
     assert callback_token not in str(report_receipt.to_json())
+
+    backend.cancel_run(submission.run_id, submission.run_token)
+
+
+@pytest.mark.parametrize("store_kind", ("memory", "sqlite"))
+def test_enqueue_control_redacts_bearer_reintroduced_by_json_coercion(
+    backend_factory: Any,
+    tmp_path: Path,
+    store_kind: str,
+) -> None:
+    workspace = backend_factory.workspace(f"workspace-{store_kind}")
+    db = tmp_path / "commands.db"
+    command_store = (
+        InMemoryCommandStore() if store_kind == "memory" else SqliteCommandStore(db)
+    )
+    token_manager = backend_factory.token_manager()
+    backend = backend_factory.create(
+        workspace=workspace,
+        token_manager=token_manager,
+        command_store=command_store,
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="wait",
+            runtime_config=runtime_config("run.finish"),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: backend._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+
+    captured: list[ControlCommand] = []
+    original_dispatch = backend._commands.dispatch
+
+    def capture_dispatch(command: ControlCommand, **kwargs: Any) -> Any:
+        captured.append(command)
+        return original_dispatch(command, **kwargs)
+
+    backend._commands.dispatch = capture_dispatch  # type: ignore[method-assign]
+
+    class OpaqueValue:
+        def __init__(self, bearer: str) -> None:
+            self.bearer = bearer
+
+        def __repr__(self) -> str:
+            return f"OpaqueValue({self.bearer})"
+
+    def command_for(token: str) -> tuple[ControlCommand, OpaqueValue]:
+        opaque = OpaqueValue(token)
+        return (
+            ControlCommand(
+                type="status",
+                run_id=submission.run_id,
+                command_id="cmd_repr_bearer",
+                args={
+                    "token": token,
+                    "bytes": token.encode(),
+                    "opaque": opaque,
+                    "nested": [token.encode(), opaque],
+                    "plain": f"prefix-{token}",
+                },
+            ),
+            opaque,
+        )
+
+    first_command, first_opaque = command_for(submission.run_token)
+    first_receipt = backend.enqueue_control(first_command)
+    assert first_receipt.status == "completed"
+    assert len(captured) == 1
+    assert captured[0].args["bytes"] == submission.run_token.encode()
+    assert captured[0].args["opaque"] is first_opaque
+    assert captured[0].args["nested"][1] is first_opaque
+
+    persisted = command_store.read_command(submission.run_id, "cmd_repr_bearer")
+    assert persisted is not None
+    assert persisted.args == {
+        "bytes": "b'[redacted]'",
+        "opaque": "OpaqueValue([redacted])",
+        "nested": ["b'[redacted]'", "OpaqueValue([redacted])"],
+        "plain": "prefix-[redacted]",
+    }
+    assert submission.run_token not in str(persisted.args)
+
+    rotated_token = token_manager.issue(
+        kind="run_access",
+        audience=BACKEND_AUDIENCE,
+        run_id=submission.run_id,
+        tenant_id="tenant",
+        user_id="user",
+        ttl_s=60,
+    )
+    assert rotated_token != submission.run_token
+    rotated_command, _ = command_for(rotated_token)
+    duplicate = backend.enqueue_control(rotated_command)
+    assert duplicate.status == "completed"
+    assert duplicate.result == first_receipt.result
+    assert len(captured) == 1
+
+    if store_kind == "sqlite":
+        with sqlite3.connect(db) as connection:
+            raw_args = connection.execute(
+                "SELECT args FROM command_inbox WHERE run_id=? AND command_id=?",
+                (submission.run_id, "cmd_repr_bearer"),
+            ).fetchone()
+        assert raw_args is not None
+        assert submission.run_token not in raw_args[0]
+        assert rotated_token not in raw_args[0]
 
     backend.cancel_run(submission.run_id, submission.run_token)

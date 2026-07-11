@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol
 
@@ -11,6 +13,7 @@ from monoid_agent_kernel.conformance.report import (
     ConformanceRuleOutcome,
     observation,
     outcome_from_observations,
+    safe_exception_summary,
 )
 from monoid_agent_kernel.core.capability import (
     CapabilityBroker,
@@ -34,19 +37,34 @@ class CapabilityBrokerFactory(Protocol):
     def __call__(self) -> CapabilityBroker: ...
 
 
+@contextmanager
+def _opened_checkpoint_store(
+    factory: CheckpointStoreFactory,
+    root: Path,
+) -> Iterator[CheckpointStore]:
+    store = factory(root)
+    try:
+        yield store
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+
 def run_checkpoint_store_contract(
     factory: CheckpointStoreFactory,
     root: Path,
 ) -> tuple[ConformanceRuleOutcome, ...]:
     """Execute backend-neutral checkpoint invariants without depending on pytest."""
 
-    store = factory(root)
     outcomes: list[ConformanceRuleOutcome] = []
     try:
-        missing = load_latest_checked(store, "contract_run")
-        store.put(RunCheckpoint(run_id="contract_run", seq=2, final_text="new"))
-        store.put(RunCheckpoint(run_id="contract_run", seq=1, final_text="stale"))
-        latest = store.latest("contract_run")
+        with _opened_checkpoint_store(factory, root) as store:
+            missing = load_latest_checked(store, "contract_monotonic")
+            store.put(RunCheckpoint(run_id="contract_monotonic", seq=2, final_text="new"))
+            store.put(RunCheckpoint(run_id="contract_monotonic", seq=1, final_text="stale"))
+        with _opened_checkpoint_store(factory, root) as reopened:
+            latest = reopened.latest("contract_monotonic")
         outcomes.append(
             outcome_from_observations(
                 "STORE-01-MONOTONIC-PUBLICATION",
@@ -54,10 +72,12 @@ def run_checkpoint_store_contract(
                 (
                     observation("initial_missing", expected="missing", actual=missing.status),
                     observation(
-                        "latest_sequence", expected=2, actual=latest.seq if latest else None
+                        "reopened_latest_sequence",
+                        expected=2,
+                        actual=latest.seq if latest else None,
                     ),
                     observation(
-                        "latest_payload",
+                        "reopened_latest_payload",
                         expected="new",
                         actual=latest.checkpoint.final_text if latest else None,
                     ),
@@ -68,7 +88,10 @@ def run_checkpoint_store_contract(
         outcomes.append(_error("STORE-01-MONOTONIC-PUBLICATION", STORE_CONTRACT_PROFILE, exc))
     try:
         data = b"conformance-blob"
-        digest = store.put_blob("contract_run", data)
+        with _opened_checkpoint_store(factory, root) as store:
+            digest = store.put_blob("contract_blob", data)
+        with _opened_checkpoint_store(factory, root) as reopened:
+            reopened_blob = reopened.get_blob("contract_blob", digest)
         outcomes.append(
             outcome_from_observations(
                 "STORE-02-CONTENT-ADDRESSED-BLOB",
@@ -80,9 +103,9 @@ def run_checkpoint_store_contract(
                         actual=digest,
                     ),
                     observation(
-                        "round_trip",
+                        "reopened_round_trip",
                         expected=data.hex(),
-                        actual=store.get_blob("contract_run", digest).hex(),
+                        actual=reopened_blob.hex(),
                     ),
                 ),
             )
@@ -90,22 +113,37 @@ def run_checkpoint_store_contract(
     except Exception as exc:
         outcomes.append(_error("STORE-02-CONTENT-ADDRESSED-BLOB", STORE_CONTRACT_PROFILE, exc))
     try:
-        store.put(RunCheckpoint(run_id="isolated_run", seq=1))
-        store.delete("contract_run")
+        with _opened_checkpoint_store(factory, root) as store:
+            store.put(RunCheckpoint(run_id="contract_deleted", seq=1))
+            store.put(RunCheckpoint(run_id="contract_isolated", seq=1))
+        with _opened_checkpoint_store(factory, root) as reopened:
+            reopened_before_delete = (
+                reopened.latest("contract_deleted") is not None
+                and reopened.latest("contract_isolated") is not None
+            )
+            reopened.delete("contract_deleted")
+        with _opened_checkpoint_store(factory, root) as reopened_after_delete:
+            deleted_missing = reopened_after_delete.latest("contract_deleted") is None
+            other_present = reopened_after_delete.latest("contract_isolated") is not None
         outcomes.append(
             outcome_from_observations(
                 "STORE-03-RUN-ISOLATION",
                 STORE_CONTRACT_PROFILE,
                 (
                     observation(
-                        "deleted_run_missing",
+                        "runs_survive_reopen_before_delete",
                         expected=True,
-                        actual=store.latest("contract_run") is None,
+                        actual=reopened_before_delete,
                     ),
                     observation(
-                        "other_run_present",
+                        "deleted_run_missing_after_reopen",
                         expected=True,
-                        actual=store.latest("isolated_run") is not None,
+                        actual=deleted_missing,
+                    ),
+                    observation(
+                        "other_run_present_after_reopen",
+                        expected=True,
+                        actual=other_present,
                     ),
                 ),
             )
@@ -199,5 +237,5 @@ def _error(rule_id: str, profile_id: str, exc: Exception) -> ConformanceRuleOutc
         rule_id=rule_id,
         profile_id=profile_id,
         status="error",
-        error=f"{type(exc).__name__}: {exc}",
+        error=safe_exception_summary(exc),
     )

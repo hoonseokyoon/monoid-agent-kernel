@@ -1,9 +1,16 @@
 # Compatibility Ledger
 
-This ledger is the release-facing inventory for public wire formats, durable artifacts,
+This ledger is the release-facing inventory for stable public wire formats, durable artifacts,
 namespace aliases, and source aliases. The machine-readable source is
 `monoid_agent_kernel.core.compatibility.PUBLIC_ARTIFACT_COMPATIBILITY`; the table below is
 checked against it in CI.
+
+Experimental optional Reference profiles are outside this stable inventory. In v0.18,
+`DbosResumeCommand` and `DbosRunReceipt` are experimental Reference operational records for the
+finite-activation proof. Core compatibility excludes them. Keep the DBOS `application_version`
+stable while pending work must recover, drain that work before an incompatible workflow change,
+and treat their exported version constants as local profile identifiers without a rolling-reader
+guarantee. DBOS types and upgrade policy stay inside the optional Reference profile.
 
 ## Reader policy
 
@@ -168,6 +175,12 @@ A checkpoint schema bump affects every non-terminal run. The release that first 
 version must also read the previous version and restore its message queue, inbox dedupe set,
 hosted tasks, continuation handle, runtime limits, and blob references. Keep that previous-version
 reader for the documented deprecation window.
+
+The v0.18 `monoid.backend-run.v1` writer adds `metadata_generation` without changing its schema
+identifier. New descriptors start at generation one and increment on every committed update.
+Recovery compares the local and shared copies, selects and repairs from the higher generation,
+and reports equal-generation divergence as `corrupt`. When both historical copies omit the field,
+the local descriptor retains authority. Older readers ignore this additive field.
 
 The v0.18 writer adds four optional recovery fields to `monoid.checkpoint.v1`:
 

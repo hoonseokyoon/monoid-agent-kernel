@@ -28,11 +28,16 @@ from monoid_agent_kernel.core.checkpoint import (
     CHECKPOINT_CODEC,
     CheckpointRecord,
     RunCheckpoint,
+    bind_checkpoint_record_result,
     checkpoint_payload_for_write,
     decode_checkpoint,
 )
 from monoid_agent_kernel.core.durable_codec import DurableLoadResult
-from monoid_agent_kernel.core.durable_metadata import RUN_METADATA_CODEC, decode_run_metadata
+from monoid_agent_kernel.core.durable_metadata import (
+    RUN_METADATA_CODEC,
+    bind_run_metadata_result,
+    decode_run_metadata,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -143,10 +148,13 @@ class SqliteCheckpointStore:
                 "checkpoint manifest is not valid JSON", sequence=seq
             ).map(lambda checkpoint: CheckpointRecord(seq=seq, checkpoint=checkpoint))
         decoded = replace(decode_checkpoint(payload), sequence=seq)
-        return decoded.map(
-            lambda checkpoint: CheckpointRecord(
-                seq=seq, checkpoint=checkpoint, _blob_reader=self._read_blob
-            )
+        return bind_checkpoint_record_result(
+            decoded.map(
+                lambda checkpoint: CheckpointRecord(
+                    seq=seq, checkpoint=checkpoint, _blob_reader=self._read_blob
+                )
+            ),
+            run_id,
         )
 
     def latest(self, run_id: str) -> CheckpointRecord | None:
@@ -199,8 +207,13 @@ class SqliteCheckpointStore:
             conn.close()
         if row is None:
             return None
-        payload = json.loads(row[0])
-        return dict(payload) if isinstance(payload, dict) else None
+        try:
+            payload = json.loads(row[0])
+        except ValueError:
+            return None
+        if not isinstance(payload, dict) or payload.get("run_id") != run_id:
+            return None
+        return dict(payload)
 
     def run_metadata_checked(self, run_id: str) -> DurableLoadResult[dict[str, object]]:
         conn = _connect(self._db_path)
@@ -214,7 +227,7 @@ class SqliteCheckpointStore:
             payload = json.loads(row[0])
         except ValueError:
             return RUN_METADATA_CODEC.corrupt("backend-run metadata is not valid JSON")
-        return decode_run_metadata(payload)
+        return bind_run_metadata_result(decode_run_metadata(payload), run_id)
 
     def _read_blob(self, sha256: str) -> bytes:
         conn = _connect(self._db_path)

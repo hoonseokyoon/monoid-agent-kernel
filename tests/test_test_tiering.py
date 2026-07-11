@@ -36,6 +36,7 @@ def test_primary_tier_policy(path: str, expected: str) -> None:
         "tests/test_backend.py",
         "tests/test_capability.py",
         "tests/test_checkpoint_store_contract.py",
+        "tests/test_command_store_contract.py",
         "tests/conformance/test_reference_full_profile.py",
     ],
 )

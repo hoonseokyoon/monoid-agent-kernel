@@ -675,6 +675,9 @@ class AgentLoop:
     # window; a handler that suppresses cancellation is detached so the run-level outcome can
     # still settle. Sync worker calls retain their existing non-preemptible boundary behavior.
     async_tool_cancel_grace_s: float = 1.0
+    # Native async model calls and streams use the same bounded-cancellation shape, but keep a
+    # separate knob so a slow provider connection cannot consume the tool-handler cleanup budget.
+    async_model_cancel_grace_s: float = 1.0
     shell_approval_provider: ShellApprovalProvider | None = None
     web_gateway_client: WebGatewayClient | None = None
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
@@ -1490,7 +1493,7 @@ class AgentLoop:
         self._owned_loop = None
         self._owned_loop_thread = None
 
-    async def _acall_model(self, request: ModelRequest) -> ModelTurn:
+    async def _acall_model(self, request: ModelRequest, deadline: float | None) -> ModelTurn:
         """Invoke the model adapter, awaiting an async adapter natively or offloading a
         sync ``next_turn`` to a thread so the event loop is never blocked on the LLM call.
 
@@ -1505,37 +1508,112 @@ class AgentLoop:
         if sink is not None and sink.active:
             astream_turn = getattr(adapter, "astream_turn", None)
             if astream_turn is not None:
-                return await self._acall_model_streaming(astream_turn, request, sink)
+                return await self._acall_model_streaming(astream_turn, request, sink, deadline)
         if self.emit_output_deltas:
             astream_turn = getattr(adapter, "astream_turn", None)
             if astream_turn is not None:
-                return await self._acall_model_emitting_deltas(astream_turn, request)
+                return await self._acall_model_emitting_deltas(astream_turn, request, deadline)
         anext = getattr(adapter, "anext_turn", None)
         if anext is not None:
-            return await anext(request)
+            return await self._await_native_model_call(anext(request), deadline)
         next_turn = adapter.next_turn
         if inspect.iscoroutinefunction(next_turn):
-            return await next_turn(request)
+            return await self._await_native_model_call(next_turn(request), deadline)
         return await asyncio.to_thread(next_turn, request)
+
+    async def _await_native_model_call(
+        self,
+        pending: Awaitable[ModelTurn],
+        deadline: float | None,
+    ) -> ModelTurn:
+        """Await native model I/O while propagating run cancellation and the run deadline.
+
+        Interrupt and pause remain step-boundary signals for one-shot model calls. They are
+        intentionally absent from this race and are checked by ``_apump_turn`` after the model
+        returns. Cancellation and deadlines are run boundaries, so they cancel the provider task
+        immediately and wait only a bounded interval for cooperative cleanup.
+        """
+
+        task = asyncio.ensure_future(pending)
+        loop = asyncio.get_running_loop()
+        cancelled: asyncio.Future[None] = loop.create_future()
+        outcome_consumed = False
+
+        def signal_cancelled() -> None:
+            def resolve() -> None:
+                if not cancelled.done():
+                    cancelled.set_result(None)
+
+            loop.call_soon_threadsafe(resolve)
+
+        remove_callback = (
+            self.cancellation_token.add_cancel_callback(signal_cancelled)
+            if self.cancellation_token is not None
+            else lambda: None
+        )
+        timeout = None if deadline is None else max(0.0, deadline - time.time())
+        try:
+            await asyncio.wait(
+                {task, cancelled},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            self._check_model_cancel_or_deadline(deadline)
+            if task.done():
+                outcome_consumed = True
+                return task.result()
+            if cancelled.done():
+                raise RunCancelled("run cancelled")
+            raise RunTimeout("run exceeded max duration")
+        finally:
+            remove_callback()
+            if not cancelled.done():
+                cancelled.cancel()
+            if not task.done():
+                task.cancel()
+                done, _pending = await asyncio.wait(
+                    {task}, timeout=max(0.0, self.async_model_cancel_grace_s)
+                )
+                if task not in done:
+                    task.add_done_callback(_consume_task_outcome)
+                else:
+                    _consume_task_outcome(task)
+            elif not outcome_consumed:
+                _consume_task_outcome(task)
 
     async def _acall_model_streaming(
         self,
         astream_turn: Callable[[ModelRequest], Any],
         request: ModelRequest,
         sink: QueueEventSink,
+        deadline: float | None,
     ) -> ModelTurn:
         """Drive an adapter's ``astream_turn``: relay each chunk to the live stream and
         accumulate them into the turn's ``ModelTurn`` (see ``assemble_streamed_turn``)."""
-        chunks: list[ModelStreamChunk] = []
-        async for chunk in astream_turn(request):
-            sink.push_delta(chunk)
-            chunks.append(chunk)
-        return assemble_streamed_turn(chunks)
+        agen = astream_turn(request)
+
+        async def consume() -> ModelTurn:
+            chunks: list[ModelStreamChunk] = []
+            try:
+                async for chunk in agen:
+                    sink.push_delta(chunk)
+                    chunks.append(chunk)
+            finally:
+                # Provider async iterators own network resources. Cooperative cancellation enters
+                # their ``finally`` and then explicitly closes the iterator; stubborn cleanup is
+                # detached by ``_await_native_model_call`` after its bounded grace interval.
+                aclose = getattr(agen, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            return assemble_streamed_turn(chunks)
+
+        return await self._await_native_model_call(consume(), deadline)
 
     async def _acall_model_emitting_deltas(
         self,
         astream_turn: Callable[[ModelRequest], Any],
         request: ModelRequest,
+        deadline: float | None,
     ) -> ModelTurn:
         """Autonomous-drive streaming (no RunStream queue): drive ``astream_turn`` and emit each
         text fragment as a ``model.output.delta`` event, so an event-stream consumer renders
@@ -1543,29 +1621,37 @@ class AgentLoop:
         identical to the one-shot path, so the rest of the turn is unchanged."""
         assert self._session is not None
         recorder = self._session.res.recorder
-        chunks: list[ModelStreamChunk] = []
         agen = astream_turn(request)
-        try:
-            async for chunk in agen:
-                chunks.append(chunk)
-                if isinstance(chunk, TextDelta) and chunk.text:
-                    recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
-                elif isinstance(chunk, ReasoningDelta) and chunk.text:
-                    # Display-only reasoning summary (DX-13b): a separate event so a consumer
-                    # renders it in a "thinking" view, distinct from the answer text.
-                    recorder.emit("model.reasoning.delta", data={"text": chunk.text}, level="debug")
-                # Immediate stop: when a turn interrupt arrives mid-stream, abort the in-flight
-                # generation now (don't wait for the next step boundary). The text already
-                # streamed stays; the except in arun_until_suspended parks the live session.
-                if self._interrupt_requested:
-                    raise TurnInterrupted("turn interrupted")
-        finally:
-            # Close the generator so the provider's stream/connection is released promptly
-            # (on a normal drain this is a no-op; on the mid-stream abort it cancels the wire).
-            aclose = getattr(agen, "aclose", None)
-            if aclose is not None:
-                await aclose()
-        return assemble_streamed_turn(chunks)
+
+        async def consume() -> ModelTurn:
+            chunks: list[ModelStreamChunk] = []
+            try:
+                async for chunk in agen:
+                    chunks.append(chunk)
+                    if isinstance(chunk, TextDelta) and chunk.text:
+                        recorder.emit(
+                            "model.output.delta", data={"text": chunk.text}, level="debug"
+                        )
+                    elif isinstance(chunk, ReasoningDelta) and chunk.text:
+                        # Display-only reasoning summary (DX-13b): a separate event so a consumer
+                        # renders it in a "thinking" view, distinct from the answer text.
+                        recorder.emit(
+                            "model.reasoning.delta", data={"text": chunk.text}, level="debug"
+                        )
+                    # Immediate stop: when a turn interrupt arrives mid-stream, abort the in-flight
+                    # generation now (don't wait for the next step boundary). The text already
+                    # streamed stays; the except in arun_until_suspended parks the live session.
+                    if self._interrupt_requested:
+                        raise TurnInterrupted("turn interrupted")
+            finally:
+                # Close the generator so the provider's stream/connection is released promptly
+                # (on a normal drain this is a no-op; on a bounded abort it cancels the wire).
+                aclose = getattr(agen, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            return assemble_streamed_turn(chunks)
+
+        return await self._await_native_model_call(consume(), deadline)
 
     def _record_failure(
         self,
@@ -1724,7 +1810,9 @@ class AgentLoop:
             delivered_reentry_jobs=tasks_payload["delivered_reentry_jobs"],
             workspace_delta=self._workspace_delta_entries(res.workspace),
             workspace_base=res.workspace.workspace_base_payload(self.spec.run_id),
-            remaining_duration_s=(res.deadline - time.time()) if res.deadline is not None else None,
+            remaining_duration_s=(
+                max(0.0, res.deadline - time.time()) if res.deadline is not None else None
+            ),
             cancellation_requested=bool(
                 self.cancellation_token is not None and self.cancellation_token.requested
             ),
@@ -2556,6 +2644,10 @@ class AgentLoop:
             # user-message observation so the model sees the outcome without retrying. A replay that
             # can't run cleanly (no valid lease) is skipped — the model then retries (fallback).
             if state.pending_capability_replays:
+                # Capability replays intentionally retain their durable at-least-once crash policy.
+                # No consumed checkpoint is written here: process loss before the next ordinary
+                # checkpoint restores the whole batch, so effectful handlers need stable
+                # idempotency at their external boundary.
                 pending_replays = state.pending_capability_replays
                 state.pending_capability_replays = ()
                 replay_obs_list: list[ToolObservation] = []
@@ -2577,32 +2669,31 @@ class AgentLoop:
                 replay_obs = tuple(replay_obs_list)
                 if replay_obs:
                     state.pending_observations = (*state.pending_observations, *replay_obs)
-            if state.pending_tool_approval_replays:
-                pending_replays = state.pending_tool_approval_replays
-                state.pending_tool_approval_replays = ()
-                # Persist the consumed approval replay before invoking the approved handler. If the
-                # process exits during the handler, restore must not re-deliver the same approval and
-                # execute a write/side-effecting tool twice.
+            while state.pending_tool_approval_replays:
+                replay = state.pending_tool_approval_replays[0]
+                state.pending_tool_approval_replays = state.pending_tool_approval_replays[1:]
+                # Approval replay delivery is durable at-most-once per head. Commit only this
+                # consumption before invoking the approved handler: a crash does not re-run the
+                # uncertain head, while the unstarted tail and every prior replay observation stay
+                # recoverable in this checkpoint.
                 self._persist_checkpoint(session)
-                replay_obs_list = []
-                for replay in pending_replays:
-                    obs = await self._aexecute_tool_approval_replay(
-                        replay,
-                        bound_catalog=bound_catalog,
-                        surface_snapshot=surface_snapshot,
-                        call_counts=state.tool_call_counts,
-                        context=context,
-                        recorder=recorder,
-                        turn_id=turn_id,
-                        step=step,
-                        side_effect_policy=side_effect_policy,
-                        deadline=deadline,
-                    )
-                    if obs is not None:
-                        replay_obs_list.append(obs)
-                replay_obs = tuple(replay_obs_list)
-                if replay_obs:
-                    state.pending_observations = (*state.pending_observations, *replay_obs)
+                obs = await self._aexecute_tool_approval_replay(
+                    replay,
+                    bound_catalog=bound_catalog,
+                    surface_snapshot=surface_snapshot,
+                    call_counts=state.tool_call_counts,
+                    context=context,
+                    recorder=recorder,
+                    turn_id=turn_id,
+                    step=step,
+                    side_effect_policy=side_effect_policy,
+                    deadline=deadline,
+                )
+                if obs is not None:
+                    # Fold the completed head immediately so the next head's safety checkpoint
+                    # durably carries its observation instead of losing all earlier outcomes on a
+                    # later replay crash.
+                    state.pending_observations = (*state.pending_observations, obs)
             # Replays run before the model request. If they consumed quota, rebuild the
             # model-facing surface so context providers and tools see the post-replay limits.
             if state.tool_call_counts != call_counts_before_replays:
@@ -2782,7 +2873,7 @@ class AgentLoop:
                 }
             )
             try:
-                turn = await self._acall_model(request)
+                turn = await self._acall_model(request, deadline)
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
@@ -4249,6 +4340,18 @@ class AgentLoop:
         # Run-level cancel (terminal) takes precedence over a turn-level interrupt (non-terminal).
         if self._interrupt_requested:
             raise TurnInterrupted("turn interrupted")
+
+    def _check_model_cancel_or_deadline(self, deadline: float | None) -> None:
+        """Check only terminal run boundaries while native model I/O is in flight.
+
+        Turn interrupt and pause keep their existing step-boundary behavior for non-streamed
+        adapters and are handled by ``_check_run_boundary`` after the model returns.
+        """
+
+        if self.cancellation_token is not None and self.cancellation_token.requested:
+            raise RunCancelled("run cancelled")
+        if deadline is not None and time.time() >= deadline:
+            raise RunTimeout("run exceeded max duration")
 
     def _emit_side_effect_event(
         self,

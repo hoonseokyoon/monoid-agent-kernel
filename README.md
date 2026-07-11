@@ -272,12 +272,16 @@ Fast local confidence checks:
 
 ```bash
 python -m pytest tests/conformance -q
-python -m pytest -q -n 4
-python -m pytest -q --cov=monoid_agent_kernel --cov=native_agent_runner
+python -m pytest -q -n 4 -m "(unit or contract) and not serial"
+python -m pytest -q -m "(integration or serial) and not live"
+python -m pytest -q -n 4 -m "(unit or contract) and not serial" \
+  --cov=monoid_agent_kernel --cov=native_agent_runner --cov-report=
+python -m pytest -q -m "(integration or serial) and not live" \
+  --cov=monoid_agent_kernel --cov=native_agent_runner --cov-append --cov-fail-under=80
 ```
 
-CI keeps the serial suite as the required gate and runs xdist plus coverage as
-advisory checks while the test seams stabilize. See
+CI requires deterministic parallel unit/contract and serial integration shards on Python 3.11
+and 3.12, an 80% branch-coverage floor, install smoke, and Windows/macOS smoke. See
 [docs/PHASE_4_CLOSURE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/PHASE_4_CLOSURE.md) for the current Phase 4
 structure closure and CI promotion criteria.
 
