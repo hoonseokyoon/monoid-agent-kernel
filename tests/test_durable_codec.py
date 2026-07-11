@@ -21,6 +21,8 @@ def test_artifact_version_parser_accepts_canonical_and_legacy_namespaces() -> No
     )
     assert parse_artifact_version("monoid.checkpoint.v0") is None
     assert parse_artifact_version("checkpoint-v1") is None
+    assert parse_artifact_version("monoid.checkpoint.v²") is None
+    assert parse_artifact_version("monoid.checkpoint.v١") is None
 
 
 def test_codec_distinguishes_loaded_corrupt_and_unsupported() -> None:
@@ -29,11 +31,13 @@ def test_codec_distinguishes_loaded_corrupt_and_unsupported() -> None:
     loaded = codec.decode({"schema_version": "monoid.demo.v1", "value": 1}, dict)
     legacy = codec.decode({"schema_version": "native-agent-runner.demo.v1", "value": 1}, dict)
     corrupt = codec.decode({"schema_version": "bad"}, dict)
+    unicode_version = codec.decode({"schema_version": "monoid.demo.v²"}, dict)
     future = codec.decode({"schema_version": "monoid.demo.v2"}, dict)
 
     assert loaded.status == "loaded" and loaded.value == {"schema_version": "monoid.demo.v1", "value": 1}
     assert legacy.status == "loaded" and legacy.observed_schema == "native-agent-runner.demo.v1"
     assert corrupt.status == "corrupt" and corrupt.error_code == "demo_corrupt"
+    assert unicode_version.status == "corrupt" and unicode_version.error_code == "demo_corrupt"
     assert future.status == "unsupported_version" and future.error_code == "demo_unsupported_version"
 
 

@@ -42,6 +42,9 @@ def test_run_metadata_validation_accepts_current_and_legacy_schema() -> None:
     assert decode_run_metadata({**current, "schema_version": "monoid.backend-run.v99"}).status == (
         "unsupported_version"
     )
+    assert decode_run_metadata({**current, "schema_version": "monoid.backend-run.v²"}).status == (
+        "corrupt"
+    )
 
 
 def test_runtime_config_hash_mismatch_is_rejected() -> None:

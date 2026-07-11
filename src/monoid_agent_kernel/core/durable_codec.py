@@ -30,9 +30,10 @@ def parse_artifact_version(value: object) -> ArtifactVersion | None:
     if len(parts) != 3 or not parts[0] or not parts[1]:
         return None
     version_token = parts[2]
-    if not version_token.startswith("v") or not version_token[1:].isdigit():
+    version_digits = version_token[1:] if version_token.startswith("v") else ""
+    if not version_digits or any(digit < "0" or digit > "9" for digit in version_digits):
         return None
-    version = int(version_token[1:])
+    version = int(version_digits)
     if version < 1:
         return None
     return ArtifactVersion(namespace=parts[0], family=parts[1], version=version, raw=value)
