@@ -18,7 +18,20 @@ COMMAND_ENVELOPE_VERSION = namespaced_id("command-inbox.v1")
 COMMAND_RECEIPT_VERSION = namespaced_id("command-receipt.v1")
 CommandStatus = Literal["pending", "claimed", "completed", "failed"]
 
-_SENSITIVE_KEY_PARTS = ("authorization", "credential", "password", "secret", "token", "api_key")
+_SENSITIVE_KEYS = frozenset(
+    {
+        "api_key",
+        "access_token",
+        "authorization",
+        "bearer_token",
+        "callback_token",
+        "credential",
+        "password",
+        "refresh_token",
+        "secret",
+        "token",
+    }
+)
 
 
 class CommandQueueFull(NativeAgentError):
@@ -91,6 +104,7 @@ class CommandReceipt:
     result: dict[str, Any] | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
+    transient_result: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -119,8 +133,8 @@ class CommandStore(Protocol):
 def sanitize_command_data(value: Any, *, key: str = "") -> Any:
     """Return JSON-safe persisted data with credential-shaped fields redacted."""
 
-    lowered = key.lower()
-    if key and any(part in lowered for part in _SENSITIVE_KEY_PARTS):
+    lowered = key.lower().replace("-", "_")
+    if key and (lowered in _SENSITIVE_KEYS or lowered.endswith("_password")):
         return "[redacted]"
     if isinstance(value, dict):
         return {

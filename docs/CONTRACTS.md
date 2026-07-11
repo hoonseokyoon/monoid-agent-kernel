@@ -573,6 +573,13 @@ the route preserves the historical `ControlResult` response. A remote owner yiel
 `monoid.command-receipt.v1`; poll
 `GET /v1/runs/{run_id}/control/{command_id}` until `completed` or `failed`.
 
+Task callback bearer tokens are accepted for `approve`, `deny`, and `report_task_result` at enqueue
+time and are never stored; the owner executes with its fresh run token. Durable capability
+`token_ref` values remain executable handles, consistent with checkpoint durability. Credential
+fields in command results, including newly issued callback tokens, are redacted in durable
+receipts. The immediate local response returns the original callback token once; a lost secret
+response cannot be recovered from the command store.
+
 Append is idempotent by `(run_id, command_id)`. A duplicate receives the existing receipt and does
 not execute a second command. Claims are oldest-first per run. A crashed claimant becomes eligible
 after `command_claim_ttl_s`; command handlers therefore retain their existing idempotency

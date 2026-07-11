@@ -235,7 +235,9 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                         }
                     )
                     receipt = backend.enqueue_control(command)
-                    if receipt.result is not None:
+                    if receipt.transient_result is not None:
+                        self._write_json(dict(receipt.transient_result))
+                    elif receipt.result is not None:
                         self._write_json(dict(receipt.result))
                     else:
                         self._write_json(receipt.to_json(), status=HTTPStatus.ACCEPTED)

@@ -149,3 +149,72 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
     assert submission.run_token not in persisted
     assert '"tenant_id": "tenant_a"' in row[1]
     assert '"user_id": "user_a"' in row[1]
+
+
+def test_local_command_returns_transient_callback_and_callback_token_can_enqueue(
+    backend_factory: Any,
+) -> None:
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(workspace=workspace)
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="wait",
+            runtime_config=runtime_config("run.finish"),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: backend._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+
+    server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        created = http_json(
+            f"{base_url}/v1/runs/{submission.run_id}/control",
+            {
+                "type": "create_task",
+                "command_id": "cmd_create_task",
+                "args": {
+                    "kind": "automation",
+                    "request": {"description": "external work"},
+                },
+                "issuer": "operator",
+            },
+            token=submission.run_token,
+        )
+        callback_token = created["data"]["callback_token"]
+        task_id = created["data"]["task_id"]
+        assert callback_token and callback_token != "[redacted]"
+
+        reported = http_json(
+            f"{base_url}/v1/runs/{submission.run_id}/control",
+            {
+                "type": "report_task_result",
+                "command_id": "cmd_callback_report",
+                "args": {
+                    "task_id": task_id,
+                    "result": {
+                        "answer": "done",
+                        "token_ref": "capability-handle",
+                    },
+                },
+                "issuer": "callback-worker",
+            },
+            token=callback_token,
+        )
+        assert reported["status"] == "ok"
+
+    persisted = backend.command_receipt(submission.run_id, submission.run_token, "cmd_create_task")
+    assert persisted.result is not None
+    assert persisted.result["data"]["callback_token"] == "[redacted]"
+    report_receipt = backend.command_receipt(
+        submission.run_id, submission.run_token, "cmd_callback_report"
+    )
+    assert report_receipt.result is not None
+    assert callback_token not in str(report_receipt.to_json())
+
+    backend.cancel_run(submission.run_id, submission.run_token)

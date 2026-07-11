@@ -95,7 +95,11 @@ def test_persisted_command_redacts_credential_shaped_fields(store: CommandStore)
         type="status",
         args={
             "access_token": "bearer-secret",
-            "nested": {"password": "do-not-store", "safe": "visible"},
+            "nested": {
+                "password": "do-not-store",
+                "safe": "visible",
+                "token_ref": "capability-handle",
+            },
         },
         principal=CommandPrincipal("tenant", "user", "operator"),
     )
@@ -104,7 +108,11 @@ def test_persisted_command_redacts_credential_shaped_fields(store: CommandStore)
 
     assert claimed is not None
     assert claimed.args["access_token"] == "[redacted]"
-    assert claimed.args["nested"] == {"password": "[redacted]", "safe": "visible"}
+    assert claimed.args["nested"] == {
+        "password": "[redacted]",
+        "safe": "visible",
+        "token_ref": "capability-handle",
+    }
 
 
 def test_sqlite_cross_instance_claim_has_exactly_one_winner(tmp_path: Path) -> None:

@@ -10,7 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -1034,7 +1034,7 @@ class RunnerBackend:
 
         args = dict(command.args)
         token = str(args.pop("token", "") or "")
-        claims = self._authorize_command_target(command.run_id, token)
+        principal = self._authorize_command_principal(command, args=args, token=token)
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         assert self.command_store is not None
         receipt = self.command_store.append(
@@ -1046,16 +1046,56 @@ class RunnerBackend:
                     redact_command_credential(sanitize_command_data(args), token)
                 ),
                 principal=CommandPrincipal(
-                    tenant_id=claims.tenant_id,
-                    user_id=claims.user_id,
+                    tenant_id=principal.tenant_id,
+                    user_id=principal.user_id,
                     issuer=str(redact_command_credential(command.issuer, token)),
                 ),
                 reason=str(redact_command_credential(command.reason, token)),
             ),
             max_pending=self.command_queue_limit,
         )
-        self._drain_command_inbox(command.run_id)
-        return self.command_store.receipt(command.run_id, command_id) or receipt
+        executed = self._drain_command_inbox(command.run_id)
+        current = self.command_store.receipt(command.run_id, command_id) or receipt
+        local_result = executed.get(command_id)
+        return (
+            replace(current, transient_result=local_result.to_json())
+            if local_result is not None
+            else current
+        )
+
+    def _authorize_command_principal(
+        self,
+        command: ControlCommand,
+        *,
+        args: dict[str, Any],
+        token: str,
+    ) -> CommandPrincipal:
+        try:
+            claims = self._authorize_command_target(command.run_id, token)
+            return CommandPrincipal(claims.tenant_id, claims.user_id, command.issuer)
+        except PermissionDenied:
+            if command.type not in {"approve", "deny", "report_task_result"}:
+                raise
+            self._commands.authorize_control_audit_target(
+                command.run_id,
+                token,
+                command_type=command.type,
+                args=args,
+            )
+            with self._lock:
+                record = self._records.get(command.run_id)
+            if record is not None:
+                return CommandPrincipal(record.tenant_id, record.user_id, command.issuer)
+            metadata = self._read_recovery_meta(
+                self.run_root / command.run_id, command.run_id
+            )
+            if metadata is None:
+                raise KeyError(command.run_id)
+            return CommandPrincipal(
+                str(metadata.get("tenant_id") or ""),
+                str(metadata.get("user_id") or ""),
+                command.issuer,
+            )
 
     def _authorize_command_target(self, run_id: str, token: str) -> Any:
         claims = self._verify_run_token(run_id, token)
@@ -1081,14 +1121,14 @@ class RunnerBackend:
             raise KeyError(command_id)
         return receipt
 
-    def _drain_command_inbox(self, run_id: str) -> list[str]:
+    def _drain_command_inbox(self, run_id: str) -> dict[str, ControlResult]:
         """Claim and execute commands only on the instance that owns the target run."""
 
         with self._lock:
             if run_id not in self._records:
-                return []
+                return {}
         assert self.command_store is not None
-        completed: list[str] = []
+        completed: dict[str, ControlResult] = {}
         while True:
             stored = self.command_store.claim(
                 run_id,
@@ -1116,7 +1156,7 @@ class RunnerBackend:
                     error_code=getattr(exc, "error_code", "command_execution_error"),
                 )
             self.command_store.acknowledge(run_id, stored.command_id, self._worker_id, result)
-            completed.append(stored.command_id)
+            completed[stored.command_id] = result
 
     def _dispatch_control_command(
         self,
