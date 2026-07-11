@@ -396,7 +396,10 @@ class LocalFsCheckpointStore:
 
     def latest_checked(self, run_id: str) -> DurableLoadResult[CheckpointRecord]:
         cdir = self._dir(run_id)
-        if not cdir.is_dir():
+        # Metadata and standalone blobs share this directory and may exist before the
+        # first checkpoint. Only a published LATEST pointer proves a checkpoint commit
+        # was attempted; without it the checkpoint state is genuinely missing.
+        if not cdir.is_dir() or not (cdir / "LATEST").exists():
             return CHECKPOINT_CODEC.missing().map(
                 lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
             )

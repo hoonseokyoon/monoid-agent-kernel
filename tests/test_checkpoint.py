@@ -241,6 +241,17 @@ def test_local_fs_store_put_gcs_orphan_blob_tmp(tmp_path: Path) -> None:
     assert (blobs_dir / ("b" * 64)).read_bytes() == b"data"
 
 
+def test_local_fs_checked_latest_treats_metadata_and_blob_only_runs_as_missing(tmp_path: Path) -> None:
+    store = LocalFsCheckpointStore(tmp_path)
+    store.put_run_metadata("metadata_only", {"run_id": "metadata_only"})
+    store.put_blob("blob_only", b"artifact")
+
+    assert store.latest_checked("metadata_only").status == "missing"
+    assert store.latest_checked("blob_only").status == "missing"
+    assert store.latest("metadata_only") is None
+    assert store.latest("blob_only") is None
+
+
 def test_snapshot_writes_checkpoint_at_hosted_park(tmp_path: Path) -> None:
     spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
     loop, _task_id, _run_dir, _artifacts = _hitl_parked_loop(spec)
