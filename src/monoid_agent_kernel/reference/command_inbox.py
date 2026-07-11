@@ -9,58 +9,22 @@ import time
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
-from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.reference._shared.control_transport import (
+    COMMAND_RECEIPT_VERSION as COMMAND_RECEIPT_VERSION,
+    CommandConflict,
+    CommandPrincipal,
+    CommandQueueFull,
+    CommandReceipt,
+    CommandStatus,
+    redact_command_credential as redact_command_credential,
+    sanitize_command_data,
+)
 
 COMMAND_ENVELOPE_VERSION = namespaced_id("command-inbox.v1")
-COMMAND_RECEIPT_VERSION = namespaced_id("command-receipt.v1")
-CommandStatus = Literal["pending", "claimed", "completed", "failed"]
-
-_SENSITIVE_KEYS = frozenset(
-    {
-        "api_key",
-        "access_token",
-        "authorization",
-        "bearer_token",
-        "callback_token",
-        "credential",
-        "password",
-        "refresh_token",
-        "secret",
-        "token",
-    }
-)
-_SENSITIVE_COMPACT_KEYS = frozenset(key.replace("_", "") for key in _SENSITIVE_KEYS)
-
-
-class CommandQueueFull(NativeAgentError):
-    error_code = "command_queue_full"
-
-
-class CommandConflict(NativeAgentError):
-    error_code = "command_id_conflict"
-
-
-@dataclass(frozen=True)
-class CommandPrincipal:
-    tenant_id: str
-    user_id: str
-    issuer: str = ""
-
-    @property
-    def actor(self) -> str:
-        authenticated = f"{self.tenant_id}/{self.user_id}"
-        return f"{authenticated} ({self.issuer})" if self.issuer else authenticated
-
-    def to_json(self) -> dict[str, str]:
-        return {
-            "tenant_id": self.tenant_id,
-            "user_id": self.user_id,
-            "issuer": self.issuer,
-        }
 
 
 @dataclass(frozen=True)
@@ -106,28 +70,6 @@ class StoredCommand:
         )
 
 
-@dataclass(frozen=True)
-class CommandReceipt:
-    run_id: str
-    command_id: str
-    status: CommandStatus
-    result: dict[str, Any] | None = None
-    created_at: float = 0.0
-    updated_at: float = 0.0
-    transient_result: dict[str, Any] | None = field(default=None, repr=False, compare=False)
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "schema_version": COMMAND_RECEIPT_VERSION,
-            "run_id": self.run_id,
-            "command_id": self.command_id,
-            "status": self.status,
-            "result": dict(self.result) if self.result is not None else None,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-
-
 class CommandStore(Protocol):
     def append(
         self, command: StoredCommand, *, max_pending: int, require_empty: bool = False
@@ -142,45 +84,6 @@ class CommandStore(Protocol):
     ) -> CommandReceipt: ...
 
     def receipt(self, run_id: str, command_id: str) -> CommandReceipt | None: ...
-
-
-def sanitize_command_data(value: Any, *, key: str = "") -> Any:
-    """Return JSON-safe persisted data with credential-shaped fields redacted."""
-
-    lowered = key.lower()
-    compact = "".join(character for character in lowered if character.isalnum())
-    sensitive_suffix = compact.endswith(("password", "secret", "secretkey"))
-    if key and (compact in _SENSITIVE_COMPACT_KEYS or sensitive_suffix):
-        return "[redacted]"
-    if isinstance(value, dict):
-        return {
-            str(item_key): sanitize_command_data(item, key=str(item_key))
-            for item_key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [sanitize_command_data(item) for item in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return repr(value)
-
-
-def redact_command_credential(value: Any, credential: str) -> Any:
-    """Remove the authenticated bearer value if a caller repeated it in payload text."""
-
-    if not credential:
-        return value
-    if isinstance(value, dict):
-        return {
-            str(item_key).replace(credential, "[redacted]"): redact_command_credential(
-                item, credential
-            )
-            for item_key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [redact_command_credential(item, credential) for item in value]
-    if isinstance(value, str):
-        return value.replace(credential, "[redacted]")
-    return value
 
 
 def _same_command_identity(existing: StoredCommand, submitted: StoredCommand) -> bool:

@@ -71,6 +71,11 @@ otel-export = [
 mcp = [
     "httpx>=0.27",
 ]
+# Optional DBOS-backed Reference control-plane profile. DBOS owns durable command workflow
+# execution; it is intentionally excluded from the lightweight default installation.
+reference-dbos = [
+    "dbos>=2.26,<2.27",
+]
 
 [project.scripts]
 monoid = "monoid_agent_kernel.cli:main"

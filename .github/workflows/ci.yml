@@ -104,6 +104,27 @@ jobs:
           tests/test_file_lock.py
           tests/test_spec_serialization.py
 
+  dbos-control:
+    name: DBOS control-plane spike (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install DBOS Reference profile
+        run: python -m pip install -e ".[dev,reference-dbos]"
+      - name: Run DBOS process-restart and idempotency acceptance tests
+        run: >-
+          python -m pytest -q
+          tests/test_backend_dbos_control.py
+          tests/test_dbos_control_models.py
+          --durations=10
+
   install-smoke:
     name: Install smoke (${{ matrix.install }})
     runs-on: ubuntu-latest
@@ -114,7 +135,7 @@ jobs:
           - install: minimal
             requirement: "."
           - install: all-extras
-            requirement: ".[openai,http-async,otel-export,mcp]"
+            requirement: ".[openai,http-async,otel-export,mcp,reference-dbos]"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -128,7 +149,8 @@ jobs:
           import monoid_agent_kernel.providers.openai;
           import monoid_agent_kernel.providers.gateway;
           import monoid_agent_kernel.observability.otel;
-          import monoid_agent_kernel.mcp"
+          import monoid_agent_kernel.mcp;
+          import monoid_agent_kernel.reference.dbos"
       - name: Verify optional dependencies
         if: matrix.install == 'all-extras'
-        run: python -c "import openai, httpx, opentelemetry.sdk"
+        run: python -c "import dbos, openai, httpx, opentelemetry.sdk"
