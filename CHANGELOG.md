@@ -7,6 +7,13 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+- Added an external minimal-agent conformance runner with stable rule IDs, typed observations,
+  versioned JSON and JUnit reports, packaged compatibility fixtures, and reusable checkpoint-store
+  and capability-broker implementation contracts.
+- Added deterministic LocalFS/SQLite durability fault coverage for corrupt and future checkpoints,
+  missing blobs, stale publication pointers, interrupted writes, metadata divergence, lease races,
+  side-effect recovery, and capability revocation.
+
 ### Added
 - Added versioned durable codecs with explicit loaded, migrated, missing, corrupt,
   and unsupported-version outcomes; LocalFS and SQLite checkpoint stores and

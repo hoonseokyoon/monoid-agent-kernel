@@ -21,6 +21,14 @@ class ConformanceHarness(Protocol):
 
 
 @runtime_checkable
+class MinimalAgentHarness(ConformanceHarness, Protocol):
+    """Executable lifecycle observations for the minimal-agent profile."""
+
+    def run_minimal_lifecycle_case(self) -> JsonObject:
+        """Return submission, lifecycle, result, and event-sequence observations."""
+
+
+@runtime_checkable
 class BackendHarness(ConformanceHarness, Protocol):
     """Raw backend operations kept for compatibility and custom harnesses."""
 
@@ -30,7 +38,9 @@ class BackendHarness(ConformanceHarness, Protocol):
     def status(self, run_id: str, token: str) -> JsonObject:
         """Return the backend status projection for a run."""
 
-    def events(self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None) -> JsonObject:
+    def events(
+        self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
+    ) -> JsonObject:
         """Return a page of run events."""
 
     def descendant_events(

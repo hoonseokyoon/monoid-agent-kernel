@@ -6,14 +6,14 @@ small profile, while a durable multi-agent backend can run the control, capabili
 multi-agent profiles.
 
 The reusable package lives under `monoid_agent_kernel.conformance`. It provides profile metadata,
-harness protocols, reusable assertion helpers, and a bundled Reference factory that runs the
-profiles against the shipped implementation.
+harness protocols, reusable implementation contracts, typed observations, JSON and JUnit reports,
+and a bundled Reference factory that runs the profiles against the shipped implementation.
 
 ## Profiles
 
 | Profile | Target runtime | Contract rules |
 | --- | --- | --- |
-| `minimal-agent` | Local loop or chatbot-style integration | Metadata registration profile; concrete assertions remain future profile work. |
+| `minimal-agent` | Local loop or chatbot-style integration | `MIN-01-SUBMISSION`, `MIN-02-LIFECYCLE`, `MIN-03-RESULT`, `MIN-04-EVENT-SEQUENCE` |
 | `tool-agent` | Agent that executes tools | `OR-10-TOOL-SURFACE-ADMISSION`, `OR-11-GENERIC-ASK-APPROVAL` |
 | `side-effect-tool-agent` | Agent that executes external side-effect tools | `OR-12-DURABLE-SIDE-EFFECT` |
 | `message-fabric` | Agent runtime that exchanges peer-agent messages | `OR-13-EXTERNAL-AGENT-ENVELOPE` |
@@ -28,6 +28,7 @@ profiles against the shipped implementation.
 
 | Profile | Assertion helpers | Harnesses |
 | --- | --- | --- |
+| `minimal-agent` | `run_minimal_agent_profile` through the external runner | `MinimalAgentHarness` |
 | `provider-gateway` | `assert_provider_gateway_profile` | `GatewayHarness` |
 | `tool-agent` | `assert_tool_agent_surface_admission_profile`; `assert_tool_agent_generic_ask_approval_profile` | `ToolAgentHarness` |
 | `side-effect-tool-agent` | `assert_side_effect_tool_agent_profile` | `SideEffectHarness` |
@@ -38,8 +39,9 @@ profiles against the shipped implementation.
 | `multi-agent` | `assert_multi_agent_backend_boundary_profile`; `assert_multi_agent_backend_capability_boundary_profile`; `assert_multi_agent_shared_revocation_profile` | `MultiAgentBackendHarness`; `CapabilityHarness` |
 | `reference-full` | `assert_reference_full_profile` | `ReferenceFullFactory` with backend, capability, gateway, side-effect, message-fabric, and Studio harnesses |
 
-`minimal-agent` remains a registered metadata profile. `tool-agent` is executable for tool surface
-admission and generic approval behavior. `side-effect-tool-agent` adds the optional durable
+`minimal-agent` executes submission, lifecycle, result, and event-sequence rules through a narrow
+external harness. `tool-agent` is executable for tool surface admission and generic approval
+behavior. `side-effect-tool-agent` adds the optional durable
 external side-effect profile for runtimes that expose those tools. `message-fabric` adds the
 optional external-agent envelope profile for runtimes that exchange messages with peer agents.
 
@@ -47,6 +49,7 @@ optional external-agent envelope profile for runtimes that exchange messages wit
 
 The conformance package defines profile-specific Protocol families:
 
+- `MinimalAgentHarness`: reports one submission-to-result lifecycle and its event sequence.
 - `ToolAgentHarness`: runs tool surface admission and generic approval behavior cases.
 - `ControlPlaneHarness`: runs decision and control audit sequencing behavior cases.
 - `DurableRunnerHarness`: runs event sequence, recovery metadata, and subagent diagnostics cases.
@@ -63,6 +66,29 @@ The conformance package defines profile-specific Protocol families:
 
 The bundled Reference implementation is the first harness target. External backends can implement
 the same harness protocols and run the same profile suite.
+
+## External Runner and Implementation Contracts
+
+An external implementation exposes a zero-argument `module:factory` that returns a
+`ConformanceHarness`. The runner emits its versioned JSON report to stdout, optionally writes the
+same report to a file, and can produce JUnit XML for CI systems:
+
+```bash
+python -m monoid_agent_kernel.conformance.runner \
+  --harness your_package.conformance:create_harness \
+  --profile minimal-agent \
+  --json-out build/conformance.json \
+  --junit-out build/conformance.xml
+```
+
+Exit code `0` means every rule passed, `1` means at least one rule failed, and `2` means the runner
+could not load or execute the harness. Reports use stable rule IDs and typed expected/actual
+observations. `load_compatibility_fixtures()` supplies packaged historical wire and checkpoint
+payloads for downstream reader tests.
+
+Store and broker implementers can call `run_checkpoint_store_contract(factory, root)` and
+`run_capability_broker_contract(factory)` directly from their own pytest suites or CI tools. These
+functions return the same typed rule outcomes and carry no pytest dependency.
 
 ## Reference Full
 
