@@ -11,6 +11,9 @@ out in commit messages and here.
 - Added versioned durable codecs with explicit loaded, migrated, missing, corrupt,
   and unsupported-version outcomes; LocalFS and SQLite checkpoint stores and
   Reference recovery now use checked checkpoint and run-metadata reads.
+- Added a machine-readable compatibility registry and matching ledger for public wire and
+  durable artifacts, aliases, mixed-version operation, schema evolution, and coordinated
+  upgrade/rollback procedures.
 
 ### Changed
 - Classified every test into an enforced unit, contract, or integration tier and

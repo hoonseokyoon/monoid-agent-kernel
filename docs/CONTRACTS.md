@@ -84,7 +84,8 @@ including `monoid.backend` and `monoid.task-callback`.
 
 Readers, validators, and gateway parsers accept the pre-rename `native-agent-runner.*`
 identifiers during migration so existing durable run artifacts and gateway clients continue
-to load.
+to load where listed. The exact per-artifact reader policy, including permissive and
+writer-only exceptions, is maintained in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Python Contracts
 

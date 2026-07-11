@@ -30,6 +30,14 @@ from monoid_agent_kernel.core.checkpoint import (
     RunCheckpoint,
 )
 from monoid_agent_kernel.core.durable_codec import ArtifactVersion, DurableLoadResult, DurableLoadStatus
+from monoid_agent_kernel.core.compatibility import (
+    PUBLIC_ARTIFACT_COMPATIBILITY,
+    PUBLIC_COMPATIBILITY_ALIASES,
+    CompatibilityAlias,
+    CompatibilityArtifact,
+    compatibility_artifact,
+    compatibility_registry,
+)
 
 # Workspace seam (the file-storage surface the engine works through; the local backend is
 # the default, integrators supply their own via AgentLoop.workspace_factory)
@@ -221,6 +229,12 @@ __all__ = [
     "ArtifactVersion",
     "DurableLoadResult",
     "DurableLoadStatus",
+    "CompatibilityAlias",
+    "CompatibilityArtifact",
+    "PUBLIC_ARTIFACT_COMPATIBILITY",
+    "PUBLIC_COMPATIBILITY_ALIASES",
+    "compatibility_artifact",
+    "compatibility_registry",
     # workspace seam (file-storage surface; the local backend is the default)
     "Workspace",
     "WorkspaceFactory",
