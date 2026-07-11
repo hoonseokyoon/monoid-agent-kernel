@@ -183,8 +183,8 @@ Every durable family has a versioned codec and compatibility-ledger entry. Upgra
 4. monitor unsupported/corrupt load results;
 5. retire an old reader only after rollback no longer needs it.
 
-Run `python -m monoid_agent_kernel.compatibility --check` and follow the mixed-version playbooks in
-[COMPATIBILITY.md](COMPATIBILITY.md).
+Run `python -m pytest -q tests/test_compatibility_ledger.py` to execute the machine-checked ledger,
+then follow the mixed-version playbooks in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Streaming and cursor ownership
 
