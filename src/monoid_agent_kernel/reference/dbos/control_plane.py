@@ -15,6 +15,7 @@ import importlib
 import math
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
@@ -172,7 +173,8 @@ class DbosControlEnvelope:
             raise ValueError("authenticated tenant_id and user_id are required")
         args = dict(command.args)
         token = str(args.pop("token", "") or "")
-        if token and (token in command.run_id or token in command.command_id):
+        command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
+        if token and (token in command.run_id or token in command_id):
             raise NativeAgentError(
                 "run_id and command_id must not contain the authenticated credential",
                 error_code="invalid_command_id",
@@ -185,7 +187,7 @@ class DbosControlEnvelope:
         )
         return cls(
             run_id=command.run_id,
-            command_id=command.command_id,
+            command_id=command_id,
             type=command.type,  # type: ignore[arg-type]
             args=dict(execution_args),
             principal=CommandPrincipal(

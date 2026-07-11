@@ -345,6 +345,30 @@ def test_dbos_control_plane_close_waits_for_an_active_dispatch_within_grace(
     assert result["replacement_constructed"] is True
 
 
+def test_dbos_control_plane_generates_and_returns_an_omitted_command_id(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "generated-id.sqlite"
+    output_path = tmp_path / "generated-id.json"
+
+    completed = _run_worker(
+        root,
+        "generated-id",
+        "--db",
+        str(db_path),
+        "--output",
+        str(output_path),
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    command_id = result["admitted"]["command_id"]
+    assert command_id.startswith("control_")
+    assert result["completed"]["command_id"] == command_id
+    assert result["completed"]["status"] == "completed"
+
+
 def test_dbos_profile_does_not_import_legacy_owner_or_inbox_orchestration() -> None:
     root = Path(__file__).resolve().parents[1]
     source = (root / "src/monoid_agent_kernel/reference/dbos/control_plane.py").read_text(

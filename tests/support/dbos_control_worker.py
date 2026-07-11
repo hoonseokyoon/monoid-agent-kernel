@@ -502,6 +502,26 @@ def shutdown_success_phase(db_path: Path, output_path: Path) -> None:
     )
 
 
+def generated_id_phase(db_path: Path, output_path: Path) -> None:
+    plane = DbosControlPlane(_config(db_path), _ok)
+    plane.launch()
+    admitted = plane.enqueue_control(
+        ControlCommand(type="status", run_id="run_generated_id"),
+        tenant_id="tenant",
+        user_id="user",
+    )
+    completed = plane.wait_for_receipt(
+        "run_generated_id",
+        admitted.command_id,
+        timeout_s=20,
+    )
+    _write_json(
+        output_path,
+        {"admitted": admitted.to_json(), "completed": completed.to_json()},
+    )
+    plane.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -517,6 +537,7 @@ def main() -> None:
             "queue-config",
             "shutdown",
             "shutdown-success",
+            "generated-id",
         ),
     )
     parser.add_argument("--db", type=Path, required=True)
@@ -551,9 +572,12 @@ def main() -> None:
     elif args.mode == "shutdown":
         assert args.output is not None
         shutdown_phase(args.db, args.output)
-    else:
+    elif args.mode == "shutdown-success":
         assert args.output is not None
         shutdown_success_phase(args.db, args.output)
+    else:
+        assert args.output is not None
+        generated_id_phase(args.db, args.output)
 
 
 if __name__ == "__main__":

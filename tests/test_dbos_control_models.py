@@ -180,3 +180,14 @@ def test_dbos_envelope_requires_authenticated_principal(
             tenant_id=tenant_id,
             user_id=user_id,
         )
+
+
+def test_dbos_envelope_generates_an_id_when_the_control_command_omits_it() -> None:
+    envelope = DbosControlEnvelope.from_control_command(
+        ControlCommand(type="status", run_id="run_1"),
+        tenant_id="tenant",
+        user_id="user",
+    )
+
+    assert envelope.command_id.startswith("control_")
+    assert len(envelope.command_id) == len("control_") + 12
