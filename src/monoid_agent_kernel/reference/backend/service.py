@@ -1043,6 +1043,11 @@ class RunnerBackend:
                 "returned without durable persistence",
                 error_code="command_requires_owner",
             )
+        if token and token in command.command_id:
+            raise NativeAgentError(
+                "command_id must not contain the authenticated credential",
+                error_code="invalid_command_id",
+            )
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         assert self.command_store is not None
         receipt = self.command_store.append(

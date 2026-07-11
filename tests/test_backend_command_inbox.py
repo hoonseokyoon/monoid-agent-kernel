@@ -15,7 +15,7 @@ from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest
 from monoid_agent_kernel.reference.command_inbox import SqliteCommandStore
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
-from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE, TASK_CALLBACK_AUDIENCE
 from monoid_agent_kernel.core.control import ControlCommand
 
@@ -101,6 +101,15 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
                 run_id=submission.run_id,
                 args={"token": wrong_callback_subject, "task_id": "task_unknown"},
                 command_id="cmd_wrong_callback_credential_subject",
+            )
+        )
+    with pytest.raises(NativeAgentError, match="command_id must not contain"):
+        peer.enqueue_control(
+            ControlCommand(
+                type="status",
+                run_id=submission.run_id,
+                args={"token": submission.run_token},
+                command_id=f"cmd_{submission.run_token}",
             )
         )
     valid_callback = token_manager.issue(
