@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from support.backend_harness import (
     BackendRunRequest,
     HTTPError,
@@ -186,6 +188,50 @@ def test_backend_event_sse_resumes_from_last_event_id_without_duplicates(tmp_pat
         assert "event: end" in body
         resumed_ids, _ = read(str(ids[0]))
         assert resumed_ids == ids[1:]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_backend_event_sse_establishes_immediately_when_live_stream_is_caught_up(
+    backend_factory: Any,
+) -> None:
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(workspace=workspace)
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="wait",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: backend._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+    last_seq = backend.events(submission.run_id, submission.run_token)["events"][-1]["seq"]
+    server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        _wait_http_ready(base_url)
+        request = Request(
+            f"{base_url}/v1/runs/{submission.run_id}/events?from_seq=0",
+            headers={
+                "Authorization": f"Bearer {submission.run_token}",
+                "Accept": "text/event-stream",
+                "Last-Event-ID": str(last_seq),
+            },
+        )
+        with urlopen(request, timeout=2) as response:
+            assert response.headers["Content-Type"].startswith("text/event-stream")
+            assert response.readline() == b": connected\n"
+        backend.cancel_run(submission.run_id, submission.run_token)
     finally:
         server.shutdown()
         server.server_close()
