@@ -45,6 +45,7 @@ from monoid_agent_kernel.core.context import TurnContext
 from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.content import ContentPart, DocumentPart, ImagePart, TextPart
+from monoid_agent_kernel.core.event_subscription import EventSubscription, SequenceCursor
 from monoid_agent_kernel.core.external_agent_envelope import (
     external_agent_envelope_to_inbox_message,
     validate_external_agent_envelope,
@@ -1347,14 +1348,34 @@ class StudioServer:
         return self._backend.interrupt_turn(run_id, token)
 
     def poll_events(self, run_id: str, from_seq: int) -> dict[str, Any]:
+        return self.event_subscription(run_id, from_seq=from_seq).poll()
+
+    def event_subscription(
+        self,
+        run_id: str,
+        *,
+        from_seq: int = 0,
+        last_event_id: str | None = None,
+    ) -> EventSubscription:
+        """Create the Studio projection-aware subscription for one root run."""
+
         assert self._backend is not None
         token = self._token_for(run_id)
-        payload = self._backend.events(run_id, token, from_seq=from_seq)
-        events = payload.get("events", [])
-        if isinstance(events, list):
-            with self._lock:
-                ChatProjection(self._run_dir_for(run_id)).project_events(events)
-        return payload
+        cursor = SequenceCursor.resolve(from_seq=from_seq, last_event_id=last_event_id)
+
+        def read_page(next_seq: int, limit: int | None) -> dict[str, Any]:
+            payload = self._backend.events(run_id, token, from_seq=next_seq, limit=limit)
+            events = payload.get("events", [])
+            if isinstance(events, list):
+                with self._lock:
+                    ChatProjection(self._run_dir_for(run_id)).project_events(events)
+            return payload
+
+        return EventSubscription(
+            read_page,
+            cursor=cursor,
+            read_lifecycle=lambda: self._backend.status(run_id, token),
+        )
 
     def chat_transcript(self, run_id: str) -> dict[str, Any]:
         with self._lock:
@@ -1375,7 +1396,12 @@ class StudioServer:
             return {"events": []}
         try:
             token = self._token_for(parent_run_id)
-            return self._backend.descendant_events(parent_run_id, token, child_run_id, from_seq=from_seq)
+            return self._backend.subscribe_descendant_events(
+                parent_run_id,
+                token,
+                child_run_id,
+                from_seq=from_seq,
+            ).poll()
         except NativeAgentError:
             return {"events": []}
 
@@ -1905,10 +1931,15 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
         # --- SSE ---------------------------------------------------------------------
         def _stream_events(self, query: dict[str, list[str]]) -> None:
             run_id = (query.get("run_id") or [""])[0]
-            cursor = int((query.get("from") or ["0"])[0])
+            from_seq = int((query.get("from") or ["0"])[0])
             if not run_id:
                 self.send_error(HTTPStatus.BAD_REQUEST, "run_id required")
                 return
+            subscription = studio.event_subscription(
+                run_id,
+                from_seq=from_seq,
+                last_event_id=self.headers.get("Last-Event-ID"),
+            )
             # SSE has no Content-Length; closing the connection at stream end is the
             # unambiguous framing that plain HTTP clients (and EventSource) both handle.
             self.close_connection = True
@@ -1920,22 +1951,15 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 self.end_headers()
             except OSError:
                 return
-            idle = 0.0
             try:
-                while True:
-                    payload = studio.poll_events(run_id, cursor)
-                    events = payload.get("events", [])
-                    if events:
-                        idle = 0.0
-                        for event in events:
-                            seq = int(event.get("seq") or 0)
-                            cursor = max(cursor, seq + 1)
-                            self._sse_send(event)
+                for frame in subscription.frames():
+                    if frame.kind == "event":
+                        assert frame.event is not None
+                        self._sse_send(dict(frame.event), event_id=frame.event_id)
+                    elif frame.kind == "heartbeat":
+                        self._sse_comment(frame.comment)
                     else:
-                        idle += 0.25
-                    # Stop once the run is terminal and we've drained its events.
-                    lifecycle = studio.run_status(run_id)
-                    if lifecycle.get("terminal") and not events:
+                        lifecycle = frame.lifecycle or {}
                         self._sse_send(
                             {
                                 "type": "studio.stream.end",
@@ -1946,21 +1970,18 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                             }
                         )
                         return
-                    if idle >= 15.0:  # heartbeat so proxies/clients keep the stream open
-                        self._sse_comment("keep-alive")
-                        idle = 0.0
-                    time.sleep(0.25)
             except (BrokenPipeError, ConnectionError, OSError):
                 return  # client disconnected
             except NativeAgentError:
                 return
 
-        def _sse_send(self, event: dict[str, Any]) -> None:
+        def _sse_send(self, event: dict[str, Any], *, event_id: str = "") -> None:
             # Annotate tool activity with a human-readable line for the UI feed (DX-3).
             summary = describe_event(event)
             if summary:
                 event = {**event, "studio_activity": summary}
-            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
+            prefix = f"id: {event_id}\n" if event_id else ""
+            self.wfile.write(f"{prefix}data: {json.dumps(event)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
         def _sse_comment(self, text: str) -> None:

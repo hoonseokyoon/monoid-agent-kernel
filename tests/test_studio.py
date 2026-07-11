@@ -14,6 +14,7 @@ from support.studio_harness import (
     fake_tool_call,
     pytest,
 )
+from monoid_agent_kernel.core.event_subscription import EventSubscription, SequenceCursor
 
 pytestmark = pytest.mark.integration
 
@@ -302,7 +303,29 @@ def test_subagent_events_uses_root_ancestor_token_for_nested_child(tmp_path: Pat
             from_seq: int = 0,
         ) -> dict:
             self.calls.append((parent_run_id, token, child_run_id, from_seq))
-            return {"events": [{"type": "child"}]}
+            return {"events": [{"seq": from_seq, "type": "child"}]}
+
+        def subscribe_descendant_events(
+            self,
+            parent_run_id: str,
+            token: str,
+            child_run_id: str,
+            *,
+            from_seq: int = 0,
+            last_event_id: str | None = None,
+        ) -> EventSubscription:
+            cursor = SequenceCursor.resolve(
+                from_seq=from_seq, last_event_id=last_event_id
+            )
+            return EventSubscription(
+                lambda next_seq, limit: self.descendant_events(
+                    parent_run_id,
+                    token,
+                    child_run_id,
+                    from_seq=next_seq,
+                ),
+                cursor=cursor,
+            )
 
     backend = FakeBackend()
     server._backend = backend  # type: ignore[assignment]
@@ -310,7 +333,7 @@ def test_subagent_events_uses_root_ancestor_token_for_nested_child(tmp_path: Pat
 
     result = server.subagent_events("run_parent.sub.task_1.sub.task_2", from_seq=7)
 
-    assert result["events"] == [{"type": "child"}]
+    assert result["events"] == [{"seq": 7, "type": "child"}]
     assert backend.calls == [("run_parent", "root-token", "run_parent.sub.task_1.sub.task_2", 7)]
     assert server.subagent_events("run_parent")["events"] == []
     assert server.subagent_events("../secret.sub.task")["events"] == []

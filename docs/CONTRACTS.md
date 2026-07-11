@@ -565,6 +565,18 @@ with `from_seq=next_seq` to avoid duplicates; omitting `limit` preserves the his
 events from N" behavior. `RunnerBackend.descendant_events(...)` uses the same pagination contract
 for subagent event streams authorized through an ancestor run token.
 
+`SequenceCursor` and `EventSubscription` turn that inclusive page API into a reusable next-sequence
+subscription. A cursor advances only after an event is presented, suppresses replayed sequences,
+and raises `EventSequenceGap` when a resumed stream skips required data. `RunnerBackend` exposes
+`subscribe_events(...)` for live and recovered root runs and `subscribe_descendant_events(...)`
+for lineage-authorized child streams.
+
+The same HTTP events route returns SSE when the request accepts `text/event-stream`. Each event
+frame carries `id: <seq>`; reconnects send `Last-Event-ID`, which takes precedence over the initial
+`from_seq` query and resumes at the following sequence. Idle streams emit `: keep-alive` comments.
+Terminal streams re-read the event page after observing terminal lifecycle state, verify the
+lifecycle watermark has been drained, then emit one named `end` frame and close.
+
 ### Diagnostics
 
 `GET /v1/runs/{run_id}/diagnostics?event_limit=N` returns one token-scoped operational aggregate:

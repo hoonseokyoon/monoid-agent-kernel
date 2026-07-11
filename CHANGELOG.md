@@ -7,6 +7,9 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+- Added cursor-correct event subscriptions with SSE event IDs, `Last-Event-ID` resume, heartbeat
+  comments, terminal final-event draining, recovered-run support, and authorized descendant feeds;
+  Reference backend HTTP and Studio now share the subscription abstraction.
 - Added an external minimal-agent conformance runner with stable rule IDs, typed observations,
   versioned JSON and JUnit reports, packaged compatibility fixtures, and reusable checkpoint-store
   and capability-broker implementation contracts.

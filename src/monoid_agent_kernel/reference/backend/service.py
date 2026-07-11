@@ -29,6 +29,7 @@ from monoid_agent_kernel.core.durable_metadata import (
 from monoid_agent_kernel.core.capability import CapabilityBroker
 from monoid_agent_kernel.core.context import ContextProvider
 from monoid_agent_kernel.core.events import AgentEvent, EventSink
+from monoid_agent_kernel.core.event_subscription import EventSubscription, SequenceCursor
 from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
 )
@@ -1230,6 +1231,25 @@ class RunnerBackend:
     ) -> dict[str, Any]:
         return self._projection.events(run_id, token, from_seq=from_seq, limit=limit)
 
+    def subscribe_events(
+        self,
+        run_id: str,
+        token: str,
+        *,
+        from_seq: int = 0,
+        last_event_id: str | None = None,
+    ) -> EventSubscription:
+        """Create a replay-safe subscription for a live or recovered authorized run."""
+
+        cursor = SequenceCursor.resolve(from_seq=from_seq, last_event_id=last_event_id)
+        return EventSubscription(
+            lambda next_seq, limit: self.events(
+                run_id, token, from_seq=next_seq, limit=limit
+            ),
+            cursor=cursor,
+            read_lifecycle=lambda: self.status(run_id, token),
+        )
+
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
         return self._projection.diagnostics(run_id, token, event_limit=event_limit)
 
@@ -1248,6 +1268,37 @@ class RunnerBackend:
             descendant_run_id,
             from_seq=from_seq,
             limit=limit,
+        )
+
+    def descendant_status(
+        self, run_id: str, token: str, descendant_run_id: str
+    ) -> dict[str, Any]:
+        return self._projection.descendant_status(run_id, token, descendant_run_id)
+
+    def subscribe_descendant_events(
+        self,
+        run_id: str,
+        token: str,
+        descendant_run_id: str,
+        *,
+        from_seq: int = 0,
+        last_event_id: str | None = None,
+    ) -> EventSubscription:
+        """Create a cursor-correct subscription scoped to an authorized descendant."""
+
+        cursor = SequenceCursor.resolve(from_seq=from_seq, last_event_id=last_event_id)
+        return EventSubscription(
+            lambda next_seq, limit: self.descendant_events(
+                run_id,
+                token,
+                descendant_run_id,
+                from_seq=next_seq,
+                limit=limit,
+            ),
+            cursor=cursor,
+            read_lifecycle=lambda: self.descendant_status(
+                run_id, token, descendant_run_id
+            ),
         )
 
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:

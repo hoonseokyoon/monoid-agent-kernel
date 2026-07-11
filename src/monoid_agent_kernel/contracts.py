@@ -175,6 +175,12 @@ from monoid_agent_kernel.core.events import (
     AgentEventType,
     EventSink,
 )
+from monoid_agent_kernel.core.event_subscription import (
+    EventSequenceGap,
+    EventSubscription,
+    EventSubscriptionFrame,
+    SequenceCursor,
+)
 
 # Permission boundary
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -340,6 +346,10 @@ __all__ = [
     "AgentEventLevel",
     "AgentEventType",
     "EventSink",
+    "EventSequenceGap",
+    "EventSubscription",
+    "EventSubscriptionFrame",
+    "SequenceCursor",
     # permission boundary
     "PermissionPolicy",
     # gateway client seam
