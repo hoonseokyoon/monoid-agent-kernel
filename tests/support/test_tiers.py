@@ -32,6 +32,7 @@ _INTEGRATION_MODULES = frozenset(
         "test_async_tools.py",
         "test_capability.py",
         "test_cli_and_openai.py",
+        "test_durability_fault_matrix.py",
         "test_examples.py",
         "test_gateway_provider.py",
         "test_hitl.py",

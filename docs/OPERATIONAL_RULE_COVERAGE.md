@@ -31,7 +31,7 @@ property tests for pure wire helpers.
 
 | Profile | Coverage status | Executable assertions | Harnesses |
 | --- | --- | --- | --- |
-| `minimal-agent` | Metadata registration profile. | None. | None. |
+| `minimal-agent` | Executable submission-to-result lifecycle profile. | `run_minimal_agent_profile` | `MinimalAgentHarness`; bundled `ReferenceBackendHarness` |
 | `tool-agent` | Concrete tool surface and generic approval profile. | `assert_tool_agent_surface_admission_profile`; `assert_tool_agent_generic_ask_approval_profile` | `ToolAgentHarness` |
 | `side-effect-tool-agent` | Optional profile for runtimes that expose external side-effect tools. | `assert_side_effect_tool_agent_profile` | `SideEffectHarness` |
 | `message-fabric` | Optional profile for runtimes that exchange peer-agent messages. | `assert_message_fabric_profile` | `MessageFabricHarness` |

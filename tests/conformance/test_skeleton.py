@@ -9,6 +9,7 @@ from monoid_agent_kernel.conformance import (
     DurableRunnerHarness,
     GatewayHarness,
     MessageFabricHarness,
+    MinimalAgentHarness,
     MultiAgentBackendHarness,
     PROFILES,
     PROFILE_BY_ID,
@@ -31,6 +32,10 @@ EXPECTED_PROFILE_IDS = (
     "reference-full",
 )
 EXPECTED_RULE_IDS = {
+    "MIN-01-SUBMISSION",
+    "MIN-02-LIFECYCLE",
+    "MIN-03-RESULT",
+    "MIN-04-EVENT-SEQUENCE",
     "OR-01-SCOPE-RELATION",
     "OR-02-CAPABILITY-BOUNDARY",
     "OR-03-LEASE-ADMISSION",
@@ -69,6 +74,7 @@ def test_get_profile_returns_registered_metadata(profile_id: str) -> None:
 
 
 def test_harness_protocols_are_importable() -> None:
+    assert MinimalAgentHarness.__name__ == "MinimalAgentHarness"
     assert BackendHarness.__name__ == "BackendHarness"
     assert ToolAgentHarness.__name__ == "ToolAgentHarness"
     assert ControlPlaneHarness.__name__ == "ControlPlaneHarness"

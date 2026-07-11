@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import time
 import uuid
 from collections.abc import Callable
@@ -10,7 +11,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition, ToolBinding
+from monoid_agent_kernel.core.agents import (
+    AgentRuntimeConfig,
+    PromptSpec,
+    SubagentDefinition,
+    ToolBinding,
+)
 from monoid_agent_kernel.core.capability import (
     AutoGrantBroker,
     CapabilityLease,
@@ -46,6 +52,7 @@ __all__ = [
     "ReferenceCapabilityHarness",
     "ReferenceConformanceFactory",
     "ReferenceGatewayHarness",
+    "create_minimal_harness",
 ]
 
 
@@ -64,6 +71,9 @@ class ReferenceConformanceFactory:
 
     def new_backend(self) -> ReferenceBackendHarness:
         return ReferenceBackendHarness(self._next_root("backend"))
+
+    def new_minimal_agent(self) -> ReferenceBackendHarness:
+        return ReferenceBackendHarness(self._next_root("minimal-agent"))
 
     def new_tool_agent(self) -> ReferenceBackendHarness:
         return ReferenceBackendHarness(self._next_root("tool-agent"))
@@ -118,6 +128,15 @@ class ReferenceConformanceFactory:
             return {"run_id": run_id, "event_count": len(events)}
         finally:
             server.shutdown()
+
+
+def create_minimal_harness() -> ReferenceBackendHarness:
+    """Create an isolated bundled harness for the external minimal-agent runner."""
+
+    temporary = tempfile.TemporaryDirectory(prefix="monoid-conformance-")
+    harness = ReferenceBackendHarness(Path(temporary.name))
+    harness._cleanup_root = temporary.cleanup
+    return harness
 
 
 @dataclass
@@ -396,6 +415,7 @@ class ReferenceBackendHarness:
         self.outbox_sender = RecordingOutboxSender()
         self.message_fabric_directory: dict[str, str] = {}
         self.message_fabric_tokens: dict[str, str] = {}
+        self._cleanup_root: Callable[[], None] | None = None
 
         def factory(spec: Any, llm_gateway_token: str) -> _ReferenceMultiAgentAdapter | FakeModelAdapter:
             del llm_gateway_token
@@ -432,7 +452,12 @@ class ReferenceBackendHarness:
         self.close()
 
     def close(self) -> None:
-        self.backend.shutdown(drain=True)
+        try:
+            self.backend.shutdown(drain=True)
+        finally:
+            cleanup, self._cleanup_root = self._cleanup_root, None
+            if cleanup is not None:
+                cleanup()
 
     def _outbox_sender_for(self, request: BackendRunRequest) -> Any:
         scenario = str(request.metadata.get("scenario") or "")
@@ -454,6 +479,7 @@ class ReferenceBackendHarness:
     @property
     def supported_profiles(self) -> tuple[str, ...]:
         return (
+            "minimal-agent",
             "control-plane",
             "durable-runner",
             "multi-agent",
@@ -462,6 +488,20 @@ class ReferenceBackendHarness:
             "message-fabric",
             "reference-full",
         )
+
+    def run_minimal_lifecycle_case(self) -> dict[str, Any]:
+        submitted = self.submit_run({"scenario": "completed"})
+        run_id = str(submitted["run_id"])
+        token = str(submitted["token"])
+        events = list(self.events(run_id, token, limit=500)["events"])
+        result = dict(self.result(run_id, token))
+        return {
+            "submitted": True,
+            "run_id": run_id,
+            "states": ("submitted", "running", str(result.get("status") or "")),
+            "result": result,
+            "event_seqs": tuple(int(event["seq"]) for event in events),
+        }
 
     def submit_run(self, request: dict[str, Any]) -> dict[str, Any]:
         scenario = str(request["scenario"])
@@ -562,8 +602,7 @@ class ReferenceBackendHarness:
         denied = [
             event
             for event in events
-            if event["type"] == "permission.denied"
-            and event["data"].get("error_code") == "tool_quota_exceeded"
+            if event["type"] == "permission.denied" and event["data"].get("error_code") == "tool_quota_exceeded"
         ]
         return {
             "permission_denied": bool(denied),
@@ -579,21 +618,23 @@ class ReferenceBackendHarness:
             approved_events = _wait_for_events(
                 self,
                 approved,
-                lambda events: _has_event(events, "tool.approval.requested")
-                and _has_event(events, "tool.approval.approved")
-                and _has_successful_approval_replay(events),
+                lambda events: (
+                    _has_event(events, "tool.approval.requested")
+                    and _has_event(events, "tool.approval.approved")
+                    and _has_successful_approval_replay(events)
+                ),
             )
             denied_events = _wait_for_events(
                 self,
                 denied,
-                lambda events: _has_event(events, "tool.approval.requested")
-                and _has_event(events, "tool.approval.denied"),
+                lambda events: (
+                    _has_event(events, "tool.approval.requested") and _has_event(events, "tool.approval.denied")
+                ),
             )
             stale_events = _wait_for_events(
                 self,
                 stale,
-                lambda events: _has_event(events, "tool.approval.approved")
-                and _has_stale_approval_rejection(events),
+                lambda events: _has_event(events, "tool.approval.approved") and _has_stale_approval_rejection(events),
             )
             return {
                 "approved_requested": _has_event(approved_events, "tool.approval.requested"),
@@ -619,7 +660,10 @@ class ReferenceBackendHarness:
                 {
                     "type": "approve",
                     "run_id": run_id,
-                    "args": {"token": approve_task["callback_token"], "task_id": approve_task["task_id"]},
+                    "args": {
+                        "token": approve_task["callback_token"],
+                        "task_id": approve_task["task_id"],
+                    },
                     "issuer": "callback_worker",
                     "reason": "approved by profile",
                     "command_id": "cmd_profile_approve",
@@ -637,7 +681,10 @@ class ReferenceBackendHarness:
                             "answer": "Approve",
                             "approved": True,
                             "granted": True,
-                            "lease": {"capability": "web.search", "token_ref": "secret-ref://lease"},
+                            "lease": {
+                                "capability": "web.search",
+                                "token_ref": "secret-ref://lease",
+                            },
                             "token_ref": "secret-ref://lease",
                         },
                     },
@@ -721,9 +768,7 @@ class ReferenceBackendHarness:
                 unauthorized_failed = True
 
             events = list(self.events(run_id, token)["events"])
-            control = [
-                event for event in events if str(event.get("type") or "").startswith("control.command.")
-            ]
+            control = [event for event in events if str(event.get("type") or "").startswith("control.command.")]
             by_id = {(event["type"], event["data"].get("command_id")): event["data"] for event in control}
 
             terminal_status = self.dispatch(
@@ -819,8 +864,7 @@ class ReferenceBackendHarness:
             resumed = same_restart.resume_run(same_run_id, same_token)
             same_recovered = (
                 resumed["resumed"] is True
-                and same_restart.runtime_config(same_run_id, same_token)["config_hash"]
-                == same_update["config_hash"]
+                and same_restart.runtime_config(same_run_id, same_token)["config_hash"] == same_update["config_hash"]
             )
 
             empty_run = self.submit_run({"scenario": "recoverable-multi-turn"})
@@ -919,9 +963,7 @@ class ReferenceBackendHarness:
                 and item["traceparent"] == traceparent
             ),
             "task_result_linked": task["child_run_id"] == child_run_id,
-            "diagnostics_summary_present": (
-                item["task_id"] == task_id and item["status"] == "completed"
-            ),
+            "diagnostics_summary_present": (item["task_id"] == task_id and item["status"] == "completed"),
             "usage_rollup_matches": (
                 result["metrics"]["subagent_count"] == 1
                 and result["metrics"]["subagent_usage"].get("total_tokens") == expected_tokens
@@ -1018,15 +1060,15 @@ class ReferenceBackendHarness:
         first = self.deliver_external_agent_message(receiver["run_id"], receiver["token"], envelope)
         assert first["status"] == "queued"
         assert _eventually(
-            lambda: "mf-duplicate-1"
-            in self.message_fabric_state(receiver["run_id"], receiver["token"])["seen_inbox_ids"],
+            lambda: (
+                "mf-duplicate-1" in self.message_fabric_state(receiver["run_id"], receiver["token"])["seen_inbox_ids"]
+            ),
             timeout_s=20.0,
         )
         assert _eventually(
             lambda: (
                 self.checkpoint_store.latest(receiver["run_id"]) is not None
-                and "mf-duplicate-1"
-                in self.checkpoint_store.latest(receiver["run_id"]).checkpoint.inbox_seen_ids  # type: ignore[union-attr]
+                and "mf-duplicate-1" in self.checkpoint_store.latest(receiver["run_id"]).checkpoint.inbox_seen_ids  # type: ignore[union-attr]
             ),
             timeout_s=20.0,
         )
@@ -1165,9 +1207,7 @@ class ReferenceBackendHarness:
         if len(pending_requests) != 1:
             raise AssertionError("expected one pending side-effect request")
         restarted = self.restart(local_state="same")
-        recovered_requests = list(
-            restarted.side_effects(str(submitted["run_id"]), str(submitted["token"]))["requests"]
-        )
+        recovered_requests = list(restarted.side_effects(str(submitted["run_id"]), str(submitted["token"]))["requests"])
         if len(recovered_requests) != 1:
             raise AssertionError("expected one recovered side-effect request")
         _cancel_backend_run(self, str(submitted["run_id"]), str(submitted["token"]))
@@ -1266,9 +1306,7 @@ class ReferenceBackendHarness:
 
     def run_two_peer_exchange_case(self) -> dict[str, Any]:
         submitted = self.submit_run({"scenario": "message-fabric-two-peer"})
-        planner_events = list(
-            self.events(str(submitted["run_id"]), str(submitted["token"]), limit=200)["events"]
-        )
+        planner_events = list(self.events(str(submitted["run_id"]), str(submitted["token"]), limit=200)["events"])
         worker_events = list(
             self.events(str(submitted["peer_run_id"]), str(submitted["peer_token"]), limit=200)["events"]
         )
@@ -1549,9 +1587,7 @@ def _turns_for_scenario(scenario: str) -> list[ModelTurn]:
         ]
     if scenario in {"tool-ask-approved", "tool-ask-denied", "tool-ask-stale-denied"}:
         return [
-            ModelTurn(
-                tool_calls=(fake_tool_call("demo_approval", {"value": scenario}, "approval_1"),)
-            ),
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": scenario}, "approval_1"),)),
             ModelTurn(response_id="ignored_until_approval", final_text="waiting for approval"),
             ModelTurn(final_text=f"{scenario} completed"),
         ]
@@ -1689,7 +1725,8 @@ def _has_successful_approval_replay(events: list[dict[str, Any]]) -> bool:
 
 def _has_stale_approval_rejection(events: list[dict[str, Any]]) -> bool:
     return any(
-        event["data"].get("error_code") in {
+        event["data"].get("error_code")
+        in {
             "tool_not_in_surface",
             "tool_binding_denied",
             "tool_unknown",

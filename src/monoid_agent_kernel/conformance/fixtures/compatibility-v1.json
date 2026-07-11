@@ -1,0 +1,46 @@
+{
+  "schema_version": "monoid.conformance-fixtures.v1",
+  "fixtures": [
+    {
+      "fixture_id": "checkpoint-current-v1",
+      "artifact": "checkpoint",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.checkpoint.v1",
+        "run_id": "fixture_run",
+        "seq": 1
+      }
+    },
+    {
+      "fixture_id": "checkpoint-legacy-v1",
+      "artifact": "checkpoint",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "native-agent-runner.checkpoint.v1",
+        "run_id": "fixture_run",
+        "seq": 1
+      }
+    },
+    {
+      "fixture_id": "checkpoint-future-v99",
+      "artifact": "checkpoint",
+      "expected_status": "unsupported_version",
+      "payload": {
+        "schema_version": "monoid.checkpoint.v99",
+        "run_id": "fixture_run",
+        "seq": 1
+      }
+    },
+    {
+      "fixture_id": "control-command-legacy-v1",
+      "artifact": "control-command",
+      "expected_status": "loaded",
+      "payload": {
+        "protocol": "native-agent-runner.control-command.v1",
+        "command_id": "fixture_command",
+        "type": "cancel",
+        "run_id": "fixture_run"
+      }
+    }
+  ]
+}

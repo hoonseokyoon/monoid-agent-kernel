@@ -283,6 +283,22 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         accepts_missing_version=True,
         notes="Diagnostics consume fields without enforcing schema_version.",
     ),
+    _monoid_artifact(
+        "conformance-report.v1",
+        kind="reference",
+        reader_policy="writer-only",
+        source=("conformance/report.py:ConformanceReport",),
+        legacy_reader=False,
+        notes="External runner JSON report; JUnit is a secondary standards-compatible projection.",
+    ),
+    _monoid_artifact(
+        "conformance-fixtures.v1",
+        kind="reference",
+        reader_policy="strict",
+        source=("conformance/fixtures/compatibility-v1.json",),
+        legacy_reader=False,
+        notes="Packaged historical fixtures consumed by load_compatibility_fixtures().",
+    ),
     # Reference Studio export/projection formats use their own namespace.
     CompatibilityArtifact(
         key="studio-chat",
