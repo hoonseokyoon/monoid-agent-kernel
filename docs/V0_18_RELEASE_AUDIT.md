@@ -70,3 +70,7 @@ The frozen candidate also produced a `0.18.0` wheel and source distribution, pas
 imports and CLI smoke, and passed all four installed-wheel external conformance rules. Final clean
 minimal/all-extras artifact validation runs from merged `develop` and belongs in the release pull
 request evidence.
+
+Final clean validation found workspace-local `.tmp/` scratch files in the source distribution.
+The release follow-up explicitly excludes that root and adds a packaging-configuration regression
+test; the rebuilt source distribution receives the same member and metadata checks.

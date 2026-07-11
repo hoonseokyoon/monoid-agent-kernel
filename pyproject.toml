@@ -96,8 +96,8 @@ exclude = ["**/DX_NOTES.md"]
 force-include = { "src/monoid_agent_kernel/py.typed" = "monoid_agent_kernel/py.typed", "src/native_agent_runner/py.typed" = "native_agent_runner/py.typed" }
 
 [tool.hatch.build.targets.sdist]
-# Keep the internal Studio development journal out of source distributions as well as wheels.
-exclude = ["**/DX_NOTES.md"]
+# Keep internal journals and workspace-local release scratch data out of source distributions.
+exclude = ["**/DX_NOTES.md", "/.tmp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

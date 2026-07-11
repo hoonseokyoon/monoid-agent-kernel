@@ -67,6 +67,7 @@ out in commit messages and here.
   timeout.
 - Redacted raw exception bodies from conformance JSON, JUnit, and console diagnostics; strengthened
   the reusable checkpoint-store contract to prove persistence across a fresh store instance.
+- Excluded the workspace-local `.tmp/` release scratch directory from source distributions.
 
 ## [0.17.1] - 2026-07-09
 
