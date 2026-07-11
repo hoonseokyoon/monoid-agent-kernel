@@ -153,7 +153,7 @@ class EventSubscription:
                 for event in page["events"]:
                     last_output = clock()
                     yield EventSubscriptionFrame(
-                        kind="event", cursor=self.cursor.next_seq, event=event
+                        kind="event", cursor=int(event["seq"]) + 1, event=event
                     )
                 continue
             lifecycle = dict(self._read_lifecycle()) if self._read_lifecycle is not None else {}
@@ -164,7 +164,7 @@ class EventSubscription:
                 if final_page["events"]:
                     for event in final_page["events"]:
                         yield EventSubscriptionFrame(
-                            kind="event", cursor=self.cursor.next_seq, event=event
+                            kind="event", cursor=int(event["seq"]) + 1, event=event
                         )
                     continue
                 watermark = _lifecycle_last_event_seq(lifecycle)

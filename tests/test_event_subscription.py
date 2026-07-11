@@ -71,6 +71,19 @@ def test_subscription_emits_heartbeat_comment_for_idle_live_stream() -> None:
     assert frame.to_sse() == b": keep-alive\n\n"
 
 
+def test_each_event_frame_carries_its_own_next_sequence_cursor() -> None:
+    events = [{"seq": seq, "type": "test.event"} for seq in range(1, 4)]
+    frames = list(
+        EventSubscription(
+            _reader(events), read_lifecycle=lambda: {"terminal": True}
+        ).frames()
+    )
+
+    event_frames = [frame for frame in frames if frame.kind == "event"]
+    assert [frame.cursor for frame in event_frames] == [2, 3, 4]
+    assert [frame.event_id for frame in event_frames] == ["1", "2", "3"]
+
+
 def test_terminal_subscription_performs_final_event_drain_before_end() -> None:
     calls = 0
 
