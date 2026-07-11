@@ -29,9 +29,24 @@ def test_dbos_preflight_recognizes_fresh_sqlite_and_postgres_queue_tables() -> N
             {},
             Exception('relation "dbos.queues" does not exist'),
         ),
+        ProgrammingError(
+            "CREATE TABLE dbos.queues (...) ",
+            {},
+            Exception('schema "dbos" does not exist'),
+        ),
     )
 
     assert all(_is_uninitialized_queue_table(error) for error in errors)
+    assert (
+        _is_uninitialized_queue_table(
+            ProgrammingError(
+                "SELECT * FROM unrelated.table",
+                {},
+                Exception('relation "unrelated.table" does not exist'),
+            )
+        )
+        is False
+    )
 
 
 def _worker_env(root: Path) -> dict[str, str]:

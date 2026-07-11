@@ -590,7 +590,8 @@ def _create_owned_runtime(dbos_module: Any, config: DbosControlConfig) -> Any:
 def _is_uninitialized_queue_table(exc: Exception) -> bool:
     message = str(exc).lower()
     missing_relation = "no such table" in message or "does not exist" in message
-    return missing_relation and "queues" in message
+    missing_queue_storage = "queues" in message or 'schema "dbos"' in message
+    return missing_relation and missing_queue_storage
 
 
 def _load_dbos() -> Any:
