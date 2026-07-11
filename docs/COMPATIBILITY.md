@@ -179,7 +179,9 @@ The v0.18 writer adds four optional recovery fields to `monoid.checkpoint.v1`:
   still returns its own boundary after newer inputs advance the run.
 
 New readers default absent fields for older checkpoints. Older readers ignore the additive fields.
-A rollback that can resume pending DBOS work must retain a reader that understands all four fields.
-Dropping active-input state can admit a competing or stale activation; dropping the identity or
-receipt ledger can redrive an applied input or return the wrong boundary. Keep the DBOS
-`application_version` stable while same-slot recovery of pending work is required.
+Any recovery adapter resuming a pending input must retain a reader that understands all four
+fields. Dropping active-input state can admit a competing or stale activation; dropping the
+identity or receipt ledger can redrive an applied input or return the wrong boundary. For the
+experimental DBOS adapter, keep `application_version` stable while same-slot recovery of pending
+workflow history is required. That operational version never replaces checkpoint schema/version
+compatibility or the checkpoint receipt as semantic authority.

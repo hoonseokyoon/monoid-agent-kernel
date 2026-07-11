@@ -1,4 +1,4 @@
-"""Subprocess worker for DBOS run-lifecycle crash/restart acceptance tests."""
+"""Subprocess worker for DBOS activation-recovery crash/restart acceptance tests."""
 
 from __future__ import annotations
 
@@ -290,7 +290,7 @@ def recover(
         stale_command.command_id,
     )
     with sqlite3.connect(db_path) as connection:
-        terminal_receipt_rows = connection.execute(
+        workflow_success_rows = connection.execute(
             "SELECT COUNT(*) FROM workflow_status WHERE workflow_uuid = ? AND status = 'SUCCESS'",
             (workflow_id,),
         ).fetchone()[0]
@@ -310,7 +310,7 @@ def recover(
             "marker_count": latest.checkpoint.applied_input_ids.count(command.checkpoint_marker),
             "stale": stale.to_json(),
             "stale_workflow_success_rows": stale_workflow_success_rows,
-            "terminal_receipt_rows": terminal_receipt_rows,
+            "workflow_success_rows": workflow_success_rows,
         },
     )
 

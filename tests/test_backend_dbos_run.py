@@ -57,7 +57,7 @@ def _worker_args(
 
 
 @pytest.mark.parametrize("fault_phase", ("effect_committed", "boundary_committed"))
-def test_dbos_run_resume_survives_kill_with_one_effect_and_one_terminal_receipt(
+def test_dbos_run_resume_survives_kill_with_one_effect_and_one_workflow_result(
     tmp_path: Path,
     fault_phase: str,
 ) -> None:
@@ -150,4 +150,4 @@ def test_dbos_run_resume_survives_kill_with_one_effect_and_one_terminal_receipt(
     assert result["stale"]["error_code"] == "stale_resume_checkpoint"
     assert result["stale"]["error"] == "DBOS run resume was safely rejected"
     assert result["stale_workflow_success_rows"] == 1
-    assert result["terminal_receipt_rows"] == 1
+    assert result["workflow_success_rows"] == 1
