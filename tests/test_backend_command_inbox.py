@@ -429,6 +429,25 @@ def test_http_resume_recovers_ownerless_run_with_full_command_inbox(
         command_queue_limit=1,
     )
     assert restarted.command_store is not None
+    original_claim_command = restarted.command_store.claim_command
+    observed_claim_ttls: list[float] = []
+
+    def claim_command_with_ttl(
+        run_id: str,
+        command_id: str,
+        worker_id: str,
+        *,
+        claim_ttl_s: float,
+    ) -> Any:
+        observed_claim_ttls.append(claim_ttl_s)
+        return original_claim_command(
+            run_id,
+            command_id,
+            worker_id,
+            claim_ttl_s=claim_ttl_s,
+        )
+
+    restarted.command_store.claim_command = claim_command_with_ttl  # type: ignore[method-assign]
     restarted.command_store.append(
         StoredCommand(
             run_id=submission.run_id,
@@ -461,6 +480,7 @@ def test_http_resume_recovers_ownerless_run_with_full_command_inbox(
     assert resumed["status"] == "ok"
     assert resumed["data"]["resumed"] is True
     assert repeated == resumed
+    assert observed_claim_ttls == [restarted.command_claim_ttl_s]
     assert submission.run_id in restarted._records
     assert restarted.lease_store is not None
     assert restarted.lease_store.owner(submission.run_id) == restarted._worker_id

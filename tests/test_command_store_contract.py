@@ -139,10 +139,17 @@ def test_claim_command_can_reserve_recovery_out_of_order(store: CommandStore) ->
         "run_1", "cmd_resume", "recovery-worker", claim_ttl_s=30
     )
     assert reserved is not None and reserved.command_id == "cmd_resume"
+    assert store.claim_command(
+        "run_1", "cmd_resume", "competing-worker", claim_ttl_s=30
+    ) is None
+    reclaimed = store.claim_command(
+        "run_1", "cmd_resume", "competing-worker", claim_ttl_s=-1
+    )
+    assert reclaimed is not None and reclaimed.claimed_by == "competing-worker"
     store.acknowledge(
         "run_1",
         "cmd_resume",
-        "recovery-worker",
+        "competing-worker",
         ControlResult(run_id="run_1", type="status", status="ok"),
     )
     head = store.claim("run_1", "ordinary-worker", claim_ttl_s=30)

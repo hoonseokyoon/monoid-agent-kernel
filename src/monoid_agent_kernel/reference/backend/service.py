@@ -1126,7 +1126,7 @@ class RunnerBackend:
                         command.run_id,
                         command_id,
                         self._worker_id,
-                        claim_ttl_s=0.0,
+                        claim_ttl_s=self.command_claim_ttl_s,
                     )
                     if claimed is None:
                         raise NativeAgentError(

@@ -608,8 +608,8 @@ Append is idempotent by `(run_id, command_id)`. An identical duplicate receives 
 receipt and does not execute a second command. Reusing the ID for a different type, sanitized
 arguments, principal, issuer, or reason returns `command_id_conflict`. Claims follow append order
 per run, with one in-flight command; a later command cannot skip an unacknowledged head command. A
-crashed claimant becomes eligible
-after `command_claim_ttl_s`; command handlers therefore retain their existing idempotency
+crashed claimant, including an exact-ID ownerless resume reservation, becomes eligible only after
+`command_claim_ttl_s`; command handlers therefore retain their existing idempotency
 obligations under crash-after-effect/before-ack recovery. `command_queue_limit` bounds pending plus
 claimed ordinary commands per run; the ownerless `resume` recovery reservation is the sole
 exception. Owner watchdogs drain inboxes alongside lease recovery and outbox redrive.
