@@ -41,6 +41,10 @@ from monoid_agent_kernel.core.schemas import (
 )
 from monoid_agent_kernel.core.workspace_index import WORKSPACE_INDEX_SCHEMA_VERSION
 from monoid_agent_kernel.reference.llm_gateway.service import LLM_TURN_PROTOCOL_VERSION
+from monoid_agent_kernel.reference._shared.tokens import (
+    LEGACY_TOKEN_HEADER_TYPE,
+    TOKEN_HEADER_TYPE,
+)
 from monoid_agent_kernel.reference.studio.chat_projection import (
     CHAT_MESSAGE_SCHEMA_VERSION,
     CHAT_SCHEMA_VERSION,
@@ -79,8 +83,8 @@ def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
                 )
         assert all(".v" in version for version in artifact.supported_readers)
 
-    assert len(PUBLIC_COMPATIBILITY_ALIASES) == 7
-    assert len({alias.key for alias in PUBLIC_COMPATIBILITY_ALIASES}) == 7
+    assert len(PUBLIC_COMPATIBILITY_ALIASES) == 8
+    assert len({alias.key for alias in PUBLIC_COMPATIBILITY_ALIASES}) == 8
 
 
 def test_registry_matches_source_owned_version_constants() -> None:
@@ -143,6 +147,7 @@ def test_alias_registry_matches_package_and_identifier_configuration() -> None:
     assert project["scripts"][aliases["cli-entry-point"][1]] == "monoid_agent_kernel.cli:main"
     assert aliases["identifier-namespace"] == ("monoid.*", f"{LEGACY_NAMESPACE}.*")
     assert aliases["token-issuer"] == (TOKEN_ISSUER, LEGACY_TOKEN_ISSUER)
+    assert aliases["token-header-type"] == (TOKEN_HEADER_TYPE, LEGACY_TOKEN_HEADER_TYPE)
     assert aliases["backend-audience"] == (BACKEND_AUDIENCE, LEGACY_BACKEND_AUDIENCE)
     assert aliases["task-callback-audience"] == (
         TASK_CALLBACK_AUDIENCE,

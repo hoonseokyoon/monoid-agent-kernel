@@ -68,6 +68,7 @@ Source locations and format-specific notes are available through
 | `identifier-namespace` | `monoid.*` | `native-agent-runner.*` | compatibility; artifact-specific support appears in the version table. Writers emit `monoid.*`. |
 | `environment-prefix` | `MONOID_*` | `NAR_*` | deprecated; `env.getenv` prefers the current name and falls back to the legacy name. |
 | `token-issuer` | `monoid` | `native-agent-runner` | compatibility; Reference token validation accepts both issuers. |
+| `token-header-type` | `MAK` | `NAR` | compatibility; newly issued tokens use `MAK`, and Reference validation accepts both header types. |
 | `backend-audience` | `monoid.backend` | `native-agent-runner.backend` | compatibility; Reference token validation accepts both audiences. |
 | `task-callback-audience` | `monoid.task-callback` | `native-agent-runner.task-callback` | compatibility; Reference token validation accepts both audiences. |
 <!-- compatibility-aliases:end -->

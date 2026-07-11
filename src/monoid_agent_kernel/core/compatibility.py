@@ -351,6 +351,14 @@ PUBLIC_COMPATIBILITY_ALIASES: tuple[CompatibilityAlias, ...] = (
         removal_policy=_MAJOR_RELEASE_NOTICE,
     ),
     CompatibilityAlias(
+        key="token-header-type",
+        kind="token",
+        current="MAK",
+        alias="NAR",
+        status="compatibility",
+        removal_policy=_MAJOR_RELEASE_NOTICE,
+    ),
+    CompatibilityAlias(
         key="backend-audience",
         kind="token",
         current="monoid.backend",
