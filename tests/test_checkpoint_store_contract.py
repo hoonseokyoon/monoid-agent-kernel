@@ -12,12 +12,19 @@ GC) stay in ``test_checkpoint.py`` because how you forge a torn write differs pe
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from monoid_agent_kernel.core.checkpoint import CheckpointStore, LocalFsCheckpointStore, RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import (
+    CheckpointStore,
+    LocalFsCheckpointStore,
+    RunCheckpoint,
+    load_latest_checked,
+)
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore
 
 StoreFactory = Callable[[Path], CheckpointStore]
@@ -46,12 +53,15 @@ def store(request: pytest.FixtureRequest, tmp_path: Path) -> CheckpointStore:
 
 def test_put_latest_seq_isolation_and_delete(store: CheckpointStore) -> None:
     assert store.latest("run_1") is None
+    assert load_latest_checked(store, "run_1").status == "missing"
 
     store.put(RunCheckpoint(run_id="run_1", seq=1, previous_turn_handle="a"))
     store.put(RunCheckpoint(run_id="run_1", seq=2, previous_turn_handle="b"))
     record = store.latest("run_1")
     assert record is not None and record.seq == 2
     assert record.checkpoint.previous_turn_handle == "b"
+    checked = load_latest_checked(store, "run_1")
+    assert checked.status == "loaded" and checked.sequence == 2
 
     # Runs are isolated; deleting one leaves the other intact.
     store.put(RunCheckpoint(run_id="run_2", seq=1))
@@ -106,3 +116,63 @@ def test_run_metadata_round_trips_and_deletes_with_run(store: CheckpointStore) -
     assert store.run_metadata("run_1") == {"run_id": "run_1", "tenant_id": "tenant_a"}
     store.delete("run_1")
     assert store.run_metadata("run_1") is None
+
+
+def test_checked_run_metadata_load_is_consistent(store: CheckpointStore) -> None:
+    checked_reader = getattr(store, "run_metadata_checked")
+    assert checked_reader("run_1").status == "missing"
+    payload = {
+        "schema_version": "monoid.backend-run.v1",
+        "run_id": "run_1",
+        "unknown": {"preserved": True},
+    }
+    store.put_run_metadata("run_1", payload)
+
+    loaded = checked_reader("run_1")
+
+    assert loaded.status == "loaded"
+    assert loaded.value == payload
+    store.put_run_metadata("run_1", {**payload, "schema_version": "monoid.backend-run.v99"})
+    assert checked_reader("run_1").status == "unsupported_version"
+
+
+def _replace_latest_manifest(store: CheckpointStore, text: str) -> None:
+    if isinstance(store, LocalFsCheckpointStore):
+        path = store.run_root / "run_1" / "checkpoints" / "1" / "manifest.json"
+        path.write_text(text, encoding="utf-8")
+        return
+    assert isinstance(store, SqliteCheckpointStore)
+    conn = sqlite3.connect(store._db_path)  # type: ignore[attr-defined]
+    try:
+        conn.execute(
+            "UPDATE checkpoints SET manifest=? WHERE run_id=? AND seq=?",
+            (text, "run_1", 1),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected_status"),
+    [
+        ("{", "corrupt"),
+        (
+            json.dumps({"schema_version": "monoid.checkpoint.v99", "run_id": "run_1", "seq": 1}),
+            "unsupported_version",
+        ),
+    ],
+)
+def test_checked_latest_distinguishes_bad_committed_state(
+    store: CheckpointStore,
+    manifest: str,
+    expected_status: str,
+) -> None:
+    store.put(RunCheckpoint(run_id="run_1", seq=1))
+    _replace_latest_manifest(store, manifest)
+
+    checked = load_latest_checked(store, "run_1")
+
+    assert checked.status == expected_status
+    assert checked.sequence == 1
+    assert store.latest("run_1") is None

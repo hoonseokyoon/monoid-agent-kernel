@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.checkpoint import (
     LocalFsCheckpointStore,
     RunCheckpoint,
     read_checkpoint,
+    read_checkpoint_checked,
     write_checkpoint,
 )
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
@@ -149,8 +150,23 @@ def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
     assert restored.schema_version == SCHEMA_VERSION
 
 
+def test_checkpoint_writer_canonicalizes_accepted_legacy_namespace(tmp_path: Path) -> None:
+    write_checkpoint(
+        tmp_path,
+        RunCheckpoint(
+            run_id="run_1",
+            schema_version="native-agent-runner.checkpoint.v1",
+        ),
+    )
+
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == SCHEMA_VERSION
+
+
 def test_read_checkpoint_missing_returns_none(tmp_path: Path) -> None:
     assert read_checkpoint(tmp_path) is None
+    assert read_checkpoint_checked(tmp_path).status == "missing"
 
 
 def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
@@ -159,6 +175,25 @@ def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
     # Corrupt the schema version on disk -> treated as no checkpoint, never raises.
     path = tmp_path / "checkpoint.json"
     path.write_text(path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "bogus.v0"), encoding="utf-8")
+    assert read_checkpoint(tmp_path) is None
+    checked = read_checkpoint_checked(tmp_path)
+    assert checked.status == "corrupt"
+    assert checked.error_code == "checkpoint_corrupt"
+
+
+def test_read_checkpoint_future_schema_is_explicitly_unsupported(tmp_path: Path) -> None:
+    cp = RunCheckpoint(run_id="run_1")
+    write_checkpoint(tmp_path, cp)
+    path = tmp_path / "checkpoint.json"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "monoid.checkpoint.v99"),
+        encoding="utf-8",
+    )
+
+    checked = read_checkpoint_checked(tmp_path)
+
+    assert checked.status == "unsupported_version"
+    assert checked.observed_schema == "monoid.checkpoint.v99"
     assert read_checkpoint(tmp_path) is None
 
 

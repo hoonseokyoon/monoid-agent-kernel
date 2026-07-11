@@ -324,6 +324,43 @@ def test_recover_runs_skips_terminal_and_metaless_checkpoints(tmp_path: Path) ->
     assert backend.recover_runs() == []
 
 
+def test_recover_runs_records_unsupported_checkpoint_instead_of_skipping(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    run_id = "run_future_checkpoint"
+    backend.checkpoint_store.put(RunCheckpoint(run_id=run_id, seq=7, terminal=False))
+    manifest = run_root / run_id / "checkpoints" / "7" / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["schema_version"] = "monoid.checkpoint.v99"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert backend.recover_runs() == []
+
+    failure = json.loads((run_root / run_id / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_code"] == "checkpoint_unsupported_version"
+    assert "checkpoint seq 7" in failure["error"]
+
+
+def test_recover_runs_records_corrupt_metadata_instead_of_treating_it_as_missing(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    run_id = "run_corrupt_metadata"
+    backend.checkpoint_store.put(RunCheckpoint(run_id=run_id, seq=1, terminal=False))
+    run_dir = run_root / run_id
+    (run_dir / "run.json").write_text("{", encoding="utf-8")
+
+    assert backend.recover_runs() == []
+
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_code"] == "backend_run_corrupt"
+
+
 def test_backend_worker_failure_writes_failure_bundle(tmp_path: Path) -> None:
     # A worker-level crash (here the model-adapter factory raises before the loop is even
     # built) must still leave a durable failure.json. Without it, a restart's recover_runs

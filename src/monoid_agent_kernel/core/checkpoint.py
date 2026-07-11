@@ -24,11 +24,12 @@ import json
 import shutil
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
 from monoid_agent_kernel.core._util import file_lock, sha256_bytes, write_json_atomic
+from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 SCHEMA_VERSION = namespaced_id("checkpoint.v1")
@@ -125,22 +126,53 @@ class RunCheckpoint:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> RunCheckpoint | None:
-        """Rebuild from a checkpoint payload. Returns ``None`` on a schema mismatch
-        (forward/backward incompatibility) rather than raising — the caller treats an
-        unreadable checkpoint as "no checkpoint" and skips recovery."""
-        if not isinstance(payload, dict):
-            return None
-        if payload.get("schema_version") not in ACCEPTED_SCHEMA_VERSIONS:
-            return None
-        known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in payload.items() if k in known})
+        """Compatibility wrapper over :func:`decode_checkpoint`."""
+        return decode_checkpoint(payload).value
+
+
+def _checkpoint_from_payload(payload: dict[str, Any]) -> RunCheckpoint:
+    known = {name for name in RunCheckpoint.__dataclass_fields__}
+    return RunCheckpoint(**{key: value for key, value in payload.items() if key in known})
+
+
+CHECKPOINT_CODEC = DurableCodec[RunCheckpoint](
+    family="checkpoint",
+    current_schema=SCHEMA_VERSION,
+)
+
+
+def decode_checkpoint(payload: object) -> DurableLoadResult[RunCheckpoint]:
+    return CHECKPOINT_CODEC.decode(payload, _checkpoint_from_payload)
+
+
+def checkpoint_payload_for_write(checkpoint: RunCheckpoint) -> dict[str, Any]:
+    """Return the canonical current writer shape regardless of a restored alias."""
+    payload = checkpoint.to_json()
+    payload["schema_version"] = SCHEMA_VERSION
+    return payload
 
 
 def write_checkpoint(run_dir: Path, checkpoint: RunCheckpoint) -> Path:
     """Atomically write ``checkpoint`` to ``run_dir/checkpoint.json`` and return the path."""
     path = run_dir / CHECKPOINT_FILENAME
-    write_json_atomic(path, checkpoint.to_json())
+    write_json_atomic(path, checkpoint_payload_for_write(checkpoint))
     return path
+
+
+def read_checkpoint_checked(run_dir: Path) -> DurableLoadResult[RunCheckpoint]:
+    """Read a single-file checkpoint with an explicit durable load outcome."""
+    path = run_dir / CHECKPOINT_FILENAME
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return CHECKPOINT_CODEC.missing()
+    except OSError:
+        return CHECKPOINT_CODEC.corrupt("checkpoint file could not be read")
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return CHECKPOINT_CODEC.corrupt("checkpoint file is not valid JSON")
+    return decode_checkpoint(payload)
 
 
 def read_checkpoint(run_dir: Path) -> RunCheckpoint | None:
@@ -149,12 +181,7 @@ def read_checkpoint(run_dir: Path) -> RunCheckpoint | None:
 
     Single-file helper retained for simple round-trips and tests; production code goes
     through a ``CheckpointStore`` (which adds seq, atomic commit, and content blobs)."""
-    path = run_dir / CHECKPOINT_FILENAME
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    return RunCheckpoint.from_json(payload)
+    return read_checkpoint_checked(run_dir).value
 
 
 # --- CheckpointStore seam: core defines WHAT (RunCheckpoint), the store defines HOW ---
@@ -203,17 +230,54 @@ class CheckpointStore(Protocol):
         ...
 
     def put_run_metadata(self, run_id: str, metadata: Mapping[str, Any]) -> None:
-        """Store backend-owned run recovery metadata in the same durable store as checkpoints.
-
-        This lets another backend instance rebuild a run from a shared store even when it has no
-        local ``run.json`` file from the original host.
-        """
+        """Store backend-owned run recovery metadata beside checkpoints."""
         ...
 
     def run_metadata(self, run_id: str) -> dict[str, Any] | None:
-        """Return backend-owned recovery metadata for ``run_id`` if this store has it."""
+        """Return backend-owned recovery metadata for ``run_id`` if present."""
         ...
 
+
+class CheckedCheckpointStore(Protocol):
+    """Optional store extension that preserves checked durable load outcomes."""
+
+    def latest_checked(self, run_id: str) -> DurableLoadResult[CheckpointRecord]: ...
+
+
+def load_latest_checked(store: CheckpointStore, run_id: str) -> DurableLoadResult[CheckpointRecord]:
+    """Use a checked store when available and adapt legacy stores without breaking them."""
+    checked = getattr(store, "latest_checked", None)
+    if callable(checked):
+        result = checked(run_id)
+        if isinstance(result, DurableLoadResult):
+            return result
+        return CHECKPOINT_CODEC.corrupt("checkpoint store returned an invalid checked result").map(
+            lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
+        )
+    try:
+        record = store.latest(run_id)
+    except Exception as exc:
+        return DurableLoadResult(
+            status="corrupt",
+            family=CHECKPOINT_CODEC.family,
+            current_schema=CHECKPOINT_CODEC.current_schema,
+            error_code="checkpoint_corrupt",
+            message=f"legacy checkpoint store read failed ({type(exc).__name__})",
+        )
+    if record is None:
+        return DurableLoadResult(
+            status="missing",
+            family=CHECKPOINT_CODEC.family,
+            current_schema=CHECKPOINT_CODEC.current_schema,
+        )
+    return DurableLoadResult(
+        status="loaded",
+        family=CHECKPOINT_CODEC.family,
+        current_schema=CHECKPOINT_CODEC.current_schema,
+        value=record,
+        observed_schema=record.checkpoint.schema_version,
+        sequence=record.seq,
+    )
 
 @dataclass
 class LocalFsCheckpointStore:
@@ -257,7 +321,7 @@ class LocalFsCheckpointStore:
             # 2) Manifest (atomic file write into the seq dir).
             seq_dir = cdir / str(checkpoint.seq)
             seq_dir.mkdir(parents=True, exist_ok=True)
-            write_json_atomic(seq_dir / "manifest.json", checkpoint.to_json())
+            write_json_atomic(seq_dir / "manifest.json", checkpoint_payload_for_write(checkpoint))
             # 3) Flip the latest pointer last — only now is this seq considered committed.
             #    Monotonic: never regress LATEST to an older seq, so a late/lower-seq writer
             #    cannot unpublish a newer committed checkpoint (re-putting the same seq, as
@@ -298,6 +362,22 @@ class LocalFsCheckpointStore:
             return None
         return dict(payload) if isinstance(payload, dict) else None
 
+    def run_metadata_checked(self, run_id: str) -> DurableLoadResult[dict[str, Any]]:
+        from monoid_agent_kernel.core.durable_metadata import RUN_METADATA_CODEC, decode_run_metadata
+
+        path = self._dir(run_id) / "run_meta.json"
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return RUN_METADATA_CODEC.missing()
+        except OSError:
+            return RUN_METADATA_CODEC.corrupt("backend-run metadata could not be read")
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return RUN_METADATA_CODEC.corrupt("backend-run metadata is not valid JSON")
+        return decode_run_metadata(payload)
+
     def _read_latest_seq(self, cdir: Path) -> int:
         try:
             return int(json.loads((cdir / "LATEST").read_text(encoding="utf-8"))["seq"])
@@ -314,10 +394,12 @@ class LocalFsCheckpointStore:
             except OSError:  # pragma: no cover - best-effort cleanup
                 pass
 
-    def latest(self, run_id: str) -> CheckpointRecord | None:
+    def latest_checked(self, run_id: str) -> DurableLoadResult[CheckpointRecord]:
         cdir = self._dir(run_id)
         if not cdir.is_dir():
-            return None  # never checkpointed — fast path, no retry
+            return CHECKPOINT_CODEC.missing().map(
+                lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
+            )
         # A reader can race a concurrent put()'s atomic LATEST/manifest replace (especially
         # cross-process, e.g. a watchdog reclaim reading while the original worker commits).
         # Retry a few times so a transient read failure mid-commit is not mistaken for
@@ -335,16 +417,22 @@ class LocalFsCheckpointStore:
                 if attempt < 3:
                     time.sleep(0.01)
         if manifest is None:
-            return None
-        checkpoint = RunCheckpoint.from_json(manifest)
-        if checkpoint is None:
-            return None
+            return CHECKPOINT_CODEC.corrupt(
+                "checkpoint latest pointer or manifest could not be read",
+                sequence=seq if seq >= 0 else None,
+            )
+        decoded = replace(decode_checkpoint(manifest), sequence=seq)
         blobs_dir = cdir / "blobs"
-        return CheckpointRecord(
-            seq=seq,
-            checkpoint=checkpoint,
-            _blob_reader=lambda sha256: (blobs_dir / sha256).read_bytes(),
+        return decoded.map(
+            lambda checkpoint: CheckpointRecord(
+                seq=seq,
+                checkpoint=checkpoint,
+                _blob_reader=lambda sha256: (blobs_dir / sha256).read_bytes(),
+            )
         )
+
+    def latest(self, run_id: str) -> CheckpointRecord | None:
+        return self.latest_checked(run_id).value
 
     def delete(self, run_id: str) -> None:
         shutil.rmtree(self._dir(run_id), ignore_errors=True)
