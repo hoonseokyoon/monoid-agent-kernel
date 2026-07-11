@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "monoid-agent-kernel"
-version = "0.17.1"
+version = "0.18.0"
 description = "Lightweight durable agent kernel for product integrations"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -94,6 +94,10 @@ packages = ["src/monoid_agent_kernel", "src/native_agent_runner"]
 exclude = ["**/DX_NOTES.md"]
 # Ship the PEP 561 marker so downstream type-checkers honor our inline type hints.
 force-include = { "src/monoid_agent_kernel/py.typed" = "monoid_agent_kernel/py.typed", "src/native_agent_runner/py.typed" = "native_agent_runner/py.typed" }
+
+[tool.hatch.build.targets.sdist]
+# Keep the internal Studio development journal out of source distributions as well as wheels.
+exclude = ["**/DX_NOTES.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
