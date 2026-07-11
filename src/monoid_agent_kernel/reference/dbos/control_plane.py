@@ -34,6 +34,8 @@ from monoid_agent_kernel.reference._shared.control_transport import (
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.dbos.runtime import (
+    DbosDependencyError as DbosDependencyError,
+    DbosProcessOwnershipError as DbosProcessOwnershipError,
     DbosShutdownTimeout,
     claim_process_owner,
     create_owned_runtime,
