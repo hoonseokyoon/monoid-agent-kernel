@@ -43,10 +43,10 @@ default must be changed for production.
 - [ ] Custom side-effect tools declare their delivery semantics (durable outbox
       or explicit idempotency).
 - [ ] Capability-gated tools run behind a `CapabilityBroker` that fails closed;
-- [ ] Multi-instance control uses one shared `SqliteCommandStore` (or equivalent transactional
-  `CommandStore`), owner watchdogs are enabled, queue limits are set, and persisted command rows
-  are monitored to confirm bearer credentials remain absent;
       `--auto-grant-capabilities` is **not** used in production.
+- [ ] Multi-instance control uses one shared `SqliteCommandStore` (or equivalent transactional
+      `CommandStore`), owner watchdogs are enabled, queue limits are set, and persisted command rows
+      are monitored to confirm bearer credentials remain absent.
 
 ## Events, artifacts, and logs
 
