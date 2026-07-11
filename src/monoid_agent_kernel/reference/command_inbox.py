@@ -130,7 +130,12 @@ class CommandReceipt:
 
 class CommandStore(Protocol):
     def append(
-        self, command: StoredCommand, *, max_pending: int, require_empty: bool = False
+        self,
+        command: StoredCommand,
+        *,
+        max_pending: int,
+        require_empty: bool = False,
+        recovery_reservation: bool = False,
     ) -> CommandReceipt: ...
 
     def read_command(self, run_id: str, command_id: str) -> StoredCommand | None: ...
@@ -212,8 +217,15 @@ class InMemoryCommandStore:
         self._results: dict[tuple[str, str], dict[str, Any]] = {}
 
     def append(
-        self, command: StoredCommand, *, max_pending: int, require_empty: bool = False
+        self,
+        command: StoredCommand,
+        *,
+        max_pending: int,
+        require_empty: bool = False,
+        recovery_reservation: bool = False,
     ) -> CommandReceipt:
+        if recovery_reservation and command.type != "resume":
+            raise ValueError("recovery reservations are restricted to resume commands")
         key = (command.run_id, command.command_id)
         with self._lock:
             existing = self._commands.get(key)
@@ -229,7 +241,7 @@ class InMemoryCommandStore:
                 raise CommandQueueFull(
                     f"command lane is busy for immediate command {command.command_id}"
                 )
-            if pending >= max_pending:
+            if pending >= max_pending and not recovery_reservation:
                 raise CommandQueueFull(f"command queue is full for run {command.run_id}")
             persisted = StoredCommand(
                 **{**command.__dict__, "args": dict(sanitize_command_data(command.args))}
@@ -373,8 +385,15 @@ class SqliteCommandStore:
             conn.commit()
 
     def append(
-        self, command: StoredCommand, *, max_pending: int, require_empty: bool = False
+        self,
+        command: StoredCommand,
+        *,
+        max_pending: int,
+        require_empty: bool = False,
+        recovery_reservation: bool = False,
     ) -> CommandReceipt:
+        if recovery_reservation and command.type != "resume":
+            raise ValueError("recovery reservations are restricted to resume commands")
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._row(conn, command.run_id, command.command_id)
@@ -393,7 +412,7 @@ class SqliteCommandStore:
                 raise CommandQueueFull(
                     f"command lane is busy for immediate command {command.command_id}"
                 )
-            if int(pending) >= max_pending:
+            if int(pending) >= max_pending and not recovery_reservation:
                 conn.rollback()
                 raise CommandQueueFull(f"command queue is full for run {command.run_id}")
             conn.execute(

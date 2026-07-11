@@ -16,7 +16,11 @@ from support.waiting import eventually
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
-from monoid_agent_kernel.reference.command_inbox import SqliteCommandStore
+from monoid_agent_kernel.reference.command_inbox import (
+    CommandPrincipal,
+    SqliteCommandStore,
+    StoredCommand,
+)
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE, TASK_CALLBACK_AUDIENCE
@@ -389,7 +393,7 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
     backend.cancel_run(submission.run_id, submission.run_token)
 
 
-def test_http_resume_recovers_ownerless_run_without_command_inbox(
+def test_http_resume_recovers_ownerless_run_with_full_command_inbox(
     backend_factory: Any, tmp_path: Path
 ) -> None:
     workspace = backend_factory.workspace()
@@ -421,6 +425,18 @@ def test_http_resume_recovers_ownerless_run_without_command_inbox(
         workspace=workspace,
         token_manager=token_manager,
         turns=[ModelTurn(response_id="resumed", final_text="resumed")],
+        command_queue_limit=1,
+    )
+    assert restarted.command_store is not None
+    restarted.command_store.append(
+        StoredCommand(
+            run_id=submission.run_id,
+            command_id="cmd_blocked_head",
+            type="status",
+            args={},
+            principal=CommandPrincipal("tenant", "user", "queued-before-restart"),
+        ),
+        max_pending=1,
     )
     server = create_backend_server(restarted, host="127.0.0.1", port=0, admin_token="admin")
     with serving(server) as base_url:
@@ -447,7 +463,6 @@ def test_http_resume_recovers_ownerless_run_without_command_inbox(
     assert submission.run_id in restarted._records
     assert restarted.lease_store is not None
     assert restarted.lease_store.owner(submission.run_id) == restarted._worker_id
-    assert restarted.command_store is not None
     durable_receipt = restarted.command_store.receipt(
         submission.run_id, "cmd_ownerless_resume"
     )

@@ -1094,6 +1094,7 @@ class RunnerBackend:
                     receipt = self.command_store.append(
                         stored_command,
                         max_pending=self.command_queue_limit,
+                        recovery_reservation=True,
                     )
                     if receipt.status in {"completed", "failed"}:
                         return replace(

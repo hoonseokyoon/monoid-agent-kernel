@@ -164,6 +164,32 @@ def test_queue_limit_counts_only_unacknowledged_commands(store: CommandStore) ->
     assert store.append(_command("cmd_2"), max_pending=1).status == "pending"
 
 
+def test_resume_recovery_reservation_bypasses_a_full_queue(store: CommandStore) -> None:
+    store.append(_command("cmd_head"), max_pending=1)
+    resume = StoredCommand(
+        run_id="run_1",
+        command_id="cmd_resume",
+        type="resume",
+        args={},
+        principal=CommandPrincipal("tenant", "user", "operator"),
+    )
+
+    reserved = store.append(resume, max_pending=1, recovery_reservation=True)
+
+    assert reserved.status == "pending"
+    with pytest.raises(CommandQueueFull):
+        store.append(_command("cmd_still_full"), max_pending=1)
+    claimed = store.claim_command(
+        "run_1", "cmd_resume", "recovery-worker", claim_ttl_s=30
+    )
+    assert claimed is not None and claimed.type == "resume"
+
+
+def test_recovery_reservation_rejects_non_resume_commands(store: CommandStore) -> None:
+    with pytest.raises(ValueError, match="restricted to resume"):
+        store.append(_command("cmd_status"), max_pending=1, recovery_reservation=True)
+
+
 def test_immediate_command_requires_an_empty_lane(store: CommandStore) -> None:
     store.append(_command("cmd_head"), max_pending=10)
 
