@@ -579,6 +579,9 @@ time and are never stored; the owner executes with its fresh run token. Durable 
 fields in command results, including newly issued callback tokens, are redacted in durable
 receipts. The immediate local response returns the original callback token once; a lost secret
 response cannot be recovered from the command store.
+For that reason, `create_task` is accepted only by the instance currently owning the run; a peer
+returns `command_requires_owner` instead of creating a task whose callback credential cannot be
+delivered. Route that command to the owner or use the dedicated task API there.
 
 Append is idempotent by `(run_id, command_id)`. A duplicate receives the existing receipt and does
 not execute a second command. Claims are oldest-first per run. A crashed claimant becomes eligible

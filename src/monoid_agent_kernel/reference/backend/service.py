@@ -52,7 +52,7 @@ from monoid_agent_kernel.core.spec import (
     ModelRetryConfig,
 )
 from monoid_agent_kernel.core.workspace import Workspace
-from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelAdapter
@@ -1035,6 +1035,14 @@ class RunnerBackend:
         args = dict(command.args)
         token = str(args.pop("token", "") or "")
         principal = self._authorize_command_principal(command, args=args, token=token)
+        with self._lock:
+            locally_owned = command.run_id in self._records
+        if command.type == "create_task" and not locally_owned:
+            raise NativeAgentError(
+                "create_task must be routed to the run owner so its callback token can be "
+                "returned without durable persistence",
+                error_code="command_requires_owner",
+            )
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
         assert self.command_store is not None
         receipt = self.command_store.append(

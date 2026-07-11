@@ -32,6 +32,7 @@ _SENSITIVE_KEYS = frozenset(
         "token",
     }
 )
+_SENSITIVE_COMPACT_KEYS = frozenset(key.replace("_", "") for key in _SENSITIVE_KEYS)
 
 
 class CommandQueueFull(NativeAgentError):
@@ -133,8 +134,9 @@ class CommandStore(Protocol):
 def sanitize_command_data(value: Any, *, key: str = "") -> Any:
     """Return JSON-safe persisted data with credential-shaped fields redacted."""
 
-    lowered = key.lower().replace("-", "_")
-    if key and (lowered in _SENSITIVE_KEYS or lowered.endswith("_password")):
+    lowered = key.lower()
+    compact = "".join(character for character in lowered if character.isalnum())
+    if key and (compact in _SENSITIVE_COMPACT_KEYS or compact.endswith("password")):
         return "[redacted]"
     if isinstance(value, dict):
         return {

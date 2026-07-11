@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from urllib.error import HTTPError
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,21 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
     server = create_backend_server(peer, host="127.0.0.1", port=0, admin_token="admin")
     try:
         with serving(server) as base_url:
+            with pytest.raises(HTTPError) as exc_info:
+                http_json(
+                    f"{base_url}/v1/runs/{submission.run_id}/control",
+                    {
+                        "type": "create_task",
+                        "command_id": "cmd_remote_create_task",
+                        "args": {
+                            "kind": "automation",
+                            "request": {"description": "external work"},
+                        },
+                    },
+                    token=submission.run_token,
+                )
+            assert exc_info.value.code == 400
+
             queued = http_json(
                 f"{base_url}/v1/runs/{submission.run_id}/control",
                 {
