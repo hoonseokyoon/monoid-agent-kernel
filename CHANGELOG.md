@@ -7,6 +7,11 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed
+- Classified every test into an enforced unit, contract, or integration tier and
+  replaced advisory xdist/coverage jobs with required deterministic shards, a
+  coverage floor, cross-platform smoke tests, and minimal/all-extras install smoke.
+
 ## [0.17.1] - 2026-07-09
 
 ### Added
