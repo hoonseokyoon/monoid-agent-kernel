@@ -1593,17 +1593,30 @@ class StudioServer:
         assert self._backend is not None
         parent_run_id = root_run_id_from_descendant(child_run_id)
         if parent_run_id is None:
-            return {"events": []}
+            return {
+                "child_run_id": child_run_id,
+                "events": [],
+                "next_seq": from_seq,
+                "has_more": False,
+                "available": False,
+            }
         try:
             token = self._token_for(parent_run_id)
-            return self._backend.subscribe_descendant_events(
+            page = self._backend.subscribe_descendant_events(
                 parent_run_id,
                 token,
                 child_run_id,
                 from_seq=from_seq,
             ).poll()
+            return {**page, "child_run_id": child_run_id, "available": True}
         except NativeAgentError:
-            return {"events": []}
+            return {
+                "child_run_id": child_run_id,
+                "events": [],
+                "next_seq": from_seq,
+                "has_more": False,
+                "available": False,
+            }
 
     def run_status(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None
@@ -1713,7 +1726,13 @@ class StudioServer:
         data = self._backend.read_run_artifact(run_id, token, digest)
         return data, f"proposal-{digest[:12]}.tar"
 
-    def proposal_image(self, run_id: str, path: str) -> tuple[bytes, str]:
+    def proposal_image(
+        self,
+        run_id: str,
+        path: str,
+        *,
+        expected_proposal_hash: str,
+    ) -> tuple[bytes, str]:
         """Bytes + content-type for an image in the run's PROPOSAL snapshot — lets the proposal
         panel preview a generated image *before* it is applied. Mirrors :meth:`read_image` but
         sources the bytes from the token-scoped backend ``proposal_file`` API (base64 for binary,
@@ -1723,7 +1742,9 @@ class StudioServer:
         if mime is None:
             raise NativeAgentError("not an image file")
         token = self._token_for(run_id)
-        payload = self._backend.proposal_file(run_id, token, path)
+        with proposal_snapshot_lock(self._run_dir_for(run_id)):
+            self._assert_proposal_hash(run_id, token, expected_proposal_hash)
+            payload = self._backend.proposal_file(run_id, token, path)
         content = str(payload.get("content") or "")
         data = base64.b64decode(content) if payload.get("encoding") == "base64" else content.encode("utf-8")
         if len(data) > _IMAGE_VIEW_MAX_BYTES:
@@ -2037,14 +2058,26 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 query = parse_qs(parsed.query)
                 run_id = (query.get("run_id") or [""])[0]
                 rel = (query.get("path") or [""])[0]
+                expected_proposal_hash = (query.get("expected_proposal_hash") or [""])[0]
                 try:
-                    data, mime = studio.proposal_image(run_id, rel)
+                    data, mime = studio.proposal_image(
+                        run_id,
+                        rel,
+                        expected_proposal_hash=expected_proposal_hash,
+                    )
                 except KeyError:
                     self.send_error(HTTPStatus.NOT_FOUND, "not found")
                 except (NativeAgentError, ValueError) as exc:
                     self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 else:
-                    self._serve_bytes(data, mime)
+                    self._serve_bytes(
+                        data,
+                        mime,
+                        headers={
+                            "Cache-Control": "no-store",
+                            "X-Content-Type-Options": "nosniff",
+                        },
+                    )
                 return
             if parsed.path == "/api/jobs":
                 run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]

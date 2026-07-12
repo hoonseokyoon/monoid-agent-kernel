@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from support.studio_harness import (
@@ -410,10 +411,39 @@ def test_proposal_panel_previews_proposed_image(tmp_path: Path) -> None:
 
         # Not on disk yet (propose mode) — but previewable straight from the proposal snapshot.
         assert not (workspace / "chart.svg").exists()
-        data, mime = server.proposal_image(run_id, "chart.svg")
+        data, mime = server.proposal_image(
+            run_id,
+            "chart.svg",
+            expected_proposal_hash=proposal["proposal_hash"],
+        )
         assert mime == "image/svg+xml" and data.decode("utf-8") == svg
 
+        preview_url = f"{server.base_url}/api/proposal-file-raw?" + urlencode(
+            {
+                "run_id": run_id,
+                "path": "chart.svg",
+                "expected_proposal_hash": proposal["proposal_hash"],
+            }
+        )
+        with urlopen(preview_url, timeout=5) as response:
+            assert response.read().decode("utf-8") == svg
+            assert response.headers["Content-Type"] == "image/svg+xml"
+            assert response.headers["Cache-Control"] == "no-store"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+        with pytest.raises(NativeAgentError) as stale:
+            server.proposal_image(
+                run_id,
+                "chart.svg",
+                expected_proposal_hash="f" * 64,
+            )
+        assert stale.value.error_code == "proposal_revision_mismatch"
+
         with pytest.raises(NativeAgentError):
-            server.proposal_image(run_id, "notes.txt")  # non-image refused
+            server.proposal_image(
+                run_id,
+                "notes.txt",
+                expected_proposal_hash=proposal["proposal_hash"],
+            )  # non-image refused
     finally:
         server.shutdown()

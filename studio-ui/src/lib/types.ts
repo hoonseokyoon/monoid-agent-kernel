@@ -153,6 +153,7 @@ export interface RetryResponse extends ChatResponse {
 
 export interface RunEvent<T extends Record<string, unknown> = Record<string, unknown>> {
   seq?: number;
+  run_id?: string;
   event_id?: string;
   parent_id?: string;
   type: string;
@@ -160,6 +161,25 @@ export interface RunEvent<T extends Record<string, unknown> = Record<string, unk
   timestamp?: string;
   studio_activity?: string;
   data: T;
+}
+
+export interface EventsResponse {
+  events: RunEvent[];
+  next_seq: number;
+  has_more: boolean;
+  available: boolean;
+  child_run_id?: string;
+}
+
+export interface SubagentActivity {
+  childRunId: string;
+  subagentType: string;
+  parentRunId: string;
+  taskId: string;
+  depth: number;
+  status: "running" | "succeeded" | "failed";
+  events: RunEvent[];
+  liveTraceUnavailable?: boolean;
 }
 
 export interface ApprovalRequest {
@@ -191,6 +211,7 @@ export interface ProposalFile {
 }
 
 export interface ProposalResponse {
+  run_id?: string;
   ready?: boolean;
   proposal_hash: string;
   diff?: string;

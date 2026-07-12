@@ -1,8 +1,10 @@
 <script lang="ts">
   import type { ApplyResponse, PackageReceipt, ProposalResponse } from "../lib/types";
+  import { studioApi } from "../lib/api";
   import Icon from "./Icon.svelte";
 
-  let { proposal, onApply, onExport } = $props<{
+  let { proposalRunId, proposal, onApply, onExport } = $props<{
+    proposalRunId: string | null;
     proposal: ProposalResponse | null;
     onApply: (approvedPaths: string[]) => Promise<ApplyResponse>;
     onExport: () => Promise<PackageReceipt>;
@@ -18,6 +20,10 @@
   let exporting = $state(false);
   let dialogError = $state("");
   let proposalIdentity = $state("");
+  let imageIdentity = $state("");
+  let imageLoaded = $state(false);
+  let imageError = $state("");
+  let imageRetry = $state(0);
   let packageDialog: HTMLDialogElement;
 
   const paths: string[] = $derived(
@@ -33,6 +39,16 @@
   const selectedSegment = $derived(fileDiff(proposal?.diff ?? "", selectedPath));
   const diffLines = $derived((selectedSegment ?? proposal?.diff ?? "").split("\n"));
   const diffLabel = $derived(selectedSegment ? `Diff for ${selectedPath}` : "Unified diff for all proposed files");
+  const selectedImageUrl = $derived(
+    proposalRunId && proposal?.proposal_hash && selectedPath && isImagePath(selectedPath)
+      ? studioApi.proposalFileRawUrl(
+          proposalRunId,
+          selectedPath,
+          proposal.proposal_hash,
+          imageRetry,
+        )
+      : "",
+  );
 
   $effect(() => {
     const identity = `${proposal?.proposal_hash ?? ""}:${proposal?.diff ?? ""}`;
@@ -45,6 +61,26 @@
       selectedPath = paths[0];
     }
   });
+
+  $effect(() => {
+    const identity = `${proposal?.proposal_hash ?? ""}:${proposalRunId ?? ""}:${selectedPath}`;
+    if (identity !== imageIdentity) {
+      imageIdentity = identity;
+      imageLoaded = false;
+      imageError = "";
+      imageRetry = 0;
+    }
+  });
+
+  function isImagePath(path: string): boolean {
+    return /\.(png|jpe?g|gif|webp|bmp|ico|svg)$/i.test(path);
+  }
+
+  function retryImage(): void {
+    imageLoaded = false;
+    imageError = "";
+    imageRetry += 1;
+  }
 
   function fileDiff(diff: string, path: string): string | null {
     if (!diff || !path) return null;
@@ -176,16 +212,42 @@
           </div>
         {/if}
       </div>
-      <!-- svelte-ignore a11y_no_noninteractive_tabindex -- keyboard focus exposes both scroll axes -->
-      <div class="diff-code" role="region" aria-label={diffLabel} tabindex="0">
-        {#if proposal?.diff}
-          {#each diffLines as line, index}
-            <div class={lineClass(line)}><span>{index + 1}</span><code>{line || " "}</code></div>
-          {/each}
-        {:else}
-          <div class="review-empty"><Icon name="code" size={21} /><strong>Diff unavailable</strong><span>The proposal may still be preparing.</span></div>
-        {/if}
-      </div>
+      {#if selectedImageUrl}
+        <div class="proposal-image-preview" role="region" aria-label={`Proposed image preview for ${selectedPath}`}>
+          <div class="proposal-image-stage" aria-busy={!imageLoaded && !imageError}>
+            {#if !imageLoaded && !imageError}<div class="image-preview-status" role="status"><span class="spinner"></span>Loading proposed image…</div>{/if}
+            {#key selectedImageUrl}
+              <img
+                class:loaded={imageLoaded}
+                src={selectedImageUrl}
+                alt={`Proposed image preview: ${selectedPath}`}
+                aria-hidden={!imageLoaded}
+                onload={() => (imageLoaded = true)}
+                onerror={() => (imageError = "The proposed image could not be loaded from this revision.")}
+              />
+            {/key}
+            {#if imageError}<div class="image-preview-error" role="alert"><Icon name="alert" size={17} /><span>{imageError}</span><button type="button" onclick={retryImage}>Retry preview</button></div>{/if}
+          </div>
+          <p><Icon name="shield" size={12} />Previewed from the proposal snapshot before approval.</p>
+          {#if selectedSegment}
+            <details class="proposal-image-patch">
+              <summary>Patch metadata</summary>
+              <pre>{selectedSegment}</pre>
+            </details>
+          {/if}
+        </div>
+      {:else}
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -- keyboard focus exposes both scroll axes -->
+        <div class="diff-code" role="region" aria-label={diffLabel} tabindex="0">
+          {#if proposal?.diff}
+            {#each diffLines as line, index}
+              <div class={lineClass(line)}><span>{index + 1}</span><code>{line || " "}</code></div>
+            {/each}
+          {:else}
+            <div class="review-empty"><Icon name="code" size={21} /><strong>Diff unavailable</strong><span>The proposal may still be preparing.</span></div>
+          {/if}
+        </div>
+      {/if}
       <footer class="review-status" aria-live="polite"><span>{actionStatus || `${pendingCount} files still need a decision.`}</span><span>Approval and apply are recorded separately</span></footer>
     </div>
   </div>

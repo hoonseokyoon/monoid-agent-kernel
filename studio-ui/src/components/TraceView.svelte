@@ -8,10 +8,11 @@
 
   function label(event: RunEvent): string {
     const data = event.data;
-    if (event.type === "tool.call.started") return `Tool · ${String(data.tool ?? "call")}`;
+    const scope = data.studio_scope === "subagent" ? `Subagent · ${String(data.subagent_type ?? "delegate")} · ` : "";
+    if (event.type === "tool.call.started") return `${scope}Tool · ${String(data.tool ?? "call")}`;
     if (event.type.startsWith("subagent.")) return `Subagent · ${String(data.subagent_type ?? data.status ?? "task")}`;
-    if (event.type === "plan.updated") return `Plan · ${Array.isArray(data.items) ? data.items.length : 0} steps`;
-    return event.type.replaceAll(".", " · ");
+    if (event.type === "plan.updated") return `${scope}Plan · ${Array.isArray(data.items) ? data.items.length : 0} steps`;
+    return scope + event.type.replaceAll(".", " · ");
   }
 
   function exportTrace(): void {

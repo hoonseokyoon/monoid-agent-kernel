@@ -1,13 +1,15 @@
 <script lang="ts">
-  import type { ApprovalRequest, RunViewState } from "../lib/types";
+  import type { ApprovalRequest, RunViewState, SubagentActivity } from "../lib/types";
   import ApprovalCard from "./ApprovalCard.svelte";
   import ErrorPanel from "./ErrorPanel.svelte";
   import Icon from "./Icon.svelte";
   import RichText from "./RichText.svelte";
   import StatusBadge from "./StatusBadge.svelte";
+  import SubagentActivityCard from "./SubagentActivityCard.svelte";
 
-  let { state, connected, onStop, onPause, onResume, onRetry, onApproval, onOpenConfig } = $props<{
+  let { state, subagents, connected, onStop, onPause, onResume, onRetry, onApproval, onOpenConfig } = $props<{
     state: RunViewState;
+    subagents: SubagentActivity[];
     connected: boolean;
     onStop: () => Promise<void>;
     onPause: () => Promise<void>;
@@ -79,6 +81,10 @@
           <div class="message-content"><header><strong>Monoid</strong><span class="typing-dot"><i></i><i></i><i></i></span></header><RichText content={state.activeResponse} /></div>
         </article>
       {/if}
+
+      {#each subagents as activity (activity.childRunId)}
+        <SubagentActivityCard {activity} />
+      {/each}
 
       {#if activeApproval}
         <div class="approval-live">

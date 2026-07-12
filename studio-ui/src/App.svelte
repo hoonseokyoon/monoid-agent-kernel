@@ -36,6 +36,7 @@
     SettingsResponse,
     StudioConfig,
     StudioMode,
+    SubagentActivity,
     InspectorMode,
     JobSummary,
     WorkspaceFile,
@@ -84,6 +85,7 @@
   let jobs = $state<JobSummary[]>([]);
   let proposal = $state<ProposalResponse | null>(null);
   let proposalRunId = $state<string | null>(null);
+  let subagents = $state<Record<string, SubagentActivity>>({});
   let run = $state(initialRunState());
   let mode = $state<StudioMode>("run");
   let inspector = $state<InspectorMode>("workspace");
@@ -102,7 +104,27 @@
   let inspectorButton = $state<HTMLButtonElement>();
   let inspectorDrawer = $state<HTMLElement>();
 
+  interface ChildPoller {
+    epoch: number;
+    nextSeq: number;
+    timer: number | null;
+    stopped: boolean;
+    inFlight: boolean;
+    finalDrain: boolean;
+    failures: number;
+    finalFailures: number;
+    seenEventIds: Set<string>;
+    controller: AbortController | null;
+  }
+
+  const childPollers = new Map<string, ChildPoller>();
+
   const activeProfile = $derived(profiles.find((profile) => profile.id === activeProfileId) ?? profiles[0] ?? fallbackProfile);
+  const subagentList = $derived(Object.values(subagents));
+  const traceEvents = $derived(
+    [...run.events, ...subagentList.flatMap((activity: SubagentActivity) => activity.events)]
+      .sort((left: RunEvent, right: RunEvent) => eventTime(left) - eventTime(right)),
+  );
   const workspaceName = $derived(config.workspace.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) || config.workspace);
   const sessionStatus = $derived(run.status);
   const topModes: Array<{ id: StudioMode; label: string; icon: string }> = [
@@ -130,6 +152,7 @@
     void bootstrap();
     return () => {
       stream?.close();
+      stopChildPollers();
       navigationMedia.removeEventListener("change", syncMedia);
       inspectorMedia.removeEventListener("change", syncMedia);
     };
@@ -292,6 +315,226 @@
     return sessionEpoch === epoch && run.runId === runId;
   }
 
+  function eventTime(event: RunEvent): number {
+    const parsed = event.timestamp ? Date.parse(event.timestamp) : Number.NaN;
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function stopChildPollers(): void {
+    for (const poller of childPollers.values()) {
+      if (poller.timer !== null) window.clearTimeout(poller.timer);
+      poller.controller?.abort();
+    }
+    childPollers.clear();
+  }
+
+  function clearSubagents(): void {
+    stopChildPollers();
+    subagents = {};
+  }
+
+  function childEvent(childRunId: string, subagentType: string, event: RunEvent): RunEvent {
+    const sourceId = event.event_id ?? `seq:${event.seq ?? "unknown"}:${event.type}`;
+    return {
+      ...event,
+      event_id: `child:${childRunId}:${sourceId}`,
+      parent_id: event.parent_id ? `child:${childRunId}:${event.parent_id}` : undefined,
+      data: {
+        ...event.data,
+        source_parent_id: event.parent_id,
+        child_run_id: childRunId,
+        subagent_type: subagentType,
+        studio_scope: "subagent",
+      },
+    };
+  }
+
+  async function drainSubagent(childRunId: string, parentRunId: string, epoch: number): Promise<void> {
+    const poller = childPollers.get(childRunId);
+    if (!poller || poller.epoch !== epoch) return;
+    if (poller.inFlight) {
+      poller.finalDrain = true;
+      return;
+    }
+    poller.inFlight = true;
+    poller.finalDrain = false;
+    const controller = new AbortController();
+    poller.controller = controller;
+    let successfulPage = false;
+    let hasMore = false;
+    try {
+      const payload = await studioApi.subagentEvents(childRunId, poller.nextSeq, controller.signal);
+      if (!isCurrentSession(parentRunId, epoch) || childPollers.get(childRunId) !== poller) return;
+      if (
+        payload.available !== true
+        || !Number.isInteger(payload.next_seq)
+        || payload.next_seq < poller.nextSeq
+        || !Array.isArray(payload.events)
+      ) {
+        throw new Error("child event page is unavailable");
+      }
+      successfulPage = true;
+      hasMore = payload.has_more === true;
+      poller.failures = 0;
+      poller.finalFailures = 0;
+      poller.nextSeq = payload.next_seq;
+      const current = subagents[childRunId];
+      if (!current) return;
+      const additions: RunEvent[] = [];
+      for (const event of payload.events ?? []) {
+        const scoped = childEvent(childRunId, current.subagentType, event);
+        if (!poller.seenEventIds.has(scoped.event_id ?? "")) {
+          poller.seenEventIds.add(scoped.event_id ?? "");
+          additions.push(scoped);
+        }
+        handleSubagentLifecycle(event, parentRunId, epoch, childRunId);
+      }
+      if (additions.length) {
+        const latest = subagents[childRunId] ?? current;
+        subagents = {
+          ...subagents,
+          [childRunId]: { ...latest, events: [...latest.events, ...additions], liveTraceUnavailable: false },
+        };
+      }
+    } catch {
+      if (!controller.signal.aborted) {
+        poller.failures += 1;
+        if (poller.stopped) poller.finalFailures += 1;
+      }
+    } finally {
+      if (poller.controller === controller) poller.controller = null;
+      poller.inFlight = false;
+      if (!isCurrentSession(parentRunId, epoch) || childPollers.get(childRunId) !== poller) {
+        childPollers.delete(childRunId);
+      } else {
+        const needsFinalDrain = poller.stopped && poller.finalDrain;
+        if (successfulPage && hasMore) {
+          poller.timer = window.setTimeout(() => void drainSubagent(childRunId, parentRunId, epoch), 0);
+        } else if (poller.stopped && successfulPage && !needsFinalDrain) {
+          childPollers.delete(childRunId);
+        } else if (poller.stopped && poller.finalFailures >= 3) {
+          const current = subagents[childRunId];
+          if (current) {
+            subagents = {
+              ...subagents,
+              [childRunId]: { ...current, liveTraceUnavailable: true },
+            };
+          }
+          childPollers.delete(childRunId);
+        } else {
+          const delay = successfulPage ? 600 : Math.min(3_000, 600 * 2 ** Math.min(poller.failures, 3));
+          poller.timer = window.setTimeout(
+            () => void drainSubagent(childRunId, parentRunId, epoch),
+            delay,
+          );
+        }
+      }
+    }
+  }
+
+  function startSubagent(data: Record<string, unknown>, parentRunId: string, epoch: number): void {
+    const childRunId = String(data.child_run_id ?? "");
+    if (!childRunId) return;
+    const existing = subagents[childRunId];
+    if (!existing) {
+      subagents = {
+        ...subagents,
+        [childRunId]: {
+          childRunId,
+          subagentType: String(data.subagent_type ?? "delegate"),
+          parentRunId: String(data.parent_run_id ?? parentRunId),
+          taskId: String(data.task_id ?? ""),
+          depth: Number.isFinite(Number(data.depth))
+            ? Number(data.depth)
+            : childRunId.split(".sub.").length - 1,
+          status: "running",
+          events: [],
+        },
+      };
+    }
+    if (childPollers.has(childRunId) || (existing && existing.status !== "running" && existing.events.length)) return;
+    childPollers.set(childRunId, {
+      epoch,
+      nextSeq: 0,
+      timer: null,
+      stopped: false,
+      inFlight: false,
+      finalDrain: false,
+      failures: 0,
+      finalFailures: 0,
+      seenEventIds: new Set((existing?.events ?? []).map((event: RunEvent) => event.event_id ?? "")),
+      controller: null,
+    });
+    void drainSubagent(childRunId, parentRunId, epoch);
+  }
+
+  function finishSubagentById(
+    childRunId: string,
+    failed: boolean,
+    parentRunId: string,
+    epoch: number,
+  ): void {
+    const current = subagents[childRunId];
+    if (current) {
+      subagents = {
+        ...subagents,
+        [childRunId]: { ...current, status: failed ? "failed" : "succeeded" },
+      };
+    }
+    const poller = childPollers.get(childRunId);
+    if (!poller) return;
+    poller.stopped = true;
+    poller.finalDrain = true;
+    if (poller.timer !== null) window.clearTimeout(poller.timer);
+    poller.timer = null;
+    void drainSubagent(childRunId, parentRunId, epoch);
+  }
+
+  function handleSubagentLifecycle(
+    event: RunEvent,
+    parentRunId: string,
+    epoch: number,
+    sourceChildRunId = "",
+  ): void {
+    if (event.type === "subagent.started") {
+      startSubagent(event.data, parentRunId, epoch);
+      return;
+    }
+    if (event.type === "subagent.finished" || event.type === "subagent.failed") {
+      finishSubagent(event.data, event.type === "subagent.failed", parentRunId, epoch);
+      return;
+    }
+    if (sourceChildRunId && (event.type === "run.finished" || event.type === "run.failed")) {
+      finishSubagentById(
+        sourceChildRunId,
+        event.type === "run.failed" || String(event.data.status ?? "") === "failed",
+        parentRunId,
+        epoch,
+      );
+      return;
+    }
+    if (["task.cancelled", "task.timed_out", "task.failed"].includes(event.type)) {
+      const taskId = String(event.data.task_id ?? "");
+      for (const activity of Object.values(subagents)) {
+        if (taskId && activity.taskId === taskId) {
+          finishSubagentById(activity.childRunId, true, parentRunId, epoch);
+        }
+      }
+    }
+  }
+
+  function finishSubagent(
+    data: Record<string, unknown>,
+    failed: boolean,
+    parentRunId: string,
+    epoch: number,
+  ): void {
+    const childRunId = String(data.child_run_id ?? "");
+    if (!childRunId) return;
+    if (!subagents[childRunId]) startSubagent(data, parentRunId, epoch);
+    finishSubagentById(childRunId, failed, parentRunId, epoch);
+  }
+
   function openStream(runId: string, epoch = sessionEpoch): void {
     stream?.close();
     stream = new RunEventStream({
@@ -303,6 +546,7 @@
       onEvent: (event: RunEvent) => {
         if (!isCurrentSession(runId, epoch)) return;
         run = reduceRunEvent(run, event);
+        handleSubagentLifecycle(event, runId, epoch);
         if (["proposal.ready", "workspace.diff.updated", "workspace.proposal.updated"].includes(event.type)) {
           void refreshProposal(runId);
         }
@@ -318,6 +562,7 @@
   async function openSession(runId: string): Promise<void> {
     const epoch = ++sessionEpoch;
     stream?.close();
+    clearSubagents();
     proposal = null;
     proposalRunId = null;
     jobs = [];
@@ -346,6 +591,7 @@
   function newSession(): void {
     sessionEpoch += 1;
     stream?.close();
+    clearSubagents();
     stream = null;
     streamConnected = false;
     run = initialRunState();
@@ -528,6 +774,7 @@
     activeProfileId = response.profile.id;
     sessionEpoch += 1;
     stream?.close();
+    clearSubagents();
     run = initialRunState();
     proposal = null;
     proposalRunId = null;
@@ -619,6 +866,7 @@
   function switchProfile(id: string): void {
     sessionEpoch += 1;
     activeProfileId = id;
+    clearSubagents();
     run = initialRunState();
     proposal = null;
     proposalRunId = null;
@@ -732,15 +980,16 @@
         {/key}
       {:else if mode === "review"}
         {#key `${run.runId ?? "none"}:${proposalRunId ?? "none"}`}
-          <ReviewChanges {proposal} onApply={applyApproved} onExport={exportPackage} />
+          <ReviewChanges {proposalRunId} {proposal} onApply={applyApproved} onExport={exportPackage} />
         {/key}
       {:else if mode === "trace"}
-        <TraceView events={run.events} />
+        <TraceView events={traceEvents} />
       {:else}
         <div class="run-stage">
           {#if run.runId || run.messages.length}
             <RunView
               state={run}
+              subagents={subagentList}
               connected={streamConnected}
               onStop={stopTurn}
               onPause={pauseRun}
@@ -799,9 +1048,9 @@
           {:else}
             <div class="mini-trace-inspector">
               <header class="inspector-heading"><div><div class="eyebrow">Live events</div><h2>Trace</h2></div><button class="icon-button" title="Open full trace" onclick={openFullTrace}><Icon name="chevron" size={14} /></button></header>
-              {#if run.events.length}
-                {#each run.events.slice(-30).reverse() as event}
-                  <button onclick={openFullTrace}><span class:error={event.level === "error"}></span><div><strong>{event.type}</strong><small>seq {event.seq ?? "—"}</small></div></button>
+              {#if traceEvents.length}
+                {#each traceEvents.slice(-30).reverse() as event}
+                  <button onclick={openFullTrace}><span class:error={event.level === "error"}></span><div><strong>{event.data.studio_scope === "subagent" ? `subagent · ${event.type}` : event.type}</strong><small>seq {event.seq ?? "—"}</small></div></button>
                 {/each}
               {:else}<div class="inspector-empty large"><Icon name="trace" size={20} />Trace events appear after the run starts.</div>{/if}
             </div>

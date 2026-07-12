@@ -3,6 +3,7 @@ import type {
   AttachmentInput,
   ChatResponse,
   ChatTranscriptResponse,
+  EventsResponse,
   FilePreviewResponse,
   FilesResponse,
   JobsResponse,
@@ -68,6 +69,11 @@ export const studioApi = {
     json<SessionsResponse>(`/api/sessions${profileId ? `?profile_id=${encodeURIComponent(profileId)}` : ""}`),
   transcript: (runId: string) =>
     json<ChatTranscriptResponse>(`/api/chat-transcript?run_id=${encodeURIComponent(runId)}`),
+  subagentEvents: (childRunId: string, from = 0, signal?: AbortSignal) =>
+    json<EventsResponse>(
+      `/api/subagent-events?run_id=${encodeURIComponent(childRunId)}&from=${Math.max(0, from)}`,
+      { signal },
+    ),
   send: (input: {
     runId?: string | null;
     message: string;
@@ -95,6 +101,15 @@ export const studioApi = {
   fileRawUrl: (path: string) => `/api/file-raw?path=${encodeURIComponent(path)}`,
   jobs: (runId: string) => json<JobsResponse>(`/api/jobs?run_id=${encodeURIComponent(runId)}`),
   proposal: (runId: string) => json<ProposalResponse>(`/api/proposal?run_id=${encodeURIComponent(runId)}`),
+  proposalFileRawUrl: (runId: string, path: string, proposalHash: string, retry = 0) => {
+    const query = new URLSearchParams({
+      run_id: runId,
+      path,
+      expected_proposal_hash: proposalHash,
+      retry: String(retry),
+    });
+    return `/api/proposal-file-raw?${query}`;
+  },
   applyProposal: (runId: string, approvedPaths: string[], expectedProposalHash: string) =>
     post<ApplyResponse>("/api/apply", {
       run_id: runId,

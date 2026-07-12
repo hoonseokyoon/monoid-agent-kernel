@@ -95,6 +95,10 @@ def test_index_serves_compiled_svelte_shell_and_assets(studio: StudioServer) -> 
         "right-panel-tabs",
         "settings-config-popup",
         "capability-toggles",
+        "/api/subagent-events",
+        "/api/proposal-file-raw",
+        "Starting delegated work",
+        "Previewed from the proposal snapshot",
     ):
         assert hook in javascript
 
@@ -321,8 +325,11 @@ def test_subagent_events_uses_root_ancestor_token_for_nested_child(tmp_path: Pat
     result = server.subagent_events("run_parent.sub.task_1.sub.task_2", from_seq=7)
 
     assert result["events"] == [{"seq": 7, "type": "child"}]
+    assert result["next_seq"] == 8
+    assert result["available"] is True
     assert backend.calls == [("run_parent", "root-token", "run_parent.sub.task_1.sub.task_2", 7)]
     assert server.subagent_events("run_parent")["events"] == []
+    assert server.subagent_events("run_parent")["available"] is False
     assert server.subagent_events("../secret.sub.task")["events"] == []
 
 
