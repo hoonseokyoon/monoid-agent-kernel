@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ApplyResponse, PackageReceipt, ProposalResponse } from "../lib/types";
   import { studioApi } from "../lib/api";
+  import { fileDiff } from "../lib/diff";
   import Icon from "./Icon.svelte";
 
   let { proposalRunId, proposal, onApply, onExport } = $props<{
@@ -80,18 +81,6 @@
     imageLoaded = false;
     imageError = "";
     imageRetry += 1;
-  }
-
-  function fileDiff(diff: string, path: string): string | null {
-    if (!diff || !path) return null;
-    const normalized = path.replaceAll("\\", "/");
-    const sections = diff.split(/(?=^diff --git )/m).filter(Boolean);
-    return sections.find((section) => {
-      const firstLine = section.split("\n", 1)[0] ?? "";
-      return firstLine.includes(` a/${normalized} b/${normalized}`)
-        || section.includes(`\n+++ b/${normalized}\n`)
-        || section.includes(`\n--- a/${normalized}\n`);
-    }) ?? null;
   }
 
   function setDecision(path: string, decision: Decision): void {

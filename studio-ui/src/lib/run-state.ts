@@ -4,8 +4,16 @@ import type {
   ChatTranscriptResponse,
   PlanItem,
   RunEvent,
+  RunStatus,
   RunViewState,
 } from "./types";
+
+export function isRunBusy(status: RunStatus): boolean {
+  return status === "queued"
+    || status === "running"
+    || status === "awaiting-approval"
+    || status === "stopping";
+}
 
 export function initialRunState(runId: string | null = null): RunViewState {
   return {

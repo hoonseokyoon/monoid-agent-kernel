@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { AttachmentInput, RunStatus } from "../lib/types";
+  import { isRunBusy } from "../lib/run-state";
   import Icon from "./Icon.svelte";
 
   let { status, disabled = false, onSend, onStop } = $props<{
@@ -14,7 +15,7 @@
   let submitting = $state(false);
   let fileInput: HTMLInputElement;
 
-  const busy = $derived(status === "running" || status === "queued" || status === "awaiting-approval");
+  const busy = $derived(isRunBusy(status));
 
   function readBase64(file: File): Promise<string> {
     return new Promise((resolve, reject) => {

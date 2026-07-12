@@ -12,7 +12,7 @@ const compiled = ts.transpileModule(source, {
   fileName: "run-state.ts",
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.outputText).toString("base64")}`;
-const { initialRunState, reduceRunEvent } = await import(moduleUrl);
+const { initialRunState, isRunBusy, reduceRunEvent } = await import(moduleUrl);
 
 function event(type, data, seq) {
   return {
@@ -56,4 +56,10 @@ state = reduceRunEvent(
 );
 assert.equal(state.status, "succeeded");
 
-console.log("Run-state checks passed (4 scenarios).");
+assert.equal(isRunBusy("running"), true);
+assert.equal(isRunBusy("queued"), true);
+assert.equal(isRunBusy("awaiting-approval"), true);
+assert.equal(isRunBusy("stopping"), true, "stop and pause requests must keep the composer busy");
+assert.equal(isRunBusy("stopped"), false);
+
+console.log("Run-state checks passed (9 scenarios).");
