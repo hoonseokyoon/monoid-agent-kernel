@@ -109,7 +109,8 @@ def run_acceptance(
             if settled:
                 final_text = str((settled[-1].get("data") or {}).get("final_text") or "")
                 state = str(server.run_status(run_id).get("state") or "")
-                break
+                if state != "running":
+                    break
             time.sleep(0.1)
         check("deterministic-chat", bool(final_text), final_text[:120])
         transcript = _http_json(f"{base_url}/api/chat-transcript?run_id={quote(run_id)}") if run_id else {}
