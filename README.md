@@ -24,18 +24,19 @@ then follow the [Documentation map](#documentation) to the path for your role.
 
 The bundled **Agent Studio** reference app (`monoid studio serve`) drives the kernel
 through its Python API behind a single-page UI. A profile chooses the model, reasoning
-level, prompt instructions, and tool surface; each profile keeps its own chat history.
+level, prompt instructions, and capability surface; each profile keeps its own chat history.
 
-![Agent Studio: a Visual Analyst profile reads sales data, writes insights, and generates an annotated revenue chart](https://raw.githubusercontent.com/hoonseokyoon/monoid-agent-kernel/main/docs/img/studio-v016-main.png)
+![Agent Studio: a Visual Analyst reads sales data, pauses for approval, and previews an annotated revenue chart](https://raw.githubusercontent.com/hoonseokyoon/monoid-agent-kernel/main/docs/img/studio-v019-main.jpg)
 
-*A real Studio run: the agent reads `sales.csv`, writes `INSIGHTS.md`, generates an
-annotated `revenue_trend.svg`, and previews the artifact directly in the workspace panel.*
+*A real Studio run: the agent reads `sales.csv`, pauses for human approval, and stages
+`INSIGHTS.md` and `revenue_trend.svg` for file-by-file review. The user applies the approved
+files through Studio and previews the chart directly in the workspace panel.*
 
-![Agent Studio profile builder showing the exact system prompt and tool schema preview](https://raw.githubusercontent.com/hoonseokyoon/monoid-agent-kernel/main/docs/img/studio-v016-profile-builder.png)
+![Agent Profile Builder with capability controls and the exact ModelRequest preview](https://raw.githubusercontent.com/hoonseokyoon/monoid-agent-kernel/main/docs/img/studio-v019-profile-builder.jpg)
 
-*The profile editor shows the exact first-turn model request boundary: system prompt,
-tool schemas, model settings, and preview notes. Users can edit the profile on the left
-and see what the model will receive on the right.*
+*The Profile Builder places model, reasoning, and capability controls beside the
+backend-resolved first-turn `ModelRequest`: system prompt, exact tool schemas, model
+settings, and boundary notes.*
 
 ## Architecture: Contract / Conformance Test / Core Helper Kit / Reference
 
