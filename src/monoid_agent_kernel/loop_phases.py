@@ -477,8 +477,7 @@ class LoopFinalizer:
         recorder = res.recorder
         workspace = res.workspace
         context.job_manager.cancel_all()
-        diff_path = recorder.write_diff(workspace.diff_patch())
-        proposal_payload = recorder.write_proposal_snapshot(workspace, diff_path)
+        _diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(workspace)
         metrics = self.build_metrics(state, res)
         recorder.write_metrics(metrics)
         recorder.emit(
@@ -535,8 +534,7 @@ class LoopFinalizer:
         loop = self._loop
         recorder = res.recorder
         workspace = res.workspace
-        diff_path = recorder.write_diff(workspace.diff_patch())
-        proposal_payload = recorder.write_proposal_snapshot(workspace, diff_path)
+        _diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(workspace)
         metrics = self.build_metrics(state, res)
         recorder.write_metrics(metrics)
         recorder.emit(

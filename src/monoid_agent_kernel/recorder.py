@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
@@ -19,6 +22,24 @@ if TYPE_CHECKING:
     from monoid_agent_kernel.core.workspace import ChangedEntry, Workspace
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.recorder")
+_PROPOSAL_LOCKS_GUARD = threading.Lock()
+_PROPOSAL_LOCKS: dict[str, threading.RLock] = {}
+
+
+@contextmanager
+def proposal_snapshot_lock(run_dir: Path) -> Iterator[None]:
+    """Serialize one run's proposal snapshot writes and live-directory consumers.
+
+    Proposal files form one logical revision even though they occupy several paths. The reference
+    backend and Studio use this same in-process lock while reading, exporting, approving, or
+    applying them, so no consumer can observe the writer between ``diff.patch`` and the final
+    atomic ``proposal.json`` replace.
+    """
+    key = str(run_dir.resolve())
+    with _PROPOSAL_LOCKS_GUARD:
+        lock = _PROPOSAL_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
 
 
 @dataclass
@@ -254,6 +275,14 @@ class AgentRecorder:
         diff_path = self.run_dir / "diff.patch"
         diff_path.write_text(diff_text, encoding="utf-8")
         return diff_path
+
+    def write_proposal_revision(self, workspace: Workspace) -> tuple[str, Path, dict[str, Any]]:
+        """Persist one internally consistent diff and proposal snapshot revision."""
+        with proposal_snapshot_lock(self.run_dir):
+            diff_text = workspace.diff_patch()
+            diff_path = self.write_diff(diff_text)
+            proposal_payload = self.write_proposal_snapshot(workspace, diff_path)
+        return diff_text, diff_path, proposal_payload
 
     def write_manifest(self, manifest: RunManifest) -> Path:
         manifest_path = self.run_dir / "manifest.json"

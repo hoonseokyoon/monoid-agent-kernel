@@ -22,6 +22,33 @@ monoid studio accept         # deterministic offline acceptance check, emits JSO
 Run `studio doctor` first if anything looks off — it turns late, cryptic setup failures into an
 upfront pass/fail checklist with remediation.
 
+## Frontend development
+
+Studio's browser UI is a Svelte 5 + TypeScript application under `studio-ui/`. Tailwind CSS v4
+maps the semantic Studio tokens to utilities. Node.js is needed only when authoring or rebuilding
+the UI; released Python packages include the compiled assets.
+
+```bash
+# terminal 1: BFF and agent runtime
+monoid studio serve --port 8799
+
+# terminal 2: Vite dev server with /api proxied to Studio
+cd studio-ui
+npm ci
+npm run dev
+```
+
+Before committing frontend changes, rebuild the packaged assets and run the Svelte checks:
+
+```bash
+cd studio-ui
+npm run check
+npm run build
+```
+
+The build writes to `src/monoid_agent_kernel/reference/studio/web/dist/`. Commit that directory so
+wheel and sdist users can run Studio without Node.js.
+
 ### Flags & defaults
 
 | Flag | Default | Meaning |

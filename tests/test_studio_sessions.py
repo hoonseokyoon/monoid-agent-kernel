@@ -56,6 +56,91 @@ def test_studio_surfaces_turn_failed_without_terminating(tmp_path: Path) -> None
         server.shutdown()
 
 
+def test_studio_retry_reissues_failed_by_value_request_without_duplicate_user_message(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    class CaptureFailThenSettle:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def next_turn(self, request):  # noqa: ANN001
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise ModelAdapterError("unsupported effort", http_status=400, retryable=False)
+            return ModelTurn(response_id="r2", final_text="ok now")
+
+    adapter = CaptureFailThenSettle()
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: adapter,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("do the thing")["run_id"]
+        failed = _wait_event(server, run_id, "turn.failed")
+        assert failed is not None and failed["data"]["retryable"] is False
+        deadline = time.time() + 10
+        while time.time() < deadline and server.run_status(run_id)["state"] != "awaiting_input":
+            time.sleep(0.05)
+        assert server.run_status(run_id)["state"] == "awaiting_input"
+
+        request = Request(
+            f"{server.base_url}/api/retry",
+            data=json.dumps({"run_id": run_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            retried = json.loads(response.read().decode("utf-8"))
+        assert retried["retried"] is True
+        assert retried["retry_mode"] == "reissue_failed_turn"
+        assert retried["retry_of_event_seq"] == failed["seq"]
+        assert retried["new_attempt"] is False
+        assert retried["message_snapshot_reused"] is True
+        assert retried["request_snapshot_reused"] is False
+        assert retried["runtime_config_source"] == "current"
+        assert retried["message_snapshot"] == "existing_by_value_messages"
+        assert _wait_settled(server, run_id, 1)
+
+        assert len(adapter.requests) == 2
+        first, second = adapter.requests
+        assert first.messages == second.messages
+        # Empty retry input is absent from the by-value messages. The ModelRequest object itself is
+        # intentionally not byte-identical: instruction is empty and config is resolved afresh.
+        assert second.instruction == ""
+        transcript = server.chat_transcript(run_id)["messages"]
+        assert [message["content"] for message in transcript if message["role"] == "user"] == [
+            "do the thing"
+        ]
+    finally:
+        server.shutdown()
+
+
+def test_studio_resume_route_reports_an_already_live_session(studio: StudioServer) -> None:
+    run_id = studio.start_chat("hello")["run_id"]
+    assert _wait_settled(studio, run_id, 1)
+    request = Request(
+        f"{studio.base_url}/api/resume",
+        data=json.dumps({"run_id": run_id}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=5) as response:
+        resumed = json.loads(response.read().decode("utf-8"))
+    assert resumed == {
+        "run_id": run_id,
+        "state": "awaiting_input",
+        "terminal": False,
+        "resumed": False,
+        "recovery_resumed": False,
+        "turn_resumed": False,
+        "resume_kind": "already_live",
+    }
+
+
 def test_studio_chat_emits_token_usage(studio: StudioServer) -> None:
     run_id = studio.start_chat("hello")["run_id"]
     _wait_settled(studio, run_id, 1)
@@ -108,6 +193,55 @@ def test_studio_interrupt_keeps_session_alive(tmp_path: Path) -> None:
         server.continue_chat(run_id, "continue")
         assert len(_wait_settled(server, run_id, 1)) >= 1
     finally:
+        server.shutdown()
+
+
+def test_studio_pause_and_resume_routes_continue_the_frozen_turn(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "notes.md").write_text("hello\n", encoding="utf-8")
+    adapter = _BlockingThenToolAdapter()
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
+        provider_factory=lambda _claims, _config: adapter,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("go")["run_id"]
+        assert adapter.reached_block.wait(10.0)
+
+        pause_request = Request(
+            f"{server.base_url}/api/pause",
+            data=json.dumps({"run_id": run_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(pause_request, timeout=5) as response:
+            paused = json.loads(response.read().decode("utf-8"))
+        assert paused["pause_requested"] is True
+        assert paused["state"] == "running"
+        assert paused["terminal"] is False
+
+        adapter.release.set()
+        deadline = time.time() + 10
+        while time.time() < deadline and server.run_status(run_id)["state"] != "paused":
+            time.sleep(0.05)
+        assert server.run_status(run_id)["state"] == "paused"
+
+        resume_request = Request(
+            f"{server.base_url}/api/resume",
+            data=json.dumps({"run_id": run_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(resume_request, timeout=5) as response:
+            resumed = json.loads(response.read().decode("utf-8"))
+        assert resumed["resumed"] is True
+        assert resumed["turn_resumed"] is True
+        assert resumed["resume_kind"] == "paused_turn"
+        assert _wait_settled(server, run_id, 1)
+    finally:
+        adapter.release.set()
         server.shutdown()
 
 
@@ -275,6 +409,37 @@ def test_studio_profile_preview_resolves_model_request_surface(studio: StudioSer
     assert preview["tool_surface"]["authorizations"]["fs.delete"]["decision"] == "ask"
     read_tool = next(tool for tool in preview["tools"] if tool["name"] == "fs_read")
     assert read_tool["input_schema"]["type"] == "object"
+    assert preview["schema_version"] == "studio.model-request-preview.v1"
+    assert preview["snapshot_kind"] == "initial_new_chat_turn"
+    assert preview["input_bound"] is False
+    assert preview["unbound_fields"] == ["instruction", "messages"]
+    model_request = preview["model_request"]
+    assert model_request["instruction"] is None
+    assert model_request["messages"] is None
+    assert model_request["previous_turn_handle"] is None
+    assert model_request["observations"] == []
+    assert model_request["system_prompt"] == preview["system_prompt"]
+    assert model_request["tools"] == preview["tools"]
+    assert model_request["model"]["model"] == "gpt-preview"
+    assert model_request["model"]["reasoning"]["effort"] == "high"
+
+    bound = studio.profile_preview(
+        {
+            "name": "Previewer",
+            "instructions": "Always mention PREVIEW_SENTINEL.",
+            "capabilities": ["read"],
+            "model": "gpt-preview",
+            "effort": "high",
+            "summary": "off",
+            "preview_instruction": "Inspect the workspace.",
+        }
+    )
+    assert bound["input_bound"] is True
+    assert bound["unbound_fields"] == []
+    assert bound["model_request"]["instruction"] == "Inspect the workspace."
+    assert bound["model_request"]["messages"] == [
+        {"role": "user", "content": "Inspect the workspace."}
+    ]
 
 
 def test_studio_profile_history_survives_restart(tmp_path: Path) -> None:

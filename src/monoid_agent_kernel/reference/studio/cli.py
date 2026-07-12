@@ -73,9 +73,15 @@ def run_acceptance(
         base_url = server.start()
         check("healthz", _http_json(f"{base_url}/healthz").get("ok") is True)
         index_html = _http_text(f"{base_url}/")
-        check("index-static-hooks", "data-testid=\"studio-shell\"" in index_html)
+        check(
+            "index-static-shell",
+            '<div id="app"></div>' in index_html and "/assets/" in index_html,
+        )
         settings_html = _http_text(f"{base_url}/settings")
-        check("settings-static-hooks", "data-testid=\"settings-popup\"" in settings_html)
+        check(
+            "settings-static-shell",
+            '<div id="app"></div>' in settings_html and "/assets/" in settings_html,
+        )
         cfg = _http_json(f"{base_url}/api/config")
         check("config-route", cfg.get("offline") is True and cfg.get("provider") == "offline")
         settings = _http_json(f"{base_url}/api/settings")
@@ -103,7 +109,8 @@ def run_acceptance(
             if settled:
                 final_text = str((settled[-1].get("data") or {}).get("final_text") or "")
                 state = str(server.run_status(run_id).get("state") or "")
-                break
+                if state != "running":
+                    break
             time.sleep(0.1)
         check("deterministic-chat", bool(final_text), final_text[:120])
         transcript = _http_json(f"{base_url}/api/chat-transcript?run_id={quote(run_id)}") if run_id else {}

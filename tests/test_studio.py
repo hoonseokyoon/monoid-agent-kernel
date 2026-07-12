@@ -61,72 +61,63 @@ def test_vendor_route_serves_katex_offline(studio: StudioServer) -> None:
         raise AssertionError("missing vendor asset should 404")
 
 
-def test_index_serves_onboarding_panel(studio: StudioServer) -> None:
-    # The served UI includes the first-run onboarding empty-state + the sendPrompt hook its
-    # suggested-prompt buttons call.
+def test_index_serves_compiled_svelte_shell_and_assets(studio: StudioServer) -> None:
+    import re
     import urllib.request
 
-    with urllib.request.urlopen(f"{studio.base_url}/") as resp:
-        html = resp.read().decode("utf-8")
-    html_lf = html.replace("\r\n", "\n")
-    assert "#onboarding" in html  # the empty-state styles ship in the page
-    assert "function showOnboarding" in html  # the panel is built on a fresh chat
-    assert "function sendPrompt" in html  # suggested-prompt buttons call it
-    # A failed run surfaces the provider error detail (shared by the run.failed + turn.failed paths).
-    assert "function providerDetail" in html
-    assert "provider_error_code" in html
+    with urllib.request.urlopen(f"{studio.base_url}/") as response:
+        assert response.headers["Cache-Control"] == "no-cache"
+        html = response.read().decode("utf-8")
+
+    assert '<div id="app"></div>' in html
+    assert "Monoid Studio" in html
+    assert 'src="/src/main.ts"' not in html
+    script_match = re.search(r'src="(/assets/[^"]+\.js)"', html)
+    style_match = re.search(r'href="(/assets/[^"]+\.css)"', html)
+    assert script_match is not None
+    assert style_match is not None
+
+    with urllib.request.urlopen(f"{studio.base_url}{script_match.group(1)}") as response:
+        assert "text/javascript" in response.headers["Content-Type"]
+        assert "immutable" in response.headers["Cache-Control"]
+        javascript = response.read().decode("utf-8")
+    with urllib.request.urlopen(f"{studio.base_url}{style_match.group(1)}") as response:
+        assert "text/css" in response.headers["Content-Type"]
+        assert "immutable" in response.headers["Cache-Control"]
+
     for hook in (
-        'data-testid="studio-shell"',
-        'data-testid="left-config-panel"',
-        'data-testid="profile-switcher"',
-        'data-testid="profile-add"',
-        'data-testid="profile-list"',
-        'data-testid="profile-editor-popup"',
-        'class="profile-editor-panel profile-preview-panel"',
-        'id="prompt-preview-system"',
-        'id="prompt-preview-tools"',
-        'id="prompt-preview-tool-count"',
-        'id="prompt-preview-settings"',
-        'id="prompt-preview-notes"',
-        'data-testid="chat-log"',
-        'data-testid="composer"',
-        'data-testid="right-panel-tabs"',
-        'data-testid="settings-config-popup"',
-        'data-testid="capability-toggles"',
+        "studio-shell",
+        "left-config-panel",
+        "profile-switcher",
+        "profile-editor-popup",
+        "chat-log",
+        "composer",
+        "right-panel-tabs",
+        "settings-config-popup",
+        "capability-toggles",
+        "/api/subagent-events",
+        "/api/proposal-file-raw",
+        "Starting delegated work",
+        "Previewed from the proposal snapshot",
     ):
-        assert hook in html
-    # Saving a profile activates that profile and clears the current run so the next message does
-    # not continue a session created under another profile.
-    assert "activeProfileId = body.profile.id;" in html
-    assert "runId = null;" in html
-    assert "resetChatView();" in html
-    assert "function refreshPromptPreview" in html
-    assert 'fetch("/api/profile-preview"' in html
-    assert "#body { flex: 1; display: grid;" in html
-    assert "#sidebar { overflow: hidden;" in html
-    assert "#sessions { list-style: none;" in html and "overflow: auto;" in html
-    assert "if (seq >= 0 && seq <= replayEventCursor) return;" in html
-    assert 'if (type === "turn.failed") return true;' in html
-    assert 'source.event_type === "turn.failed"' in html
-    assert (
-        'if (type === "task.started" && (data.kind === "hitl" || data.kind === "tool_approval")) {\n'
-        "    if (seq >= 0 && seq <= replayEventCursor) return;\n"
-        "    hideTyping();\n"
-        "    renderHitl(data);\n"
-        "    return;\n"
-        "  }"
-    ) in html_lf
-    assert "arguments_preview" in html
+        assert hook in javascript
 
 
-def test_settings_page_serves_static_test_hooks(studio: StudioServer) -> None:
+def test_settings_deep_link_serves_compiled_shell(studio: StudioServer) -> None:
+    import urllib.error
     import urllib.request
 
-    with urllib.request.urlopen(f"{studio.base_url}/settings") as resp:
-        html = resp.read().decode("utf-8")
-    assert 'data-testid="settings-popup"' in html
-    assert 'data-testid="capability-toggles"' in html
-    assert 'data-testid="capability-toggle-' in html
+    with urllib.request.urlopen(f"{studio.base_url}/settings") as response:
+        html = response.read().decode("utf-8")
+    assert '<div id="app"></div>' in html
+    assert "/assets/" in html
+
+    try:
+        urllib.request.urlopen(f"{studio.base_url}/assets/missing.js")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 404
+    else:
+        raise AssertionError("missing compiled asset should 404")
 
 
 def test_offline_chat_produces_assistant_reply(studio: StudioServer) -> None:
@@ -334,8 +325,11 @@ def test_subagent_events_uses_root_ancestor_token_for_nested_child(tmp_path: Pat
     result = server.subagent_events("run_parent.sub.task_1.sub.task_2", from_seq=7)
 
     assert result["events"] == [{"seq": 7, "type": "child"}]
+    assert result["next_seq"] == 8
+    assert result["available"] is True
     assert backend.calls == [("run_parent", "root-token", "run_parent.sub.task_1.sub.task_2", 7)]
     assert server.subagent_events("run_parent")["events"] == []
+    assert server.subagent_events("run_parent")["available"] is False
     assert server.subagent_events("../secret.sub.task")["events"] == []
 
 

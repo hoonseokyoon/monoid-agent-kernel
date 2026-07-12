@@ -68,6 +68,10 @@ For the dynamic binding-based tool surface, see
 pip install monoid-agent-kernel
 ```
 
+The Studio UI ships as precompiled static assets. Running Studio does not install or require
+Node.js, Svelte, Vite, or Tailwind CSS; those tools are confined to frontend development and the
+release build.
+
 The default install runs Studio with complete one-shot gateway turns. Add the async HTTP extra
 to render live token deltas in Studio:
 

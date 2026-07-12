@@ -77,6 +77,7 @@ from monoid_agent_kernel.reference.mcp_gateway import FakeMcpServer, create_mcp_
 from monoid_agent_kernel.memory import LocalFilesystemMemoryProvider
 from monoid_agent_kernel.mcp import McpError, McpToolProvider
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
+from monoid_agent_kernel.recorder import proposal_snapshot_lock
 from monoid_agent_kernel.tools.base import ToolRegistry, ToolSpec
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.tools.defaults import default_tool_bindings
@@ -84,6 +85,8 @@ from monoid_agent_kernel.tools.defaults import default_tool_bindings
 _LOGGER = logging.getLogger("monoid_agent_kernel.studio")
 
 _WEB_DIR = Path(__file__).parent / "web"
+_APP_DIR = _WEB_DIR / "dist"
+_APP_INDEX = _APP_DIR / "index.html"
 # Per-attachment cap. An attachment rides a base64 ``data:`` URI inside the JSON body (handed to
 # the kernel by value; the core normalizes it to a content-addressed blob), so the HTTP body limit
 # is sized to clear one inflated image plus the JSON envelope.
@@ -121,6 +124,22 @@ _VENDOR_CONTENT_TYPES = {
     ".woff": "font/woff",
     ".ttf": "font/ttf",
     ".map": "application/json",
+}
+_APP_CONTENT_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".gif": "image/gif",
+    ".html": "text/html; charset=utf-8",
+    ".ico": "image/x-icon",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".png": "image/png",
+    ".svg": "image/svg+xml; charset=utf-8",
+    ".webp": "image/webp",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
 }
 
 
@@ -674,7 +693,37 @@ class StudioServer:
             else f"{static_system_prompt}\n\n{dynamic_context}"
         )
         tools = [_gateway_tool_schema(tool) for tool in surface.immediate_tools]
+        # A profile alone cannot supply the first user message. When callers provide a
+        # ``preview_instruction`` we can render the complete initial by-value ModelRequest; when
+        # they omit it, the two input-owned fields stay explicitly unbound instead of displaying a
+        # made-up prompt. Everything else is the exact runtime-resolved first-turn snapshot.
+        preview_instruction = (
+            str(payload.get("preview_instruction") or "").strip()
+            if "preview_instruction" in payload
+            else None
+        )
+        input_bound = bool(preview_instruction)
+        preview_messages = (
+            ([{"role": "user", "content": preview_instruction}] if preview_instruction else [])
+            if input_bound
+            else None
+        )
+        model_config = runtime_config.model or ModelConfig()
+        model_request = {
+            "instruction": preview_instruction,
+            "system_prompt": system_prompt,
+            "tools": tools,
+            "previous_turn_handle": None,
+            "observations": [],
+            "model": model_config.to_json(),
+            "messages": preview_messages,
+        }
         return {
+            "schema_version": "studio.model-request-preview.v1",
+            "snapshot_kind": "initial_new_chat_turn",
+            "input_bound": input_bound,
+            "unbound_fields": [] if input_bound else ["instruction", "messages"],
+            "model_request": model_request,
             "system_prompt": system_prompt,
             "tools": tools,
             "tool_count": len(tools),
@@ -688,6 +737,11 @@ class StudioServer:
             "notes": [
                 "System prompt includes profile instructions and provider dynamic context for the initial turn.",
                 "Tools are the exact ModelRequest.tools schema sent to the Studio LLM gateway; the gateway provider may convert them to a vendor-native function schema.",
+                (
+                    "The preview instruction is bound into the initial by-value user message."
+                    if input_bound
+                    else "Instruction and messages are null until the first user message is supplied."
+                ),
             ],
         }
 
@@ -1349,6 +1403,138 @@ class StudioServer:
             )
         return result
 
+    def pause_chat(self, run_id: str) -> dict[str, Any]:
+        """Cooperatively pause the current turn through the backend control boundary."""
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        return self._backend.pause_run(run_id, token)
+
+    def resume_chat(self, run_id: str) -> dict[str, Any]:
+        """Explicitly resume a recoverable checkpoint or a cooperatively paused turn.
+
+        ``RunnerBackend.resume_run`` owns checkpoint recovery and is idempotent for an already-live
+        run. A live paused turn needs the distinct ``signal_resume`` operation so it continues the
+        frozen turn without adding user input. The BFF composes those two backend contracts while
+        keeping the run token server-side.
+        """
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        before = self._backend.status(run_id, token)
+        if bool(before.get("terminal")):
+            raise NativeAgentError(
+                "cannot resume a terminal run",
+                error_code="resume_terminal_run",
+            )
+
+        recovery = self._backend.resume_run(run_id, token)
+        recovery_resumed = bool(recovery.get("resumed"))
+        turn_resumed = False
+        result = recovery
+        if str(before.get("state") or "") == "paused":
+            result = self._backend.signal_resume(run_id, token)
+            turn_resumed = bool(result.get("resumed"))
+
+        if recovery_resumed and turn_resumed:
+            resume_kind = "checkpoint_and_paused_turn"
+        elif recovery_resumed:
+            resume_kind = "checkpoint"
+        elif turn_resumed:
+            resume_kind = "paused_turn"
+        else:
+            resume_kind = "already_live"
+        return {
+            "run_id": run_id,
+            "state": str(result.get("state") or recovery.get("state") or before.get("state") or ""),
+            "terminal": bool(result.get("terminal", recovery.get("terminal", False))),
+            "resumed": recovery_resumed or turn_resumed,
+            "recovery_resumed": recovery_resumed,
+            "turn_resumed": turn_resumed,
+            "resume_kind": resume_kind,
+        }
+
+    def retry_chat(self, run_id: str) -> dict[str, Any]:
+        """Reissue the latest non-retryable failed model turn without duplicating user input.
+
+        The public backend has no byte-identical ``ModelRequest`` replay seam. Its closest safe
+        operation is an empty ``send_message``: the durable by-value message log remains unchanged,
+        ``user_message_from_parts`` omits the empty input, and the current runtime config is resolved
+        again. This is the desired config-fix retry behavior, but it is not reuse of the complete
+        prior request object. A deterministic message id derived from the failed event makes
+        duplicate POSTs effectively-once through the backend inbox.
+
+        Transient failures remain backend-owned automatic retries. This endpoint accepts only a
+        parked, non-retryable ``turn.failed`` boundary; it never guesses from frontend chat text.
+        """
+        assert self._backend is not None
+        token = self._token_for(run_id)
+        status = self._backend.status(run_id, token)
+        if bool(status.get("terminal")):
+            raise NativeAgentError(
+                "cannot retry a terminal run",
+                error_code="retry_terminal_run",
+            )
+        if str(status.get("state") or "") != "awaiting_input":
+            raise NativeAgentError(
+                "the run is not parked for a manual retry",
+                error_code="retry_not_ready",
+            )
+
+        events = self._backend.events(run_id, token, from_seq=0).get("events", [])
+        boundaries = {
+            "model.turn.started",
+            "turn.failed",
+            "turn.settled",
+            "turn.interrupted",
+            "run.failed",
+            "run.finished",
+        }
+        latest = next(
+            (
+                event
+                for event in reversed(events if isinstance(events, list) else [])
+                if str(event.get("type") or "") in boundaries
+            ),
+            None,
+        )
+        if latest is None or str(latest.get("type") or "") != "turn.failed":
+            raise NativeAgentError(
+                "the latest turn boundary is not a failed turn",
+                error_code="retry_no_failed_turn",
+            )
+        failure = latest.get("data") if isinstance(latest.get("data"), dict) else {}
+        if bool(failure.get("retryable")):
+            raise NativeAgentError(
+                "transient turn failures are retried automatically by the backend",
+                error_code="retry_is_automatic",
+            )
+
+        failed_seq = int(latest.get("seq", -1))
+        retry_id = f"studio_retry_{failed_seq}"
+        queued = self._backend.send_message(
+            run_id,
+            token,
+            "",
+            message_id=retry_id,
+            source="studio-retry",
+            metadata={"retry_of_event_seq": failed_seq},
+        )
+        queue_status = str(queued.get("status") or "")
+        return {
+            "run_id": run_id,
+            "state": str(status.get("state") or ""),
+            "terminal": False,
+            "retried": queue_status in {"queued", "duplicate"},
+            "status": queue_status,
+            "retry_id": retry_id,
+            "retry_of_event_seq": failed_seq,
+            "retry_mode": "reissue_failed_turn",
+            "new_attempt": False,
+            "message_snapshot_reused": True,
+            "request_snapshot_reused": False,
+            "runtime_config_source": "current",
+            "message_snapshot": "existing_by_value_messages",
+        }
+
     def cancel_chat(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None
         token = self._token_for(run_id)
@@ -1407,17 +1593,30 @@ class StudioServer:
         assert self._backend is not None
         parent_run_id = root_run_id_from_descendant(child_run_id)
         if parent_run_id is None:
-            return {"events": []}
+            return {
+                "child_run_id": child_run_id,
+                "events": [],
+                "next_seq": from_seq,
+                "has_more": False,
+                "available": False,
+            }
         try:
             token = self._token_for(parent_run_id)
-            return self._backend.subscribe_descendant_events(
+            page = self._backend.subscribe_descendant_events(
                 parent_run_id,
                 token,
                 child_run_id,
                 from_seq=from_seq,
             ).poll()
+            return {**page, "child_run_id": child_run_id, "available": True}
         except NativeAgentError:
-            return {"events": []}
+            return {
+                "child_run_id": child_run_id,
+                "events": [],
+                "next_seq": from_seq,
+                "has_more": False,
+                "available": False,
+            }
 
     def run_status(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None
@@ -1429,33 +1628,95 @@ class StudioServer:
         token-scoped backend APIs (no reading run artifacts off disk)."""
         assert self._backend is not None
         token = self._token_for(run_id)
-        payload = self._backend.proposal(run_id, token)
-        payload["diff"] = self._backend.proposal_diff(run_id, token).get("diff", "")
+        with proposal_snapshot_lock(self._run_dir_for(run_id)):
+            payload = self._backend.proposal(run_id, token)
+            if not payload.get("ready"):
+                return payload
+            proposal_hash = str(payload.get("proposal_hash") or "")
+            diff_payload = self._backend.proposal_diff(run_id, token)
+            diff = diff_payload.get("diff", "")
+            if str(diff_payload.get("diff_sha256") or "") != str(
+                payload.get("diff_sha256") or ""
+            ):
+                raise NativeAgentError(
+                    "proposal diff does not match its snapshot; refresh and review again",
+                    error_code="proposal_diff_mismatch",
+                )
+            after = self._backend.proposal(run_id, token)
+            if str(after.get("proposal_hash") or "") != proposal_hash:
+                raise NativeAgentError(
+                    "proposal changed while Studio was loading its diff; refresh and review again",
+                    error_code="proposal_changed_during_read",
+                )
+        payload["diff"] = diff
         return payload
 
-    def apply(self, run_id: str, *, approved_paths: tuple[str, ...] = ()) -> dict[str, Any]:
+    def _assert_proposal_hash(
+        self,
+        run_id: str,
+        token: str,
+        expected_proposal_hash: str,
+    ) -> dict[str, Any]:
+        assert self._backend is not None
+        expected = expected_proposal_hash.strip().lower()
+        if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+            raise NativeAgentError(
+                "expected_proposal_hash must be a 64-character sha256 hex string",
+                error_code="proposal_hash_invalid",
+            )
+        current = self._backend.proposal(run_id, token)
+        actual = str(current.get("proposal_hash") or "").lower()
+        if not actual or not secrets.compare_digest(actual, expected):
+            raise NativeAgentError(
+                "the proposal changed after review; refresh Changes and approve the new revision",
+                error_code="proposal_revision_mismatch",
+            )
+        return current
+
+    def apply(
+        self,
+        run_id: str,
+        *,
+        approved_paths: tuple[str, ...],
+        expected_proposal_hash: str,
+    ) -> dict[str, Any]:
         """Approve and apply the current proposal into the workspace (the propose→apply step).
 
-        ``approved_paths`` empty = approve every changed path (the legacy all-or-nothing behavior).
-        A non-empty subset records a partial approval, so apply_package writes only those files and
-        reports the rest as skipped — the per-file approval gate the core has always supported but
-        the studio used to bypass."""
+        Studio always supplies an explicit non-empty file selection and the hash of the proposal
+        the human reviewed. A changed revision fails closed before apply."""
         assert self._backend is not None
+        if not approved_paths:
+            raise NativeAgentError(
+                "approved_paths must contain at least one reviewed file",
+                error_code="approved_paths_required",
+            )
         token = self._token_for(run_id)
-        self._backend.approve_proposal(
-            run_id, token, approver_id=_USER, approved_paths=approved_paths
-        )
-        result = self._backend.apply_proposal(run_id, token, target=self.workspace)
+        with proposal_snapshot_lock(self._run_dir_for(run_id)):
+            self._assert_proposal_hash(run_id, token, expected_proposal_hash)
+            approval = self._backend.approve_proposal(
+                run_id, token, approver_id=_USER, approved_paths=approved_paths
+            )
+            approved_hash = str(approval.get("proposal_hash") or "").lower()
+            if not secrets.compare_digest(approved_hash, expected_proposal_hash.strip().lower()):
+                raise NativeAgentError(
+                    "the proposal changed while approval was being recorded; review the new revision",
+                    error_code="proposal_revision_mismatch",
+                )
+            result = self._backend.apply_proposal(run_id, token, target=self.workspace)
         return result
 
-    def export_package(self, run_id: str) -> dict[str, Any]:
+    def export_package(self, run_id: str, *, expected_proposal_hash: str) -> dict[str, Any]:
         """Build the portable proposal package and return its RECEIPT (``digest`` + name + size).
         The bytes are fetched separately by digest via :meth:`read_artifact` — no run_dir path ever
         crosses the boundary, so this works identically whether the backend is co-located or remote
         (closes the R9 contract gap)."""
         assert self._backend is not None
         token = self._token_for(run_id)
-        return self._backend.export_proposal_package(run_id, token)
+        with proposal_snapshot_lock(self._run_dir_for(run_id)):
+            self._assert_proposal_hash(run_id, token, expected_proposal_hash)
+            receipt = self._backend.export_proposal_package(run_id, token)
+            self._assert_proposal_hash(run_id, token, expected_proposal_hash)
+        return {**receipt, "proposal_hash": expected_proposal_hash.strip().lower()}
 
     def read_artifact(self, run_id: str, digest: str) -> tuple[bytes, str]:
         """Fetch a run artifact's bytes by sha256 digest (the data-returning seam). Returns
@@ -1465,7 +1726,13 @@ class StudioServer:
         data = self._backend.read_run_artifact(run_id, token, digest)
         return data, f"proposal-{digest[:12]}.tar"
 
-    def proposal_image(self, run_id: str, path: str) -> tuple[bytes, str]:
+    def proposal_image(
+        self,
+        run_id: str,
+        path: str,
+        *,
+        expected_proposal_hash: str,
+    ) -> tuple[bytes, str]:
         """Bytes + content-type for an image in the run's PROPOSAL snapshot — lets the proposal
         panel preview a generated image *before* it is applied. Mirrors :meth:`read_image` but
         sources the bytes from the token-scoped backend ``proposal_file`` API (base64 for binary,
@@ -1475,7 +1742,9 @@ class StudioServer:
         if mime is None:
             raise NativeAgentError("not an image file")
         token = self._token_for(run_id)
-        payload = self._backend.proposal_file(run_id, token, path)
+        with proposal_snapshot_lock(self._run_dir_for(run_id)):
+            self._assert_proposal_hash(run_id, token, expected_proposal_hash)
+            payload = self._backend.proposal_file(run_id, token, path)
         content = str(payload.get("content") or "")
         data = base64.b64decode(content) if payload.get("encoding") == "base64" else content.encode("utf-8")
         if len(data) > _IMAGE_VIEW_MAX_BYTES:
@@ -1710,10 +1979,10 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path in ("/", "/index.html"):
-                self._serve_file(_WEB_DIR / "index.html", "text/html; charset=utf-8")
+                self._serve_app_index()
                 return
             if parsed.path == "/settings":
-                self._serve_file(_WEB_DIR / "settings.html", "text/html; charset=utf-8")
+                self._serve_app_index()
                 return
             if parsed.path == "/api/settings":
                 self._write_json(studio.settings())
@@ -1789,14 +2058,26 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 query = parse_qs(parsed.query)
                 run_id = (query.get("run_id") or [""])[0]
                 rel = (query.get("path") or [""])[0]
+                expected_proposal_hash = (query.get("expected_proposal_hash") or [""])[0]
                 try:
-                    data, mime = studio.proposal_image(run_id, rel)
+                    data, mime = studio.proposal_image(
+                        run_id,
+                        rel,
+                        expected_proposal_hash=expected_proposal_hash,
+                    )
                 except KeyError:
                     self.send_error(HTTPStatus.NOT_FOUND, "not found")
                 except (NativeAgentError, ValueError) as exc:
                     self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 else:
-                    self._serve_bytes(data, mime)
+                    self._serve_bytes(
+                        data,
+                        mime,
+                        headers={
+                            "Cache-Control": "no-store",
+                            "X-Content-Type-Options": "nosniff",
+                        },
+                    )
                 return
             if parsed.path == "/api/jobs":
                 run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
@@ -1833,6 +2114,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path.startswith("/vendor/"):
                 self._serve_vendor(parsed.path[len("/vendor/"):])
+                return
+            if parsed.path.startswith("/assets/"):
+                self._serve_app_asset(parsed.path.removeprefix("/"))
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
@@ -1885,19 +2169,55 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     run_id = str(body.get("run_id") or "")
                     self._write_json(studio.interrupt_chat(run_id))
                     return
+                if parsed.path == "/api/pause":
+                    body = self._read_json()
+                    run_id = str(body.get("run_id") or "")
+                    self._write_json(studio.pause_chat(run_id))
+                    return
+                if parsed.path == "/api/resume":
+                    body = self._read_json()
+                    run_id = str(body.get("run_id") or "")
+                    self._write_json(studio.resume_chat(run_id))
+                    return
+                if parsed.path == "/api/retry":
+                    body = self._read_json()
+                    run_id = str(body.get("run_id") or "")
+                    self._write_json(studio.retry_chat(run_id))
+                    return
                 if parsed.path == "/api/apply":
                     body = self._read_json()
                     run_id = str(body.get("run_id") or "")
                     raw = body.get("approved_paths")
-                    approved = tuple(str(p) for p in raw) if isinstance(raw, list) else ()
-                    self._write_json(studio.apply(run_id, approved_paths=approved))
+                    if not isinstance(raw, list) or not raw:
+                        raise NativeAgentError(
+                            "approved_paths must be a non-empty list",
+                            error_code="approved_paths_required",
+                        )
+                    if not all(isinstance(path, str) and path.strip() for path in raw):
+                        raise NativeAgentError(
+                            "approved_paths entries must be non-empty strings",
+                            error_code="approved_paths_invalid",
+                        )
+                    approved = tuple(path.strip() for path in raw)
+                    self._write_json(
+                        studio.apply(
+                            run_id,
+                            approved_paths=approved,
+                            expected_proposal_hash=str(body.get("expected_proposal_hash") or ""),
+                        )
+                    )
                     return
                 if parsed.path == "/api/export-package":
                     # Build → return the RECEIPT (digest + size + name). The bytes are fetched
                     # separately via GET /api/artifact?digest=… — no run_dir path crosses the wire.
                     body = self._read_json()
                     run_id = str(body.get("run_id") or "")
-                    self._write_json(studio.export_package(run_id))
+                    self._write_json(
+                        studio.export_package(
+                            run_id,
+                            expected_proposal_hash=str(body.get("expected_proposal_hash") or ""),
+                        )
+                    )
                     return
                 if parsed.path == "/api/hitl":
                     body = self._read_json()
@@ -1935,7 +2255,10 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
             except NativeAgentError as exc:
-                self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                self._write_json(
+                    {"error": str(exc), "error_code": str(getattr(exc, "error_code", "internal_error"))},
+                    HTTPStatus.BAD_REQUEST,
+                )
             except ValueError as exc:
                 self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception:  # pragma: no cover - defensive
@@ -2035,13 +2358,61 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             content_type = _VENDOR_CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
             self._serve_file(target, content_type)
 
-        def _serve_file(self, path: Path, content_type: str, *, download_name: str = "") -> None:
+        def _serve_app_index(self) -> None:
+            """Serve the compiled Svelte shell shipped with the Python package."""
+            self._serve_file(
+                _APP_INDEX,
+                "text/html; charset=utf-8",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Referrer-Policy": "no-referrer",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+
+        def _serve_app_asset(self, rel: str) -> None:
+            """Serve a Vite build asset from web/dist with traversal and content-type guards."""
+            base = _APP_DIR.resolve()
+            try:
+                target = (base / rel).resolve()
+                target.relative_to(base)
+            except (ValueError, OSError):
+                self.send_error(HTTPStatus.FORBIDDEN, "forbidden")
+                return
+            if not target.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND, "not found")
+                return
+            content_type = _APP_CONTENT_TYPES.get(
+                target.suffix.lower(), "application/octet-stream"
+            )
+            self._serve_file(
+                target,
+                content_type,
+                headers={
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+
+        def _serve_file(
+            self,
+            path: Path,
+            content_type: str,
+            *,
+            download_name: str = "",
+            headers: dict[str, str] | None = None,
+        ) -> None:
             try:
                 body = path.read_bytes()
             except OSError:
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
                 return
-            self._serve_bytes(body, content_type, download_name=download_name)
+            self._serve_bytes(
+                body,
+                content_type,
+                download_name=download_name,
+                headers=headers,
+            )
 
         def _serve_bytes(
             self,
