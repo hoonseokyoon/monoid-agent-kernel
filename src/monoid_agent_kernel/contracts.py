@@ -24,9 +24,19 @@ from monoid_agent_kernel.core.spec import (
 )
 from monoid_agent_kernel.core.result import AgentArtifact, AgentRunResult, AgentTurnResult, Suspension
 from monoid_agent_kernel.core.checkpoint import (
+    CheckedCheckpointStore,
     CheckpointRecord,
     CheckpointStore,
     RunCheckpoint,
+)
+from monoid_agent_kernel.core.durable_codec import ArtifactVersion, DurableLoadResult, DurableLoadStatus
+from monoid_agent_kernel.core.compatibility import (
+    PUBLIC_ARTIFACT_COMPATIBILITY,
+    PUBLIC_COMPATIBILITY_ALIASES,
+    CompatibilityAlias,
+    CompatibilityArtifact,
+    compatibility_artifact,
+    compatibility_registry,
 )
 
 # Workspace seam (the file-storage surface the engine works through; the local backend is
@@ -128,10 +138,12 @@ from monoid_agent_kernel.core.content import (
 
 # Model adapter contract
 from monoid_agent_kernel.providers.base import (
+    AsyncModelAdapter,
     ModelAdapter,
     ModelRequest,
     ModelStreamChunk,
     ModelTurn,
+    StreamingModelAdapter,
     TextDelta,
     ToolCall,
     ToolCallDelta,
@@ -142,7 +154,9 @@ from monoid_agent_kernel.core.streaming import RunStream
 
 # Tool contract
 from monoid_agent_kernel.tools.base import (
+    AsyncToolHandler,
     DynamicToolProvider,
+    SyncToolHandler,
     ToolContext,
     ToolHandler,
     ToolProvider,
@@ -160,6 +174,12 @@ from monoid_agent_kernel.core.events import (
     AgentEventLevel,
     AgentEventType,
     EventSink,
+)
+from monoid_agent_kernel.core.event_subscription import (
+    EventSequenceGap,
+    EventSubscription,
+    EventSubscriptionFrame,
+    SequenceCursor,
 )
 
 # Permission boundary
@@ -214,7 +234,17 @@ __all__ = [
     "Suspension",
     "RunCheckpoint",
     "CheckpointStore",
+    "CheckedCheckpointStore",
     "CheckpointRecord",
+    "ArtifactVersion",
+    "DurableLoadResult",
+    "DurableLoadStatus",
+    "CompatibilityAlias",
+    "CompatibilityArtifact",
+    "PUBLIC_ARTIFACT_COMPATIBILITY",
+    "PUBLIC_COMPATIBILITY_ALIASES",
+    "compatibility_artifact",
+    "compatibility_registry",
     # workspace seam (file-storage surface; the local backend is the default)
     "Workspace",
     "WorkspaceFactory",
@@ -283,6 +313,8 @@ __all__ = [
     "VideoPart",
     # model adapter contract
     "ModelAdapter",
+    "AsyncModelAdapter",
+    "StreamingModelAdapter",
     "ModelRequest",
     "ModelTurn",
     "ToolCall",
@@ -294,6 +326,8 @@ __all__ = [
     "ToolCallDelta",
     "TurnComplete",
     # tool contract
+    "SyncToolHandler",
+    "AsyncToolHandler",
     "DynamicToolProvider",
     "ToolContext",
     "ToolHandler",
@@ -312,6 +346,10 @@ __all__ = [
     "AgentEventLevel",
     "AgentEventType",
     "EventSink",
+    "EventSequenceGap",
+    "EventSubscription",
+    "EventSubscriptionFrame",
+    "SequenceCursor",
     # permission boundary
     "PermissionPolicy",
     # gateway client seam

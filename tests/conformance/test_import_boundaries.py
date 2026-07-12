@@ -12,7 +12,6 @@ CONFORMANCE_SRC = ROOT / "src" / "monoid_agent_kernel" / "conformance"
 CONFORMANCE_TESTS = ROOT / "tests" / "conformance"
 
 REFERENCE_SCENARIO_STRINGS = {
-    "completed",
     "multi-turn",
     "parked-hitl",
     "recoverable-multi-turn",
@@ -23,6 +22,9 @@ REFERENCE_SCENARIO_STRINGS = {
     "tool-ask-stale-denied",
     "tool-quota-denied",
 }
+
+# Generic lifecycle contracts legitimately use the public state value ``completed``. Direct
+# scenario submission remains forbidden below, so this set contains only fixture-specific names.
 
 REFERENCE_FIXTURE_STRINGS = {
     "demo_approval",

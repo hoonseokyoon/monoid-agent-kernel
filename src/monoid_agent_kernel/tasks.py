@@ -1266,6 +1266,45 @@ class TaskManager:
         finally:
             self._shutdown_task_loop()
 
+    def discard_uncommitted(self, *, preserve_hosted_task_ids: set[str]) -> None:
+        """Cancel process-local work and newly-created hosted tasks during recovery cleanup.
+
+        Hosted tasks already present in the last durable checkpoint remain live: another process
+        will restore them and accept their external result. Hosted tasks created after that
+        checkpoint are cancelled so an externally visible orphan cannot survive the discarded
+        activation.
+        """
+
+        with self._condition:
+            job_ids: list[str] = []
+            for job_id, job in self.jobs.items():
+                if job.status != "running":
+                    continue
+                executor = self.executors.get(job.kind)
+                in_process = bool(executor is not None and executor.in_process)
+                if in_process or job_id not in preserve_hosted_task_ids:
+                    job_ids.append(job_id)
+        cleanup_errors: list[BaseException] = []
+        try:
+            for job_id in job_ids:
+                try:
+                    self.cancel(job_id)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with self._condition:
+                    if all(self.jobs[job_id].status != "running" for job_id in job_ids):
+                        break
+                time.sleep(0.05)
+        finally:
+            try:
+                self._shutdown_task_loop()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
     def _wait_startup(self, job_id: str, startup_wait_s: int) -> None:
         deadline = time.time() + startup_wait_s
         while time.time() < deadline:

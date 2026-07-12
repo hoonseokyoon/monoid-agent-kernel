@@ -14,6 +14,7 @@ from pathlib import Path
 from support.process import python_command as _python_command
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
+from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.errors import NativeAgentError
@@ -79,20 +80,145 @@ def test_native_async_adapter_is_awaited(tmp_path: Path) -> None:
         supports_multimodal = False
         awaited = False
 
-        def next_turn(self, request: ModelRequest) -> ModelTurn:  # pragma: no cover
-            raise AssertionError("anext_turn should be preferred over next_turn")
-
         async def anext_turn(self, request: ModelRequest) -> ModelTurn:
             await asyncio.sleep(0)
             type(self).awaited = True
             return ModelTurn(response_id="a", final_text="native-async")
 
-    loop = _loop(tmp_path, AsyncAdapter())
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=AsyncAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
     result = asyncio.run(loop.arun_once("go"))
 
     assert result.status == "completed"
     assert result.final_text == "native-async"
     assert AsyncAdapter.awaited is True
+
+
+def test_never_returning_anext_turn_observes_run_deadline(tmp_path: Path) -> None:
+    async def run() -> tuple[object, bool]:
+        started = asyncio.Event()
+        cleaned_up = asyncio.Event()
+
+        class NeverReturningAdapter:
+            supports_multimodal = False
+
+            async def anext_turn(self, request: ModelRequest) -> ModelTurn:
+                del request
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    cleaned_up.set()
+
+        loop = AgentLoop(
+            spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+            model_adapter=NeverReturningAdapter(),
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+        )
+        pending = asyncio.create_task(loop.arun_once("go"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        result = await asyncio.wait_for(pending, timeout=2)
+        return result, cleaned_up.is_set()
+
+    result, cleaned_up = asyncio.run(run())
+
+    assert result.status == "limited"
+    assert result.error_code == "run_timeout"
+    assert cleaned_up is True
+
+
+def test_never_returning_coroutine_next_turn_observes_run_cancellation(tmp_path: Path) -> None:
+    token = CancellationToken()
+
+    async def run() -> tuple[object, bool]:
+        started = asyncio.Event()
+        cleaned_up = asyncio.Event()
+
+        class NeverReturningAdapter:
+            supports_multimodal = False
+
+            async def next_turn(self, request: ModelRequest) -> ModelTurn:
+                del request
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    cleaned_up.set()
+
+        loop = AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=NeverReturningAdapter(),  # type: ignore[arg-type]
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            cancellation_token=token,
+        )
+        pending = asyncio.create_task(loop.arun_once("go"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        token.cancel()
+        result = await asyncio.wait_for(pending, timeout=1)
+        return result, cleaned_up.is_set()
+
+    result, cleaned_up = asyncio.run(run())
+
+    assert result.status == "limited"
+    assert result.error_code == "cancelled"
+    assert cleaned_up is True
+
+
+def test_blocked_async_stream_cleanup_cannot_block_run_cancellation(tmp_path: Path) -> None:
+    token = CancellationToken()
+
+    async def run() -> tuple[object, bool, bool]:
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        stream_closed = asyncio.Event()
+
+        class StubbornStreamingAdapter:
+            supports_multimodal = False
+
+            def next_turn(self, request: ModelRequest) -> ModelTurn:  # pragma: no cover
+                del request
+                raise AssertionError("astream_turn should be preferred")
+
+            async def astream_turn(self, request: ModelRequest):
+                del request
+                try:
+                    started.set()
+                    await asyncio.Future()
+                    if False:  # pragma: no cover - keeps this an async generator
+                        yield TextDelta("")
+                except asyncio.CancelledError:
+                    cleanup_started.set()
+                    await release_cleanup.wait()
+                finally:
+                    stream_closed.set()
+
+        loop = AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=StubbornStreamingAdapter(),
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            cancellation_token=token,
+            emit_output_deltas=True,
+            async_model_cancel_grace_s=0.01,
+        )
+        pending = asyncio.create_task(loop.arun_once("go"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        token.cancel()
+        result = await asyncio.wait_for(pending, timeout=1)
+        cleanup_was_bounded = cleanup_started.is_set() and not stream_closed.is_set()
+        release_cleanup.set()
+        await asyncio.wait_for(stream_closed.wait(), timeout=1)
+        return result, cleanup_was_bounded, stream_closed.is_set()
+
+    result, cleanup_was_bounded, stream_closed = asyncio.run(run())
+
+    assert result.status == "limited"
+    assert result.error_code == "cancelled"
+    assert cleanup_was_bounded is True
+    assert stream_closed is True
 
 
 def test_sync_api_inside_running_loop_raises(tmp_path: Path) -> None:

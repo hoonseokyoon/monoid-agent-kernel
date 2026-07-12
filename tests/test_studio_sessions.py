@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from support.studio_harness import (
     FakeModelAdapter,
@@ -409,6 +409,39 @@ def test_studio_chat_transcript_http_route(studio: StudioServer) -> None:
     assert body["run_id"] == run_id
     assert body["messages"][0]["content"] == "route check"
     assert body["event_cursor"] >= 0
+
+
+def test_studio_sse_uses_event_ids_and_last_event_id_resume(studio: StudioServer) -> None:
+    run_id = studio.start_chat("hello")["run_id"]
+    _wait_settled(studio, run_id, 1)
+    studio.cancel_chat(run_id)
+    deadline = time.time() + 10
+    while not studio.run_status(run_id)["terminal"] and time.time() < deadline:
+        time.sleep(0.02)
+    assert studio.run_status(run_id)["terminal"] is True
+
+    def read(last_event_id: str | None = None) -> tuple[list[int], str]:
+        headers = {"Accept": "text/event-stream"}
+        if last_event_id is not None:
+            headers["Last-Event-ID"] = last_event_id
+        request = Request(
+            f"{studio.base_url}/api/events?run_id={run_id}&from=0",
+            headers=headers,
+        )
+        with urlopen(request, timeout=10) as response:
+            body = response.read().decode("utf-8")
+        ids = [
+            int(line.removeprefix("id: "))
+            for line in body.splitlines()
+            if line.startswith("id: ")
+        ]
+        return ids, body
+
+    ids, body = read()
+    assert ids == sorted(set(ids))
+    assert "studio.stream.end" in body
+    resumed_ids, _ = read(str(ids[0]))
+    assert resumed_ids == ids[1:]
 
 
 def test_a2a_demo_preset_wires_two_peers(studio: StudioServer) -> None:

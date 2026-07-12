@@ -1,5 +1,8 @@
 # Production Security Checklist
 
+Use the deployment and ownership paths in [the production embedding handbook](../EMBEDDING.md)
+alongside this checklist.
+
 Work through this before running Monoid outside local development. It is the
 actionable form of the integrator responsibilities in
 [SECURITY_MODEL.md](SECURITY_MODEL.md); the rationale for each item is in
@@ -21,8 +24,8 @@ default must be changed for production.
 
 ## Workspace and files — **(default is unsafe)**
 
-- [ ] Hosted runs use `propose`/`staging` mode; `apply` is reserved for
-      explicitly privileged paths.
+- [ ] Hosted runs use `mode="propose"` with an isolated `overlay` or `staging` workspace backend;
+      `mode="apply"` is reserved for explicitly privileged paths.
 - [ ] A deny/redact policy is set per run — there is no secure default. At
       minimum deny `.env`, `*.key`, `*.pem`, `**/id_rsa`, `.ssh/**`, `.git/**`.
 - [ ] The workspace root is per-tenant isolated; no host-sensitive directory is
@@ -41,6 +44,16 @@ default must be changed for production.
       or explicit idempotency).
 - [ ] Capability-gated tools run behind a `CapabilityBroker` that fails closed;
       `--auto-grant-capabilities` is **not** used in production.
+- [ ] Each run selects exactly one activation authority and proves fencing, per-run input ordering,
+      idempotent receipts, admission limits, and credential-free durable records.
+- [ ] Deployments derived from the Reference inbox assembly share durable checkpoint and lease
+      stores plus one transactional command store across instances, enable owner watchdogs, set
+      queue limits, isolate run roots and database access by tenant, and monitor persisted command
+      rows for credential leakage. The bundled SQLite stores are a single-host Reference fixture.
+- [ ] Experimental Reference profiles stay within their documented scope. The Reference inbox
+      assembly and optional DBOS activation-recovery profile run as mutually exclusive
+      compositions for a run. The DBOS profile does not compose with `LeaseStore`, `CommandStore`,
+      `RecoveryService`, or watchdog lifecycle ownership and is not production-qualified in v0.18.
 
 ## Events, artifacts, and logs
 

@@ -70,11 +70,34 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     run_id = parts[2]
                     self._write_json(backend.result(run_id, self._bearer_token()))
                     return
+                if len(parts) == 5 and parts[:2] == ["v1", "runs"] and parts[3] == "control":
+                    run_id = parts[2]
+                    self._write_json(
+                        backend.command_receipt(
+                            run_id,
+                            self._bearer_token(),
+                            unquote(parts[4]),
+                        ).to_json()
+                    )
+                    return
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "events":
                     run_id = parts[2]
                     query = parse_qs(parsed.query)
                     from_seq = int((query.get("from_seq") or ["0"])[0])
                     limit_raw = (query.get("limit") or [None])[0]
+                    if "text/event-stream" in (self.headers.get("Accept") or ""):
+                        token = self._bearer_token()
+                        # Authenticate and resolve the run before committing a 200 SSE response.
+                        backend.status(run_id, token)
+                        self._stream_event_subscription(
+                            backend.subscribe_events(
+                                run_id,
+                                token,
+                                from_seq=from_seq,
+                                last_event_id=self.headers.get("Last-Event-ID"),
+                            )
+                        )
+                        return
                     self._write_json(
                         backend.events(
                             run_id,
@@ -211,7 +234,13 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                             "args": args,
                         }
                     )
-                    self._write_json(backend.dispatch(command).to_json())
+                    receipt = backend.enqueue_control(command)
+                    if receipt.transient_result is not None:
+                        self._write_json(dict(receipt.transient_result))
+                    elif receipt.result is not None:
+                        self._write_json(dict(receipt.result))
+                    else:
+                        self._write_json(receipt.to_json(), status=HTTPStatus.ACCEPTED)
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "tasks":
                     run_id = parts[2]
@@ -387,6 +416,26 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                 frame = q.get()
                 if frame is _STREAM_SENTINEL:
                     return
+
+        def _stream_event_subscription(self, subscription: Any) -> None:
+            """Write a reusable event subscription as replay-safe SSE frames."""
+
+            frames = iter(subscription.frames())
+            self.close_connection = True
+            self.send_response(int(HTTPStatus.OK))
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                # Establish the stream immediately even when the subscriber is caught up.
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                for frame in frames:
+                    self.wfile.write(frame.to_sse())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
 
         def _bearer_token(self) -> str:
             header = self.headers.get("Authorization") or ""

@@ -22,7 +22,17 @@ EXPECTED_CONTRACTS_ALL = [
     "Suspension",
     "RunCheckpoint",
     "CheckpointStore",
+    "CheckedCheckpointStore",
     "CheckpointRecord",
+    "ArtifactVersion",
+    "DurableLoadResult",
+    "DurableLoadStatus",
+    "CompatibilityAlias",
+    "CompatibilityArtifact",
+    "PUBLIC_ARTIFACT_COMPATIBILITY",
+    "PUBLIC_COMPATIBILITY_ALIASES",
+    "compatibility_artifact",
+    "compatibility_registry",
     "Workspace",
     "WorkspaceFactory",
     "FileEntry",
@@ -82,6 +92,8 @@ EXPECTED_CONTRACTS_ALL = [
     "AudioPart",
     "VideoPart",
     "ModelAdapter",
+    "AsyncModelAdapter",
+    "StreamingModelAdapter",
     "ModelRequest",
     "ModelTurn",
     "ToolCall",
@@ -91,6 +103,8 @@ EXPECTED_CONTRACTS_ALL = [
     "TextDelta",
     "ToolCallDelta",
     "TurnComplete",
+    "SyncToolHandler",
+    "AsyncToolHandler",
     "DynamicToolProvider",
     "ToolContext",
     "ToolHandler",
@@ -105,6 +119,10 @@ EXPECTED_CONTRACTS_ALL = [
     "AgentEventLevel",
     "AgentEventType",
     "EventSink",
+    "EventSequenceGap",
+    "EventSubscription",
+    "EventSubscriptionFrame",
+    "SequenceCursor",
     "PermissionPolicy",
     "WebGatewayClient",
     "TaskExecutor",
@@ -395,10 +413,11 @@ import monoid_agent_kernel
 blocked = [
     name for name in sys.modules
     if name.startswith('monoid_agent_kernel.reference.')
-    or name in {'openai', 'httpx', 'opentelemetry'}
+    or name in {'openai', 'httpx', 'opentelemetry', 'dbos'}
     or name.startswith('openai.')
     or name.startswith('httpx.')
     or name.startswith('opentelemetry.')
+    or name.startswith('dbos.')
 ]
 if blocked:
     raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))

@@ -27,8 +27,8 @@ pip install ruff                                     # linter (configured in pyp
 
 ```bash
 ruff check src tests       # lint (line-length 100, target py311)
-python -m pytest -n 4 -q   # fast local suite
-python -m pytest -q        # serial compatibility suite
+python -m pytest -n 4 -q -m "(unit or contract) and not serial"  # parallel shard
+python -m pytest -q -m "(integration or serial) and not live"  # serial shard
 ```
 
 - Add or update tests for any behavior change. Custom adapters/workspaces/stores
@@ -38,10 +38,14 @@ python -m pytest -q        # serial compatibility suite
   fixture or the helpers in `tests/support/backend_harness.py`; the fixture owns
   spawned futures and fails the test if a backend leaves live runs behind.
 - Use `python -m pytest --durations=30` when a change could affect suite runtime.
-- Mark deliberate timeout or live-provider coverage with `slow` or `live` so the
-  fast local path stays clear.
-- CI keeps `pytest -q` as the required gate and runs `pytest -q -n 4 -m "not live"`
-  plus coverage as advisory signals until they stabilize.
+- Every test receives exactly one primary tier from `tests/support/test_tiers.py`:
+  `unit`, `contract`, or `integration`. Update that policy when a new module crosses
+  a different boundary. `slow`, `live`, and `serial` are orthogonal traits.
+- Mark deliberate timeout or live-provider coverage with `slow` or `live`. Integration
+  and serial contract tests run in the required serial shard; worker-safe unit and
+  contract tests run under xdist.
+- CI requires both shards, branch coverage, minimal/all-extras install smoke, and a
+  small Windows/macOS platform-sensitive smoke matrix.
 - To profile without unrelated pytest plugins, run
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -p xdist -n 4 -q -m "not slow and not live"`.
 - Match the surrounding code style: typed, small functions, comment density and

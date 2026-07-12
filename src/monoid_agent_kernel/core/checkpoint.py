@@ -1,17 +1,13 @@
-"""Durable run checkpoint: a state-snapshot taken at a pump park point.
+"""Durable run checkpoint: a complete state snapshot at a safe recovery boundary.
 
-The kernel is already half-durable — the provider holds the conversation by
-reference (``turn_handle``), the workspace truth is on disk, and events/transcript
-are append-only. The only volatile state worth persisting is the small mutable
-``RunState`` (handle + counters + pending observations) plus the hosted tasks a run
-is parked on. This module is the serialized form of exactly that, written to
-``run_dir/checkpoint.json`` and read back to rehydrate a fresh ``AgentLoop`` after a
-process restart.
+The checkpoint carries the provider-neutral conversation, mutable run state, workspace delta,
+hosted tasks, counters, and durable activation observations needed to rehydrate a fresh
+``AgentLoop`` after process restart. Observable suspension boundaries and selected internal safety
+barriers can both publish snapshots.
 
-This is a *state-snapshot* (LangGraph style), not an event-sourcing journal
-(Temporal/Restate style): because the LLM transcript is by-reference, restore never
-replays the model, so there is no determinism constraint and no double-side-effect
-risk. Snapshots are only ever taken at clean park points, never mid-step.
+This persistence model uses state snapshots. Restore continues from the latest committed state
+instead of replaying earlier model turns. An external effect can still commit
+before the next snapshot, so such effects require a stable idempotency key or durable outbox.
 
 ``RunCheckpoint`` is a plain JSON container — the object<->dict conversions for
 observations, content parts, runtime config and hosted tasks live in the loop's
@@ -21,14 +17,16 @@ observations, content parts, runtime config and hosted tasks live in the loop's
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
 from monoid_agent_kernel.core._util import file_lock, sha256_bytes, write_json_atomic
+from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 SCHEMA_VERSION = namespaced_id("checkpoint.v1")
@@ -48,7 +46,6 @@ class RunCheckpoint:
     # Monotonic per-run checkpoint sequence; the store flips its "latest" pointer to
     # this only after the checkpoint is fully written (atomic commit / last-good).
     seq: int = 0
-
     # --- RunState (minus previous_surface_snapshot) ---
     status: str = "completed"
     error: str = ""
@@ -120,27 +117,252 @@ class RunCheckpoint:
     # secrets) so a pending request survives a restart and is (re)dispatched by the edge. Additive.
     outbox_requests: list[dict[str, Any]] = field(default_factory=list)
 
+    # --- additive v0.18 recovery observations (kept at the tail for positional compatibility) ---
+    # Portable observation of the suspension boundary that produced this checkpoint.
+    # Recovery drivers use it to return the same result when an input was committed before
+    # the driver's own receipt. Older checkpoints omit it and remain readable.
+    last_suspension: dict[str, Any] | None = None
+    # Generic activation/input identities whose resulting boundary is already committed. A
+    # recovery driver returns the stored boundary for a repeated id instead of driving effects
+    # again. This stays transport- and implementation-neutral; old checkpoints default to [].
+    applied_input_ids: list[str] = field(default_factory=list)
+    # The input currently advancing between durable boundaries. ``phase`` is driver-defined but
+    # portable values are "running" and "completed"; ``source_seq`` identifies the admitted
+    # source. A matching recovery can continue from an internal safety checkpoint.
+    active_input: dict[str, Any] | None = None
+    # Immutable boundary receipts keyed by applied input identity. They let an old duplicate return
+    # its own stored observation after newer inputs have advanced the run.
+    applied_input_receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
+
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> RunCheckpoint | None:
-        """Rebuild from a checkpoint payload. Returns ``None`` on a schema mismatch
-        (forward/backward incompatibility) rather than raising — the caller treats an
-        unreadable checkpoint as "no checkpoint" and skips recovery."""
-        if not isinstance(payload, dict):
-            return None
-        if payload.get("schema_version") not in ACCEPTED_SCHEMA_VERSIONS:
-            return None
-        known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in payload.items() if k in known})
+        """Compatibility wrapper over :func:`decode_checkpoint`."""
+        return decode_checkpoint(payload).value
+
+
+_CHECKPOINT_STRING_FIELDS = frozenset(
+    {
+        "status",
+        "error",
+        "error_code",
+        "provider_error_code",
+        "final_text",
+    }
+)
+_CHECKPOINT_OPTIONAL_STRING_FIELDS = frozenset({"previous_turn_handle"})
+_CHECKPOINT_NONNEGATIVE_INT_FIELDS = frozenset(
+    {
+        "seq",
+        "provider_http_status",
+        "total_tool_calls",
+        "output_retries",
+        "session_step",
+        "submit_local_step",
+    }
+)
+_CHECKPOINT_BOOL_FIELDS = frozenset({"terminal", "revoked_all", "cancellation_requested"})
+_CHECKPOINT_LIST_OF_DICT_FIELDS = frozenset(
+    {
+        "pending_observations",
+        "messages",
+        "hosted_tasks",
+        "workspace_delta",
+        "capability_leases",
+        "pending_capability_replays",
+        "pending_tool_approval_replays",
+        "outbox_requests",
+    }
+)
+_CHECKPOINT_LIST_OF_STRING_FIELDS = frozenset(
+    {
+        "pending_binding_loads",
+        "reentry_queue",
+        "delivered_reentry_jobs",
+        "revoked_lease_ids",
+        "revoked_capabilities",
+        "inbox_seen_ids",
+        "applied_input_ids",
+    }
+)
+
+
+def _require_nonempty_string(value: object, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"checkpoint {field_name} must be a non-empty string")
+
+
+def _require_nonnegative_int(value: object, field_name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"checkpoint {field_name} must be a non-negative integer")
+
+
+def _require_finite_nonnegative_number(value: object, field_name: str) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value < 0
+    ):
+        raise ValueError(f"checkpoint {field_name} must be a finite non-negative number")
+
+
+def _require_list_of(value: object, item_type: type[object], field_name: str) -> None:
+    if not isinstance(value, list) or any(not isinstance(item, item_type) for item in value):
+        raise ValueError(f"checkpoint {field_name} has an invalid list shape")
+
+
+def _validate_counter_mapping(value: object, field_name: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"checkpoint {field_name} must be an object")
+    for key, count in value.items():
+        if not isinstance(key, str):
+            raise ValueError(f"checkpoint {field_name} keys must be strings")
+        _require_nonnegative_int(count, f"{field_name}.{key}")
+
+
+def _validate_active_input(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint active_input must be an object or null")
+    _require_nonempty_string(value.get("input_id"), "active_input.input_id")
+    if value.get("phase") not in {"running", "completed"}:
+        raise ValueError("checkpoint active_input.phase must be running or completed")
+    _require_nonnegative_int(value.get("source_seq"), "active_input.source_seq")
+
+
+def _validate_receipts(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint applied_input_receipts must be an object")
+    for input_id, receipt in value.items():
+        _require_nonempty_string(input_id, "applied_input_receipts key")
+        if not isinstance(receipt, dict):
+            raise ValueError("checkpoint applied_input_receipts values must be objects")
+        if "checkpoint_seq" in receipt:
+            _require_nonnegative_int(
+                receipt["checkpoint_seq"],
+                f"applied_input_receipts.{input_id}.checkpoint_seq",
+            )
+        if "terminal" in receipt and not isinstance(receipt["terminal"], bool):
+            raise ValueError(
+                f"checkpoint applied_input_receipts.{input_id}.terminal must be boolean"
+            )
+        if "suspension" in receipt and not isinstance(receipt["suspension"], dict):
+            raise ValueError(
+                f"checkpoint applied_input_receipts.{input_id}.suspension must be an object"
+            )
+        for field_name in ("checkpoint_sha256", "state", "error", "error_code"):
+            if field_name in receipt and not isinstance(receipt[field_name], str):
+                raise ValueError(
+                    f"checkpoint applied_input_receipts.{input_id}.{field_name} must be a string"
+                )
+
+
+def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
+    _require_nonempty_string(payload.get("run_id"), "run_id")
+    for field_name in _CHECKPOINT_STRING_FIELDS:
+        if field_name in payload and not isinstance(payload[field_name], str):
+            raise ValueError(f"checkpoint {field_name} must be a string")
+    for field_name in _CHECKPOINT_OPTIONAL_STRING_FIELDS:
+        if (
+            field_name in payload
+            and payload[field_name] is not None
+            and not isinstance(payload[field_name], str)
+        ):
+            raise ValueError(f"checkpoint {field_name} must be a string or null")
+    for field_name in _CHECKPOINT_NONNEGATIVE_INT_FIELDS:
+        if field_name in payload and payload[field_name] is not None:
+            _require_nonnegative_int(payload[field_name], field_name)
+    for field_name in _CHECKPOINT_BOOL_FIELDS:
+        if field_name in payload and not isinstance(payload[field_name], bool):
+            raise ValueError(f"checkpoint {field_name} must be boolean")
+    for field_name in _CHECKPOINT_LIST_OF_DICT_FIELDS:
+        if field_name in payload:
+            _require_list_of(payload[field_name], dict, field_name)
+    for field_name in _CHECKPOINT_LIST_OF_STRING_FIELDS:
+        if field_name in payload:
+            _require_list_of(payload[field_name], str, field_name)
+    if "pending_user_input" in payload and payload["pending_user_input"] is not None:
+        _require_list_of(payload["pending_user_input"], dict, "pending_user_input")
+    for field_name in ("previous_runtime_config", "workspace_base", "last_suspension"):
+        if (
+            field_name in payload
+            and payload[field_name] is not None
+            and not isinstance(payload[field_name], dict)
+        ):
+            raise ValueError(f"checkpoint {field_name} must be an object or null")
+    for field_name in ("tool_call_counts", "total_usage"):
+        if field_name in payload:
+            _validate_counter_mapping(payload[field_name], field_name)
+    for field_name in ("revoked_before", "remaining_duration_s"):
+        if field_name in payload and payload[field_name] is not None:
+            _require_finite_nonnegative_number(payload[field_name], field_name)
+    if "queued_messages" in payload:
+        messages = payload["queued_messages"]
+        if not isinstance(messages, list):
+            raise ValueError("checkpoint queued_messages must be a list")
+        for message in messages:
+            if isinstance(message, (str, dict)):
+                continue
+            if isinstance(message, list) and all(isinstance(part, dict) for part in message):
+                continue
+            raise ValueError(
+                "checkpoint queued_messages entries must be strings, envelopes, or content lists"
+            )
+    if "active_input" in payload:
+        _validate_active_input(payload["active_input"])
+    if "applied_input_receipts" in payload:
+        _validate_receipts(payload["applied_input_receipts"])
+
+
+def _checkpoint_from_payload(payload: dict[str, Any]) -> RunCheckpoint:
+    _validate_checkpoint_payload(payload)
+    known = {name for name in RunCheckpoint.__dataclass_fields__}
+    return RunCheckpoint(**{key: value for key, value in payload.items() if key in known})
+
+
+CHECKPOINT_CODEC = DurableCodec[RunCheckpoint](
+    family="checkpoint",
+    current_schema=SCHEMA_VERSION,
+)
+
+
+def decode_checkpoint(payload: object) -> DurableLoadResult[RunCheckpoint]:
+    return CHECKPOINT_CODEC.decode(payload, _checkpoint_from_payload)
+
+
+def checkpoint_payload_for_write(checkpoint: RunCheckpoint) -> dict[str, Any]:
+    """Return the canonical current writer shape regardless of a restored alias."""
+    payload = checkpoint.to_json()
+    payload["schema_version"] = SCHEMA_VERSION
+    _validate_checkpoint_payload(payload)
+    return payload
 
 
 def write_checkpoint(run_dir: Path, checkpoint: RunCheckpoint) -> Path:
     """Atomically write ``checkpoint`` to ``run_dir/checkpoint.json`` and return the path."""
     path = run_dir / CHECKPOINT_FILENAME
-    write_json_atomic(path, checkpoint.to_json())
+    write_json_atomic(path, checkpoint_payload_for_write(checkpoint))
     return path
+
+
+def read_checkpoint_checked(run_dir: Path) -> DurableLoadResult[RunCheckpoint]:
+    """Read a single-file checkpoint with an explicit durable load outcome."""
+    path = run_dir / CHECKPOINT_FILENAME
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return CHECKPOINT_CODEC.missing()
+    except OSError:
+        return CHECKPOINT_CODEC.corrupt("checkpoint file could not be read")
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return CHECKPOINT_CODEC.corrupt("checkpoint file is not valid JSON")
+    return decode_checkpoint(payload)
 
 
 def read_checkpoint(run_dir: Path) -> RunCheckpoint | None:
@@ -149,12 +371,7 @@ def read_checkpoint(run_dir: Path) -> RunCheckpoint | None:
 
     Single-file helper retained for simple round-trips and tests; production code goes
     through a ``CheckpointStore`` (which adds seq, atomic commit, and content blobs)."""
-    path = run_dir / CHECKPOINT_FILENAME
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    return RunCheckpoint.from_json(payload)
+    return read_checkpoint_checked(run_dir).value
 
 
 # --- CheckpointStore seam: core defines WHAT (RunCheckpoint), the store defines HOW ---
@@ -203,17 +420,87 @@ class CheckpointStore(Protocol):
         ...
 
     def put_run_metadata(self, run_id: str, metadata: Mapping[str, Any]) -> None:
-        """Store backend-owned run recovery metadata in the same durable store as checkpoints.
-
-        This lets another backend instance rebuild a run from a shared store even when it has no
-        local ``run.json`` file from the original host.
-        """
+        """Store backend-owned run recovery metadata beside checkpoints."""
         ...
 
     def run_metadata(self, run_id: str) -> dict[str, Any] | None:
-        """Return backend-owned recovery metadata for ``run_id`` if this store has it."""
+        """Return backend-owned recovery metadata for ``run_id`` if present."""
         ...
 
+
+class CheckedCheckpointStore(Protocol):
+    """Optional store extension that preserves checked durable load outcomes."""
+
+    def latest_checked(self, run_id: str) -> DurableLoadResult[CheckpointRecord]: ...
+
+
+def bind_checkpoint_record_result(
+    result: DurableLoadResult[CheckpointRecord], run_id: str
+) -> DurableLoadResult[CheckpointRecord]:
+    """Bind a checked record to its lookup key and committed sequence."""
+
+    if not result.ok:
+        return result
+    record = result.value
+    if not isinstance(record, CheckpointRecord):
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint store returned an invalid record",
+            sequence=result.sequence,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    if isinstance(record.seq, bool) or not isinstance(record.seq, int) or record.seq < 0:
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint store returned an invalid committed sequence",
+            sequence=result.sequence,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    if record.checkpoint.run_id != run_id:
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint manifest run_id does not match the requested run",
+            sequence=record.seq,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    if record.checkpoint.seq != record.seq:
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint manifest sequence does not match the committed sequence",
+            sequence=record.seq,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    if result.sequence is not None and result.sequence != record.seq:
+        return CHECKPOINT_CODEC.corrupt(
+            "checkpoint checked result sequence does not match the committed record",
+            sequence=record.seq,
+        ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+    return replace(result, sequence=record.seq)
+
+
+def load_latest_checked(store: CheckpointStore, run_id: str) -> DurableLoadResult[CheckpointRecord]:
+    """Use a checked store when available and adapt legacy stores without breaking them."""
+    checked = getattr(store, "latest_checked", None)
+    if callable(checked):
+        result = checked(run_id)
+        if isinstance(result, DurableLoadResult):
+            return bind_checkpoint_record_result(result, run_id)
+        return CHECKPOINT_CODEC.corrupt("checkpoint store returned an invalid checked result").map(
+            lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
+        )
+    # A legacy store cannot distinguish malformed durable state from a transient
+    # transport failure. Preserve its exception so recovery can defer and retry;
+    # only checked stores may authoritatively classify an artifact as corrupt.
+    record = store.latest(run_id)
+    if record is None:
+        return DurableLoadResult(
+            status="missing",
+            family=CHECKPOINT_CODEC.family,
+            current_schema=CHECKPOINT_CODEC.current_schema,
+        )
+    return bind_checkpoint_record_result(
+        DurableLoadResult(
+            status="loaded",
+            family=CHECKPOINT_CODEC.family,
+            current_schema=CHECKPOINT_CODEC.current_schema,
+            value=record,
+            observed_schema=record.checkpoint.schema_version,
+            sequence=record.seq,
+        ),
+        run_id,
+    )
 
 @dataclass
 class LocalFsCheckpointStore:
@@ -235,9 +522,8 @@ class LocalFsCheckpointStore:
 
     def put(self, checkpoint: RunCheckpoint, blobs: Mapping[str, bytes] = {}) -> None:
         cdir = self._dir(checkpoint.run_id)
-        # Serialize puts for this run across processes (e.g. a watchdog reclaim racing the
-        # original worker): without it, two writers could interleave blob writes and LATEST
-        # flips and tear a checkpoint.
+        # Serialize puts for this run across processes: without it, two writers could interleave
+        # blob writes and LATEST flips and tear a checkpoint.
         cdir.mkdir(parents=True, exist_ok=True)
         with file_lock(cdir / ".put.lock", timeout_s=self.lock_timeout_s, stale_s=self.lock_stale_s):
             # 0) GC orphaned blob temp files left by a crashed prior write (no LATEST was
@@ -257,7 +543,7 @@ class LocalFsCheckpointStore:
             # 2) Manifest (atomic file write into the seq dir).
             seq_dir = cdir / str(checkpoint.seq)
             seq_dir.mkdir(parents=True, exist_ok=True)
-            write_json_atomic(seq_dir / "manifest.json", checkpoint.to_json())
+            write_json_atomic(seq_dir / "manifest.json", checkpoint_payload_for_write(checkpoint))
             # 3) Flip the latest pointer last — only now is this seq considered committed.
             #    Monotonic: never regress LATEST to an older seq, so a late/lower-seq writer
             #    cannot unpublish a newer committed checkpoint (re-putting the same seq, as
@@ -296,7 +582,29 @@ class LocalFsCheckpointStore:
             payload = json.loads((self._dir(run_id) / "run_meta.json").read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError, OSError):
             return None
-        return dict(payload) if isinstance(payload, dict) else None
+        if not isinstance(payload, dict) or payload.get("run_id") != run_id:
+            return None
+        return dict(payload)
+
+    def run_metadata_checked(self, run_id: str) -> DurableLoadResult[dict[str, Any]]:
+        from monoid_agent_kernel.core.durable_metadata import (
+            RUN_METADATA_CODEC,
+            bind_run_metadata_result,
+            decode_run_metadata,
+        )
+
+        path = self._dir(run_id) / "run_meta.json"
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return RUN_METADATA_CODEC.missing()
+        except OSError:
+            return RUN_METADATA_CODEC.corrupt("backend-run metadata could not be read")
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return RUN_METADATA_CODEC.corrupt("backend-run metadata is not valid JSON")
+        return bind_run_metadata_result(decode_run_metadata(payload), run_id)
 
     def _read_latest_seq(self, cdir: Path) -> int:
         try:
@@ -314,12 +622,17 @@ class LocalFsCheckpointStore:
             except OSError:  # pragma: no cover - best-effort cleanup
                 pass
 
-    def latest(self, run_id: str) -> CheckpointRecord | None:
+    def latest_checked(self, run_id: str) -> DurableLoadResult[CheckpointRecord]:
         cdir = self._dir(run_id)
-        if not cdir.is_dir():
-            return None  # never checkpointed — fast path, no retry
-        # A reader can race a concurrent put()'s atomic LATEST/manifest replace (especially
-        # cross-process, e.g. a watchdog reclaim reading while the original worker commits).
+        # Metadata and standalone blobs share this directory and may exist before the
+        # first checkpoint. Only a published LATEST pointer proves a checkpoint commit
+        # was attempted; without it the checkpoint state is genuinely missing.
+        if not cdir.is_dir() or not (cdir / "LATEST").exists():
+            return CHECKPOINT_CODEC.missing().map(
+                lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
+            )
+        # A reader can race a concurrent put()'s atomic LATEST/manifest replace, including across
+        # processes.
         # Retry a few times so a transient read failure mid-commit is not mistaken for
         # "no checkpoint" — returning None here would wrongly skip a recoverable run.
         seq = -1
@@ -335,16 +648,25 @@ class LocalFsCheckpointStore:
                 if attempt < 3:
                     time.sleep(0.01)
         if manifest is None:
-            return None
-        checkpoint = RunCheckpoint.from_json(manifest)
-        if checkpoint is None:
-            return None
+            return CHECKPOINT_CODEC.corrupt(
+                "checkpoint latest pointer or manifest could not be read",
+                sequence=seq if seq >= 0 else None,
+            )
+        decoded = replace(decode_checkpoint(manifest), sequence=seq)
         blobs_dir = cdir / "blobs"
-        return CheckpointRecord(
-            seq=seq,
-            checkpoint=checkpoint,
-            _blob_reader=lambda sha256: (blobs_dir / sha256).read_bytes(),
+        return bind_checkpoint_record_result(
+            decoded.map(
+                lambda checkpoint: CheckpointRecord(
+                    seq=seq,
+                    checkpoint=checkpoint,
+                    _blob_reader=lambda sha256: (blobs_dir / sha256).read_bytes(),
+                )
+            ),
+            run_id,
         )
+
+    def latest(self, run_id: str) -> CheckpointRecord | None:
+        return self.latest_checked(run_id).value
 
     def delete(self, run_id: str) -> None:
         shutil.rmtree(self._dir(run_id), ignore_errors=True)

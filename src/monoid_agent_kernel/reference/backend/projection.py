@@ -193,6 +193,33 @@ class RunProjectionService:
         page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
         return {"run_id": descendant_run_id, **page}
 
+    def descendant_status(
+        self, run_id: str, token: str, descendant_run_id: str
+    ) -> dict[str, Any]:
+        """Read descendant lifecycle after authorizing its root ancestor."""
+
+        self._context.authorize_run(run_id, token)
+        try:
+            validate_descendant_run_id(run_id, descendant_run_id)
+        except ValueError as exc:
+            raise PermissionDenied(str(exc)) from exc
+        run_dir = self._context.run_root_provider() / descendant_run_id
+        status_payload = _read_optional_json(run_dir / "status.json")
+        record = self._context.active_record(descendant_run_id)
+        if record is not None:
+            return {
+                "run_id": descendant_run_id,
+                **_record_lifecycle_payload(record),
+                "last_event_seq": record.last_event_seq,
+                "last_event_type": record.last_event_type,
+                "status_file": status_payload,
+            }
+        return {
+            "run_id": descendant_run_id,
+            **_status_payload_lifecycle(status_payload, run_dir),
+            "status_file": status_payload,
+        }
+
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
         if event_limit < 1:
             raise ValueError("event_limit must be positive")

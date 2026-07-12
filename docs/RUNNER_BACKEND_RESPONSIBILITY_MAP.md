@@ -49,6 +49,7 @@ private helper modules used by the services that need them.
 | Outbox dispatch wiring | `_build_outbox_dispatch_service`, `_drain_outbox`, `_stage_outbox_ack`, `_outbox_backoff_delay`, and `_redrive_outbox` stay as facade compatibility and composition-root wrappers around `OutboxDispatchService`. |
 | Event/state wiring | `record_event`, `_emit_backend_event`, `_record_run_result`, `_record_run_failure`, and `tenant_usage` stay as facade compatibility and public API wrappers around `RunStateMutationService`. |
 | Watchdog heartbeat | `start_watchdog`, `stop_watchdog`, `_watchdog_loop`, and `_heartbeat_own_runs` stay with process ownership. Stale reclaim delegates to `RecoveryService`; outbox redrive delegates to `OutboxDispatchService`. |
+| Durable command drain | The watchdog asks the configured `CommandStore` for oldest-first claims only for runs owned in this process; execution stays in `BackendCommandService`, and acknowledgements/results return to the shared store. |
 | Shared auth/record ports | `_authorize_run`, `_verify_run_token`, `_authorized_run_dir`, `_record`, `_active_record`, and token issuance helpers are backend-owned ports shared by services. |
 | Recovery factories | Recovery request/record reconstruction and gateway-token reissue factories stay in the composition root; `RecoveryService` drives the recovery flow through those ports. |
 
@@ -80,8 +81,8 @@ Reference scenario names stay inside `monoid_agent_kernel.reference.conformance`
 
 | Target | Why it remains |
 | --- | --- |
-| CI hardening | Xdist and coverage jobs are advisory. Promote them only after their signal is consistently clean. |
-| Streaming transport adapters | HTTP SSE and Studio consumers sit outside the backend service split. Keep them transport-owned. |
+| Streaming transport adapters | Cursor ownership and final draining use `core.event_subscription`; HTTP SSE framing and Studio rendering remain transport-owned. |
+| Long-run event tail indexing | The Reference JSONL reader rescans from the beginning for each page. A future indexed or byte-offset reader can bound polling I/O without changing subscription semantics. |
 
 ## Design Position
 
@@ -95,6 +96,6 @@ The current structure matches the Phase 4 target:
 - Core, helper, and conformance surfaces do not require this Reference backend
   decomposition or any specific storage/product deployment choice.
 
-Phase 4 closure is recorded in `docs/PHASE_4_CLOSURE.md`. The next cleanup
-should focus on CI hardening, streaming transport adapters, or product-facing
-behavior, not more public API movement.
+Phase 4 closure is recorded in `docs/PHASE_4_CLOSURE.md`. CI hardening landed in
+v0.18. Further cleanup should focus on streaming transport efficiency or
+product-facing behavior, not more public API movement.

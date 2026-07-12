@@ -14,8 +14,9 @@ already a dependency) and wrap the return value in a :class:`ToolResult`.
 
 If the first parameter is annotated :class:`ToolContext` (or named ``ctx`` / ``context``),
 the engine's tool context is injected and the remaining parameters are filled from the
-validated tool arguments. The function may return a ``ToolResult`` (used as-is), a ``dict``
-(wrapped as ``content``), or any other value (wrapped as ``{"result": value}``).
+validated tool arguments. Synchronous and ``async def`` functions are supported. The function
+may return a ``ToolResult`` (used as-is), a ``dict`` (wrapped as ``content``), or any other
+value (wrapped as ``{"result": value}``).
 """
 
 from __future__ import annotations
@@ -103,7 +104,7 @@ def _spec_from_function(
     tool_id = id or fn.__name__
     tool_description = description or (inspect.getdoc(fn) or "").split("\n", 1)[0]
 
-    def handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+    def validated_kwargs(args: dict[str, Any]) -> dict[str, Any] | ToolResult:
         try:
             validated = model(**(args or {}))
         except ValidationError as exc:
@@ -113,13 +114,32 @@ def _spec_from_function(
                 error_code="invalid_tool_args",
                 category="tool",
             )
-        kwargs = validated.model_dump()
-        result = fn(ctx, **kwargs) if ctx_param_name is not None else fn(**kwargs)
+        return validated.model_dump()
+
+    def normalize_result(result: Any) -> ToolResult:
         if isinstance(result, ToolResult):
             return result
         if isinstance(result, dict):
             return ToolResult(ok=True, content=result)
         return ToolResult(ok=True, content={"result": result})
+
+    if inspect.iscoroutinefunction(fn):
+
+        async def handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            kwargs = validated_kwargs(args)
+            if isinstance(kwargs, ToolResult):
+                return kwargs
+            result = await (fn(ctx, **kwargs) if ctx_param_name is not None else fn(**kwargs))
+            return normalize_result(result)
+
+    else:
+
+        def handler(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            kwargs = validated_kwargs(args)
+            if isinstance(kwargs, ToolResult):
+                return kwargs
+            result = fn(ctx, **kwargs) if ctx_param_name is not None else fn(**kwargs)
+            return normalize_result(result)
 
     return ToolSpec(
         id=tool_id,

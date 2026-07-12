@@ -99,7 +99,15 @@ Beyond the durable event sinks, `AgentLoop.astream(user_input)` returns a
 interleaved with `ModelStreamChunk` (token deltas: `TextDelta` / `ReasoningDelta` /
 `ToolCallDelta` / `TurnComplete`) when the adapter exposes `astream_turn`. Read `stream.result`
 after the stream drains. Gateway token streaming uses Server-Sent Events and needs the
-`[http-async]` extra.
+`[http-async]` extra. Studio uses complete one-shot gateway turns when that extra is absent and
+enables live token deltas when it is installed.
+
+Durable event subscriptions use `EventSubscription` over the append-only `events.jsonl` sequence.
+They support page polling and SSE, sequence IDs, `Last-Event-ID` reconnects, heartbeat comments,
+terminal final-event draining, recovered runs, and ancestor-authorized descendant streams. Request
+`GET /v1/runs/{run_id}/events` with `Accept: text/event-stream`; a JSON request keeps the existing
+inclusive `from_seq` pagination response. Studio uses the same cursor abstraction for its root SSE
+feed and descendant event polling.
 
 ## Metrics
 

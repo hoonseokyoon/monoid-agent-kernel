@@ -68,6 +68,13 @@ For the dynamic binding-based tool surface, see
 pip install monoid-agent-kernel
 ```
 
+The default install runs Studio with complete one-shot gateway turns. Add the async HTTP extra
+to render live token deltas in Studio:
+
+```bash
+pip install "monoid-agent-kernel[http-async]"
+```
+
 Core has no provider SDK dependency. The direct OpenAI adapter is for local smoke tests;
 hosted/product runs use `GatewayModelAdapter` through your gateway:
 
@@ -258,7 +265,7 @@ Start with **[docs/README.md](https://github.com/hoonseokyoon/monoid-agent-kerne
 Quick links:
 
 - **Use it:** [CLI reference](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CLI.md) · [Hosted backend](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/BACKEND.md) · [Observability](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OBSERVABILITY.md)
-- **Build against it:** [Contracts](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONTRACTS.md) · [Tool surface](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/TOOL_SURFACE.md) · [Conformance](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONFORMANCE.md)
+- **Build against it:** [Embedding handbook](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/EMBEDDING.md) · [Contracts](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONTRACTS.md) · [Tool surface](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/TOOL_SURFACE.md) · [Conformance](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONFORMANCE.md)
 - **Extend it:** [Subagents](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/SUBAGENT_DESIGN.md) · [Skills](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/SKILLS_DESIGN.md) · [First skill tutorial](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/FIRST_SKILL_TUTORIAL.md)
 - **Secure it:** [Security model](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/SECURITY_MODEL.md) · [Threat model](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/THREAT_MODEL.md) · [Production checklist](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/PRODUCTION_CHECKLIST.md) · [Security policy](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/SECURITY.md)
 
@@ -272,12 +279,16 @@ Fast local confidence checks:
 
 ```bash
 python -m pytest tests/conformance -q
-python -m pytest -q -n 4
-python -m pytest -q --cov=monoid_agent_kernel --cov=native_agent_runner
+python -m pytest -q -n 4 -m "(unit or contract) and not serial"
+python -m pytest -q -m "(integration or serial) and not live"
+python -m pytest -q -n 4 -m "(unit or contract) and not serial" \
+  --cov=monoid_agent_kernel --cov=native_agent_runner --cov-report=
+python -m pytest -q -m "(integration or serial) and not live" \
+  --cov=monoid_agent_kernel --cov=native_agent_runner --cov-append --cov-fail-under=80
 ```
 
-CI keeps the serial suite as the required gate and runs xdist plus coverage as
-advisory checks while the test seams stabilize. See
+CI requires deterministic parallel unit/contract and serial integration shards on Python 3.11
+and 3.12, an 80% branch-coverage floor, install smoke, and Windows/macOS smoke. See
 [docs/PHASE_4_CLOSURE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/PHASE_4_CLOSURE.md) for the current Phase 4
 structure closure and CI promotion criteria.
 

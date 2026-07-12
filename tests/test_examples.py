@@ -12,6 +12,7 @@ fake mode exercised here.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 
@@ -88,3 +89,81 @@ def test_full_stack_integration_fake_scenario(tmp_path: Path) -> None:
     assert result["result_ready"] is True, result.get("status")
     assert result["event_types"], "no events emitted"
     assert result["secret_leak_detected"] is False
+
+
+def test_local_product_embedding_golden_path(tmp_path: Path) -> None:
+    module = _load("embedding_local_product.py")
+    result = module.run_local_product(tmp_path)
+
+    assert result["status"] == "completed"
+    assert result["runtime_profile"] == "embedded-local"
+    assert result["output_exists"] is True
+    assert result["checkpoint_load_status"] == "loaded"
+    assert result["checkpoint_seq"] >= 1
+    assert result["event_count"] > 0
+    assert result["network_required"] is False
+
+
+def test_hosted_product_embedding_golden_path(tmp_path: Path) -> None:
+    module = _load("embedding_hosted_product.py")
+    result = module.run_hosted_product(tmp_path)
+
+    assert result["status"] == "ok"
+    assert result["runtime_profile"] == "reference-inbox"
+    assert result["tenants"] == ["tenant_a", "tenant_b"]
+    assert result["cross_tenant_access_denied"] is True
+    assert set(result["checked_loads"]) == set(result["run_ids"])
+    assert all(
+        load == {"checkpoint": "loaded", "run_metadata": "loaded"}
+        for load in result["checked_loads"].values()
+    )
+    assert result["initial_event_count"] > 0
+    assert result["replay_count"] == 0
+    assert result["status_receipt"] == "completed"
+    assert result["status_result"]["type"] == "status"
+    assert result["status_result"]["status"] == "ok"
+    assert result["status_result"]["data"]["state"] == "awaiting_input"
+    assert result["status_duplicate_matches"] is True
+    assert result["task_receipt"] == "completed"
+    assert result["task_result"]["type"] == "report_task_result"
+    assert result["task_result"]["status"] == "ok"
+    assert result["approval_receipt"] == "completed"
+    assert result["approval_result"]["type"] == "approve"
+    assert result["approval_result"]["status"] == "ok"
+    assert result["historical_event_count"] >= result["initial_event_count"]
+    assert {
+        tenant: (usage["tenant_id"], usage["runs"])
+        for tenant, usage in result["tenant_usage"].items()
+    } == {"tenant_a": ("tenant_a", 1), "tenant_b": ("tenant_b", 1)}
+    assert result["observed_gateway_token_count"] == 2
+    assert result["credential_leak_detected"] is False
+    assert result["network_required"] is False
+
+
+def test_hosted_embedding_uses_reference_facades_without_dbos() -> None:
+    tree = ast.parse((EXAMPLES_DIR / "embedding_hosted_product.py").read_text(encoding="utf-8"))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            modules.add(node.module)
+        elif isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+
+    assert "monoid_agent_kernel.reference.backend" in modules
+    assert "monoid_agent_kernel.reference.stores" in modules
+    assert not any(
+        module == "monoid_agent_kernel.reference.dbos"
+        or module.startswith("monoid_agent_kernel.reference.dbos.")
+        for module in modules
+    )
+    assert not any(
+        module.startswith(
+            (
+                "monoid_agent_kernel.reference._",
+                "monoid_agent_kernel.reference.backend.service",
+                "monoid_agent_kernel.reference.command_inbox",
+                "monoid_agent_kernel.reference.stores.sqlite",
+            )
+        )
+        for module in modules
+    )

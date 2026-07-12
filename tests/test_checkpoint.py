@@ -14,8 +14,15 @@ from monoid_agent_kernel.core.checkpoint import (
     SCHEMA_VERSION,
     LocalFsCheckpointStore,
     RunCheckpoint,
+    decode_checkpoint,
     read_checkpoint,
+    read_checkpoint_checked,
     write_checkpoint,
+)
+from monoid_agent_kernel.core.result import (
+    Suspension,
+    suspension_checkpoint_payload,
+    suspension_from_checkpoint_payload,
 )
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.errors import NativeAgentError
@@ -56,6 +63,333 @@ def test_tool_observation_round_trip() -> None:
         is_background=True,
     )
     assert ToolObservation.from_json(obs.to_json()) == obs
+
+
+@pytest.mark.parametrize(
+    "suspension",
+    (
+        Suspension(reason="settled", status="completed", final_text="done"),
+        Suspension(
+            reason="awaiting_tasks",
+            status="completed",
+            awaiting_task_ids=("task_1",),
+            has_external=True,
+        ),
+        Suspension(
+            reason="turn_failed",
+            status="failed",
+            error="retry",
+            error_code="model_error",
+            retryable=True,
+            http_status=429,
+        ),
+        Suspension(reason="paused", status="completed"),
+        Suspension(reason="interrupted", status="completed"),
+        Suspension(reason="limited", status="limited", error_code="max_steps_exceeded"),
+        Suspension(reason="terminal", status="failed", error_code="cancelled"),
+    ),
+)
+def test_durable_suspension_observation_round_trip(suspension: Suspension) -> None:
+    assert suspension_from_checkpoint_payload(suspension_checkpoint_payload(suspension)) == suspension
+
+
+def test_release_parked_closes_process_resources_without_finalizing_or_deleting(
+    tmp_path: Path,
+) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="park")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop.open()
+    suspension = loop.run_until_suspended("hold here")
+    checkpoint = _latest_checkpoint(spec)
+    assert checkpoint is not None
+    assert checkpoint.last_suspension == suspension_checkpoint_payload(suspension)
+
+    recorder = loop._session.res.recorder  # type: ignore[union-attr]
+    loop.release_parked()
+
+    assert loop._session is None
+    assert loop._owned_loop is None
+    assert recorder._transcript_file.closed is True
+    assert _latest_checkpoint(spec) is not None
+    events = (spec.run_root / spec.run_id / "events.jsonl").read_text(encoding="utf-8")
+    assert '"type": "run.finished"' not in events
+
+
+def test_release_parked_rejects_uncommitted_state_and_discard_cleans_resources(
+    tmp_path: Path,
+) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="park")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop.open()
+    loop.run_until_suspended("hold here")
+    committed = _latest_checkpoint(spec)
+    assert committed is not None and committed.hosted_tasks == []
+
+    uncommitted_task_id = loop.create_task("hitl", {"prompt": "uncommitted"})
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    uncommitted_task = manager.get_job(uncommitted_task_id)
+    recorder = loop._session.res.recorder  # type: ignore[union-attr]
+    with pytest.raises(NativeAgentError) as raised:
+        loop.release_parked()
+
+    assert raised.value.error_code == "run_not_durably_parked"
+    assert _latest_checkpoint(spec).hosted_tasks == []  # type: ignore[union-attr]
+    loop.discard_uncommitted()
+    assert uncommitted_task.status == "cancelled"
+    assert uncommitted_task.cancel_path.exists()  # type: ignore[union-attr]
+    assert recorder._transcript_file.closed is True
+    assert loop._session is None
+    assert loop._owned_loop is None
+
+
+def test_discard_preserves_hosted_task_from_last_committed_checkpoint(tmp_path: Path) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop, task_id, _, _ = _hitl_parked_loop(spec)
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    committed_task = manager.get_job(task_id)
+    committed = _latest_checkpoint(spec)
+
+    assert committed is not None
+    assert {task["task_id"] for task in committed.hosted_tasks} == {task_id}
+    assert committed_task.cancel_path.exists() is False  # type: ignore[union-attr]
+
+    loop.discard_uncommitted()
+
+    assert committed_task.status == "running"
+    assert committed_task.cancel_path.exists() is False  # type: ignore[union-attr]
+
+
+def test_partial_restore_failure_preserves_source_checkpoint_hosted_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    source, task_id, _, artifacts_dir = _hitl_parked_loop(spec)
+    checkpoint = _latest_checkpoint(spec)
+    assert checkpoint is not None
+    blobs = source.collect_checkpoint_blobs()
+    source.release_parked()
+    cancel_path = artifacts_dir / "tasks" / task_id / "cancel.requested"
+
+    restored = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("hitl.request")),
+    )
+
+    def fail_after_hosted_restore(_resources: object):
+        raise RuntimeError("post-hosted-task restore failure")
+
+    monkeypatch.setattr(restored, "_crashed_shell_observations", fail_after_hosted_restore)
+
+    with pytest.raises(RuntimeError, match="post-hosted-task restore failure"):
+        restored.restore(checkpoint, blobs=blobs)
+
+    assert cancel_path.exists() is False
+    assert restored._session is None
+    assert restored._bootstrap_resources is None
+
+
+def test_release_parked_ignores_backend_owned_checkpoint_projection_fields(
+    tmp_path: Path,
+) -> None:
+    committed: list[RunCheckpoint] = []
+
+    def persist(checkpoint: RunCheckpoint, _blobs: object) -> None:
+        checkpoint.queued_messages = [{"id": "message_1", "text": "next"}]
+        checkpoint.inbox_seen_ids = ["message_1"]
+        committed.append(checkpoint)
+
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="park")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+        checkpoint_persist_callback=persist,
+    )
+    loop.open()
+    loop.run_until_suspended("hold here")
+
+    assert committed and committed[-1].queued_messages
+    loop.release_parked()
+    assert loop._session is None
+
+
+def test_internal_checkpoint_writer_failure_does_not_terminalize_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_checkpoint(_checkpoint: RunCheckpoint, _blobs: object) -> None:
+        raise RuntimeError("storage credential detail")
+
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+        checkpoint_persist_callback=reject_checkpoint,
+    )
+    loop.open()
+
+    async def pump_with_safety_checkpoint(state, resources, session):  # noqa: ANN001, ANN202
+        del state, resources
+        loop._persist_checkpoint(session)
+
+    monkeypatch.setattr(loop, "_apump_turn", pump_with_safety_checkpoint)
+
+    with pytest.raises(RuntimeError, match="^checkpoint persistence failed$") as raised:
+        loop.run_until_suspended(None)
+
+    assert str(raised.value.__cause__) == "storage credential detail"
+    assert loop._session is not None and loop._session.terminal is False
+    assert (spec.run_root / spec.run_id / "failure.json").exists() is False
+    loop.discard_uncommitted()
+
+
+def test_fail_recoverable_commits_terminal_suspension_observation(tmp_path: Path) -> None:
+    class _RetryableAdapter:
+        def next_turn(self, request):  # noqa: ANN001, ANN201
+            del request
+            from monoid_agent_kernel.errors import ModelAdapterError
+
+            raise ModelAdapterError("retry", error_code="provider_unavailable", retryable=True)
+
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=_RetryableAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop.open()
+    assert loop.run_until_suspended("go").reason == "turn_failed"
+
+    loop.fail_recoverable("retry budget exhausted", error_code="model_error")
+    checkpoint = _latest_checkpoint(spec)
+
+    assert checkpoint is not None and checkpoint.terminal is True
+    assert checkpoint.last_suspension is not None
+    assert checkpoint.last_suspension["reason"] == "terminal"
+    assert checkpoint.last_suspension["status"] == "failed"
+    loop.release_parked()
+
+
+def test_restore_failure_releases_partially_bootstrapped_resources(tmp_path: Path) -> None:
+    spec = AgentRunSpec(
+        run_id="run_restore_failure",
+        workspace_root=_mk(tmp_path / "ws"),
+        run_root=tmp_path / "runs",
+    )
+    checkpoint = RunCheckpoint(
+        run_id=spec.run_id,
+        seq=1,
+        workspace_delta=[
+            {
+                "path": "missing.txt",
+                "kind": "file",
+                "change_kind": "created",
+                "content_sha256": "0" * 64,
+            }
+        ],
+    )
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+
+    with pytest.raises(KeyError):
+        loop.restore(checkpoint, blobs={})
+
+    assert loop._session is None
+    assert loop._bootstrap_resources is None
+    assert loop._owned_loop is None
+
+
+def test_restore_bootstrap_failure_closes_published_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    closed_recorders: list[AgentRecorder] = []
+    original_close = AgentRecorder.close
+
+    def record_close(recorder: AgentRecorder) -> None:
+        original_close(recorder)
+        closed_recorders.append(recorder)
+
+    class _FailingRuntimeConfigProvider:
+        def current_config(self, run_id: str):  # noqa: ANN201
+            del run_id
+            raise RuntimeError("runtime config bootstrap failed")
+
+    monkeypatch.setattr(AgentRecorder, "close", record_close)
+    spec = AgentRunSpec(
+        run_id="run_bootstrap_failure",
+        workspace_root=_mk(tmp_path / "ws"),
+        run_root=tmp_path / "runs",
+    )
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(),
+        runtime_config_provider=_FailingRuntimeConfigProvider(),
+    )
+
+    with pytest.raises(RuntimeError, match="runtime config bootstrap failed"):
+        loop.restore(RunCheckpoint(run_id=spec.run_id, seq=1))
+
+    assert len(closed_recorders) == 1
+    assert closed_recorders[0]._transcript_file.closed is True
+    assert loop._session is None
+    assert loop._bootstrap_resources is None
+    assert loop._owned_loop is None
+
+
+def test_discard_attempts_all_cleanup_after_task_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="park")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop.open()
+    loop.run_until_suspended("hold here")
+    recorder = loop._session.res.recorder  # type: ignore[union-attr]
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+
+    def fail_task_cleanup(*, preserve_hosted_task_ids: set[str]) -> None:
+        del preserve_hosted_task_ids
+        raise RuntimeError("task cleanup failed")
+
+    monkeypatch.setattr(manager, "discard_uncommitted", fail_task_cleanup)
+
+    with pytest.raises(RuntimeError, match="task cleanup failed"):
+        loop.discard_uncommitted()
+
+    assert recorder._transcript_file.closed is True
+    assert loop._session is None
+    assert loop._bootstrap_resources is None
+    assert loop._owned_loop is None
+
+
+def test_additive_checkpoint_fields_preserve_existing_positional_order() -> None:
+    checkpoint = RunCheckpoint("run_1", SCHEMA_VERSION, 3, "failed")
+
+    assert checkpoint.seq == 3
+    assert checkpoint.status == "failed"
+    assert checkpoint.last_suspension is None
+    assert checkpoint.applied_input_ids == []
 
 
 def test_hosted_task_checkpoint_round_trip(tmp_path: Path) -> None:
@@ -149,8 +483,65 @@ def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
     assert restored.schema_version == SCHEMA_VERSION
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("run_id", ""),
+        ("run_id", []),
+        ("seq", True),
+        ("seq", -1),
+        ("terminal", "no"),
+        ("pending_observations", {}),
+        ("pending_binding_loads", [1]),
+        ("tool_call_counts", {"fs.read": True}),
+        ("queued_messages", [1]),
+        ("active_input", {"input_id": "input", "phase": "running", "source_seq": True}),
+        ("applied_input_receipts", {"input": {"terminal": "false"}}),
+    ),
+)
+def test_checkpoint_decoder_rejects_malformed_current_payload(field: str, value: object) -> None:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": "run_1",
+        "seq": 1,
+        "unknown_additive_field": {"preserved_by_format": True},
+    }
+    payload[field] = value
+
+    assert decode_checkpoint(payload).status == "corrupt"
+
+
+def test_checkpoint_decoder_allows_unknown_additive_fields() -> None:
+    checked = decode_checkpoint(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": "run_1",
+            "seq": 1,
+            "future_additive_field": {"value": True},
+        }
+    )
+
+    assert checked.status == "loaded"
+    assert checked.value is not None and checked.value.run_id == "run_1"
+
+
+def test_checkpoint_writer_canonicalizes_accepted_legacy_namespace(tmp_path: Path) -> None:
+    write_checkpoint(
+        tmp_path,
+        RunCheckpoint(
+            run_id="run_1",
+            schema_version="native-agent-runner.checkpoint.v1",
+        ),
+    )
+
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == SCHEMA_VERSION
+
+
 def test_read_checkpoint_missing_returns_none(tmp_path: Path) -> None:
     assert read_checkpoint(tmp_path) is None
+    assert read_checkpoint_checked(tmp_path).status == "missing"
 
 
 def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
@@ -159,6 +550,39 @@ def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
     # Corrupt the schema version on disk -> treated as no checkpoint, never raises.
     path = tmp_path / "checkpoint.json"
     path.write_text(path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "bogus.v0"), encoding="utf-8")
+    assert read_checkpoint(tmp_path) is None
+    checked = read_checkpoint_checked(tmp_path)
+    assert checked.status == "corrupt"
+    assert checked.error_code == "checkpoint_corrupt"
+
+
+def test_read_checkpoint_unicode_version_is_corrupt(tmp_path: Path) -> None:
+    write_checkpoint(tmp_path, RunCheckpoint(run_id="run_1"))
+    path = tmp_path / "checkpoint.json"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "monoid.checkpoint.v²"),
+        encoding="utf-8",
+    )
+
+    checked = read_checkpoint_checked(tmp_path)
+
+    assert checked.status == "corrupt"
+    assert checked.error_code == "checkpoint_corrupt"
+
+
+def test_read_checkpoint_future_schema_is_explicitly_unsupported(tmp_path: Path) -> None:
+    cp = RunCheckpoint(run_id="run_1")
+    write_checkpoint(tmp_path, cp)
+    path = tmp_path / "checkpoint.json"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "monoid.checkpoint.v99"),
+        encoding="utf-8",
+    )
+
+    checked = read_checkpoint_checked(tmp_path)
+
+    assert checked.status == "unsupported_version"
+    assert checked.observed_schema == "monoid.checkpoint.v99"
     assert read_checkpoint(tmp_path) is None
 
 
@@ -204,6 +628,17 @@ def test_local_fs_store_put_gcs_orphan_blob_tmp(tmp_path: Path) -> None:
     store.put(RunCheckpoint(run_id="run_1", seq=1), blobs={"b" * 64: b"data"})
     assert not orphan.exists()
     assert (blobs_dir / ("b" * 64)).read_bytes() == b"data"
+
+
+def test_local_fs_checked_latest_treats_metadata_and_blob_only_runs_as_missing(tmp_path: Path) -> None:
+    store = LocalFsCheckpointStore(tmp_path)
+    store.put_run_metadata("metadata_only", {"run_id": "metadata_only"})
+    store.put_blob("blob_only", b"artifact")
+
+    assert store.latest_checked("metadata_only").status == "missing"
+    assert store.latest_checked("blob_only").status == "missing"
+    assert store.latest("metadata_only") is None
+    assert store.latest("blob_only") is None
 
 
 def test_snapshot_writes_checkpoint_at_hosted_park(tmp_path: Path) -> None:

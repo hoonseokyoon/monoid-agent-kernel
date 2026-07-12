@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "monoid-agent-kernel"
-version = "0.17.1"
+version = "0.18.0"
 description = "Lightweight durable agent kernel for product integrations"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,6 +33,7 @@ dev = [
     "pytest>=8.2",
     "pytest-xdist>=3.6",
     "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
     "hypothesis>=6.112",
     "httpx>=0.27",
     "opentelemetry-api>=1.20",
@@ -70,6 +71,12 @@ otel-export = [
 mcp = [
     "httpx>=0.27",
 ]
+# Optional experimental DBOS activation-recovery profile. DBOS owns operational admission,
+# serialization, and retry. For run activations, CheckpointStore owns portable semantic state and
+# boundary receipts. The dependency stays outside the lightweight default installation.
+reference-dbos = [
+    "dbos>=2.26,<2.27",
+]
 
 [project.scripts]
 monoid = "monoid_agent_kernel.cli:main"
@@ -88,16 +95,23 @@ exclude = ["**/DX_NOTES.md"]
 # Ship the PEP 561 marker so downstream type-checkers honor our inline type hints.
 force-include = { "src/monoid_agent_kernel/py.typed" = "monoid_agent_kernel/py.typed", "src/native_agent_runner/py.typed" = "native_agent_runner/py.typed" }
 
+[tool.hatch.build.targets.sdist]
+# Keep internal journals and workspace-local release scratch data out of source distributions.
+exclude = ["**/DX_NOTES.md", "/.tmp"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
 markers = [
-    "unit: fast in-process tests with no external service dependency",
-    "integration: multi-component tests that exercise reference services or threaded servers",
+    "unit: fast in-process tests with no component or transport boundary",
+    "contract: implementation-independent contract and conformance behavior",
+    "integration: multi-component tests that exercise reference services, processes, or transports",
     "slow: tests that intentionally wait for subprocess, timeout, or multi-service behavior",
     "live: tests that require external credentials or network-backed providers",
     "serial: tests that must not run concurrently under pytest-xdist",
 ]
+timeout = 240
+timeout_method = "thread"
 
 [tool.coverage.run]
 branch = true

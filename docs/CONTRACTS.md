@@ -84,7 +84,8 @@ including `monoid.backend` and `monoid.task-callback`.
 
 Readers, validators, and gateway parsers accept the pre-rename `native-agent-runner.*`
 identifiers during migration so existing durable run artifacts and gateway clients continue
-to load.
+to load where listed. The exact per-artifact reader policy, including permissive and
+writer-only exceptions, is maintained in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Python Contracts
 
@@ -252,7 +253,26 @@ results and pending loads.
 
 ### Model Adapter
 
-Implement `ModelAdapter.next_turn(request: ModelRequest) -> ModelTurn`.
+Choose one one-shot contract:
+
+- `ModelAdapter.next_turn(request: ModelRequest) -> ModelTurn` for synchronous adapters. The
+  loop executes it in a worker thread.
+- `AsyncModelAdapter.anext_turn(request: ModelRequest) -> ModelTurn` for native async adapters.
+  The loop awaits it directly. An adapter that exposes both uses `anext_turn`.
+
+Add `StreamingModelAdapter.astream_turn(request) -> AsyncIterator[ModelStreamChunk]` to either
+one-shot contract for token streaming. `AgentLoop.astream` prefers the streaming method and folds
+its chunks into the same `ModelTurn`, event, error, and checkpoint path. Autonomous runs use the
+stream when `emit_output_deltas=True`.
+
+Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
+`next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
+cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provider task is detached
+so a cancellation-suppressing adapter cannot block the run result. Turn interrupt and pause remain
+step-boundary signals for non-streamed model calls. A synchronous adapter runs through
+`asyncio.to_thread`; Python cannot force-stop that worker thread, so cancellation and the run
+deadline take effect after `next_turn` returns. Sync adapters should enforce their own provider I/O
+timeout and idempotency policy.
 
 `ModelRequest` carries:
 
@@ -275,6 +295,44 @@ side-effect class, handler, provider name, path args, preview hints, guidance,
 examples, and annotations. Registry specs are implementation tools. Bindings
 decide model-facing names, guidance, exposure, authorization, scope, quota, and
 runtime settings.
+
+Handlers implement either `SyncToolHandler` or `AsyncToolHandler`:
+
+```python
+def handler(context: ToolContext, args: dict) -> ToolResult: ...
+
+async def handler(context: ToolContext, args: dict) -> ToolResult: ...
+```
+
+The `@tool` decorator preserves `async def` functions and normalizes their awaited return value
+the same way as synchronous functions. Native async handlers run on the run loop. Synchronous
+handlers run in a worker thread. Tool calls from one model turn execute sequentially in model
+order.
+
+Authorization, scope, quota, approval, capability leases, and side-effect admission complete
+before the handler starts. `tool.call.started` precedes handler execution; one
+`tool.call.finished` or `tool.call.failed` event follows it. Approved and capability-granted
+replays use the same async execution path.
+
+Approved calls use durable at-most-once replay delivery. Before each approved handler starts, the
+loop checkpoints consumption of that head only; unstarted approvals and observations from earlier
+completed heads remain in the durable tail. A process loss after the consume checkpoint does not
+retry the uncertain head, so its effect may have happened zero or one time. Handlers that need a
+stronger effect guarantee require a stable idempotency key or transactional outbox at their
+external boundary.
+
+Run cancellation and the run deadline cancel an in-flight native async handler and preserve the
+run-level `cancelled` or `run_timeout` result. Cleanup has a bounded
+`AgentLoop.async_tool_cancel_grace_s` window; a handler that suppresses cancellation is detached
+after that window so it cannot block the run result. A synchronous Python call cannot be
+force-stopped safely; its worker completes before the next run-boundary check. Sync tools that
+perform external I/O should apply their own operation timeout and idempotency policy.
+
+`ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
+errors become failed tool observations. A handler-local `CancelledError` maps to
+`tool_handler_cancelled`; run-token cancellation and deadlines retain their run-level outcome.
+Unexpected handler exceptions fail the run through the normal recording boundary. Cancellation
+cleanup runs before the call context is cleared.
 
 `ToolResult.to_observation()` returns:
 
@@ -506,14 +564,61 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   forward-compatible).
 - HTTP: `POST /v1/runs/{run_id}/control` with `{"type": ..., "args": {...}, "issuer": ...,
   "reason": ...}`; the bearer token authorizes the run (the route injects it into `args` so the
-  envelope stays credential-free). `resume` on a *live* paused run wakes it; on a run not in
-  memory (parked after a restart) it falls back to checkpoint recovery (`resume_run`).
+  envelope stays credential-free). `resume` on a locally owned paused run wakes it immediately.
+  A peer with a fresh remote owner appends to the durable command inbox. An absent or stale owner
+  returns `command_owner_unavailable`; checkpoint recovery must establish a live owner before a
+  control command can be admitted.
 - Audit: `RunnerBackend.dispatch` appends `control.command.received` and then either
   `control.command.completed` or `control.command.failed` to the run event log. Events include
   `command_id`, command type, target run, `issuer` as actor, reason, idempotency key,
   result/failure code, result status/error, duration, and a safe `token_sha256` reference — never
   the bearer token itself. A control `send_message` uses the command id as its inbox idempotency
   key.
+
+### Durable Command Inbox
+
+`CommandStore` is the Reference multi-instance transport for control commands. The bundled
+`InMemoryCommandStore` serves one-process deployments; `SqliteCommandStore` supplies transactional
+idempotent append, ordered claim, stale-claim recovery, acknowledgement, result receipts, and
+per-run queue limits across backend instances. Configure every instance with a command store over
+the same database used by its shared checkpoint and lease stores.
+
+`POST /v1/runs/{run_id}/control` authenticates the submitted bearer token before enqueueing. The
+stored `monoid.command-inbox.v1` envelope contains the command ID, sanitized arguments, reason, and
+authenticated tenant/user principal. It never contains the bearer token. The owner mints a fresh
+short-lived internal run token when it drains the command. A local owner drains immediately and
+the route preserves the historical `ControlResult` response. A remote owner yields a `202`
+`monoid.command-receipt.v1`; poll
+`GET /v1/runs/{run_id}/control/{command_id}` until `completed` or `failed`.
+
+Task callback bearer tokens are accepted for `approve`, `deny`, and `report_task_result` at enqueue
+time and are never stored; the owner executes with its fresh run token. Durable capability
+`token_ref` values remain executable handles, consistent with checkpoint durability. Credential
+fields in command results, including newly issued callback tokens, are redacted in durable
+receipts. The immediate local response returns the original callback token once; a lost secret
+response cannot be recovered from the command store.
+For that reason, `create_task` is accepted only by the instance currently owning the run; a peer
+returns `command_requires_owner` instead of creating a task whose callback credential cannot be
+delivered. Route that command to the owner or use the dedicated task API there.
+Task callback credentials may poll the receipt for the same callback command and task scope. They
+do not gain access to receipts for ordinary run-token commands or commands for another task.
+Owner-local commands execute from a transient payload after removing the authenticated bearer, so
+legitimate domain fields such as `password` remain intact without entering the inbox. Cross-worker
+commands execute from the durable sanitized payload; use durable references such as `token_ref`
+for credential-shaped domain data that must cross that boundary.
+`create_task` also requires an empty per-run command lane so its one-time callback credential can
+be returned by the submitting owner thread. Peers accept durable commands only while the run has a
+fresh ownership lease; an absent or stale owner returns `command_owner_unavailable` before append.
+
+Append is idempotent by `(run_id, command_id)`. An identical duplicate receives the existing
+receipt and does not execute a second command. Reusing the ID for a different type, sanitized
+arguments, principal, issuer, or reason returns `command_id_conflict`. Claims follow append order
+per run, with one in-flight command; a later command cannot skip an unacknowledged head command. A
+crashed claimant becomes eligible
+after `command_claim_ttl_s`; command handlers therefore retain their existing idempotency
+obligations under crash-after-effect/before-ack recovery. `command_queue_limit` bounds pending plus
+claimed commands per run. Owner watchdogs drain inboxes alongside lease recovery and outbox
+redrive.
 
 ### Event Reads
 
@@ -522,6 +627,18 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
 with `from_seq=next_seq` to avoid duplicates; omitting `limit` preserves the historical "return all
 events from N" behavior. `RunnerBackend.descendant_events(...)` uses the same pagination contract
 for subagent event streams authorized through an ancestor run token.
+
+`SequenceCursor` and `EventSubscription` turn that inclusive page API into a reusable next-sequence
+subscription. A cursor advances only after an event is presented, suppresses replayed sequences,
+and raises `EventSequenceGap` when a resumed stream skips required data. `RunnerBackend` exposes
+`subscribe_events(...)` for live and recovered root runs and `subscribe_descendant_events(...)`
+for lineage-authorized child streams.
+
+The same HTTP events route returns SSE when the request accepts `text/event-stream`. Each event
+frame carries `id: <seq>`; reconnects send `Last-Event-ID`, which takes precedence over the initial
+`from_seq` query and resumes at the following sequence. Idle streams emit `: keep-alive` comments.
+Terminal streams re-read the event page after observing terminal lifecycle state, verify the
+lifecycle watermark has been drained, then emit one named `end` frame and close.
 
 ### Diagnostics
 
@@ -689,7 +806,9 @@ requirement, and the loop acquires a scoped, expiring **lease** from a broker be
   re-executes the gated call automatically at the next step (through the normal tool path, real
   permission/quota/events) and delivers the result to the model — no model retry needed. If a replay
   can't run cleanly (no valid lease), it falls back to model-retry. The gated tool never executed at
-  the gate, so the replay is its first and only execution (no double side effect).
+  the gate, so failure-free replay executes it once. Capability replay recovery is at-least-once: a
+  process loss before the next ordinary checkpoint restores the durable replay batch. Effectful
+  handlers therefore require a stable idempotency policy at their external boundary.
 - **Durable leases**: an escalation-approved lease is marked `durable` and checkpointed (the
   `token_ref` handle only, never a secret), so a restart does not re-prompt the approver; ephemeral
   sync grants are not persisted (re-brokered on restart). The gated call is captured in the durable
@@ -930,17 +1049,36 @@ length is bounded by idle timeout, max lifetime, and max turns.
 A checkpoint is a **complete, self-contained "save file."** A parked run survives a
 process restart even when the agent's workspace is *not* durable: workspace, the
 conversation, and run state all roll back to one aligned instant. This is a
-**state-snapshot at the suspend points** (not event-sourcing replay); snapshots are
-only taken at clean park points, so there is no determinism constraint and no
-double-side-effect risk.
+**state snapshot at clean checkpointable recovery boundaries**. Recovery reads snapshots directly. An
+activation can publish internal safety checkpoints before returning its observable suspension
+boundary. Restore continues from the latest committed snapshot; work before that snapshot is
+already represented in it. A crash inside an activation can redeliver effects that completed
+before a later checkpoint commit.
+`OR-12-DURABLE-SIDE-EFFECT` requires a stable idempotency key or durable outbox for those effects.
 
 **Division of responsibility:** the core defines *what* a checkpoint contains
 (`RunCheckpoint`) and how to `restore()` it; the integrator decides *how* it is
-stored by implementing `CheckpointStore`. The core never does storage I/O or
-auto-recovery — on failure it surfaces a bundle and the last-good checkpoint, and
-recovery is the integrator's call.
+stored by implementing `CheckpointStore`. Checkpoint I/O crosses the explicit store seam.
+Auto-recovery belongs to the integrator. On failure, Core surfaces a bundle and the last-good
+checkpoint.
 
-- `AgentLoop.snapshot() -> RunCheckpoint | None` captures, at one quiescent park:
+**Portable recovery semantics:** every committed snapshot advances a monotonic checkpoint
+sequence. Each internal safety checkpoint for an admitted input records its identity, original
+source sequence, and `running` phase. Such checkpoints can advance from source `N` to
+`N+1 ... N+k-1` while retaining that same active-input identity. Recovery continues only that
+input and rejects stale or competing inputs. The returned suspension boundary commits `N+k` with
+the exact observable suspension
+(`reason`, status, awaiting task ids, terminal/error and retry classification), the applied input
+identity, a `completed` phase, and one immutable identity-bound receipt. Repeating an applied input
+returns its own stored receipt and performs zero new model/tool drives, including after later inputs
+have advanced the run. A terminal boundary therefore has one terminal receipt for that input.
+These observable rules are portable. Process placement, liveness, fencing, and recovery
+coordination are deployment policy outside the Core contract.
+An ambiguous checkpoint write remains unacknowledged until exact canonical readback proves the
+commit. A caller cannot convert an unknown write outcome into a terminal receipt or admit a
+competing input.
+
+- `AgentLoop.snapshot() -> RunCheckpoint | None` captures one safe recovery boundary:
   run state + counters + parked hosted tasks, the **workspace delta** (created/
   modified/deleted files; content travels as content-addressed blobs), the **by-value
   conversation** (`messages` — provider-neutral user/assistant/tool log, vendor-
@@ -952,8 +1090,20 @@ recovery is the integrator's call.
   `latest(run_id)`; `delete(run_id)`. `LocalFsCheckpointStore` is the default
   (`run_root/<id>/checkpoints/<seq>/manifest.json` + content-addressed `blobs/<sha>`);
   swap it for a mounted-volume path or an object-store/DB store. The loop advances a
-  monotonic `seq` per park and deletes checkpoints only on a *completed* run — a
+  monotonic `seq` per committed snapshot and deletes checkpoints only on a *completed* run — a
   failed/limited run keeps its last-good checkpoint.
+- `CheckedCheckpointStore` is the additive checked-read extension. Its
+  `latest_checked(run_id)` result distinguishes `loaded`, `migrated`, `missing`,
+  `corrupt`, and `unsupported_version`, including the observed schema and committed
+  sequence when available. A loaded record binds its embedded run ID and sequence to the lookup
+  key and committed pointer; structural or identity mismatches are `corrupt`.
+  `load_latest_checked()` adapts legacy stores, so existing `CheckpointStore` implementations
+  remain source-compatible.
+- Durable readers use `core.durable_codec.DurableCodec`: artifact versions parse as
+  `<namespace>.<family>.vN`, accepted older versions migrate through pure ordered
+  `dict -> dict` steps, and writers always emit the canonical current `monoid.*`
+  version. A migration or validation failure performs no write and leaves `LATEST`
+  pointing at the prior committed checkpoint.
 - `AgentLoop.restore(checkpoint, *, blobs=...)` reopens the run: no second
   `run.started`/manifest, parked hosted tasks re-registered (so `report_task_result`
   still wakes it), the **workspace delta re-applied** on top of a re-provisioned base
@@ -961,21 +1111,43 @@ recovery is the integrator's call.
   `runtime_config` restored, remaining duration carried forward (downtime does not
   count against `max_duration_s`), and any shell job left `running` on disk folded in
   as a failed observation.
+- `AgentLoop.release_parked()` closes recorder/sink and process-local loop resources after a
+  durable boundary commit. It preserves the checkpoint and hosted-task state and emits no
+  `run.finished`. A non-terminal boundary can be restored by the next activation in a fresh
+  process. Terminal artifact finalization remains the caller's responsibility.
 - **Failure bundle:** on failure the core writes `run_dir/failure.json`
   (`{error, error_code, type, last_good_seq, restore_hint}`) — fail loud, name the
   checkpoint to restore from. No auto-recovery.
-- The reference backend writes `run_dir/run.json` and stores the same recovery descriptor in the
-  configured `CheckpointStore`: identity, workspace, limits, policy, and the authoritative resolved
-  runtime config. Runtime-config hot-swaps update both copies with `runtime_config_version`,
-  `runtime_config_hash`, `runtime_config_issuer`, `runtime_config_reason`, and
-  `runtime_config_committed_at`; recovery verifies the hash before rebuilding providers or gateway
-  token sources. A backend that never hosted the run can reclaim it from a shared lease/checkpoint
-  store, read the shared descriptor when local `run.json` is absent, materialize a local copy, then
-  resume. `recover_runs()` scans `run_root`; the active watchdog discovers cross-instance orphaned
+
+#### Reference operational scopes
+
+- The legacy Reference backend writes `run_dir/run.json` and stores the same recovery descriptor in
+  the configured `CheckpointStore`: identity, workspace, limits, policy, and the authoritative
+  resolved runtime config. Runtime-config hot-swaps update both copies with
+  `runtime_config_version`, `runtime_config_hash`, `runtime_config_issuer`,
+  `runtime_config_reason`, and `runtime_config_committed_at`; recovery verifies the hash before
+  rebuilding providers or gateway token sources. `metadata_generation` starts at one and advances
+  on each update. Recovery selects the higher generation, repairs the stale copy, and classifies
+  different payloads at the same generation as `corrupt`. Two legacy copies without a generation
+  retain local-authority behavior. Its optional lease/watchdog profile allows a backend that never
+  hosted the run to reclaim it from a shared lease/checkpoint store, read the shared descriptor
+  when local `run.json` is absent, materialize a local copy, then resume. Checked metadata reads
+  use the same five outcomes as checkpoints; corrupt or unsupported local metadata remains
+  authoritative bad state. `recover_runs()`
+  writes an actionable failure bundle for corrupt or unsupported durable state. It scans
+  `run_root`; the active watchdog discovers cross-instance orphaned
   runs from the shared lease store. Recovery skips terminal checkpoints and failed runs, rebuilds
   each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
   is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved
   follow-up messages, and resumes.
+- The experimental v0.18 DBOS activation-recovery profile has a narrower operational scope. One
+  stable executor slot has one active process; a restart reuses the same executor identity and
+  application version after the prior process terminates or is fenced. DBOS schedules and retries
+  one finite activation. The configured `CheckpointStore` remains authoritative for checkpoint
+  sequence, input deduplication, the committed boundary receipt, suspension, and terminal meaning.
+  The profile scope covers same-slot finite-activation recovery. The Reference backend, terminal
+  artifact finalization, HTTP, Studio, and arbitrary-host takeover remain separate. Portable
+  recovery semantics remain unchanged.
 
 **Assumption (workspace):** the agent workspace is not durable; on restore the
 deployment re-provisions the base (re-clone/re-mount) and the checkpoint re-applies
@@ -989,10 +1161,10 @@ Multimodal message parts (image/document) round-trip through the checkpoint, so 
 resumed run re-forwards the media. `transcript.jsonl` is a debug artifact (the
 by-value `messages` in the checkpoint are the load-bearing conversation record).
 
-## Production Hardening
+## Legacy Reference Production Hardening
 
-Operational safety net layered on durable persistence. The core still never auto-recovers;
-the active watchdog lives only in the reference backend (the operational layer).
+This section describes the legacy `RunnerBackend` lease/watchdog profile. The DBOS Reference path
+does not compose these services. The core never auto-recovers.
 
 ### Failure surfacing & bounded recovery
 
@@ -1007,7 +1179,7 @@ the active watchdog lives only in the reference backend (the operational layer).
   `failure.json` with `error_code="unrecoverable"`, so a poison checkpoint is permanently
   skipped instead of retried forever.
 
-### Active watchdog / lease (backend only)
+### Active watchdog / lease (legacy backend only)
 
 - `RunnerBackend.start_watchdog()` / `stop_watchdog()` run an opt-in heartbeat thread (tick
   `watchdog_interval_s`, default 5s). For each owned live run it refreshes
@@ -1035,7 +1207,7 @@ the active watchdog lives only in the reference backend (the operational layer).
 
 ### Pluggable durable stores
 
-Two seams make durability and multi-node recovery pluggable without touching the loop:
+The legacy backend uses two seams for pluggable durability and multi-node recovery:
 
 - **`CheckpointStore`** (core) — `put(checkpoint, blobs)` / `latest` / `delete`.
   `CheckpointRecord.blob(sha)` is a callable, not a directory, so a store can back blobs with
@@ -1049,7 +1221,7 @@ Every store must pass the parametrized contract suites (`tests/test_checkpoint_s
 blob dedup, run metadata round-trip, and a single-winner `try_claim`. Passing them makes a backend
 a drop-in.
 
-**SQLite reference stores** (`reference/stores/`, stdlib `sqlite3`, zero dependencies):
+**Legacy SQLite reference stores** (`reference/stores/`, stdlib `sqlite3`, zero dependencies):
 `SqliteCheckpointStore` and `SqliteLeaseStore`. A DB transaction supplies the invariants —
 `put` commits atomically (a crash rolls back, so `latest` never sees a torn checkpoint), the
 latest pointer advances monotonically via a conditional UPSERT, blobs are write-once, and
@@ -1067,9 +1239,10 @@ backend = RunnerBackend(
 )
 ```
 
-**Limitation / follow-up:** SQLite is single-host. A true cross-*host* deployment swaps in a
-networked `CheckpointStore` / `LeaseStore` (an object store or a networked DB) behind the same
-seams, as an optional dependency.
+**Legacy profile limitation / follow-up:** SQLite is single-host. A legacy cross-host deployment
+can supply a networked `CheckpointStore` / `LeaseStore` behind these seams. This capability is a
+Reference implementation option; the Core contract and the initial DBOS profile do not promise
+automatic host takeover.
 
 ### HTTP hardening & request bounds
 

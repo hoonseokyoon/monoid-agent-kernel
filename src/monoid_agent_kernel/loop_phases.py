@@ -166,6 +166,23 @@ class LoopBootstrapper:
             capability_vault=loop._capability_vault,
             outbox=loop._outbox,
         )
+        started = time.time()
+        deadline = (
+            started + loop.spec.limits.max_duration_s
+            if loop.spec.limits.max_duration_s is not None
+            else None
+        )
+        # Publish partial ownership as soon as recorder/task resources exist. If a provider,
+        # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.
+        loop._bootstrap_resources = _RunResources(
+            workspace=workspace,
+            recorder=recorder,
+            context=context,
+            base_tool_specs=(),
+            started=started,
+            deadline=deadline,
+            static_segments=(),
+        )
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))
         for provider in loop.tool_providers:
@@ -173,12 +190,6 @@ class LoopBootstrapper:
         if loop.subagent_definitions:
             loop._install_subagent_capability(base_registry, context, job_manager)
 
-        started = time.time()
-        deadline = (
-            started + loop.spec.limits.max_duration_s
-            if loop.spec.limits.max_duration_s is not None
-            else None
-        )
         loop._bootstrap_resources = _RunResources(
             workspace=workspace,
             recorder=recorder,

@@ -7,6 +7,70 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-12
+
+- Added an experimental optional DBOS Reference activation-recovery profile. Its finite,
+  run-partitioned resume workflows restore one checkpoint, drive one durable suspension boundary,
+  reject stale sources, commit applied-input markers, return the stored receipt for duplicates,
+  and recover after a same-slot process kill with one semantic effect and one identity-bound
+  boundary receipt. `CheckpointStore` remains the semantic authority while DBOS owns operational
+  admission, serialization, retry, and workflow recovery. DBOS dependencies and runtime types stay
+  in the optional Reference profile; the path constructs no legacy lease, inbox, recovery, or
+  watchdog services. Ambiguous checkpoint-store results reconcile by exact readback and remain
+  pending until the exact commit or a conflicting writer is observed.
+- Added portable durable suspension observations and `AgentLoop.release_parked()` so recovery
+  drivers can return an already-committed boundary and release process resources without
+  finalizing a resumable run.
+- Added an executable production embedding handbook with offline-tested local and hosted,
+  multi-tenant golden paths, portable deployment responsibilities, one explicit Reference inbox
+  assembly, and clear separation from the optional experimental DBOS activation-recovery profile.
+- Added a durable Reference command inbox with idempotent append, ordered and recoverable claims,
+  acknowledgements, result receipts, queue limits, authenticated principal attribution, sanitized
+  persistence, owner-side draining, and in-memory/SQLite implementations for cross-worker control.
+- Added cursor-correct event subscriptions with SSE event IDs, `Last-Event-ID` resume, heartbeat
+  comments, terminal final-event draining, recovered-run support, and authorized descendant feeds;
+  Reference backend HTTP and Studio now share the subscription abstraction.
+- Added an external minimal-agent conformance runner with stable rule IDs, typed observations,
+  versioned JSON and JUnit reports, packaged compatibility fixtures, and reusable checkpoint-store
+  and capability-broker implementation contracts.
+- Added deterministic LocalFS/SQLite durability fault coverage for corrupt and future checkpoints,
+  missing blobs, stale publication pointers, interrupted writes, metadata divergence, lease races,
+  side-effect recovery, and capability revocation.
+
+### Added
+- Added versioned durable codecs with explicit loaded, migrated, missing, corrupt,
+  and unsupported-version outcomes; LocalFS and SQLite checkpoint stores and
+  Reference recovery now use checked checkpoint and run-metadata reads.
+- Added a machine-readable compatibility registry and matching ledger for public wire and
+  durable artifacts, aliases, mixed-version operation, schema evolution, and coordinated
+  upgrade/rollback procedures.
+- Added explicit native async model, streaming model, and async tool-handler contracts;
+  async tools now execute on the run loop with deadline/cancellation propagation while
+  synchronous handlers retain worker-thread compatibility.
+
+### Changed
+- Classified every test into an enforced unit, contract, or integration tier and
+  replaced advisory xdist/coverage jobs with required deterministic shards, a
+  coverage floor, cross-platform smoke tests, and minimal/all-extras install smoke.
+
+### Fixed
+- Hardened checkpoint and run-metadata readers with structural validation, lookup-key and
+  committed-sequence binding, recovery-shape checks, and generation-based reconciliation between
+  local and shared metadata copies.
+- Preserved every unstarted approval replay across a process loss by consuming one durable head at
+  a time and carrying completed observations into the next safety checkpoint.
+- Applied cancellation and the session deadline to native async model calls and streams with
+  bounded provider cleanup; synchronous adapters retain their documented provider-timeout
+  responsibility.
+- Closed a Reference inbox redaction gap where JSON coercion of bytes or custom objects could
+  reintroduce a bearer into durable command arguments, and fenced watchdog restart after a stop
+  timeout.
+- Redacted raw exception bodies from conformance JSON, JUnit, and console diagnostics; strengthened
+  the reusable checkpoint-store contract to prove persistence across a fresh store instance.
+- Excluded the workspace-local `.tmp/` release scratch directory from source distributions.
+- Kept offline Studio functional in the minimal install by falling back to complete one-shot
+  gateway turns when the optional async HTTP transport is unavailable.
+
 ## [0.17.1] - 2026-07-09
 
 ### Added

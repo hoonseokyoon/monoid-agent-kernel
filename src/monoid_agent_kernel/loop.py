@@ -7,11 +7,11 @@ import inspect
 import json
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any
 
-from monoid_agent_kernel.core._util import sha256_bytes
+from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointStore,
@@ -61,7 +61,12 @@ from monoid_agent_kernel.core.agents import (
     validate_runtime_config,
 )
 from monoid_agent_kernel.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
-from monoid_agent_kernel.core.result import AgentRunResult, AgentTurnResult, Suspension
+from monoid_agent_kernel.core.result import (
+    AgentRunResult,
+    AgentTurnResult,
+    Suspension,
+    suspension_checkpoint_payload,
+)
 from monoid_agent_kernel.core.output_validator import (
     OutputValidator,
 )
@@ -139,6 +144,7 @@ from monoid_agent_kernel.tasks import (
 )
 from monoid_agent_kernel.permissions import PermissionPolicy, matches_path_patterns
 from monoid_agent_kernel.providers.base import (
+    AsyncModelAdapter,
     ModelAdapter,
     ModelRequest,
     ModelStreamChunk,
@@ -173,7 +179,20 @@ from monoid_agent_kernel.tool_loader import FunctionToolProvider
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
 from monoid_agent_kernel.web import WebGatewayClient, domain_allowed, domain_from_url
 
-CheckpointPersistCallback = Callable[[RunCheckpoint, Mapping[str, bytes]], None]
+CheckpointPersistCallback = Callable[[RunCheckpoint, Mapping[str, bytes]], bool | None]
+
+
+class _CheckpointPersistError(RuntimeError):
+    """Infrastructure failure that must escape the agent-failure recording boundary."""
+
+
+def _consume_task_outcome(task: asyncio.Future[Any]) -> None:
+    """Retrieve a detached task outcome so late cleanup cannot emit an unhandled warning."""
+
+    try:
+        task.result()
+    except BaseException:
+        pass
 
 
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
@@ -538,6 +557,22 @@ def _as_blob_reader(
     return lambda sha256: blobs[sha256]
 
 
+def _checkpoint_state_sha256(checkpoint: RunCheckpoint) -> str:
+    """Fingerprint checkpointed state while excluding snapshot-time-only values."""
+
+    payload = checkpoint.to_json()
+    payload.pop("remaining_duration_s", None)
+    # These fields belong to backend transports and cannot be reproduced by a pure Core snapshot.
+    payload.pop("queued_messages", None)
+    payload.pop("inbox_seen_ids", None)
+    workspace_base = payload.get("workspace_base")
+    if isinstance(workspace_base, dict):
+        workspace_base = dict(workspace_base)
+        workspace_base.pop("created_at", None)
+        payload["workspace_base"] = workspace_base
+    return canonical_sha256(payload)
+
+
 @dataclass
 class RunState:
     """Mutable state threaded through a run's steps and teardown."""
@@ -600,12 +635,26 @@ class _Session:
     terminal: bool = False
     # Monotonic checkpoint sequence for this open run; advanced once per park.
     checkpoint_seq: int = 0
+    # The observable boundary paired with the latest checkpoint. Backend-owned persistence can
+    # commit another snapshot (for example after a task report) without losing this observation.
+    last_suspension: dict[str, Any] | None = None
+    # Recovery-driver input identities survive every later snapshot without coupling the loop to
+    # a command transport or orchestration implementation.
+    applied_input_ids: set[str] = field(default_factory=set)
+    # Fingerprint of the last checkpoint writer success. ``release_parked`` compares current
+    # checkpointable state against it so uncommitted mutations cannot be silently discarded.
+    persisted_checkpoint_sha256: str | None = None
+    # Hosted task ids present in the last committed checkpoint. Failure cleanup preserves them and
+    # cancels only process-local work plus newly-created, uncommitted hosted tasks.
+    persisted_hosted_task_ids: set[str] = field(default_factory=set)
+    active_input: dict[str, Any] | None = None
+    applied_input_receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
 class AgentLoop:
     spec: AgentRunSpec
-    model_adapter: ModelAdapter
+    model_adapter: ModelAdapter | AsyncModelAdapter
     _: KW_ONLY
     # Accepts a RuntimeConfigProvider, a bare AgentRuntimeConfig, or a
     # callable(run_id) -> AgentRuntimeConfig; __post_init__ coerces to a provider.
@@ -622,6 +671,13 @@ class AgentLoop:
     emit_output_deltas: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
+    # Native async handlers receive cancellation immediately. Cleanup gets a bounded grace
+    # window; a handler that suppresses cancellation is detached so the run-level outcome can
+    # still settle. Sync worker calls retain their existing non-preemptible boundary behavior.
+    async_tool_cancel_grace_s: float = 1.0
+    # Native async model calls and streams use the same bounded-cancellation shape, but keep a
+    # separate knob so a slow provider connection cannot consume the tool-handler cleanup budget.
+    async_model_cancel_grace_s: float = 1.0
     shell_approval_provider: ShellApprovalProvider | None = None
     web_gateway_client: WebGatewayClient | None = None
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
@@ -704,7 +760,7 @@ class AgentLoop:
     def from_config(
         cls,
         spec: AgentRunSpec,
-        model_adapter: ModelAdapter,
+        model_adapter: ModelAdapter | AsyncModelAdapter,
         runtime_config: RuntimeConfigSource,
         **kwargs: Any,
     ) -> AgentLoop:
@@ -724,7 +780,7 @@ class AgentLoop:
     def from_tools(
         cls,
         spec: AgentRunSpec,
-        model_adapter: ModelAdapter,
+        model_adapter: ModelAdapter | AsyncModelAdapter,
         tools: Iterable[ToolSpec],
         *,
         definition_id: str = "custom-agent",
@@ -1046,6 +1102,9 @@ class AgentLoop:
                 "run reached a terminal state and cannot accept more input",
                 error_code="run_terminal",
             )
+        # This activation is now in progress. Internal safety checkpoints must not masquerade as
+        # the prior completed suspension; a new observation is attached only at the return boundary.
+        session.last_suspension = None
         state, res = session.state, session.res
         if user_input is not None:
             # Per-submit outcome fields describe this turn; reset before running.
@@ -1071,6 +1130,11 @@ class AgentLoop:
             session.submit_local_step = 0
         try:
             suspension = await self._apump_turn(state, res, session)
+        except _CheckpointPersistError:
+            # A failed safety checkpoint leaves activation ownership uncertain. Preserve the
+            # last durable snapshot and let the lifecycle owner decide retry/recovery; converting
+            # this into a terminal agent failure could commit past the failed barrier.
+            raise
         except (RunCancelled, RunTimeout) as exc:
             state.status = "limited"
             state.error = str(exc)
@@ -1088,7 +1152,7 @@ class AgentLoop:
                 error_code=state.error_code,
                 turn=self._checkpoint_on_settle(state, res),
             )
-            self._persist_checkpoint(session)
+            self._persist_checkpoint(session, result)
             return result
         except ModelAdapterError as exc:
             if not _recoverable_turn_error(exc):
@@ -1102,7 +1166,7 @@ class AgentLoop:
                     error_code=state.error_code,
                     turn=self._checkpoint_on_settle(state, res),
                 )
-                self._persist_checkpoint(session)
+                self._persist_checkpoint(session, result)
                 return result
             # Recoverable model-turn failure: keep the session alive so the turn can be
             # re-attempted (driver decides: backoff-retry transient, or park for the user to
@@ -1124,14 +1188,15 @@ class AgentLoop:
                 level="warning",
             )
             state.pending_observations = ()
-            self._persist_checkpoint(session)
-            return replace(
+            result = replace(
                 Suspension(reason="turn_failed", status="failed"),
                 error=public_error_message(str(exc)),
                 error_code=exc.error_code,
                 retryable=exc.retryable,
                 http_status=exc.http_status,
             )
+            self._persist_checkpoint(session, result)
+            return result
         except TurnInterrupted:
             # Turn-level stop: keep the session alive (no error, not terminal). Same idempotency
             # as turn_failed — the user message/observations are already committed; only clear
@@ -1140,8 +1205,9 @@ class AgentLoop:
             self._interrupt_requested = False
             res.recorder.emit("turn.interrupted", data={"reason": "user_stop"}, level="info")
             state.pending_observations = ()
-            self._persist_checkpoint(session)
-            return Suspension(reason="interrupted", status="completed")
+            result = Suspension(reason="interrupted", status="completed")
+            self._persist_checkpoint(session, result)
+            return result
         except TurnPaused:
             # Cooperative pause: freeze the turn at a clean start-of-step boundary and keep
             # the session alive. Unlike interrupt, pending_observations are KEPT — the resumed
@@ -1156,8 +1222,9 @@ class AgentLoop:
                 "session.state.changed",
                 data={"state": "paused", "from": "running", "reason": "pause_requested"},
             )
-            self._persist_checkpoint(session)
-            return Suspension(reason="paused", status="completed")
+            result = Suspension(reason="paused", status="completed")
+            self._persist_checkpoint(session, result)
+            return result
         except Exception as exc:  # controlled recording boundary for standalone CLI
             self._record_failure(state, res, exc)
             session.terminal = True
@@ -1167,7 +1234,7 @@ class AgentLoop:
                 error_code=state.error_code,
                 turn=self._checkpoint_on_settle(state, res),
             )
-            self._persist_checkpoint(session)
+            self._persist_checkpoint(session, result)
             return result
         if suspension.reason == "awaiting_tasks":
             if suspension.has_external:
@@ -1176,13 +1243,13 @@ class AgentLoop:
                     "run.awaiting_input",
                     data={"reason": "task", "task_ids": list(suspension.awaiting_task_ids)},
                 )
-            self._persist_checkpoint(session)
+            self._persist_checkpoint(session, suspension)
             return suspension
         if state.error_code == "max_tool_calls_exceeded":
             # Tool-call budget is session-cumulative; once spent the run is done.
             session.terminal = True
         result = replace(suspension, turn=self._checkpoint_on_settle(state, res))
-        self._persist_checkpoint(session)
+        self._persist_checkpoint(session, result)
         return result
 
     def await_user_input(self) -> None:
@@ -1206,7 +1273,15 @@ class AgentLoop:
             inherit_provider_detail=True,  # promotion of the prior turn.failed — keep its detail
         )
         session.terminal = True
-        self._persist_checkpoint(session)
+        self._persist_checkpoint(
+            session,
+            Suspension(
+                reason="terminal",
+                status="failed",
+                error=session.state.error,
+                error_code=session.state.error_code,
+            ),
+        )
 
     def has_pending_tasks(self) -> bool:
         """Whether the run has resume-tasks still outstanding (not yet drained)."""
@@ -1244,6 +1319,77 @@ class AgentLoop:
         # there _maybe_close_loop is a no-op and run_once's finally does the teardown.
         self._maybe_close_loop()
         return result
+
+    def release_parked(self) -> None:
+        """Release process-local resources while leaving a durably parked run resumable.
+
+        The latest boundary must already have been committed by the configured checkpoint writer.
+        This closes recorders and an owned sync event loop without emitting ``run.finished``,
+        cancelling hosted tasks, or deleting checkpoints. A recovery driver can then construct a
+        fresh loop and call :meth:`restore` for the next activation.
+        """
+
+        session = self._require_open()
+        checkpoint = self.snapshot()
+        if (
+            session.last_suspension is None
+            or checkpoint is None
+            or session.persisted_checkpoint_sha256 is None
+            or _checkpoint_state_sha256(checkpoint) != session.persisted_checkpoint_sha256
+        ):
+            raise NativeAgentError(
+                "run has no current committed suspension boundary",
+                error_code="run_not_durably_parked",
+            )
+        session.res.recorder.close()
+        self._session = None
+        self._bootstrap_resources = None
+        self._stream_sink = None
+        self._maybe_close_loop()
+
+    async def arelease_parked(self) -> None:
+        """Async facade for :meth:`release_parked`."""
+
+        await asyncio.to_thread(self.release_parked)
+
+    def discard_uncommitted(self) -> None:
+        """Discard process-local activation state and keep the last durable checkpoint.
+
+        This is failure cleanup for recovery drivers. It cancels live process-local jobs and
+        closes recorder/sink and owned-loop resources without finalizing the run or deleting its
+        checkpoint. The next process restores the last successfully committed boundary.
+        """
+
+        session = self._session
+        resources = session.res if session is not None else self._bootstrap_resources
+        cleanup_errors: list[BaseException] = []
+        if resources is not None:
+            try:
+                resources.context.job_manager.discard_uncommitted(
+                    preserve_hosted_task_ids=(
+                        session.persisted_hosted_task_ids if session is not None else set()
+                    )
+                )
+            except BaseException as exc:  # cleanup continues through every owned resource
+                cleanup_errors.append(exc)
+            try:
+                resources.recorder.close()
+            except BaseException as exc:  # cleanup continues through the owned event loop
+                cleanup_errors.append(exc)
+        self._session = None
+        self._bootstrap_resources = None
+        self._stream_sink = None
+        try:
+            self._maybe_close_loop()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
+    async def adiscard_uncommitted(self) -> None:
+        """Async facade for :meth:`discard_uncommitted`."""
+
+        await asyncio.to_thread(self.discard_uncommitted)
 
     def run_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
         """One-shot convenience: open() + submit(user_input) + close().
@@ -1347,7 +1493,7 @@ class AgentLoop:
         self._owned_loop = None
         self._owned_loop_thread = None
 
-    async def _acall_model(self, request: ModelRequest) -> ModelTurn:
+    async def _acall_model(self, request: ModelRequest, deadline: float | None) -> ModelTurn:
         """Invoke the model adapter, awaiting an async adapter natively or offloading a
         sync ``next_turn`` to a thread so the event loop is never blocked on the LLM call.
 
@@ -1362,37 +1508,112 @@ class AgentLoop:
         if sink is not None and sink.active:
             astream_turn = getattr(adapter, "astream_turn", None)
             if astream_turn is not None:
-                return await self._acall_model_streaming(astream_turn, request, sink)
+                return await self._acall_model_streaming(astream_turn, request, sink, deadline)
         if self.emit_output_deltas:
             astream_turn = getattr(adapter, "astream_turn", None)
             if astream_turn is not None:
-                return await self._acall_model_emitting_deltas(astream_turn, request)
+                return await self._acall_model_emitting_deltas(astream_turn, request, deadline)
         anext = getattr(adapter, "anext_turn", None)
         if anext is not None:
-            return await anext(request)
+            return await self._await_native_model_call(anext(request), deadline)
         next_turn = adapter.next_turn
         if inspect.iscoroutinefunction(next_turn):
-            return await next_turn(request)
+            return await self._await_native_model_call(next_turn(request), deadline)
         return await asyncio.to_thread(next_turn, request)
+
+    async def _await_native_model_call(
+        self,
+        pending: Awaitable[ModelTurn],
+        deadline: float | None,
+    ) -> ModelTurn:
+        """Await native model I/O while propagating run cancellation and the run deadline.
+
+        Interrupt and pause remain step-boundary signals for one-shot model calls. They are
+        intentionally absent from this race and are checked by ``_apump_turn`` after the model
+        returns. Cancellation and deadlines are run boundaries, so they cancel the provider task
+        immediately and wait only a bounded interval for cooperative cleanup.
+        """
+
+        task = asyncio.ensure_future(pending)
+        loop = asyncio.get_running_loop()
+        cancelled: asyncio.Future[None] = loop.create_future()
+        outcome_consumed = False
+
+        def signal_cancelled() -> None:
+            def resolve() -> None:
+                if not cancelled.done():
+                    cancelled.set_result(None)
+
+            loop.call_soon_threadsafe(resolve)
+
+        remove_callback = (
+            self.cancellation_token.add_cancel_callback(signal_cancelled)
+            if self.cancellation_token is not None
+            else lambda: None
+        )
+        timeout = None if deadline is None else max(0.0, deadline - time.time())
+        try:
+            await asyncio.wait(
+                {task, cancelled},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            self._check_model_cancel_or_deadline(deadline)
+            if task.done():
+                outcome_consumed = True
+                return task.result()
+            if cancelled.done():
+                raise RunCancelled("run cancelled")
+            raise RunTimeout("run exceeded max duration")
+        finally:
+            remove_callback()
+            if not cancelled.done():
+                cancelled.cancel()
+            if not task.done():
+                task.cancel()
+                done, _pending = await asyncio.wait(
+                    {task}, timeout=max(0.0, self.async_model_cancel_grace_s)
+                )
+                if task not in done:
+                    task.add_done_callback(_consume_task_outcome)
+                else:
+                    _consume_task_outcome(task)
+            elif not outcome_consumed:
+                _consume_task_outcome(task)
 
     async def _acall_model_streaming(
         self,
         astream_turn: Callable[[ModelRequest], Any],
         request: ModelRequest,
         sink: QueueEventSink,
+        deadline: float | None,
     ) -> ModelTurn:
         """Drive an adapter's ``astream_turn``: relay each chunk to the live stream and
         accumulate them into the turn's ``ModelTurn`` (see ``assemble_streamed_turn``)."""
-        chunks: list[ModelStreamChunk] = []
-        async for chunk in astream_turn(request):
-            sink.push_delta(chunk)
-            chunks.append(chunk)
-        return assemble_streamed_turn(chunks)
+        agen = astream_turn(request)
+
+        async def consume() -> ModelTurn:
+            chunks: list[ModelStreamChunk] = []
+            try:
+                async for chunk in agen:
+                    sink.push_delta(chunk)
+                    chunks.append(chunk)
+            finally:
+                # Provider async iterators own network resources. Cooperative cancellation enters
+                # their ``finally`` and then explicitly closes the iterator; stubborn cleanup is
+                # detached by ``_await_native_model_call`` after its bounded grace interval.
+                aclose = getattr(agen, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            return assemble_streamed_turn(chunks)
+
+        return await self._await_native_model_call(consume(), deadline)
 
     async def _acall_model_emitting_deltas(
         self,
         astream_turn: Callable[[ModelRequest], Any],
         request: ModelRequest,
+        deadline: float | None,
     ) -> ModelTurn:
         """Autonomous-drive streaming (no RunStream queue): drive ``astream_turn`` and emit each
         text fragment as a ``model.output.delta`` event, so an event-stream consumer renders
@@ -1400,29 +1621,37 @@ class AgentLoop:
         identical to the one-shot path, so the rest of the turn is unchanged."""
         assert self._session is not None
         recorder = self._session.res.recorder
-        chunks: list[ModelStreamChunk] = []
         agen = astream_turn(request)
-        try:
-            async for chunk in agen:
-                chunks.append(chunk)
-                if isinstance(chunk, TextDelta) and chunk.text:
-                    recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
-                elif isinstance(chunk, ReasoningDelta) and chunk.text:
-                    # Display-only reasoning summary (DX-13b): a separate event so a consumer
-                    # renders it in a "thinking" view, distinct from the answer text.
-                    recorder.emit("model.reasoning.delta", data={"text": chunk.text}, level="debug")
-                # Immediate stop: when a turn interrupt arrives mid-stream, abort the in-flight
-                # generation now (don't wait for the next step boundary). The text already
-                # streamed stays; the except in arun_until_suspended parks the live session.
-                if self._interrupt_requested:
-                    raise TurnInterrupted("turn interrupted")
-        finally:
-            # Close the generator so the provider's stream/connection is released promptly
-            # (on a normal drain this is a no-op; on the mid-stream abort it cancels the wire).
-            aclose = getattr(agen, "aclose", None)
-            if aclose is not None:
-                await aclose()
-        return assemble_streamed_turn(chunks)
+
+        async def consume() -> ModelTurn:
+            chunks: list[ModelStreamChunk] = []
+            try:
+                async for chunk in agen:
+                    chunks.append(chunk)
+                    if isinstance(chunk, TextDelta) and chunk.text:
+                        recorder.emit(
+                            "model.output.delta", data={"text": chunk.text}, level="debug"
+                        )
+                    elif isinstance(chunk, ReasoningDelta) and chunk.text:
+                        # Display-only reasoning summary (DX-13b): a separate event so a consumer
+                        # renders it in a "thinking" view, distinct from the answer text.
+                        recorder.emit(
+                            "model.reasoning.delta", data={"text": chunk.text}, level="debug"
+                        )
+                    # Immediate stop: when a turn interrupt arrives mid-stream, abort the in-flight
+                    # generation now (don't wait for the next step boundary). The text already
+                    # streamed stays; the except in arun_until_suspended parks the live session.
+                    if self._interrupt_requested:
+                        raise TurnInterrupted("turn interrupted")
+            finally:
+                # Close the generator so the provider's stream/connection is released promptly
+                # (on a normal drain this is a no-op; on a bounded abort it cancels the wire).
+                aclose = getattr(agen, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            return assemble_streamed_turn(chunks)
+
+        return await self._await_native_model_call(consume(), deadline)
 
     def _record_failure(
         self,
@@ -1520,17 +1749,17 @@ class AgentLoop:
             self._persist_checkpoint(session)
         return reported
 
-    # --- durable persistence (state-snapshot at park points) ---
+    # --- durable persistence (state snapshots at safe recovery boundaries) ---
 
     def snapshot(self) -> RunCheckpoint | None:
-        """Capture the run's park-point state as a ``RunCheckpoint``, or ``None`` when
+        """Capture the run's current safe state as a ``RunCheckpoint``, or ``None`` when
         a durable snapshot is unsafe right now. Pure read — never mutates state or jobs.
 
         Refuses (returns ``None``) while a live in-process (shell) resume-task is still
         running: its subprocess can't cross a process boundary, so the park only becomes
-        durable once just hosted (hitl/automation) tasks remain. The conversation itself
-        is held by the provider via ``previous_turn_handle``, so the LLM transcript is
-        never serialized here."""
+        durable once just hosted (hitl/automation) tasks remain. The provider-neutral
+        conversation is serialized by value in ``messages``; ``previous_turn_handle`` is an
+        optional continuation optimization."""
         session = self._require_open()
         state = session.state
         res = session.res
@@ -1573,15 +1802,26 @@ class AgentLoop:
             session_step=session.session_step,
             submit_local_step=session.submit_local_step,
             terminal=session.terminal,
+            last_suspension=(
+                dict(session.last_suspension) if session.last_suspension is not None else None
+            ),
             hosted_tasks=tasks_payload["hosted_tasks"],
             reentry_queue=tasks_payload["reentry_queue"],
             delivered_reentry_jobs=tasks_payload["delivered_reentry_jobs"],
             workspace_delta=self._workspace_delta_entries(res.workspace),
             workspace_base=res.workspace.workspace_base_payload(self.spec.run_id),
-            remaining_duration_s=(res.deadline - time.time()) if res.deadline is not None else None,
+            remaining_duration_s=(
+                max(0.0, res.deadline - time.time()) if res.deadline is not None else None
+            ),
             cancellation_requested=bool(
                 self.cancellation_token is not None and self.cancellation_token.requested
             ),
+            applied_input_ids=sorted(session.applied_input_ids),
+            active_input=(dict(session.active_input) if session.active_input is not None else None),
+            applied_input_receipts={
+                input_id: dict(receipt)
+                for input_id, receipt in session.applied_input_receipts.items()
+            },
             # Durable (approved) capability leases — handles only — so a restart does not re-prompt.
             capability_leases=self._capability_vault.export_durable(),
             outbox_requests=self._outbox.export(),
@@ -1611,20 +1851,49 @@ class AgentLoop:
         run_id = self.spec.run_id
         return lambda sha: store.get_blob(run_id, sha)
 
-    def _persist_checkpoint(self, session: _Session) -> None:
+    def _persist_checkpoint(
+        self,
+        session: _Session,
+        suspension: Suspension | None = None,
+    ) -> None:
         """Best-effort durable checkpoint at a park point. No-op when ``snapshot()``
         refuses (a live shell job is parked-on) — that park is simply not durable yet.
         Advances the per-run sequence so the store commits a new last-good checkpoint."""
+        prior_suspension = session.last_suspension
+        if suspension is not None:
+            session.last_suspension = suspension_checkpoint_payload(suspension)
         checkpoint = self.snapshot()
         if checkpoint is None:
+            session.last_suspension = prior_suspension
             return
         session.checkpoint_seq += 1
         checkpoint.seq = session.checkpoint_seq
         blobs = self.collect_checkpoint_blobs()
-        if self.checkpoint_persist_callback is not None:
-            self.checkpoint_persist_callback(checkpoint, blobs)
+        try:
+            committed = True
+            if self.checkpoint_persist_callback is not None:
+                committed = self.checkpoint_persist_callback(checkpoint, blobs) is not False
+            else:
+                self._checkpoint_store().put(checkpoint, blobs)
+        except Exception as exc:
+            session.last_suspension = prior_suspension
+            raise _CheckpointPersistError("checkpoint persistence failed") from exc
+        if not committed:
             return
-        self._checkpoint_store().put(checkpoint, blobs)
+        session.applied_input_ids = set(checkpoint.applied_input_ids)
+        session.active_input = (
+            dict(checkpoint.active_input) if checkpoint.active_input is not None else None
+        )
+        session.applied_input_receipts = {
+            input_id: dict(receipt)
+            for input_id, receipt in checkpoint.applied_input_receipts.items()
+        }
+        session.persisted_checkpoint_sha256 = _checkpoint_state_sha256(checkpoint)
+        session.persisted_hosted_task_ids = {
+            str(task.get("task_id") or task.get("job_id") or "")
+            for task in checkpoint.hosted_tasks
+            if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
+        }
 
     @staticmethod
     def _workspace_delta_entries(workspace: Workspace) -> list[dict[str, Any]]:
@@ -1681,9 +1950,17 @@ class AgentLoop:
         self._restoring = True
         try:
             res = self._bootstrap()
+            self._rehydrate(checkpoint, res, _as_blob_reader(blobs))
+        except Exception:
+            try:
+                self.discard_uncommitted()
+            except Exception:
+                # Preserve the restore failure as the actionable cause. Cleanup still attempts
+                # every owned resource before it reports its own first error.
+                pass
+            raise
         finally:
             self._restoring = False
-        self._rehydrate(checkpoint, res, _as_blob_reader(blobs))
 
     def _rehydrate(self, cp: RunCheckpoint, res: _RunResources, blob_reader: Callable[[str], bytes]) -> None:
         # Deadline carry-over: downtime while parked does not count against
@@ -1759,6 +2036,31 @@ class AgentLoop:
         # changed_entries() reports the same delta again.
         self._apply_workspace_delta(res.workspace, cp.workspace_delta, blob_reader, self.spec.limits)
         manager = res.context.job_manager
+        # Publish the restored durable baseline before registering hosted tasks. If any later
+        # rehydration step fails, cleanup preserves every task owned by the source checkpoint.
+        self._session = _Session(
+            state=state,
+            res=res,
+            session_step=cp.session_step,
+            submit_local_step=cp.submit_local_step,
+            terminal=cp.terminal,
+            # Continue the sequence so the next park commits cp.seq + 1.
+            checkpoint_seq=cp.seq,
+            last_suspension=(
+                dict(cp.last_suspension) if cp.last_suspension is not None else None
+            ),
+            applied_input_ids=set(cp.applied_input_ids),
+            active_input=(dict(cp.active_input) if cp.active_input is not None else None),
+            applied_input_receipts={
+                input_id: dict(receipt) for input_id, receipt in cp.applied_input_receipts.items()
+            },
+            persisted_checkpoint_sha256=_checkpoint_state_sha256(cp),
+            persisted_hosted_task_ids={
+                str(task.get("task_id") or task.get("job_id") or "")
+                for task in cp.hosted_tasks
+                if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
+            },
+        )
         manager.restore_state(
             [HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir) for payload in cp.hosted_tasks],
             reentry_queue=cp.reentry_queue,
@@ -1769,15 +2071,6 @@ class AgentLoop:
             state.pending_observations = state.pending_observations + crashed
         if cp.cancellation_requested and self.cancellation_token is not None:
             self.cancellation_token.cancel()
-        self._session = _Session(
-            state=state,
-            res=res,
-            session_step=cp.session_step,
-            submit_local_step=cp.submit_local_step,
-            terminal=cp.terminal,
-            # Continue the sequence so the next park commits cp.seq + 1.
-            checkpoint_seq=cp.seq,
-        )
 
     @staticmethod
     def _apply_workspace_delta(
@@ -2347,59 +2640,60 @@ class AgentLoop:
             call_counts_before_replays = dict(state.tool_call_counts)
             # Auto-redispatch (⑤): run any gated calls whose capability was just granted, now that
             # this turn's context (catalog/surface/turn_id) exists. Each goes through the normal
-            # _execute_tool_call (real permission/quota/events); the result is injected as a
+            # _aexecute_tool_call (real permission/quota/events); the result is injected as a
             # user-message observation so the model sees the outcome without retrying. A replay that
             # can't run cleanly (no valid lease) is skipped — the model then retries (fallback).
             if state.pending_capability_replays:
+                # Capability replays intentionally retain their durable at-least-once crash policy.
+                # No consumed checkpoint is written here: process loss before the next ordinary
+                # checkpoint restores the whole batch, so effectful handlers need stable
+                # idempotency at their external boundary.
                 pending_replays = state.pending_capability_replays
                 state.pending_capability_replays = ()
-                replay_obs = tuple(
-                    obs
-                    for replay in pending_replays
-                    if (
-                        obs := self._execute_capability_replay(
-                            replay,
-                            bound_catalog=bound_catalog,
-                            surface_snapshot=surface_snapshot,
-                            call_counts=state.tool_call_counts,
-                            context=context,
-                            recorder=recorder,
-                            turn_id=turn_id,
-                            step=step,
-                            side_effect_policy=side_effect_policy,
-                        )
+                replay_obs_list: list[ToolObservation] = []
+                for replay in pending_replays:
+                    obs = await self._aexecute_capability_replay(
+                        replay,
+                        bound_catalog=bound_catalog,
+                        surface_snapshot=surface_snapshot,
+                        call_counts=state.tool_call_counts,
+                        context=context,
+                        recorder=recorder,
+                        turn_id=turn_id,
+                        step=step,
+                        side_effect_policy=side_effect_policy,
+                        deadline=deadline,
                     )
-                    is not None
-                )
+                    if obs is not None:
+                        replay_obs_list.append(obs)
+                replay_obs = tuple(replay_obs_list)
                 if replay_obs:
                     state.pending_observations = (*state.pending_observations, *replay_obs)
-            if state.pending_tool_approval_replays:
-                pending_replays = state.pending_tool_approval_replays
-                state.pending_tool_approval_replays = ()
-                # Persist the consumed approval replay before invoking the approved handler. If the
-                # process exits during the handler, restore must not re-deliver the same approval and
-                # execute a write/side-effecting tool twice.
+            while state.pending_tool_approval_replays:
+                replay = state.pending_tool_approval_replays[0]
+                state.pending_tool_approval_replays = state.pending_tool_approval_replays[1:]
+                # Approval replay delivery is durable at-most-once per head. Commit only this
+                # consumption before invoking the approved handler: a crash does not re-run the
+                # uncertain head, while the unstarted tail and every prior replay observation stay
+                # recoverable in this checkpoint.
                 self._persist_checkpoint(session)
-                replay_obs = tuple(
-                    obs
-                    for replay in pending_replays
-                    if (
-                        obs := self._execute_tool_approval_replay(
-                            replay,
-                            bound_catalog=bound_catalog,
-                            surface_snapshot=surface_snapshot,
-                            call_counts=state.tool_call_counts,
-                            context=context,
-                            recorder=recorder,
-                            turn_id=turn_id,
-                            step=step,
-                            side_effect_policy=side_effect_policy,
-                        )
-                    )
-                    is not None
+                obs = await self._aexecute_tool_approval_replay(
+                    replay,
+                    bound_catalog=bound_catalog,
+                    surface_snapshot=surface_snapshot,
+                    call_counts=state.tool_call_counts,
+                    context=context,
+                    recorder=recorder,
+                    turn_id=turn_id,
+                    step=step,
+                    side_effect_policy=side_effect_policy,
+                    deadline=deadline,
                 )
-                if replay_obs:
-                    state.pending_observations = (*state.pending_observations, *replay_obs)
+                if obs is not None:
+                    # Fold the completed head immediately so the next head's safety checkpoint
+                    # durably carries its observation instead of losing all earlier outcomes on a
+                    # later replay crash.
+                    state.pending_observations = (*state.pending_observations, obs)
             # Replays run before the model request. If they consumed quota, rebuild the
             # model-facing surface so context providers and tools see the post-replay limits.
             if state.tool_call_counts != call_counts_before_replays:
@@ -2579,7 +2873,7 @@ class AgentLoop:
                 }
             )
             try:
-                turn = await self._acall_model(request)
+                turn = await self._acall_model(request, deadline)
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
@@ -2707,11 +3001,10 @@ class AgentLoop:
                     state.final_text = "Stopped after reaching max tool calls."
                     state.error_code = "max_tool_calls_exceeded"
                     break
-                # Offload the (sync) tool handler — which may block on shell/web/fs — to a
-                # thread so the event loop stays free. Awaited sequentially, so there is no
-                # concurrent access to the shared context/state it mutates.
-                observation = await asyncio.to_thread(
-                    self._execute_tool_call,
+                # Each call completes before the next starts. Native async handlers stay on
+                # this loop; synchronous handlers are offloaded inside the shared execution
+                # path so approvals, capability gates, events, and error mapping remain aligned.
+                observation = await self._aexecute_tool_call(
                     call_name=call.name,
                     call_id=call.id,
                     arguments=call.arguments,
@@ -2724,6 +3017,7 @@ class AgentLoop:
                     parent_id=turn_started.event_id,
                     step=step,
                     side_effect_policy=side_effect_policy,
+                    deadline=deadline,
                 )
                 observations.append(observation)
                 self._check_run_boundary(deadline)
@@ -3034,7 +3328,7 @@ class AgentLoop:
                 },
             )
 
-    def _execute_capability_replay(
+    async def _aexecute_capability_replay(
         self,
         replay: dict[str, Any],
         *,
@@ -3046,6 +3340,7 @@ class AgentLoop:
         turn_id: str,
         step: int,
         side_effect_policy: ToolSideEffectPolicy,
+        deadline: float | None,
     ) -> ToolObservation | None:
         """Re-execute one gated tool call after its capability was granted, returning the result as
         a user-message observation (so it never collides with the original call's pending tool
@@ -3054,7 +3349,7 @@ class AgentLoop:
         capability = str(replay.get("capability") or "")
         if not capability or self._capability_vault.token_for(capability, now=time.time()) is None:
             return None  # lease missing/expired -> let the model retry (the granted message stands)
-        observation = self._execute_tool_call(
+        observation = await self._aexecute_tool_call(
             call_name=str(replay.get("call_name") or ""),
             call_id=str(replay.get("call_id") or ""),
             arguments=dict(replay.get("arguments") or {}),
@@ -3072,6 +3367,7 @@ class AgentLoop:
                 else None
             ),
             side_effect_policy=side_effect_policy,
+            deadline=deadline,
         )
         # Deliver as a user message (is_background) under a distinct call_id — the original call_id
         # already carries the "pending" tool result, so a second tool result there would be malformed.
@@ -3087,7 +3383,7 @@ class AgentLoop:
             is_background=True,
         )
 
-    def _execute_tool_approval_replay(
+    async def _aexecute_tool_approval_replay(
         self,
         replay: dict[str, Any],
         *,
@@ -3099,11 +3395,12 @@ class AgentLoop:
         turn_id: str,
         step: int,
         side_effect_policy: ToolSideEffectPolicy,
+        deadline: float | None,
     ) -> ToolObservation | None:
         call_name = str(replay.get("call_name") or "")
         if not call_name:
             return None
-        observation = self._execute_tool_call(
+        observation = await self._aexecute_tool_call(
             call_name=call_name,
             call_id=str(replay.get("call_id") or ""),
             arguments=dict(replay.get("arguments") or {}),
@@ -3117,6 +3414,7 @@ class AgentLoop:
             step=step,
             approved_tool_approval=replay,
             side_effect_policy=side_effect_policy,
+            deadline=deadline,
         )
         return ToolObservation(
             call_id=f"tool_approval_replay:{replay.get('call_id') or ''}",
@@ -3320,7 +3618,7 @@ class AgentLoop:
                     error_code="tool_scope_denied",
                 )
 
-    def _invoke_handler(
+    async def _ainvoke_handler(
         self,
         bound_tool: BoundTool,
         context: AgentToolContext,
@@ -3331,6 +3629,7 @@ class AgentLoop:
         recorder: AgentRecorder,
         started_event: AgentEvent,
         authorization: ToolAuthorization,
+        deadline: float | None,
     ) -> ToolResult:
         spec = bound_tool.base_spec
         context._current_call = CallContext(
@@ -3345,10 +3644,78 @@ class AgentLoop:
             runtime=bound_tool.runtime,
         )
         try:
-            result = spec.handler(context, arguments)
+            handler = spec.handler
+            async_call = inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(
+                getattr(handler, "__call__", None)
+            )
+            if async_call:
+                pending = handler(context, arguments)
+                result = await self._await_native_tool_handler(pending, deadline)
+            else:
+                result = await asyncio.to_thread(handler, context, arguments)
+                if inspect.isawaitable(result):
+                    result = await self._await_native_tool_handler(result, deadline)
+            if not isinstance(result, ToolResult):
+                raise TypeError("tool handler must return ToolResult")
         finally:
             context._current_call = CallContext("", None, None)
         return result
+
+    async def _await_native_tool_handler(
+        self,
+        pending: Awaitable[ToolResult],
+        deadline: float | None,
+    ) -> ToolResult:
+        """Await a native handler with run cancellation and deadline propagation."""
+
+        task = asyncio.ensure_future(pending)
+        loop = asyncio.get_running_loop()
+        cancelled: asyncio.Future[None] = loop.create_future()
+
+        def signal_cancelled() -> None:
+            def resolve() -> None:
+                if not cancelled.done():
+                    cancelled.set_result(None)
+
+            loop.call_soon_threadsafe(resolve)
+
+        remove_callback = (
+            self.cancellation_token.add_cancel_callback(signal_cancelled)
+            if self.cancellation_token is not None
+            else lambda: None
+        )
+        timeout = None if deadline is None else max(0.0, deadline - time.time())
+        try:
+            done, _pending = await asyncio.wait(
+                {task, cancelled},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            self._check_run_boundary(deadline)
+            if task in done:
+                try:
+                    return task.result()
+                except asyncio.CancelledError as exc:
+                    raise ToolExecutionError(
+                        "async tool handler was cancelled",
+                        error_code="tool_handler_cancelled",
+                    ) from exc
+            if cancelled in done:
+                raise RunCancelled("run cancelled")
+            raise RunTimeout("run exceeded max duration")
+        finally:
+            remove_callback()
+            if not cancelled.done():
+                cancelled.cancel()
+            if not task.done():
+                task.cancel()
+                done, _pending = await asyncio.wait(
+                    {task}, timeout=max(0.0, self.async_tool_cancel_grace_s)
+                )
+                if task not in done:
+                    task.add_done_callback(_consume_task_outcome)
+                else:
+                    _consume_task_outcome(task)
 
     def _finalize_tool_call(
         self,
@@ -3465,7 +3832,7 @@ class AgentLoop:
                 error_code="tool_approval_stale",
             )
 
-    def _execute_tool_call(
+    async def _aexecute_tool_call(
         self,
         *,
         call_name: str,
@@ -3480,6 +3847,7 @@ class AgentLoop:
         parent_id: str | None,
         step: int,
         side_effect_policy: ToolSideEffectPolicy,
+        deadline: float | None,
         approved_tool_approval: Mapping[str, Any] | None = None,
     ) -> ToolObservation:
         spec: ToolSpec | None = None
@@ -3595,7 +3963,7 @@ class AgentLoop:
                         outbox_count = (
                             len(self._outbox.export()) if side_effect_admission.requires_outbox else 0
                         )
-                        result = self._invoke_handler(
+                        result = await self._ainvoke_handler(
                             bound_tool,
                             context,
                             arguments,
@@ -3604,6 +3972,7 @@ class AgentLoop:
                             recorder=recorder,
                             started_event=started_event,
                             authorization=authorization,
+                            deadline=deadline,
                         )
                         if result.ok:
                             if side_effect_admission.requires_outbox:
@@ -3626,6 +3995,8 @@ class AgentLoop:
                                 turn_id,
                                 started_event.event_id,
                             )
+        except (RunCancelled, RunTimeout, TurnInterrupted):
+            raise
         except ToolExecutionError as exc:
             if started_event is None:
                 started_event = self._emit_tool_started(
@@ -3969,6 +4340,18 @@ class AgentLoop:
         # Run-level cancel (terminal) takes precedence over a turn-level interrupt (non-terminal).
         if self._interrupt_requested:
             raise TurnInterrupted("turn interrupted")
+
+    def _check_model_cancel_or_deadline(self, deadline: float | None) -> None:
+        """Check only terminal run boundaries while native model I/O is in flight.
+
+        Turn interrupt and pause keep their existing step-boundary behavior for non-streamed
+        adapters and are handled by ``_check_run_boundary`` after the model returns.
+        """
+
+        if self.cancellation_token is not None and self.cancellation_token.requested:
+            raise RunCancelled("run cancelled")
+        if deadline is not None and time.time() >= deadline:
+            raise RunTimeout("run exceeded max duration")
 
     def _emit_side_effect_event(
         self,
