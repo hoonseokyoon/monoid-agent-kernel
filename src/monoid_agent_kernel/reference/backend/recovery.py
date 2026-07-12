@@ -22,7 +22,11 @@ from monoid_agent_kernel.core.durable_metadata import (
     DurableMetadataCommitter,
     validate_recovery_metadata,
 )
-from monoid_agent_kernel.core.result import AgentRunResult, Suspension
+from monoid_agent_kernel.core.result import (
+    AgentRunResult,
+    Suspension,
+    suspension_from_checkpoint_payload,
+)
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference.backend.ports import (
     DriveOpenSessionPort,
@@ -209,15 +213,24 @@ class RecoveryService:
         record.seen_inbox_ids = set(checkpoint.inbox_seen_ids)
         for message in checkpoint.queued_messages:
             self._context.call_soon(record.message_queue.put_nowait, message)
-        self._context.spawn(self.run_recovered(run_id, request, loop))
+        restored_suspension = (
+            suspension_from_checkpoint_payload(checkpoint.last_suspension)
+            if checkpoint.last_suspension is not None
+            else Suspension(reason="settled", status="completed")
+        )
+        self._context.spawn(self.run_recovered(run_id, request, loop, restored_suspension))
 
-    async def run_recovered(self, run_id: str, request: RunRequestPort, loop: LoopPort) -> None:
+    async def run_recovered(
+        self,
+        run_id: str,
+        request: RunRequestPort,
+        loop: LoopPort,
+        suspension: Suspension,
+    ) -> None:
         await self._context.acquire_run_slot()
         try:
             if loop.has_pending_tasks():
                 suspension = Suspension(reason="awaiting_tasks", status="running", has_external=True)
-            else:
-                suspension = Suspension(reason="settled", status="completed")
             record = self._context.record(run_id)
             result = await self._context.drive_open_session(
                 record,
