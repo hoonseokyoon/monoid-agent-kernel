@@ -1510,14 +1510,16 @@ class StudioServer:
 
         failed_seq = int(latest.get("seq", -1))
         retry_id = f"studio_retry_{failed_seq}"
-        queued = self._backend.send_message(
-            run_id,
-            token,
-            "",
-            message_id=retry_id,
-            source="studio-retry",
-            metadata={"retry_of_event_seq": failed_seq},
-        )
+        retry_kwargs = {
+            "message_id": retry_id,
+            "source": "studio-retry",
+            "metadata": {"retry_of_event_seq": failed_seq},
+        }
+        try:
+            queued = self._backend.send_message(run_id, token, "", **retry_kwargs)
+        except KeyError:
+            self._backend.resume_run(run_id, token)
+            queued = self._backend.send_message(run_id, token, "", **retry_kwargs)
         queue_status = str(queued.get("status") or "")
         return {
             "run_id": run_id,

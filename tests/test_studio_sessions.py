@@ -119,6 +119,67 @@ def test_studio_retry_reissues_failed_by_value_request_without_duplicate_user_me
         server.shutdown()
 
 
+def test_studio_retry_recovers_a_parked_session_before_enqueue(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs")
+    )
+    run_id = "run_parked"
+    token = "run-token"
+    server._run_tokens[run_id] = token
+
+    class ParkedBackend:
+        def __init__(self) -> None:
+            self.resumed = False
+            self.send_calls: list[dict[str, object]] = []
+
+        def status(self, received_run_id: str, received_token: str) -> dict[str, object]:
+            assert (received_run_id, received_token) == (run_id, token)
+            return {"state": "awaiting_input", "terminal": False}
+
+        def events(self, received_run_id: str, received_token: str, *, from_seq: int) -> dict[str, object]:
+            assert (received_run_id, received_token, from_seq) == (run_id, token, 0)
+            return {
+                "events": [
+                    {"type": "turn.failed", "seq": 7, "data": {"retryable": False}},
+                ]
+            }
+
+        def resume_run(self, received_run_id: str, received_token: str) -> dict[str, object]:
+            assert (received_run_id, received_token) == (run_id, token)
+            self.resumed = True
+            return {"resumed": True, "state": "awaiting_input", "terminal": False}
+
+        def send_message(self, received_run_id: str, received_token: str, message: str, **kwargs):  # noqa: ANN001
+            assert (received_run_id, received_token, message) == (run_id, token, "")
+            self.send_calls.append(kwargs)
+            if not self.resumed:
+                raise KeyError(run_id)
+            return {"status": "queued"}
+
+    backend = ParkedBackend()
+    server._backend = backend  # type: ignore[assignment]
+
+    retried = server.retry_chat(run_id)
+
+    assert retried["retried"] is True
+    assert retried["retry_id"] == "studio_retry_7"
+    assert backend.resumed is True
+    assert backend.send_calls == [
+        {
+            "message_id": "studio_retry_7",
+            "source": "studio-retry",
+            "metadata": {"retry_of_event_seq": 7},
+        },
+        {
+            "message_id": "studio_retry_7",
+            "source": "studio-retry",
+            "metadata": {"retry_of_event_seq": 7},
+        },
+    ]
+
+
 def test_studio_resume_route_reports_an_already_live_session(studio: StudioServer) -> None:
     run_id = studio.start_chat("hello")["run_id"]
     assert _wait_settled(studio, run_id, 1)
