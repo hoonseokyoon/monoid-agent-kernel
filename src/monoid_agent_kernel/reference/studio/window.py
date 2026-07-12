@@ -51,8 +51,8 @@ def open_app_window(
     url: str,
     *,
     profile_dir: Path | None = None,
-    width: int = 1200,
-    height: int = 820,
+    width: int = 1440,
+    height: int = 900,
 ) -> subprocess.Popen | None:
     """Launch the UI in a chromeless app window. Returns the process handle, or ``None`` if
     no Chromium browser is installed (caller should fall back to a normal browser tab)."""

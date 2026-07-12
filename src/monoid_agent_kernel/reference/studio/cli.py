@@ -73,9 +73,15 @@ def run_acceptance(
         base_url = server.start()
         check("healthz", _http_json(f"{base_url}/healthz").get("ok") is True)
         index_html = _http_text(f"{base_url}/")
-        check("index-static-hooks", "data-testid=\"studio-shell\"" in index_html)
+        check(
+            "index-static-shell",
+            '<div id="app"></div>' in index_html and "/assets/" in index_html,
+        )
         settings_html = _http_text(f"{base_url}/settings")
-        check("settings-static-hooks", "data-testid=\"settings-popup\"" in settings_html)
+        check(
+            "settings-static-shell",
+            '<div id="app"></div>' in settings_html and "/assets/" in settings_html,
+        )
         cfg = _http_json(f"{base_url}/api/config")
         check("config-route", cfg.get("offline") is True and cfg.get("provider") == "offline")
         settings = _http_json(f"{base_url}/api/settings")
