@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "check": "svelte-check --tsconfig ./tsconfig.json --fail-on-warnings && node scripts/check-contrast.mjs",
+    "check": "svelte-check --tsconfig ./tsconfig.json --fail-on-warnings && node scripts/check-run-state.mjs && node scripts/check-contrast.mjs",
     "preview": "vite preview"
   },
   "devDependencies": {

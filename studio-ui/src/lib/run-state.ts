@@ -194,8 +194,42 @@ export function reduceRunEvent(state: RunViewState, event: RunEvent): RunViewSta
         return { ...next, status: "failed", manualRetryReady: true, errorRetryable: true };
       }
       return { ...next, status: "idle" };
-    case "run.finished":
-      return { ...next, status: "succeeded", activeResponse: "", manualRetryCandidate: false, manualRetryReady: false, errorRetryable: false };
+    case "run.finished": {
+      const terminalStatus = String(data.status ?? "completed").toLowerCase();
+      const succeeded = ["completed", "succeeded", "success", "ok"].includes(terminalStatus);
+      if (succeeded) {
+        return {
+          ...next,
+          status: "succeeded",
+          activeResponse: "",
+          reasoning: "",
+          error: null,
+          manualRetryCandidate: false,
+          manualRetryReady: false,
+          errorRetryable: false,
+        };
+      }
+      const hadError = Boolean(next.error);
+      const content = String(
+        data.error
+        || next.error
+        || data.error_code
+        || `Run finished with status ${terminalStatus}.`,
+      );
+      return {
+        ...next,
+        status: "failed",
+        activeResponse: "",
+        reasoning: "",
+        error: content,
+        errorRetryable: false,
+        manualRetryCandidate: false,
+        manualRetryReady: false,
+        messages: hadError || projectedByTranscript
+          ? next.messages
+          : appendMessage(next, eventMessage(event, "error", content)),
+      };
+    }
     case "run.failed":
     case "ModelAdapterError": {
       const content = String(data.error ?? data.message ?? "The run failed.");
