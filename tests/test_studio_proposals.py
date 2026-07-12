@@ -21,6 +21,36 @@ from support.studio_harness import (
 pytestmark = pytest.mark.integration
 
 
+def test_proposal_returns_not_ready_without_reading_diff(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    run_dir = tmp_path / "runs" / "fresh"
+    run_dir.mkdir(parents=True)
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs")
+    )
+    server._run_tokens["fresh"] = "token"
+
+    class NotReadyBackend:
+        @staticmethod
+        def _authorized_run_dir(run_id: str, token: str) -> Path:
+            assert (run_id, token) == ("fresh", "token")
+            return run_dir
+
+        @staticmethod
+        def proposal(run_id: str, token: str) -> dict[str, object]:
+            assert (run_id, token) == ("fresh", "token")
+            return {"run_id": run_id, "ready": False, "state": "running"}
+
+        @staticmethod
+        def proposal_diff(run_id: str, token: str) -> dict[str, object]:
+            raise AssertionError(f"not-ready proposal requested its diff: {run_id=} {token=}")
+
+    server._backend = NotReadyBackend()  # type: ignore[assignment]
+
+    assert server.proposal("fresh") == {"run_id": "fresh", "ready": False, "state": "running"}
+
+
 def test_agent_write_is_staged_then_applied(tmp_path: Path) -> None:
     # The propose->apply loop: the agent writes a file (staged in the overlay, not on disk),
     # Studio surfaces it as a diff, and apply materializes it into the workspace.

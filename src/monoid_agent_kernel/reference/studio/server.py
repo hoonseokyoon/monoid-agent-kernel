@@ -1617,6 +1617,8 @@ class StudioServer:
         token = self._token_for(run_id)
         with proposal_snapshot_lock(self._run_dir_for(run_id)):
             payload = self._backend.proposal(run_id, token)
+            if not payload.get("ready"):
+                return payload
             proposal_hash = str(payload.get("proposal_hash") or "")
             diff_payload = self._backend.proposal_diff(run_id, token)
             diff = diff_payload.get("diff", "")
