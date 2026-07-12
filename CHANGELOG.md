@@ -7,6 +7,8 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-12
+
 ### Added
 
 - Rebuilt Agent Studio as a packaged Svelte 5, TypeScript, Vite, and Tailwind CSS application with
