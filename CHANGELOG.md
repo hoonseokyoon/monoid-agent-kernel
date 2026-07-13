@@ -7,7 +7,7 @@ out in commit messages and here.
 
 ## [Unreleased]
 
-## [0.19.0] - 2026-07-12
+## [0.19.0] - 2026-07-13
 
 ### Added
 
