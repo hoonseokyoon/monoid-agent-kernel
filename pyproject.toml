@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "monoid-agent-kernel"
-version = "0.18.0"
+version = "0.19.0"
 description = "Lightweight durable agent kernel for product integrations"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -96,8 +96,10 @@ exclude = ["**/DX_NOTES.md"]
 force-include = { "src/monoid_agent_kernel/py.typed" = "monoid_agent_kernel/py.typed", "src/native_agent_runner/py.typed" = "native_agent_runner/py.typed" }
 
 [tool.hatch.build.targets.sdist]
-# Keep internal journals and workspace-local release scratch data out of source distributions.
-exclude = ["**/DX_NOTES.md", "/.tmp"]
+# Keep internal journals, workspace-local release scratch data, and the Node-only Studio authoring
+# project out of source distributions. The compiled Studio assets live under the Python package and
+# remain available to wheel/sdist users without Node.js.
+exclude = ["**/DX_NOTES.md", "/.tmp", "/studio-ui"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

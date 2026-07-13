@@ -255,6 +255,79 @@ def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> No
     backend1.cancel_run(run_id, token)  # stop the defunct first-process worker
 
 
+def test_resume_run_restores_paused_boundary_after_restart(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+    reached_model = threading.Event()
+    release_model = threading.Event()
+
+    class _PauseBoundaryAdapter:
+        def __init__(self) -> None:
+            self.requests: list = []
+
+        def next_turn(self, request):  # noqa: ANN001
+            self.requests.append(request)
+            reached_model.set()
+            release_model.wait(timeout=10)
+            return ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "read1"),),
+            )
+
+    paused_adapter = _PauseBoundaryAdapter()
+    backend1 = RunnerBackend(
+        run_root=run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _spec, _token: paused_adapter,
+    )
+    backend1.idle_timeout_s = 30.0
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="pause before the second model step",
+            runtime_config=_default_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert reached_model.wait(10.0)
+    assert backend1.pause_run(run_id, token)["pause_requested"] is True
+    release_model.set()
+    assert eventually(lambda: backend1._record(run_id).state is SessionState.PAUSED)
+    stored = backend1.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.last_suspension is not None
+    assert stored.checkpoint.last_suspension["reason"] == "paused"
+
+    resumed: list = []
+    backend2 = _recoverable_backend(
+        run_root,
+        token_manager,
+        workspace,
+        resumed,
+        turns=[ModelTurn(response_id="r2", final_text="resumed after restart")],
+    )
+    backend2.idle_timeout_s = 30.0
+    backend2.max_recover_attempts = 10_000
+
+    assert backend2.resume_run(run_id, token)["resumed"] is True
+    assert eventually(lambda: backend2._record(run_id).state is SessionState.PAUSED)
+    assert backend2.signal_resume(run_id, token)["resumed"] is True
+    assert eventually(lambda: bool(resumed and resumed[0].requests))
+    assert eventually(lambda: backend2._record(run_id).state is SessionState.AWAITING_INPUT)
+    assert resumed[0].requests[0].previous_turn_handle == "r1"
+
+    backend2.cancel_run(run_id, token)
+    backend2.wait_for_run(run_id, timeout_s=20)
+    backend1.cancel_run(run_id, token)
+    backend1.wait_for_run(run_id, timeout_s=20)
+
+
 def test_resume_run_uses_latest_runtime_config_after_hotswap(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     run_root = tmp_path / "runs"

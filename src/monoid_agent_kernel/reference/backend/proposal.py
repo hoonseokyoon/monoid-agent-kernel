@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from monoid_agent_kernel.core.packages import (
 )
 from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.recorder import proposal_snapshot_lock
 from monoid_agent_kernel.reference.backend.ports import RunRecordPort
 from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
 from monoid_agent_kernel.reference.backend.run_state import (
@@ -44,7 +46,8 @@ class ProposalService:
     def proposal(self, run_id: str, token: str) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
-        payload = read_proposal_snapshot(record)
+        with proposal_snapshot_lock(record.run_dir):
+            payload = read_proposal_snapshot(record)
         if payload is None:
             return {
                 "run_id": record.run_id,
@@ -65,23 +68,31 @@ class ProposalService:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
         diff_path = record.run_dir / "diff.patch"
-        diff = diff_path.read_text(encoding="utf-8") if diff_path.exists() else ""
-        return {"run_id": run_id, "ready": diff_path.exists(), "diff": diff}
+        with proposal_snapshot_lock(record.run_dir):
+            ready = diff_path.exists()
+            data = diff_path.read_bytes() if ready else b""
+        return {
+            "run_id": run_id,
+            "ready": ready,
+            "diff": data.decode("utf-8"),
+            "diff_sha256": hashlib.sha256(data).hexdigest(),
+        }
 
     def proposal_file(self, run_id: str, token: str, path: str) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
-        proposal = read_proposal_snapshot(record)
-        if proposal is None:
-            raise ValueError("proposal snapshot is not ready")
-        try:
-            file_payload = read_proposal_file_payload(record.run_dir, proposal, path)
-        except ProposalFileError as exc:
-            if exc.reason in {"not_found", "snapshot_missing"}:
-                raise KeyError(str(exc)) from exc
-            if exc.reason == "escapes_run_dir":
-                raise PermissionDenied(str(exc)) from exc
-            raise ValueError(str(exc)) from exc
+        with proposal_snapshot_lock(record.run_dir):
+            proposal = read_proposal_snapshot(record)
+            if proposal is None:
+                raise ValueError("proposal snapshot is not ready")
+            try:
+                file_payload = read_proposal_file_payload(record.run_dir, proposal, path)
+            except ProposalFileError as exc:
+                if exc.reason in {"not_found", "snapshot_missing"}:
+                    raise KeyError(str(exc)) from exc
+                if exc.reason == "escapes_run_dir":
+                    raise PermissionDenied(str(exc)) from exc
+                raise ValueError(str(exc)) from exc
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
@@ -93,8 +104,9 @@ class ProposalService:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
         output = record.run_dir / "proposal.tar"
-        payload = export_package(record.run_dir, output)
-        tar_bytes = output.read_bytes()
+        with proposal_snapshot_lock(record.run_dir):
+            payload = export_package(record.run_dir, output)
+            tar_bytes = output.read_bytes()
         checkpoint_store = self._checkpoint_store()
         digest = checkpoint_store.put_blob(run_id, tar_bytes)
         self._context.emit_backend_event(
@@ -141,13 +153,14 @@ class ProposalService:
     ) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
-        approval = create_approval(
-            record.run_dir,
-            approver_id=approver_id,
-            approved_paths=approved_paths or None,
-            note=note,
-        )
-        write_approval(record.run_dir / "approval.json", approval)
+        with proposal_snapshot_lock(record.run_dir):
+            approval = create_approval(
+                record.run_dir,
+                approver_id=approver_id,
+                approved_paths=approved_paths or None,
+                note=note,
+            )
+            write_approval(record.run_dir / "approval.json", approval)
         self._context.emit_backend_event(
             run_id,
             "proposal.approved",
@@ -165,13 +178,14 @@ class ProposalService:
     ) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
-        approval = create_approval(
-            record.run_dir,
-            approver_id=approver_id,
-            decision="rejected",
-            note=reason,
-        )
-        write_approval(record.run_dir / "approval.json", approval)
+        with proposal_snapshot_lock(record.run_dir):
+            approval = create_approval(
+                record.run_dir,
+                approver_id=approver_id,
+                decision="rejected",
+                note=reason,
+            )
+            write_approval(record.run_dir / "approval.json", approval)
         self._context.emit_backend_event(
             run_id,
             "proposal.rejected",
@@ -197,8 +211,9 @@ class ProposalService:
             raise PermissionDenied(f"apply target is outside allowed roots: {target}")
         record = self._context.record(run_id)
         approval = approval_path or (record.run_dir / "approval.json")
-        result = apply_package(record.run_dir, approval=approval, target=target, dry_run=dry_run)
-        write_apply_result(record.run_dir / "apply-result.json", result)
+        with proposal_snapshot_lock(record.run_dir):
+            result = apply_package(record.run_dir, approval=approval, target=target, dry_run=dry_run)
+            write_apply_result(record.run_dir / "apply-result.json", result)
         event_type = "proposal.conflict" if result.status == "conflict" else "proposal.applied"
         self._context.emit_backend_event(
             run_id,

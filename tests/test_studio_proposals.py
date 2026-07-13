@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+from urllib.error import HTTPError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
 from support.studio_harness import (
     FakeModelAdapter,
     ModelTurn,
@@ -15,6 +20,36 @@ from support.studio_harness import (
 )
 
 pytestmark = pytest.mark.integration
+
+
+def test_proposal_returns_not_ready_without_reading_diff(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    run_dir = tmp_path / "runs" / "fresh"
+    run_dir.mkdir(parents=True)
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs")
+    )
+    server._run_tokens["fresh"] = "token"
+
+    class NotReadyBackend:
+        @staticmethod
+        def _authorized_run_dir(run_id: str, token: str) -> Path:
+            assert (run_id, token) == ("fresh", "token")
+            return run_dir
+
+        @staticmethod
+        def proposal(run_id: str, token: str) -> dict[str, object]:
+            assert (run_id, token) == ("fresh", "token")
+            return {"run_id": run_id, "ready": False, "state": "running"}
+
+        @staticmethod
+        def proposal_diff(run_id: str, token: str) -> dict[str, object]:
+            raise AssertionError(f"not-ready proposal requested its diff: {run_id=} {token=}")
+
+    server._backend = NotReadyBackend()  # type: ignore[assignment]
+
+    assert server.proposal("fresh") == {"run_id": "fresh", "ready": False, "state": "running"}
 
 
 def test_agent_write_is_staged_then_applied(tmp_path: Path) -> None:
@@ -46,8 +81,59 @@ def test_agent_write_is_staged_then_applied(tmp_path: Path) -> None:
         assert "OUT.md" in proposal["diff"]
         assert "hello" in proposal["diff"]
 
+        # A diff and proposal.json from different revisions are never presented as one review.
+        diff_path = server._run_dir_for(run_id) / "diff.patch"
+        original_diff = diff_path.read_bytes()
+        diff_path.write_bytes(original_diff + b"\n# stale mixed revision\n")
+        with pytest.raises(NativeAgentError) as mismatch:
+            server.proposal(run_id)
+        assert mismatch.value.error_code == "proposal_diff_mismatch"
+        diff_path.write_bytes(original_diff)
+
+        # The browser route fails closed: an empty selection never means "approve everything".
+        empty_apply = Request(
+            f"{server.base_url}/api/apply",
+            data=json.dumps(
+                {
+                    "run_id": run_id,
+                    "approved_paths": [],
+                    "expected_proposal_hash": proposal["proposal_hash"],
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as empty_error:
+            urlopen(empty_apply, timeout=5)
+        assert empty_error.value.code == 400
+        assert json.loads(empty_error.value.read())["error_code"] == "approved_paths_required"
+        assert not target.exists()
+
+        # The reviewed proposal hash is an optimistic-concurrency boundary for apply.
+        stale_apply = Request(
+            f"{server.base_url}/api/apply",
+            data=json.dumps(
+                {
+                    "run_id": run_id,
+                    "approved_paths": ["OUT.md"],
+                    "expected_proposal_hash": "f" * 64,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as stale_error:
+            urlopen(stale_apply, timeout=5)
+        assert stale_error.value.code == 400
+        assert json.loads(stale_error.value.read())["error_code"] == "proposal_revision_mismatch"
+        assert not target.exists()
+
         # Approve & apply -> the file lands in the workspace.
-        result = server.apply(run_id)
+        result = server.apply(
+            run_id,
+            approved_paths=("OUT.md",),
+            expected_proposal_hash=proposal["proposal_hash"],
+        )
         assert result["status"] != "conflict"
         assert "OUT.md" in str(result.get("applied_paths"))
         assert target.exists()
@@ -81,9 +167,13 @@ def test_partial_approval_applies_only_selected_paths(tmp_path: Path) -> None:
     try:
         run_id = server.start_chat("stage two files")["run_id"]
         _wait_settled(server, run_id, 1)
-        _wait_proposal(server, run_id)
+        proposal = _wait_proposal(server, run_id)
 
-        result = server.apply(run_id, approved_paths=("KEEP.md",))
+        result = server.apply(
+            run_id,
+            approved_paths=("KEEP.md",),
+            expected_proposal_hash=proposal["proposal_hash"],
+        )
         assert result["status"] != "conflict"
         assert "KEEP.md" in str(result.get("applied_paths"))
         assert "DROP.md" in str(result.get("skipped_paths"))
@@ -115,9 +205,14 @@ def test_export_package_returns_digest_receipt_fetched_as_bytes(tmp_path: Path) 
     try:
         run_id = server.start_chat("write OUT.md")["run_id"]
         _wait_settled(server, run_id, 1)
-        _wait_proposal(server, run_id)
+        proposal = _wait_proposal(server, run_id)
 
-        receipt = server.export_package(run_id)
+        with pytest.raises(NativeAgentError, match="proposal changed"):
+            server.export_package(run_id, expected_proposal_hash="f" * 64)
+        receipt = server.export_package(
+            run_id,
+            expected_proposal_hash=proposal["proposal_hash"],
+        )
         # The receipt is a handle, not a path — no run_dir path leaks across the boundary.
         assert "package_path" not in receipt
         assert len(receipt["digest"]) == 64
@@ -181,6 +276,11 @@ def test_continue_chat_resumes_a_parked_session_after_restart(tmp_path: Path) ->
         assert backend.checkpoint_store.latest(run_id) is not None
         with backend._lock:
             backend._records.pop(run_id)
+
+        resumed = server.resume_chat(run_id)
+        assert resumed["resumed"] is True
+        assert resumed["recovery_resumed"] is True
+        assert resumed["resume_kind"] == "checkpoint"
 
         result = server.continue_chat(run_id, "again")
         assert result["status"] == "queued"
@@ -311,10 +411,39 @@ def test_proposal_panel_previews_proposed_image(tmp_path: Path) -> None:
 
         # Not on disk yet (propose mode) — but previewable straight from the proposal snapshot.
         assert not (workspace / "chart.svg").exists()
-        data, mime = server.proposal_image(run_id, "chart.svg")
+        data, mime = server.proposal_image(
+            run_id,
+            "chart.svg",
+            expected_proposal_hash=proposal["proposal_hash"],
+        )
         assert mime == "image/svg+xml" and data.decode("utf-8") == svg
 
+        preview_url = f"{server.base_url}/api/proposal-file-raw?" + urlencode(
+            {
+                "run_id": run_id,
+                "path": "chart.svg",
+                "expected_proposal_hash": proposal["proposal_hash"],
+            }
+        )
+        with urlopen(preview_url, timeout=5) as response:
+            assert response.read().decode("utf-8") == svg
+            assert response.headers["Content-Type"] == "image/svg+xml"
+            assert response.headers["Cache-Control"] == "no-store"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+        with pytest.raises(NativeAgentError) as stale:
+            server.proposal_image(
+                run_id,
+                "chart.svg",
+                expected_proposal_hash="f" * 64,
+            )
+        assert stale.value.error_code == "proposal_revision_mismatch"
+
         with pytest.raises(NativeAgentError):
-            server.proposal_image(run_id, "notes.txt")  # non-image refused
+            server.proposal_image(
+                run_id,
+                "notes.txt",
+                expected_proposal_hash=proposal["proposal_hash"],
+            )  # non-image refused
     finally:
         server.shutdown()

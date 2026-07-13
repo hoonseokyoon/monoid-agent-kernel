@@ -6,6 +6,28 @@ on:
   pull_request:
 
 jobs:
+  studio-ui:
+    name: Studio UI build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: studio-ui/package-lock.json
+      - name: Install Studio UI dependencies
+        working-directory: studio-ui
+        run: npm ci
+      - name: Type and accessibility check
+        working-directory: studio-ui
+        run: npm run check
+      - name: Build packaged Studio UI
+        working-directory: studio-ui
+        run: npm run build
+      - name: Verify committed assets are current
+        run: git diff --exit-code -- src/monoid_agent_kernel/reference/studio/web/dist
+
   lint:
     runs-on: ubuntu-latest
     steps:

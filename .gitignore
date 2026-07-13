@@ -15,10 +15,17 @@ __pycache__/
 .eggs/
 build/
 dist/
+!src/monoid_agent_kernel/reference/studio/web/dist/
+!src/monoid_agent_kernel/reference/studio/web/dist/**
 .pytest_cache/
 .hypothesis/
 .mypy_cache/
 .ruff_cache/
+
+# Studio frontend build workspace
+node_modules/
+studio-ui/coverage/
+studio-ui/.vite/
 
 # Virtual environments
 .venv/

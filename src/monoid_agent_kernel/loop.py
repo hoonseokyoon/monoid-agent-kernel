@@ -3495,8 +3495,7 @@ class AgentLoop:
         turn_id: str | None = None,
         parent_id: str | None = None,
     ) -> None:
-        diff_text = context.workspace.diff_patch()
-        diff_path = recorder.write_diff(diff_text)
+        diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(context.workspace)
         recorder.emit(
             "workspace.diff.updated",
             turn_id=turn_id,
@@ -3504,10 +3503,12 @@ class AgentLoop:
             data={
                 "path": str(diff_path.relative_to(recorder.run_dir)),
                 "bytes": len(diff_text.encode("utf-8")),
-                "changed_paths": [public_path(path, self.permission_policy) for path in context.workspace.changed_paths()],
+                "changed_paths": [
+                    public_path(path, self.permission_policy)
+                    for path in context.workspace.changed_paths()
+                ],
             },
         )
-        proposal_payload = recorder.write_proposal_snapshot(context.workspace, diff_path)
         recorder.emit(
             "workspace.proposal.updated",
             turn_id=turn_id,
