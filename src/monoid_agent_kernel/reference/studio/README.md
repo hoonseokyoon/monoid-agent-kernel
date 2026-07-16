@@ -26,7 +26,8 @@ upfront pass/fail checklist with remediation.
 
 Studio's browser UI is a Svelte 5 + TypeScript application under `studio-ui/`. Tailwind CSS v4
 maps the semantic Studio tokens to utilities. Node.js is needed only when authoring or rebuilding
-the UI; released Python packages include the compiled assets.
+the UI; released Python packages include the compiled assets. Frontend development is pinned to
+Node.js 24.18.0 and npm 11.16.0 through the repository's `.nvmrc` and package metadata.
 
 ```bash
 # terminal 1: BFF and agent runtime
