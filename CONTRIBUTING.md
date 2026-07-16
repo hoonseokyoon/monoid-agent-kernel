@@ -15,13 +15,26 @@ issues, and design feedback are welcome.
 
 ## Development setup
 
-Requires Python 3.11+.
+Requires Python 3.11+. Frontend development uses the Node.js version pinned in
+`.nvmrc` and the npm version pinned in `studio-ui/package.json`.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 pip install ruff                                     # linter (configured in pyproject.toml)
 ```
+
+Activate the pinned Node.js version from the repository root before working on Studio UI:
+
+```bash
+nvm install
+nvm use
+node --version  # v24.18.0
+npm --version   # 11.16.0
+```
+
+With nvm-windows, run `nvm install 24.18.0` followed by `nvm use 24.18.0` from an
+elevated terminal.
 
 ## Before you open a PR
 
