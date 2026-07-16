@@ -7,6 +7,13 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-07-16
+
+### Changed
+
+- Pinned Studio frontend development and CI to Node.js 24.18.0 and npm 11.16.0, added
+  fail-fast developer engine checks, and documented POSIX nvm and nvm-windows setup.
+
 ## [0.19.0] - 2026-07-13
 
 ### Added
