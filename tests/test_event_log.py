@@ -7,8 +7,10 @@ import pytest
 
 import monoid_agent_kernel.core._event_log as event_log
 from monoid_agent_kernel.core._event_log import (
+    EventLogBoundaryError,
     EventLogChanged,
     EventLogCorruption,
+    inspect_open_committed_jsonl_tail,
     inspect_event_log_tail,
     iter_committed_event_records,
     iter_committed_jsonl_records,
@@ -57,10 +59,35 @@ def test_committed_record_iterator_requires_record_boundary(tmp_path) -> None:
     path = tmp_path / "events.jsonl"
     path.write_bytes(_record(1, text="private-value"))
 
-    with pytest.raises(EventLogCorruption, match="record boundary") as caught:
+    with pytest.raises(EventLogBoundaryError, match="record boundary") as caught:
         list(iter_committed_event_records(path, start_offset=3))
 
     assert "private-value" not in str(caught.value)
+
+
+def test_committed_record_iterator_stops_at_captured_end(tmp_path) -> None:
+    first = _record(1)
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(first)
+    captured_end = len(first)
+    with path.open("ab") as handle:
+        handle.write(_record(2))
+
+    records = list(iter_committed_event_records(path, end_offset=captured_end))
+
+    assert [record.seq for record in records] == [1]
+    assert records[-1].next_byte_offset == captured_end
+
+
+def test_committed_record_iterator_rejects_truncated_captured_end(tmp_path) -> None:
+    first = _record(1)
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(first + _record(2))
+    captured_end = path.stat().st_size
+    path.write_bytes(first)
+
+    with pytest.raises(EventLogChanged, match="end offset"):
+        list(iter_committed_event_records(path, end_offset=captured_end))
 
 
 def test_committed_record_iterator_skips_blank_lines(tmp_path) -> None:
@@ -150,6 +177,20 @@ def test_tail_inspection_reads_trailing_blank_bytes_once(tmp_path) -> None:
     assert tail.inspected_bytes <= len(record) + len(blanks) + 1
 
 
+def test_physical_tail_inspection_does_not_decode_final_record(tmp_path) -> None:
+    path = tmp_path / "events.jsonl"
+    invalid_record = b'{"seq":0}\n'
+    path.write_bytes(_record(1) + invalid_record)
+
+    with path.open("rb") as handle:
+        tail = inspect_open_committed_jsonl_tail(path, handle)
+
+    assert tail.committed_end == path.stat().st_size
+    assert tail.last_record_sha256 == hashlib.sha256(invalid_record).hexdigest()
+    with pytest.raises(EventLogCorruption, match="invalid sequence"):
+        inspect_event_log_tail(path)
+
+
 def test_repair_truncates_only_uncommitted_suffix(tmp_path) -> None:
     path = tmp_path / "events.jsonl"
     committed = _record(1) + b"\n"
@@ -160,6 +201,7 @@ def test_repair_truncates_only_uncommitted_suffix(tmp_path) -> None:
     assert tail.last_seq == 1
     assert tail.has_incomplete_tail is False
     assert path.read_bytes() == committed
+    assert tail.modified_ns == inspect_event_log_tail(path).modified_ns
 
 
 def test_repair_refuses_ahead_watermark_without_mutation(tmp_path) -> None:
