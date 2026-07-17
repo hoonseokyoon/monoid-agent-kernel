@@ -10,8 +10,8 @@ out in commit messages and here.
 ### Added
 
 - Added a Reference-private single-handle, snapshot-bounded event page reader with
-  content-verified byte-offset anchors and raw-read source-work metrics, preparing long-run index
-  lookup without changing Core cursor semantics or production readers.
+  monotonic-prefix and content-verified byte-offset anchors plus raw-read source-work metrics,
+  preparing long-run index lookup without changing Core cursor semantics or production readers.
 
 ### Fixed
 

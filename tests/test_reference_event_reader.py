@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,11 +13,11 @@ from monoid_agent_kernel.core._event_log import (
     EventLogChanged,
     EventLogCorruption,
     inspect_event_log_tail,
-    iter_committed_event_records,
 )
 from monoid_agent_kernel.core.event_sequencing import read_event_page
 from monoid_agent_kernel.reference.event_reader import (
     EventReadAnchor,
+    iter_verified_event_read_anchors,
     read_event_page_from_anchor,
 )
 
@@ -26,6 +27,10 @@ def _record(seq: int, *, text: str = "") -> bytes:
         json.dumps({"seq": seq, "type": "run.started", "data": {"text": text}}, ensure_ascii=False)
         + "\n"
     ).encode()
+
+
+def _anchor_for(path: Path, seq: int) -> EventReadAnchor:
+    return next(anchor for anchor in iter_verified_event_read_anchors(path) if anchor.seq == seq)
 
 
 @pytest.mark.parametrize(
@@ -96,7 +101,7 @@ def test_finite_page_does_not_decode_committed_tail_beyond_core_lookahead(
     path.write_bytes(first + _record(2) + invalid_tail)
     anchor = None
     if anchored:
-        anchor = EventReadAnchor.from_record(next(iter_committed_event_records(path)))
+        anchor = _anchor_for(path, 1)
 
     observed = read_event_page_from_anchor(
         path,
@@ -121,10 +126,7 @@ def test_static_malformed_lookahead_remains_authoritative_corruption(tmp_path: P
 def test_verified_anchor_skips_prefix_and_preserves_page_results(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     path.write_bytes(b"".join(_record(seq, text=f"value-{seq}") for seq in range(1, 101)))
-    anchor_record = next(
-        record for record in iter_committed_event_records(path) if record.seq == 91
-    )
-    anchor = EventReadAnchor.from_record(anchor_record)
+    anchor = _anchor_for(path, 91)
 
     observed = read_event_page_from_anchor(path, from_seq=93, limit=3, anchor=anchor)
 
@@ -135,33 +137,132 @@ def test_verified_anchor_skips_prefix_and_preserves_page_results(tmp_path: Path)
     assert observed.source_bytes_read < 2 * 64 * 1024
 
 
-@pytest.mark.parametrize(
-    "field",
-    ["seq", "byte_offset", "next_byte_offset", "record_sha256"],
-)
-def test_anchor_content_mismatch_fails_closed(tmp_path: Path, field: str) -> None:
+def test_anchor_content_mismatch_fails_closed(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
-    path.write_bytes(_record(1) + _record(2))
-    record = next(iter_committed_event_records(path))
-    values = {
-        "seq": record.seq,
-        "byte_offset": record.byte_offset,
-        "next_byte_offset": record.next_byte_offset,
-        "record_sha256": record.record_sha256,
-    }
-    values[field] = (
-        2
-        if field == "seq"
-        else record.byte_offset + 1
-        if field == "byte_offset"
-        else record.next_byte_offset + 1
-        if field == "next_byte_offset"
-        else hashlib.sha256(b"different").hexdigest()
-    )
-    anchor = EventReadAnchor(**values)
+    path.write_bytes(_record(1, text="aaaa") + _record(2))
+    anchor = _anchor_for(path, 1)
+    path.write_bytes(_record(1, text="bbbb") + _record(2))
 
     with pytest.raises(EventLogChanged):
+        read_event_page_from_anchor(path, from_seq=1, limit=1, anchor=anchor)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("seq", 2),
+        ("byte_offset", 1),
+        ("next_byte_offset", 999),
+        ("record_sha256", hashlib.sha256(b"different").hexdigest()),
+    ],
+)
+def test_anchor_proof_rejects_field_tampering(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_record(1) + _record(2))
+    anchor = replace(_anchor_for(path, 1), **{field: value})
+
+    with pytest.raises(ValueError, match="strictly increasing prefix"):
         read_event_page_from_anchor(path, from_seq=2, limit=1, anchor=anchor)
+
+
+def test_anchor_builder_rejects_nonmonotonic_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_record(5) + _record(1) + _record(6))
+    anchors = iter_verified_event_read_anchors(path)
+
+    assert next(anchors).seq == 5
+    with pytest.raises(EventLogCorruption, match="non-increasing event prefix"):
+        next(anchors)
+
+
+def test_verified_anchor_preserves_core_semantics_across_sequence_gaps(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_record(1) + _record(3) + _record(7))
+    anchor = _anchor_for(path, 3)
+
+    observed = read_event_page_from_anchor(path, from_seq=5, limit=1, anchor=anchor)
+
+    assert observed.to_page() == read_event_page(path, from_seq=5, limit=1)
+
+
+def test_verified_anchor_cannot_be_reused_for_another_log(tmp_path: Path) -> None:
+    source = tmp_path / "source.jsonl"
+    target = tmp_path / "target.jsonl"
+    source.write_bytes(_record(1) + _record(2))
+    target.write_bytes(_record(9) + _record(2))
+    anchor = _anchor_for(source, 2)
+
+    with pytest.raises(EventLogChanged, match="different log"):
+        read_event_page_from_anchor(target, from_seq=2, limit=None, anchor=anchor)
+
+
+def test_verified_anchor_rejects_same_source_rewrite(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_record(1) + _record(2))
+    anchor = _anchor_for(path, 2)
+    before = path.stat()
+    path.write_bytes(_record(9) + _record(2))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+    with pytest.raises(EventLogChanged, match="rewritten"):
+        read_event_page_from_anchor(path, from_seq=2, limit=None, anchor=anchor)
+
+
+def test_verified_anchor_allows_append_on_bound_source(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_record(1) + _record(2))
+    anchor = _anchor_for(path, 2)
+    with path.open("ab") as handle:
+        handle.write(_record(3))
+
+    observed = read_event_page_from_anchor(path, from_seq=2, limit=None, anchor=anchor)
+
+    assert observed.to_page() == read_event_page(path, from_seq=2, limit=None)
+
+
+def test_verified_anchor_allows_incomplete_tail_repair(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    committed = _record(1)
+    path.write_bytes(committed + b'{"seq":2')
+    anchor = _anchor_for(path, 1)
+    with path.open("r+b") as handle:
+        handle.truncate(len(committed))
+
+    observed = read_event_page_from_anchor(path, from_seq=1, limit=None, anchor=anchor)
+
+    assert observed.to_page() == read_event_page(path, from_seq=1, limit=None)
+
+
+def test_reconstructed_proof_cannot_register_a_forged_anchor(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    first = _record(1)
+    second = _record(2)
+    path.write_bytes(first + second)
+    anchor = _anchor_for(path, 1)
+    forged_identity = (
+        2,
+        len(first),
+        len(first) + len(second),
+        hashlib.sha256(second).hexdigest(),
+    )
+    forged = replace(
+        anchor,
+        seq=forged_identity[0],
+        byte_offset=forged_identity[1],
+        next_byte_offset=forged_identity[2],
+        record_sha256=forged_identity[3],
+        _prefix_proof=replace(
+            anchor._prefix_proof,
+            anchor_identity=forged_identity,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="strictly increasing prefix"):
+        read_event_page_from_anchor(path, from_seq=2, limit=None, anchor=forged)
 
 
 @pytest.mark.parametrize(
@@ -182,14 +283,7 @@ def test_anchor_validation_rejects_untrusted_index_types(
     path = tmp_path / "events.jsonl"
     record_bytes = _record(1)
     path.write_bytes(record_bytes)
-    values = {
-        "seq": 1,
-        "byte_offset": 0,
-        "next_byte_offset": len(record_bytes),
-        "record_sha256": hashlib.sha256(record_bytes).hexdigest(),
-    }
-    values[field] = value
-    anchor = EventReadAnchor(**values)
+    anchor = replace(_anchor_for(path, 1), **{field: value})
 
     with pytest.raises(ValueError):
         read_event_page_from_anchor(path, from_seq=1, limit=1, anchor=anchor)
@@ -514,14 +608,7 @@ def test_near_tail_source_work_is_independent_of_retained_history(tmp_path: Path
         records = [_record(seq, text="fixed-width") for seq in range(1, count + 1)]
         path.write_bytes(b"".join(records))
         target_seq = count - 4
-        target_offset = sum(len(record) for record in records[: target_seq - 1])
-        target_raw = records[target_seq - 1]
-        anchor = EventReadAnchor(
-            seq=target_seq,
-            byte_offset=target_offset,
-            next_byte_offset=target_offset + len(target_raw),
-            record_sha256=hashlib.sha256(target_raw).hexdigest(),
-        )
+        anchor = _anchor_for(path, target_seq)
         page = read_event_page_from_anchor(
             path,
             from_seq=target_seq,

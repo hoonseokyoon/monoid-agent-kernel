@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import io
 import os
-from dataclasses import dataclass
+from collections.abc import Generator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, cast
+from weakref import WeakValueDictionary
 
 from monoid_agent_kernel.core._event_log import (
     CommittedJsonlTail,
@@ -25,6 +27,17 @@ _SHA256_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 
 @dataclass(frozen=True)
+class _VerifiedPrefixProof:
+    anchor_identity: tuple[int, int, int, str]
+    source_path: str
+    source_device: int
+    source_inode: int
+    source_modified_ns: int
+    source_file_size: int
+    source_committed_end: int
+
+
+@dataclass(frozen=True)
 class EventReadAnchor:
     """A content-verified logical sequence to physical byte-offset hint."""
 
@@ -32,15 +45,10 @@ class EventReadAnchor:
     byte_offset: int
     next_byte_offset: int
     record_sha256: str
+    _prefix_proof: _VerifiedPrefixProof = field(repr=False, compare=False)
 
-    @classmethod
-    def from_record(cls, record: EventLogRecord) -> EventReadAnchor:
-        return cls(
-            seq=record.seq,
-            byte_offset=record.byte_offset,
-            next_byte_offset=record.next_byte_offset,
-            record_sha256=record.record_sha256,
-        )
+
+_VERIFIED_ANCHORS: WeakValueDictionary[int, EventReadAnchor] = WeakValueDictionary()
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,60 @@ class EventPageRead:
             "next_seq": self.next_seq,
             "has_more": self.has_more,
         }
+
+
+def iter_verified_event_read_anchors(
+    events_path: Path,
+) -> Generator[EventReadAnchor, None, None]:
+    """Yield anchors only after verifying a strict physical prefix from byte zero."""
+    try:
+        handle = events_path.open("rb")
+    except FileNotFoundError:
+        return
+
+    with handle:
+        source = inspect_open_committed_jsonl_tail(events_path, handle)
+        source_path = _normalized_source_path(events_path)
+        records = iter_open_committed_event_records(
+            events_path,
+            handle,
+            start_offset=0,
+            end_offset=source.committed_end,
+        )
+        previous_seq: int | None = None
+        try:
+            for record in records:
+                if previous_seq is not None and record.seq <= previous_seq:
+                    raise EventLogCorruption(
+                        f"cannot anchor a non-increasing event prefix: {events_path} "
+                        f"at byte {record.byte_offset}"
+                    )
+                previous_seq = record.seq
+                identity = (
+                    record.seq,
+                    record.byte_offset,
+                    record.next_byte_offset,
+                    record.record_sha256,
+                )
+                anchor = EventReadAnchor(
+                    seq=record.seq,
+                    byte_offset=record.byte_offset,
+                    next_byte_offset=record.next_byte_offset,
+                    record_sha256=record.record_sha256,
+                    _prefix_proof=_VerifiedPrefixProof(
+                        anchor_identity=identity,
+                        source_path=source_path,
+                        source_device=source.device,
+                        source_inode=source.inode,
+                        source_modified_ns=source.modified_ns,
+                        source_file_size=source.file_size,
+                        source_committed_end=source.committed_end,
+                    ),
+                )
+                _VERIFIED_ANCHORS[id(anchor)] = anchor
+                yield anchor
+        finally:
+            records.close()
 
 
 class _CountingRawReader(io.RawIOBase):
@@ -154,6 +216,8 @@ def _read_open_event_page(
     anchor: EventReadAnchor | None,
 ) -> EventPageRead:
     before = inspect_open_committed_jsonl_tail(events_path, handle)
+    if anchor is not None:
+        _verify_anchor_source(events_path, anchor, before)
     start_offset = anchor.byte_offset if anchor is not None else 0
     if start_offset > before.committed_end or (
         anchor is not None and anchor.next_byte_offset > before.committed_end
@@ -272,6 +336,49 @@ def _validate_request(
         or not set(anchor.record_sha256) <= _SHA256_HEX_DIGITS
     ):
         raise ValueError("anchor record_sha256 must be a SHA-256 hex digest")
+    expected_identity = (
+        anchor.seq,
+        anchor.byte_offset,
+        anchor.next_byte_offset,
+        anchor.record_sha256,
+    )
+    if (
+        _VERIFIED_ANCHORS.get(id(anchor)) is not anchor
+        or not isinstance(anchor._prefix_proof, _VerifiedPrefixProof)
+        or anchor._prefix_proof.anchor_identity != expected_identity
+    ):
+        raise ValueError("anchor must prove a contiguous strictly increasing prefix")
+
+
+def _verify_anchor_source(
+    events_path: Path,
+    anchor: EventReadAnchor,
+    current: CommittedJsonlTail,
+) -> None:
+    proof = anchor._prefix_proof
+    if (
+        proof.source_path != _normalized_source_path(events_path)
+        or (proof.source_device, proof.source_inode) != (current.device, current.inode)
+    ):
+        raise EventLogChanged(f"event read anchor belongs to a different log: {events_path}")
+    repaired_incomplete_tail = (
+        proof.source_file_size > proof.source_committed_end
+        and current.file_size == proof.source_committed_end
+        and current.committed_end == proof.source_committed_end
+    )
+    if current.file_size < proof.source_file_size and not repaired_incomplete_tail:
+        raise EventLogChanged(f"event read anchor source was truncated: {events_path}")
+    if current.committed_end < proof.source_committed_end:
+        raise EventLogChanged(f"event read anchor source lost committed records: {events_path}")
+    if (
+        current.file_size == proof.source_file_size
+        and current.modified_ns != proof.source_modified_ns
+    ):
+        raise EventLogChanged(f"event read anchor source was rewritten: {events_path}")
+
+
+def _normalized_source_path(events_path: Path) -> str:
+    return os.path.normcase(str(events_path.resolve()))
 
 
 def _is_exact_int(value: object) -> bool:
