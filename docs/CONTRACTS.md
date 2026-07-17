@@ -626,7 +626,8 @@ redrive.
 `from_seq` remains inclusive for backward compatibility. When `limit` is present, callers resume
 with `from_seq=next_seq` to avoid duplicates; omitting `limit` preserves the historical "return all
 events from N" behavior. `RunnerBackend.descendant_events(...)` uses the same pagination contract
-for subagent event streams authorized through an ancestor run token.
+for subagent event streams authorized through an ancestor run token. Stored event sequences are
+positive integers; `from_seq=0` remains the valid cursor for reading from before the first event.
 
 The physical JSONL commit marker is the terminating newline. Readers withhold any trailing bytes
 after the last newline, including an otherwise valid JSON object. Before a recorder or guarded

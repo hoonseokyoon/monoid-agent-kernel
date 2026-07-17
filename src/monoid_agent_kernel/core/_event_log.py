@@ -350,7 +350,7 @@ def _decode_event_record(path: Path, byte_offset: int, raw_record: bytes) -> dic
 
 def _event_sequence(path: Path, byte_offset: int, event: dict[str, Any]) -> int:
     seq = event.get("seq")
-    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
         raise EventLogCorruption(
             f"committed event log record has an invalid sequence: {path} at byte {byte_offset}"
         )

@@ -128,6 +128,20 @@ def test_direct_append_treats_valid_record_without_newline_as_uncommitted(tmp_pa
     assert [json.loads(line)["seq"] for line in events_path.read_text().splitlines()] == [1]
 
 
+def test_direct_append_rejects_zero_sequence_without_mutation(tmp_path) -> None:
+    run_dir = tmp_path / "runs" / "run_zero_sequence"
+    run_dir.mkdir(parents=True)
+    events_path = run_dir / "events.jsonl"
+    original = b'{"seq":0}\n'
+    events_path.write_bytes(original)
+
+    with pytest.raises(EventLogCorruption, match="invalid sequence"):
+        append_event_to_run(run_dir, "control.command.received")
+
+    assert events_path.read_bytes() == original
+    assert not (run_dir / "status.json").exists()
+
+
 @pytest.mark.parametrize("with_matching_status", [False, True])
 def test_direct_append_rejects_out_of_order_history(
     tmp_path,
@@ -270,6 +284,20 @@ def test_committed_malformed_tail_blocks_append_without_mutation(
 
     with pytest.raises(EventLogCorruption, match=message):
         append_event_to_run(run_dir, "control.command.received")
+
+    assert events_path.read_bytes() == original
+
+
+def test_recorder_reopen_rejects_zero_sequence_without_mutation(tmp_path) -> None:
+    run_root = tmp_path / "runs"
+    run_dir = run_root / "run_zero_sequence"
+    (run_dir / "artifacts").mkdir(parents=True)
+    events_path = run_dir / "events.jsonl"
+    original = b'{"seq":0}\n'
+    events_path.write_bytes(original)
+
+    with pytest.raises(EventLogCorruption, match="invalid sequence"):
+        AgentRecorder(run_root, "run_zero_sequence", reopen=True)
 
     assert events_path.read_bytes() == original
 

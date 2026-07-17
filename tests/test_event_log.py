@@ -97,6 +97,7 @@ def test_no_newline_fragment_is_uncommitted(tmp_path, fragment: bytes) -> None:
 @pytest.mark.parametrize(
     "committed_record, message",
     [
+        (b'{"seq": 0}\n', "invalid sequence"),
         (b'{"seq": "secret-marker"}\n', "invalid sequence"),
         (b'{"secret-marker"\n', "valid JSON"),
         (b"\xffsecret-marker\n", "valid UTF-8"),
