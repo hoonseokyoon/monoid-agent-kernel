@@ -4,11 +4,13 @@ import json
 import inspect
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from support.runtime import runtime_config, runtime_provider
 
-from monoid_agent_kernel.cli import main
+from monoid_agent_kernel.cli import _read_watch_batch, main
+from monoid_agent_kernel.core._event_log import EventLogChanged, inspect_event_log_tail
 from monoid_agent_kernel.core.events import EventBus
 from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
@@ -89,6 +91,30 @@ def test_jsonl_and_status_sinks_flush_and_update(tmp_path: Path) -> None:
     assert status["state"] == "completed"
     assert status["terminal"] is True
     assert status["last_event_type"] == "run.finished"
+
+
+def test_status_projection_withholds_uncommitted_terminal_event(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_partial_projection"
+    run_dir.mkdir()
+    events_path = run_dir / "events.jsonl"
+    started = {"seq": 1, "type": "run.started", "data": {}}
+    finished = {"seq": 2, "type": "run.finished", "data": {"status": "completed"}}
+    events_path.write_text(
+        json.dumps(started) + "\n" + json.dumps(finished),
+        encoding="utf-8",
+    )
+
+    before_commit = project_run_status(run_dir)
+    with events_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    after_commit = project_run_status(run_dir)
+
+    assert before_commit["state"] == "running"
+    assert before_commit["terminal"] is False
+    assert before_commit["last_event_seq"] == 1
+    assert after_commit["state"] == "completed"
+    assert after_commit["terminal"] is True
+    assert after_commit["last_event_seq"] == 2
 
 
 def test_emit_after_close_is_a_noop(tmp_path: Path) -> None:
@@ -496,6 +522,137 @@ def make_sink():
     assert status_payload["state"] == "completed"
     assert status_payload["terminal"] is True
     assert status_payload["last_event_type"] == "run.finished"
+
+
+def test_cli_watch_withholds_uncommitted_event_tail(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_watch_partial"
+    run_dir.mkdir()
+    events_path = run_dir / "events.jsonl"
+    committed = {"seq": 1, "type": "run.started"}
+    uncommitted = {"seq": 2, "type": "run.finished", "data": {"secret": "withheld"}}
+    events_path.write_text(
+        json.dumps(committed) + "\n" + json.dumps(uncommitted),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(main, ["watch", str(run_dir), "--from-start", "--json"])
+
+    assert result.exit_code == 0
+    assert [json.loads(line) for line in result.stdout.splitlines()] == [committed]
+    assert "withheld" not in result.stdout
+
+
+def test_cli_watch_follows_repaired_partial_tail_by_committed_offset(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    first = b'{"seq":1,"type":"run.started"}\n'
+    events_path.write_bytes(first + (b"x" * 1_000))
+    tail = inspect_event_log_tail(events_path)
+    identity = (tail.device, tail.inode)
+    offset = tail.committed_end
+
+    records, offset, drained = _read_watch_batch(events_path, offset, identity)
+    assert records == []
+    assert drained is True
+
+    second = b'{ "seq" : 2, "type":"run.finished", "text":"\\u2603" }\n'
+    events_path.write_bytes(first + second)
+    records, offset, drained = _read_watch_batch(events_path, offset, identity)
+    assert [record.raw_json for record in records] == [second.decode().removesuffix("\n")]
+    assert drained is True
+
+    third = b'{"seq":3,"type":"run.finished","padding":"' + (b"y" * 2_000) + b'"}\r\n'
+    with events_path.open("ab") as handle:
+        handle.write(third)
+    records, offset, drained = _read_watch_batch(events_path, offset, identity)
+    assert [record.raw_json for record in records] == [third.decode().removesuffix("\r\n")]
+    assert drained is True
+    assert _read_watch_batch(events_path, offset, identity)[0] == []
+
+
+def test_cli_watch_batches_large_history_without_skip_or_duplicate(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_bytes(
+        b"".join(f'{{"seq":{seq},"type":"run.started"}}\n'.encode() for seq in range(1, 1_001))
+    )
+    tail = inspect_event_log_tail(events_path)
+    identity = (tail.device, tail.inode)
+    offset = 0
+    seen: list[int] = []
+    drained = False
+
+    while not drained:
+        records, offset, drained = _read_watch_batch(events_path, offset, identity)
+        assert len(records) <= 256
+        seen.extend(record.seq for record in records)
+
+    assert seen == list(range(1, 1_001))
+    assert offset == tail.committed_end
+
+
+def test_cli_watch_follow_starts_at_committed_end_before_partial_tail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_dir = tmp_path / "run_watch_follow_partial"
+    run_dir.mkdir()
+    events_path = run_dir / "events.jsonl"
+    events_path.write_bytes(b"x" * 1_000)
+    replacement = b'{ "seq" : 1, "type":"run.started" }\n'
+    sleeps = 0
+
+    class StopWatch(Exception):
+        pass
+
+    def advance_then_stop(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 1:
+            events_path.write_bytes(replacement)
+            return
+        raise StopWatch
+
+    monkeypatch.setattr("monoid_agent_kernel.cli.time.sleep", advance_then_stop)
+
+    result = CliRunner().invoke(main, ["watch", str(run_dir), "--follow", "--json"])
+
+    assert isinstance(result.exception, StopWatch)
+    assert result.stdout.splitlines() == [replacement.decode().removesuffix("\n")]
+
+
+def test_cli_watch_fails_closed_on_committed_truncation(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_bytes(b'{"seq":1}\n{"seq":2}\n')
+    tail = inspect_event_log_tail(events_path)
+    identity = (tail.device, tail.inode)
+    offset = tail.committed_end
+    events_path.write_bytes(b'{"seq":1}\n')
+
+    with pytest.raises(EventLogChanged, match="truncated"):
+        _read_watch_batch(events_path, offset, identity)
+
+
+def test_cli_watch_fails_closed_on_file_replacement(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_bytes(b'{"seq":1}\n')
+    tail = inspect_event_log_tail(events_path)
+    identity = (tail.device, tail.inode)
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_bytes(b'{"seq":2}\n')
+    replacement.replace(events_path)
+
+    with pytest.raises(EventLogChanged, match="replaced"):
+        _read_watch_batch(events_path, tail.committed_end, identity)
+
+
+def test_cli_watch_reports_committed_corruption(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_watch_corrupt"
+    run_dir.mkdir()
+    (run_dir / "events.jsonl").write_bytes(b'{"seq":\n')
+
+    result = CliRunner().invoke(main, ["watch", str(run_dir), "--json"])
+
+    assert result.exit_code != 0
+    assert "committed event log record is not valid JSON" in result.output
 
 
 def test_cli_normal_mode_prints_run_identity_before_completion(tmp_path: Path, monkeypatch) -> None:

@@ -130,6 +130,28 @@ def test_chat_projection_backfills_legacy_title_and_events(tmp_path: Path) -> No
     assert body["messages"][0]["source"]["legacy"] is True
 
 
+def test_chat_projection_withholds_uncommitted_event_tail(tmp_path: Path) -> None:
+    event = {
+        "type": "turn.settled",
+        "event_id": "evt-partial",
+        "seq": 1,
+        "timestamp": "2026-07-08T00:00:00Z",
+        "data": {"final_text": "withheld answer"},
+    }
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(json.dumps(event), encoding="utf-8")
+    projection = ChatProjection(tmp_path)
+
+    before_commit = projection.catch_up("run-1")
+    assert not (tmp_path / "studio.chat.jsonl").exists()
+    with events_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    after_commit = projection.catch_up("run-1")
+
+    assert before_commit["messages"] == []
+    assert after_commit["messages"][0]["content"] == "withheld answer"
+
+
 def test_chat_projection_backfills_legacy_title_after_event_only_projection(tmp_path: Path) -> None:
     (tmp_path / "run.json").write_text(
         json.dumps({"title": "legacy prompt", "created_at": 10.0}),

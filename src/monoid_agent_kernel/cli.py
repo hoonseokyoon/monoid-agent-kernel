@@ -9,6 +9,13 @@ from typing import Any
 import click
 
 from monoid_agent_kernel._version import user_agent
+from monoid_agent_kernel.core._event_log import (
+    EventLogChanged,
+    EventLogCorruption,
+    EventLogRecord,
+    inspect_event_log_tail,
+    iter_committed_event_records,
+)
 from monoid_agent_kernel.core.agents import (
     AgentDefinition,
     AgentRuntimeConfig,
@@ -69,6 +76,9 @@ from monoid_agent_kernel.reference.web_gateway.providers import (
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.reference.studio.cli import studio as studio_group
 from monoid_agent_kernel.builder import builder_group
+
+_WATCH_BATCH_MAX_RECORDS = 256
+_WATCH_BATCH_MAX_BYTES = 1024 * 1024
 
 
 @click.group()
@@ -355,18 +365,60 @@ def watch(run_dir_or_id: str, run_root: Path, from_start: bool, follow: bool, js
     if not events_path.exists():
         raise click.ClickException(f"events.jsonl not found: {events_path}")
 
-    start_from_beginning = from_start or not follow
-    with events_path.open("r", encoding="utf-8") as handle:
-        if not start_from_beginning:
-            handle.seek(0, 2)
+    try:
+        initial_tail = inspect_event_log_tail(events_path)
+        source_identity = (initial_tail.device, initial_tail.inode)
+        offset = 0 if from_start or not follow else initial_tail.committed_end
         while True:
-            line = handle.readline()
-            if line:
-                click.echo(line.rstrip("\n") if json_output else _compact_event_line(line))
+            records, offset, drained = _read_watch_batch(events_path, offset, source_identity)
+            for record in records:
+                click.echo(record.raw_json if json_output else _compact_event_line(record.raw_json))
+            if not drained:
                 continue
             if not follow:
                 break
             time.sleep(0.25)
+    except EventLogCorruption as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _read_watch_batch(
+    events_path: Path,
+    offset: int,
+    source_identity: tuple[int, int],
+) -> tuple[list[EventLogRecord], int, bool]:
+    before = inspect_event_log_tail(events_path)
+    if not before.exists or (before.device, before.inode) != source_identity:
+        raise EventLogChanged(f"event log was replaced while watching: {events_path}")
+    if before.committed_end < offset:
+        raise EventLogChanged(f"event log was truncated while watching: {events_path}")
+
+    records: list[EventLogRecord] = []
+    batch_bytes = 0
+    drained = True
+    for record in iter_committed_event_records(events_path, start_offset=offset):
+        record_bytes = record.next_byte_offset - record.byte_offset
+        if records and (
+            len(records) >= _WATCH_BATCH_MAX_RECORDS
+            or batch_bytes + record_bytes > _WATCH_BATCH_MAX_BYTES
+        ):
+            drained = False
+            break
+        records.append(record)
+        batch_bytes += record_bytes
+
+    next_offset = offset
+    if records:
+        next_offset = records[-1].next_byte_offset
+    if drained:
+        next_offset = max(next_offset, before.committed_end)
+
+    after = inspect_event_log_tail(events_path)
+    if not after.exists or (after.device, after.inode) != source_identity:
+        raise EventLogChanged(f"event log was replaced while watching: {events_path}")
+    if after.committed_end < next_offset:
+        raise EventLogChanged(f"event log was truncated while watching: {events_path}")
+    return records, next_offset, drained
 
 
 @main.command("status")

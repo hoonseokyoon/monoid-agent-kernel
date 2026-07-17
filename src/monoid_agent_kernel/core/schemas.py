@@ -8,6 +8,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.identifiers import schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
@@ -969,8 +970,7 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
         _validate_canonical_hash(apply_result_path, "apply_hash", issues)
     events_path = run_dir / "events.jsonl"
     if events_path.exists():
-        _validate_jsonl_file(events_path, EVENT_SCHEMA, issues)
-        _validate_event_data(events_path, issues)
+        _validate_event_file(events_path, issues)
     transcript_path = run_dir / "transcript.jsonl"
     if transcript_path.exists():
         _validate_jsonl_file(transcript_path, TRANSCRIPT_RECORD_SCHEMA, issues)
@@ -1012,14 +1012,20 @@ def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[Valida
         _validate_object(payload, schema, issues, f"{path.name}:{index}")
 
 
-def _validate_event_data(path: Path, issues: list[ValidationIssue]) -> None:
-    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
+def _validate_event_file(path: Path, issues: list[ValidationIssue]) -> None:
+    for index, record in enumerate(iter_committed_jsonl_records(path), start=1):
+        if not record.raw_bytes.strip():
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # envelope pass already reported malformed lines
+            event = json.loads(record.raw_bytes.decode("utf-8"))
+        except UnicodeDecodeError:
+            issues.append(ValidationIssue(f"{path.name}:{index}", "invalid UTF-8"))
+            continue
+        except ValueError as exc:
+            message = exc.msg if isinstance(exc, json.JSONDecodeError) else "decoder limit exceeded"
+            issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {message}"))
+            continue
+        _validate_object(event, EVENT_SCHEMA, issues, f"{path.name}:{index}")
         if not isinstance(event, dict):
             continue
         event_type = event.get("type")

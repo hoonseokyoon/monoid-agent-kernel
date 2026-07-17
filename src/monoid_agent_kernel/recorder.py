@@ -11,7 +11,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
-from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes, write_json_atomic
+from monoid_agent_kernel.core._event_log import (
+    EventLogCorruption,
+    EventLogTail,
+    repair_event_log_tail_for_append,
+    validate_committed_event_sequence,
+)
+from monoid_agent_kernel.core._util import (
+    canonical_sha256,
+    read_text_resilient,
+    sha256_bytes,
+    write_json_atomic,
+)
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
 from monoid_agent_kernel.core.lifecycle import SessionState, session_state_from_run_status, session_state_value
 from monoid_agent_kernel.core.manifest import RunManifest
@@ -219,9 +230,14 @@ class AgentRecorder:
         self.run_dir = self.run_root / self.run_id
         self.artifacts_dir = self.run_dir / "artifacts"
         self.artifacts_dir.mkdir(parents=True, exist_ok=self.reopen)
-        self._transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
         events_path = self.run_dir / "events.jsonl"
-        initial_seq = _last_event_seq(events_path)
+        advertised_last_seq = _read_status_last_event_seq(self.run_dir)
+        tail = repair_event_log_tail_for_append(
+            events_path,
+            advertised_last_seq=advertised_last_seq,
+        )
+        initial_seq = _verified_event_sequence_seed(events_path, tail)
+        self._transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
         sinks: list[EventSink] = [JsonlEventSink(events_path)]
         if self.status_file:
             sinks.append(StatusJsonSink(self.run_dir / "status.json"))
@@ -381,9 +397,16 @@ def append_event_to_run(
     data: dict[str, Any] | None = None,
     level: str = "info",
 ) -> AgentEvent:
+    """Append through the queued or terminal sequence owner selected by the caller."""
     events_path = run_dir / "events.jsonl"
     run_id = _run_id_from_run_dir(run_dir)
-    seq = _last_event_seq(events_path) + 1
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    advertised_last_seq = _read_status_last_event_seq(run_dir)
+    tail = repair_event_log_tail_for_append(
+        events_path,
+        advertised_last_seq=advertised_last_seq,
+    )
+    seq = _verified_event_sequence_seed(events_path, tail) + 1
     event = make_agent_event(
         run_id=run_id,
         seq=seq,
@@ -391,7 +414,6 @@ def append_event_to_run(
         data=data,
         level=level,  # type: ignore[arg-type]
     )
-    events_path.parent.mkdir(parents=True, exist_ok=True)
     with events_path.open("a", encoding="utf-8") as handle:
         _write_jsonl(handle, event.to_json())
     _update_status_last_event(run_dir, event)
@@ -405,7 +427,7 @@ def _run_id_from_run_dir(run_dir: Path) -> str:
             status = json.loads(status_path.read_text(encoding="utf-8"))
             if isinstance(status, dict) and isinstance(status.get("run_id"), str):
                 return status["run_id"]
-        except json.JSONDecodeError:
+        except (OSError, ValueError):
             pass
     proposal_path = run_dir / "proposal.json"
     if proposal_path.exists():
@@ -413,25 +435,42 @@ def _run_id_from_run_dir(run_dir: Path) -> str:
             proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
             if isinstance(proposal, dict) and isinstance(proposal.get("run_id"), str):
                 return proposal["run_id"]
-        except json.JSONDecodeError:
+        except (OSError, ValueError):
             pass
     return run_dir.name
 
 
-def _last_event_seq(events_path: Path) -> int:
-    if not events_path.exists():
+def _read_status_last_event_seq(run_dir: Path) -> int | None:
+    try:
+        raw_status = read_text_resilient(run_dir / "status.json")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise EventLogCorruption("status event watermark cannot be verified") from exc
+    try:
+        status = json.loads(raw_status)
+    except ValueError as exc:
+        raise EventLogCorruption("status event watermark cannot be verified") from exc
+    if not isinstance(status, dict):
+        raise EventLogCorruption("status event watermark cannot be verified")
+    if "last_event_seq" not in status:
+        return None
+    value = status["last_event_seq"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise EventLogCorruption("status event watermark cannot be verified")
+    return value
+
+
+def _verified_event_sequence_seed(
+    events_path: Path,
+    tail: EventLogTail,
+) -> int:
+    if not tail.exists or tail.file_size == 0:
         return 0
-    last_seq = 0
-    for line in events_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            last_seq = max(last_seq, int(event.get("seq") or 0))
-    return last_seq
+    validated_last_seq = validate_committed_event_sequence(events_path)
+    if validated_last_seq != tail.last_seq:
+        raise EventLogCorruption("event log tail changed during sequence validation")
+    return validated_last_seq
 
 
 def _update_status_last_event(run_dir: Path, event: AgentEvent) -> None:

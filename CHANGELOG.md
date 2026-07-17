@@ -7,6 +7,12 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Treats newline-terminated event-log records as committed and repairs uncommitted crash fragments
+  before recorder or direct append, preventing malformed concatenation and sequence reuse during
+  restart. Committed records with invalid sequence fields now fail closed.
+
 ## [0.19.1] - 2026-07-16
 
 ### Changed
