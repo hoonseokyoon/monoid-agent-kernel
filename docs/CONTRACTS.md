@@ -639,6 +639,21 @@ terminal sequence-owner decision; it validates storage and does not elect anothe
 acts only as a contradiction guard. Writer restart continues to validate all committed sequences
 and fails on duplicate or decreasing physical values; the derived read index never seeds writers.
 
+The Reference package also provides an internal snapshot-bounded page-scan primitive that can
+begin at a content-verified `(seq, byte offset, next byte offset, record digest)` anchor. Tail
+capture, bounded scan, and tail-witness verification share one open file description, so pathname
+replacement cannot mix records from different files in one page. A concurrent append stays outside
+the captured committed prefix. The result reports decoded records, logical scan span, and raw bytes
+fetched by the Reference reader, including fixed-size buffer read-ahead, for deterministic scale
+tests.
+
+The run directory is a protected append-only trust boundary. Persistent anchors must derive from a
+contiguous prefix that was previously verified from byte zero; the anchor record and captured tail
+are verified again on every seek. Malicious same-inode prefix rewrites combined with suffix-size
+changes require a future writer-maintained generation seal or hash chain. This primitive remains
+unwired until the disposable persistent index is reviewed; Core subscriptions and the authoritative
+from-zero reader remain storage-neutral.
+
 `SequenceCursor` and `EventSubscription` turn that inclusive page API into a reusable next-sequence
 subscription. A cursor advances only after an event is presented, suppresses replayed sequences,
 and raises `EventSequenceGap` when a resumed stream skips required data. `RunnerBackend` exposes

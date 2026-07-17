@@ -7,6 +7,12 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added
+
+- Added a Reference-private single-handle, snapshot-bounded event page reader with
+  content-verified byte-offset anchors and raw-read source-work metrics, preparing long-run index
+  lookup without changing Core cursor semantics or production readers.
+
 ### Fixed
 
 - Treats newline-terminated event-log records as committed and repairs uncommitted crash fragments
