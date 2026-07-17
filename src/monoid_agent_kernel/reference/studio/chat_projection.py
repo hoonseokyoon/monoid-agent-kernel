@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from monoid_agent_kernel.core._event_log import iter_committed_event_records
+
 CHAT_SCHEMA_VERSION = "studio.chat.v1"
 CHAT_MESSAGE_SCHEMA_VERSION = "studio.chat.message.v1"
 CHAT_FILE_NAME = "studio.chat.jsonl"
@@ -37,6 +39,10 @@ def _write_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(dict(payload), sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def _read_committed_events(path: Path) -> list[dict[str, Any]]:
+    return [record.payload for record in iter_committed_event_records(path)]
 
 
 def _sorted_chat_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -178,7 +184,7 @@ class ChatProjection:
 
     def catch_up(self, run_id: str) -> dict[str, Any]:
         self.ensure_legacy_user_from_run_meta()
-        self.project_events(_read_jsonl(self.run_dir / "events.jsonl"))
+        self.project_events(_read_committed_events(self.run_dir / "events.jsonl"))
         return self.response(run_id)
 
     def _record_from_event(self, event: Mapping[str, Any]) -> dict[str, Any] | None:

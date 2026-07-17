@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from monoid_agent_kernel.core._event_log import iter_committed_event_records
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     session_state_from_run_status,
@@ -141,17 +142,7 @@ def _apply_event_projection(
 
 
 def _iter_events(path: Path) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            events.append(event)
-    return events
+    return [record.payload for record in iter_committed_event_records(path)]
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any]:

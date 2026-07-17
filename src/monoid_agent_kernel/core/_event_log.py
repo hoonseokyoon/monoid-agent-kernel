@@ -22,6 +22,16 @@ class EventLogChanged(EventLogCorruption):
 
 
 @dataclass(frozen=True)
+class CommittedJsonlRecord:
+    """One newline-committed physical JSONL record."""
+
+    byte_offset: int
+    next_byte_offset: int
+    raw_bytes: bytes
+    record_sha256: str
+
+
+@dataclass(frozen=True)
 class EventLogRecord:
     """One verified newline-committed JSONL record and its binary location."""
 
@@ -29,6 +39,7 @@ class EventLogRecord:
     next_byte_offset: int
     seq: int
     payload: dict[str, Any]
+    raw_json: str
     record_sha256: str
 
 
@@ -58,6 +69,30 @@ def iter_committed_event_records(
     start_offset: int = 0,
 ) -> Iterator[EventLogRecord]:
     """Yield newline-committed JSON object records from an exact byte boundary."""
+    for record in iter_committed_jsonl_records(path, start_offset=start_offset):
+        raw_record = record.raw_bytes
+        if not raw_record.strip():
+            continue
+        payload = _decode_event_record(path, record.byte_offset, raw_record)
+        raw_json = raw_record[:-1].decode("utf-8")
+        if raw_json.endswith("\r"):
+            raw_json = raw_json[:-1]
+        yield EventLogRecord(
+            byte_offset=record.byte_offset,
+            next_byte_offset=record.next_byte_offset,
+            seq=_event_sequence(path, record.byte_offset, payload),
+            payload=payload,
+            raw_json=raw_json,
+            record_sha256=record.record_sha256,
+        )
+
+
+def iter_committed_jsonl_records(
+    path: Path,
+    *,
+    start_offset: int = 0,
+) -> Iterator[CommittedJsonlRecord]:
+    """Yield raw physical records whose final byte is the JSONL commit marker."""
     if start_offset < 0:
         raise ValueError("start_offset must be non-negative")
     try:
@@ -81,14 +116,10 @@ def iter_committed_event_records(
             if not raw_record.endswith(b"\n"):
                 return
             next_byte_offset = handle.tell()
-            if not raw_record.strip():
-                continue
-            payload = _decode_event_record(path, byte_offset, raw_record)
-            yield EventLogRecord(
+            yield CommittedJsonlRecord(
                 byte_offset=byte_offset,
                 next_byte_offset=next_byte_offset,
-                seq=_event_sequence(path, byte_offset, payload),
-                payload=payload,
+                raw_bytes=raw_record,
                 record_sha256=hashlib.sha256(raw_record).hexdigest(),
             )
 

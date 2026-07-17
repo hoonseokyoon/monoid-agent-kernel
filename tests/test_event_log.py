@@ -11,9 +11,11 @@ from monoid_agent_kernel.core._event_log import (
     EventLogCorruption,
     inspect_event_log_tail,
     iter_committed_event_records,
+    iter_committed_jsonl_records,
     repair_event_log_tail_for_append,
     validate_committed_event_sequence,
 )
+from monoid_agent_kernel.core.schemas import validate_run_dir
 
 
 def _record(seq: int, *, text: str = "") -> bytes:
@@ -48,6 +50,7 @@ def test_committed_records_report_binary_offsets_for_crlf(tmp_path) -> None:
     assert records[0].byte_offset == len(first)
     assert records[0].next_byte_offset == len(first) + len(second)
     assert records[0].seq == 2
+    assert records[0].raw_json == second.decode().removesuffix("\r\n")
 
 
 def test_committed_record_iterator_requires_record_boundary(tmp_path) -> None:
@@ -65,6 +68,15 @@ def test_committed_record_iterator_skips_blank_lines(tmp_path) -> None:
     path.write_bytes(b"\n \t\r\n" + _record(3))
 
     assert [item.seq for item in iter_committed_event_records(path)] == [3]
+
+
+def test_raw_committed_iterator_preserves_blank_records(tmp_path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b"\n" + _record(1) + b"partial")
+
+    records = list(iter_committed_jsonl_records(path))
+
+    assert [record.raw_bytes for record in records] == [b"\n", _record(1)]
 
 
 @pytest.mark.parametrize("fragment", [b'{"seq":2}', b'{"seq":'])
@@ -205,3 +217,20 @@ def test_sequence_validation_rejects_nonincreasing_committed_records(
 
     with pytest.raises(EventLogCorruption, match="sequence is not increasing"):
         validate_committed_event_sequence(path)
+
+
+@pytest.mark.parametrize("fragment", [b'{"seq":1,"type":"unknown"}', b'{"seq":'])
+def test_run_dir_validation_ignores_uncommitted_event_fragment(
+    tmp_path,
+    fragment: bytes,
+) -> None:
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_bytes(fragment)
+
+    before_commit = validate_run_dir(tmp_path)
+    with events_path.open("ab") as handle:
+        handle.write(b"\n")
+    after_commit = validate_run_dir(tmp_path)
+
+    assert not any(issue.path.startswith("events.jsonl") for issue in before_commit)
+    assert any(issue.path.startswith("events.jsonl") for issue in after_commit)
