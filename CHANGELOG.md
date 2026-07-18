@@ -15,6 +15,8 @@ out in commit messages and here.
 - Added a Reference-private process-local sparse offset index that retains verified anchors,
   stages bounded candidates during successful page scans, performs logarithmic warm lookup, and
   rebuilds safely after source invalidation or process restart.
+- Bounded the sparse index's retained source slots with a pinned least-recently-used policy and
+  an authoritative uncached fallback for saturated admission, plus cache-capacity metrics.
 
 ### Fixed
 
