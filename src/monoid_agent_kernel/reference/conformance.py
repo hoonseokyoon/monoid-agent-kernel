@@ -11,6 +11,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from monoid_agent_kernel._version import package_version
+from monoid_agent_kernel.conformance.harness import MinimalAgentEvidenceCapture
+from monoid_agent_kernel.conformance.provenance import (
+    ConformanceEvent,
+    ConformanceEvidenceBundle,
+    ConformanceTarget,
+    case_id_sha256,
+)
 from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     PromptSpec,
@@ -46,6 +54,9 @@ from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 PARENT_MARK = "[[ROLE=PARENT]]"
 CHILD_MARK = "[[ROLE=CHILD]]"
+_MINIMAL_EVIDENCE_PAGE_SIZE = 256
+_MINIMAL_EVIDENCE_MAX_PAGES = 4096
+_MINIMAL_EVIDENCE_MAX_EVENTS = 100_000
 
 __all__ = [
     "ReferenceBackendHarness",
@@ -54,6 +65,84 @@ __all__ = [
     "ReferenceGatewayHarness",
     "create_minimal_harness",
 ]
+
+
+def _collect_complete_minimal_events(
+    *,
+    read_page: Callable[[int, int], dict[str, Any]],
+    read_status: Callable[[], dict[str, Any]],
+    page_size: int = _MINIMAL_EVIDENCE_PAGE_SIZE,
+    max_pages: int = _MINIMAL_EVIDENCE_MAX_PAGES,
+    max_events: int = _MINIMAL_EVIDENCE_MAX_EVENTS,
+) -> tuple[tuple[ConformanceEvent, ...], int]:
+    """Collect a terminal event snapshot while discarding event payloads immediately."""
+
+    if type(page_size) is not int or page_size <= 0:
+        raise ValueError("minimal evidence page size must be a positive integer")
+    if type(max_pages) is not int or max_pages <= 0:
+        raise ValueError("minimal evidence max pages must be a positive integer")
+    if type(max_events) is not int or max_events < 0:
+        raise ValueError("minimal evidence max events must be a non-negative integer")
+    cursor = 0
+    events: list[ConformanceEvent] = []
+    for _ in range(max_pages):
+        page = read_page(cursor, page_size)
+        if not isinstance(page, dict):
+            raise TypeError("minimal evidence event page must be an object")
+        raw_events = page.get("events")
+        if not isinstance(raw_events, list):
+            raise TypeError("minimal evidence events must be a list")
+        if len(raw_events) > page_size:
+            raise ValueError("minimal evidence page exceeds its requested limit")
+        page_events: list[ConformanceEvent] = []
+        for raw_event in raw_events:
+            if not isinstance(raw_event, dict):
+                raise TypeError("minimal evidence event must be an object")
+            seq = raw_event.get("seq")
+            event_type = raw_event.get("type")
+            if type(seq) is not int or not isinstance(event_type, str):
+                raise TypeError("minimal evidence event identity has an invalid type")
+            event = ConformanceEvent(seq=seq, event_type=event_type)
+            previous_seq = (
+                page_events[-1].seq
+                if page_events
+                else (events[-1].seq if events else 0)
+            )
+            if event.seq <= previous_seq or event.seq < max(1, cursor):
+                raise ValueError("minimal evidence event sequence did not advance")
+            page_events.append(event)
+        if len(events) + len(page_events) > max_events:
+            raise ValueError("minimal evidence exceeds the event limit")
+        events.extend(page_events)
+        has_more = page.get("has_more")
+        next_seq = page.get("next_seq")
+        if type(has_more) is not bool:
+            raise TypeError("minimal evidence has_more must be a boolean")
+        if type(next_seq) is not int or next_seq < 0:
+            raise TypeError("minimal evidence next_seq must be a non-negative integer")
+        if page_events:
+            if next_seq != page_events[-1].seq + 1:
+                raise ValueError("minimal evidence page returned an inconsistent cursor")
+        elif next_seq != cursor:
+            raise ValueError("minimal evidence empty page skipped its cursor")
+        if has_more:
+            if not page_events or next_seq <= cursor:
+                raise ValueError("minimal evidence page cannot make progress")
+            cursor = next_seq
+            continue
+        status = read_status()
+        if not isinstance(status, dict):
+            raise TypeError("minimal evidence status must be an object")
+        if status.get("terminal") is not True:
+            raise ValueError("minimal evidence requires a terminal run")
+        last_event_seq = status.get("last_event_seq")
+        if type(last_event_seq) is not int or last_event_seq < 0:
+            raise TypeError("minimal evidence last_event_seq must be a non-negative integer")
+        if last_event_seq >= max(1, next_seq):
+            cursor = next_seq
+            continue
+        return tuple(events), next_seq
+    raise ValueError("minimal evidence exceeded the page limit")
 
 
 @dataclass
@@ -490,18 +579,55 @@ class ReferenceBackendHarness:
         )
 
     def run_minimal_lifecycle_case(self) -> dict[str, Any]:
+        return dict(self._run_minimal_lifecycle_capture().case)
+
+    def run_minimal_lifecycle_case_with_evidence(self) -> MinimalAgentEvidenceCapture:
+        return self._run_minimal_lifecycle_capture()
+
+    def _run_minimal_lifecycle_capture(self) -> MinimalAgentEvidenceCapture:
         submitted = self.submit_run({"scenario": "completed"})
         run_id = str(submitted["run_id"])
         token = str(submitted["token"])
-        events = list(self.events(run_id, token, limit=500)["events"])
+        events, next_seq = _collect_complete_minimal_events(
+            read_page=lambda from_seq, limit: self.events(
+                run_id,
+                token,
+                from_seq=from_seq,
+                limit=limit,
+            ),
+            read_status=lambda: self.status(run_id, token),
+            page_size=_MINIMAL_EVIDENCE_PAGE_SIZE,
+        )
         result = dict(self.result(run_id, token))
-        return {
+        states = ("submitted", "running", str(result.get("status") or ""))
+        case = {
             "submitted": True,
             "run_id": run_id,
-            "states": ("submitted", "running", str(result.get("status") or "")),
+            "states": states,
             "result": result,
-            "event_seqs": tuple(int(event["seq"]) for event in events),
+            "event_seqs": tuple(event.seq for event in events),
         }
+        version = package_version()
+        target = ConformanceTarget(
+            implementation_id="monoid-agent-kernel.reference-backend",
+            implementation_version=version,
+            adapter_id="monoid-agent-kernel.reference-conformance",
+            adapter_version=version,
+        )
+        evidence = ConformanceEvidenceBundle(
+            profile_id="minimal-agent",
+            target=target,
+            case_id_sha256=case_id_sha256(run_id),
+            run_id_present=bool(run_id),
+            submitted=True,
+            states=states,
+            result_run_id_matches=str(result.get("run_id") or "") == run_id,
+            result_status=str(result.get("status") or ""),
+            events=events,
+            events_complete=True,
+            next_seq=next_seq,
+        )
+        return MinimalAgentEvidenceCapture(case=case, evidence=evidence)
 
     def submit_run(self, request: dict[str, Any]) -> dict[str, Any]:
         scenario = str(request["scenario"])
