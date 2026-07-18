@@ -303,7 +303,7 @@ def test_host_launches_and_closes_all_participants_once_in_deterministic_order(
     assert calls[8:] == [
         "run:stop",
         "control:stop",
-        ("runtime:destroy", 1),
+        ("runtime:destroy", 0),
         "control:active",
         "run:active",
         "control:closed",
@@ -620,7 +620,7 @@ def test_close_racing_launch_waits_and_completes_one_shutdown(
     assert host.state == "closed"
     assert host.accepting is False
     assert calls.count("runtime:launch") == 1
-    assert calls.count(("runtime:destroy", 1)) == 1
+    assert calls.count(("runtime:destroy", 0)) == 1
 
 
 def test_close_fences_when_launch_does_not_yield_within_shutdown_grace(
@@ -716,7 +716,7 @@ def test_concurrent_close_waits_for_the_single_shutdown_owner(
 
     assert failures == []
     assert host.state == "closed"
-    assert calls.count(("runtime:destroy", 1)) == 1
+    assert calls.count(("runtime:destroy", 0)) == 1
 
 
 def test_joining_close_times_out_without_revoking_shutdown_owner(
@@ -761,7 +761,7 @@ def test_joining_close_times_out_without_revoking_shutdown_owner(
     assert first.is_alive() is False
     assert first_failures == []
     assert host.state == "closed"
-    assert calls.count(("runtime:destroy", 1)) == 1
+    assert calls.count(("runtime:destroy", 0)) == 1
 
 
 def test_close_interruption_while_launching_fences_the_authority(
@@ -971,6 +971,50 @@ def test_minimum_shutdown_grace_reserves_time_for_cleanup(
     assert host.state == "running"
 
     host.close(timeout_s=2)
+
+    assert host.state == "closed"
+    assert calls.count(("runtime:destroy", 0)) == 1
+
+
+def test_participant_stop_time_reduces_the_dbos_workflow_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    fake = _FakeRuntime(calls)
+    _install_fake_runtime(monkeypatch, fake)
+    config = DbosHostConfig(
+        system_database_url="sqlite:///dbos.sqlite",
+        application_version="host-stop-budget-v1",
+        executor_id="stable-stop-budget-slot",
+        shutdown_grace_s=4,
+    )
+    participant = _participant(
+        "control",
+        "queue-control",
+        calls,
+        host_config=config,
+    )
+
+    def _slow_stop() -> None:
+        time.sleep(1.1)
+
+    host = DbosRuntimeHost(config)
+    host._register_participant(
+        _DbosHostParticipant(
+            participant_id=participant.participant_id,
+            queue_name=participant.queue_name,
+            host_config=participant.host_config,
+            register_workflows=participant.register_workflows,
+            preflight=participant.preflight,
+            register_queue=participant.register_queue,
+            stop_admission=_slow_stop,
+            active_count=participant.active_count,
+            mark_closed=participant.mark_closed,
+        )
+    )
+    host.launch()
+
+    host.close()
 
     assert host.state == "closed"
     assert calls.count(("runtime:destroy", 0)) == 1

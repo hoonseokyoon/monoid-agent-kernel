@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import re
 import threading
 import time
@@ -140,7 +141,6 @@ class DbosRuntimeHost:
         self._lifecycle_thread_id: int | None = None
         self._shutdown_owner_id: int | None = None
         self._shutdown_deadline: float | None = None
-        self._shutdown_grace_s: int | None = None
         self._shutdown_error: DbosShutdownTimeout | None = None
         self._shutdown_thread: threading.Thread | None = None
         self._shutdown_watchdog: threading.Thread | None = None
@@ -273,7 +273,6 @@ class DbosRuntimeHost:
                 if self._shutdown_owner_id is None:
                     self._claim_shutdown_authority_locked(
                         caller_id=caller_id,
-                        grace_s=grace_s,
                         deadline=caller_deadline,
                     )
                 if self._state == "launching":
@@ -324,7 +323,6 @@ class DbosRuntimeHost:
     def _close_worker(
         self,
         participants: tuple[_DbosHostParticipant, ...],
-        grace_s: int,
         deadline: float,
     ) -> None:
         with self._state_condition:
@@ -335,7 +333,7 @@ class DbosRuntimeHost:
         try:
             stopped = _stop_participants(participants)
             self._runtime.destroy(
-                workflow_completion_timeout_sec=_dbos_workflow_grace(grace_s),
+                workflow_completion_timeout_sec=_dbos_workflow_grace(deadline),
                 deadline=deadline,
             )
             _require_participants_drained(participants, deadline=deadline)
@@ -365,7 +363,6 @@ class DbosRuntimeHost:
             self._lifecycle_thread_id = None
             self._shutdown_owner_id = None
             self._shutdown_deadline = None
-            self._shutdown_grace_s = None
             self._state_condition.notify_all()
 
     def _ordered_participants(self) -> tuple[_DbosHostParticipant, ...]:
@@ -388,12 +385,10 @@ class DbosRuntimeHost:
         self,
         *,
         caller_id: int,
-        grace_s: int,
         deadline: float,
     ) -> None:
         self._shutdown_owner_id = caller_id
         self._shutdown_deadline = deadline
-        self._shutdown_grace_s = grace_s
         watchdog = threading.Thread(
             target=self._shutdown_watchdog_worker,
             args=(deadline,),
@@ -410,9 +405,8 @@ class DbosRuntimeHost:
     def _start_shutdown_locked(self) -> None:
         if self._state not in {"registering", "running"}:
             raise RuntimeError(f"DBOS runtime host cannot close from {self._state}")
-        grace_s = self._shutdown_grace_s
         deadline = self._shutdown_deadline
-        if grace_s is None or deadline is None:
+        if deadline is None:
             self._fence_locked("DBOS shutdown authority is incomplete; terminate the process")
             raise self._shutdown_error or AssertionError("unreachable")
         self._admission_open = False
@@ -420,7 +414,7 @@ class DbosRuntimeHost:
         participants = self._ordered_participants()
         worker = threading.Thread(
             target=self._close_worker,
-            args=(participants, grace_s, deadline),
+            args=(participants, deadline),
             name="monoid-dbos-host-shutdown",
             daemon=True,
         )
@@ -564,10 +558,11 @@ def _require_shutdown_grace(value: object) -> None:
         raise ValueError("DBOS shutdown timeout must be at least two whole seconds")
 
 
-def _dbos_workflow_grace(shutdown_grace_s: int) -> int:
-    """Reserve the final two seconds for DBOS stopped-state proof and host cleanup."""
+def _dbos_workflow_grace(deadline: float) -> int:
+    """Budget whole workflow-wait seconds from the live outer-deadline remainder."""
 
-    return max(0, shutdown_grace_s - 2)
+    remaining_after_proof_reserve = deadline - time.monotonic() - 2.0
+    return max(0, math.ceil(remaining_after_proof_reserve) - 1)
 
 
 def _stop_participants(participants: tuple[_DbosHostParticipant, ...]) -> bool:
