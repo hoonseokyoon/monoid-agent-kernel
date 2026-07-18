@@ -335,7 +335,7 @@ class DbosRuntimeHost:
         try:
             stopped = _stop_participants(participants)
             self._runtime.destroy(
-                workflow_completion_timeout_sec=grace_s,
+                workflow_completion_timeout_sec=_dbos_workflow_grace(grace_s),
                 deadline=deadline,
             )
             _require_participants_drained(participants, deadline=deadline)
@@ -560,8 +560,14 @@ def release_process_owner(token: object) -> None:
 
 
 def _require_shutdown_grace(value: object) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError("DBOS shutdown timeout must be a positive whole second")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+        raise ValueError("DBOS shutdown timeout must be at least two whole seconds")
+
+
+def _dbos_workflow_grace(shutdown_grace_s: int) -> int:
+    """Reserve the final two seconds for DBOS stopped-state proof and host cleanup."""
+
+    return max(0, shutdown_grace_s - 2)
 
 
 def _stop_participants(participants: tuple[_DbosHostParticipant, ...]) -> bool:

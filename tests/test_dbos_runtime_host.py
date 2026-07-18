@@ -235,6 +235,7 @@ def test_host_config_rejects_ambiguous_workflow_tokens(
         ("application_version", ""),
         ("executor_id", ""),
         ("shutdown_grace_s", 0),
+        ("shutdown_grace_s", 1),
         ("shutdown_grace_s", True),
     ],
 )
@@ -302,7 +303,7 @@ def test_host_launches_and_closes_all_participants_once_in_deterministic_order(
     assert calls[8:] == [
         "run:stop",
         "control:stop",
-        ("runtime:destroy", 3),
+        ("runtime:destroy", 1),
         "control:active",
         "run:active",
         "control:closed",
@@ -619,7 +620,7 @@ def test_close_racing_launch_waits_and_completes_one_shutdown(
     assert host.state == "closed"
     assert host.accepting is False
     assert calls.count("runtime:launch") == 1
-    assert calls.count(("runtime:destroy", 3)) == 1
+    assert calls.count(("runtime:destroy", 1)) == 1
 
 
 def test_close_fences_when_launch_does_not_yield_within_shutdown_grace(
@@ -663,7 +664,7 @@ def test_close_fences_when_launch_does_not_yield_within_shutdown_grace(
     assert preflight_entered.wait(timeout=3)
 
     with pytest.raises(DbosShutdownTimeout, match="lifecycle owner exceeded"):
-        host.close(timeout_s=1)
+        host.close(timeout_s=2)
 
     assert host.state == "fenced"
     assert host.accepting is False
@@ -715,7 +716,7 @@ def test_concurrent_close_waits_for_the_single_shutdown_owner(
 
     assert failures == []
     assert host.state == "closed"
-    assert calls.count(("runtime:destroy", 3)) == 1
+    assert calls.count(("runtime:destroy", 1)) == 1
 
 
 def test_joining_close_times_out_without_revoking_shutdown_owner(
@@ -751,7 +752,7 @@ def test_joining_close_times_out_without_revoking_shutdown_owner(
     assert destroy_entered.wait(timeout=3)
 
     with pytest.raises(DbosShutdownTimeout, match="close caller exceeded its wait"):
-        host.close(timeout_s=1)
+        host.close(timeout_s=2)
 
     assert host.state == "closing"
     assert first.is_alive()
@@ -760,7 +761,7 @@ def test_joining_close_times_out_without_revoking_shutdown_owner(
     assert first.is_alive() is False
     assert first_failures == []
     assert host.state == "closed"
-    assert calls.count(("runtime:destroy", 3)) == 1
+    assert calls.count(("runtime:destroy", 1)) == 1
 
 
 def test_close_interruption_while_launching_fences_the_authority(
@@ -911,9 +912,9 @@ def test_initiating_close_is_bounded_when_runtime_destroy_never_returns(
     started = time.monotonic()
     try:
         with pytest.raises(DbosShutdownTimeout, match="lifecycle owner exceeded"):
-            host.close(timeout_s=1)
+            host.close(timeout_s=2)
 
-        assert time.monotonic() - started < 2
+        assert time.monotonic() - started < 3
         assert destroy_entered.is_set()
         assert host.state == "fenced"
     finally:
@@ -944,15 +945,35 @@ def test_cleanup_probe_cannot_block_the_shutdown_watchdog(
     started = time.monotonic()
     try:
         with pytest.raises(DbosShutdownTimeout, match="lifecycle owner exceeded"):
-            host.close(timeout_s=1)
+            host.close(timeout_s=2)
 
-        assert time.monotonic() - started < 2
+        assert time.monotonic() - started < 3
         assert probe_entered.is_set()
         assert host.state == "fenced"
     finally:
         release_probe.set()
         assert host._shutdown_thread is not None
         host._shutdown_thread.join(timeout=3)
+
+
+def test_minimum_shutdown_grace_reserves_time_for_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    fake = _FakeRuntime(calls)
+    _install_fake_runtime(monkeypatch, fake)
+    host = DbosRuntimeHost(_config())
+    host._register_participant(_participant("control", "queue-control", calls))
+    host.launch()
+
+    with pytest.raises(ValueError, match="at least two"):
+        host.close(timeout_s=1)
+    assert host.state == "running"
+
+    host.close(timeout_s=2)
+
+    assert host.state == "closed"
+    assert calls.count(("runtime:destroy", 0)) == 1
 
 
 def test_participant_work_may_drain_within_the_shared_shutdown_grace(
@@ -972,7 +993,7 @@ def test_participant_work_may_drain_within_the_shared_shutdown_grace(
     host._register_participant(_participant("control", "queue-control", calls, active=_active))
     host.launch()
 
-    host.close(timeout_s=1)
+    host.close(timeout_s=2)
 
     assert samples == 3
     assert host.state == "closed"
@@ -1003,13 +1024,13 @@ def test_uncertain_shutdown_stops_admission_and_fences_process_ownership(
     host.launch()
 
     with pytest.raises(DbosShutdownTimeout) as raised:
-        host.close(timeout_s=1)
+        host.close(timeout_s=2)
 
     assert "private DBOS" not in str(raised.value)
     assert "foreign DBOS" not in str(raised.value)
     assert host.state == "fenced"
     assert host.accepting is False
-    assert ("runtime:destroy", 1) in calls
+    assert ("runtime:destroy", 0) in calls
     with pytest.raises(DbosProcessOwnershipError):
         DbosRuntimeHost(_config())
 
@@ -1173,6 +1194,53 @@ def test_real_dbos_host_launches_queue_work_and_resets_global_state(
 
         assert handle.get_result() == 42
         host.close()
+        assert host.state == "closed"
+        assert closed.is_set()
+        assert getattr(implementation, "_dbos_global_instance", None) is None
+        assert getattr(implementation, "_dbos_global_registry", None) is None
+    finally:
+        if host is not None and host.state not in {"closed", "fenced"}:
+            host.close()
+        dbos.DBOS.destroy(destroy_registry=True, workflow_completion_timeout_sec=0)
+
+
+def test_real_dbos_idle_host_closes_with_the_minimum_grace(tmp_path: Path) -> None:
+    dbos = pytest.importorskip("dbos")
+    if _delegate_real_dbos_case(
+        "test_real_dbos_idle_host_closes_with_the_minimum_grace",
+        "minimum-close",
+    ):
+        return
+    implementation = importlib.import_module("dbos._dbos")
+    dbos.DBOS.destroy(destroy_registry=True, workflow_completion_timeout_sec=0)
+    host: DbosRuntimeHost | None = None
+    closed = threading.Event()
+    try:
+        config = DbosHostConfig(
+            system_database_url=f"sqlite:///{tmp_path / 'minimum-close.sqlite'}",
+            name="monoid-host-min-close",
+            application_version="monoid-host-min-close-v1",
+            executor_id="stable-min-close-slot",
+            shutdown_grace_s=2,
+        )
+        host = DbosRuntimeHost(config)
+        host._register_participant(
+            _DbosHostParticipant(
+                participant_id="minimum-close",
+                queue_name="monoid-reference-host-minimum-close-v1",
+                host_config=config,
+                register_workflows=lambda runtime: None,
+                preflight=lambda: None,
+                register_queue=lambda runtime: None,
+                stop_admission=lambda: None,
+                active_count=lambda: 0,
+                mark_closed=closed.set,
+            )
+        )
+
+        host.launch()
+        host.close()
+
         assert host.state == "closed"
         assert closed.is_set()
         assert getattr(implementation, "_dbos_global_instance", None) is None
