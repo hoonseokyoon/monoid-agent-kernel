@@ -197,6 +197,8 @@ def _validate_evidence_matches_case(
     ):
         raise TypeError("minimal-agent evidence requires integer event sequences")
     event_seqs = tuple(raw_event_seqs)
+    if any(right <= left for left, right in zip(event_seqs, event_seqs[1:])):
+        raise ValueError("minimal-agent evidence sequences must increase")
     evidence_seqs = tuple(event.seq for event in evidence.events)
     if evidence.events_complete is not True:
         raise ValueError("minimal-agent evidence must be complete")

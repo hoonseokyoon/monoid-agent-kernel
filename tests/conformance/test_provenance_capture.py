@@ -186,6 +186,18 @@ def test_incomplete_or_inconsistent_capture_becomes_safe_errors(
     assert all(outcome.status == "error" for outcome in execution.outcomes)
 
 
+def test_non_increasing_enhanced_evidence_fails_closed() -> None:
+    execution = execute_minimal_agent_profile(
+        _EvidenceHarness(
+            case_event_seqs=(2, 1),
+            evidence_event_seqs=(2, 1),
+        )
+    )
+
+    assert execution.evidence == ()
+    assert all(outcome.status == "error" for outcome in execution.outcomes)
+
+
 def test_runner_keeps_v1_report_and_junit_shape_for_enhanced_harness(
     tmp_path: Path,
 ) -> None:
