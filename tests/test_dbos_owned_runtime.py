@@ -59,7 +59,10 @@ def _raw_config(tmp_path: Path, *, stem: str) -> dict[str, Any]:
     }
 
 
-def test_owned_adapter_runs_work_without_classmethod_dispatch(tmp_path: Path) -> None:
+def test_owned_adapter_runs_work_without_classmethod_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     owned = _construct_owned_runtime_226(dbos, _config(tmp_path))
 
     @owned.step(name="monoid.reference.adapter-step.v1", retries_allowed=False)
@@ -80,7 +83,31 @@ def test_owned_adapter_runs_work_without_classmethod_dispatch(tmp_path: Path) ->
         polling_interval_sec=0.01,
         on_conflict="always_update",
     )
-    handle = owned.enqueue_workflow(queue_name, workflow, 41)
+    workflow_id = "monoid/reference/adapter-workflow/explicit-id"
+    partition_key = "adapter-partition"
+    failed_workflow_id = "monoid/reference/adapter-workflow/rejected-id"
+    with dbos.SetWorkflowID("ambient-workflow-id"), dbos.SetEnqueueOptions(
+        queue_partition_key="ambient-partition"
+    ):
+        ambient = implementation.get_local_dbos_context()
+        assert ambient is not None
+        with pytest.raises(RuntimeError, match="no ambient DBOS context"):
+            owned.enqueue_workflow_with_identity(
+                queue_name,
+                workflow,
+                0,
+                workflow_id=failed_workflow_id,
+                queue_partition_key="rejected-partition",
+            )
+        assert ambient.id_assigned_for_next_workflow == "ambient-workflow-id"
+        assert ambient.queue_partition_key == "ambient-partition"
+    handle = owned.enqueue_workflow_with_identity(
+        queue_name,
+        workflow,
+        41,
+        workflow_id=workflow_id,
+        queue_partition_key=partition_key,
+    )
     retrieved = owned.retrieve_queue(queue_name)
 
     assert queue.name == queue_name
@@ -88,6 +115,34 @@ def test_owned_adapter_runs_work_without_classmethod_dispatch(tmp_path: Path) ->
     assert retrieved._client_system_database is owned._runtime._sys_db
     assert retrieved.concurrency == 1
     assert handle.get_result() == 42
+    automatic_handle = owned.enqueue_workflow(queue_name, workflow, 1)
+    assert automatic_handle.get_result() == 2
+
+    def _forbid_global_status(cls: type[Any], target_workflow_id: str) -> Any:
+        del cls, target_workflow_id
+        raise AssertionError("global DBOS status dispatch is forbidden")
+
+    monkeypatch.setattr(
+        real_dbos_class,
+        "get_workflow_status",
+        classmethod(_forbid_global_status),
+    )
+    status = handle.get_status()
+    assert status.workflow_id == workflow_id
+    assert status.queue_partition_key == partition_key
+    retrieved_handle = owned.retrieve_workflow(workflow_id)
+    assert retrieved_handle.workflow_id == workflow_id
+    assert retrieved_handle._raw_handle.dbos is owned._runtime
+    assert retrieved_handle.get_result() == 42
+    automatic_status = automatic_handle.get_status()
+    assert automatic_status.workflow_id not in {
+        workflow_id,
+        failed_workflow_id,
+        "ambient-workflow-id",
+    }
+    assert automatic_status.queue_partition_key is None
+    with pytest.raises(implementation.DBOSNonExistentWorkflowError):
+        owned.retrieve_workflow("monoid/reference/adapter-workflow/missing")
     owned.destroy(workflow_completion_timeout_sec=3, deadline=time.monotonic() + 3)
     assert getattr(implementation, "_dbos_global_instance", None) is None
     assert getattr(implementation, "_dbos_global_registry", None) is None
@@ -304,6 +359,115 @@ def test_owned_adapter_does_not_destroy_a_replacement_created_during_destroy(
         destroy_thread.join(timeout=3)
         monkeypatch.setattr(owned._runtime, "_destroy", original_destroy)
         original_destroy(workflow_completion_timeout_sec=0)
+
+
+def test_owned_adapter_does_not_retrieve_from_a_replacement(tmp_path: Path) -> None:
+    owned = _construct_owned_runtime_226(dbos, _config(tmp_path, stem="rreplace"))
+    implementation._dbos_global_instance = None
+    implementation._dbos_global_registry = None
+    foreign = real_dbos_class(config=_raw_config(tmp_path, stem="fretrieve"))
+    foreign_registry = getattr(implementation, "_dbos_global_registry", None)
+
+    with pytest.raises(_DbosOwnershipConflict, match="ownership changed"):
+        owned.retrieve_workflow("monoid/reference/adapter-workflow/foreign")
+
+    assert foreign._launched is False
+    assert getattr(implementation, "_dbos_global_instance", None) is foreign
+    assert getattr(implementation, "_dbos_global_registry", None) is foreign_registry
+
+
+@pytest.mark.parametrize("operation", ["enqueue", "retrieve"])
+def test_owned_adapter_normalizes_operation_failure_after_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    owned = _construct_owned_runtime_226(dbos, _config(tmp_path, stem=f"e{operation}"))
+    foreign_holder: dict[str, Any] = {}
+
+    def _replace_and_fail(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        implementation._dbos_global_instance = None
+        implementation._dbos_global_registry = None
+        foreign = real_dbos_class(config=_raw_config(tmp_path, stem=f"f{operation}"))
+        foreign_holder["runtime"] = foreign
+        raise RuntimeError("private replacement race detail")
+
+    if operation == "enqueue":
+        monkeypatch.setattr(owned, "_enqueue_workflow_unlocked", _replace_and_fail)
+    else:
+        monkeypatch.setattr(owned, "_workflow_status_unlocked", _replace_and_fail)
+
+    def _invoke() -> Any:
+        if operation == "enqueue":
+            return owned.enqueue_workflow("queue", lambda: None)
+        return owned.retrieve_workflow("workflow-id")
+
+    with pytest.raises(_DbosOwnershipConflict, match="ownership changed") as raised:
+        _invoke()
+
+    foreign = foreign_holder["runtime"]
+    assert "private replacement race detail" not in str(raised.value)
+    assert foreign._initialized is True
+    assert getattr(implementation, "_dbos_global_instance", None) is foreign
+
+
+def test_owned_workflow_handles_fence_after_runtime_replacement(tmp_path: Path) -> None:
+    owned = _construct_owned_runtime_226(dbos, _config(tmp_path, stem="hreplace"))
+
+    @owned.workflow(name="monoid.reference.handle-replacement.v1")
+    def workflow(value: str) -> str:
+        return value
+
+    queue_name = "monoid-reference-hreplace-v1"
+    workflow_id = "monoid/reference/handle-replacement/explicit-id"
+    owned.listen_queues((queue_name,))
+    owned.launch()
+    owned.register_queue(
+        queue_name,
+        worker_concurrency=1,
+        concurrency=1,
+        polling_interval_sec=0.01,
+        on_conflict="always_update",
+    )
+    handle = owned.enqueue_workflow_with_identity(
+        queue_name,
+        workflow,
+        "owned-result",
+        workflow_id=workflow_id,
+        queue_partition_key="owned-partition",
+    )
+    assert handle.get_result() == "owned-result"
+    retrieved = owned.retrieve_workflow(workflow_id)
+    foreign: Any = None
+    try:
+        implementation._dbos_global_instance = None
+        implementation._dbos_global_registry = None
+        foreign = real_dbos_class(config=_raw_config(tmp_path, stem="fhandle"))
+        foreign_registry = getattr(implementation, "_dbos_global_registry", None)
+
+        for accessor in (
+            handle.get_status,
+            handle.get_result,
+            retrieved.get_status,
+            retrieved.get_result,
+        ):
+            with pytest.raises(_DbosOwnershipConflict, match="ownership changed"):
+                accessor()
+
+        assert getattr(implementation, "_dbos_global_instance", None) is foreign
+        assert getattr(implementation, "_dbos_global_registry", None) is foreign_registry
+    finally:
+        if foreign is not None and getattr(implementation, "_dbos_global_instance", None) is foreign:
+            real_dbos_class.destroy(
+                destroy_registry=True,
+                workflow_completion_timeout_sec=0,
+            )
+        implementation._dbos_global_instance = owned._runtime
+        implementation._dbos_global_registry = owned._registry
+        implementation.GlobalParams.app_version = owned._application_version
+        implementation.GlobalParams.executor_id = owned._executor_id
+        owned.destroy(workflow_completion_timeout_sec=0, deadline=time.monotonic() + 3)
 
 
 def test_owned_adapter_fences_a_nested_dbos_thread_that_survives_destroy(

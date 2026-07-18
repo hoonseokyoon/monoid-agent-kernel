@@ -27,9 +27,10 @@ out in commit messages and here.
   runner retains content-addressed normalized evidence, binds all four rules to its digest,
   self-verifies, and publishes evidence, JUnit, JSON, then stdout. Default report-only and legacy
   adapter runs preserve the v1 output contract.
-- Added a Reference-private DBOS 2.26 owned-runtime adapter that binds workflow, queue, launch, and
-  shutdown operations to one captured singleton and registry, rejects Cloud/Conductor mode, and
-  verifies global identity plus DBOS-owned thread cleanup before ownership release.
+- Added a Reference-private DBOS 2.26 owned-runtime adapter that binds workflow registration,
+  identity-scoped enqueue and retrieval, queue, launch, and shutdown operations to one captured
+  singleton and registry, rejects Cloud/Conductor mode, and verifies global identity plus
+  DBOS-owned thread cleanup before ownership release.
 - Added a single-owner Reference-private DBOS runtime host with deterministic workflow identity,
   pre-launch workflow/listener aggregation, one launch/shutdown lifecycle, deadline-bounded close,
   and process fencing when participant drain or ownership verification is uncertain.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import math
 import os
 import threading
 import time
@@ -12,6 +13,14 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 _DBOS_ADAPTER_LOCK = threading.RLock()
+_TERMINAL_WORKFLOW_STATUSES = frozenset(
+    {
+        "SUCCESS",
+        "ERROR",
+        "CANCELLED",
+        "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
+    }
+)
 
 
 class _DbosOwnershipConflict(RuntimeError):
@@ -24,6 +33,59 @@ class _DbosConstructionUncertain(RuntimeError):
 
 class _DbosCleanupUncertain(RuntimeError):
     """Raised when stopped state cannot be proven before ownership release."""
+
+
+class _OwnedDbosWorkflowHandle226:
+    """Workflow handle whose status and result access stay bound to one owned runtime."""
+
+    def __init__(
+        self,
+        adapter: _OwnedDbosRuntime226,
+        raw_handle: Any,
+        workflow_id: str,
+    ) -> None:
+        self._adapter = adapter
+        self._raw_handle = raw_handle
+        self.workflow_id = workflow_id
+
+    def get_workflow_id(self) -> str:
+        return self.workflow_id
+
+    def get_result(self, *, polling_interval_sec: float = 1.0) -> Any:
+        if not math.isfinite(polling_interval_sec) or polling_interval_sec <= 0:
+            raise ValueError("DBOS workflow result polling interval must be positive")
+        while True:
+            status = self.get_status()
+            status_value = getattr(status.status, "value", status.status)
+            if str(status_value) in _TERMINAL_WORKFLOW_STATUSES:
+                break
+            time.sleep(polling_interval_sec)
+        with _DBOS_ADAPTER_LOCK:
+            self._adapter.require_owned()
+            try:
+                result = self._raw_handle.get_result(
+                    polling_interval_sec=polling_interval_sec
+                )
+            except BaseException:
+                self._adapter._require_owned_after_failure_unlocked()
+                raise
+            self._adapter.require_owned()
+            return result
+
+    def get_status(self) -> Any:
+        with _DBOS_ADAPTER_LOCK:
+            self._adapter.require_owned()
+            try:
+                status = self._adapter._workflow_status_unlocked(self.workflow_id)
+            except BaseException:
+                self._adapter._require_owned_after_failure_unlocked()
+                raise
+            self._adapter.require_owned()
+            if status is None:
+                raise self._adapter._implementation.DBOSNonExistentWorkflowError(
+                    "target", self.workflow_id
+                )
+            return status
 
 
 class _OwnedDbosRuntime226:
@@ -59,6 +121,12 @@ class _OwnedDbosRuntime226:
                 raise _DbosOwnershipConflict(
                     "DBOS process-global runtime ownership changed; terminate the process"
                 )
+
+    def _require_owned_after_failure_unlocked(self) -> None:
+        if not self._owns_globals_unlocked():
+            raise _DbosOwnershipConflict(
+                "DBOS process-global runtime ownership changed; terminate the process"
+            ) from None
 
     def _require_cleanup_owned(self) -> None:
         if not self._owns_globals_unlocked():
@@ -264,18 +332,128 @@ class _OwnedDbosRuntime226:
     ) -> Any:
         with _DBOS_ADAPTER_LOCK:
             self.require_owned()
-            queue = self._implementation.Queue(queue_name, database_backed_queue=True)
-            queue._validate_enqueue(self._implementation.get_local_dbos_context())
-            handle = self._implementation.start_workflow(
-                self._runtime,
-                func,
-                args,
-                kwargs,
-                queue_name=queue_name,
-                execute_workflow=False,
-            )
+            try:
+                raw_handle = self._enqueue_workflow_unlocked(queue_name, func, args, kwargs)
+                handle = self._wrap_workflow_handle_unlocked(raw_handle)
+            except BaseException:
+                self._require_owned_after_failure_unlocked()
+                raise
             self.require_owned()
             return handle
+
+    def enqueue_workflow_with_identity(
+        self,
+        queue_name: str,
+        func: Callable[..., Any],
+        *args: Any,
+        workflow_id: str,
+        queue_partition_key: str,
+        **kwargs: Any,
+    ) -> Any:
+        """Enqueue on the captured runtime with explicit durable and partition identities."""
+
+        if type(workflow_id) is not str or not workflow_id:
+            raise ValueError("DBOS workflow_id is required")
+        if type(queue_partition_key) is not str or not queue_partition_key:
+            raise ValueError("DBOS queue_partition_key is required")
+        with _DBOS_ADAPTER_LOCK:
+            self.require_owned()
+            if self._implementation.get_local_dbos_context() is not None:
+                raise RuntimeError(
+                    "DBOS identity-scoped enqueue requires no ambient DBOS context"
+                )
+            try:
+                with self._dbos_module.SetWorkflowID(
+                    workflow_id
+                ), self._dbos_module.SetEnqueueOptions(
+                    queue_partition_key=queue_partition_key
+                ):
+                    raw_handle = self._enqueue_workflow_unlocked(queue_name, func, args, kwargs)
+                handle = self._wrap_workflow_handle_unlocked(
+                    raw_handle,
+                    expected_workflow_id=workflow_id,
+                )
+            except BaseException:
+                self._require_owned_after_failure_unlocked()
+                raise
+            self.require_owned()
+            return handle
+
+    def retrieve_workflow(self, workflow_id: str) -> Any:
+        """Return a polling handle bound to the captured runtime, never the global singleton."""
+
+        if type(workflow_id) is not str or not workflow_id:
+            raise ValueError("DBOS workflow_id is required")
+        with _DBOS_ADAPTER_LOCK:
+            self.require_owned()
+            try:
+                self._implementation.check_async("retrieve_workflow")
+                status = self._workflow_status_unlocked(workflow_id)
+                if status is None:
+                    raise self._implementation.DBOSNonExistentWorkflowError(
+                        "target", workflow_id
+                    )
+                raw_handle = self._implementation.WorkflowHandlePolling(
+                    workflow_id, self._runtime
+                )
+                handle = self._wrap_workflow_handle_unlocked(
+                    raw_handle,
+                    expected_workflow_id=workflow_id,
+                )
+            except BaseException:
+                self._require_owned_after_failure_unlocked()
+                raise
+            self.require_owned()
+            return handle
+
+    def _enqueue_workflow_unlocked(
+        self,
+        queue_name: str,
+        func: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        queue = self._implementation.Queue(queue_name, database_backed_queue=True)
+        queue._validate_enqueue(self._implementation.get_local_dbos_context())
+        return self._implementation.start_workflow(
+            self._runtime,
+            func,
+            args,
+            kwargs,
+            queue_name=queue_name,
+            execute_workflow=False,
+        )
+
+    def _workflow_status_unlocked(self, workflow_id: str) -> Any:
+        self._implementation.check_async("get_workflow_status")
+        system_database = self._runtime._sys_db
+
+        def _load_status() -> Any:
+            return self._implementation.get_workflow(system_database, workflow_id)
+
+        return system_database.call_function_as_step(
+            _load_status,
+            "DBOS.getStatus",
+            self._implementation.snapshot_step_context(reserve_sleep_id=False),
+        )
+
+    def _wrap_workflow_handle_unlocked(
+        self,
+        raw_handle: Any,
+        *,
+        expected_workflow_id: str | None = None,
+    ) -> _OwnedDbosWorkflowHandle226:
+        workflow_id = getattr(raw_handle, "workflow_id", None)
+        if (
+            type(workflow_id) is not str
+            or not workflow_id
+            or getattr(raw_handle, "dbos", None) is not self._runtime
+            or (expected_workflow_id is not None and workflow_id != expected_workflow_id)
+        ):
+            raise _DbosOwnershipConflict(
+                "DBOS returned an unexpected workflow handle; terminate the process"
+            )
+        return _OwnedDbosWorkflowHandle226(self, raw_handle, workflow_id)
 
     def destroy(self, *, workflow_completion_timeout_sec: int, deadline: float) -> None:
         """Stop the captured runtime; the host enforces an outer deadline around this call."""
