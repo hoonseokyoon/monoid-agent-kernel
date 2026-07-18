@@ -93,6 +93,24 @@ def test_owned_adapter_runs_work_without_classmethod_dispatch(tmp_path: Path) ->
     assert getattr(implementation, "_dbos_global_registry", None) is None
 
 
+def test_owned_adapter_rejects_async_launch_before_mutation(tmp_path: Path) -> None:
+    owned = _construct_owned_runtime_226(dbos, _config(tmp_path, stem="async-launch"))
+
+    async def _attempt_launch() -> None:
+        with pytest.raises(_DbosOwnershipConflict, match="synchronous lifecycle thread"):
+            owned.preflight_launch()
+        with pytest.raises(_DbosOwnershipConflict, match="synchronous lifecycle thread"):
+            owned.launch()
+
+    asyncio.run(_attempt_launch())
+
+    assert owned._runtime._launched is False
+    assert owned._async_executor is None
+    owned.destroy(workflow_completion_timeout_sec=0, deadline=time.monotonic() + 3)
+    assert getattr(implementation, "_dbos_global_instance", None) is None
+    assert getattr(implementation, "_dbos_global_registry", None) is None
+
+
 @pytest.mark.parametrize("decorator_name", ["step", "workflow"])
 def test_owned_adapter_guards_decorator_application_after_replacement(
     tmp_path: Path,
@@ -219,21 +237,26 @@ def test_owned_adapter_does_not_launch_a_replacement_created_during_launch(
 
     launch_thread = threading.Thread(target=_launch)
     launch_thread.start()
-    assert launch_entered.wait(timeout=3)
-    implementation._dbos_global_instance = None
-    implementation._dbos_global_registry = None
-    foreign = real_dbos_class(config=_raw_config(tmp_path, stem="flaunch"))
-    foreign_registry = getattr(implementation, "_dbos_global_registry", None)
-    release_launch.set()
-    launch_thread.join(timeout=3)
+    try:
+        assert launch_entered.wait(timeout=3)
+        implementation._dbos_global_instance = None
+        implementation._dbos_global_registry = None
+        foreign = real_dbos_class(config=_raw_config(tmp_path, stem="flaunch"))
+        foreign_registry = getattr(implementation, "_dbos_global_registry", None)
+        release_launch.set()
+        launch_thread.join(timeout=3)
 
-    assert launch_thread.is_alive() is False
-    assert len(failures) == 1
-    assert isinstance(failures[0], _DbosOwnershipConflict)
-    assert foreign._launched is False
-    assert foreign._listening_queues is None
-    assert getattr(implementation, "_dbos_global_instance", None) is foreign
-    assert getattr(implementation, "_dbos_global_registry", None) is foreign_registry
+        assert launch_thread.is_alive() is False
+        assert len(failures) == 1
+        assert isinstance(failures[0], _DbosOwnershipConflict)
+        assert foreign._launched is False
+        assert foreign._listening_queues is None
+        assert getattr(implementation, "_dbos_global_instance", None) is foreign
+        assert getattr(implementation, "_dbos_global_registry", None) is foreign_registry
+    finally:
+        release_launch.set()
+        launch_thread.join(timeout=3)
+        owned._runtime._destroy(workflow_completion_timeout_sec=0)
 
 
 def test_owned_adapter_does_not_destroy_a_replacement_created_during_destroy(
@@ -244,6 +267,7 @@ def test_owned_adapter_does_not_destroy_a_replacement_created_during_destroy(
     destroy_entered = threading.Event()
     release_destroy = threading.Event()
     failures: list[BaseException] = []
+    original_destroy = owned._runtime._destroy
 
     def _blocked_destroy(*, workflow_completion_timeout_sec: int) -> None:
         del workflow_completion_timeout_sec
@@ -260,20 +284,26 @@ def test_owned_adapter_does_not_destroy_a_replacement_created_during_destroy(
 
     destroy_thread = threading.Thread(target=_destroy)
     destroy_thread.start()
-    assert destroy_entered.wait(timeout=3)
-    implementation._dbos_global_instance = None
-    implementation._dbos_global_registry = None
-    foreign = real_dbos_class(config=_raw_config(tmp_path, stem="fdestroy"))
-    foreign_registry = getattr(implementation, "_dbos_global_registry", None)
-    release_destroy.set()
-    destroy_thread.join(timeout=3)
+    try:
+        assert destroy_entered.wait(timeout=3)
+        implementation._dbos_global_instance = None
+        implementation._dbos_global_registry = None
+        foreign = real_dbos_class(config=_raw_config(tmp_path, stem="fdestroy"))
+        foreign_registry = getattr(implementation, "_dbos_global_registry", None)
+        release_destroy.set()
+        destroy_thread.join(timeout=3)
 
-    assert destroy_thread.is_alive() is False
-    assert len(failures) == 1
-    assert isinstance(failures[0], _DbosCleanupUncertain)
-    assert foreign._initialized is True
-    assert getattr(implementation, "_dbos_global_instance", None) is foreign
-    assert getattr(implementation, "_dbos_global_registry", None) is foreign_registry
+        assert destroy_thread.is_alive() is False
+        assert len(failures) == 1
+        assert isinstance(failures[0], _DbosCleanupUncertain)
+        assert foreign._initialized is True
+        assert getattr(implementation, "_dbos_global_instance", None) is foreign
+        assert getattr(implementation, "_dbos_global_registry", None) is foreign_registry
+    finally:
+        release_destroy.set()
+        destroy_thread.join(timeout=3)
+        monkeypatch.setattr(owned._runtime, "_destroy", original_destroy)
+        original_destroy(workflow_completion_timeout_sec=0)
 
 
 def test_owned_adapter_fences_a_nested_dbos_thread_that_survives_destroy(
@@ -294,6 +324,61 @@ def test_owned_adapter_fences_a_nested_dbos_thread_that_survives_destroy(
 
     assert getattr(implementation, "_dbos_global_instance", None) is owned._runtime
     assert getattr(implementation, "_dbos_global_registry", None) is owned._registry
+
+
+def test_owned_adapter_allows_an_unrelated_preexisting_queue_worker_name(
+    tmp_path: Path,
+) -> None:
+    thread_entered = threading.Event()
+    release_thread = threading.Event()
+
+    def _preexisting_work() -> None:
+        thread_entered.set()
+        release_thread.wait(timeout=5)
+
+    preexisting = threading.Thread(
+        target=_preexisting_work,
+        name="queue-worker-preexisting-runtime",
+        daemon=True,
+    )
+    preexisting.start()
+    assert thread_entered.wait(timeout=3)
+    try:
+        owned = _construct_owned_runtime_226(dbos, _config(tmp_path, stem="preexisting"))
+        owned.listen_queues(())
+        owned.launch()
+        owned.destroy(workflow_completion_timeout_sec=0, deadline=time.monotonic() + 3)
+
+        assert getattr(implementation, "_dbos_global_instance", None) is None
+        assert getattr(implementation, "_dbos_global_registry", None) is None
+        assert preexisting.is_alive()
+    finally:
+        release_thread.set()
+        preexisting.join(timeout=3)
+
+
+def test_owned_adapter_rejects_preexisting_dbos_thread_provenance(tmp_path: Path) -> None:
+    thread_entered = threading.Event()
+    release_thread = threading.Event()
+
+    def _preexisting_dbos_work() -> None:
+        thread_entered.set()
+        release_thread.wait(timeout=5)
+
+    _preexisting_dbos_work.__module__ = "dbos.synthetic"
+    preexisting = threading.Thread(target=_preexisting_dbos_work, daemon=True)
+    preexisting.start()
+    assert thread_entered.wait(timeout=3)
+    try:
+        with pytest.raises(_DbosOwnershipConflict, match="worker threads are active"):
+            _construct_owned_runtime_226(dbos, _config(tmp_path, stem="dbos-thread"))
+
+        assert getattr(implementation, "_dbos_global_instance", None) is None
+        assert getattr(implementation, "_dbos_global_registry", None) is None
+        assert preexisting.is_alive()
+    finally:
+        release_thread.set()
+        preexisting.join(timeout=3)
 
 
 def test_owned_adapter_fences_an_asyncio_worker_that_survives_destroy(tmp_path: Path) -> None:
