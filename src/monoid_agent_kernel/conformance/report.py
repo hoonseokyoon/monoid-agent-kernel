@@ -374,6 +374,8 @@ def read_conformance_report(
             object_pairs_hook=_unique_json_object,
             parse_constant=_reject_json_constant,
         )
+    except FileNotFoundError:
+        return _CONFORMANCE_REPORT_CODEC.missing()
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
         return _CONFORMANCE_REPORT_CODEC.corrupt("conformance report JSON is unreadable")
     return decode_conformance_report(payload)

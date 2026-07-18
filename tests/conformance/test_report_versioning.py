@@ -271,6 +271,26 @@ def test_file_reader_rejects_duplicate_keys_and_nonfinite_numbers(tmp_path: Path
         read_conformance_report(path, max_bytes=-1)
 
 
+def test_file_reader_classifies_absent_and_disappearing_files_as_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "report.json"
+
+    assert read_conformance_report(path).status == "missing"
+
+    path.write_text(json.dumps(_v2_report().to_json(), sort_keys=True))
+    original_open = Path.open
+
+    def _disappeared(candidate: Path, *args: Any, **kwargs: Any) -> Any:
+        if candidate == path:
+            raise FileNotFoundError(path)
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _disappeared)
+    assert read_conformance_report(path).status == "missing"
+
+
 def test_file_reader_uses_a_bounded_stream_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
