@@ -123,6 +123,85 @@ def test_static_malformed_lookahead_remains_authoritative_corruption(tmp_path: P
     assert not isinstance(caught.value, EventLogChanged)
 
 
+def test_anchor_selector_returns_verified_batch_after_successful_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_record(1) + _record(2))
+
+    page = read_event_page_from_anchor(
+        path,
+        from_seq=0,
+        limit=1,
+        anchor_selector=lambda _record: True,
+    )
+
+    assert [event["seq"] for event in page.events] == [1]
+    assert page.anchor_batch is not None
+    assert [anchor.seq for anchor in page.anchor_batch.sparse] == [1, 2]
+    assert page.anchor_batch.tail is page.anchor_batch.sparse[-1]
+
+
+def test_anchor_selector_mints_nothing_before_snapshot_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_record(1) + b'{"seq":\n')
+    minted = 0
+    mint_anchor = event_reader._mint_verified_anchor
+
+    def count_mint(*args, **kwargs):
+        nonlocal minted
+        minted += 1
+        return mint_anchor(*args, **kwargs)
+
+    monkeypatch.setattr(event_reader, "_mint_verified_anchor", count_mint)
+
+    with pytest.raises(EventLogCorruption):
+        read_event_page_from_anchor(
+            path,
+            from_seq=0,
+            limit=None,
+            anchor_selector=lambda _record: True,
+        )
+
+    assert minted == 0
+
+
+def test_anchor_selector_extends_verified_anchor_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b"".join(_record(seq) for seq in range(1, 5)))
+    anchor = _anchor_for(path, 2)
+
+    page = read_event_page_from_anchor(
+        path,
+        from_seq=2,
+        limit=None,
+        anchor=anchor,
+        anchor_selector=lambda _record: True,
+    )
+
+    assert page.anchor_batch is not None
+    assert [item.seq for item in page.anchor_batch.sparse] == [3, 4]
+    assert page.anchor_batch.tail is page.anchor_batch.sparse[-1]
+
+
+def test_anchor_selector_stops_before_nonmonotonic_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_record(5) + _record(1) + _record(6))
+
+    page = read_event_page_from_anchor(
+        path,
+        from_seq=0,
+        limit=None,
+        anchor_selector=lambda _record: True,
+    )
+
+    assert page.to_page() == read_event_page(path, from_seq=0, limit=None)
+    assert page.anchor_batch is not None
+    assert [anchor.seq for anchor in page.anchor_batch.sparse] == [5]
+    assert page.anchor_batch.tail is page.anchor_batch.sparse[-1]
+
+
 def test_verified_anchor_skips_prefix_and_preserves_page_results(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     path.write_bytes(b"".join(_record(seq, text=f"value-{seq}") for seq in range(1, 101)))
@@ -394,7 +473,9 @@ def test_reader_fails_if_same_file_is_rewritten_after_scan(tmp_path: Path, monke
     assert len(original) == len(replacement)
     path.write_bytes(original)
     iterate = event_reader.iter_open_committed_event_records
+    mint_anchor = event_reader._mint_verified_anchor
     rewritten = False
+    minted = 0
 
     def rewrite_after_scan(*args, **kwargs):
         nonlocal rewritten
@@ -408,14 +489,27 @@ def test_reader_fails_if_same_file_is_rewritten_after_scan(tmp_path: Path, monke
             )
             rewritten = True
 
+    def count_mint(*args, **kwargs):
+        nonlocal minted
+        minted += 1
+        return mint_anchor(*args, **kwargs)
+
     monkeypatch.setattr(
         event_reader,
         "iter_open_committed_event_records",
         rewrite_after_scan,
     )
+    monkeypatch.setattr(event_reader, "_mint_verified_anchor", count_mint)
 
     with pytest.raises(EventLogChanged, match="snapshot changed|rewritten"):
-        read_event_page_from_anchor(path, from_seq=0, limit=None)
+        read_event_page_from_anchor(
+            path,
+            from_seq=0,
+            limit=None,
+            anchor_selector=lambda _record: True,
+        )
+
+    assert minted == 0
 
 
 def test_tail_witness_boundary_mutation_is_snapshot_change(tmp_path: Path, monkeypatch) -> None:

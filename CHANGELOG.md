@@ -12,6 +12,9 @@ out in commit messages and here.
 - Added a Reference-private single-handle, snapshot-bounded event page reader with
   monotonic-prefix and content-verified byte-offset anchors plus raw-read source-work metrics,
   preparing long-run index lookup without changing Core cursor semantics or production readers.
+- Added a Reference-private process-local sparse offset index that retains verified anchors,
+  stages bounded candidates during successful page scans, performs logarithmic warm lookup, and
+  rebuilds safely after source invalidation or process restart.
 
 ### Fixed
 
