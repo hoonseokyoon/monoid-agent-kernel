@@ -224,7 +224,7 @@ def test_verified_anchor_allows_append_on_bound_source(tmp_path: Path) -> None:
     assert observed.to_page() == read_event_page(path, from_seq=2, limit=None)
 
 
-def test_verified_anchor_allows_incomplete_tail_repair(tmp_path: Path) -> None:
+def test_verified_anchor_invalidates_after_incomplete_tail_repair(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     committed = _record(1)
     path.write_bytes(committed + b'{"seq":2')
@@ -232,9 +232,24 @@ def test_verified_anchor_allows_incomplete_tail_repair(tmp_path: Path) -> None:
     with path.open("r+b") as handle:
         handle.truncate(len(committed))
 
-    observed = read_event_page_from_anchor(path, from_seq=1, limit=None, anchor=anchor)
+    with pytest.raises(EventLogChanged, match="truncated"):
+        read_event_page_from_anchor(path, from_seq=1, limit=None, anchor=anchor)
 
-    assert observed.to_page() == read_event_page(path, from_seq=1, limit=None)
+
+def test_incomplete_tail_repair_cannot_hide_rewritten_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    committed = _record(1) + _record(2)
+    path.write_bytes(committed + b'{"seq":3')
+    anchor = _anchor_for(path, 2)
+    rewritten = _record(9) + _record(2)
+    assert len(rewritten) == len(committed)
+    with path.open("r+b") as handle:
+        handle.seek(0)
+        handle.write(rewritten)
+        handle.truncate(len(rewritten))
+
+    with pytest.raises(EventLogChanged, match="truncated"):
+        read_event_page_from_anchor(path, from_seq=2, limit=None, anchor=anchor)
 
 
 def test_reconstructed_proof_cannot_register_a_forged_anchor(tmp_path: Path) -> None:
@@ -482,6 +497,87 @@ def test_incomplete_tail_repair_preserves_captured_page(tmp_path: Path, monkeypa
 
     assert [event["seq"] for event in observed.events] == [1]
     assert path.read_bytes() == committed
+
+
+def test_anchored_page_invalidates_if_incomplete_tail_repairs_during_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    committed = _record(1)
+    path.write_bytes(committed + b'{"seq":2')
+    anchor = _anchor_for(path, 1)
+    inspect = event_reader.inspect_open_committed_jsonl_tail
+
+    def repair_after_snapshot(events_path: Path, handle):
+        tail = inspect(events_path, handle)
+        with events_path.open("r+b") as writer:
+            writer.truncate(tail.committed_end)
+        return tail
+
+    monkeypatch.setattr(
+        event_reader,
+        "inspect_open_committed_jsonl_tail",
+        repair_after_snapshot,
+    )
+
+    with pytest.raises(EventLogChanged, match="shrank while reading"):
+        read_event_page_from_anchor(path, from_seq=1, limit=None, anchor=anchor)
+
+
+def test_anchored_page_rejects_rewrite_and_repair_during_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    committed = _record(1) + _record(2)
+    rewritten = _record(9) + _record(2)
+    assert len(rewritten) == len(committed)
+    path.write_bytes(committed + b'{"seq":3')
+    anchor = _anchor_for(path, 2)
+    inspect = event_reader.inspect_open_committed_jsonl_tail
+
+    def rewrite_and_repair_after_snapshot(events_path: Path, handle):
+        tail = inspect(events_path, handle)
+        with events_path.open("r+b") as writer:
+            writer.seek(0)
+            writer.write(rewritten)
+            writer.truncate(len(rewritten))
+        return tail
+
+    monkeypatch.setattr(
+        event_reader,
+        "inspect_open_committed_jsonl_tail",
+        rewrite_and_repair_after_snapshot,
+    )
+
+    with pytest.raises(EventLogChanged, match="shrank while reading"):
+        read_event_page_from_anchor(path, from_seq=2, limit=None, anchor=anchor)
+
+
+def test_anchored_corruption_path_rejects_repair_during_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_record(1) + b'{"seq":\n' + b"partial")
+    anchor = _anchor_for(path, 1)
+    inspect = event_reader.inspect_open_committed_jsonl_tail
+
+    def repair_after_snapshot(events_path: Path, handle):
+        tail = inspect(events_path, handle)
+        with events_path.open("r+b") as writer:
+            writer.truncate(tail.committed_end)
+        return tail
+
+    monkeypatch.setattr(
+        event_reader,
+        "inspect_open_committed_jsonl_tail",
+        repair_after_snapshot,
+    )
+
+    with pytest.raises(EventLogChanged, match="shrank while reading"):
+        read_event_page_from_anchor(path, from_seq=1, limit=None, anchor=anchor)
 
 
 def test_tail_capture_scan_and_witness_share_one_handle(tmp_path: Path, monkeypatch) -> None:

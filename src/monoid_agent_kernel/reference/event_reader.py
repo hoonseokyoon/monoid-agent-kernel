@@ -264,7 +264,12 @@ def _read_open_event_page(
             raise
         except EventLogCorruption:
             records.close()
-            _verify_open_snapshot(events_path, handle, before)
+            _verify_open_snapshot(
+                events_path,
+                handle,
+                before,
+                reject_physical_shrink=anchor is not None,
+            )
             raise
     finally:
         records.close()
@@ -279,7 +284,12 @@ def _read_open_event_page(
         if exhausted
         else last_examined_end - start_offset
     )
-    _verify_open_snapshot(events_path, handle, before)
+    _verify_open_snapshot(
+        events_path,
+        handle,
+        before,
+        reject_physical_shrink=anchor is not None,
+    )
     return EventPageRead(
         events=tuple(events),
         next_seq=next_seq,
@@ -361,12 +371,7 @@ def _verify_anchor_source(
         or (proof.source_device, proof.source_inode) != (current.device, current.inode)
     ):
         raise EventLogChanged(f"event read anchor belongs to a different log: {events_path}")
-    repaired_incomplete_tail = (
-        proof.source_file_size > proof.source_committed_end
-        and current.file_size == proof.source_committed_end
-        and current.committed_end == proof.source_committed_end
-    )
-    if current.file_size < proof.source_file_size and not repaired_incomplete_tail:
+    if current.file_size < proof.source_file_size:
         raise EventLogChanged(f"event read anchor source was truncated: {events_path}")
     if current.committed_end < proof.source_committed_end:
         raise EventLogChanged(f"event read anchor source lost committed records: {events_path}")
@@ -410,6 +415,8 @@ def _verify_open_snapshot(
     events_path: Path,
     handle: BinaryIO,
     before: CommittedJsonlTail,
+    *,
+    reject_physical_shrink: bool,
 ) -> None:
     if before.last_record_sha256:
         witnesses = iter_open_committed_jsonl_records(
@@ -440,5 +447,7 @@ def _verify_open_snapshot(
         raise EventLogChanged(f"event log identity changed while reading: {events_path}")
     if after.st_size < before.committed_end:
         raise EventLogChanged(f"event log was truncated while reading: {events_path}")
+    if reject_physical_shrink and after.st_size < before.file_size:
+        raise EventLogChanged(f"event read anchor source shrank while reading: {events_path}")
     if after.st_size == before.file_size and after.st_mtime_ns != before.modified_ns:
         raise EventLogChanged(f"event log was rewritten while reading: {events_path}")
