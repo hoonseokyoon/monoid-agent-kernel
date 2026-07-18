@@ -20,6 +20,22 @@ from .contracts import (
     run_checkpoint_store_contract,
 )
 from .fixtures import CompatibilityFixture, load_compatibility_fixtures
+from .provenance import (
+    CONFORMANCE_EVIDENCE_KIND,
+    CONFORMANCE_EVIDENCE_MEDIA_TYPE,
+    CONFORMANCE_EVIDENCE_VERSION,
+    MAX_CONFORMANCE_EVIDENCE_BYTES,
+    ConformanceDigest,
+    ConformanceEvent,
+    ConformanceEvidenceBundle,
+    ConformanceEvidenceReference,
+    ConformanceResource,
+    ConformanceTarget,
+    build_evidence_reference,
+    case_id_sha256,
+    serialize_conformance_evidence,
+    verify_conformance_evidence,
+)
 from .report import (
     CONFORMANCE_REPORT_VERSION,
     ConformanceObservation,
@@ -54,4 +70,18 @@ __all__ = [
     "run_checkpoint_store_contract",
     "CompatibilityFixture",
     "load_compatibility_fixtures",
+    "CONFORMANCE_EVIDENCE_KIND",
+    "CONFORMANCE_EVIDENCE_MEDIA_TYPE",
+    "CONFORMANCE_EVIDENCE_VERSION",
+    "MAX_CONFORMANCE_EVIDENCE_BYTES",
+    "ConformanceDigest",
+    "ConformanceEvent",
+    "ConformanceEvidenceBundle",
+    "ConformanceEvidenceReference",
+    "ConformanceResource",
+    "ConformanceTarget",
+    "build_evidence_reference",
+    "case_id_sha256",
+    "serialize_conformance_evidence",
+    "verify_conformance_evidence",
 ]
