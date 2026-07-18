@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 from bisect import bisect_right
+from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, RLock
@@ -20,6 +23,7 @@ from monoid_agent_kernel.reference.event_reader import (
 
 _DEFAULT_BYTE_STRIDE = 64 * 1024
 _DEFAULT_RECORD_STRIDE = 256
+_DEFAULT_MAX_SOURCES = 128
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,20 @@ class EventIndexStats:
     last_source_bytes_read: int
 
 
+@dataclass(frozen=True)
+class EventIndexCacheStats:
+    """Bounded source-slot cache state for operations and acceptance tests."""
+
+    max_sources: int
+    sources: int
+    pinned_sources: int
+    total_pins: int
+    hits: int
+    misses: int
+    evictions: int
+    bypasses: int
+
+
 class _EventIndexSlot:
     def __init__(self) -> None:
         self.lock = RLock()
@@ -47,6 +65,12 @@ class _EventIndexSlot:
         self.pages = 0
         self.last_records_examined = 0
         self.last_source_bytes_read = 0
+
+
+class _RetainedEventIndexSlot:
+    def __init__(self) -> None:
+        self.slot = _EventIndexSlot()
+        self.pins = 0
 
 
 class _SparseAnchorSelector:
@@ -119,6 +143,7 @@ class ReferenceEventOffsetIndex:
         *,
         byte_stride: int = _DEFAULT_BYTE_STRIDE,
         record_stride: int = _DEFAULT_RECORD_STRIDE,
+        max_sources: int = _DEFAULT_MAX_SOURCES,
     ) -> None:
         if isinstance(byte_stride, bool) or not isinstance(byte_stride, int) or byte_stride < 1:
             raise ValueError("byte_stride must be a positive integer")
@@ -128,10 +153,21 @@ class ReferenceEventOffsetIndex:
             or record_stride < 1
         ):
             raise ValueError("record_stride must be a positive integer")
+        if (
+            isinstance(max_sources, bool)
+            or not isinstance(max_sources, int)
+            or max_sources < 0
+        ):
+            raise ValueError("max_sources must be a non-negative integer")
         self._byte_stride = byte_stride
         self._record_stride = record_stride
+        self._max_sources = max_sources
         self._slots_lock = Lock()
-        self._slots: dict[str, _EventIndexSlot] = {}
+        self._slots: OrderedDict[str, _RetainedEventIndexSlot] = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
+        self._cache_bypasses = 0
 
     def read_page(
         self,
@@ -142,80 +178,162 @@ class ReferenceEventOffsetIndex:
     ) -> EventPageRead:
         """Read a page through the nearest verified offset, rebuilding once if stale."""
         _validate_request(from_seq=from_seq, limit=limit)
-        slot = self._slot(events_path)
-        with slot.lock:
-            anchor = _select_anchor(slot, from_seq)
-            selector = self._selector(slot, cold_sampling=anchor is None)
-            try:
-                page = read_event_page_from_anchor(
+        with self._lease_slot(events_path, create=True, touch=True) as slot:
+            if slot is None:
+                return self._read_uncached_page(
                     events_path,
                     from_seq=from_seq,
                     limit=limit,
-                    anchor=anchor,
-                    anchor_selector=selector,
                 )
-            except (EventLogChanged, EventAnchorUnavailable):
-                _clear_slot(slot, count_invalidation=True)
-                anchor = None
-                selector = self._selector(slot, cold_sampling=True)
-                page = read_event_page_from_anchor(
-                    events_path,
-                    from_seq=from_seq,
-                    limit=limit,
-                    anchor_selector=selector,
+            with slot.lock:
+                anchor = _select_anchor(slot, from_seq)
+                selector = self._selector(slot, cold_sampling=anchor is None)
+                try:
+                    page = read_event_page_from_anchor(
+                        events_path,
+                        from_seq=from_seq,
+                        limit=limit,
+                        anchor=anchor,
+                        anchor_selector=selector,
+                    )
+                except (EventLogChanged, EventAnchorUnavailable):
+                    _clear_slot(slot, count_invalidation=True)
+                    anchor = None
+                    selector = self._selector(slot, cold_sampling=True)
+                    page = read_event_page_from_anchor(
+                        events_path,
+                        from_seq=from_seq,
+                        limit=limit,
+                        anchor_selector=selector,
+                    )
+                if anchor is None:
+                    slot.from_zero_reads += 1
+                self._publish(
+                    slot,
+                    page.anchor_batch,
+                    used_anchor=anchor,
+                    selector=selector,
                 )
-            if anchor is None:
-                slot.from_zero_reads += 1
-            self._publish(
-                slot,
-                page.anchor_batch,
-                used_anchor=anchor,
-                selector=selector,
+                slot.pages += 1
+                slot.last_records_examined = page.records_examined
+                slot.last_source_bytes_read = page.source_bytes_read
+                return page
+
+    @staticmethod
+    def _read_uncached_page(
+        events_path: Path,
+        *,
+        from_seq: int,
+        limit: int | None,
+    ) -> EventPageRead:
+        try:
+            return read_event_page_from_anchor(
+                events_path,
+                from_seq=from_seq,
+                limit=limit,
             )
-            slot.pages += 1
-            slot.last_records_examined = page.records_examined
-            slot.last_source_bytes_read = page.source_bytes_read
-            return page
+        except EventLogChanged:
+            return read_event_page_from_anchor(
+                events_path,
+                from_seq=from_seq,
+                limit=limit,
+            )
 
     def invalidate(self, events_path: Path) -> None:
         """Discard one derived source generation without touching authoritative bytes."""
-        key = _source_key(events_path)
-        with self._slots_lock:
-            slot = self._slots.get(key)
-        if slot is None:
-            return
-        with slot.lock:
-            _clear_slot(slot, count_invalidation=True)
+        with self._lease_slot(events_path, create=False, touch=False) as slot:
+            if slot is None:
+                return
+            with slot.lock:
+                _clear_slot(slot, count_invalidation=True)
 
     def stats(self, events_path: Path) -> EventIndexStats | None:
         """Return a stable snapshot of one source's process-local index metrics."""
-        key = _source_key(events_path)
+        with self._lease_slot(events_path, create=False, touch=False) as slot:
+            if slot is None:
+                return None
+            with slot.lock:
+                tail = slot.tail_anchor
+                tail_is_sparse = tail is not None and any(
+                    anchor is tail for anchor in slot.anchors
+                )
+                return EventIndexStats(
+                    anchor_count=len(slot.anchors) + int(
+                        tail is not None and not tail_is_sparse
+                    ),
+                    indexed_through_seq=tail.seq if tail is not None else 0,
+                    indexed_through_offset=tail.next_byte_offset if tail is not None else 0,
+                    from_zero_reads=slot.from_zero_reads,
+                    invalidations=slot.invalidations,
+                    pages=slot.pages,
+                    last_records_examined=slot.last_records_examined,
+                    last_source_bytes_read=slot.last_source_bytes_read,
+                )
+
+    def cache_stats(self) -> EventIndexCacheStats:
+        """Return cache capacity, pin, and eviction counters without changing recency."""
         with self._slots_lock:
-            slot = self._slots.get(key)
-        if slot is None:
-            return None
-        with slot.lock:
-            tail = slot.tail_anchor
-            tail_is_sparse = tail is not None and any(anchor is tail for anchor in slot.anchors)
-            return EventIndexStats(
-                anchor_count=len(slot.anchors) + int(tail is not None and not tail_is_sparse),
-                indexed_through_seq=tail.seq if tail is not None else 0,
-                indexed_through_offset=tail.next_byte_offset if tail is not None else 0,
-                from_zero_reads=slot.from_zero_reads,
-                invalidations=slot.invalidations,
-                pages=slot.pages,
-                last_records_examined=slot.last_records_examined,
-                last_source_bytes_read=slot.last_source_bytes_read,
+            pinned_sources = sum(entry.pins > 0 for entry in self._slots.values())
+            total_pins = sum(entry.pins for entry in self._slots.values())
+            return EventIndexCacheStats(
+                max_sources=self._max_sources,
+                sources=len(self._slots),
+                pinned_sources=pinned_sources,
+                total_pins=total_pins,
+                hits=self._cache_hits,
+                misses=self._cache_misses,
+                evictions=self._cache_evictions,
+                bypasses=self._cache_bypasses,
             )
 
-    def _slot(self, events_path: Path) -> _EventIndexSlot:
+    @contextmanager
+    def _lease_slot(
+        self,
+        events_path: Path,
+        *,
+        create: bool,
+        touch: bool,
+    ) -> Iterator[_EventIndexSlot | None]:
         key = _source_key(events_path)
+        victims: list[_RetainedEventIndexSlot] = []
         with self._slots_lock:
-            slot = self._slots.get(key)
-            if slot is None:
-                slot = _EventIndexSlot()
-                self._slots[key] = slot
-            return slot
+            entry = self._slots.get(key)
+            if entry is None and create:
+                self._cache_misses += 1
+                if len(self._slots) < self._max_sources:
+                    entry = _RetainedEventIndexSlot()
+                    self._slots[key] = entry
+                else:
+                    victim_key = self._oldest_idle_key_locked()
+                    if victim_key is None:
+                        self._cache_bypasses += 1
+                    else:
+                        victims.append(self._slots.pop(victim_key))
+                        self._cache_evictions += 1
+                        entry = _RetainedEventIndexSlot()
+                        self._slots[key] = entry
+            elif entry is not None and create:
+                self._cache_hits += 1
+            if entry is not None:
+                entry.pins += 1
+                if touch:
+                    self._slots.move_to_end(key)
+        victims.clear()
+
+        if entry is None:
+            yield None
+            return
+        try:
+            yield entry.slot
+        finally:
+            with self._slots_lock:
+                entry.pins -= 1
+
+    def _oldest_idle_key_locked(self) -> str | None:
+        return next(
+            (key for key, entry in self._slots.items() if entry.pins == 0),
+            None,
+        )
 
     def _selector(
         self,
