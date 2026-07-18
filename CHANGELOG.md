@@ -17,6 +17,8 @@ out in commit messages and here.
   rebuilds safely after source invalidation or process restart.
 - Bounded the sparse index's retained source slots with a pinned least-recently-used policy and
   an authoritative uncached fallback for saturated admission, plus cache-capacity metrics.
+- Wired one backend-owned sparse event index into root, descendant, and diagnostics projections,
+  with configurable retained-source capacity and unchanged Core subscription semantics.
 
 ### Fixed
 
