@@ -19,6 +19,8 @@ out in commit messages and here.
   an authoritative uncached fallback for saturated admission, plus cache-capacity metrics.
 - Wired one backend-owned sparse event index into root, descendant, and diagnostics projections,
   with configurable retained-source capacity and unchanged Core subscription semantics.
+- Added exact-byte conformance evidence descriptors plus a checked reader that migrates retained
+  v1 reports into the v2 provenance model before the external runner changes writers.
 
 ### Fixed
 
