@@ -20,9 +20,13 @@ out in commit messages and here.
 - Wired one backend-owned sparse event index into root, descendant, and diagnostics projections,
   with configurable retained-source capacity and unchanged Core subscription semantics.
 - Added exact-byte conformance evidence descriptors plus a checked reader that migrates retained
-  v1 reports into the v2 provenance model before the external runner changes writers.
+  v1 reports into the v2 provenance model with provenance explicitly unavailable.
 - Added offline minimal-agent report verification that binds exact evidence bytes to the report
   target, profile, lifecycle completeness, rule references, and recomputed rule semantics.
+- Added opt-in v2 external reports. When `--evidence-dir` meets an evidence-capable adapter, the
+  runner retains content-addressed normalized evidence, binds all four rules to its digest,
+  self-verifies, and publishes evidence, JUnit, JSON, then stdout. Default report-only and legacy
+  adapter runs preserve the v1 output contract.
 
 ### Fixed
 

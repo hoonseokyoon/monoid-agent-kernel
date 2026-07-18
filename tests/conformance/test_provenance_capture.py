@@ -64,9 +64,7 @@ def _evidence(*, event_seqs: tuple[int, ...] = (1, 2)) -> ConformanceEvidenceBun
         states=("submitted", "running", "completed"),
         result_run_id_matches=True,
         result_status="completed",
-        events=tuple(
-            ConformanceEvent(seq=seq, event_type="run.observed") for seq in event_seqs
-        ),
+        events=tuple(ConformanceEvent(seq=seq, event_type="run.observed") for seq in event_seqs),
         events_complete=True,
         next_seq=(event_seqs[-1] + 1 if event_seqs else 0),
     )
@@ -156,8 +154,7 @@ def test_enhanced_execution_outcomes_verify_against_the_same_evidence() -> None:
         harness_id="legacy-external",
         profile_id="minimal-agent",
         outcomes=tuple(
-            replace(outcome, evidence_refs=(evidence_id,))
-            for outcome in execution.outcomes
+            replace(outcome, evidence_refs=(evidence_id,)) for outcome in execution.outcomes
         ),
         schema_version=CONFORMANCE_REPORT_V2,
         provenance_status="available",
@@ -183,9 +180,7 @@ def test_mismatched_capture_becomes_safe_error_outcomes() -> None:
 
     assert execution.evidence == ()
     assert all(outcome.status == "error" for outcome in execution.outcomes)
-    assert {outcome.error for outcome in execution.outcomes} == {
-        "ValueError: details redacted"
-    }
+    assert {outcome.error for outcome in execution.outcomes} == {"ValueError: details redacted"}
     assert "run_external" not in repr(execution.outcomes)
 
 
@@ -237,7 +232,7 @@ def test_non_increasing_enhanced_evidence_fails_closed() -> None:
     assert all(outcome.status == "error" for outcome in execution.outcomes)
 
 
-def test_runner_keeps_v1_report_and_junit_shape_for_enhanced_harness(
+def test_report_only_runner_marks_discarded_evidence_unavailable(
     tmp_path: Path,
 ) -> None:
     report = run_conformance(_EvidenceHarness(), "minimal-agent")
@@ -258,8 +253,7 @@ def test_runner_keeps_v1_report_and_junit_shape_for_enhanced_harness(
         "summary",
         "outcomes",
     }
-    assert "target" not in payload
-    assert "evidence" not in payload
+    assert all("evidence_refs" not in outcome for outcome in payload["outcomes"])
     assert suite.find("properties") is None
     assert suite.attrib["hostname"] == "legacy-external"
 
@@ -417,10 +411,6 @@ def test_reference_capture_paginates_and_excludes_raw_fields(
     )
     assert verify_conformance_evidence(reference, data) == bundle
     event_outcome = next(
-        outcome
-        for outcome in execution.outcomes
-        if outcome.rule_id == "MIN-04-EVENT-SEQUENCE"
+        outcome for outcome in execution.outcomes if outcome.rule_id == "MIN-04-EVENT-SEQUENCE"
     )
-    assert event_outcome.observations[-1].actual == tuple(
-        event.seq for event in bundle.events
-    )
+    assert event_outcome.observations[-1].actual == tuple(event.seq for event in bundle.events)

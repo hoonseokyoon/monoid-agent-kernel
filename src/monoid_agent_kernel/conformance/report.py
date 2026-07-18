@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
@@ -21,7 +23,6 @@ from monoid_agent_kernel.identifiers import namespaced_id
 
 CONFORMANCE_REPORT_V1 = namespaced_id("conformance-report.v1")
 CONFORMANCE_REPORT_V2 = namespaced_id("conformance-report.v2")
-# Reader-first rollout: the runner remains a v1 writer until evidence wiring flips this alias.
 CONFORMANCE_REPORT_VERSION = CONFORMANCE_REPORT_V1
 CONFORMANCE_REPORT_READER_VERSION = CONFORMANCE_REPORT_V2
 SUPPORTED_CONFORMANCE_REPORT_VERSIONS = (
@@ -30,6 +31,7 @@ SUPPORTED_CONFORMANCE_REPORT_VERSIONS = (
 )
 MAX_CONFORMANCE_REPORT_BYTES = 16 * 1024 * 1024
 _REPORT_READ_CHUNK_BYTES = 64 * 1024
+_XML_FORBIDDEN_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufffe\uffff]")
 RuleStatus = Literal["passed", "failed", "error", "skipped"]
 ReportProvenanceStatus = Literal["available", "unavailable"]
 
@@ -208,7 +210,9 @@ class ConformanceReport:
             if self.provenance_status == "available" and self.target is None:
                 raise ValueError("available conformance provenance requires a target")
             if self.provenance_status == "unavailable" and (
-                self.target is not None or evidence or any(outcome.evidence_refs for outcome in outcomes)
+                self.target is not None
+                or evidence
+                or any(outcome.evidence_refs for outcome in outcomes)
             ):
                 raise ValueError("unavailable conformance provenance must be empty")
             if self.target is not None and not isinstance(self.target, ConformanceTarget):
@@ -244,51 +248,143 @@ class ConformanceReport:
 
     def write_json(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(self.to_json(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        path.write_bytes(self.to_json_bytes())
+
+    def to_json_bytes(self) -> bytes:
+        """Return the UTF-8 file projection, preserving v1 native newlines."""
+
+        text = (
+            json.dumps(
+                self.to_json(),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        )
+        if self.schema_version == CONFORMANCE_REPORT_V1 and os.linesep != "\n":
+            text = text.replace("\n", os.linesep)
+        return text.encode("utf-8")
+
+    def to_junit_bytes(self) -> bytes:
+        """Return the JUnit projection without embedding raw evidence bundles."""
+
+        suite = self._junit_suite()
+        tree = ET.ElementTree(suite)
+        ET.indent(tree, space="  ")
+        return ET.tostring(
+            suite,
+            encoding="utf-8",
+            xml_declaration=True,
         )
 
     def write_junit(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(self.to_junit_bytes())
+
+    def _junit_suite(self) -> ET.Element:
+        include_provenance = self.schema_version == CONFORMANCE_REPORT_V2
         suite = ET.Element(
             "testsuite",
             {
-                "name": f"monoid-conformance:{self.profile_id}",
+                "name": _xml_visual_escape(f"monoid-conformance:{self.profile_id}"),
                 "tests": str(len(self.outcomes)),
                 "failures": str(sum(outcome.status == "failed" for outcome in self.outcomes)),
                 "errors": str(sum(outcome.status == "error" for outcome in self.outcomes)),
                 "skipped": str(sum(outcome.status == "skipped" for outcome in self.outcomes)),
-                "time": f"{self.duration_s:.6f}",
+                "time": (
+                    f"{self.duration_s:.3f}" if include_provenance else f"{self.duration_s:.6f}"
+                ),
             },
         )
-        suite.set("hostname", self.harness_id)
+        suite.set("hostname", _xml_visual_escape(self.harness_id))
+        if include_provenance:
+            properties = ET.SubElement(suite, "properties")
+            _junit_property(properties, "monoid.report.schema_version", self.schema_version)
+            _junit_property(
+                properties,
+                "monoid.provenance.status",
+                self.provenance_status,
+            )
+            if self.target is not None:
+                _junit_property(
+                    properties,
+                    "monoid.target",
+                    json.dumps(
+                        self.target.to_json(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                )
+            for reference in self.evidence:
+                _junit_property(
+                    properties,
+                    f"monoid.evidence.{reference.evidence_id}",
+                    json.dumps(
+                        reference.to_json(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                )
+            _junit_property(
+                properties,
+                "monoid.rule_evidence_refs",
+                json.dumps(
+                    [
+                        {
+                            "rule_id": outcome.rule_id,
+                            "evidence_refs": list(outcome.evidence_refs),
+                        }
+                        for outcome in self.outcomes
+                    ],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+            )
         for outcome in self.outcomes:
             case = ET.SubElement(
                 suite,
                 "testcase",
                 {
-                    "classname": self.profile_id,
-                    "name": outcome.rule_id,
+                    "classname": _xml_visual_escape(self.profile_id),
+                    "name": _xml_visual_escape(outcome.rule_id),
                     "time": f"{outcome.duration_s:.6f}",
                 },
             )
             if outcome.status == "failed":
                 failure = ET.SubElement(
-                    case, "failure", {"message": outcome.error or "rule failed"}
+                    case,
+                    "failure",
+                    {"message": _xml_visual_escape(outcome.error or "rule failed")},
                 )
-                failure.text = json.dumps(outcome.to_json(), sort_keys=True)
+                failure.text = json.dumps(
+                    outcome.to_json(include_evidence_refs=include_provenance),
+                    sort_keys=True,
+                    allow_nan=False,
+                )
             elif outcome.status == "error":
-                error = ET.SubElement(case, "error", {"message": outcome.error or "rule error"})
-                error.text = json.dumps(outcome.to_json(), sort_keys=True)
+                error = ET.SubElement(
+                    case,
+                    "error",
+                    {"message": _xml_visual_escape(outcome.error or "rule error")},
+                )
+                error.text = json.dumps(
+                    outcome.to_json(include_evidence_refs=include_provenance),
+                    sort_keys=True,
+                    allow_nan=False,
+                )
             elif outcome.status == "skipped":
                 ET.SubElement(case, "skipped")
             system_out = ET.SubElement(case, "system-out")
             system_out.text = json.dumps(
-                [observation.to_json() for observation in outcome.observations], sort_keys=True
+                [observation.to_json() for observation in outcome.observations],
+                sort_keys=True,
+                allow_nan=False,
             )
-        tree = ET.ElementTree(suite)
-        ET.indent(tree, space="  ")
-        tree.write(path, encoding="utf-8", xml_declaration=True)
+        return suite
 
 
 def observation(
@@ -351,9 +447,7 @@ def read_conformance_report(
         raise ValueError("conformance report max_bytes must be a non-negative integer")
     try:
         if path.stat().st_size > max_bytes:
-            return _CONFORMANCE_REPORT_CODEC.corrupt(
-                "conformance report exceeds the byte limit"
-            )
+            return _CONFORMANCE_REPORT_CODEC.corrupt("conformance report exceeds the byte limit")
         with path.open("rb") as stream:
             data = bytearray()
             while len(data) <= max_bytes:
@@ -366,9 +460,7 @@ def read_conformance_report(
                     break
                 data.extend(chunk)
         if len(data) > max_bytes:
-            return _CONFORMANCE_REPORT_CODEC.corrupt(
-                "conformance report exceeds the byte limit"
-            )
+            return _CONFORMANCE_REPORT_CODEC.corrupt("conformance report exceeds the byte limit")
         payload = json.loads(
             data.decode("utf-8"),
             object_pairs_hook=_unique_json_object,
@@ -651,6 +743,24 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _reject_json_constant(value: str) -> Any:
     del value
     raise ValueError("conformance report JSON contains a non-finite number")
+
+
+def _junit_property(parent: ET.Element, name: str, value: str) -> None:
+    ET.SubElement(
+        parent,
+        "property",
+        {
+            "name": _xml_visual_escape(name),
+            "value": _xml_visual_escape(value),
+        },
+    )
+
+
+def _xml_visual_escape(value: str) -> str:
+    return _XML_FORBIDDEN_RE.sub(
+        lambda match: f"#x{ord(match.group()):02X}",
+        value,
+    )
 
 
 _CONFORMANCE_REPORT_CODEC = DurableCodec[ConformanceReport](

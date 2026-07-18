@@ -12,7 +12,9 @@ import pytest
 from monoid_agent_kernel.conformance import runner
 from monoid_agent_kernel.conformance.profiles.minimal_agent import MINIMAL_AGENT_RULE_IDS
 from monoid_agent_kernel.conformance.report import CONFORMANCE_REPORT_VERSION
+from monoid_agent_kernel.conformance.report import read_conformance_report
 from monoid_agent_kernel.conformance.runner import run_conformance
+from monoid_agent_kernel.conformance.verification import verify_conformance_report
 
 
 class _MinimalHarness:
@@ -37,6 +39,9 @@ def test_external_runner_returns_typed_stable_outcomes() -> None:
 
     assert report.schema_version == CONFORMANCE_REPORT_VERSION
     assert report.passed
+    assert report.provenance_status == "unavailable"
+    assert report.target is None
+    assert report.evidence == ()
     assert tuple(outcome.rule_id for outcome in report.outcomes) == MINIMAL_AGENT_RULE_IDS
     assert report.to_json()["summary"] == {
         "total": 4,
@@ -59,6 +64,7 @@ def test_external_runner_reports_rule_failure_without_hiding_observations() -> N
 def test_module_runner_writes_json_and_junit_for_reference_backend(tmp_path: Path) -> None:
     json_path = tmp_path / "conformance.json"
     junit_path = tmp_path / "conformance.xml"
+    evidence_dir = tmp_path / "evidence"
     root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(
@@ -77,6 +83,8 @@ def test_module_runner_writes_json_and_junit_for_reference_backend(tmp_path: Pat
             str(json_path),
             "--junit-out",
             str(junit_path),
+            "--evidence-dir",
+            str(evidence_dir),
         ],
         cwd=root,
         env=env,
@@ -91,6 +99,17 @@ def test_module_runner_writes_json_and_junit_for_reference_backend(tmp_path: Pat
     file_report = json.loads(json_path.read_text(encoding="utf-8"))
     assert stdout_report == file_report
     assert file_report["passed"] is True
+    assert file_report["provenance_status"] == "available"
+    checked = read_conformance_report(json_path)
+    assert checked.status == "loaded" and checked.value is not None
+    reference = checked.value.evidence[0]
+    evidence_data = (evidence_dir / reference.resource.name).read_bytes()
+    verified = verify_conformance_report(
+        checked.value,
+        {reference.evidence_id: evidence_data},
+    )
+    assert verified.status == "verified"
+    assert verified.report_passed is True
     suite = ET.parse(junit_path).getroot()
     assert suite.attrib["tests"] == "4"
     assert suite.attrib["failures"] == "0"

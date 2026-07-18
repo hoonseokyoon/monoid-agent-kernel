@@ -50,6 +50,8 @@ optional external-agent envelope profile for runtimes that exchange messages wit
 The conformance package defines profile-specific Protocol families:
 
 - `MinimalAgentHarness`: reports one submission-to-result lifecycle and its event sequence.
+- `MinimalAgentEvidenceHarness`: optionally returns the same case with a closed, secret-minimized
+  evidence bundle from one invocation.
 - `ToolAgentHarness`: runs tool surface admission and generic approval behavior cases.
 - `ControlPlaneHarness`: runs decision and control audit sequencing behavior cases.
 - `DurableRunnerHarness`: runs event sequence, recovery metadata, and subagent diagnostics cases.
@@ -78,7 +80,8 @@ python -m monoid_agent_kernel.conformance.runner \
   --harness your_package.conformance:create_harness \
   --profile minimal-agent \
   --json-out build/conformance.json \
-  --junit-out build/conformance.xml
+  --junit-out build/conformance.xml \
+  --evidence-dir build/conformance-evidence
 ```
 
 Exit code `0` means every rule passed, `1` means at least one rule failed, and `2` means the runner
@@ -87,11 +90,77 @@ observations. `load_compatibility_fixtures()` supplies packaged historical wire 
 payloads for downstream reader tests. JSON, JUnit, and console diagnostics retain a safe exception
 category and redact the exception body; keep raw stack traces in protected implementation logs.
 
-The v0.18 command-line runner executes the `minimal-agent` profile. Other profile harnesses remain
+The command-line runner executes the `minimal-agent` profile. Other profile harnesses remain
 Python test integrations. Store and broker implementers call
 `run_checkpoint_store_contract(factory, root)` and `run_capability_broker_contract(factory)`
 directly from their own pytest suites or CI tools. These functions return the same typed rule
 outcomes and carry no pytest dependency.
+
+## Provenance and retained evidence
+
+An evidence-retaining v2 report marks provenance `available` only while the caller owns the exact
+evidence bytes. The command-line runner emits that report when `--evidence-dir` is present and the
+adapter implements `MinimalAgentEvidenceHarness`. A report-only call or a legacy adapter preserves
+the v1 output contract. Programmatic callers use
+`monoid_agent_kernel.conformance.runner.execute_conformance(..., retain_evidence=True)` to receive
+the report and exact evidence artifacts from the same invocation.
+
+One normalized lifecycle bundle supports all four `MIN-*` outcomes. Every outcome references the
+stable evidence id `minimal-agent.lifecycle`. The runner stores the bytes under a content-addressed
+name such as:
+
+```text
+minimal-agent.lifecycle.sha256-<64 lowercase hexadecimal digits>.json
+```
+
+Resolve an artifact as `evidence_dir / report.evidence[0].resource.name`. The runner verifies the
+assembled report and bytes before publication, reuses an identical content-addressed artifact,
+and rejects conflicting content without overwriting it. Evidence publication requires atomic
+no-replace support; the runner fails before publishing the report when that primitive is
+unavailable. Publication writes evidence first,
+JUnit second, JSON last, and stdout after file outputs succeed. JSON plus retained evidence is the
+authoritative verification set. JUnit remains a secondary xUnit2-compatible CI projection with
+suite-level target, evidence, and per-rule reference descriptors; it never embeds the raw evidence
+bundle. Give each concurrent runner its own mutable JSON and JUnit destinations; content-addressed
+evidence directories may be shared.
+
+Offline verification does not invoke the original harness:
+
+```python
+from pathlib import Path
+
+from monoid_agent_kernel.conformance import (
+    read_conformance_report,
+    verify_conformance_report,
+)
+
+report_path = Path("build/conformance.json")
+evidence_dir = Path("build/conformance-evidence")
+loaded = read_conformance_report(report_path)
+assert loaded.status == "loaded" and loaded.value is not None
+report = loaded.value
+assert report.provenance_status == "available"
+reference = report.evidence[0]
+result = verify_conformance_report(
+    report,
+    {reference.evidence_id: (evidence_dir / reference.resource.name).read_bytes()},
+)
+assert result.verified
+```
+
+The closed evidence schema retains sanitized target identity, a domain-separated case fingerprint,
+lifecycle scalars, and event sequence/type pairs. It excludes raw run ids, provider errors, event
+payloads, model text, tool arguments, tokens, timestamps, filesystem paths, and environment data.
+`harness_id` is public adapter metadata; adapters must keep credentials, paths, and user data out of
+that field. The JUnit projection renders XML-forbidden code points as visible `#xHEX` tokens so
+public metadata cannot produce malformed XML.
+
+The harness adapter is the trusted translator and asserts that the normalized bundle reflects the
+tested runtime. Offline report verification first checks exact-byte digest integrity, then checks
+target/profile binding, lifecycle completeness, rule-reference coverage, and internal
+report/evidence semantic consistency. Target metadata remains a sanitized self-assertion. Producer
+authenticity, freshness, and adapter honesty require a trusted distribution channel, signature, or
+external attestation.
 
 ## Reference Full
 
