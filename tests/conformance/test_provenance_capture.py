@@ -25,8 +25,13 @@ from monoid_agent_kernel.conformance.provenance import (
     serialize_conformance_evidence,
     verify_conformance_evidence,
 )
-from monoid_agent_kernel.conformance.report import CONFORMANCE_REPORT_VERSION
+from monoid_agent_kernel.conformance.report import (
+    CONFORMANCE_REPORT_V2,
+    CONFORMANCE_REPORT_VERSION,
+    ConformanceReport,
+)
 from monoid_agent_kernel.conformance.runner import run_conformance
+from monoid_agent_kernel.conformance.verification import verify_conformance_report
 from monoid_agent_kernel.reference.conformance import ReferenceBackendHarness
 
 
@@ -135,6 +140,40 @@ def test_enhanced_harness_executes_one_case_and_preserves_failed_sequence() -> N
     failed = [outcome for outcome in execution.outcomes if not outcome.passed]
     assert [outcome.rule_id for outcome in failed] == ["MIN-04-EVENT-SEQUENCE"]
     assert b"raw-result-secret" not in serialize_conformance_evidence(execution.evidence[0])
+
+
+def test_enhanced_execution_outcomes_verify_against_the_same_evidence() -> None:
+    execution = execute_minimal_agent_profile(_EvidenceHarness())
+    bundle = execution.evidence[0]
+    evidence_id = "minimal-agent.lifecycle"
+    data = serialize_conformance_evidence(bundle)
+    reference = build_evidence_reference(
+        bundle,
+        evidence_id=evidence_id,
+        artifact_name="minimal-agent.evidence.json",
+    )
+    report = ConformanceReport(
+        harness_id="legacy-external",
+        profile_id="minimal-agent",
+        outcomes=tuple(
+            replace(outcome, evidence_refs=(evidence_id,))
+            for outcome in execution.outcomes
+        ),
+        schema_version=CONFORMANCE_REPORT_V2,
+        provenance_status="available",
+        target=bundle.target,
+        evidence=(reference,),
+    )
+
+    verified = verify_conformance_report(report, {evidence_id: data})
+    result_outcome = next(
+        outcome for outcome in execution.outcomes if outcome.rule_id == "MIN-03-RESULT"
+    )
+
+    assert verified.status == "verified"
+    assert all(type(item.expected) is bool for item in result_outcome.observations)
+    assert all(type(item.actual) is bool for item in result_outcome.observations)
+    assert "run_external" not in repr(execution.outcomes)
 
 
 def test_mismatched_capture_becomes_safe_error_outcomes() -> None:

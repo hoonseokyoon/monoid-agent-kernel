@@ -133,10 +133,14 @@ def _outcomes_from_case(
             PROFILE.profile_id,
             (
                 observation(
-                    "result_run_id", expected=run_id, actual=str(result.get("run_id") or "")
+                    "result_run_id",
+                    expected=True,
+                    actual=str(result.get("run_id") or "") == run_id,
                 ),
                 observation(
-                    "result_status", expected="completed", actual=str(result.get("status") or "")
+                    "result_status",
+                    expected=True,
+                    actual=str(result.get("status") or "") == "completed",
                 ),
             ),
         ),

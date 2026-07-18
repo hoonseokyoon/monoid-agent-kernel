@@ -26,6 +26,8 @@ out in commit messages and here.
 
 ### Fixed
 
+- Projected MIN-03 result identity and completion checks as booleans so raw run identifiers and
+  result status strings do not enter conformance report projections.
 - Treats newline-terminated event-log records as committed and repairs uncommitted crash fragments
   before recorder or direct append, preventing malformed concatenation and sequence reuse during
   restart. Committed records with invalid sequence fields now fail closed.
