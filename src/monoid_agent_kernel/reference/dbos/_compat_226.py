@@ -61,6 +61,12 @@ class _OwnedDbosRuntime226:
         with _DBOS_ADAPTER_LOCK:
             return self._owns_globals_unlocked()
 
+    def require_released(self) -> None:
+        """Verify no DBOS singleton or registry was populated after owned shutdown."""
+
+        with _DBOS_ADAPTER_LOCK:
+            _require_globals_cleared(self._implementation)
+
     def _owns_globals_unlocked(self) -> bool:
         implementation = self._implementation
         return (
@@ -303,6 +309,10 @@ def _construct_owned_runtime_226(dbos_module: Any, config: Any) -> _OwnedDbosRun
                 "an existing DBOS runtime or registry is active; shared host ownership is required"
             )
         marker = object()
+        if any(_is_dbos_owned_thread(thread) for thread in threading.enumerate()):
+            raise _DbosOwnershipConflict(
+                "preexisting DBOS worker threads are active; process restart is required"
+            )
         owned_runtime_type = _owned_runtime_type(dbos_module.DBOS, marker)
         try:
             runtime = owned_runtime_type(
