@@ -52,6 +52,12 @@ from .report import (
     read_conformance_report,
 )
 from .profiles import PROFILES, PROFILE_BY_ID, ProfileMetadata, get_profile
+from .verification import (
+    ConformanceVerificationIssueCode,
+    ConformanceVerificationResult,
+    ConformanceVerificationStatus,
+    verify_conformance_report,
+)
 
 __all__ = [
     "BackendHarness",
@@ -102,4 +108,8 @@ __all__ = [
     "case_id_sha256",
     "serialize_conformance_evidence",
     "verify_conformance_evidence",
+    "ConformanceVerificationIssueCode",
+    "ConformanceVerificationResult",
+    "ConformanceVerificationStatus",
+    "verify_conformance_report",
 ]

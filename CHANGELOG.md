@@ -21,6 +21,8 @@ out in commit messages and here.
   with configurable retained-source capacity and unchanged Core subscription semantics.
 - Added exact-byte conformance evidence descriptors plus a checked reader that migrates retained
   v1 reports into the v2 provenance model before the external runner changes writers.
+- Added offline minimal-agent report verification that binds exact evidence bytes to the report
+  target, profile, lifecycle completeness, rule references, and recomputed rule semantics.
 
 ### Fixed
 
