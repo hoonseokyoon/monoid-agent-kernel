@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import subprocess
@@ -64,6 +65,16 @@ class _FakeRuntime:
 
     def listen_queues(self, queues: tuple[str, ...]) -> None:
         self.calls.append(("runtime:listen", queues))
+
+    def preflight_launch(self) -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if running_loop is not None:
+            raise _DbosOwnershipConflict(
+                "DBOS Reference launch requires a dedicated synchronous lifecycle thread"
+            )
 
     def launch(self) -> None:
         self.calls.append("runtime:launch")
@@ -556,6 +567,29 @@ def test_live_base_exception_is_replaced_with_a_static_ownership_error(
     assert host.state == "fenced"
     with pytest.raises(DbosProcessOwnershipError):
         DbosRuntimeHost(_config())
+
+
+def test_async_launch_rejection_rolls_back_and_releases_process_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    fake = _FakeRuntime(calls)
+    _install_fake_runtime(monkeypatch, fake)
+    host = DbosRuntimeHost(_config())
+    host._register_participant(_participant("control", "queue-control", calls))
+
+    async def _attempt_launch() -> None:
+        with pytest.raises(DbosProcessOwnershipError, match="synchronous lifecycle thread"):
+            host.launch()
+
+    asyncio.run(_attempt_launch())
+
+    assert host.state == "closed"
+    assert host.accepting is False
+    assert "runtime:launch" not in calls
+    assert ("runtime:destroy", 0) in calls
+    replacement = DbosRuntimeHost(_config())
+    replacement.close()
 
 
 def test_close_racing_launch_waits_and_completes_one_shutdown(
@@ -1290,6 +1324,59 @@ def test_real_dbos_idle_host_closes_with_the_minimum_grace(tmp_path: Path) -> No
         assert getattr(implementation, "_dbos_global_instance", None) is None
         assert getattr(implementation, "_dbos_global_registry", None) is None
     finally:
+        if host is not None and host.state not in {"closed", "fenced"}:
+            host.close()
+        dbos.DBOS.destroy(destroy_registry=True, workflow_completion_timeout_sec=0)
+
+
+def test_real_dbos_async_launch_rejection_releases_ownership(tmp_path: Path) -> None:
+    dbos = pytest.importorskip("dbos")
+    if _delegate_real_dbos_case(
+        "test_real_dbos_async_launch_rejection_releases_ownership",
+        "async-launch",
+    ):
+        return
+    implementation = importlib.import_module("dbos._dbos")
+    dbos.DBOS.destroy(destroy_registry=True, workflow_completion_timeout_sec=0)
+    host: DbosRuntimeHost | None = None
+    replacement: DbosRuntimeHost | None = None
+    try:
+        config = DbosHostConfig(
+            system_database_url=f"sqlite:///{tmp_path / 'async-launch.sqlite'}",
+            name="monoid-host-async-launch",
+            application_version="monoid-host-async-launch-v1",
+            executor_id="stable-async-launch-slot",
+        )
+        host = DbosRuntimeHost(config)
+        host._register_participant(
+            _DbosHostParticipant(
+                participant_id="async-launch",
+                queue_name="monoid-reference-host-async-launch-v1",
+                host_config=config,
+                register_workflows=lambda runtime: None,
+                preflight=lambda: None,
+                register_queue=lambda runtime: None,
+                stop_admission=lambda: None,
+                active_count=lambda: 0,
+                mark_closed=lambda: None,
+            )
+        )
+
+        async def _attempt_launch() -> None:
+            with pytest.raises(DbosProcessOwnershipError, match="synchronous lifecycle thread"):
+                host.launch()
+
+        asyncio.run(_attempt_launch())
+
+        assert host.state == "closed"
+        assert getattr(implementation, "_dbos_global_instance", None) is None
+        assert getattr(implementation, "_dbos_global_registry", None) is None
+        replacement = DbosRuntimeHost(config)
+        replacement.close()
+        assert replacement.state == "closed"
+    finally:
+        if replacement is not None and replacement.state not in {"closed", "fenced"}:
+            replacement.close()
         if host is not None and host.state not in {"closed", "fenced"}:
             host.close()
         dbos.DBOS.destroy(destroy_registry=True, workflow_completion_timeout_sec=0)

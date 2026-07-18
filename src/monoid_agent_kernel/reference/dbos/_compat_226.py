@@ -160,17 +160,17 @@ class _OwnedDbosRuntime226:
             self._runtime._listening_queues = list(queues)
             self.require_owned()
 
+    def preflight_launch(self) -> None:
+        """Reject an asynchronous lifecycle caller before launch mutates DBOS state."""
+
+        with _DBOS_ADAPTER_LOCK:
+            self.require_owned()
+            self._require_synchronous_launch()
+
     def launch(self) -> None:
         with _DBOS_ADAPTER_LOCK:
             self.require_owned()
-            try:
-                running_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                running_loop = None
-            if running_loop is not None:
-                raise _DbosOwnershipConflict(
-                    "DBOS Reference launch requires a dedicated synchronous lifecycle thread"
-                )
+            self._require_synchronous_launch()
             if not self._runtime._launched and self._async_executor is None:
                 background_event_loop = self._runtime._background_event_loop
                 background_event_loop.start()
@@ -183,6 +183,17 @@ class _OwnedDbosRuntime226:
                 background_loop.set_default_executor(self._async_executor)
             self._runtime._launch()
             self.require_owned()
+
+    @staticmethod
+    def _require_synchronous_launch() -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is not None:
+            raise _DbosOwnershipConflict(
+                "DBOS Reference launch requires a dedicated synchronous lifecycle thread"
+            )
 
     def register_queue(
         self,

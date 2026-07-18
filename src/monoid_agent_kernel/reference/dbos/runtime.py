@@ -210,6 +210,8 @@ class DbosRuntimeHost:
 
         try:
             self._require_launching_owner()
+            self._runtime.preflight_launch()
+            self._require_launching_owner()
             for participant in participants:
                 participant.register_workflows(self._runtime)
                 self._require_launching_owner()
@@ -220,6 +222,9 @@ class DbosRuntimeHost:
                 tuple(sorted(participant.queue_name for participant in participants))
             )
             self._require_launching_owner()
+        except _DbosOwnershipConflict as exc:
+            self._rollback_launch(participants)
+            raise DbosProcessOwnershipError(str(exc)) from None
         except DbosProcessOwnershipError:
             self._fence("DBOS host launch ownership changed; terminate the process")
             raise

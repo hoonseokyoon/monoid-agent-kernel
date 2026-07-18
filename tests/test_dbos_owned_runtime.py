@@ -93,6 +93,24 @@ def test_owned_adapter_runs_work_without_classmethod_dispatch(tmp_path: Path) ->
     assert getattr(implementation, "_dbos_global_registry", None) is None
 
 
+def test_owned_adapter_rejects_async_launch_before_mutation(tmp_path: Path) -> None:
+    owned = _construct_owned_runtime_226(dbos, _config(tmp_path, stem="async-launch"))
+
+    async def _attempt_launch() -> None:
+        with pytest.raises(_DbosOwnershipConflict, match="synchronous lifecycle thread"):
+            owned.preflight_launch()
+        with pytest.raises(_DbosOwnershipConflict, match="synchronous lifecycle thread"):
+            owned.launch()
+
+    asyncio.run(_attempt_launch())
+
+    assert owned._runtime._launched is False
+    assert owned._async_executor is None
+    owned.destroy(workflow_completion_timeout_sec=0, deadline=time.monotonic() + 3)
+    assert getattr(implementation, "_dbos_global_instance", None) is None
+    assert getattr(implementation, "_dbos_global_registry", None) is None
+
+
 @pytest.mark.parametrize("decorator_name", ["step", "workflow"])
 def test_owned_adapter_guards_decorator_application_after_replacement(
     tmp_path: Path,
