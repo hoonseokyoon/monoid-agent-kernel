@@ -21,9 +21,13 @@ out in commit messages and here.
   with configurable retained-source capacity and unchanged Core subscription semantics.
 - Added exact-byte conformance evidence descriptors plus a checked reader that migrates retained
   v1 reports into the v2 provenance model before the external runner changes writers.
+- Added offline minimal-agent report verification that binds exact evidence bytes to the report
+  target, profile, lifecycle completeness, rule references, and recomputed rule semantics.
 
 ### Fixed
 
+- Projected MIN-03 result identity and completion checks as booleans so raw run identifiers and
+  result status strings do not enter conformance report projections.
 - Treats newline-terminated event-log records as committed and repairs uncommitted crash fragments
   before recorder or direct append, preventing malformed concatenation and sequence reuse during
   restart. Committed records with invalid sequence fields now fail closed.
