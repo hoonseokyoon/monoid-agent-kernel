@@ -657,9 +657,9 @@ generation metadata; copied or field-tampered anchors and cross-log, truncated, 
 rewritten sources fail closed. A persisted index row remains an untrusted candidate after process
 restart and must be reverified from byte zero before minting a fresh in-memory proof. Malicious
 same-inode prefix rewrites combined with suffix growth require a future writer-maintained generation
-seal or hash chain for constant-work restart rehydration. This primitive remains unwired until the
-Reference projection seam is reviewed; Core subscriptions and the authoritative from-zero reader
-remain storage-neutral.
+seal or hash chain for constant-work restart rehydration. The Reference projection injects this
+reader behind its private page-reader seam; Core subscriptions and the authoritative from-zero
+reader remain storage-neutral.
 
 `ReferenceEventOffsetIndex` is the internal warm-read coordinator for those anchors. It retains the
 first verified record, sparse anchors at fixed byte or record strides, and the newest verified
@@ -670,13 +670,14 @@ the captured snapshot passes final verification. Replacement, truncation, shrink
 expired proof clears the derived state and permits one authoritative from-zero retry. Committed
 event-log corruption remains authoritative and propagates unchanged.
 
-The index retains at most 128 source slots by default. A configurable `max_sources` sets that hard
-retained-slot capacity. Page reads pin admitted slots before taking the per-source I/O lock, so
+The index retains at most 128 source slots by default. Its `max_sources` constructor setting defines
+that hard retained-slot capacity; `RunnerBackend.event_index_max_sources` configures the owned
+Reference instance. Page reads pin admitted slots before taking the per-source I/O lock, so
 concurrent readers for one retained cold source share one construction. A miss replaces the
 least-recently-used idle slot. When every retained slot is active, a miss reads one authoritative
 snapshot from byte zero without creating a slot or anchor capabilities. This bypass preserves event
 delivery and the hard metadata bound. It uses an independent snapshot, and another read can repeat
-that cold work until capacity becomes available. `max_sources=0` routes every read through this
+that cold work until capacity becomes available. Capacity zero routes every read through this
 authoritative uncached path.
 
 `cache_stats()` exposes retained sources, pins, page-read hits and misses, idle-slot evictions, and
@@ -689,8 +690,15 @@ A new process starts with an empty offset index. Its first relevant read verifie
 zero while rebuilding sparse anchors; later pages and same-process appends extend from the retained
 tail. Persisting candidate offsets cannot reduce that required verification under the current
 process-local proof contract. Constant-work restart remains coupled to the future writer-maintained
-generation seal or hash chain. The sparse index remains unwired. The next change injects it through
-the Reference projection seam.
+generation seal or hash chain.
+
+Each `RunnerBackend` owns one index and injects its page reader into `RunProjectionService`. Root
+events, authorized descendant events, and diagnostics share that instance. Authorization and
+descendant-lineage validation complete before cache admission. Backend JSON, SSE, Studio transports,
+`SequenceCursor`, Last-Event-ID resume, heartbeat emission, and terminal final draining continue to
+consume the same `{events, next_seq, has_more}` page shape. Backend shutdown leaves the cache alone
+because shutdown is a non-terminal operational stop and Studio ingress can still be active; bounded
+capacity supplies the process-lifetime memory control.
 
 `SequenceCursor` and `EventSubscription` turn that inclusive page API into a reusable next-sequence
 subscription. A cursor advances only after an event is presented, suppresses replayed sequences,
