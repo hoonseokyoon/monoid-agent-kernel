@@ -308,7 +308,9 @@ def test_owned_adapter_fences_a_nested_dbos_thread_that_survives_destroy(
     assert getattr(implementation, "_dbos_global_registry", None) is owned._registry
 
 
-def test_owned_adapter_rejects_a_preexisting_dbos_named_thread(tmp_path: Path) -> None:
+def test_owned_adapter_allows_an_unrelated_preexisting_queue_worker_name(
+    tmp_path: Path,
+) -> None:
     thread_entered = threading.Event()
     release_thread = threading.Event()
 
@@ -324,8 +326,34 @@ def test_owned_adapter_rejects_a_preexisting_dbos_named_thread(tmp_path: Path) -
     preexisting.start()
     assert thread_entered.wait(timeout=3)
     try:
+        owned = _construct_owned_runtime_226(dbos, _config(tmp_path, stem="preexisting"))
+        owned.listen_queues(())
+        owned.launch()
+        owned.destroy(workflow_completion_timeout_sec=0, deadline=time.monotonic() + 3)
+
+        assert getattr(implementation, "_dbos_global_instance", None) is None
+        assert getattr(implementation, "_dbos_global_registry", None) is None
+        assert preexisting.is_alive()
+    finally:
+        release_thread.set()
+        preexisting.join(timeout=3)
+
+
+def test_owned_adapter_rejects_preexisting_dbos_thread_provenance(tmp_path: Path) -> None:
+    thread_entered = threading.Event()
+    release_thread = threading.Event()
+
+    def _preexisting_dbos_work() -> None:
+        thread_entered.set()
+        release_thread.wait(timeout=5)
+
+    _preexisting_dbos_work.__module__ = "dbos.synthetic"
+    preexisting = threading.Thread(target=_preexisting_dbos_work, daemon=True)
+    preexisting.start()
+    assert thread_entered.wait(timeout=3)
+    try:
         with pytest.raises(_DbosOwnershipConflict, match="worker threads are active"):
-            _construct_owned_runtime_226(dbos, _config(tmp_path, stem="preexisting"))
+            _construct_owned_runtime_226(dbos, _config(tmp_path, stem="dbos-thread"))
 
         assert getattr(implementation, "_dbos_global_instance", None) is None
         assert getattr(implementation, "_dbos_global_registry", None) is None

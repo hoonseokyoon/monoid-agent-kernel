@@ -35,13 +35,22 @@ class _OwnedDbosRuntime226:
     A detected direct-access violation fences the caller without acting on the replacement runtime.
     """
 
-    def __init__(self, dbos_module: Any, runtime: Any, registry: Any, config: Any) -> None:
+    def __init__(
+        self,
+        dbos_module: Any,
+        runtime: Any,
+        registry: Any,
+        config: Any,
+        *,
+        preexisting_name_collisions: tuple[Any, ...],
+    ) -> None:
         self._dbos_module = dbos_module
         self._implementation = importlib.import_module("dbos._dbos")
         self._runtime = runtime
         self._registry = registry
         self._application_version = config.application_version
         self._executor_id = config.executor_id
+        self._preexisting_name_collisions = preexisting_name_collisions
         self._async_executor: ThreadPoolExecutor | None = None
 
     def require_owned(self) -> None:
@@ -268,6 +277,7 @@ class _OwnedDbosRuntime226:
             runtime_threads = _capture_runtime_threads(
                 self._runtime,
                 runtime_executors=runtime_executors,
+                preexisting_name_collisions=self._preexisting_name_collisions,
             )
             try:
                 self._runtime._destroy(
@@ -288,6 +298,7 @@ class _OwnedDbosRuntime226:
                 self._runtime,
                 runtime_threads=runtime_threads,
                 runtime_executors=runtime_executors,
+                preexisting_name_collisions=self._preexisting_name_collisions,
                 deadline=deadline,
             )
             self._require_cleanup_owned()
@@ -308,11 +319,8 @@ def _construct_owned_runtime_226(dbos_module: Any, config: Any) -> _OwnedDbosRun
             raise _DbosOwnershipConflict(
                 "an existing DBOS runtime or registry is active; shared host ownership is required"
             )
+        preexisting_name_collisions = _classify_preexisting_threads()
         marker = object()
-        if any(_is_dbos_owned_thread(thread) for thread in threading.enumerate()):
-            raise _DbosOwnershipConflict(
-                "preexisting DBOS worker threads are active; process restart is required"
-            )
         owned_runtime_type = _owned_runtime_type(dbos_module.DBOS, marker)
         try:
             runtime = owned_runtime_type(
@@ -340,7 +348,13 @@ def _construct_owned_runtime_226(dbos_module: Any, config: Any) -> _OwnedDbosRun
             raise _DbosConstructionUncertain(
                 "DBOS construction validation failed; terminate the process"
             ) from None
-        return _OwnedDbosRuntime226(dbos_module, runtime, registry, config)
+        return _OwnedDbosRuntime226(
+            dbos_module,
+            runtime,
+            registry,
+            config,
+            preexisting_name_collisions=preexisting_name_collisions,
+        )
 
 
 def _owned_runtime_type(dbos_class: type[Any], marker: object) -> type[Any]:
@@ -436,6 +450,7 @@ def _capture_runtime_threads(
     runtime: Any,
     *,
     runtime_executors: tuple[Any, ...] = (),
+    preexisting_name_collisions: tuple[Any, ...] = (),
 ) -> tuple[Any, ...]:
     threads: list[Any] = list(getattr(runtime, "_background_threads", ()))
     event_loop = getattr(runtime, "_background_event_loop", None)
@@ -449,14 +464,41 @@ def _capture_runtime_threads(
     threads.extend(getattr(executor, "_threads", ()))
     for runtime_executor in runtime_executors:
         threads.extend(getattr(runtime_executor, "_threads", ()))
-    threads.extend(thread for thread in threading.enumerate() if _is_dbos_owned_thread(thread))
+    threads.extend(
+        thread
+        for thread in threading.enumerate()
+        if _is_dbos_owned_thread(thread)
+        and all(
+            thread is not collision
+            for collision in preexisting_name_collisions
+        )
+    )
     return _unique_threads(threads)
+
+
+def _classify_preexisting_threads() -> tuple[Any, ...]:
+    name_collisions: list[Any] = []
+    for thread in threading.enumerate():
+        name = str(getattr(thread, "name", ""))
+        if _has_dbos_thread_provenance(thread) or name.startswith(
+            ("dbos-executor", "monoid-dbos-asyncio")
+        ):
+            raise _DbosOwnershipConflict(
+                "preexisting DBOS worker threads are active; process restart is required"
+            )
+        if name.startswith("queue-worker-"):
+            name_collisions.append(thread)
+    return tuple(name_collisions)
 
 
 def _is_dbos_owned_thread(thread: Any) -> bool:
     name = str(getattr(thread, "name", ""))
-    if name.startswith(("queue-worker-", "dbos-executor")):
+    if name.startswith(("queue-worker-", "dbos-executor", "monoid-dbos-asyncio")):
         return True
+    return _has_dbos_thread_provenance(thread)
+
+
+def _has_dbos_thread_provenance(thread: Any) -> bool:
     target = getattr(thread, "_target", None)
     target_module = str(getattr(target, "__module__", ""))
     owner = getattr(target, "__self__", None)
@@ -476,6 +518,7 @@ def _wait_runtime_stopped(
     *,
     runtime_threads: tuple[Any, ...],
     runtime_executors: tuple[Any, ...],
+    preexisting_name_collisions: tuple[Any, ...],
     deadline: float,
 ) -> None:
     active_set = getattr(runtime, "_active_workflows_set", None)
@@ -492,6 +535,7 @@ def _wait_runtime_stopped(
                 _capture_runtime_threads(
                     runtime,
                     runtime_executors=runtime_executors,
+                    preexisting_name_collisions=preexisting_name_collisions,
                 )
             )
             observed_threads = _unique_threads([*observed_threads, *discovered])
