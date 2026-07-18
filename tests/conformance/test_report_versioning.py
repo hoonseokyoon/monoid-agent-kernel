@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import os
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -105,7 +107,7 @@ def _v2_report(
     )
 
 
-def test_reader_first_versions_keep_v1_writer_and_support_v2() -> None:
+def test_default_v1_writer_keeps_the_deployed_v2_reader_path() -> None:
     assert CONFORMANCE_REPORT_VERSION == CONFORMANCE_REPORT_V1
     assert CONFORMANCE_REPORT_READER_VERSION == CONFORMANCE_REPORT_V2
     assert SUPPORTED_CONFORMANCE_REPORT_VERSIONS == (
@@ -118,6 +120,7 @@ def test_v2_report_round_trips_through_checked_reader() -> None:
     report = _v2_report()
     payload = report.to_json()
     checked = decode_conformance_report(payload)
+    suite = ET.fromstring(report.to_junit_bytes())
 
     assert payload["target"] == _target().to_json()
     assert payload["provenance_status"] == "available"
@@ -127,13 +130,74 @@ def test_v2_report_round_trips_through_checked_reader() -> None:
     assert checked.value == report
     assert checked.value is not None
     assert checked.value.to_json() == payload
+    assert suite.attrib["time"] == "0.250"
+
+
+def test_explicit_v1_json_and_junit_keep_the_historical_projection(
+    tmp_path: Path,
+) -> None:
+    report = ConformanceReport(
+        harness_id="legacy-adapter",
+        profile_id="minimal-agent",
+        outcomes=(_outcome(evidence_refs=()),),
+        schema_version=CONFORMANCE_REPORT_V1,
+    )
+    json_path = tmp_path / "report.json"
+    junit_path = tmp_path / "report.xml"
+
+    report.write_json(json_path)
+    report.write_junit(junit_path)
+    suite = ET.parse(junit_path).getroot()
+
+    assert json_path.read_bytes() == report.to_json_bytes()
+    assert report.to_json_bytes().endswith(os.linesep.encode("ascii"))
+    assert junit_path.read_bytes() == report.to_junit_bytes()
+    assert suite.attrib["hostname"] == "legacy-adapter"
+    assert suite.attrib["time"] == "0.000000"
+    assert suite.find("properties") is None
+    case = suite.find("testcase")
+    assert case is not None
+    assert case.find("properties") is None
+    assert isinstance(json.loads(case.findtext("system-out", default="")), list)
+
+
+def test_junit_visually_escapes_xml_forbidden_public_strings() -> None:
+    profile_id = "minimal\x1fagent"
+    raw_error = "failure\x0b\ud800"
+    report = ConformanceReport(
+        harness_id="adapter\x00\udfff",
+        profile_id=profile_id,
+        outcomes=(
+            ConformanceRuleOutcome(
+                rule_id="MIN\x08RULE",
+                profile_id=profile_id,
+                status="error",
+                error=raw_error,
+            ),
+        ),
+        schema_version=CONFORMANCE_REPORT_V1,
+    )
+
+    suite = ET.fromstring(report.to_junit_bytes())
+    case = suite.find("testcase")
+    assert case is not None
+    error = case.find("error")
+    assert error is not None
+
+    assert suite.attrib["name"] == "monoid-conformance:minimal#x1Fagent"
+    assert suite.attrib["hostname"] == "adapter#x00#xDFFF"
+    assert case.attrib == {
+        "classname": "minimal#x1Fagent",
+        "name": "MIN#x08RULE",
+        "time": "0.000000",
+    }
+    assert error.attrib["message"] == "failure#x0B#xD800"
+    assert json.loads(error.text or "")["error"] == raw_error
 
 
 def test_packaged_v1_report_migrates_purely_to_explicit_unavailable_provenance() -> None:
     fixture = next(
-        item
-        for item in load_compatibility_fixtures()
-        if item.fixture_id == "conformance-report-v1"
+        item for item in load_compatibility_fixtures() if item.fixture_id == "conformance-report-v1"
     )
     source = copy.deepcopy(fixture.payload)
 
@@ -197,9 +261,7 @@ def test_v2_reader_rejects_unknown_fields_and_inconsistent_derived_values(
 
 def test_v1_migration_rejects_reserved_v2_fields() -> None:
     fixture = next(
-        item
-        for item in load_compatibility_fixtures()
-        if item.fixture_id == "conformance-report-v1"
+        item for item in load_compatibility_fixtures() if item.fixture_id == "conformance-report-v1"
     )
     payload = copy.deepcopy(fixture.payload)
     payload["target"] = None

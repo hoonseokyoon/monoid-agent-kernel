@@ -23,8 +23,10 @@ guarantee. DBOS types and upgrade policy stay inside the optional Reference prof
   accept unknown identifiers.
 - `writer-only` formats have a public producer and no public serialized reader contract.
 
-`Missing id accepted` records an existing compatibility behavior. New producers must always
-write the current identifier.
+`current_writer` is the default producer identifier. The machine-readable `active_writers` tuple
+lists every identifier this release can emit; most artifacts contain only `current_writer`.
+`Missing id accepted` records an existing compatibility behavior. New producers write
+`current_writer` unless a documented variant selects another active writer.
 
 ## Versioned artifact inventory
 
@@ -67,10 +69,10 @@ write the current identifier.
 | `studio-chat-message` | reference | `studio.chat.message.v1` | permissive; missing id accepted | `studio.chat.message.v1` |
 <!-- compatibility-registry:end -->
 
-The v0.19.2 conformance rollout deploys the v2 checked reader before changing the external runner's
-v1 writer. The reader migrates retained v1 reports into a v2 typed model with provenance explicitly
-marked unavailable. The next writer step can then emit target and evidence references without a
-reader gap.
+The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in
+v2 evidence path after deploying its checked reader. Retained v1 reports migrate into the v2 typed
+model with provenance explicitly marked unavailable. `--evidence-dir` emits v2 when an enhanced
+adapter supplies retained evidence; consumers of that output need a v2 reader.
 
 Source locations and format-specific notes are available through
 `compatibility_registry()`. Integrators can serialize that result directly as JSON.
@@ -137,7 +139,8 @@ a web call, control delivery, and checkpoint resume before advancing the rollout
 4. Deploy readers first: gateways and backend recovery workers before clients and run workers.
 5. Resume a non-terminal checkpoint canary and verify its run metadata, event sequence, queued
    messages, hosted tasks, and blob references.
-6. Enable new writers. Confirm they emit the registry's `current_writer` identifiers.
+6. Enable new writers. Confirm each emitted identifier appears in the registry's `active_writers`;
+   use `current_writer` for the default producer path.
 7. Retain the pre-upgrade snapshot until recovery, Studio projection, proposal verification,
    and gateway smoke checks pass.
 

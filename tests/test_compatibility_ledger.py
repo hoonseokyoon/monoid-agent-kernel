@@ -8,6 +8,7 @@ from monoid_agent_kernel import contracts
 from monoid_agent_kernel.conformance.fixtures import load_compatibility_fixtures
 from monoid_agent_kernel.conformance.provenance import CONFORMANCE_EVIDENCE_VERSION
 from monoid_agent_kernel.conformance.report import (
+    CONFORMANCE_REPORT_V1,
     CONFORMANCE_REPORT_V2,
     CONFORMANCE_REPORT_VERSION,
 )
@@ -83,6 +84,8 @@ def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     json.dumps(compatibility_registry(), sort_keys=True)
 
     for artifact in artifacts:
+        assert artifact.current_writer in artifact.active_writers
+        assert len(set(artifact.active_writers)) == len(artifact.active_writers)
         if artifact.current_writer.startswith("monoid."):
             assert artifact.current_writer in artifact.supported_readers or (
                 artifact.reader_policy == "writer-only" and not artifact.supported_readers
@@ -92,6 +95,7 @@ def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
                     "monoid.", "native-agent-runner.", 1
                 )
         assert all(".v" in version for version in artifact.supported_readers)
+        assert all(".v" in version for version in artifact.active_writers)
 
     assert len(PUBLIC_COMPATIBILITY_ALIASES) == 8
     assert len({alias.key for alias in PUBLIC_COMPATIBILITY_ALIASES}) == 8
@@ -134,13 +138,17 @@ def test_packaged_compatibility_fixture_schema_matches_registry() -> None:
     )
 
 
-def test_conformance_report_reader_is_deployed_before_the_v2_writer() -> None:
+def test_conformance_report_default_writer_retains_the_v1_migration_path() -> None:
     report = compatibility_artifact("conformance-report")
 
     assert report.current_writer == CONFORMANCE_REPORT_VERSION
     assert report.reader_policy == "checked"
     assert report.supported_readers == (
-        CONFORMANCE_REPORT_VERSION,
+        CONFORMANCE_REPORT_V1,
+        CONFORMANCE_REPORT_V2,
+    )
+    assert report.active_writers == (
+        CONFORMANCE_REPORT_V1,
         CONFORMANCE_REPORT_V2,
     )
 
