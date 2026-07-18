@@ -6,7 +6,11 @@ from pathlib import Path
 
 from monoid_agent_kernel import contracts
 from monoid_agent_kernel.conformance.fixtures import load_compatibility_fixtures
-from monoid_agent_kernel.conformance.report import CONFORMANCE_REPORT_VERSION
+from monoid_agent_kernel.conformance.provenance import CONFORMANCE_EVIDENCE_VERSION
+from monoid_agent_kernel.conformance.report import (
+    CONFORMANCE_REPORT_V2,
+    CONFORMANCE_REPORT_VERSION,
+)
 from monoid_agent_kernel.core.capability import (
     CAPABILITY_LEASE_VERSION,
     CAPABILITY_REQUEST_VERSION,
@@ -73,7 +77,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 33
+    assert len(artifacts) == 34
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -112,6 +116,7 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "approval": APPROVAL_SCHEMA_VERSION,
         "apply-result": APPLY_RESULT_SCHEMA_VERSION,
         "conformance-report": CONFORMANCE_REPORT_VERSION,
+        "conformance-evidence": CONFORMANCE_EVIDENCE_VERSION,
         "conformance-fixtures": "monoid.conformance-fixtures.v1",
         "command-inbox": COMMAND_ENVELOPE_VERSION,
         "command-receipt": COMMAND_RECEIPT_VERSION,
@@ -126,6 +131,17 @@ def test_packaged_compatibility_fixture_schema_matches_registry() -> None:
     assert load_compatibility_fixtures()
     assert compatibility_artifact("conformance-fixtures").current_writer == (
         "monoid.conformance-fixtures.v1"
+    )
+
+
+def test_conformance_report_reader_is_deployed_before_the_v2_writer() -> None:
+    report = compatibility_artifact("conformance-report")
+
+    assert report.current_writer == CONFORMANCE_REPORT_VERSION
+    assert report.reader_policy == "checked"
+    assert report.supported_readers == (
+        CONFORMANCE_REPORT_VERSION,
+        CONFORMANCE_REPORT_V2,
     )
 
 

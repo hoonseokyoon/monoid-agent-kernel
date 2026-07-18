@@ -60,11 +60,17 @@ write the current identifier.
 | `failure` | durable | `monoid.failure.v1` | permissive; missing id accepted | `monoid.failure.v1`<br>`native-agent-runner.failure.v1` |
 | `command-inbox` | durable | `monoid.command-inbox.v1` | strict | `monoid.command-inbox.v1` |
 | `command-receipt` | wire | `monoid.command-receipt.v1` | writer-only | None (writer-only) |
-| `conformance-report` | reference | `monoid.conformance-report.v1` | writer-only | None (writer-only) |
+| `conformance-report` | reference | `monoid.conformance-report.v1` | checked | `monoid.conformance-report.v1`<br>`monoid.conformance-report.v2` |
+| `conformance-evidence` | reference | `monoid.conformance-evidence.v1` | strict | `monoid.conformance-evidence.v1` |
 | `conformance-fixtures` | reference | `monoid.conformance-fixtures.v1` | strict | `monoid.conformance-fixtures.v1` |
 | `studio-chat` | reference | `studio.chat.v1` | strict | `studio.chat.v1` |
 | `studio-chat-message` | reference | `studio.chat.message.v1` | permissive; missing id accepted | `studio.chat.message.v1` |
 <!-- compatibility-registry:end -->
+
+The v0.19.2 conformance rollout deploys the v2 checked reader before changing the external runner's
+v1 writer. The reader migrates retained v1 reports into a v2 typed model with provenance explicitly
+marked unavailable. The next writer step can then emit target and evidence references without a
+reader gap.
 
 Source locations and format-specific notes are available through
 `compatibility_registry()`. Integrators can serialize that result directly as JSON.

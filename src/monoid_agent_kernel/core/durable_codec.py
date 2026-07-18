@@ -12,6 +12,7 @@ U = TypeVar("U")
 
 DurableLoadStatus = Literal["loaded", "migrated", "missing", "corrupt", "unsupported_version"]
 Migration = Callable[[dict[str, Any]], dict[str, Any]]
+MAX_ARTIFACT_VERSION_DIGITS = 9
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,11 @@ def parse_artifact_version(value: object) -> ArtifactVersion | None:
         return None
     version_token = parts[2]
     version_digits = version_token[1:] if version_token.startswith("v") else ""
-    if not version_digits or any(digit < "0" or digit > "9" for digit in version_digits):
+    if (
+        not version_digits
+        or len(version_digits) > MAX_ARTIFACT_VERSION_DIGITS
+        or any(digit < "0" or digit > "9" for digit in version_digits)
+    ):
         return None
     version = int(version_digits)
     if version < 1:

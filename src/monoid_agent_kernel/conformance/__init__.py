@@ -39,10 +39,17 @@ from .provenance import (
     verify_conformance_evidence,
 )
 from .report import (
+    CONFORMANCE_REPORT_READER_VERSION,
+    CONFORMANCE_REPORT_V1,
+    CONFORMANCE_REPORT_V2,
     CONFORMANCE_REPORT_VERSION,
+    MAX_CONFORMANCE_REPORT_BYTES,
+    SUPPORTED_CONFORMANCE_REPORT_VERSIONS,
     ConformanceObservation,
     ConformanceReport,
     ConformanceRuleOutcome,
+    decode_conformance_report,
+    read_conformance_report,
 )
 from .profiles import PROFILES, PROFILE_BY_ID, ProfileMetadata, get_profile
 
@@ -65,9 +72,16 @@ __all__ = [
     "ProfileMetadata",
     "get_profile",
     "CONFORMANCE_REPORT_VERSION",
+    "CONFORMANCE_REPORT_V1",
+    "CONFORMANCE_REPORT_V2",
+    "CONFORMANCE_REPORT_READER_VERSION",
+    "MAX_CONFORMANCE_REPORT_BYTES",
+    "SUPPORTED_CONFORMANCE_REPORT_VERSIONS",
     "ConformanceObservation",
     "ConformanceReport",
     "ConformanceRuleOutcome",
+    "decode_conformance_report",
+    "read_conformance_report",
     "CapabilityBrokerFactory",
     "CheckpointStoreFactory",
     "run_capability_broker_contract",

@@ -41,6 +41,125 @@
         "type": "cancel",
         "run_id": "fixture_run"
       }
+    },
+    {
+      "fixture_id": "conformance-report-v1",
+      "artifact": "conformance-report",
+      "expected_status": "migrated",
+      "payload": {
+        "schema_version": "monoid.conformance-report.v1",
+        "runner_version": "0.18.0",
+        "harness_id": "fixture-adapter",
+        "profile_id": "minimal-agent",
+        "passed": true,
+        "started_at": 0.0,
+        "duration_s": 0.4,
+        "summary": {
+          "total": 4,
+          "passed": 4,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "outcomes": [
+          {
+            "rule_id": "MIN-01-SUBMISSION",
+            "profile_id": "minimal-agent",
+            "status": "passed",
+            "passed": true,
+            "duration_s": 0.1,
+            "error": "",
+            "observations": [
+              {
+                "observation_id": "run_id_present",
+                "passed": true,
+                "expected": true,
+                "actual": true,
+                "detail": ""
+              },
+              {
+                "observation_id": "submission_accepted",
+                "passed": true,
+                "expected": true,
+                "actual": true,
+                "detail": ""
+              }
+            ]
+          },
+          {
+            "rule_id": "MIN-02-LIFECYCLE",
+            "profile_id": "minimal-agent",
+            "status": "passed",
+            "passed": true,
+            "duration_s": 0.0,
+            "error": "",
+            "observations": [
+              {
+                "observation_id": "terminal_state",
+                "passed": true,
+                "expected": true,
+                "actual": true,
+                "detail": ""
+              },
+              {
+                "observation_id": "running_observed",
+                "passed": true,
+                "expected": true,
+                "actual": true,
+                "detail": ""
+              }
+            ]
+          },
+          {
+            "rule_id": "MIN-03-RESULT",
+            "profile_id": "minimal-agent",
+            "status": "passed",
+            "passed": true,
+            "duration_s": 0.0,
+            "error": "",
+            "observations": [
+              {
+                "observation_id": "result_run_id",
+                "passed": true,
+                "expected": "fixture_run",
+                "actual": "fixture_run",
+                "detail": ""
+              },
+              {
+                "observation_id": "result_status",
+                "passed": true,
+                "expected": "completed",
+                "actual": "completed",
+                "detail": ""
+              }
+            ]
+          },
+          {
+            "rule_id": "MIN-04-EVENT-SEQUENCE",
+            "profile_id": "minimal-agent",
+            "status": "passed",
+            "passed": true,
+            "duration_s": 0.0,
+            "error": "",
+            "observations": [
+              {
+                "observation_id": "events_present",
+                "passed": true,
+                "expected": true,
+                "actual": true,
+                "detail": ""
+              },
+              {
+                "observation_id": "event_sequence_contiguous",
+                "passed": true,
+                "expected": [1, 2, 3],
+                "actual": [1, 2, 3],
+                "detail": ""
+              }
+            ]
+          }
+        ]
+      }
     }
   ]
 }

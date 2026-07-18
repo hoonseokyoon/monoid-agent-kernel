@@ -299,13 +299,31 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         legacy_reader=False,
         notes="HTTP and Python receipt projection for queued command state and results.",
     ),
-    _monoid_artifact(
-        "conformance-report.v1",
+    CompatibilityArtifact(
+        key="conformance-report",
         kind="reference",
-        reader_policy="writer-only",
-        source=("conformance/report.py:ConformanceReport",),
-        legacy_reader=False,
-        notes="External runner JSON report; JUnit is a secondary standards-compatible projection.",
+        current_writer=namespaced_id("conformance-report.v1"),
+        supported_readers=(
+            namespaced_id("conformance-report.v1"),
+            namespaced_id("conformance-report.v2"),
+        ),
+        namespace_aliases=(),
+        reader_policy="checked",
+        source=("conformance/report.py:decode_conformance_report",),
+        notes=(
+            "Reader-first rollout: the checked reader migrates v1 reports to the v2 typed model "
+            "before the external runner begins writing v2."
+        ),
+    ),
+    CompatibilityArtifact(
+        key="conformance-evidence",
+        kind="reference",
+        current_writer=namespaced_id("conformance-evidence.v1"),
+        supported_readers=(namespaced_id("conformance-evidence.v1"),),
+        namespace_aliases=(),
+        reader_policy="strict",
+        source=("conformance/provenance.py:verify_conformance_evidence",),
+        notes="Exact-byte normalized evidence with size and SHA-256 verification.",
     ),
     _monoid_artifact(
         "conformance-fixtures.v1",
