@@ -658,8 +658,24 @@ rewritten sources fail closed. A persisted index row remains an untrusted candid
 restart and must be reverified from byte zero before minting a fresh in-memory proof. Malicious
 same-inode prefix rewrites combined with suffix growth require a future writer-maintained generation
 seal or hash chain for constant-work restart rehydration. This primitive remains unwired until the
-disposable persistent index is reviewed; Core subscriptions and the authoritative from-zero reader
-remain storage-neutral.
+bounded source-slot lifecycle and projection seam are reviewed; Core subscriptions and the
+authoritative from-zero reader remain storage-neutral.
+
+`ReferenceEventOffsetIndex` is the internal warm-read coordinator for those anchors. It retains the
+first verified record, sparse anchors at fixed byte or record strides, and the newest verified
+record as strong process-local references. One per-source lock single-flights cold construction;
+different event logs remain independent. A page scan stages only lightweight stride-selected
+candidates plus its newest safe-prefix candidate. It mints and publishes anchor capabilities after
+the captured snapshot passes final verification. Replacement, truncation, shrink, rewrite, or an
+expired proof clears the derived state and permits one authoritative from-zero retry. Committed
+event-log corruption remains authoritative and propagates unchanged.
+
+A new process starts with an empty offset index. Its first relevant read verifies JSONL from byte
+zero while rebuilding sparse anchors; later pages and same-process appends extend from the retained
+tail. Persisting candidate offsets cannot reduce that required verification under the current
+process-local proof contract. Constant-work restart remains coupled to the future writer-maintained
+generation seal or hash chain. The sparse index remains unwired until its bounded source-slot
+lifecycle and Reference projection seam are reviewed.
 
 `SequenceCursor` and `EventSubscription` turn that inclusive page API into a reusable next-sequence
 subscription. A cursor advances only after an event is presented, suppresses replayed sequences,
