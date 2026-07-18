@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+
+from monoid_agent_kernel.conformance.provenance import ConformanceEvidenceBundle
 
 JsonObject = Mapping[str, Any]
 
@@ -26,6 +29,29 @@ class MinimalAgentHarness(ConformanceHarness, Protocol):
 
     def run_minimal_lifecycle_case(self) -> JsonObject:
         """Return submission, lifecycle, result, and event-sequence observations."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class MinimalAgentEvidenceCapture:
+    """One trusted case result paired with its closed public evidence projection."""
+
+    case: JsonObject
+    evidence: ConformanceEvidenceBundle
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.case, Mapping):
+            raise TypeError("minimal-agent evidence case must be a mapping")
+        if not isinstance(self.evidence, ConformanceEvidenceBundle):
+            raise TypeError("minimal-agent evidence must be a typed bundle")
+        object.__setattr__(self, "case", dict(self.case))
+
+
+@runtime_checkable
+class MinimalAgentEvidenceHarness(MinimalAgentHarness, Protocol):
+    """Optional additive protocol for adapters that retain inspectable evidence."""
+
+    def run_minimal_lifecycle_case_with_evidence(self) -> MinimalAgentEvidenceCapture:
+        """Run one case and return its legacy facts plus normalized public evidence."""
 
 
 @runtime_checkable
