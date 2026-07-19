@@ -82,7 +82,7 @@ Reference scenario names stay inside `monoid_agent_kernel.reference.conformance`
 | Target | Why it remains |
 | --- | --- |
 | Streaming transport adapters | Cursor ownership and final draining use `core.event_subscription`; HTTP SSE framing and Studio rendering remain transport-owned. |
-| Restart-stable event-index rehydration | Warm reads use process-local, content-verified byte-offset anchors. Constant-work restart rehydration requires persisted offset candidates bound to a writer-maintained generation seal or hash chain. |
+| Writer-authenticated event generations | Warm reads assume immutable committed prefixes, and cold restarts rebuild from byte zero. Persisted offset candidates bound to trusted writer lineage can detect same-inode rewrite-plus-growth boundary violations while supporting constant-work restart rehydration. |
 
 ## Design Position
 
@@ -98,5 +98,5 @@ The current structure matches the Phase 4 target:
 
 Phase 4 closure is recorded in `docs/PHASE_4_CLOSURE.md`. CI hardening landed in
 v0.18, and v0.19.2 added bounded warm-tail indexing. Further cleanup should focus
-on restart-stable index rehydration, streaming transport efficiency, or
-product-facing behavior.
+on writer-authenticated generation lineage for restart-stable index rehydration,
+streaming transport efficiency, or product-facing behavior.
