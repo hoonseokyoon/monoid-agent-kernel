@@ -14,6 +14,8 @@ from typing import Any
 
 import pytest
 
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.reference.dbos import (
     DbosProcessOwnershipError,
     DbosShutdownTimeout,
@@ -34,11 +36,15 @@ from monoid_agent_kernel.reference.dbos.control_plane import (
     DBOS_CONTROL_STEP_NAME,
     DBOS_CONTROL_WORKFLOW_NAME,
     DbosControlConfig,
+    DbosControlEnvelope,
+    _register_hosted_control_plane,
 )
 from monoid_agent_kernel.reference.dbos.run_driver import (
     DBOS_RUN_STEP_NAME,
     DBOS_RUN_WORKFLOW_NAME,
+    DbosResumeCommand,
     DbosRunConfig,
+    _register_hosted_run_driver,
 )
 
 pytestmark = pytest.mark.serial
@@ -1475,6 +1481,211 @@ def test_real_dbos_host_launches_queue_work_and_resets_global_state(
         if host is not None and host.state not in {"closed", "fenced"}:
             host.close()
         dbos.DBOS.destroy(destroy_registry=True, workflow_completion_timeout_sec=0)
+
+
+@pytest.mark.slow
+def test_real_dbos_host_composes_control_and_run_under_one_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dbos = pytest.importorskip("dbos")
+    if _delegate_real_dbos_case(
+        "test_real_dbos_host_composes_control_and_run_under_one_runtime",
+        "control-run-composition",
+    ):
+        return
+    implementation = importlib.import_module("dbos._dbos")
+    dbos.DBOS.destroy(destroy_registry=True, workflow_completion_timeout_sec=0)
+    host: DbosRuntimeHost | None = None
+    replacement: DbosRuntimeHost | None = None
+    constructed_runtimes: list[Any] = []
+    original_construct = runtime_module._construct_owned_runtime_226
+
+    def _construct(dbos_module: Any, config: DbosHostConfig) -> Any:
+        runtime = original_construct(dbos_module, config)
+        constructed_runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(runtime_module, "_construct_owned_runtime_226", _construct)
+    try:
+        database_url = f"sqlite:///{tmp_path / 'composition.sqlite'}"
+        control_config = DbosControlConfig(
+            system_database_url=database_url,
+            name="monoid-host-composition",
+            application_version="monoid-host-composition-v1",
+            executor_id="stable-host-composition-slot",
+            queue_name="composition-control",
+            polling_interval_s=0.01,
+            shutdown_grace_s=5,
+        )
+        run_config = DbosRunConfig(
+            system_database_url=database_url,
+            name="monoid-host-composition",
+            application_version="monoid-host-composition-v1",
+            executor_id="stable-host-composition-slot",
+            queue_name="composition-run",
+            polling_interval_s=0.01,
+            checkpoint_retry_interval_s=0.01,
+            shutdown_grace_s=5,
+            local_task_wait_s=5,
+        )
+        shared_config = _require_shared_host_config(
+            control_config._host_config(),
+            run_config._host_config(),
+        )
+        host = DbosRuntimeHost(shared_config)
+        observed_control: list[str] = []
+
+        def _dispatch(envelope: DbosControlEnvelope) -> ControlResult:
+            observed_control.append(envelope.command_id)
+            return ControlResult(
+                run_id=envelope.run_id,
+                type=envelope.type,
+                status="ok",
+                state="running",
+                data={"runtime_owner": "shared-host"},
+            )
+
+        def _unexpected_loop(command: DbosResumeCommand) -> Any:
+            del command
+            raise AssertionError("missing-checkpoint recovery must not construct an AgentLoop")
+
+        store = LocalFsCheckpointStore(tmp_path / "runs")
+        driver = _register_hosted_run_driver(
+            host,
+            run_config,
+            store,
+            _unexpected_loop,
+        )
+        plane = _register_hosted_control_plane(host, control_config, _dispatch)
+        owned_runtime = host._runtime
+        assert constructed_runtimes == [owned_runtime]
+        assert set(host._participants) == {"control", "run"}
+
+        lifecycle_calls: list[tuple[str, object]] = []
+        original_listen = owned_runtime.listen_queues
+        original_launch = owned_runtime.launch
+        original_register_queue = owned_runtime.register_queue
+        original_destroy = owned_runtime.destroy
+
+        def _listen(queues: tuple[str, ...]) -> None:
+            lifecycle_calls.append(("listen", tuple(queues)))
+            original_listen(queues)
+
+        def _launch() -> None:
+            lifecycle_calls.append(("launch", None))
+            original_launch()
+
+        def _register_queue(name: str, **kwargs: Any) -> Any:
+            lifecycle_calls.append(("queue", name))
+            return original_register_queue(name, **kwargs)
+
+        def _destroy(*, workflow_completion_timeout_sec: int, deadline: float) -> None:
+            lifecycle_calls.append(("destroy", workflow_completion_timeout_sec))
+            original_destroy(
+                workflow_completion_timeout_sec=workflow_completion_timeout_sec,
+                deadline=deadline,
+            )
+
+        monkeypatch.setattr(owned_runtime, "listen_queues", _listen)
+        monkeypatch.setattr(owned_runtime, "launch", _launch)
+        monkeypatch.setattr(owned_runtime, "register_queue", _register_queue)
+        monkeypatch.setattr(owned_runtime, "destroy", _destroy)
+
+        host.launch()
+        host.launch()
+        expected_queues = tuple(
+            sorted((plane.registered_queue_name, driver.registered_queue_name))
+        )
+        assert lifecycle_calls == [
+            ("listen", expected_queues),
+            ("launch", None),
+            ("queue", plane.registered_queue_name),
+            ("queue", driver.registered_queue_name),
+        ]
+        assert plane._runtime is driver._runtime is owned_runtime
+        assert getattr(implementation, "_dbos_global_instance", None) is owned_runtime._runtime
+        assert plane._workflow is not None
+        assert driver._workflow is not None
+        assert host.state == "running"
+        assert host.accepting is plane._accepting is driver._accepting is True
+        with pytest.raises(DbosProcessOwnershipError, match="already owns"):
+            DbosRuntimeHost(shared_config)
+
+        run_id = "shared/run"
+        command_id = "shared/command"
+        control_command = ControlCommand(
+            type="status",
+            run_id=run_id,
+            command_id=command_id,
+        )
+        run_command = DbosResumeCommand(run_id, command_id, 1)
+        control_workflow_id = plane.workflow_id(run_id, command_id)
+        run_workflow_id = driver.workflow_id(run_id, command_id)
+        assert control_workflow_id == (
+            "monoid/run/shared%2Frun/control/shared%2Fcommand"
+        )
+        assert run_workflow_id == (
+            "monoid/run/shared%2Frun/resume/shared%2Fcommand"
+        )
+        initial_control = plane.enqueue_control(
+            control_command,
+            tenant_id="tenant",
+            user_id="user",
+        )
+        initial_run = driver.enqueue_resume(run_command)
+        completed_control = plane.wait_for_receipt(
+            run_id,
+            control_command.command_id,
+            timeout_s=30,
+        )
+        completed_run = driver.wait_for_receipt(run_command, timeout_s=30)
+
+        assert initial_control.status in {"pending", "completed"}
+        assert initial_run.status in {"pending", "failed"}
+        assert completed_control.status == "completed"
+        assert completed_control.result is not None
+        assert completed_control.result["data"] == {"runtime_owner": "shared-host"}
+        assert completed_run.status == "failed"
+        assert completed_run.error_code == "checkpoint_missing"
+        assert observed_control == [control_command.command_id]
+        assert store.latest(run_id) is None
+
+        host.close()
+        host.close()
+        assert [name for name, _ in lifecycle_calls] == [
+            "listen",
+            "launch",
+            "queue",
+            "queue",
+            "destroy",
+        ]
+        assert host.state == "closed"
+        assert plane._closed is driver._closed is True
+        assert constructed_runtimes == [owned_runtime]
+        assert getattr(implementation, "_dbos_global_instance", None) is None
+        assert getattr(implementation, "_dbos_global_registry", None) is None
+
+        replacement = DbosRuntimeHost(shared_config)
+        assert constructed_runtimes == [owned_runtime, replacement._runtime]
+        assert replacement._runtime is not owned_runtime
+        replacement.close()
+        assert replacement.state == "closed"
+        assert getattr(implementation, "_dbos_global_instance", None) is None
+        assert getattr(implementation, "_dbos_global_registry", None) is None
+    finally:
+        try:
+            for candidate in (replacement, host):
+                if candidate is None or candidate.state == "closed":
+                    continue
+                if candidate.state == "fenced":
+                    cleanup = candidate._fenced_cleanup_thread
+                    if cleanup is not None:
+                        cleanup.join(timeout=6)
+                    continue
+                candidate.close()
+        finally:
+            dbos.DBOS.destroy(destroy_registry=True, workflow_completion_timeout_sec=0)
 
 
 def test_real_dbos_idle_host_closes_with_the_minimum_grace(tmp_path: Path) -> None:
