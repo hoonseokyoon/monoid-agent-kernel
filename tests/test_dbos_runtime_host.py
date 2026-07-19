@@ -28,14 +28,17 @@ from monoid_agent_kernel.reference.dbos.runtime import (
     DbosHostConfig,
     DbosRuntimeHost,
     _DbosHostParticipant,
+    _require_shared_host_config,
 )
 from monoid_agent_kernel.reference.dbos.control_plane import (
     DBOS_CONTROL_STEP_NAME,
     DBOS_CONTROL_WORKFLOW_NAME,
+    DbosControlConfig,
 )
 from monoid_agent_kernel.reference.dbos.run_driver import (
     DBOS_RUN_STEP_NAME,
     DBOS_RUN_WORKFLOW_NAME,
+    DbosRunConfig,
 )
 
 pytestmark = pytest.mark.serial
@@ -199,8 +202,15 @@ def test_host_models_import_without_loading_optional_dbos() -> None:
     env["PYTHONPATH"] = str(root / "src")
     code = """
 import sys
+from monoid_agent_kernel.reference.dbos.control_plane import DbosControlConfig
 from monoid_agent_kernel.reference.dbos.runtime import DbosHostConfig, DbosRuntimeHost
-assert DbosHostConfig and DbosRuntimeHost
+from monoid_agent_kernel.reference.dbos.run_driver import DbosRunConfig
+control = DbosControlConfig(system_database_url='sqlite:///dbos.sqlite', executor_id='slot')
+run = DbosRunConfig(system_database_url='sqlite:///dbos.sqlite', executor_id='slot')
+assert control._host_config() == run._host_config() == DbosHostConfig(
+    system_database_url='sqlite:///dbos.sqlite', executor_id='slot'
+)
+assert DbosRuntimeHost
 assert 'dbos' not in sys.modules
 """
 
@@ -214,6 +224,136 @@ assert 'dbos' not in sys.modules
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def _aligned_surface_configs() -> tuple[DbosControlConfig, DbosRunConfig]:
+    control = DbosControlConfig(
+        system_database_url="sqlite:///shared.sqlite",
+        name="shared-host",
+        application_version="shared-v2",
+        executor_id="shared-slot",
+        queue_name="control-local-queue",
+        polling_interval_s=0.01,
+        shutdown_grace_s=3,
+    )
+    run = DbosRunConfig(
+        system_database_url="sqlite:///shared.sqlite",
+        name="shared-host",
+        application_version="shared-v2",
+        executor_id="shared-slot",
+        queue_name="run-local-queue",
+        polling_interval_s=0.2,
+        checkpoint_retry_interval_s=0.3,
+        shutdown_grace_s=3,
+        local_task_wait_s=17,
+    )
+    return control, run
+
+
+def test_surface_configs_project_one_explicit_shared_host_configuration() -> None:
+    control, run = _aligned_surface_configs()
+
+    shared = _require_shared_host_config(control._host_config(), run._host_config())
+
+    assert shared == DbosHostConfig(
+        system_database_url="sqlite:///shared.sqlite",
+        name="shared-host",
+        application_version="shared-v2",
+        executor_id="shared-slot",
+        shutdown_grace_s=3,
+    )
+
+
+def test_shared_host_config_requires_typed_participants() -> None:
+    with pytest.raises(ValueError, match="at least one participant"):
+        _require_shared_host_config()
+    with pytest.raises(TypeError, match="typed host configurations"):
+        _require_shared_host_config(_config(), object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("surface", ["control", "run"])
+@pytest.mark.parametrize(
+    ("field", "different"),
+    [
+        ("system_database_url", "sqlite:///different.sqlite"),
+        ("name", "different-host"),
+        ("application_version", "different-v2"),
+        ("executor_id", "different-slot"),
+        ("shutdown_grace_s", 4),
+    ],
+)
+def test_shared_host_config_rejects_each_surface_process_mismatch(
+    surface: str,
+    field: str,
+    different: object,
+) -> None:
+    control, run = _aligned_surface_configs()
+    values: dict[str, object] = {
+        "system_database_url": "sqlite:///shared.sqlite",
+        "name": "shared-host",
+        "application_version": "shared-v2",
+        "executor_id": "shared-slot",
+        "shutdown_grace_s": 3,
+    }
+    values[field] = different
+    if surface == "control":
+        mismatched = DbosControlConfig(**values)._host_config()  # type: ignore[arg-type]
+        matching = run._host_config()
+    else:
+        mismatched = DbosRunConfig(**values)._host_config()  # type: ignore[arg-type]
+        matching = control._host_config()
+
+    with pytest.raises(ValueError, match="host configurations do not match"):
+        _require_shared_host_config(matching, mismatched)
+
+
+def test_shared_host_config_preserves_recovery_defaults_as_explicit_mismatch() -> None:
+    database_url = "sqlite:///defaults.sqlite"
+    host = DbosHostConfig(system_database_url=database_url)
+    run = DbosRunConfig(system_database_url=database_url)
+    control = DbosControlConfig(system_database_url=database_url)
+
+    assert run._host_config() == host
+    with pytest.raises(ValueError, match="host configurations do not match"):
+        _require_shared_host_config(host, control._host_config())
+
+
+@pytest.mark.parametrize("surface", ["control", "run"])
+def test_host_projection_tightens_identity_types_without_changing_surface_validation(
+    surface: str,
+) -> None:
+    config_type = DbosControlConfig if surface == "control" else DbosRunConfig
+    config = config_type(  # type: ignore[call-arg]
+        system_database_url="sqlite:///types.sqlite",
+        name=object(),
+    )
+
+    with pytest.raises(ValueError, match="host name is required"):
+        config._host_config()
+
+
+@pytest.mark.parametrize("surface", ["control", "run"])
+def test_host_projection_preserves_standalone_one_second_grace(surface: str) -> None:
+    config_type = DbosControlConfig if surface == "control" else DbosRunConfig
+    config = config_type(  # type: ignore[call-arg]
+        system_database_url="sqlite:///grace.sqlite",
+        shutdown_grace_s=1,
+    )
+
+    assert config.shutdown_grace_s == 1
+    with pytest.raises(ValueError, match="at least two whole seconds"):
+        config._host_config()
+
+
+def test_shared_host_config_mismatch_does_not_disclose_database_urls() -> None:
+    first = DbosHostConfig(system_database_url="postgresql://secret-a@host/database")
+    second = DbosHostConfig(system_database_url="postgresql://secret-b@host/database")
+
+    with pytest.raises(ValueError, match="host configurations do not match") as raised:
+        _require_shared_host_config(first, second)
+
+    assert "secret-a" not in str(raised.value)
+    assert "secret-b" not in str(raised.value)
 
 
 def test_host_config_owns_stable_workflow_namespace() -> None:

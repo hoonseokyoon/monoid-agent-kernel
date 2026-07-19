@@ -35,6 +35,7 @@ from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.reference._shared.control_transport import CommandConflict
 from monoid_agent_kernel.reference.dbos.runtime import (
+    DbosHostConfig as _DbosHostConfig,
     DbosShutdownTimeout,
     claim_process_owner,
     create_owned_runtime,
@@ -116,6 +117,17 @@ class DbosRunConfig:
             raise ValueError("DBOS shutdown_grace_s must be a positive whole number of seconds")
         if not math.isfinite(self.local_task_wait_s) or self.local_task_wait_s <= 0:
             raise ValueError("DBOS local_task_wait_s must be positive")
+
+    def _host_config(self) -> _DbosHostConfig:
+        """Project the process-wide fields requested by this run participant."""
+
+        return _DbosHostConfig(
+            system_database_url=self.system_database_url,
+            name=self.name,
+            application_version=self.application_version,
+            executor_id=self.executor_id,
+            shutdown_grace_s=self.shutdown_grace_s,
+        )
 
 
 @dataclass(frozen=True)

@@ -37,6 +37,7 @@ from monoid_agent_kernel.reference._shared.control_transport import (
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.dbos.runtime import (
     DbosDependencyError as DbosDependencyError,
+    DbosHostConfig as _DbosHostConfig,
     DbosProcessOwnershipError as DbosProcessOwnershipError,
     DbosShutdownTimeout,
     claim_process_owner,
@@ -80,6 +81,17 @@ class DbosControlConfig:
             or self.shutdown_grace_s < 1
         ):
             raise ValueError("DBOS shutdown_grace_s must be a positive whole number of seconds")
+
+    def _host_config(self) -> _DbosHostConfig:
+        """Project the process-wide fields requested by this control participant."""
+
+        return _DbosHostConfig(
+            system_database_url=self.system_database_url,
+            name=self.name,
+            application_version=self.application_version,
+            executor_id=self.executor_id,
+            shutdown_grace_s=self.shutdown_grace_s,
+        )
 
 
 @dataclass(frozen=True)
