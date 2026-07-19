@@ -34,9 +34,14 @@ from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.reference._shared.control_transport import CommandConflict
+from monoid_agent_kernel.reference.dbos._compat_226 import _DbosOwnershipConflict
 from monoid_agent_kernel.reference.dbos.runtime import (
     DbosHostConfig as _DbosHostConfig,
+    DbosProcessOwnershipError as _DbosProcessOwnershipError,
+    DbosRuntimeHost as _DbosRuntimeHost,
     DbosShutdownTimeout,
+    _DbosHostParticipant,
+    _require_shared_host_config,
     claim_process_owner,
     create_owned_runtime,
     load_dbos,
@@ -348,10 +353,16 @@ class DbosRunDriver:
     def registered_queue_name(self) -> str:
         return self._queue_name
 
-    def _register_workflow(self) -> Any:
-        runtime = self._runtime
+    def _register_workflow(
+        self,
+        *,
+        runtime: Any | None = None,
+        step_name: str = DBOS_RUN_STEP_NAME,
+        workflow_name: str = DBOS_RUN_WORKFLOW_NAME,
+    ) -> Any:
+        runtime = self._runtime if runtime is None else runtime
 
-        @runtime.step(name=DBOS_RUN_STEP_NAME, retries_allowed=False)
+        @runtime.step(name=step_name, retries_allowed=False)
         def drive_step(payload: dict[str, Any]) -> dict[str, Any]:
             invalid_command = False
             try:
@@ -388,7 +399,7 @@ class DbosRunDriver:
                     self._active_drives -= 1
                     self._drive_condition.notify_all()
 
-        @runtime.workflow(name=DBOS_RUN_WORKFLOW_NAME)
+        @runtime.workflow(name=workflow_name)
         def run_workflow(payload: dict[str, Any]) -> dict[str, Any]:
             return drive_step(payload)
 
@@ -845,6 +856,210 @@ class DbosRunDriver:
             command_id=command.command_id,
             status="pending",
         )
+
+
+class _HostedDbosRunDriver(DbosRunDriver):
+    """Run participant whose runtime and lifecycle belong to one DBOS host."""
+
+    def __init__(
+        self,
+        host: _DbosRuntimeHost,
+        config: DbosRunConfig,
+        checkpoint_store: CheckpointStore,
+        loop_factory: DbosRunLoopFactory,
+        *,
+        fault_hook: DbosRunFaultHook | None = None,
+    ) -> None:
+        self.config = config
+        self._host = host
+        self._checkpoint_store = checkpoint_store
+        self._loop_factory = loop_factory
+        self._fault_hook = fault_hook
+        self._state_lock = threading.Lock()
+        self._drive_condition = threading.Condition()
+        self._active_drives = 0
+        self._active_facade_operations = 0
+        self._launched = False
+        self._accepting = False
+        self._cleanup_failed = False
+        self._closing = False
+        self._closed = False
+        self._queue_name = self.versioned_queue_name(
+            config.queue_name,
+            config.application_version,
+        )
+        self._dbos_module = load_dbos()
+        self._runtime: Any | None = None
+        self._workflow: Any | None = None
+
+    def _host_participant(self) -> _DbosHostParticipant:
+        return _DbosHostParticipant(
+            participant_id="run",
+            queue_name=self._queue_name,
+            host_config=self._host.config,
+            register_workflows=self._register_hosted_workflows,
+            preflight=self._preflight_queue_configuration,
+            register_queue=self._register_hosted_queue,
+            stop_admission=self._stop_hosted_admission,
+            admission_count=self._hosted_admission_count,
+            active_count=self._hosted_active_count,
+            mark_closed=self._mark_hosted_closed,
+        )
+
+    def _register_hosted_workflows(self, runtime: Any) -> None:
+        workflow = super()._register_workflow(
+            runtime=runtime,
+            step_name=self._host.workflow_name("run", "step"),
+            workflow_name=self._host.workflow_name("run", "workflow"),
+        )
+        with self._state_lock:
+            self._runtime = runtime
+            self._workflow = workflow
+
+    def _register_hosted_queue(self, runtime: Any) -> None:
+        with self._state_lock:
+            if runtime is not self._runtime or self._workflow is None:
+                raise _DbosProcessOwnershipError(
+                    "DBOS run participant runtime registration is inconsistent"
+                )
+        queue = self._register_run_queue(runtime)
+        self._assert_queue_configuration(queue)
+        with self._state_lock:
+            self._launched = True
+            self._accepting = not self._cleanup_failed
+
+    def _stop_hosted_admission(self) -> None:
+        with self._state_lock:
+            self._accepting = False
+            self._closing = True
+
+    def _hosted_admission_count(self) -> int:
+        with self._drive_condition:
+            return self._active_facade_operations
+
+    def _hosted_active_count(self) -> int:
+        with self._drive_condition:
+            return self._active_drives
+
+    def _mark_hosted_closed(self) -> None:
+        with self._state_lock:
+            self._launched = False
+            self._accepting = False
+            self._closing = False
+            self._closed = True
+
+    def launch(self) -> None:
+        raise RuntimeError("DBOS runtime host owns hosted run-driver lifecycle")
+
+    def close(self, *, timeout_s: int | None = None) -> None:
+        del timeout_s
+        raise RuntimeError("DBOS runtime host owns hosted run-driver lifecycle")
+
+    def enqueue_resume(self, command: DbosResumeCommand) -> DbosRunReceipt:
+        if not isinstance(command, DbosResumeCommand):
+            raise TypeError("enqueue_resume requires a DbosResumeCommand")
+        self._begin_hosted_operation(require_submission_admission=True)
+        try:
+            runtime = self._runtime
+            workflow = self._workflow
+            if runtime is None or workflow is None:
+                raise RuntimeError("DBOS run participant runtime is unavailable")
+            workflow_id = self.workflow_id(command.run_id, command.command_id)
+            try:
+                handle = runtime.enqueue_workflow_with_identity(
+                    self._queue_name,
+                    workflow,
+                    command.to_json(),
+                    workflow_id=workflow_id,
+                    queue_partition_key=command.run_id,
+                )
+                status = handle.get_status()
+            except _DbosOwnershipConflict:
+                self._raise_hosted_ownership_error()
+            self._assert_same_identity(command, status.input)
+            return self._receipt_from_status(command, status)
+        finally:
+            self._end_hosted_operation()
+
+    def run_receipt(self, command: DbosResumeCommand) -> DbosRunReceipt:
+        self._begin_hosted_operation(require_submission_admission=False)
+        try:
+            runtime = self._runtime
+            if runtime is None:
+                raise RuntimeError("DBOS run participant runtime is unavailable")
+            try:
+                handle = runtime.retrieve_workflow(
+                    self.workflow_id(command.run_id, command.command_id)
+                )
+                status = handle.get_status()
+            except _DbosOwnershipConflict:
+                self._raise_hosted_ownership_error()
+            self._assert_same_identity(command, status.input)
+            return self._receipt_from_status(command, status)
+        finally:
+            self._end_hosted_operation()
+
+    def _require_launched(self) -> None:
+        if self._closed or self._closing or not self._launched or self._host.state != "running":
+            raise RuntimeError("DBOS run driver must be launched before use")
+
+    def _begin_hosted_operation(self, *, require_submission_admission: bool) -> None:
+        with self._state_lock:
+            if self._closing or self._closed or not self._host.accepting:
+                raise RuntimeError("DBOS run driver is not accepting commands")
+            if require_submission_admission and not self._accepting:
+                raise RuntimeError("DBOS run driver is not accepting commands")
+            self._require_launched()
+            with self._drive_condition:
+                self._active_facade_operations += 1
+
+    def _end_hosted_operation(self) -> None:
+        with self._drive_condition:
+            self._active_facade_operations -= 1
+            self._drive_condition.notify_all()
+
+    def _raise_hosted_ownership_error(self) -> None:
+        with self._state_lock:
+            self._accepting = False
+        self._host._fence("DBOS run runtime ownership changed; terminate the process")
+        raise _DbosProcessOwnershipError(
+            "DBOS process-global runtime ownership changed; terminate the process"
+        ) from None
+
+    def _mark_cleanup_failure(self) -> None:
+        with self._state_lock:
+            self._cleanup_failed = True
+            self._accepting = False
+
+
+def _register_hosted_run_driver(
+    host: _DbosRuntimeHost,
+    config: DbosRunConfig,
+    checkpoint_store: CheckpointStore,
+    loop_factory: DbosRunLoopFactory,
+    *,
+    fault_hook: DbosRunFaultHook | None = None,
+) -> DbosRunDriver:
+    """Register one private run participant without launching the shared host."""
+
+    if not isinstance(host, _DbosRuntimeHost):
+        raise TypeError("hosted DBOS run driver requires DbosRuntimeHost")
+    if not isinstance(config, DbosRunConfig):
+        raise TypeError("hosted DBOS run driver requires DbosRunConfig")
+    if not callable(loop_factory):
+        raise TypeError("hosted DBOS run driver requires a loop factory")
+    if fault_hook is not None and not callable(fault_hook):
+        raise TypeError("hosted DBOS run driver fault hook must be callable")
+    _require_shared_host_config(host.config, config._host_config())
+    driver = _HostedDbosRunDriver(
+        host,
+        config,
+        checkpoint_store,
+        loop_factory,
+        fault_hook=fault_hook,
+    )
+    host._register_participant(driver._host_participant())
+    return driver
 
 
 def _is_uninitialized_queue_table(exc: Exception) -> bool:

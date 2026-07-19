@@ -37,6 +37,8 @@ out in commit messages and here.
   fencing when participant drain or ownership verification is uncertain.
 - Added a Reference-private hosted control participant that defers workflow, queue, admission,
   and shutdown ownership to the single DBOS runtime host while preserving standalone behavior.
+- Added a Reference-private hosted run participant with host-owned workflow, queue, admission,
+  active-drive, and shutdown lifecycle while keeping checkpoint semantics portable.
 
 ### Fixed
 
