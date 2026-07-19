@@ -32,8 +32,9 @@ out in commit messages and here.
   singleton and registry, rejects Cloud/Conductor mode, and verifies global identity plus
   DBOS-owned thread cleanup before ownership release.
 - Added a single-owner Reference-private DBOS runtime host with deterministic workflow identity,
-  pre-launch workflow/listener aggregation, one launch/shutdown lifecycle, deadline-bounded close,
-  and process fencing when participant drain or ownership verification is uncertain.
+  an explicit shared surface-configuration contract, pre-launch workflow/listener aggregation,
+  one launch/shutdown lifecycle, deadline-bounded close, and process fencing when participant
+  drain or ownership verification is uncertain.
 
 ### Fixed
 

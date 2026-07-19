@@ -89,6 +89,19 @@ class DbosHostConfig:
         return f"{self.workflow_namespace}.dbos-{surface}-{operation}.v1"
 
 
+def _require_shared_host_config(*configs: DbosHostConfig) -> DbosHostConfig:
+    """Return one explicit host configuration shared by every DBOS participant."""
+
+    if not configs:
+        raise ValueError("DBOS shared host configuration requires at least one participant")
+    if any(not isinstance(config, DbosHostConfig) for config in configs):
+        raise TypeError("DBOS participants must provide typed host configurations")
+    shared = configs[0]
+    if any(config != shared for config in configs[1:]):
+        raise ValueError("DBOS participant host configurations do not match")
+    return shared
+
+
 @dataclass(frozen=True, kw_only=True)
 class _DbosHostParticipant:
     """Private lifecycle hooks registered by one host-owned Reference component.
