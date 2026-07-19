@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 
 PACKAGE_NAME = "monoid-agent-kernel"
-FALLBACK_VERSION = "0.19.1"
+FALLBACK_VERSION = "0.19.2"
 
 
 def package_version() -> str:
