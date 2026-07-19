@@ -35,11 +35,15 @@ from monoid_agent_kernel.reference._shared.control_transport import (
     sanitize_command_data,
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.reference.dbos._compat_226 import _DbosOwnershipConflict
 from monoid_agent_kernel.reference.dbos.runtime import (
     DbosDependencyError as DbosDependencyError,
     DbosHostConfig as _DbosHostConfig,
     DbosProcessOwnershipError as DbosProcessOwnershipError,
+    DbosRuntimeHost as _DbosRuntimeHost,
     DbosShutdownTimeout,
+    _DbosHostParticipant,
+    _require_shared_host_config,
     claim_process_owner,
     create_owned_runtime,
     load_dbos,
@@ -249,10 +253,17 @@ class DbosControlPlane:
 
         return self._queue_name
 
-    def _register_workflow(self, dispatcher: DbosDispatcher) -> Any:
-        runtime = self._runtime
+    def _register_workflow(
+        self,
+        dispatcher: DbosDispatcher,
+        *,
+        runtime: Any | None = None,
+        step_name: str = DBOS_CONTROL_STEP_NAME,
+        workflow_name: str = DBOS_CONTROL_WORKFLOW_NAME,
+    ) -> Any:
+        runtime = self._runtime if runtime is None else runtime
 
-        @runtime.step(name=DBOS_CONTROL_STEP_NAME, retries_allowed=False)
+        @runtime.step(name=step_name, retries_allowed=False)
         def dispatch_step(payload: dict[str, Any]) -> dict[str, Any]:
             envelope = DbosControlEnvelope.from_json(payload)
             with self._dispatch_condition:
@@ -277,7 +288,7 @@ class DbosControlPlane:
                     self._active_dispatches -= 1
                     self._dispatch_condition.notify_all()
 
-        @runtime.workflow(name=DBOS_CONTROL_WORKFLOW_NAME)
+        @runtime.workflow(name=workflow_name)
         def control_workflow(payload: dict[str, Any]) -> dict[str, Any]:
             envelope = DbosControlEnvelope.from_json(payload)
             dispatch_record = dispatch_step(payload)
@@ -558,6 +569,201 @@ class DbosControlPlane:
             created_at=created_at,
             updated_at=updated_at,
         )
+
+
+class _HostedDbosControlPlane(DbosControlPlane):
+    """Control participant whose runtime and lifecycle belong to one DBOS host."""
+
+    def __init__(
+        self,
+        host: _DbosRuntimeHost,
+        config: DbosControlConfig,
+        dispatcher: DbosDispatcher,
+    ) -> None:
+        self.config = config
+        self._host = host
+        self._dispatcher = dispatcher
+        self._state_lock = threading.Lock()
+        self._dispatch_condition = threading.Condition()
+        self._active_dispatches = 0
+        self._active_facade_operations = 0
+        self._launched = False
+        self._accepting = False
+        self._closing = False
+        self._closed = False
+        self._queue_name = self.versioned_queue_name(
+            config.queue_name,
+            config.application_version,
+        )
+        self._dbos_module = load_dbos()
+        self._runtime: Any | None = None
+        self._workflow: Any | None = None
+
+    def _host_participant(self) -> _DbosHostParticipant:
+        return _DbosHostParticipant(
+            participant_id="control",
+            queue_name=self._queue_name,
+            host_config=self._host.config,
+            register_workflows=self._register_hosted_workflows,
+            preflight=self._preflight_queue_configuration,
+            register_queue=self._register_hosted_queue,
+            stop_admission=self._stop_hosted_admission,
+            admission_count=self._hosted_admission_count,
+            active_count=self._hosted_active_count,
+            mark_closed=self._mark_hosted_closed,
+        )
+
+    def _register_hosted_workflows(self, runtime: Any) -> None:
+        workflow = super()._register_workflow(
+            self._dispatcher,
+            runtime=runtime,
+            step_name=self._host.workflow_name("control", "step"),
+            workflow_name=self._host.workflow_name("control", "workflow"),
+        )
+        with self._state_lock:
+            self._runtime = runtime
+            self._workflow = workflow
+
+    def _register_hosted_queue(self, runtime: Any) -> None:
+        with self._state_lock:
+            if runtime is not self._runtime or self._workflow is None:
+                raise DbosProcessOwnershipError(
+                    "DBOS control participant runtime registration is inconsistent"
+                )
+        queue = self._register_control_queue(runtime)
+        self._assert_queue_configuration(queue)
+        with self._state_lock:
+            self._launched = True
+            self._accepting = True
+
+    def _stop_hosted_admission(self) -> None:
+        with self._state_lock:
+            self._accepting = False
+            self._closing = True
+
+    def _hosted_admission_count(self) -> int:
+        with self._dispatch_condition:
+            return self._active_facade_operations
+
+    def _hosted_active_count(self) -> int:
+        with self._dispatch_condition:
+            return self._active_dispatches
+
+    def _mark_hosted_closed(self) -> None:
+        with self._state_lock:
+            self._launched = False
+            self._accepting = False
+            self._closing = False
+            self._closed = True
+
+    def launch(self) -> None:
+        raise RuntimeError("DBOS runtime host owns hosted control-plane lifecycle")
+
+    def close(self, *, timeout_s: int | None = None) -> None:
+        del timeout_s
+        raise RuntimeError("DBOS runtime host owns hosted control-plane lifecycle")
+
+    def enqueue_control(
+        self,
+        command: ControlCommand,
+        *,
+        tenant_id: str,
+        user_id: str,
+    ) -> CommandReceipt:
+        if not isinstance(command, ControlCommand):
+            raise TypeError("enqueue_control requires a ControlCommand")
+        envelope = DbosControlEnvelope.from_control_command(
+            command,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        self._begin_hosted_operation()
+        try:
+            return self._enqueue_envelope(envelope)
+        finally:
+            self._end_hosted_operation()
+
+    def _enqueue_envelope(self, command: DbosControlEnvelope) -> CommandReceipt:
+        runtime = self._runtime
+        workflow = self._workflow
+        if runtime is None or workflow is None:
+            raise RuntimeError("DBOS control participant runtime is unavailable")
+        workflow_id = self.workflow_id(command.run_id, command.command_id)
+        try:
+            handle = runtime.enqueue_workflow_with_identity(
+                self._queue_name,
+                workflow,
+                command.to_json(),
+                workflow_id=workflow_id,
+                queue_partition_key=command.run_id,
+            )
+            status = handle.get_status()
+        except _DbosOwnershipConflict:
+            self._raise_hosted_ownership_error()
+        self._assert_same_identity(command, status.input)
+        return self._receipt_from_status(command.run_id, command.command_id, status)
+
+    def command_receipt(self, run_id: str, command_id: str) -> CommandReceipt:
+        self._begin_hosted_operation()
+        try:
+            runtime = self._runtime
+            if runtime is None:
+                raise RuntimeError("DBOS control participant runtime is unavailable")
+            try:
+                handle = runtime.retrieve_workflow(self.workflow_id(run_id, command_id))
+                status = handle.get_status()
+            except _DbosOwnershipConflict:
+                self._raise_hosted_ownership_error()
+            self._assert_workflow_target(run_id, command_id, status.input)
+            return self._receipt_from_status(run_id, command_id, status)
+        finally:
+            self._end_hosted_operation()
+
+    def _require_launched(self) -> None:
+        if self._closed or self._closing or not self._launched or self._host.state != "running":
+            raise RuntimeError("DBOS control plane must be launched before use")
+
+    def _begin_hosted_operation(self) -> None:
+        with self._state_lock:
+            if not self._accepting or self._closing or not self._host.accepting:
+                raise RuntimeError("DBOS control plane is not accepting commands")
+            self._require_launched()
+            with self._dispatch_condition:
+                self._active_facade_operations += 1
+
+    def _end_hosted_operation(self) -> None:
+        with self._dispatch_condition:
+            self._active_facade_operations -= 1
+            self._dispatch_condition.notify_all()
+
+    def _raise_hosted_ownership_error(self) -> None:
+        with self._state_lock:
+            self._accepting = False
+        self._host._fence(
+            "DBOS control-plane runtime ownership changed; terminate the process"
+        )
+        raise DbosProcessOwnershipError(
+            "DBOS process-global runtime ownership changed; terminate the process"
+        ) from None
+
+
+def _register_hosted_control_plane(
+    host: _DbosRuntimeHost,
+    config: DbosControlConfig,
+    dispatcher: DbosDispatcher,
+) -> DbosControlPlane:
+    """Register one private control participant without launching the shared host."""
+
+    if not isinstance(host, _DbosRuntimeHost):
+        raise TypeError("hosted DBOS control plane requires DbosRuntimeHost")
+    if not isinstance(config, DbosControlConfig):
+        raise TypeError("hosted DBOS control plane requires DbosControlConfig")
+    if not callable(dispatcher):
+        raise TypeError("hosted DBOS control plane requires a dispatcher")
+    _require_shared_host_config(host.config, config._host_config())
+    plane = _HostedDbosControlPlane(host, config, dispatcher)
+    host._register_participant(plane._host_participant())
+    return plane
 
 
 def _is_uninitialized_queue_table(exc: Exception) -> bool:

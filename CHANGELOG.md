@@ -33,8 +33,10 @@ out in commit messages and here.
   DBOS-owned thread cleanup before ownership release.
 - Added a single-owner Reference-private DBOS runtime host with deterministic workflow identity,
   an explicit shared surface-configuration contract, pre-launch workflow/listener aggregation,
-  one launch/shutdown lifecycle, deadline-bounded close, and process fencing when participant
-  drain or ownership verification is uncertain.
+  one launch/shutdown lifecycle, pre-destroy admission drain, deadline-bounded close, and process
+  fencing when participant drain or ownership verification is uncertain.
+- Added a Reference-private hosted control participant that defers workflow, queue, admission,
+  and shutdown ownership to the single DBOS runtime host while preserving standalone behavior.
 
 ### Fixed
 

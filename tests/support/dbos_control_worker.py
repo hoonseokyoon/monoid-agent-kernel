@@ -19,6 +19,8 @@ from monoid_agent_kernel.reference.dbos import (
     DbosProcessOwnershipError,
     DbosShutdownTimeout,
 )
+from monoid_agent_kernel.reference.dbos.control_plane import _register_hosted_control_plane
+from monoid_agent_kernel.reference.dbos.runtime import DbosRuntimeHost
 
 _APP_VERSION = "monoid-dbos-control-test-v1"
 _EXECUTOR_ID = "stable-test-executor"
@@ -177,6 +179,69 @@ def recovery_phase(db_path: Path, output_path: Path) -> None:
         {"receipt": receipt.to_json(), "dispatched": dispatched},
     )
     plane.close()
+
+
+def hosted_crash_phase(db_path: Path, started_path: Path) -> None:
+    def dispatch(envelope: DbosControlEnvelope) -> ControlResult:
+        started_path.write_text(envelope.command_id, encoding="utf-8")
+        while True:
+            time.sleep(1)
+
+    config = _config(db_path)
+    host = DbosRuntimeHost(config._host_config())
+    plane = _register_hosted_control_plane(host, config, dispatch)
+    host.launch()
+    plane.enqueue_control(
+        ControlCommand(type="resume", run_id="run_hosted_restart", command_id="cmd_restart"),
+        tenant_id="tenant",
+        user_id="user",
+    )
+    while True:
+        time.sleep(1)
+
+
+def hosted_recovery_phase(db_path: Path, output_path: Path) -> None:
+    import dbos
+
+    dispatched: list[str] = []
+
+    def dispatch(envelope: DbosControlEnvelope) -> ControlResult:
+        dispatched.append(envelope.command_id)
+        return _ok(envelope)
+
+    config = _config(db_path)
+    host = DbosRuntimeHost(config._host_config())
+    plane = _register_hosted_control_plane(host, config, dispatch)
+    host.launch()
+    receipt = plane.wait_for_receipt("run_hosted_restart", "cmd_restart", timeout_s=30)
+    ambient_rejected = False
+    with dbos.SetWorkflowID("ambient-parent-workflow"):
+        try:
+            plane.enqueue_control(
+                ControlCommand(
+                    type="status",
+                    run_id="run_hosted_restart",
+                    command_id="cmd_ambient",
+                ),
+                tenant_id="tenant",
+                user_id="user",
+            )
+        except RuntimeError as exc:
+            ambient_rejected = "no ambient DBOS context" in str(exc)
+    host_running_after_rejection = host.state == "running" and host.accepting
+    host.close()
+    replacement = DbosRuntimeHost(config._host_config())
+    replacement.close()
+    _write_json(
+        output_path,
+        {
+            "ambient_rejected": ambient_rejected,
+            "dispatched": dispatched,
+            "host_running_after_rejection": host_running_after_rejection,
+            "receipt": receipt.to_json(),
+            "replacement_constructed": True,
+        },
+    )
 
 
 def partition_phase(db_path: Path, output_path: Path) -> None:
@@ -538,6 +603,8 @@ def main() -> None:
             "shutdown",
             "shutdown-success",
             "generated-id",
+            "hosted-crash",
+            "hosted-recover",
         ),
     )
     parser.add_argument("--db", type=Path, required=True)
@@ -554,6 +621,12 @@ def main() -> None:
     elif args.mode == "recover":
         assert args.output is not None
         recovery_phase(args.db, args.output)
+    elif args.mode == "hosted-crash":
+        assert args.started is not None
+        hosted_crash_phase(args.db, args.started)
+    elif args.mode == "hosted-recover":
+        assert args.output is not None
+        hosted_recovery_phase(args.db, args.output)
     elif args.mode == "partitions":
         assert args.output is not None
         partition_phase(args.db, args.output)
