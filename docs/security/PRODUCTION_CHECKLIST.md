@@ -63,6 +63,9 @@ default must be changed for production.
       secret-bearing tool args / shell commands.
 - [ ] Run directories, `transcript.jsonl`, and checkpoints are access-controlled
       and not served publicly.
+- [ ] Only runtime event and metadata owners can write `run_root`. Tool workspaces,
+      MCP servers, and untrusted processes cannot modify committed `events.jsonl`
+      prefixes; the Reference warm offset index relies on this append-only boundary.
 - [ ] Retention policy for private artifacts is defined.
 - [ ] Application logs and OTel exporters do not carry bearer tokens or lease
       material.

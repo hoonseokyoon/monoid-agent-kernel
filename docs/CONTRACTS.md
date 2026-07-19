@@ -647,28 +647,38 @@ the captured committed prefix. The result reports decoded records, logical scan 
 fetched by the Reference reader, including fixed-size buffer read-ahead, for deterministic scale
 tests.
 
-The run directory is a protected append-only trust boundary. Persistent anchors must derive from a
-contiguous prefix that was previously verified from byte zero; the anchor record and captured tail
-are verified again on every seek. The in-memory primitive accepts only anchors minted while scanning
-that prefix and rejects duplicate or decreasing sequences before issuing the affected anchor. This
-ensures every skipped prefix sequence is below the anchor sequence and preserves Core page results.
+The run directory is a protected append-only trust boundary. Deployments reserve run-artifact write
+access for runtime event and metadata owners. Committed event records are immutable, and tool
+workspaces and untrusted processes have no write access to run artifacts. Persistent anchors derive
+transitively from a contiguous prefix originally verified from byte zero. Each warm seek rechecks
+the source identity and nonshrinking committed extent, then verifies the anchored record at its byte
+offset. The current snapshot's committed tail witness is verified before new anchors are minted.
+The in-memory primitive accepts only anchors minted while scanning a strictly increasing prefix.
+Within this boundary, every skipped prefix sequence remains below the anchor sequence, preserving
+Core page results.
 Each proof is process-local and bound to the normalized source path, open-file identity, and captured
-generation metadata; copied or field-tampered anchors and cross-log, truncated, or same-size
-rewritten sources fail closed. A persisted index row remains an untrusted candidate after process
-restart and must be reverified from byte zero before minting a fresh in-memory proof. Malicious
-same-inode prefix rewrites combined with suffix growth require a future writer-maintained generation
-seal or hash chain for constant-work restart rehydration. The Reference projection injects this
-reader behind its private page-reader seam; Core subscriptions and the authoritative from-zero
-reader remain storage-neutral.
+source metadata; copied or field-tampered anchors, cross-log anchors, truncated sources, and
+same-size sources with a changed modification timestamp fail closed. A persisted index row remains
+an untrusted candidate after process restart and must be reverified from byte zero before minting a
+fresh in-memory proof.
+
+A same-inode prefix rewrite followed by suffix growth violates this trust boundary and is
+indistinguishable from a valid append through portable path, inode, timestamp, and size metadata. A
+live warm anchor can therefore skip rewritten earlier records. A new process verifies the current
+bytes from zero. Detecting this mutation while retaining bounded warm I/O requires future
+writer-authenticated generation lineage. The Reference projection injects this reader behind its
+private page-reader seam; Core subscriptions and the authoritative from-zero reader remain
+storage-neutral.
 
 `ReferenceEventOffsetIndex` is the internal warm-read coordinator for those anchors. It retains the
 first verified record, sparse anchors at fixed byte or record strides, and the newest verified
 record as strong process-local references. One per-source lock single-flights cold construction;
 different event logs remain independent. A page scan stages only lightweight stride-selected
 candidates plus its newest safe-prefix candidate. It mints and publishes anchor capabilities after
-the captured snapshot passes final verification. Replacement, truncation, shrink, rewrite, or an
-expired proof clears the derived state and permits one authoritative from-zero retry. Committed
-event-log corruption remains authoritative and propagates unchanged.
+the captured snapshot passes final verification. Path replacement, committed-prefix truncation,
+physical shrink, a detected same-size rewrite, or an expired proof clears the derived state and
+permits one authoritative from-zero retry. Committed event-log corruption remains authoritative and
+propagates unchanged.
 
 The index retains at most 128 source slots by default. Its `max_sources` constructor setting defines
 that hard retained-slot capacity; `RunnerBackend.event_index_max_sources` configures the owned
@@ -687,10 +697,10 @@ hot polled-source working set. Source capacity bounds retained slot and capabili
 per-source sparse-anchor density remains governed by the byte and record strides.
 
 A new process starts with an empty offset index. Its first relevant read verifies JSONL from byte
-zero while rebuilding sparse anchors; later pages and same-process appends extend from the retained
-tail. Persisting candidate offsets cannot reduce that required verification under the current
-process-local proof contract. Constant-work restart remains coupled to the future writer-maintained
-generation seal or hash chain.
+zero while rebuilding sparse anchors; later pages and append-only-conforming same-process appends
+extend from the retained tail. Persisting candidate offsets cannot reduce that required verification
+under the current process-local proof contract. Constant-work restart remains coupled to the future
+writer-authenticated generation lineage.
 
 Each `RunnerBackend` owns one index and injects its page reader into `RunProjectionService`. Root
 events, authorized descendant events, and diagnostics share that instance. Authorization and
