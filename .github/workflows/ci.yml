@@ -146,6 +146,7 @@ jobs:
           tests/test_backend_dbos_run.py
           tests/test_backend_dbos_control.py
           tests/test_dbos_control_models.py
+          tests/test_dbos_hosted_control.py
           tests/test_dbos_owned_runtime.py
           tests/test_dbos_runtime_host.py
           tests/test_dbos_run_driver.py

@@ -153,6 +153,55 @@ def test_dbos_control_plane_recovers_pending_workflow_after_process_restart(
     assert result["dispatched"] == ["cmd_restart"]
 
 
+def test_hosted_dbos_control_recovers_pending_workflow_after_process_restart(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "hosted-restart.sqlite"
+    started_path = tmp_path / "hosted-started.txt"
+    output_path = tmp_path / "hosted-recovered.json"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "support.dbos_control_worker",
+            "hosted-crash",
+            "--db",
+            str(db_path),
+            "--started",
+            str(started_path),
+        ],
+        cwd=root,
+        env=_worker_env(root),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert eventually(started_path.exists, timeout_s=30)
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+
+    recovered = _run_worker(
+        root,
+        "hosted-recover",
+        "--db",
+        str(db_path),
+        "--output",
+        str(output_path),
+        timeout=90,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr or recovered.stdout
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["receipt"]["status"] == "completed"
+    assert result["receipt"]["result"]["status"] == "ok"
+    assert result["dispatched"] == ["cmd_restart"]
+    assert result["ambient_rejected"] is True
+    assert result["host_running_after_rejection"] is True
+    assert result["replacement_constructed"] is True
+
+
 def test_dbos_control_plane_serializes_each_run_without_blocking_other_runs(
     tmp_path: Path,
 ) -> None:
