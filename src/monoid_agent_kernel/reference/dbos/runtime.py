@@ -117,6 +117,7 @@ class _DbosHostParticipant:
     preflight: Callable[[], None]
     register_queue: Callable[[Any], None]
     stop_admission: Callable[[], None]
+    admission_count: Callable[[], int]
     active_count: Callable[[], int]
     mark_closed: Callable[[], None]
 
@@ -132,6 +133,7 @@ class _DbosHostParticipant:
             self.preflight,
             self.register_queue,
             self.stop_admission,
+            self.admission_count,
             self.active_count,
             self.mark_closed,
         ):
@@ -350,6 +352,7 @@ class DbosRuntimeHost:
 
         try:
             stopped = _stop_participants(participants)
+            _require_participant_admissions_drained(participants, deadline=deadline)
             self._runtime.destroy(
                 workflow_completion_timeout_sec=_dbos_workflow_grace(deadline),
                 deadline=deadline,
@@ -473,6 +476,7 @@ class DbosRuntimeHost:
         stopped = _stop_participants(participants)
         deadline = time.monotonic() + self.config.shutdown_grace_s
         try:
+            _require_participant_admissions_drained(participants, deadline=deadline)
             self._require_launching_owner()
             self._runtime.destroy(
                 workflow_completion_timeout_sec=0,
@@ -534,11 +538,13 @@ class DbosRuntimeHost:
         participants: tuple[_DbosHostParticipant, ...],
     ) -> None:
         _stop_participants(participants)
+        deadline = time.monotonic() + self.config.shutdown_grace_s
         try:
+            _require_participant_admissions_drained(participants, deadline=deadline)
             if self._runtime.owns_globals():
                 self._runtime.destroy(
                     workflow_completion_timeout_sec=0,
-                    deadline=time.monotonic() + self.config.shutdown_grace_s,
+                    deadline=deadline,
                 )
         except BaseException:
             return
@@ -618,6 +624,37 @@ def _require_participants_drained(
         if remaining <= 0:
             raise DbosShutdownTimeout(
                 "DBOS participant work survived the shutdown grace; terminate the process"
+            )
+        time.sleep(min(0.01, remaining))
+
+
+def _require_participant_admissions_drained(
+    participants: tuple[_DbosHostParticipant, ...],
+    *,
+    deadline: float,
+) -> None:
+    """Wait for operations admitted before the shared gate closed, before DBOS destroy."""
+
+    while True:
+        active = False
+        for participant in participants:
+            try:
+                count = participant.admission_count()
+            except BaseException:
+                raise DbosShutdownTimeout(
+                    "DBOS participant admission state is unavailable; terminate the process"
+                ) from None
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise DbosShutdownTimeout(
+                    "DBOS participant admission state is invalid; terminate the process"
+                )
+            active = active or count > 0
+        if not active:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DbosShutdownTimeout(
+                "DBOS participant admission survived the shutdown grace; terminate the process"
             )
         time.sleep(min(0.01, remaining))
 

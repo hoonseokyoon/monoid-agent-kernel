@@ -191,6 +191,7 @@ def _participant(
         preflight=lambda: _call("preflight"),
         register_queue=_register,
         stop_admission=lambda: _call("stop"),
+        admission_count=lambda: 0,
         active_count=_active,
         mark_closed=lambda: _call("closed"),
     )
@@ -522,6 +523,7 @@ def test_host_opens_global_admission_only_after_every_queue_is_registered(
             preflight=lambda: None,
             register_queue=lambda runtime: observed.append(host.accepting),
             stop_admission=lambda: None,
+            admission_count=lambda: 0,
             active_count=lambda: 0,
             mark_closed=lambda: None,
         )
@@ -617,6 +619,7 @@ def test_live_launch_failure_fences_before_best_effort_cleanup_hooks(
             preflight=participant.preflight,
             register_queue=participant.register_queue,
             stop_admission=_stop,
+            admission_count=participant.admission_count,
             active_count=participant.active_count,
             mark_closed=participant.mark_closed,
         )
@@ -756,6 +759,7 @@ def test_close_racing_launch_waits_and_completes_one_shutdown(
             preflight=_preflight,
             register_queue=lambda runtime: calls.append("control:register"),
             stop_admission=lambda: calls.append("control:stop"),
+            admission_count=lambda: 0,
             active_count=lambda: 0,
             mark_closed=lambda: calls.append("control:closed"),
         )
@@ -822,6 +826,7 @@ def test_close_fences_when_launch_does_not_yield_within_shutdown_grace(
             preflight=_preflight,
             register_queue=participant.register_queue,
             stop_admission=participant.stop_admission,
+            admission_count=participant.admission_count,
             active_count=participant.active_count,
             mark_closed=participant.mark_closed,
         )
@@ -963,6 +968,7 @@ def test_close_interruption_while_launching_fences_the_authority(
             preflight=_preflight,
             register_queue=participant.register_queue,
             stop_admission=participant.stop_admission,
+            admission_count=participant.admission_count,
             active_count=participant.active_count,
             mark_closed=participant.mark_closed,
         )
@@ -1182,6 +1188,7 @@ def test_participant_stop_time_reduces_the_dbos_workflow_grace(
             preflight=participant.preflight,
             register_queue=participant.register_queue,
             stop_admission=_slow_stop,
+            admission_count=participant.admission_count,
             active_count=participant.active_count,
             mark_closed=participant.mark_closed,
         )
@@ -1209,6 +1216,53 @@ def test_participant_work_may_drain_within_the_shared_shutdown_grace(
 
     host = DbosRuntimeHost(_config())
     host._register_participant(_participant("control", "queue-control", calls, active=_active))
+    host.launch()
+
+    host.close(timeout_s=2)
+
+    assert samples == 3
+    assert host.state == "closed"
+
+
+def test_admitted_facade_operations_drain_before_runtime_destroy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    fake = _FakeRuntime(calls)
+    _install_fake_runtime(monkeypatch, fake)
+    samples = 0
+    participant = _participant("control", "queue-control", calls)
+
+    def _admissions() -> int:
+        nonlocal samples
+        samples += 1
+        return 1 if samples < 3 else 0
+
+    original_destroy = fake.destroy
+
+    def _destroy(*, workflow_completion_timeout_sec: int, deadline: float) -> None:
+        assert samples == 3
+        original_destroy(
+            workflow_completion_timeout_sec=workflow_completion_timeout_sec,
+            deadline=deadline,
+        )
+
+    fake.destroy = _destroy  # type: ignore[method-assign]
+    host = DbosRuntimeHost(_config())
+    host._register_participant(
+        _DbosHostParticipant(
+            participant_id=participant.participant_id,
+            queue_name=participant.queue_name,
+            host_config=participant.host_config,
+            register_workflows=participant.register_workflows,
+            preflight=participant.preflight,
+            register_queue=participant.register_queue,
+            stop_admission=participant.stop_admission,
+            admission_count=_admissions,
+            active_count=participant.active_count,
+            mark_closed=participant.mark_closed,
+        )
+    )
     host.launch()
 
     host.close(timeout_s=2)
@@ -1402,6 +1456,7 @@ def test_real_dbos_host_launches_queue_work_and_resets_global_state(
                     on_conflict="always_update",
                 ),
                 stop_admission=lambda: None,
+                admission_count=lambda: 0,
                 active_count=lambda: 0,
                 mark_closed=closed.set,
             )
@@ -1451,6 +1506,7 @@ def test_real_dbos_idle_host_closes_with_the_minimum_grace(tmp_path: Path) -> No
                 preflight=lambda: None,
                 register_queue=lambda runtime: None,
                 stop_admission=lambda: None,
+                admission_count=lambda: 0,
                 active_count=lambda: 0,
                 mark_closed=closed.set,
             )
@@ -1497,6 +1553,7 @@ def test_real_dbos_async_launch_rejection_releases_ownership(tmp_path: Path) -> 
                 preflight=lambda: None,
                 register_queue=lambda runtime: None,
                 stop_admission=lambda: None,
+                admission_count=lambda: 0,
                 active_count=lambda: 0,
                 mark_closed=lambda: None,
             )
