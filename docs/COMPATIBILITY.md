@@ -5,12 +5,15 @@ namespace aliases, and source aliases. The machine-readable source is
 `monoid_agent_kernel.core.compatibility.PUBLIC_ARTIFACT_COMPATIBILITY`; the table below is
 checked against it in CI.
 
-Experimental optional Reference profiles are outside this stable inventory. In v0.18,
-`DbosResumeCommand` and `DbosRunReceipt` are experimental Reference operational records for the
-finite-activation proof. Core compatibility excludes them. Keep the DBOS `application_version`
-stable while pending work must recover, drain that work before an incompatible workflow change,
-and treat their exported version constants as local profile identifiers without a rolling-reader
-guarantee. DBOS types and upgrade policy stay inside the optional Reference profile.
+Experimental optional Reference profiles sit outside this stable inventory. v0.19.2 treats
+`DbosResumeCommand`, `DbosRunReceipt`, and the DBOS-specific control envelope as experimental
+Reference operational records for the finite-activation profile. Their compatibility belongs to
+the DBOS profile rather than Core. Control workflow output uses the stable writer-only
+`CommandReceipt` listed below. Keep the DBOS `application_version` stable while pending work must
+recover, drain that work before an incompatible workflow change, and treat exported DBOS version
+constants and the internal control-envelope version as local profile identifiers without a
+rolling-reader guarantee. DBOS types and upgrade policy stay inside the optional Reference
+profile.
 
 ## Reader policy
 

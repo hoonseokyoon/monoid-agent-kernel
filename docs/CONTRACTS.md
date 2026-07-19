@@ -1212,14 +1212,19 @@ competing input.
   each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
   is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved
   follow-up messages, and resumes.
-- The experimental v0.18 DBOS activation-recovery profile has a narrower operational scope. One
+- The experimental v0.19.2 DBOS activation-recovery profile has a narrow operational scope. One
   stable executor slot has one active process; a restart reuses the same executor identity and
-  application version after the prior process terminates or is fenced. DBOS schedules and retries
-  one finite activation. The configured `CheckpointStore` remains authoritative for checkpoint
-  sequence, input deduplication, the committed boundary receipt, suspension, and terminal meaning.
-  The profile scope covers same-slot finite-activation recovery. The Reference backend, terminal
-  artifact finalization, HTTP, Studio, and arbitrary-host takeover remain separate. Portable
-  recovery semantics remain unchanged.
+  application version after the prior process terminates or is fenced. One private Reference host
+  owns a captured process-global DBOS runtime. Its private control and run participants register
+  distinct workflow families, preflight their queue names, and contribute one aggregate listener
+  set before one launch. The host registers participant queue objects after launch, then opens
+  shared admission. The participants also share host drain and shutdown. DBOS schedules and retries
+  finite control-dispatch and run-resume activations. The configured `CheckpointStore` remains
+  authoritative for checkpoint sequence, input deduplication, committed boundary receipts,
+  suspension, and terminal meaning. The profile scope covers same-slot finite-activation recovery
+  and private lifecycle composition. The Reference backend, terminal artifact finalization, HTTP,
+  Studio, product routing, and arbitrary-host takeover sit outside this scope. Portable recovery
+  semantics remain unchanged.
 
 **Assumption (workspace):** the agent workspace is not durable; on restore the
 deployment re-provisions the base (re-clone/re-mount) and the checkpoint re-applies
@@ -1235,8 +1240,9 @@ by-value `messages` in the checkpoint are the load-bearing conversation record).
 
 ## Legacy Reference Production Hardening
 
-This section describes the legacy `RunnerBackend` lease/watchdog profile. The DBOS Reference path
-does not compose these services. The core never auto-recovers.
+This section applies to the legacy `RunnerBackend` lease/watchdog profile. The DBOS Reference
+profile has a private host-owned runtime lifecycle and no lease/watchdog stack. Core recovery
+requires explicit host orchestration.
 
 ### Failure surfacing & bounded recovery
 
