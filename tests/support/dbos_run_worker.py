@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,8 @@ from monoid_agent_kernel.reference.dbos import (
     DbosRunConfig,
     DbosRunDriver,
 )
+from monoid_agent_kernel.reference.dbos.run_driver import _register_hosted_run_driver
+from monoid_agent_kernel.reference.dbos.runtime import DbosRuntimeHost
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 _RUN_ID = "run_dbos_resume"
@@ -48,10 +51,12 @@ class _EffectProvider:
         run_id: str,
         *,
         committed_path: Path | None = None,
+        marker_payload: dict[str, Any] | None = None,
     ) -> None:
         self._effect_db = effect_db
         self._run_id = run_id
         self._committed_path = committed_path
+        self._marker_payload = marker_payload
 
     def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
         del context
@@ -71,7 +76,8 @@ class _EffectProvider:
                 )
                 connection.commit()
             if self._committed_path is not None:
-                self._committed_path.write_text("semantic effect committed", encoding="utf-8")
+                assert self._marker_payload is not None
+                _write_json_atomic(self._committed_path, self._marker_payload)
                 while True:
                     time.sleep(0.1)
             return ToolResult(ok=True, content={"applied": cursor.rowcount == 1})
@@ -156,6 +162,11 @@ def seed(run_root: Path, workspace: Path, effect_db: Path, output_path: Path) ->
     _write_json(
         output_path,
         {
+            "checkpoint_marker": DbosResumeCommand(
+                _RUN_ID,
+                _COMMAND_ID,
+                checkpoint.seq,
+            ).checkpoint_marker,
             "run_id": _RUN_ID,
             "command_id": _COMMAND_ID,
             "checkpoint_seq": checkpoint.seq,
@@ -170,12 +181,22 @@ def _make_driver(
     workspace: Path,
     effect_db: Path,
     *,
+    host: DbosRuntimeHost | None = None,
     started_path: Path | None = None,
     fault_phase: str | None = None,
 ) -> DbosRunDriver:
     store = LocalFsCheckpointStore(run_root)
+    driver_mode = "hosted" if host is not None else "standalone"
 
     def loop_factory(command: DbosResumeCommand) -> AgentLoop:
+        marker_payload = {
+            "command_id": command.command_id,
+            "fault_phase": fault_phase,
+            "pid": os.getpid(),
+            "run_id": command.run_id,
+            "runtime_mode": driver_mode,
+            "workflow_id": DbosRunDriver.workflow_id(command.run_id, command.command_id),
+        }
         adapter = FakeModelAdapter(
             turns=[
                 ModelTurn(
@@ -206,28 +227,46 @@ def _make_driver(
                     committed_path=(
                         started_path if fault_phase == "effect_committed" else None
                     ),
+                    marker_payload=marker_payload,
                 ),
             ),
         )
 
     def fault_hook(phase: str, command: DbosResumeCommand) -> None:
-        del command
         if (
             phase != "boundary_committed"
             or fault_phase != "boundary_committed"
             or started_path is None
         ):
             return
-        started_path.write_text("boundary committed", encoding="utf-8")
+        _write_json_atomic(
+            started_path,
+            {
+                "command_id": command.command_id,
+                "fault_phase": fault_phase,
+                "pid": os.getpid(),
+                "run_id": command.run_id,
+                "runtime_mode": driver_mode,
+                "workflow_id": DbosRunDriver.workflow_id(
+                    command.run_id,
+                    command.command_id,
+                ),
+            },
+        )
         while True:
             time.sleep(0.1)
 
-    return DbosRunDriver(
-        _driver_config(db_path),
-        store,
-        loop_factory,
-        fault_hook=fault_hook if fault_phase == "boundary_committed" else None,
-    )
+    config = _driver_config(db_path)
+    selected_fault_hook = fault_hook if fault_phase == "boundary_committed" else None
+    if host is not None:
+        return _register_hosted_run_driver(
+            host,
+            config,
+            store,
+            loop_factory,
+            fault_hook=selected_fault_hook,
+        )
+    return DbosRunDriver(config, store, loop_factory, fault_hook=selected_fault_hook)
 
 
 def crash(
@@ -237,16 +276,23 @@ def crash(
     effect_db: Path,
     started_path: Path,
     fault_phase: str,
+    *,
+    hosted: bool = False,
 ) -> None:
+    host = DbosRuntimeHost(_driver_config(db_path)._host_config()) if hosted else None
     driver = _make_driver(
         db_path,
         run_root,
         workspace,
         effect_db,
+        host=host,
         started_path=started_path,
         fault_phase=fault_phase,
     )
-    driver.launch()
+    if host is None:
+        driver.launch()
+    else:
+        host.launch()
     command = DbosResumeCommand(_RUN_ID, _COMMAND_ID, 1)
     driver.enqueue_resume(command)
     driver.wait_for_receipt(command, timeout_s=60)
@@ -258,9 +304,19 @@ def recover(
     workspace: Path,
     effect_db: Path,
     output_path: Path,
+    *,
+    hosted: bool = False,
 ) -> None:
-    driver = _make_driver(db_path, run_root, workspace, effect_db)
-    driver.launch()
+    host = DbosRuntimeHost(_driver_config(db_path)._host_config()) if hosted else None
+    driver = _make_driver(db_path, run_root, workspace, effect_db, host=host)
+    if host is None:
+        driver.launch()
+    else:
+        host.launch()
+    host_running_after_launch = (
+        host is not None and host.state == "running" and host.accepting
+    )
+    shared_runtime = host is not None and driver._runtime is host._runtime
     command = DbosResumeCommand(_RUN_ID, _COMMAND_ID, 1)
     completed = driver.wait_for_receipt(command, timeout_s=30)
     duplicate = driver.enqueue_resume(command)
@@ -298,16 +354,42 @@ def recover(
             "SELECT COUNT(*) FROM workflow_status WHERE workflow_uuid = ? AND status = 'SUCCESS'",
             (stale_workflow_id,),
         ).fetchone()[0]
-    driver.close()
+    ambient_rejected = False
+    host_running_after_rejection = False
+    host_closed = False
+    replacement_constructed = False
+    if host is not None:
+        import dbos
+
+        with dbos.SetWorkflowID("ambient-parent-workflow"):
+            try:
+                driver.enqueue_resume(command)
+            except RuntimeError as exc:
+                ambient_rejected = "no ambient DBOS context" in str(exc)
+        host_running_after_rejection = host.state == "running" and host.accepting
+        host.close()
+        host_closed = host.state == "closed" and driver._closed
+        replacement = DbosRuntimeHost(_driver_config(db_path)._host_config())
+        replacement.close()
+        replacement_constructed = replacement.state == "closed"
+    else:
+        driver.close()
     _write_json(
         output_path,
         {
+            "ambient_rejected": ambient_rejected,
             "completed": completed.to_json(),
             "conflict_code": conflict_code,
             "duplicate": duplicate.to_json(),
             "effect_count": effect_count,
+            "host_closed": host_closed,
+            "host_running_after_launch": host_running_after_launch,
+            "host_running_after_rejection": host_running_after_rejection,
             "latest_seq": latest.seq,
             "marker_count": latest.checkpoint.applied_input_ids.count(command.checkpoint_marker),
+            "recovery_driver_mode": "hosted" if host is not None else "standalone",
+            "replacement_constructed": replacement_constructed,
+            "shared_runtime": shared_runtime,
             "stale": stale.to_json(),
             "stale_workflow_success_rows": stale_workflow_success_rows,
             "workflow_success_rows": workflow_success_rows,
@@ -319,9 +401,18 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
 
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("seed", "crash", "recover"))
+    parser.add_argument(
+        "mode",
+        choices=("seed", "crash", "recover", "hosted-crash", "hosted-recover"),
+    )
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--workspace", type=Path, required=True)
@@ -336,7 +427,7 @@ def main() -> None:
     if args.mode == "seed":
         assert args.output is not None
         seed(args.run_root, args.workspace, args.effect_db, args.output)
-    elif args.mode == "crash":
+    elif args.mode in {"crash", "hosted-crash"}:
         assert args.started is not None
         assert args.fault_phase is not None
         crash(
@@ -346,10 +437,18 @@ def main() -> None:
             args.effect_db,
             args.started,
             args.fault_phase,
+            hosted=args.mode == "hosted-crash",
         )
     else:
         assert args.output is not None
-        recover(args.db, args.run_root, args.workspace, args.effect_db, args.output)
+        recover(
+            args.db,
+            args.run_root,
+            args.workspace,
+            args.effect_db,
+            args.output,
+            hosted=args.mode == "hosted-recover",
+        )
 
 
 if __name__ == "__main__":
