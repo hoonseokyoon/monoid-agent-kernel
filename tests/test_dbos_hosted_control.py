@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import sys
 import threading
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -227,6 +228,15 @@ def _install_fake_runtime(
     monkeypatch: pytest.MonkeyPatch,
     runtime: _FakeOwnedRuntime,
 ) -> None:
+    class _FakeDBAPIError(Exception):
+        pass
+
+    sqlalchemy_module = ModuleType("sqlalchemy")
+    sqlalchemy_exc_module = ModuleType("sqlalchemy.exc")
+    setattr(sqlalchemy_exc_module, "DBAPIError", _FakeDBAPIError)
+    setattr(sqlalchemy_module, "exc", sqlalchemy_exc_module)
+    monkeypatch.setitem(sys.modules, "sqlalchemy", sqlalchemy_module)
+    monkeypatch.setitem(sys.modules, "sqlalchemy.exc", sqlalchemy_exc_module)
     module = SimpleNamespace(
         DBOSClient=lambda *, system_database_url: _FakeClient(runtime),
     )
