@@ -64,11 +64,11 @@ with tenant routing, multiple API instances, external workers, callbacks, and du
 
 ## Choose one hosted assembly
 
-| Assembly | v0.18 position | Operational owner | Recovery scope |
+| Assembly | v0.19.2 position | Operational owner | Recovery scope |
 |---|---|---|---|
 | Product-owned runtime | Production integration target | The product's scheduler and worker control plane | Defined and qualified by the product |
 | Reference inbox assembly | Runnable Reference example and CI-qualified hosted golden path | `RunnerBackend`, `LeaseStore`, `CommandStore`, `RecoveryService`, and watchdog | Shared-store stale-owner claim demonstrated with SQLite |
-| Optional DBOS activation-recovery profile | Experimental Reference recovery proof | DBOS owns finite activation admission, serialization, retry, and same-slot workflow recovery | Same `executor_id` and `application_version` after a fenced restart |
+| Optional DBOS activation-recovery profile | Experimental private Reference composition proof | One private host owns the process-global DBOS runtime and hosted control/run lifecycle | Same `executor_id` and `application_version` after a fenced restart; hosted control and run recovery are acceptance-tested |
 
 The hosted golden path uses owner-local Reference submission together with the durable inbox for
 post-submission status, task-result, and approval commands. It also covers event projection and
@@ -76,12 +76,18 @@ tenant usage through one executable facade. `submit_run()` has no durable client
 the product edge owns idempotent initial-submission admission and routes each accepted submission
 to the selected owner. Integrators place this Reference fixture behind their own product API.
 
-The optional DBOS profile covers one finite resume activation. `CheckpointStore` remains the
-semantic authority, and the DBOS workflow result copies the committed boundary receipt. Its v0.18
-scope excludes `RunnerBackend` replacement, Studio integration, terminal artifact projection,
-PostgreSQL production qualification, rolling upgrades, and arbitrary-host takeover. Conductor is
-outside this profile. The isolated DBOS control experiment and run driver also remain separate.
-See [DBOS_REFERENCE.md](DBOS_REFERENCE.md) for the exact verified invariant and non-goals.
+The optional DBOS profile covers finite control-dispatch and run-resume activations.
+`CheckpointStore` remains the run-semantic authority, and each run-resume workflow result copies
+its committed boundary receipt. Control workflows return a versioned, credential-sanitized
+`CommandReceipt` after dispatch. Private hosted control and run participants share one captured
+runtime, listener set, launch, admission, drain, and shutdown lifecycle while retaining distinct
+partitioned queues. The exported standalone components remain individual experimental entry
+points.
+
+The v0.19.2 scope excludes `RunnerBackend` replacement, hosted-golden-path routing, Studio and
+terminal-projection migration, PostgreSQL production qualification, rolling upgrades,
+arbitrary-host takeover, and Conductor. See [DBOS_REFERENCE.md](DBOS_REFERENCE.md) for the exact
+verified invariant and non-goals.
 
 ## Golden path A: embedded/local product
 
@@ -228,10 +234,11 @@ one transactional command store. A fresh backend can call `recover_runs()` and s
 after an atomic stale-owner claim. Queue limits and claim TTLs bound durable command admission and
 recovery. The bundled SQLite composition remains a single-host Reference fixture.
 
-For the experimental DBOS profile, a supervisor fences the previous process and restarts the same
-stable executor slot with the same application version. DBOS resumes pending finite activations;
-the checked checkpoint remains canonical for semantic state. The profile contains no Reference
-lease, command inbox, recovery service, or watchdog.
+For the experimental DBOS profile, the private host is the sole DBOS lifecycle authority in one
+process. A supervisor fences the previous process and restarts the same stable executor slot with
+the same application version. DBOS resumes pending finite activations; the checked checkpoint
+remains canonical for semantic state. The profile contains no Reference lease, command inbox,
+recovery service, or watchdog lifecycle.
 
 Every durable family has a versioned codec and compatibility-ledger entry. Upgrade in this order:
 
@@ -244,7 +251,7 @@ Every durable family has a versioned codec and compatibility-ledger entry. Upgra
 Run `python -m pytest -q tests/test_compatibility_ledger.py`, then follow the mixed-version and
 rollback procedures in [COMPATIBILITY.md](COMPATIBILITY.md). DBOS workflow inputs, results, executor
 identity, and application-version operation remain governed by the experimental profile document;
-v0.18 makes no production rolling-upgrade claim for that profile.
+v0.19.2 makes no production rolling-upgrade claim for that profile.
 
 ## Streaming and cursor ownership
 
@@ -305,8 +312,10 @@ For tool approvals, render the sanitized durable task request, preserve the task
 decision through the callback-scoped path. Record the approver and reason. Execute the original
 durable request after approval.
 
-The v0.18 `DbosControlPlane` is an isolated transport experiment. It does not supply the hosted
-facade used by this golden path and does not compose with `DbosRunDriver`.
+The exported `DbosControlPlane` is an isolated transport experiment outside the hosted golden
+facade. Its private hosted form composes with the private hosted run participant under one
+Reference runtime host. Public product routing across those participants sits outside the v0.19.2
+proof.
 
 ## Gateway credentials and security
 
@@ -381,8 +390,9 @@ Before production traffic:
 7. complete [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md).
 
 For the Reference inbox fixture, run `tests/test_backend_command_inbox.py` and its shared-store
-recovery tests. For DBOS evaluation, install `reference-dbos`, run its focused model/driver/process
-tests, and apply the scope limits in [DBOS_REFERENCE.md](DBOS_REFERENCE.md).
+recovery tests. For DBOS evaluation, install `reference-dbos`, run the owned-runtime, shared-host,
+hosted-control, hosted-run, and process-restart suites, and apply the scope limits in
+[DBOS_REFERENCE.md](DBOS_REFERENCE.md).
 
 `tests/test_examples.py` imports and executes both golden paths. Contract, Helper Kit, and Reference
 facade drift therefore fails CI at the same integration points shown here.

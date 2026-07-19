@@ -1,13 +1,15 @@
 """Experimental finite DBOS workflows for durable Reference control commands.
 
-This optional profile deliberately does not import or compose the legacy ``LeaseStore``,
-``CommandStore``, recovery watchdog, or process-local owner registry. Each command is one
-finite DBOS workflow, workflow IDs provide idempotency, and a partitioned queue serializes
-commands for the same run while allowing different runs to progress concurrently.
+This optional profile uses a private DBOS runtime host for hosted control and run participants.
+The legacy ``LeaseStore``, ``CommandStore``, recovery watchdog, and ``RunnerBackend._records``
+registry belong to a separate Reference assembly. Each command is one finite DBOS workflow,
+workflow IDs provide idempotency, and a partitioned queue serializes commands for the same run
+while allowing different runs to progress concurrently.
 
-This transport experiment is evaluated separately from the run driver. ``RunnerBackend`` remains
-the Reference HTTP/Studio facade. DBOS steps are at-least-once across a crash before their result
-is checkpointed. Any integrating dispatcher must therefore retain Monoid's command/effect
+The exported control plane remains a standalone transport experiment. Its private hosted form
+registers alongside the private hosted run participant under one runtime host. ``RunnerBackend``
+remains the Reference HTTP/Studio facade. DBOS steps are at-least-once across a crash before their
+result is checkpointed. Any integrating dispatcher must therefore retain Monoid's command/effect
 idempotency and durable outbox rules.
 """
 

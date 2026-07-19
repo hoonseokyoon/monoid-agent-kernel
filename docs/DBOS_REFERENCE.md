@@ -1,13 +1,15 @@
 # DBOS Reference Activation-Recovery Profile
 
-Status: experimental v0.18.0 Reference profile. The optional extra pins the validated DBOS 2.26
-minor line. DBOS owns the operational execution of one finite activation: admission, per-run
-serialization, retry, same-slot workflow recovery, and the workflow result. The Core-defined
-`CheckpointStore` owns the portable semantic state, including input deduplication, the committed
-boundary receipt, suspension, and terminal meaning.
+Status: experimental v0.19.2 Reference profile. The optional extra pins the validated DBOS 2.26
+minor line. DBOS owns finite-activation admission, participant-local per-run serialization, retry,
+same-slot workflow recovery, and workflow results. The private hosted composition adds one shared
+process-runtime lifecycle for control and run participants. The Core-defined `CheckpointStore`
+owns portable semantic state, including input deduplication, committed boundary receipts,
+suspension, and terminal meaning.
 
-This profile is a recovery interoperability proof. Its v0.18 scope covers one finite activation;
-`RunnerBackend`, Studio, and production cutover remain separate.
+This profile is a recovery interoperability proof. Its v0.19.2 scope covers finite control-dispatch
+and run-resume activations plus private shared-host ownership for those hosted workflows.
+`RunnerBackend`, Studio, product routing, and production cutover sit outside this profile.
 
 Install the profile with:
 
@@ -16,7 +18,7 @@ python -m pip install "monoid-agent-kernel[reference-dbos]"
 ```
 
 Importing `monoid_agent_kernel` or `monoid_agent_kernel.reference.dbos` stays lazy. DBOS loads when
-`DbosRunDriver` or `DbosControlPlane` is constructed.
+a standalone `DbosRunDriver` or `DbosControlPlane`, or the private runtime host, is constructed.
 
 ## Boundary
 
@@ -105,10 +107,18 @@ driver.enqueue_resume(command)
 receipt = driver.wait_for_receipt(command)
 ```
 
-`DbosControlPlane` remains the isolated authenticated, credential-sanitizing transport experiment
-from the earlier control-plane spike. v0.18 evaluates it separately from `DbosRunDriver`. The
-legacy Reference command inbox remains a separate valid multi-instance assembly. Shared DBOS host
-composition belongs to a future architecture decision.
+The exported `DbosControlPlane` and `DbosRunDriver` remain standalone experimental entry points.
+Their Reference-private hosted forms register with one private runtime host. The host constructs
+one captured DBOS runtime and registry, aggregates the participants' distinct versioned queues and
+stable workflow names under one shared namespace, launches once, and owns shared admission and
+shutdown. Every hosted participant must request the same database URL, application name,
+application version, executor ID, and shutdown grace. Queue and retry settings remain
+participant-local.
+
+The control and run queues serialize their own partitions independently. Cross-surface per-run
+serialization and control-to-run semantic routing require product integration. The host and
+participant-registration factories are private Reference implementation details. The legacy
+Reference command inbox remains a separate valid multi-instance assembly.
 
 ## Stable executor slot
 
@@ -125,7 +135,7 @@ excludes Conductor. A later multi-host requirement can add a narrow Reference re
 coordinator that reassigns eligible DBOS work while preserving checkpoint sequence and slot
 fencing. That coordinator stays smaller than a general orchestration control plane.
 
-SQLite is the checked development and single-host acceptance database. v0.18 validates that
+SQLite is the checked development and single-host acceptance database. v0.19.2 validates that
 configuration only. DBOS recommends PostgreSQL for production system-database deployments;
 PostgreSQL process qualification and any broader takeover contract belong to a future milestone.
 
@@ -180,10 +190,17 @@ then resumes the still-pending DBOS workflow.
 
 ## Runtime and version lifecycle
 
-DBOS owns a process-global runtime and workflow registry. Reference DBOS components claim one
-process owner before workflow registration. `close()` stops admission, waits for active workflows,
-verifies the DBOS active-workflow set, and releases ownership. A grace timeout requires process
-termination.
+DBOS owns a process-global runtime and workflow registry. Standalone Reference DBOS components
+claim one process owner before workflow registration. In the private hosted composition, control
+and run participants register before launch and share an exact host identity. The host registers
+both workflow families, preflights both queues, installs one aggregate listener set, launches the
+captured runtime once, registers both queues, and then opens admission.
+
+Identity-scoped hosted submissions require a clean external call context; an ambient DBOS workflow
+context is rejected before durable enqueue. Shared close stops host and participant admission,
+drains admitted facade calls, destroys the captured runtime once under one deadline, proves both
+participants drained, clears DBOS globals, and releases process ownership. Uncertain launch,
+drain, or shutdown fences the host and requires process termination.
 
 Finite workflows keep version-drain pressure bounded. A deployment retains compatible workflow
 code for pending work, keeps `application_version` stable across a slot restart, and changes the
@@ -191,7 +208,7 @@ version when workflow operation order or durable input/result compatibility chan
 
 The exported resume-command and run-receipt version constants describe this experimental
 Reference profile only. They are excluded from the stable Core compatibility inventory and carry
-no mixed-version rolling-reader guarantee in v0.18. Drain pending workflows before deploying an
+no mixed-version rolling-reader guarantee in v0.19.2. Drain pending workflows before deploying an
 incompatible record or operation-order change.
 
 Official references:
@@ -202,7 +219,7 @@ Official references:
 - [Workflow recovery](https://docs.dbos.dev/production/workflow-recovery)
 - [Workflow code upgrades](https://docs.dbos.dev/python/tutorials/upgrading-workflows)
 
-## v0.18 status and non-goals
+## v0.19.2 status and non-goals
 
 Completed vertical-slice gates:
 
@@ -215,16 +232,27 @@ Completed vertical-slice gates:
    finite-activation workflow result copied from the committed checkpoint receipt.
 4. Core checkpoints carry the exact portable suspension observation, and `AgentLoop.release_parked`
    closes process resources without finalizing the run.
+5. The DBOS 2.26 adapter binds workflow registration, identity-scoped workflow access, queues,
+   launch, and shutdown to one captured runtime and verifies process-global ownership.
+6. The private runtime host aggregates hosted control and run workflows under one listener set,
+   launch, admission, drain, and shutdown lifecycle. Hosted control recovery and hosted run
+   recovery pass same-slot process-restart acceptance.
+7. Run recovery covers effect-committed and boundary-committed crashes across standalone,
+   hosted, and standalone-to-hosted transitions. Real composition acceptance proves one runtime,
+   two queues, one launch, one destroy, both participant receipts, and fresh replacement ownership.
 
-The v0.18 profile deliberately stops at that vertical slice. Its non-goals are:
+The v0.19.2 profile stops at that Reference-private vertical slice. Its non-goals are:
 
 - replacing `RunnerBackend`, its HTTP facade, or Studio;
-- composing the control-plane experiment and run driver into a production host;
+- publishing the private runtime host or participant-registration seam as a supported product API;
+- automatic standalone-component composition or control-to-run semantic routing;
 - migrating submission, task-result, pause, cancel, status, or terminal artifact projection;
 - claiming one physical write for proposal, metrics, `run.finished`, or other rebuildable views;
 - PostgreSQL production qualification, rolling upgrades, or arbitrary-host takeover;
 - retiring the accepted durable Reference command-inbox workstream.
 
-These items sit outside the v0.18 release scope. A future DBOS milestone must first choose one
-explicit authority model. The portable model keeps `CheckpointStore` authoritative for
-boundary/terminal receipts and other semantic state while DBOS remains an activation scheduler.
+These items sit outside the v0.19.2 release scope and require separate product-integration design
+review. The private host owns DBOS lifecycle. Hosted participants add no `LeaseStore`,
+`CommandStore`, `RecoveryService`, or watchdog lifecycle. `CheckpointStore` remains authoritative
+for boundary and terminal receipts and other portable semantic state while DBOS remains the
+activation scheduler.
