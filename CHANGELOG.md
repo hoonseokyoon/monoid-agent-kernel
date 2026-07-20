@@ -7,6 +7,53 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-07-19
+
+### Added
+
+- Added a Reference-private single-handle, snapshot-bounded event page reader with
+  monotonic-prefix and content-verified byte-offset anchors plus raw-read source-work metrics,
+  supplying the sparse index's verified scan primitive while preserving Core cursor semantics
+  inside the protected append-only run-directory boundary.
+- Added a Reference-private process-local sparse offset index that retains verified anchors,
+  stages bounded candidates during successful page scans, performs logarithmic warm lookup, and
+  rebuilds safely after detected source invalidation or process restart.
+- Bounded the sparse index's retained source slots with a pinned least-recently-used policy and
+  an authoritative uncached fallback for saturated admission, plus cache-capacity metrics.
+- Wired one backend-owned sparse event index into root, descendant, and diagnostics projections,
+  with configurable retained-source capacity and unchanged Core subscription semantics.
+- Added exact-byte conformance evidence descriptors plus a checked reader that reads retained v1
+  reports into the current typed provenance model with provenance explicitly unavailable.
+- Added offline minimal-agent report verification of exact-byte digest integrity, sanitized
+  self-asserted target metadata, profile binding, lifecycle completeness, rule-reference coverage,
+  and internal report/evidence semantic consistency.
+- Added opt-in v2 external reports. When `--evidence-dir` is supplied with an evidence-capable
+  adapter, the runner retains content-addressed normalized evidence, binds all four rules to its
+  content-addressed evidence reference, self-verifies, then publishes retained evidence and
+  configured JUnit/JSON outputs before stdout. Default report-only and legacy adapter runs preserve
+  the v1 output contract.
+- Added a Reference-private DBOS 2.26 owned-runtime adapter that binds workflow registration,
+  identity-scoped enqueue and retrieval, queue, launch, and shutdown operations to one captured
+  singleton and registry, rejects Cloud/Conductor mode, and verifies global identity plus
+  DBOS-owned thread cleanup before ownership release.
+- Added a single-owner Reference-private DBOS runtime host that composes hosted control and run
+  participants under one captured runtime, with deterministic workflow identity, an explicit
+  shared surface-configuration contract, pre-launch workflow/listener aggregation, one
+  launch/shutdown lifecycle, pre-destroy admission drain, deadline-bounded close, and process
+  fencing when participant drain or ownership verification is uncertain.
+- Added a Reference-private hosted control participant that defers workflow, queue, admission,
+  and shutdown ownership to the single DBOS runtime host while preserving standalone behavior.
+- Added a Reference-private hosted run participant with host-owned workflow, queue, admission,
+  active-drive, and shutdown lifecycle while keeping checkpoint semantics portable.
+
+### Fixed
+
+- Projected MIN-03 result identity and completion checks as booleans so raw run identifiers and
+  result status strings do not enter conformance report projections.
+- Treated newline-terminated event-log records as committed and repaired uncommitted crash
+  fragments before recorder or direct append, preventing malformed concatenation and sequence
+  reuse during restart. Committed records with invalid sequence fields now fail closed.
+
 ## [0.19.1] - 2026-07-16
 
 ### Changed

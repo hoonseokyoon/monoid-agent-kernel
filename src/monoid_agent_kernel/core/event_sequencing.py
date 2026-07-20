@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from monoid_agent_kernel.core._event_log import iter_committed_event_records
 from monoid_agent_kernel.core.lifecycle import (
     TERMINAL_STATES,
     SessionState,
@@ -54,20 +55,16 @@ def read_event_page(events_path: Path, *, from_seq: int, limit: int | None) -> d
     events: list[dict[str, Any]] = []
     next_seq = from_seq
     has_more = False
-    if events_path.exists():
-        with events_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                seq = int(event.get("seq") or 0)
-                if seq < from_seq:
-                    continue
-                if limit is not None and len(events) >= limit:
-                    has_more = True
-                    break
-                events.append(event)
-                next_seq = seq + 1
+    for record in iter_committed_event_records(events_path):
+        event = record.payload
+        seq = record.seq
+        if seq < from_seq:
+            continue
+        if limit is not None and len(events) >= limit:
+            has_more = True
+            break
+        events.append(event)
+        next_seq = seq + 1
     return {"events": events, "next_seq": next_seq, "has_more": has_more}
 
 

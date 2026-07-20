@@ -25,6 +25,7 @@ from monoid_agent_kernel.contracts import (  # noqa: E402
     ToolBinding,
 )
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore  # noqa: E402
+from monoid_agent_kernel.core.event_sequencing import RunEventSequencer  # noqa: E402
 from monoid_agent_kernel.providers import FakeModelAdapter  # noqa: E402
 from monoid_agent_kernel.tools import tool_ids  # noqa: E402
 
@@ -81,7 +82,9 @@ def run_local_product(root: Path) -> dict[str, Any]:
     result = session.close()
 
     events_path = run_root / result.run_id / "events.jsonl"
-    event_count = len(events_path.read_text(encoding="utf-8").splitlines())
+    event_count = len(
+        RunEventSequencer().read_event_page(events_path, from_seq=0, limit=None)["events"]
+    )
     return {
         "status": result.status,
         "runtime_profile": "embedded-local",

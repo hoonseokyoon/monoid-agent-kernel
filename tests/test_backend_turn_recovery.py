@@ -162,22 +162,22 @@ def test_backend_descendant_events_reads_child_and_checks_lineage(tmp_path: Path
         child_dir = backend.run_root / child_id
         child_dir.mkdir(parents=True)
         (child_dir / "events.jsonl").write_text(
-            json.dumps({"seq": 0, "type": "model.output.delta", "data": {"text": "hi"}}) + "\n"
-            + json.dumps({"seq": 1, "type": "turn.settled", "data": {"final_text": "hi"}}) + "\n",
+            json.dumps({"seq": 1, "type": "model.output.delta", "data": {"text": "hi"}}) + "\n"
+            + json.dumps({"seq": 2, "type": "turn.settled", "data": {"final_text": "hi"}}) + "\n",
             encoding="utf-8",
         )
         out = backend.descendant_events(run_id, token, child_id)
         assert [e["type"] for e in out["events"]] == ["model.output.delta", "turn.settled"]
         # from_seq filters
-        tail = backend.descendant_events(run_id, token, child_id, from_seq=1)
-        assert [e["seq"] for e in tail["events"]] == [1]
+        tail = backend.descendant_events(run_id, token, child_id, from_seq=2)
+        assert [e["seq"] for e in tail["events"]] == [2]
         page = backend.descendant_events(run_id, token, child_id, from_seq=0, limit=1)
-        assert [e["seq"] for e in page["events"]] == [0]
-        assert page["next_seq"] == 1
+        assert [e["seq"] for e in page["events"]] == [1]
+        assert page["next_seq"] == 2
         assert page["has_more"] is True
         next_page = backend.descendant_events(run_id, token, child_id, from_seq=page["next_seq"], limit=1)
-        assert [e["seq"] for e in next_page["events"]] == [1]
-        assert next_page["next_seq"] == 2
+        assert [e["seq"] for e in next_page["events"]] == [2]
+        assert next_page["next_seq"] == 3
         # a non-descendant id is rejected even with a valid token
         with pytest.raises(PermissionDenied):
             backend.descendant_events(run_id, token, "some.other.run")

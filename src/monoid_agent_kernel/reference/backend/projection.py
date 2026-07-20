@@ -4,7 +4,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from monoid_agent_kernel.core._util import read_text_resilient
 from monoid_agent_kernel.core.checkpoint import CheckpointStore
@@ -12,7 +12,6 @@ from monoid_agent_kernel.core.durable_metadata import DurableMetadataCommitter
 from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
     diagnostic_event_summary,
-    read_event_page,
 )
 from monoid_agent_kernel.core.lifecycle import (
     lifecycle_from_status_artifact,
@@ -33,8 +32,14 @@ from monoid_agent_kernel.reference.backend.run_state import (
 _RUN_EVENT_SEQUENCER = RunEventSequencer()
 
 
-def _read_event_page(events_path: Path, *, from_seq: int, limit: int | None) -> dict[str, Any]:
-    return read_event_page(events_path, from_seq=from_seq, limit=limit)
+class EventPageReader(Protocol):
+    def __call__(
+        self,
+        events_path: Path,
+        *,
+        from_seq: int,
+        limit: int | None,
+    ) -> dict[str, Any]: ...
 
 
 def _read_optional_json(path: Path) -> dict[str, Any] | None:
@@ -89,6 +94,7 @@ class RunProjectionContext:
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     max_recover_attempts_provider: Callable[[], int]
     issue_read_token: Callable[[str, str, str], str]
+    read_event_page: EventPageReader
 
 
 class RunProjectionService:
@@ -172,7 +178,7 @@ class RunProjectionService:
         self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
     ) -> dict[str, Any]:
         events_path = self._context.authorized_run_dir(run_id, token) / "events.jsonl"
-        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
+        page = self._context.read_event_page(events_path, from_seq=from_seq, limit=limit)
         return {"run_id": run_id, **page}
 
     def descendant_events(
@@ -190,7 +196,7 @@ class RunProjectionService:
         except ValueError as exc:
             raise PermissionDenied(str(exc)) from exc
         events_path = self._context.run_root_provider() / descendant_run_id / "events.jsonl"
-        page = _read_event_page(events_path, from_seq=from_seq, limit=limit)
+        page = self._context.read_event_page(events_path, from_seq=from_seq, limit=limit)
         return {"run_id": descendant_run_id, **page}
 
     def descendant_status(
@@ -231,7 +237,11 @@ class RunProjectionService:
             status_file,
             event_limit=event_limit,
         )
-        event_page = _read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=event_limit)
+        event_page = self._context.read_event_page(
+            run_dir / "events.jsonl",
+            from_seq=from_seq,
+            limit=event_limit,
+        )
         event_summaries = [_diagnostic_event_summary(event) for event in event_page["events"]]
         control_events = [
             event for event in event_summaries if str(event.get("type") or "").startswith("control.command.")

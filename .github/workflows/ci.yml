@@ -146,6 +146,10 @@ jobs:
           tests/test_backend_dbos_run.py
           tests/test_backend_dbos_control.py
           tests/test_dbos_control_models.py
+          tests/test_dbos_hosted_control.py
+          tests/test_dbos_hosted_run.py
+          tests/test_dbos_owned_runtime.py
+          tests/test_dbos_runtime_host.py
           tests/test_dbos_run_driver.py
           tests/test_dbos_run_models.py
           --durations=10
@@ -179,6 +183,16 @@ jobs:
       - name: Verify optional dependencies
         if: matrix.install == 'all-extras'
         run: python -c "import dbos, openai, httpx, opentelemetry.sdk"
+      - name: Run installed conformance evidence smoke
+        if: matrix.install == 'minimal'
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m monoid_agent_kernel.conformance.runner \
+            --harness monoid_agent_kernel.reference.conformance:create_minimal_harness \
+            --json-out conformance.json \
+            --junit-out conformance.xml \
+            --evidence-dir conformance-evidence
+          python -c "from pathlib import Path; from monoid_agent_kernel.conformance import read_conformance_report, verify_conformance_report; loaded = read_conformance_report(Path('conformance.json')); assert loaded.status == 'loaded' and loaded.value is not None; report = loaded.value; reference = report.evidence[0]; result = verify_conformance_report(report, {reference.evidence_id: (Path('conformance-evidence') / reference.resource.name).read_bytes()}); assert result.verified and result.report_passed"
       - name: Run minimal Studio acceptance from installed package
         if: matrix.install == 'minimal'
         working-directory: ${{ runner.temp }}

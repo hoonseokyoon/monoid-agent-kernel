@@ -5,12 +5,15 @@ namespace aliases, and source aliases. The machine-readable source is
 `monoid_agent_kernel.core.compatibility.PUBLIC_ARTIFACT_COMPATIBILITY`; the table below is
 checked against it in CI.
 
-Experimental optional Reference profiles are outside this stable inventory. In v0.18,
-`DbosResumeCommand` and `DbosRunReceipt` are experimental Reference operational records for the
-finite-activation proof. Core compatibility excludes them. Keep the DBOS `application_version`
-stable while pending work must recover, drain that work before an incompatible workflow change,
-and treat their exported version constants as local profile identifiers without a rolling-reader
-guarantee. DBOS types and upgrade policy stay inside the optional Reference profile.
+Experimental optional Reference profiles sit outside this stable inventory. v0.19.2 treats
+`DbosResumeCommand`, `DbosRunReceipt`, and the DBOS-specific control envelope as experimental
+Reference operational records for the finite-activation profile. Their compatibility belongs to
+the DBOS profile rather than Core. Control workflow output uses the stable writer-only
+`CommandReceipt` listed below. Keep the DBOS `application_version` stable while pending work must
+recover, drain that work before an incompatible workflow change, and treat exported DBOS version
+constants and the internal control-envelope version as local profile identifiers without a
+rolling-reader guarantee. DBOS types and upgrade policy stay inside the optional Reference
+profile.
 
 ## Reader policy
 
@@ -23,8 +26,10 @@ guarantee. DBOS types and upgrade policy stay inside the optional Reference prof
   accept unknown identifiers.
 - `writer-only` formats have a public producer and no public serialized reader contract.
 
-`Missing id accepted` records an existing compatibility behavior. New producers must always
-write the current identifier.
+`current_writer` is the default producer identifier. The machine-readable `active_writers` tuple
+lists every identifier this release can emit; most artifacts contain only `current_writer`.
+`Missing id accepted` records an existing compatibility behavior. New producers write
+`current_writer` unless a documented variant selects another active writer.
 
 ## Versioned artifact inventory
 
@@ -60,11 +65,17 @@ write the current identifier.
 | `failure` | durable | `monoid.failure.v1` | permissive; missing id accepted | `monoid.failure.v1`<br>`native-agent-runner.failure.v1` |
 | `command-inbox` | durable | `monoid.command-inbox.v1` | strict | `monoid.command-inbox.v1` |
 | `command-receipt` | wire | `monoid.command-receipt.v1` | writer-only | None (writer-only) |
-| `conformance-report` | reference | `monoid.conformance-report.v1` | writer-only | None (writer-only) |
+| `conformance-report` | reference | `monoid.conformance-report.v1` | checked | `monoid.conformance-report.v1`<br>`monoid.conformance-report.v2` |
+| `conformance-evidence` | reference | `monoid.conformance-evidence.v1` | strict | `monoid.conformance-evidence.v1` |
 | `conformance-fixtures` | reference | `monoid.conformance-fixtures.v1` | strict | `monoid.conformance-fixtures.v1` |
 | `studio-chat` | reference | `studio.chat.v1` | strict | `studio.chat.v1` |
 | `studio-chat-message` | reference | `studio.chat.message.v1` | permissive; missing id accepted | `studio.chat.message.v1` |
 <!-- compatibility-registry:end -->
+
+The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in
+v2 evidence path after deploying its checked reader. Retained v1 reports migrate into the v2 typed
+model with provenance explicitly marked unavailable. `--evidence-dir` emits v2 when an enhanced
+adapter supplies retained evidence; consumers of that output need a v2 reader.
 
 Source locations and format-specific notes are available through
 `compatibility_registry()`. Integrators can serialize that result directly as JSON.
@@ -131,7 +142,8 @@ a web call, control delivery, and checkpoint resume before advancing the rollout
 4. Deploy readers first: gateways and backend recovery workers before clients and run workers.
 5. Resume a non-terminal checkpoint canary and verify its run metadata, event sequence, queued
    messages, hosted tasks, and blob references.
-6. Enable new writers. Confirm they emit the registry's `current_writer` identifiers.
+6. Enable new writers. Confirm each emitted identifier appears in the registry's `active_writers`;
+   use `current_writer` for the default producer path.
 7. Retain the pre-upgrade snapshot until recovery, Studio projection, proposal verification,
    and gateway smoke checks pass.
 

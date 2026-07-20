@@ -18,7 +18,7 @@ building against, and securing the kernel.
 - **I'm running a backend/gateway** → [BACKEND.md](BACKEND.md) for the reference
   wiring and token boundary, [OBSERVABILITY.md](OBSERVABILITY.md) for outputs,
   event sinks, and OTel, [DBOS_REFERENCE.md](DBOS_REFERENCE.md) for the experimental
-  finite-activation recovery proof and explicit non-goals.
+  finite-activation recovery and private single-runtime composition proof.
 - **I'm reviewing security** → [security/SECURITY_MODEL.md](security/SECURITY_MODEL.md)
   for verified invariants and boundaries, [security/THREAT_MODEL.md](security/THREAT_MODEL.md)
   for the threat-by-threat breakdown, [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md)
@@ -35,7 +35,7 @@ building against, and securing the kernel.
 |-----|----------------|
 | [CLI.md](CLI.md) | Full `monoid` CLI: `run`, `builder`, `watch`, `proposal`, `jobs`, modes, custom workspace backends, streaming, and path permissions. |
 | [BACKEND.md](BACKEND.md) | Reference backend + LLM/Web gateway walkthrough: starting the services, creating a run over HTTP, and the token boundary. |
-| [DBOS_REFERENCE.md](DBOS_REFERENCE.md) | Experimental DBOS activation-recovery profile, stable-slot crash invariant, ownership boundary, and v0.18 non-goals. |
+| [DBOS_REFERENCE.md](DBOS_REFERENCE.md) | Experimental DBOS activation recovery, private shared-host lifecycle, stable-slot crash invariant, ownership boundary, and v0.19.2 non-goals. |
 | [OBSERVABILITY.md](OBSERVABILITY.md) | Run-directory artifact set, custom event sinks, OpenTelemetry tracing, live streaming, and metrics. |
 | [security/SECURITY_MODEL.md](security/SECURITY_MODEL.md) | Intended security boundaries, non-goals, actors/trust zones, and verified core invariants (each mapped to an operational rule and its tests). |
 | [security/THREAT_MODEL.md](security/THREAT_MODEL.md) | Trust boundaries, the permissive-by-default warning, threat-by-threat defenses, and integrator responsibilities. |

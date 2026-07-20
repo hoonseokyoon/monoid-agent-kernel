@@ -6,7 +6,12 @@ from pathlib import Path
 
 from monoid_agent_kernel import contracts
 from monoid_agent_kernel.conformance.fixtures import load_compatibility_fixtures
-from monoid_agent_kernel.conformance.report import CONFORMANCE_REPORT_VERSION
+from monoid_agent_kernel.conformance.provenance import CONFORMANCE_EVIDENCE_VERSION
+from monoid_agent_kernel.conformance.report import (
+    CONFORMANCE_REPORT_V1,
+    CONFORMANCE_REPORT_V2,
+    CONFORMANCE_REPORT_VERSION,
+)
 from monoid_agent_kernel.core.capability import (
     CAPABILITY_LEASE_VERSION,
     CAPABILITY_REQUEST_VERSION,
@@ -73,12 +78,14 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 33
+    assert len(artifacts) == 34
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
 
     for artifact in artifacts:
+        assert artifact.current_writer in artifact.active_writers
+        assert len(set(artifact.active_writers)) == len(artifact.active_writers)
         if artifact.current_writer.startswith("monoid."):
             assert artifact.current_writer in artifact.supported_readers or (
                 artifact.reader_policy == "writer-only" and not artifact.supported_readers
@@ -88,6 +95,7 @@ def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
                     "monoid.", "native-agent-runner.", 1
                 )
         assert all(".v" in version for version in artifact.supported_readers)
+        assert all(".v" in version for version in artifact.active_writers)
 
     assert len(PUBLIC_COMPATIBILITY_ALIASES) == 8
     assert len({alias.key for alias in PUBLIC_COMPATIBILITY_ALIASES}) == 8
@@ -112,6 +120,7 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "approval": APPROVAL_SCHEMA_VERSION,
         "apply-result": APPLY_RESULT_SCHEMA_VERSION,
         "conformance-report": CONFORMANCE_REPORT_VERSION,
+        "conformance-evidence": CONFORMANCE_EVIDENCE_VERSION,
         "conformance-fixtures": "monoid.conformance-fixtures.v1",
         "command-inbox": COMMAND_ENVELOPE_VERSION,
         "command-receipt": COMMAND_RECEIPT_VERSION,
@@ -126,6 +135,21 @@ def test_packaged_compatibility_fixture_schema_matches_registry() -> None:
     assert load_compatibility_fixtures()
     assert compatibility_artifact("conformance-fixtures").current_writer == (
         "monoid.conformance-fixtures.v1"
+    )
+
+
+def test_conformance_report_default_writer_retains_the_v1_migration_path() -> None:
+    report = compatibility_artifact("conformance-report")
+
+    assert report.current_writer == CONFORMANCE_REPORT_VERSION
+    assert report.reader_policy == "checked"
+    assert report.supported_readers == (
+        CONFORMANCE_REPORT_V1,
+        CONFORMANCE_REPORT_V2,
+    )
+    assert report.active_writers == (
+        CONFORMANCE_REPORT_V1,
+        CONFORMANCE_REPORT_V2,
     )
 
 

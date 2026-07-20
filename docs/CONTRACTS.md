@@ -626,7 +626,89 @@ redrive.
 `from_seq` remains inclusive for backward compatibility. When `limit` is present, callers resume
 with `from_seq=next_seq` to avoid duplicates; omitting `limit` preserves the historical "return all
 events from N" behavior. `RunnerBackend.descendant_events(...)` uses the same pagination contract
-for subagent event streams authorized through an ancestor run token.
+for subagent event streams authorized through an ancestor run token. Stored event sequences are
+positive integers; `from_seq=0` remains the valid cursor for reading from before the first event.
+
+The physical JSONL commit marker is the terminating newline. Readers withhold any trailing bytes
+after the last newline, including an otherwise valid JSON object. Before a recorder or guarded
+direct append reopens the log, it removes that uncommitted suffix only when the status watermark
+does not advertise a later event. A later watermark or a malformed newline-terminated tail fails
+closed without changing the file. Logical `seq` values remain the public cursor; binary offsets
+are private storage details. Tail preparation runs only after the existing queued, live, or
+terminal sequence-owner decision; it validates storage and does not elect another writer. Status
+acts only as a contradiction guard. Writer restart continues to validate all committed sequences
+and fails on duplicate or decreasing physical values; the derived read index never seeds writers.
+
+The Reference package also provides an internal snapshot-bounded page-scan primitive that can
+begin at a content-verified `(seq, byte offset, next byte offset, record digest)` anchor. Tail
+capture, bounded scan, and tail-witness verification share one open file description, so pathname
+replacement cannot mix records from different files in one page. A concurrent append stays outside
+the captured committed prefix. The result reports decoded records, logical scan span, and raw bytes
+fetched by the Reference reader, including fixed-size buffer read-ahead, for deterministic scale
+tests.
+
+The run directory is a protected append-only trust boundary. Deployments reserve run-artifact write
+access for runtime event and metadata owners. Committed event records are immutable, and tool
+workspaces and untrusted processes have no write access to run artifacts. Persistent anchors derive
+transitively from a contiguous prefix originally verified from byte zero. Each warm seek rechecks
+the source identity and nonshrinking committed extent, then verifies the anchored record at its byte
+offset. The current snapshot's committed tail witness is verified before new anchors are minted.
+The in-memory primitive accepts only anchors minted while scanning a strictly increasing prefix.
+Within this boundary, every skipped prefix sequence remains below the anchor sequence, preserving
+Core page results.
+Each proof is process-local and bound to the normalized source path, open-file identity, and captured
+source metadata; copied or field-tampered anchors, cross-log anchors, truncated sources, and
+same-size sources with a changed modification timestamp fail closed. A persisted index row remains
+an untrusted candidate after process restart and must be reverified from byte zero before minting a
+fresh in-memory proof.
+
+A same-inode prefix rewrite followed by suffix growth violates this trust boundary and is
+indistinguishable from a valid append through portable path, inode, timestamp, and size metadata. A
+live warm anchor can therefore skip rewritten earlier records. A new process verifies the current
+bytes from zero. Detecting this mutation while retaining bounded warm I/O requires future
+writer-authenticated generation lineage. The Reference projection injects this reader behind its
+private page-reader seam; Core subscriptions and the authoritative from-zero reader remain
+storage-neutral.
+
+`ReferenceEventOffsetIndex` is the internal warm-read coordinator for those anchors. It retains the
+first verified record, sparse anchors at fixed byte or record strides, and the newest verified
+record as strong process-local references. One per-source lock single-flights cold construction;
+different event logs remain independent. A page scan stages only lightweight stride-selected
+candidates plus its newest safe-prefix candidate. It mints and publishes anchor capabilities after
+the captured snapshot passes final verification. Path replacement, committed-prefix truncation,
+physical shrink, a detected same-size rewrite, or an expired proof clears the derived state and
+permits one authoritative from-zero retry. Committed event-log corruption remains authoritative and
+propagates unchanged.
+
+The index retains at most 128 source slots by default. Its `max_sources` constructor setting defines
+that hard retained-slot capacity; `RunnerBackend.event_index_max_sources` configures the owned
+Reference instance. Page reads pin admitted slots before taking the per-source I/O lock, so
+concurrent readers for one retained cold source share one construction. A miss replaces the
+least-recently-used idle slot. When every retained slot is active, a miss reads one authoritative
+snapshot from byte zero without creating a slot or anchor capabilities. This bypass preserves event
+delivery and the hard metadata bound. It uses an independent snapshot, and another read can repeat
+that cold work until capacity becomes available. Capacity zero routes every read through this
+authoritative uncached path.
+
+`cache_stats()` exposes retained sources, pins, page-read hits and misses, idle-slot evictions, and
+saturated bypasses. `stats()` and `invalidate()` create no slots and leave recency unchanged. An
+evicted source verifies from byte zero on its next read, so deployments size `max_sources` for the
+hot polled-source working set. Source capacity bounds retained slot and capability metadata;
+per-source sparse-anchor density remains governed by the byte and record strides.
+
+A new process starts with an empty offset index. Its first relevant read verifies JSONL from byte
+zero while rebuilding sparse anchors; later pages and append-only-conforming same-process appends
+extend from the retained tail. Persisting candidate offsets cannot reduce that required verification
+under the current process-local proof contract. Constant-work restart remains coupled to the future
+writer-authenticated generation lineage.
+
+Each `RunnerBackend` owns one index and injects its page reader into `RunProjectionService`. Root
+events, authorized descendant events, and diagnostics share that instance. Authorization and
+descendant-lineage validation complete before cache admission. Backend JSON, SSE, Studio transports,
+`SequenceCursor`, Last-Event-ID resume, heartbeat emission, and terminal final draining continue to
+consume the same `{events, next_seq, has_more}` page shape. Backend shutdown leaves the cache alone
+because shutdown is a non-terminal operational stop and Studio ingress can still be active; bounded
+capacity supplies the process-lifetime memory control.
 
 `SequenceCursor` and `EventSubscription` turn that inclusive page API into a reusable next-sequence
 subscription. A cursor advances only after an event is presented, suppresses replayed sequences,
@@ -1140,14 +1222,19 @@ competing input.
   each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
   is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved
   follow-up messages, and resumes.
-- The experimental v0.18 DBOS activation-recovery profile has a narrower operational scope. One
+- The experimental v0.19.2 DBOS activation-recovery profile has a narrow operational scope. One
   stable executor slot has one active process; a restart reuses the same executor identity and
-  application version after the prior process terminates or is fenced. DBOS schedules and retries
-  one finite activation. The configured `CheckpointStore` remains authoritative for checkpoint
-  sequence, input deduplication, the committed boundary receipt, suspension, and terminal meaning.
-  The profile scope covers same-slot finite-activation recovery. The Reference backend, terminal
-  artifact finalization, HTTP, Studio, and arbitrary-host takeover remain separate. Portable
-  recovery semantics remain unchanged.
+  application version after the prior process terminates or is fenced. One private Reference host
+  owns a captured process-global DBOS runtime. Its private control and run participants register
+  distinct workflow families, preflight their queue names, and contribute one aggregate listener
+  set before one launch. The host registers participant queue objects after launch, then opens
+  shared admission. The participants also share host drain and shutdown. DBOS schedules and retries
+  finite control-dispatch and run-resume activations. The configured `CheckpointStore` remains
+  authoritative for checkpoint sequence, input deduplication, committed boundary receipts,
+  suspension, and terminal meaning. The profile scope covers same-slot finite-activation recovery
+  and private lifecycle composition. The Reference backend, terminal artifact finalization, HTTP,
+  Studio, product routing, and arbitrary-host takeover sit outside this scope. Portable recovery
+  semantics remain unchanged.
 
 **Assumption (workspace):** the agent workspace is not durable; on restore the
 deployment re-provisions the base (re-clone/re-mount) and the checkpoint re-applies
@@ -1163,8 +1250,9 @@ by-value `messages` in the checkpoint are the load-bearing conversation record).
 
 ## Legacy Reference Production Hardening
 
-This section describes the legacy `RunnerBackend` lease/watchdog profile. The DBOS Reference path
-does not compose these services. The core never auto-recovers.
+This section applies to the legacy `RunnerBackend` lease/watchdog profile. The DBOS Reference
+profile has a private host-owned runtime lifecycle and no lease/watchdog stack. Core recovery
+requires explicit host orchestration.
 
 ### Failure surfacing & bounded recovery
 

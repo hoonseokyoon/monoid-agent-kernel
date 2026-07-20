@@ -52,8 +52,10 @@ default must be changed for production.
       rows for credential leakage. The bundled SQLite stores are a single-host Reference fixture.
 - [ ] Experimental Reference profiles stay within their documented scope. The Reference inbox
       assembly and optional DBOS activation-recovery profile run as mutually exclusive
-      compositions for a run. The DBOS profile does not compose with `LeaseStore`, `CommandStore`,
-      `RecoveryService`, or watchdog lifecycle ownership and is not production-qualified in v0.18.
+      activation-authority compositions for a run. Inside the DBOS profile, one private runtime
+      host owns hosted control and run lifecycle together. The profile excludes `LeaseStore`,
+      `CommandStore`, `RecoveryService`, and watchdog lifecycle ownership. Production qualification
+      remains a future milestone after v0.19.2.
 
 ## Events, artifacts, and logs
 
@@ -61,6 +63,9 @@ default must be changed for production.
       secret-bearing tool args / shell commands.
 - [ ] Run directories, `transcript.jsonl`, and checkpoints are access-controlled
       and not served publicly.
+- [ ] Only runtime event and metadata owners can write `run_root`. Tool workspaces,
+      MCP servers, and untrusted processes cannot modify committed `events.jsonl`
+      prefixes; the Reference warm offset index relies on this append-only boundary.
 - [ ] Retention policy for private artifacts is defined.
 - [ ] Application logs and OTel exporters do not carry bearer tokens or lease
       material.

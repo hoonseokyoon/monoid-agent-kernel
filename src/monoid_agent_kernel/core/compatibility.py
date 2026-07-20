@@ -14,7 +14,7 @@ AliasKind = Literal["python", "cli", "identifier", "environment", "token"]
 
 @dataclass(frozen=True)
 class CompatibilityArtifact:
-    """One public versioned surface and the versions its current reader supports."""
+    """One public versioned surface with its active writers and supported readers."""
 
     key: str
     kind: ArtifactKind
@@ -25,6 +25,17 @@ class CompatibilityArtifact:
     source: tuple[str, ...]
     accepts_missing_version: bool = False
     notes: str = ""
+    active_writers: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        active_writers = tuple(self.active_writers) or (self.current_writer,)
+        if self.current_writer not in active_writers:
+            raise ValueError("compatibility current_writer must be active")
+        if len(set(active_writers)) != len(active_writers):
+            raise ValueError("compatibility active_writers must be unique")
+        if any(type(version) is not str or not version for version in active_writers):
+            raise TypeError("compatibility active_writers must contain strings")
+        object.__setattr__(self, "active_writers", active_writers)
 
     def to_json(self) -> dict[str, object]:
         return asdict(self)
@@ -299,13 +310,38 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         legacy_reader=False,
         notes="HTTP and Python receipt projection for queued command state and results.",
     ),
-    _monoid_artifact(
-        "conformance-report.v1",
+    CompatibilityArtifact(
+        key="conformance-report",
         kind="reference",
-        reader_policy="writer-only",
-        source=("conformance/report.py:ConformanceReport",),
-        legacy_reader=False,
-        notes="External runner JSON report; JUnit is a secondary standards-compatible projection.",
+        current_writer=namespaced_id("conformance-report.v1"),
+        supported_readers=(
+            namespaced_id("conformance-report.v1"),
+            namespaced_id("conformance-report.v2"),
+        ),
+        namespace_aliases=(),
+        reader_policy="checked",
+        source=(
+            "conformance/report.py:decode_conformance_report",
+            "conformance/runner.py:execute_conformance",
+        ),
+        notes=(
+            "The default writer remains v1. Evidence-retaining executions opt into v2 after the "
+            "checked reader; retained v1 reports migrate with provenance explicitly unavailable."
+        ),
+        active_writers=(
+            namespaced_id("conformance-report.v1"),
+            namespaced_id("conformance-report.v2"),
+        ),
+    ),
+    CompatibilityArtifact(
+        key="conformance-evidence",
+        kind="reference",
+        current_writer=namespaced_id("conformance-evidence.v1"),
+        supported_readers=(namespaced_id("conformance-evidence.v1"),),
+        namespace_aliases=(),
+        reader_policy="strict",
+        source=("conformance/provenance.py:verify_conformance_evidence",),
+        notes="Exact-byte normalized evidence with size and SHA-256 verification.",
     ),
     _monoid_artifact(
         "conformance-fixtures.v1",

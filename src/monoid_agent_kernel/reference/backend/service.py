@@ -63,6 +63,7 @@ from monoid_agent_kernel.identifiers import (
     TASK_CALLBACK_AUDIENCES,
 )
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManager
+from monoid_agent_kernel.reference.event_index import ReferenceEventOffsetIndex
 from monoid_agent_kernel.reference.command_inbox import (
     CommandPrincipal,
     CommandReceipt,
@@ -352,6 +353,7 @@ class RunnerBackend:
     max_message_bytes: int = 1_000_000
     max_message_queue_depth: int = 100
     max_concurrent_runs: int = 0
+    event_index_max_sources: int = field(default=128, kw_only=True)
     # How checkpoints are durably stored (backend owns HOW). Defaults to a local-fs
     # store under run_root; swap for a mounted-volume path or an object-store/DB store.
     checkpoint_store: CheckpointStore | None = None
@@ -378,6 +380,7 @@ class RunnerBackend:
     # (backend._outbox_rng.seed(...)) without perturbing global random state.
     _outbox_rng: random.Random = field(default_factory=random.Random, init=False, repr=False)
     _loop_factory: BackendLoopFactory = field(init=False, repr=False)
+    _event_index: ReferenceEventOffsetIndex = field(init=False, repr=False)
     _projection: RunProjectionService = field(init=False, repr=False)
     _proposal: ProposalService = field(init=False, repr=False)
     _runtime_config: RuntimeConfigService = field(init=False, repr=False)
@@ -393,6 +396,9 @@ class RunnerBackend:
 
     def __post_init__(self) -> None:
         self._worker_id = uuid.uuid4().hex
+        self._event_index = ReferenceEventOffsetIndex(
+            max_sources=self.event_index_max_sources,
+        )
         if self.max_concurrent_runs > 0:
             # Bound on the shared run loop; constructed without a running loop (3.10+ binds
             # lazily) and acquired/released inside the run coroutines.
@@ -505,8 +511,22 @@ class RunnerBackend:
                 checkpoint_store_provider=lambda: self.checkpoint_store,
                 max_recover_attempts_provider=lambda: self.max_recover_attempts,
                 issue_read_token=self._issue_read_token,
+                read_event_page=self._read_indexed_event_page,
             )
         )
+
+    def _read_indexed_event_page(
+        self,
+        events_path: Path,
+        *,
+        from_seq: int,
+        limit: int | None,
+    ) -> dict[str, Any]:
+        return self._event_index.read_page(
+            events_path,
+            from_seq=from_seq,
+            limit=limit,
+        ).to_page()
 
     def _build_proposal_service(self) -> ProposalService:
         return ProposalService(
