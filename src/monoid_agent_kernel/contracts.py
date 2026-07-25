@@ -101,8 +101,12 @@ from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
     DEFAULT_SECRET_KEY_PARTS,
     CapturePolicy,
+    ClosableModelIOObserver,
     DefaultRedactor,
+    ModelCallCapture,
     ModelCallReceipt,
+    ModelIOObserver,
+    ModelIOSubscription,
     RedactionPolicy,
     Redactor,
 )
@@ -314,6 +318,10 @@ __all__ = [
     "DefaultRedactor",
     "DEFAULT_SECRET_KEY_PARTS",
     "ModelCallReceipt",
+    "ModelCallCapture",
+    "ModelIOObserver",
+    "ClosableModelIOObserver",
+    "ModelIOSubscription",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

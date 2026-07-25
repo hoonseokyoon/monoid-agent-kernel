@@ -26,11 +26,23 @@ from monoid_agent_kernel.core.capability import (
     scope_within,
 )
 from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint, load_latest_checked
-from monoid_agent_kernel.core.model_io import RedactionPolicy, Redactor, redacted_or_none
+from monoid_agent_kernel.core.model_io import (
+    CapturePolicy,
+    ModelCallCapture,
+    ModelCallReceipt,
+    ModelIOObserver,
+    ModelIOSubscription,
+    RedactionPolicy,
+    Redactor,
+    close_model_io_subscriptions,
+    dispatch_model_call,
+    redacted_or_none,
+)
 
 STORE_CONTRACT_PROFILE = "checkpoint-store-contract"
 BROKER_CONTRACT_PROFILE = "capability-broker-contract"
 REDACTOR_CONTRACT_PROFILE = "redactor-contract"
+MODEL_IO_CONTRACT_PROFILE = "model-io-observer-contract"
 
 
 class CheckpointStoreFactory(Protocol):
@@ -43,6 +55,10 @@ class CapabilityBrokerFactory(Protocol):
 
 class RedactorFactory(Protocol):
     def __call__(self) -> Redactor: ...
+
+
+class ModelIOObserverFactory(Protocol):
+    def __call__(self) -> ModelIOObserver: ...
 
 
 @contextmanager
@@ -320,6 +336,130 @@ def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutc
         outcomes.append(_error("REDACTOR-03-FAILURE-IS-CONTAINED", REDACTOR_CONTRACT_PROFILE, exc))
 
     return tuple(outcomes)
+
+
+def run_model_io_observer_contract(
+    factory: ModelIOObserverFactory,
+) -> tuple[ConformanceRuleOutcome, ...]:
+    """Execute the guarantees the capture pipeline gives a `ModelIOObserver`.
+
+    The rules are pipeline guarantees rather than observer obligations, so each one drives the
+    factory's observer through `dispatch_model_call` for tolerance and puts a recording observer of
+    our own alongside it to witness what the capture actually held. An opaque implementation cannot
+    report what it received, and asking it to would make the suite test the reporting rather than the
+    contract.
+    """
+
+    outcomes: list[ConformanceRuleOutcome] = []
+    content = {"final_text": "settled output", "api_key": "sk-must-not-survive"}
+    receipt = ModelCallReceipt()
+
+    try:
+        witness = _RecordingObserver()
+        subject = factory()
+        returned = dispatch_model_call(
+            receipt=receipt,
+            content=content,
+            subscriptions=(
+                ModelIOSubscription(subject, CapturePolicy(mode="full")),
+                ModelIOSubscription(witness, CapturePolicy(mode="full")),
+            ),
+        )
+        close_model_io_subscriptions((ModelIOSubscription(subject, CapturePolicy()),))
+        outcomes.append(
+            outcome_from_observations(
+                "MODELIO-01-PARTIAL-IMPLEMENTATION-LEGAL",
+                MODEL_IO_CONTRACT_PROFILE,
+                (
+                    # An observer that declares only ``on_model_call`` is a complete implementation.
+                    observation("declares_on_model_call", expected=True, actual=callable(getattr(subject, "on_model_call", None))),
+                    observation("close_is_optional", expected=True, actual=True),
+                    observation("delivery_reached_a_peer_observer", expected=1, actual=len(witness.captures)),
+                    observation("receipt_returned", expected=True, actual=returned is not None),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(_error("MODELIO-01-PARTIAL-IMPLEMENTATION-LEGAL", MODEL_IO_CONTRACT_PROFILE, exc))
+
+    try:
+        witness = _RecordingObserver()
+        returned = dispatch_model_call(
+            receipt=receipt,
+            content=content,
+            subscriptions=(
+                ModelIOSubscription(_RaisingObserver(), CapturePolicy(mode="full")),
+                ModelIOSubscription(factory(), CapturePolicy(mode="full")),
+                ModelIOSubscription(witness, CapturePolicy(mode="full")),
+            ),
+        )
+        outcomes.append(
+            outcome_from_observations(
+                "MODELIO-02-OBSERVER-FAILURE-CONTAINED",
+                MODEL_IO_CONTRACT_PROFILE,
+                (
+                    # The call already happened and the provider has already been paid; a broken
+                    # exporter does not get to undo that, nor to starve the observers behind it.
+                    observation("dispatch_did_not_raise", expected=True, actual=True),
+                    observation("later_observers_still_ran", expected=1, actual=len(witness.captures)),
+                    observation("receipt_still_returned", expected=True, actual=returned is not None),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(_error("MODELIO-02-OBSERVER-FAILURE-CONTAINED", MODEL_IO_CONTRACT_PROFILE, exc))
+
+    try:
+        witness = _RecordingObserver()
+        dispatch_model_call(
+            receipt=receipt,
+            content=content,
+            subscriptions=(
+                ModelIOSubscription(factory(), CapturePolicy(mode="none")),
+                ModelIOSubscription(witness, CapturePolicy(mode="none")),
+            ),
+        )
+        captured = witness.captures[0]
+        rendered = json.dumps(_jsonish({"content": captured.content, "digests": dict(captured.digests)}))
+        outcomes.append(
+            outcome_from_observations(
+                "MODELIO-03-NONE-POLICY-RECEIVES-NO-CONTENT",
+                MODEL_IO_CONTRACT_PROFILE,
+                (
+                    observation("mode", expected="none", actual=captured.mode),
+                    observation("content_absent", expected=True, actual=captured.content is None),
+                    # Not even a digest: ``none`` means the consumer learns nothing about the content,
+                    # and a digest of a short prompt is a guessable one.
+                    observation("digests_absent", expected=0, actual=len(captured.digests)),
+                    observation("lengths_absent", expected=0, actual=len(captured.lengths)),
+                    observation("nothing_leaked", expected=False, actual="sk-must-not-survive" in rendered),
+                    # The receipt still arrives: it is metadata only, so it is safe at every mode.
+                    observation("receipt_still_delivered", expected=True, actual=captured.receipt is not None),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(_error("MODELIO-03-NONE-POLICY-RECEIVES-NO-CONTENT", MODEL_IO_CONTRACT_PROFILE, exc))
+
+    return tuple(outcomes)
+
+
+class _RecordingObserver:
+    """Witnesses what a capture held, for rules an opaque implementation cannot report on."""
+
+    def __init__(self) -> None:
+        self.captures: list[ModelCallCapture] = []
+
+    def on_model_call(self, capture: ModelCallCapture) -> None:
+        self.captures.append(capture)
+
+
+class _RaisingObserver:
+    """An observer that always fails, for the containment rule."""
+
+    def on_model_call(self, capture: ModelCallCapture) -> None:
+        del capture
+        raise RuntimeError("exporter unavailable")
 
 
 class _FailingRedactor:

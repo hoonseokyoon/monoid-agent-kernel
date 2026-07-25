@@ -27,7 +27,7 @@ from functools import lru_cache
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from monoid_agent_kernel._policy_util import dedupe, str_tuple
-from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.wire_validation import (
@@ -326,6 +326,38 @@ class CapturePolicy:
         }
 
 
+def content_digest(value: Any) -> str:
+    """A stable digest of one captured content field, computed on the raw value.
+
+    Text hashes its UTF-8 bytes; anything else hashes as canonical JSON, so a digest does not depend
+    on mapping order. Wrapped in a single-key object rather than hashed directly, so a string and a
+    list containing that string cannot collide.
+    """
+    if isinstance(value, str):
+        return sha256_bytes(value.encode("utf-8"))
+    return canonical_sha256({"value": _jsonish(value)})
+
+
+def content_length(value: Any) -> int | None:
+    """Character length for text, `None` for anything else.
+
+    Deliberately not "length of the canonical JSON": for a structured payload that number measures
+    the serialization, not the content, and an operator reading it as a content size would be wrong.
+    A missing answer is better than a misleading one.
+    """
+    return len(value) if isinstance(value, str) else None
+
+
+def _jsonish(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _jsonish(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_jsonish(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 @dataclass(frozen=True)
 class ModelCallReceipt:
     """What happened on one model call, without any of what was said.
@@ -455,3 +487,156 @@ class ModelCallReceipt:
             redaction_digest=parse_str(payload, "redaction_digest"),
             capture_downgrades=parse_int(payload, "capture_downgrades"),
         )
+
+
+@dataclass(frozen=True)
+class ModelCallCapture:
+    """One model call as a single consumer is allowed to see it.
+
+    `mode` is the mode *actually applied*, which is not always the mode the policy asked for:
+    `downgraded_from` is set when redaction failed and this consumer dropped to `digest`. The pair is
+    what lets a consumer tell "there was no content" apart from "there was content I was not given",
+    which a single mode field cannot express.
+
+    `digests` and `lengths` describe the **raw** content, never the redacted view. That is the whole
+    reason the digest is taken first: two consumers on different policies see different text but agree
+    on the identity of what the provider was sent, so a digest can join a redacted record to a full
+    one — and, later, key a replay.
+    """
+
+    receipt: ModelCallReceipt
+    mode: CaptureMode = "none"
+    downgraded_from: str = ""
+    content: Mapping[str, Any] | None = None
+    digests: Mapping[str, str] = field(default_factory=dict)
+    lengths: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.mode not in CAPTURE_MODES:
+            raise WireValidationError(f"capture mode must be one of: {', '.join(CAPTURE_MODES)}")
+        object.__setattr__(self, "digests", dict(self.digests))
+        object.__setattr__(self, "lengths", dict(self.lengths))
+        if self.content is not None:
+            object.__setattr__(self, "content", dict(self.content))
+
+    @property
+    def was_downgraded(self) -> bool:
+        return self.downgraded_from != ""
+
+
+@runtime_checkable
+class ModelIOObserver(Protocol):
+    """A consumer of settled model calls.
+
+    One required member. `close` is declared separately by `ClosableModelIOObserver`, because a member
+    with a default in a `Protocol` body reaches only classes that explicitly inherit it — for
+    structural typing it is *required*, and declaring `close` here would reject every observer that
+    does not define one. The pipeline probes for it with `getattr`.
+
+    An observer must not raise, and if it does the kernel swallows it: an exporter that is down is not
+    a reason to fail a model call the provider has already billed for. It must also treat the capture
+    as read-only; each consumer gets its own capture, but the receipt inside is shared.
+    """
+
+    def on_model_call(self, capture: ModelCallCapture) -> None: ...
+
+
+@runtime_checkable
+class ClosableModelIOObserver(Protocol):
+    """An observer that owns a resource to release. Opt-in; see `ModelIOObserver`."""
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class ModelIOSubscription:
+    """One observer and the policy that governs what it sees.
+
+    The policy lives here rather than on the observer, so registering the same exporter twice under
+    two policies is a normal thing to do — and so an observer cannot widen its own grant.
+    """
+
+    observer: ModelIOObserver
+    policy: CapturePolicy = field(default_factory=lambda: CapturePolicy())
+
+
+def _resolve_capture(policy: CapturePolicy, content: Mapping[str, Any]) -> tuple[CaptureMode, str, Mapping[str, Any] | None]:
+    """Decide what one subscription sees, as `(mode, downgraded_from, content)`."""
+    if policy.mode == "none":
+        return "none", "", None
+    if policy.mode == "digest":
+        return "digest", "", None
+    if policy.mode == "full":
+        return "full", "", dict(content)
+    redacted = redacted_or_none(
+        dict(content), policy=policy.effective_redaction, redactor=policy.redactor
+    )
+    if redacted is None:
+        # Fail closed. This consumer asked for redacted content and the redactor could not produce it,
+        # so it gets what ``digest`` would have given it -- never the raw value.
+        return "digest", "redacted", None
+    return "redacted", "", dict(redacted)
+
+
+def dispatch_model_call(
+    *,
+    receipt: ModelCallReceipt,
+    content: Mapping[str, Any],
+    subscriptions: Sequence[ModelIOSubscription],
+) -> ModelCallReceipt:
+    """Deliver one settled model call to every subscription under its own policy.
+
+    Returns the receipt the observers were given: the same one, plus `capture_downgrades`. The count
+    is resolved in a first pass *before* any delivery, so every observer sees the same receipt.
+    Delivering as we go would hand the first observer a count of zero and the last the true total, and
+    a receipt that disagrees with itself across consumers is worse than no count at all.
+
+    Digests and lengths are computed once, on the raw content, and shared. Beyond the cost, that is
+    what makes them comparable: a per-observer digest taken after redaction would differ by policy and
+    could not join anything.
+
+    An observer that raises is skipped and the rest still run. The call already happened and the
+    provider has already been paid; a broken exporter does not get to undo that.
+    """
+    if not subscriptions:
+        return receipt
+
+    digests = {key: content_digest(value) for key, value in content.items()}
+    lengths = {
+        key: length for key, value in content.items() if (length := content_length(value)) is not None
+    }
+
+    resolved = [_resolve_capture(subscription.policy, content) for subscription in subscriptions]
+    downgrades = sum(1 for _mode, downgraded_from, _payload in resolved if downgraded_from)
+    settled = replace(receipt, capture_downgrades=receipt.capture_downgrades + downgrades)
+
+    for subscription, (mode, downgraded_from, payload) in zip(subscriptions, resolved, strict=True):
+        reveals_metadata = mode != "none"
+        capture = ModelCallCapture(
+            receipt=settled,
+            mode=mode,
+            downgraded_from=downgraded_from,
+            content=payload,
+            digests=digests if reveals_metadata else {},
+            lengths=lengths if reveals_metadata else {},
+        )
+        try:
+            subscription.observer.on_model_call(capture)
+        except Exception:
+            continue
+    return settled
+
+
+def close_model_io_subscriptions(subscriptions: Sequence[ModelIOSubscription]) -> None:
+    """Release every observer that declared a `close`, tolerating failures.
+
+    Probed with `getattr` rather than required, which is what keeps `close` off the base protocol.
+    """
+    for subscription in subscriptions:
+        close = getattr(subscription.observer, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except Exception:
+            continue

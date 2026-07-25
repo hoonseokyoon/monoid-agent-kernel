@@ -9,6 +9,7 @@ import pytest
 from monoid_agent_kernel.conformance.contracts import (
     run_capability_broker_contract,
     run_checkpoint_store_contract,
+    run_model_io_observer_contract,
     run_redactor_contract,
 )
 from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityBroker
@@ -121,7 +122,8 @@ def test_contract_suites_are_reachable_through_the_public_conformance_package() 
     import monoid_agent_kernel.conformance as conformance
 
     assert conformance.run_redactor_contract is run_redactor_contract
-    assert "RedactorFactory" in conformance.__all__
+    assert conformance.run_model_io_observer_contract is run_model_io_observer_contract
+    assert {"RedactorFactory", "ModelIOObserverFactory"} <= set(conformance.__all__)
 
     outcomes = conformance.run_redactor_contract(DefaultRedactor)
 
@@ -132,6 +134,20 @@ def test_contract_suites_are_reachable_through_the_public_conformance_package() 
     ]
     assert all(outcome.profile_id == "redactor-contract" for outcome in outcomes)
     assert all(outcome.status == "passed" for outcome in outcomes)
+
+    class Observer:
+        def on_model_call(self, capture: object) -> None:
+            del capture
+
+    observer_outcomes = conformance.run_model_io_observer_contract(Observer)
+
+    assert [outcome.rule_id for outcome in observer_outcomes] == [
+        "MODELIO-01-PARTIAL-IMPLEMENTATION-LEGAL",
+        "MODELIO-02-OBSERVER-FAILURE-CONTAINED",
+        "MODELIO-03-NONE-POLICY-RECEIVES-NO-CONTENT",
+    ]
+    assert all(outcome.profile_id == "model-io-observer-contract" for outcome in observer_outcomes)
+    assert all(outcome.status == "passed" for outcome in observer_outcomes)
 
 
 def test_redactor_contract_redacts_exception_details() -> None:
