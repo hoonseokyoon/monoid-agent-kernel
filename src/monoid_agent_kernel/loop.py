@@ -281,9 +281,11 @@ def _start_abandonable_sync_call(
         future or task is cancelled and consumed so it stops running and cannot surface as a
         never-retrieved exception. Any other awaitable has no generic disposal and is left alone.
 
-        ``on_live_loop`` is False when the run's loop has already closed. A future or task bound to
-        a closed loop can no longer run, and cancelling it there would try to schedule callbacks on
-        the dead loop, so only the loop-independent coroutine close is safe.
+        ``on_live_loop`` is False when the run's loop has already closed. Cancelling a future there
+        is unsafe -- it schedules callbacks on the dead loop -- and a still-pending future can no
+        longer run, so there is nothing to stop and no outcome to read. An *already settled* one is
+        different: reading its outcome touches no loop, and an unretrieved exception is exactly what
+        warns at collection, so that case is consumed rather than skipped.
         """
 
         succeeded, payload = outcome[0]
@@ -291,9 +293,12 @@ def _start_abandonable_sync_call(
             return
         if inspect.iscoroutine(payload):
             payload.close()
-        elif on_live_loop and isinstance(payload, asyncio.Future):
-            payload.cancel()
-            payload.add_done_callback(_consume_task_outcome)
+        elif isinstance(payload, asyncio.Future):
+            if on_live_loop:
+                payload.cancel()
+                payload.add_done_callback(_consume_task_outcome)
+            elif payload.done():
+                _consume_task_outcome(payload)
 
     def deliver() -> None:
         if not settled.done():
@@ -1668,6 +1673,16 @@ class AgentLoop:
         loop.call_soon_threadsafe(loop.stop)
         if self._owned_loop_thread is not None:
             self._owned_loop_thread.join(timeout=5)
+        # An abandoned sync worker can deliver into the window between ``stop`` and ``close``.
+        # ``call_soon_threadsafe`` accepts a callback there -- the loop is stopped, not closed -- but
+        # a stopped loop never runs it and closing drops it, so a late awaitable would go undisposed
+        # and warn at collection. The loop thread has exited by now, so this thread is free to drive
+        # one more iteration and flush what is already queued. ``running is None`` because an async
+        # caller closing from its own loop cannot drive a second loop here; that path keeps the plain
+        # stop-and-close, and a worker arriving after the close still self-disposes on the
+        # ``RuntimeError`` from ``call_soon_threadsafe``.
+        if running is None and not loop.is_closed():
+            loop.run_until_complete(asyncio.sleep(0))
         loop.close()
         self._owned_loop = None
         self._owned_loop_thread = None

@@ -657,6 +657,40 @@ def test_awaitable_from_abandoned_sync_tool_is_closed_after_loop_shutdown(tmp_pa
     assert inspect.getcoroutinestate(returned[0]) == inspect.CORO_CLOSED
 
 
+def test_late_failed_future_from_abandoned_sync_call_is_consumed_after_loop_shutdown() -> None:
+    """A settled future arriving after the loop closed still has its outcome read.
+
+    Cancelling a future needs the loop, so the closed-loop path cannot dispose a *pending* one -- but
+    such a future can no longer run either, so there is nothing to stop and no outcome to read.
+    A future that already carries an exception is the case that matters: reading it touches no loop,
+    and leaving it unread is precisely what asyncio reports at collection.
+    """
+    release = threading.Event()
+    holder: list[asyncio.Future[None]] = []
+
+    async def scenario() -> None:
+        failed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        failed.set_exception(RuntimeError("late failure"))
+        holder.append(failed)
+
+        def call() -> asyncio.Future[None]:
+            release.wait(timeout=5)
+            return failed
+
+        _start_abandonable_sync_call(call, thread_name="nar-test-late-failed").result.cancel()
+
+    asyncio.run(scenario())  # the loop is closed once this returns
+    release.set()  # ... and only now does the call return its future
+
+    failed = holder[0]
+    deadline = time.time() + 5
+    # ``_log_traceback`` is the flag that drives the warning: set on ``set_exception``, cleared once
+    # the exception is retrieved.
+    while time.time() < deadline and failed._log_traceback:  # type: ignore[attr-defined]
+        time.sleep(0.02)
+    assert failed._log_traceback is False  # type: ignore[attr-defined]
+
+
 def test_stubborn_async_tool_cleanup_cannot_block_run_cancellation(tmp_path: Path) -> None:
     token = CancellationToken()
 
