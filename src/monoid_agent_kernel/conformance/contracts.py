@@ -407,10 +407,19 @@ def run_model_io_observer_contract(
     outcomes: list[ConformanceRuleOutcome] = []
     content = {"final_text": "settled output", "api_key": "sk-must-not-survive"}
     receipt = ModelCallReceipt()
+    # Every observer this suite constructs, so a factory returning an exporter that owns a file, thread
+    # or network client has all of them released -- not just the first rule's. A public conformance
+    # suite gets run repeatedly, which is exactly where a per-run leak accumulates.
+    subjects: list[ModelIOObserver] = []
+
+    def new_subject() -> ModelIOObserver:
+        subject = factory()
+        subjects.append(subject)
+        return subject
 
     try:
         witness = _RecordingObserver()
-        subject = factory()
+        subject = new_subject()
         returned = dispatch_model_call(
             receipt=receipt,
             content=content,
@@ -419,7 +428,6 @@ def run_model_io_observer_contract(
                 ModelIOSubscription(witness, CapturePolicy(mode="full")),
             ),
         )
-        close_model_io_subscriptions((ModelIOSubscription(subject, CapturePolicy()),))
         outcomes.append(
             outcome_from_observations(
                 "MODELIO-01-PARTIAL-IMPLEMENTATION-LEGAL",
@@ -443,7 +451,7 @@ def run_model_io_observer_contract(
             content=content,
             subscriptions=(
                 ModelIOSubscription(_RaisingObserver(), CapturePolicy(mode="full")),
-                ModelIOSubscription(factory(), CapturePolicy(mode="full")),
+                ModelIOSubscription(new_subject(), CapturePolicy(mode="full")),
                 ModelIOSubscription(witness, CapturePolicy(mode="full")),
             ),
         )
@@ -469,7 +477,7 @@ def run_model_io_observer_contract(
             receipt=receipt,
             content=content,
             subscriptions=(
-                ModelIOSubscription(factory(), CapturePolicy(mode="none")),
+                ModelIOSubscription(new_subject(), CapturePolicy(mode="none")),
                 ModelIOSubscription(witness, CapturePolicy(mode="none")),
             ),
         )
@@ -495,6 +503,11 @@ def run_model_io_observer_contract(
     except Exception as exc:
         outcomes.append(_error("MODELIO-03-NONE-POLICY-RECEIVES-NO-CONTENT", MODEL_IO_CONTRACT_PROFILE, exc))
 
+    # ``close_model_io_subscriptions`` de-duplicates by identity and swallows failures, so a factory
+    # returning one shared instance is closed once and a raising ``close`` cannot lose the outcomes.
+    close_model_io_subscriptions(
+        tuple(ModelIOSubscription(subject, CapturePolicy()) for subject in subjects)
+    )
     return tuple(outcomes)
 
 

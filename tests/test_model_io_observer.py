@@ -481,6 +481,80 @@ def test_full_capture_content_shares_no_nested_structure_with_the_caller() -> No
     assert retained == {"messages": [{"role": "user", "text": "original"}], "final_text": "done"}
 
 
+def test_an_in_place_redactor_touches_neither_the_caller_nor_its_peers() -> None:
+    """Nothing in the `Redactor` contract forbids editing mappings in place, and it is the natural way
+    to write one — so each redacted subscription is handed a payload it owns.
+
+    With only the outer mapping copied, such a redactor mutated the caller's settled payload *and* the
+    input the next redacted subscription saw, which made the first consumer's rules everyone's.
+    """
+
+    class InPlace:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            for message in value.get("messages", []):
+                message["text"] = "[masked]"
+            return value
+
+    class Observes:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return {"saw": [dict(message) for message in value.get("messages", [])]}
+
+    content: dict[str, Any] = {"messages": [{"text": "original"}]}
+    first, second = Recorder(), Recorder()
+
+    dispatch_model_call(
+        receipt=ModelCallReceipt(),
+        content=content,
+        subscriptions=(
+            ModelIOSubscription(first, CapturePolicy(mode="redacted", redactor=InPlace())),
+            ModelIOSubscription(second, CapturePolicy(mode="redacted", redactor=Observes())),
+        ),
+    )
+
+    assert content == {"messages": [{"text": "original"}]}
+    assert first.captures[0].content == {"messages": [{"text": "[masked]"}]}
+    assert second.captures[0].content == {"saw": [{"text": "original"}]}
+
+
+def test_an_all_none_dispatch_hashes_nothing() -> None:
+    """Hashing walks every field and, for a value with no JSON form, materializes a string of it — so a
+    run wired to nothing but a `none`-mode observer was paying to digest resolved media it discarded."""
+    rendered: list[str] = []
+
+    class Loud:
+        def __repr__(self) -> str:
+            rendered.append("rendered")
+            return "loud"
+
+    dispatch_model_call(
+        receipt=ModelCallReceipt(),
+        content={"blob": Loud()},
+        subscriptions=(ModelIOSubscription(Recorder(), CapturePolicy(mode="none")),),
+    )
+
+    assert rendered == []
+
+
+def test_a_downgraded_subscription_still_gets_its_metadata_computed() -> None:
+    """Keyed on the *resolved* modes: a subscription downgraded from `redacted` lands on `digest`, which
+    does expose this metadata, so keying on the declared mode would have withheld it."""
+    recorder = Recorder()
+
+    dispatch_model_call(
+        receipt=ModelCallReceipt(),
+        content=CONTENT,
+        subscriptions=(
+            ModelIOSubscription(
+                recorder, CapturePolicy(mode="redacted", redactor=FailingRedactor())
+            ),
+        ),
+    )
+
+    capture = recorder.captures[0]
+    assert capture.mode == "digest"
+    assert capture.digests == {key: content_digest(value) for key, value in CONTENT.items()}
+
+
 def test_full_capture_content_is_detached_once_not_per_observer() -> None:
     """Content can carry resolved media, so copying per subscriber is real cost for a case an observer
     is already forbidden to cause — treating the capture as read-only is part of its contract, whereas

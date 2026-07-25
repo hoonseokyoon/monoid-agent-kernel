@@ -70,6 +70,60 @@ def test_observer_shapes_satisfy_the_contract(
     ]
 
 
+def test_the_suite_closes_every_observer_it_constructs() -> None:
+    """It builds one per rule, and only the first was being released.
+
+    A public conformance suite gets run repeatedly, which is exactly where a per-run leak of a file
+    handle, thread or network client accumulates.
+    """
+    closed: list[int] = []
+
+    class Closing:
+        def on_model_call(self, capture: ModelCallCapture) -> None:
+            del capture
+
+        def close(self) -> None:
+            closed.append(id(self))
+
+    outcomes = run_model_io_observer_contract(Closing)
+
+    assert all(outcome.status == "passed" for outcome in outcomes)
+    assert len(closed) == len(RULE_IDS)
+    assert len(set(closed)) == len(RULE_IDS)
+
+
+def test_a_raising_close_does_not_lose_the_outcomes() -> None:
+    class ClosingBadly:
+        def on_model_call(self, capture: ModelCallCapture) -> None:
+            del capture
+
+        def close(self) -> None:
+            raise RuntimeError("already gone")
+
+    outcomes = run_model_io_observer_contract(ClosingBadly)
+
+    assert [outcome.rule_id for outcome in outcomes] == RULE_IDS
+    assert all(outcome.status == "passed" for outcome in outcomes)
+
+
+def test_a_shared_observer_instance_is_closed_once() -> None:
+    """`close_model_io_subscriptions` de-duplicates by identity, so a factory returning one instance
+    does not get closed three times."""
+    closes = []
+
+    class Counting:
+        def on_model_call(self, capture: ModelCallCapture) -> None:
+            del capture
+
+        def close(self) -> None:
+            closes.append(1)
+
+    shared = Counting()
+    run_model_io_observer_contract(lambda: shared)
+
+    assert len(closes) == 1
+
+
 def test_an_observer_that_always_raises_still_satisfies_the_contract() -> None:
     """Because containment is the pipeline's job, not the observer's. An exporter that is down is
     not a reason to fail a model call the provider has already billed for."""

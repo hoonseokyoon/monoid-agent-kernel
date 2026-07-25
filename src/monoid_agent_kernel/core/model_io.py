@@ -689,8 +689,15 @@ def redacted_fields_or_none(
 
     A shape violation is treated exactly like a raise. It is a contract violation either way, and the
     consumer that asked for redacted content gets metadata instead of a guess.
+
+    The redactor is handed a **fully detached** payload it may treat as its own, so an implementation
+    that edits mappings and lists in place is legal. Nothing in the `Redactor` contract forbids that, and
+    it is the natural way to write one — but with only the outer mapping copied it mutated the caller's
+    settled payload *and* the input the next redacted subscription would see, so the first consumer's
+    rules silently became everyone's. Detached per call rather than once per dispatch, precisely because
+    an in-place redactor would otherwise contaminate its peers.
     """
-    redacted = redacted_or_none(dict(content), policy=policy, redactor=redactor)
+    redacted = redacted_or_none(_detached_content(content), policy=policy, redactor=redactor)
     if not isinstance(redacted, Mapping):
         return None
     return {str(key): value for key, value in redacted.items()}
@@ -703,10 +710,11 @@ def _detached_content(content: Mapping[str, Any]) -> Mapping[str, Any]:
     mutated its own payload after dispatch changed captures observers had already retained, while the
     digests kept describing the pre-mutation value. A capture is meant to be a settled record.
 
-    Done once per dispatch and shared by the `full`-mode subscriptions rather than copied per observer.
-    Content can carry resolved media, and copying that per subscriber is real cost for a case an
-    observer is already forbidden to cause — treating the capture as read-only is part of the
-    `ModelIOObserver` contract, whereas a caller mutating its own dict violates nothing.
+    For `full` mode this is done once per dispatch and shared by those subscriptions rather than copied
+    per observer. Content can carry resolved media, and copying that per subscriber is real cost for a
+    case an observer is already forbidden to cause — treating the capture as read-only is part of the
+    `ModelIOObserver` contract, whereas a caller mutating its own dict violates nothing. Redaction is the
+    opposite: an in-place redactor is legal, so each redacted subscription gets its own copy.
 
     A payload holding something `deepcopy` refuses falls back to the shallow copy: degraded isolation is
     survivable, failing a model call the provider has already been paid for is not.
@@ -799,10 +807,6 @@ def dispatch_model_call(
     if not subscriptions:
         return receipt
 
-    digests = {key: content_digest(value) for key, value in content.items()}
-    lengths = {
-        key: length for key, value in content.items() if (length := content_length(value)) is not None
-    }
     full_content = (
         _detached_content(content)
         if any(subscription.policy.mode == "full" for subscription in subscriptions)
@@ -814,6 +818,24 @@ def dispatch_model_call(
         for subscription in subscriptions
     ]
     downgrades = sum(1 for _mode, downgraded_from, _payload in resolved if downgraded_from)
+
+    # Only if somebody will actually see them. Hashing walks every field and, for a value with no JSON
+    # form, materializes a string of it -- so a run wired to nothing but a ``none``-mode observer was
+    # paying to digest resolved media it then discarded. Keyed on the *resolved* modes, not the declared
+    # ones: a subscription downgraded from ``redacted`` lands on ``digest`` and does see this metadata.
+    reveals_any_metadata = any(mode != "none" for mode, _downgraded_from, _payload in resolved)
+    digests = (
+        {key: content_digest(value) for key, value in content.items()} if reveals_any_metadata else {}
+    )
+    lengths = (
+        {
+            key: length
+            for key, value in content.items()
+            if (length := content_length(value)) is not None
+        }
+        if reveals_any_metadata
+        else {}
+    )
     settled = replace(receipt, capture_downgrades=receipt.capture_downgrades + downgrades)
 
     for subscription, (mode, downgraded_from, payload) in zip(subscriptions, resolved, strict=True):
