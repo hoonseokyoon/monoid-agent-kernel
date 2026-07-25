@@ -3915,6 +3915,7 @@ class AgentLoop:
         task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
         loop = asyncio.get_running_loop()
         cancelled: asyncio.Future[None] = loop.create_future()
+        outcome_consumed = False
 
         def signal_cancelled() -> None:
             def resolve() -> None:
@@ -3937,6 +3938,7 @@ class AgentLoop:
             )
             self._check_run_boundary(deadline)
             if task in done:
+                outcome_consumed = True
                 try:
                     return task.result()
                 except asyncio.CancelledError as exc:
@@ -3955,6 +3957,12 @@ class AgentLoop:
                 await self._detach_unfinished_call(
                     task, sync_call, grace_s=self.async_tool_cancel_grace_s
                 )
+            elif not outcome_consumed:
+                # The handler finished -- possibly by raising -- in the same loop turn that made a
+                # run boundary observable, so ``_check_run_boundary`` raised before anything read the
+                # outcome. Nothing downstream will read it now either, and an unretrieved exception
+                # surfaces as a "Future exception was never retrieved" warning at collection.
+                _consume_task_outcome(task)
 
     def _finalize_tool_call(
         self,

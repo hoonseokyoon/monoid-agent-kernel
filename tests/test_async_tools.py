@@ -16,9 +16,9 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 from monoid_agent_kernel import tool
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityLease
-from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
-from monoid_agent_kernel.errors import ToolExecutionError
+from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.errors import RunCancelled, ToolExecutionError
 from monoid_agent_kernel.loop import AgentLoop, _start_abandonable_sync_call
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -470,6 +470,34 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
     assert result.error_code == "run_timeout"
     workers[0].join(timeout=10)
     assert late_tool_id == ["sync.late_scope"]
+
+
+def test_failed_tool_outcome_is_consumed_when_a_run_boundary_wins_the_turn(tmp_path: Path) -> None:
+    """A handler that fails in the same loop turn a run boundary becomes observable is consumed.
+
+    ``_check_run_boundary`` runs before anything reads the outcome, so it raises the run-level error
+    first. The future is already done by then, so the detach path is skipped too -- leaving the
+    handler's exception unretrieved, which asyncio reports as "Future exception was never retrieved"
+    when the future is collected. Nothing downstream will read it, so this boundary has to.
+    """
+    token = CancellationToken()
+    token.cancel()
+    loop = AgentLoop.from_tools(
+        _spec(tmp_path), FakeModelAdapter(turns=[]), [], cancellation_token=token
+    )
+
+    async def scenario() -> asyncio.Future[ToolResult]:
+        failed: asyncio.Future[ToolResult] = asyncio.get_running_loop().create_future()
+        failed.set_exception(RuntimeError("handler blew up"))
+        with pytest.raises(RunCancelled):
+            await loop._await_native_tool_handler(failed, None)
+        return failed
+
+    failed = asyncio.run(scenario())
+
+    # ``_log_traceback`` is the flag that drives the warning: asyncio sets it on ``set_exception``
+    # and clears it once the exception is retrieved.
+    assert failed._log_traceback is False  # type: ignore[attr-defined]
 
 
 def test_sync_tool_child_thread_keeps_the_call_authorization(tmp_path: Path) -> None:
