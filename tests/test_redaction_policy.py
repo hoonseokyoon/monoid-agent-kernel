@@ -289,6 +289,24 @@ def test_effective_accessors_fill_in_the_defaults() -> None:
     assert isinstance(policy.effective_redactor, DefaultRedactor)
 
 
+def test_effective_redactor_is_none_for_a_policy_that_lost_its_custom_one() -> None:
+    """The accessor has to agree with the pipeline, or an external consumer reading it applies the
+    built-in rules and believes it honoured the policy while `dispatch_model_call` downgrades the very
+    same policy to `digest`. There is no correct redactor to hand back, so it hands back nothing."""
+
+    class Custom:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return value
+
+    restored = CapturePolicy.from_json(
+        CapturePolicy(mode="redacted", redactor=Custom()).to_json()
+    )
+
+    assert restored.effective_redactor is None
+    # Still the default for a policy that never had one, which is what keeps zero-config redaction work.
+    assert isinstance(CapturePolicy(mode="redacted").effective_redactor, DefaultRedactor)
+
+
 def test_json_round_trip_names_a_custom_redactor_without_carrying_it() -> None:
     """A redactor is live code. A round trip must not quietly turn custom redaction into the
     default, so the payload records that one was attached and the restored policy says so."""

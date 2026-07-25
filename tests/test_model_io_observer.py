@@ -461,6 +461,65 @@ def test_dispatch_with_no_subscriptions_returns_the_receipt_untouched() -> None:
 # --- capture value semantics ---------------------------------------------------------------
 
 
+def test_full_capture_content_shares_no_nested_structure_with_the_caller() -> None:
+    """`dict(content)` copied only the outer mapping, so a nested message list stayed shared.
+
+    A caller mutating its own payload after dispatch changed captures observers had already retained,
+    while the digests kept describing the pre-mutation value. A capture is meant to be a settled record.
+    """
+    content = {"messages": [{"role": "user", "text": "original"}], "final_text": "done"}
+    recorder = Recorder()
+
+    dispatch_model_call(
+        receipt=ModelCallReceipt(),
+        content=content,
+        subscriptions=(ModelIOSubscription(recorder, CapturePolicy(mode="full")),),
+    )
+    content["messages"][0]["text"] = "mutated after the fact"  # type: ignore[index]
+
+    retained = recorder.captures[0].content
+    assert retained == {"messages": [{"role": "user", "text": "original"}], "final_text": "done"}
+
+
+def test_full_capture_content_is_detached_once_not_per_observer() -> None:
+    """Content can carry resolved media, so copying per subscriber is real cost for a case an observer
+    is already forbidden to cause — treating the capture as read-only is part of its contract, whereas
+    a caller mutating its own dict violates nothing."""
+    first, second = Recorder(), Recorder()
+
+    dispatch_model_call(
+        receipt=ModelCallReceipt(),
+        content={"messages": [{"text": "original"}]},
+        subscriptions=(
+            ModelIOSubscription(first, CapturePolicy(mode="full")),
+            ModelIOSubscription(second, CapturePolicy(mode="full")),
+        ),
+    )
+
+    assert first.captures[0].content == second.captures[0].content
+    assert first.captures[0].content["messages"] is second.captures[0].content["messages"]  # type: ignore[index]
+
+
+def test_content_a_deepcopy_refuses_still_reaches_the_observer() -> None:
+    """Degraded isolation is survivable; failing a model call the provider has already been paid for is
+    not."""
+
+    class Uncopyable:
+        def __deepcopy__(self, memo: dict[int, Any]) -> Any:
+            raise TypeError("cannot copy")
+
+    sentinel = Uncopyable()
+    recorder = Recorder()
+
+    dispatch_model_call(
+        receipt=ModelCallReceipt(),
+        content={"handle": sentinel},
+        subscriptions=(ModelIOSubscription(recorder, CapturePolicy(mode="full")),),
+    )
+
+    assert recorder.captures[0].content == {"handle": sentinel}  # type: ignore[comparison-overlap]
+
+
 def test_a_capture_copies_its_mappings_away_from_the_caller() -> None:
     digests = {"final_text": "sha"}
     capture = ModelCallCapture(receipt=ModelCallReceipt(), mode="digest", digests=digests)

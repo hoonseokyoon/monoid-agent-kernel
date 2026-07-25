@@ -20,11 +20,14 @@ usable as a join key and, later, as a replay key. Redaction changes the view, ne
 
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Literal, Protocol, runtime_checkable
+
+from pydantic import TypeAdapter, ValidationError
 
 from monoid_agent_kernel._policy_util import dedupe, str_tuple
 from monoid_agent_kernel.core._util import canonical_sha256
@@ -88,26 +91,40 @@ def _optional_object(payload: Mapping[str, Any], key: str) -> dict[str, Any] | N
     return None if value is None else require_object(value, key)
 
 
+_MODEL_CONFIG_ADAPTER = TypeAdapter(ModelConfig)
+
+
 def _parsed_model_config(payload: Mapping[str, Any] | None) -> ModelConfig:
-    """`ModelConfig.from_json` with its failures translated into wire-validation failures.
+    """`ModelConfig.from_json`, with malformed input turned into a wire-validation failure.
 
     `ModelConfig` and its nested `ReasoningConfig` / `ModelRetryConfig` are typed `dict | None` and
-    trust it, so a malformed *nested* object — `{"model": {"reasoning": []}}` — reaches `.get` on a list
-    and raises `AttributeError`. Checking the outer object is not enough, and enumerating the nested
-    fields here would couple this module to another type's shape and go stale the moment
-    `ModelConfig` grows a field.
+    trust it, and they validate nothing: a malformed nested object reaches `.get` on a list and raises
+    `AttributeError`, while a bad *value* — `{"provider": []}`, an unsupported reasoning effort — is
+    accepted outright and yields an object whose fields contradict their own `Literal` annotations.
+    Checking the outer object catches neither.
 
-    So the translation happens at this boundary, which is the one that made the promise: this module's
-    `from_json` documents `WireValidationError` for malformed input, and a consumer handling corrupt
-    audit records through that exception must not instead get an `AttributeError`. Teaching
-    `ModelConfig.from_json` to validate its own payload is the deeper fix and belongs with that type.
+    Both are handled without naming a single field, so this cannot go stale when `ModelConfig` grows
+    one: exceptions are translated, and the parsed result is re-validated through a pydantic
+    `TypeAdapter` over its serialized form — the same tool `core.wire_validation` already uses, applied
+    recursively by the type's own annotations. Validating the *instance* would not work; pydantic
+    trusts an already-constructed dataclass and skips it.
+
+    What survives is `from_json`'s deliberate coercion: `{"model": []}` becomes `"[]"` and
+    `{"retry": {"retry_on": "x"}}` becomes `("x",)`. Those produce correctly-typed values, so they are a
+    question about that type's leniency rather than a validation gap here, and tightening them changes
+    a public contract type used by agent runtime config.
     """
     try:
-        return ModelConfig.from_json(payload)
+        parsed = ModelConfig.from_json(payload)
     except WireValidationError:
         raise
     except (AttributeError, TypeError, ValueError) as exc:
         raise WireValidationError(f"model must be a valid model config: {exc}") from exc
+    try:
+        _MODEL_CONFIG_ADAPTER.validate_python(parsed.to_json())
+    except ValidationError as exc:
+        raise WireValidationError(f"model must be a valid model config: {exc.errors()[0]['msg']}") from exc
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -353,8 +370,18 @@ class CapturePolicy:
         return self.redaction if self.redaction is not None else RedactionPolicy()
 
     @property
-    def effective_redactor(self) -> Redactor:
-        return self.redactor if self.redactor is not None else DefaultRedactor()
+    def effective_redactor(self) -> Redactor | None:
+        """The redactor to apply, or `None` when redaction cannot be performed at all.
+
+        `None` for a policy restored from JSON that knows it had a custom redactor. There is no correct
+        redactor to hand back in that case, and handing back `DefaultRedactor` is the disclosure the
+        marker exists to prevent — an external consumer reading this accessor would apply the built-in
+        rules and believe it had honoured the policy, while the pipeline downgraded the very same policy
+        to `digest`. One answer, not two.
+        """
+        if self.redactor is not None:
+            return self.redactor
+        return None if self.restored_without_redactor else DefaultRedactor()
 
     @classmethod
     def from_json(cls, payload: Any) -> CapturePolicy:
@@ -662,6 +689,27 @@ def redacted_fields_or_none(
     return {str(key): value for key, value in redacted.items()}
 
 
+def _detached_content(content: Mapping[str, Any]) -> Mapping[str, Any]:
+    """A copy of `content` that shares no nested structure with the caller's payload.
+
+    `dict(content)` copies only the outer mapping, so a nested message list stayed shared: a caller that
+    mutated its own payload after dispatch changed captures observers had already retained, while the
+    digests kept describing the pre-mutation value. A capture is meant to be a settled record.
+
+    Done once per dispatch and shared by the `full`-mode subscriptions rather than copied per observer.
+    Content can carry resolved media, and copying that per subscriber is real cost for a case an
+    observer is already forbidden to cause — treating the capture as read-only is part of the
+    `ModelIOObserver` contract, whereas a caller mutating its own dict violates nothing.
+
+    A payload holding something `deepcopy` refuses falls back to the shallow copy: degraded isolation is
+    survivable, failing a model call the provider has already been paid for is not.
+    """
+    try:
+        return copy.deepcopy(dict(content))
+    except Exception:
+        return dict(content)
+
+
 def _resolve_capture(
     policy: CapturePolicy, content: Mapping[str, Any]
 ) -> tuple[CaptureMode, str, Mapping[str, Any] | None]:
@@ -671,8 +719,8 @@ def _resolve_capture(
     if policy.mode == "digest":
         return "digest", "", None
     if policy.mode == "full":
-        return "full", "", dict(content)
-    if policy.restored_without_redactor and policy.redactor is None:
+        return "full", "", content
+    if policy.effective_redactor is None:
         # A policy that came back from JSON knowing it *had* a custom redactor, and no longer has one.
         # Silently applying the built-in rules would be the worst outcome available: the consumer is
         # told it received redacted content while a classifier that masked more than key names and
@@ -748,8 +796,16 @@ def dispatch_model_call(
     lengths = {
         key: length for key, value in content.items() if (length := content_length(value)) is not None
     }
+    full_content = (
+        _detached_content(content)
+        if any(subscription.policy.mode == "full" for subscription in subscriptions)
+        else content
+    )
 
-    resolved = [_resolve_capture(subscription.policy, content) for subscription in subscriptions]
+    resolved = [
+        _resolve_capture(subscription.policy, full_content if subscription.policy.mode == "full" else content)
+        for subscription in subscriptions
+    ]
     downgrades = sum(1 for _mode, downgraded_from, _payload in resolved if downgraded_from)
     settled = replace(receipt, capture_downgrades=receipt.capture_downgrades + downgrades)
 
