@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.model_io import (
     DEFAULT_SECRET_KEY_PARTS,
     REDACTION_PLACEHOLDER,
@@ -202,10 +203,37 @@ def test_digest_identifies_the_rules_without_disclosing_them() -> None:
     policy = RedactionPolicy(literals=("hunter2",))
 
     # A receipt records the digest precisely because a literal is a secret by construction.
-    assert "hunter2" not in policy.digest
     assert policy.digest == RedactionPolicy(literals=("hunter2",)).digest
     assert policy.digest != RedactionPolicy(literals=("hunter3",)).digest
     assert policy.digest != RedactionPolicy(literals=("hunter2",), replacement="***").digest
+
+
+def test_digest_does_not_let_a_holder_confirm_a_guess_at_a_literal() -> None:
+    """The non-disclosure half of the property above, checked as the attack rather than a substring.
+
+    ``"hunter2" not in policy.digest`` used to stand in for this and proved nothing: a hex digest
+    cannot contain a ``u`` or an ``n``. The real question is whether an observer holding the digest
+    can search a small candidate space -- the space a PIN or a short token lives in.
+
+    The attacker here is the one that matters: it holds the digest, the serialization rule and the
+    payload shape, all of which are public, but not the process's key. Brute-forcing *through
+    ``.digest``* would prove nothing, because in-process it borrows the very key the attacker lacks.
+    """
+    pin = "4417"
+    target = RedactionPolicy(literals=(pin,)).digest
+
+    def guess(candidate: str) -> str:
+        return canonical_sha256(RedactionPolicy(literals=(candidate,)).to_json())
+
+    recovered = [c for c in (f"{value:04d}" for value in range(10000)) if guess(c) == target]
+
+    # Not ``recovered != [pin]`` -- the search must come up empty, not merely land elsewhere.
+    assert recovered == []
+    assert guess(pin) != target
+    # ...and the digest is still a working identity for the policy that legitimately has it, so
+    # "return a constant" and "return a fresh random string" both fail this test.
+    assert RedactionPolicy(literals=(pin,)).digest == target
+    assert RedactionPolicy(literals=("0000",)).digest != target
 
 
 def test_redact_text_applies_literals_then_patterns_in_order() -> None:

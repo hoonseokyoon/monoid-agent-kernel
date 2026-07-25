@@ -57,6 +57,22 @@ def test_usage_must_be_whole_token_counts() -> None:
         ModelCallReceipt(usage={"input_tokens": True})
 
 
+def test_usage_counts_must_not_be_negative() -> None:
+    """The sign check the other three counters already had. Usage is the one that gets *summed*, so
+    a negative slipping through subtracts from an aggregate instead of failing visibly."""
+    with pytest.raises(WireValidationError, match="'input_tokens' must not be negative"):
+        ModelCallReceipt(usage={"input_tokens": -100})
+    with pytest.raises(WireValidationError, match="'output_tokens' must not be negative"):
+        ModelCallReceipt.from_json({"usage": {"input_tokens": 5, "output_tokens": -1}})
+
+    # Zero is a real count -- a cache-hit call reports it -- so "reject anything not positive" is
+    # not the rule and does not pass here.
+    assert dict(ModelCallReceipt(usage={"input_tokens": 0, "output_tokens": 7}).usage) == {
+        "input_tokens": 0,
+        "output_tokens": 7,
+    }
+
+
 def test_usage_is_copied_away_from_the_caller() -> None:
     supplied = {"input_tokens": 5}
     receipt = ModelCallReceipt(usage=supplied)

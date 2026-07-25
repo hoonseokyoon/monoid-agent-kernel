@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import re
+import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -30,7 +31,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 from pydantic import TypeAdapter, ValidationError
 
 from monoid_agent_kernel._policy_util import dedupe
-from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core._util import canonical_hmac_sha256, canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.wire_validation import (
@@ -43,6 +44,11 @@ from monoid_agent_kernel.core.wire_validation import (
 )
 
 REDACTION_PLACEHOLDER = "[redacted]"
+
+# Keys ``RedactionPolicy.digest``. Minted once per process and never exported: a receipt consumer is
+# meant to compare digests, not reproduce them. See ``RedactionPolicy.digest`` for why an unkeyed
+# digest over a policy is a guessing oracle for that policy's ``literals``.
+_DIGEST_KEY = secrets.token_bytes(32)
 
 # Substrings that mark a *key* as naming a secret. Matching is on the lowercased key with hyphens
 # folded to underscores, and it is a substring test, so "x_api_key" and "X-Api-Key" both match
@@ -257,12 +263,25 @@ class RedactionPolicy:
 
     @property
     def digest(self) -> str:
-        """A stable id for this policy, for a receipt to record *which* rules were applied.
+        """An id for this policy, for a receipt to record *which* rules were applied.
 
         The receipt records the digest rather than the policy because the policy itself can name
         secrets — a `literals` entry is a secret by construction.
+
+        Keyed, under a key minted once per process. An unkeyed digest would have defeated the very
+        purpose above: the observer that receives `redaction_digest` also knows the canonical JSON
+        shape, so it could hash candidate literals until one matched, and a `literals` entry is
+        exactly the kind of low-entropy secret — a PIN, a password, a tenant token — that a
+        ten-thousand-guess search recovers instantly. Keying removes the oracle without weakening
+        what a receipt consumer actually needs, which is to tell two policies apart within a run.
+
+        The cost is that the digest identifies a policy *within one process*, not across processes
+        or restarts. That is not a property that can be recovered by choosing a better hash: any
+        digest that both is reproducible by an outsider and distinguishes policies by their secret
+        values is a guessing oracle for those values. A deployment that needs cross-process joins
+        needs a shared key, which is a deployment-time secret rather than a kernel default.
         """
-        return canonical_sha256(self.to_json())
+        return canonical_hmac_sha256(self.to_json(), _DIGEST_KEY)
 
     def names_a_secret(self, key: str) -> bool:
         """Whether `key` names a secret under this policy.
@@ -543,6 +562,11 @@ class ModelCallReceipt:
         for key, value in self.usage.items():
             if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int):
                 raise WireValidationError("model call usage must be a mapping of str to int")
+            # Every other counter on this receipt refuses a negative, and usage is the one that gets
+            # summed: a single ``{"input_tokens": -100}`` in an audit payload silently subtracts from
+            # an aggregate, so a budget check undercounts rather than visibly failing.
+            if value < 0:
+                raise WireValidationError(f"model call usage {key!r} must not be negative")
         object.__setattr__(self, "usage", dict(self.usage))
 
     @property
