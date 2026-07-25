@@ -287,12 +287,12 @@ def test_abandoning_a_sync_next_turn_warns(
         await asyncio.sleep(0)  # let the future's done callback run
         return result
 
-    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.loop"):
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.core.sync_bridge"):
         result = asyncio.run(run())
 
     assert result.error_code == "run_timeout"
     assert workers[0].is_alive() is True
-    warnings = [r.getMessage() for r in caplog.records if r.name == "monoid_agent_kernel.loop"]
+    warnings = [r.getMessage() for r in caplog.records if r.name == "monoid_agent_kernel.core.sync_bridge"]
     assert len(warnings) == 1
     assert "abandoned a synchronous call" in warnings[0]
 
@@ -309,7 +309,7 @@ def test_completed_sync_next_turn_does_not_warn(
             del request
             return ModelTurn(response_id="r1", final_text="ok")
 
-    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.loop"):
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.core.sync_bridge"):
         result = asyncio.run(
             AgentLoop(
                 spec=_spec(tmp_path),
@@ -319,7 +319,7 @@ def test_completed_sync_next_turn_does_not_warn(
         )
 
     assert result.status == "completed"
-    assert [r for r in caplog.records if r.name == "monoid_agent_kernel.loop"] == []
+    assert [r for r in caplog.records if r.name == "monoid_agent_kernel.core.sync_bridge"] == []
 
 
 def test_never_returning_sync_next_turn_observes_run_cancellation(tmp_path: Path) -> None:

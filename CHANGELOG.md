@@ -64,6 +64,11 @@ out in commit messages and here.
   joins that executor's workers before returning, which made a run deadline enforced internally but
   unobservable to the caller — it produced its result on time, then blocked at loop shutdown until
   the provider returned on its own.
+- The abandoned-synchronous-call warning now logs under `monoid_agent_kernel.core.sync_bridge`
+  instead of `monoid_agent_kernel.loop`. The bridge that runs a blocking call on a daemon thread
+  moved into `core` so the model-call runner can share it with the tool path, and a logger naming a
+  module it no longer lives in would misdirect anyone reading the warning. Deployments filtering
+  this warning by logger name need to add the new one; the message text is unchanged.
 
 ## [0.19.2] - 2026-07-19
 

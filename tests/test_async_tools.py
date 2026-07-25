@@ -19,7 +19,8 @@ from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityLease
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import RunCancelled, ToolExecutionError
-from monoid_agent_kernel.loop import AgentLoop, _start_abandonable_sync_call
+from monoid_agent_kernel.core._sync_bridge import start_abandonable_sync_call
+from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference.capability import HumanEscalationBroker
@@ -337,7 +338,7 @@ def test_sync_tool_finishing_within_the_grace_is_not_abandoned(
     adapter = FakeModelAdapter(
         turns=[ModelTurn(tool_calls=(fake_tool_call("sync_almost_done", {}, "c1"),))]
     )
-    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.loop"):
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.core.sync_bridge"):
         result = asyncio.run(
             AgentLoop.from_tools(
                 _spec(tmp_path, limits=RunLimits(max_duration_s=1)),
@@ -376,7 +377,7 @@ def test_late_task_from_abandoned_sync_tool_is_cancelled() -> None:
             release.wait(timeout=5)
             return task
 
-        pending = _start_abandonable_sync_call(call, thread_name="nar-test-late-task")
+        pending = start_abandonable_sync_call(call, thread_name="nar-test-late-task")
         pending.result.cancel()  # the run gave up on the call
         release.set()  # ... and only now does the handler return its task
         await asyncio.wait({pending.settled}, timeout=5)
@@ -748,7 +749,7 @@ def test_late_failed_future_from_abandoned_sync_call_is_consumed_after_loop_shut
             release.wait(timeout=5)
             return failed
 
-        _start_abandonable_sync_call(call, thread_name="nar-test-late-failed").result.cancel()
+        start_abandonable_sync_call(call, thread_name="nar-test-late-failed").result.cancel()
 
     asyncio.run(scenario())  # the loop is closed once this returns
     release.set()  # ... and only now does the call return its future
