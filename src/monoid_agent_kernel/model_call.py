@@ -23,9 +23,10 @@ inherits classification without inheriting a retry loop.
 from __future__ import annotations
 
 import inspect
+import json
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from monoid_agent_kernel.core._sync_bridge import (
@@ -48,6 +49,7 @@ from monoid_agent_kernel.providers.base import (
     ModelTurn,
     assemble_streamed_turn,
 )
+from monoid_agent_kernel.tools.base import ToolSpec
 
 DeltaConsumer = Callable[[ModelStreamChunk], None]
 """Receives every chunk of a streamed call, in order, as it arrives.
@@ -68,26 +70,58 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
     Tool definitions and generation settings are deliberately absent: the question this digest
     answers is "did the model see the same conversation twice", which must stay true when a tool is
     added to the surface or the temperature changes around it.
+
+    Everything that *constitutes* the conversation is present, including the by-reference shape.
+    A request may carry its history as `messages`, or as a `previous_turn_handle` naming history the
+    provider holds plus the `observations` produced since -- and in that second shape those two
+    fields **are** the prompt. Hashing only `messages` made every by-reference continuation collide
+    with every other, which is the ordinary case for a gateway client, not an edge one.
     """
 
     return {
         "system_prompt": request.system_prompt,
         "instruction": request.instruction,
         "messages": list(request.messages or ()),
+        "previous_turn_handle": request.previous_turn_handle,
+        "observations": [observation.to_json() for observation in request.observations],
+    }
+
+
+def _wire_value(value: Any) -> Any:
+    """`value` if JSON can carry it, else a stable string form, so hashing never raises."""
+
+    try:
+        json.dumps(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
+    """A tool definition as the replay key sees it: every field except the ones JSON cannot carry.
+
+    Read off the dataclass rather than listing fields by hand, so a field added to `ToolSpec` joins
+    the digest automatically instead of quietly falling out of it. Reducing a tool to its `id` --
+    which this did first -- made two requests offering the same id with different descriptions or
+    input schemas produce the same replay key, though the provider was sent different tool
+    definitions.
+
+    Erring toward *more* than the wire carries is deliberate and asymmetric: an over-sensitive
+    replay key costs a miss and a re-run, an under-sensitive one hands back the wrong call.
+    """
+
+    return {
+        field_.name: _wire_value(getattr(spec, field_.name))
+        for field_ in fields(spec)
+        if not callable(getattr(spec, field_.name))
     }
 
 
 def _request_payload(request: ModelRequest) -> dict[str, Any]:
-    """The whole request, as the thing `request_digest` identifies -- the replay key.
-
-    Tools are reduced to their ids. A `ToolSpec` carries callables and is not JSON-able, and the
-    identity that matters for replay is *which* tools were offered, not their internal wiring.
-    """
+    """The whole request, as the thing `request_digest` identifies -- the replay key."""
 
     payload = _prompt_payload(request)
-    payload["tools"] = [spec.id for spec in request.tools]
-    payload["previous_turn_handle"] = request.previous_turn_handle
-    payload["observations"] = [observation.to_json() for observation in request.observations]
+    payload["tools"] = [_tool_payload(spec) for spec in request.tools]
     payload["model"] = (request.model or ModelConfig()).to_json()
     return payload
 
@@ -117,12 +151,19 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
 
     Keys are stable field names rather than one blob so a `RedactionPolicy` can name a field and a
     consumer can be given some fields and not others.
+
+    `observations` are here because they are model *input*: in the by-reference request shape they
+    carry the tool results the model is being shown. Omitting them did not merely give a `full`
+    observer an incomplete picture -- it routed tool output around redaction entirely, since a
+    policy can only mask a field it is handed. That is a disclosure hole, not a gap in coverage.
     """
 
     content: dict[str, Any] = {
         "system_prompt": request.system_prompt,
         "instruction": request.instruction,
         "messages": list(request.messages or ()),
+        "observations": [observation.to_json() for observation in request.observations],
+        "previous_turn_handle": request.previous_turn_handle or "",
     }
     if turn is not None:
         content["output_text"] = turn.final_text or ""
@@ -241,6 +282,10 @@ class ModelCallRunner:
             receipt,
             stop_reason=str(turn.stop_reason or ""),
             usage=_recordable_usage(turn.usage),
+            # Probed rather than read as an attribute: a third-party adapter may return any
+            # turn-shaped object, and a missing flag means "did not retry", which is true of every
+            # adapter with no retry loop.
+            provider_retried=bool(getattr(turn, "provider_retried", False)),
         )
 
     def _publish(

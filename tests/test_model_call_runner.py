@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -17,12 +18,13 @@ from monoid_agent_kernel.core.model_io import (
 )
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import ModelCallAborted, RunCancelled, RunTimeout
-from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.model_call import ModelCallRunner, _wire_value
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
     TextDelta,
     ToolCallDelta,
+    ToolObservation,
     TurnComplete,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
@@ -362,14 +364,7 @@ def test_the_prompt_digest_ignores_what_surrounds_the_prompt() -> None:
     Adding a tool to the surface or changing a generation setting must not perturb it, or the
     question it answers becomes unanswerable across ordinary configuration drift.
     """
-    spec = ToolSpec(
-        id="t.one",
-        description="d",
-        input_schema={"type": "object"},
-        capability="read",
-        side_effect="read",
-        handler=lambda **kwargs: None,
-    )
+    spec = _spec("t.one", "d", {"type": "object"})
     plain = ModelRequest(instruction="hi", system_prompt="sys", tools=())
     with_tool = ModelRequest(instruction="hi", system_prompt="sys", tools=(spec,))
     with_model = ModelRequest(
@@ -403,6 +398,164 @@ def test_a_different_prompt_changes_both_digests() -> None:
     second = asyncio.run(digests("bye"))
     assert first[0] != second[0]
     assert first[1] != second[1]
+
+
+def _spec(tool_id: str, description: str, schema: dict[str, Any]) -> ToolSpec:
+    return ToolSpec(
+        id=tool_id,
+        description=description,
+        input_schema=schema,
+        capability="read",
+        side_effect="read",
+        handler=lambda **kwargs: None,
+    )
+
+
+async def _receipt_for(request: ModelRequest) -> Any:
+    _turn, receipt = await ModelCallRunner(adapter=SyncAdapter()).acall(request)
+    return receipt
+
+
+def test_the_replay_key_distinguishes_tools_sharing_an_id() -> None:
+    """Two requests offering the same tool id with different wire definitions are different calls.
+
+    The provider is sent the description and the input schema, so reducing a tool to its id made
+    the "exact replay key" hand back a call the model never made.
+    """
+    plain = ModelRequest(
+        instruction="hi", system_prompt="s", tools=(_spec("t.x", "alpha", {"type": "object"}),)
+    )
+    renamed = ModelRequest(
+        instruction="hi", system_prompt="s", tools=(_spec("t.x", "BETA", {"type": "object"}),)
+    )
+    reschemad = ModelRequest(
+        instruction="hi",
+        system_prompt="s",
+        tools=(_spec("t.x", "alpha", {"type": "object", "required": ["q"]}),),
+    )
+
+    keys = {asyncio.run(_receipt_for(request)).request_digest for request in (plain, renamed, reschemad)}
+    assert len(keys) == 3
+
+
+def test_a_tool_field_json_cannot_carry_does_not_break_the_replay_key() -> None:
+    """The tool payload is read off the dataclass, so a future non-JSON-able field would reach it.
+
+    Hashing must degrade to a stable string rather than raise: failing a model call because a tool
+    definition grew an exotic field would be a poor trade for a digest.
+    """
+
+    class Exotic:
+        def __repr__(self) -> str:
+            return "<exotic>"
+
+    assert _wire_value(Exotic()) == "<exotic>"
+    assert _wire_value({"ok": 1}) == {"ok": 1}
+
+
+def test_the_prompt_digest_distinguishes_by_reference_continuations() -> None:
+    """A request may carry its history as `messages` or as a handle plus new observations.
+
+    In the second shape those fields *are* the prompt, so hashing only `messages` made every
+    by-reference continuation collide with every other -- the ordinary case for a gateway client.
+    """
+    first = ModelRequest(
+        instruction=None, system_prompt="s", tools=(), previous_turn_handle="turn_AAA"
+    )
+    second = ModelRequest(
+        instruction=None, system_prompt="s", tools=(), previous_turn_handle="turn_ZZZ"
+    )
+    assert (
+        asyncio.run(_receipt_for(first)).prompt_digest
+        != asyncio.run(_receipt_for(second)).prompt_digest
+    )
+
+    one = ToolObservation(call_id="c1", tool_name="t", output={"answer": "yes"})
+    other = ToolObservation(call_id="c1", tool_name="t", output={"answer": "no"})
+    assert (
+        asyncio.run(
+            _receipt_for(
+                ModelRequest(instruction=None, system_prompt="s", tools=(), observations=(one,))
+            )
+        ).prompt_digest
+        != asyncio.run(
+            _receipt_for(
+                ModelRequest(instruction=None, system_prompt="s", tools=(), observations=(other,))
+            )
+        ).prompt_digest
+    )
+
+
+def test_tool_results_reach_the_redaction_policy() -> None:
+    """Observations are model *input*, so a policy has to be handed them to be able to mask them.
+
+    Omitting them from the capture did not merely give a `full` observer an incomplete picture -- it
+    routed tool output around redaction entirely. This is the disclosure half; the assertion below
+    it is the completeness half.
+    """
+    observation = ToolObservation(
+        call_id="c1", tool_name="lookup", output={"api_key": "sk-live-secret"}
+    )
+    request = ModelRequest(
+        instruction=None, system_prompt="s", tools=(), observations=(observation,)
+    )
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=SyncAdapter(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="redacted")),
+            ),
+        ).acall(request)
+
+    asyncio.run(run())
+    capture = observer.captures[0]
+    assert capture.content is not None
+    assert "observations" in capture.content
+    # The default policy calls ``api_key`` a secret, and it can only have masked it if it was given
+    # the field at all.
+    assert "sk-live-secret" not in json.dumps(capture.content, default=str)
+
+
+def test_an_adapter_that_retried_internally_says_so_in_the_receipt() -> None:
+    """`attempts` and `provider_retried` are not the same fact.
+
+    The kernel makes one adapter call per turn however many attempts happen inside it, so a call
+    that failed twice and succeeded on the third try would otherwise be recorded as a clean single
+    attempt.
+    """
+
+    class RetriedAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer", provider_retried=True)
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(adapter=RetriedAdapter()).acall(REQUEST)
+        return receipt
+
+    receipt = asyncio.run(run())
+    assert receipt.provider_retried is True
+    assert receipt.attempts == 1, "the kernel still made exactly one adapter call"
+
+    # Counterweight: an adapter with no retry loop reports False, which is true of it.
+    assert asyncio.run(_receipt_for(REQUEST)).provider_retried is False
+
+
+def test_a_retried_stream_reports_the_retry_through_the_terminal_chunk() -> None:
+    """On the streaming path the turn is assembled from chunks, so the fact has to ride one."""
+    adapter = StreamingAdapter(
+        chunks=[TextDelta("ok"), TurnComplete(response_id="r", provider_retried=True)]
+    )
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(adapter=adapter).acall(
+            REQUEST, delta_consumer=lambda chunk: None
+        )
+        return receipt
+
+    assert asyncio.run(run()).provider_retried is True
 
 
 def test_the_receipt_carries_the_invocation_context() -> None:
