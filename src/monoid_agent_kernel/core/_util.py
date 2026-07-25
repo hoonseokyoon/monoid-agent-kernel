@@ -7,6 +7,7 @@ Core-internal only. The supported public surface is exported from
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -27,6 +28,23 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _canonical_bytes(payload: dict[str, Any], drop: tuple[str, ...]) -> bytes:
+    """``payload`` as canonical JSON bytes, minus the ``drop`` keys.
+
+    The single serializer behind both the plain and the keyed digest. Keeping it in one place is
+    what lets a keyed digest be introduced without any risk of the two disagreeing on encoding.
+    """
+    canonical = dict(payload)
+    for key in drop:
+        canonical.pop(key, None)
+    return json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def canonical_sha256(payload: dict[str, Any], *, drop: tuple[str, ...] = ()) -> str:
     """SHA-256 hex digest of ``payload`` serialized as canonical JSON.
 
@@ -34,17 +52,22 @@ def canonical_sha256(payload: dict[str, Any], *, drop: tuple[str, ...] = ()) -> 
     itself). Serialization is deterministic — ``sort_keys=True`` and compact
     separators — so the digest is stable across processes and must stay
     byte-identical to remain compatible with already-recorded hashes.
+
+    Unkeyed, so it is only safe over payloads whose contents are not themselves secret: anyone
+    holding the digest can confirm a guess at the payload. Use ``canonical_hmac_sha256`` when the
+    payload names secrets.
     """
-    canonical = dict(payload)
-    for key in drop:
-        canonical.pop(key, None)
-    data = json.dumps(
-        canonical,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(_canonical_bytes(payload, drop)).hexdigest()
+
+
+def canonical_hmac_sha256(payload: dict[str, Any], key: bytes, *, drop: tuple[str, ...] = ()) -> str:
+    """Keyed digest of ``payload`` as canonical JSON, for payloads that contain secrets.
+
+    Same serialization as ``canonical_sha256``, so equal payloads still produce equal digests for a
+    given ``key`` — but without ``key`` the digest cannot be recomputed, so it no longer confirms a
+    guess at the payload. That matters whenever the payload's own values are low-entropy secrets.
+    """
+    return hmac.new(key, _canonical_bytes(payload, drop), hashlib.sha256).hexdigest()
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:

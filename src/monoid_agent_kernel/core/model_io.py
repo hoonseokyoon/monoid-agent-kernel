@@ -1,0 +1,931 @@
+"""What a consumer is allowed to see of a model call's prompt and output.
+
+Model I/O is the most sensitive data the kernel handles, and different consumers warrant different
+answers: a Studio bubble needs the text, an OTel exporter usually needs a digest, a compliance sink
+needs a redacted view. So the decision is not global — a `CapturePolicy` is attached per consumer
+registration, and one call can serve `full` to one observer and `digest` to another.
+
+The split of responsibilities:
+
+- `RedactionPolicy` is *what* counts as sensitive. Frozen, JSON-serializable, and digestible, so a
+  receipt can record which policy was applied without recording the policy's contents.
+- `Redactor` is *how* to remove it. A protocol, because the default is substring-and-regex matching
+  and any real deployment eventually wants its own detector.
+- `CapturePolicy` binds a mode to those two for one consumer.
+
+Redaction runs *after* the digest is computed, never before. The digest identifies the content that
+actually went to the provider, so it stays stable across policy changes — that is what makes it
+usable as a join key and, later, as a replay key. Redaction changes the view, never the identity.
+"""
+
+from __future__ import annotations
+
+import copy
+import re
+import secrets
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
+from typing import Any, Literal, Protocol, runtime_checkable
+
+from pydantic import TypeAdapter, ValidationError
+
+from monoid_agent_kernel._policy_util import dedupe
+from monoid_agent_kernel.core._util import canonical_hmac_sha256, canonical_sha256
+from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.wire_validation import (
+    WireValidationError,
+    parse_bool,
+    parse_int,
+    parse_literal,
+    parse_str,
+    require_object,
+)
+
+REDACTION_PLACEHOLDER = "[redacted]"
+
+# Keys ``RedactionPolicy.digest``. Minted once per process and never exported: a receipt consumer is
+# meant to compare digests, not reproduce them. See ``RedactionPolicy.digest`` for why an unkeyed
+# digest over a policy is a guessing oracle for that policy's ``literals``.
+_DIGEST_KEY = secrets.token_bytes(32)
+
+# Substrings that mark a *key* as naming a secret. Matching is on the lowercased key with hyphens
+# folded to underscores, and it is a substring test, so "x_api_key" and "X-Api-Key" both match
+# "api_key". Promoted from ``core.tool_approval``, which has masked tool-call arguments with this list
+# since approvals shipped; model I/O needs the same answer, and two copies would drift.
+DEFAULT_SECRET_KEY_PARTS: tuple[str, ...] = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+
+CaptureMode = Literal["none", "digest", "redacted", "full"]
+CAPTURE_MODES: tuple[CaptureMode, ...] = ("none", "digest", "redacted", "full")
+
+
+@lru_cache(maxsize=512)
+def _compiled(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern)
+
+
+def _folded_key(text: str) -> str:
+    """The form secret-key matching happens in: stripped, lowercased, hyphens as underscores.
+
+    One function, used for both the *rule* and the *candidate*. Keeping two copies of "how a key is
+    normalized" is what produced this bug twice: first the rule was not lowercased, so `("API_KEY",)`
+    matched nothing; then the rule kept its hyphens, so `("api-key",)` matched nothing — including the
+    literal key `api-key`, since the candidate had already become `api_key`. Both sides now fold here or
+    neither does.
+    """
+    return text.strip().lower().replace("-", "_")
+
+
+def _string_rules(payload: Mapping[str, Any], key: str, *, reject_blank: bool) -> tuple[str, ...]:
+    """A validated tuple of rule strings: absent or null give `()`, anything malformed raises.
+
+    Element-wise, not just container-wise. `_policy_util.str_tuple` coerces with `str()`, so
+    `{"patterns": [None]}` became the pattern `"None"` — a rule that matches the literal text "None" and
+    nothing an operator intended — and the policy was accepted while captures went on being labelled
+    `redacted`. For a security policy, a malformed rule has to be a load error, not a rule that silently
+    does something else.
+    """
+    value = _absent_as_empty(payload, key)
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise WireValidationError(f"{key} must be an array of strings")
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise WireValidationError(f"{key} must be an array of strings")
+        if reject_blank and not item.strip():
+            raise WireValidationError(f"empty {key} entry is not allowed")
+        items.append(item)
+    return tuple(items)
+
+
+def _absent_as_empty(payload: Mapping[str, Any], key: str) -> Any:
+    """`()` when `key` is absent or explicitly null, the raw value otherwise.
+
+    Deliberately not `payload.get(key) or ()`, the idiom used elsewhere in this repo. That reads a
+    *falsy wrong type* as an empty list, so `{"patterns": ""}` silently disabled text masking and still
+    produced captures labelled `redacted` — the validator downstream never saw the bad value. Here the
+    only shortcut is for genuinely absent or null; anything present reaches the type check.
+    """
+    value = payload.get(key, None)
+    return () if value is None else value
+
+
+def _optional_object(payload: Mapping[str, Any], key: str) -> dict[str, Any] | None:
+    """A present object, or `None` when absent/null. A falsy wrong type still raises.
+
+    Same hazard as `_absent_as_empty`, one level up: `{"context": []}` read as "no context" would
+    accept a corrupt audit record as an anonymous invocation and quietly drop its run and trace
+    attribution.
+    """
+    value = payload.get(key, None)
+    return None if value is None else require_object(value, key)
+
+
+_MODEL_CONFIG_ADAPTER = TypeAdapter(ModelConfig)
+
+
+def _parsed_model_config(payload: Mapping[str, Any] | None) -> ModelConfig:
+    """`ModelConfig.from_json`, with malformed input turned into a wire-validation failure.
+
+    `ModelConfig` and its nested `ReasoningConfig` / `ModelRetryConfig` are typed `dict | None` and
+    trust it, and they validate nothing: a malformed nested object reaches `.get` on a list and raises
+    `AttributeError`, while a bad *value* — `{"provider": []}`, an unsupported reasoning effort — is
+    accepted outright and yields an object whose fields contradict their own `Literal` annotations.
+    Checking the outer object catches neither.
+
+    Both are handled without naming a single field, so this cannot go stale when `ModelConfig` grows
+    one: exceptions are translated, and the parsed result is re-validated through a pydantic
+    `TypeAdapter` over its serialized form — the same tool `core.wire_validation` already uses, applied
+    recursively by the type's own annotations. Validating the *instance* would not work; pydantic
+    trusts an already-constructed dataclass and skips it.
+
+    What survives is `from_json`'s deliberate coercion: `{"model": []}` becomes `"[]"` and
+    `{"retry": {"retry_on": "x"}}` becomes `("x",)`. Those produce correctly-typed values, so they are a
+    question about that type's leniency rather than a validation gap here, and tightening them changes
+    a public contract type used by agent runtime config.
+    """
+    try:
+        parsed = ModelConfig.from_json(payload)
+    except WireValidationError:
+        raise
+    # ``OverflowError`` is an ``ArithmeticError``, not a ``ValueError``, so it needs naming: JSON decodes
+    # an oversized exponent such as ``1e999`` to ``inf``, and ``int(inf)`` raises it. A corrupt audit
+    # record must not be able to crash a consumer that rejects corrupt audit records.
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise WireValidationError(f"model must be a valid model config: {exc}") from exc
+    try:
+        _MODEL_CONFIG_ADAPTER.validate_python(parsed.to_json())
+    except ValidationError as exc:
+        raise WireValidationError(f"model must be a valid model config: {exc.errors()[0]['msg']}") from exc
+    return parsed
+
+
+@dataclass(frozen=True)
+class RedactionPolicy:
+    """What counts as sensitive in a model call's prompt and output.
+
+    Shaped like `permissions.PermissionPolicy` — `from_json` / `to_json` / `merged` — because an
+    integrator configuring one has already learned the other. Three axes, because model I/O has two
+    very different shapes and key names only help with one of them:
+
+    - `secret_key_parts` masks a mapping *value* whose key names a secret. This is what catches
+      structured payloads: tool-call arguments, request message fields, provider extras.
+    - `patterns` are regexes applied to free text, which is the only thing that helps with model
+      output — there are no key names in a paragraph.
+    - `literals` are exact strings to mask, so a caller that already knows a secret's value does not
+      have to regex-escape it.
+
+    `secret_key_parts` defaults to `DEFAULT_SECRET_KEY_PARTS`, which makes the empty policy a useful
+    one. That is why `from_json` distinguishes an absent key from an explicitly empty list, unlike
+    `PermissionPolicy` where both mean "nothing": here they mean "the defaults" and "genuinely
+    nothing", and silently reading `[]` as the defaults would ignore a deliberate opt-out.
+
+    Regexes are compiled at construction so a bad pattern fails when the policy is built rather than
+    mid-call. They are *not* checked for catastrophic backtracking: patterns come from the
+    integrator's own configuration, never from model output, so this is the integrator's own foot to
+    shoot — but it is worth knowing the foot is there.
+    """
+
+    secret_key_parts: tuple[str, ...] = DEFAULT_SECRET_KEY_PARTS
+    patterns: tuple[str, ...] = ()
+    literals: tuple[str, ...] = ()
+    replacement: str = REDACTION_PLACEHOLDER
+
+    def __post_init__(self) -> None:
+        for pattern in self.patterns:
+            try:
+                _compiled(pattern)
+            except re.error as exc:
+                raise ValueError(f"invalid redaction pattern {pattern!r}: {exc}") from exc
+        # Normalized here, not only in ``from_json``. ``names_a_secret`` folds the *candidate* key to
+        # lowercase, so an un-normalized rule can never match: ``secret_key_parts=("API_KEY",)`` was a
+        # rule that silently matched nothing, and the value it was written to mask was delivered in a
+        # ``redacted`` capture. The defaults are already lowercase, which is exactly what hid it.
+        # Doing it in the constructor covers ``merged`` and every programmatic caller at once, and
+        # makes two policies that differ only in rule case compare -- and digest -- equal.
+        object.__setattr__(
+            self,
+            "secret_key_parts",
+            dedupe(_folded_key(part) for part in self.secret_key_parts if part.strip()),
+        )
+
+    @classmethod
+    def from_json(cls, payload: Any) -> RedactionPolicy:
+        if payload is None:
+            return cls()
+        payload = require_object(payload, "redaction_policy")
+        secret_key_parts = (
+            DEFAULT_SECRET_KEY_PARTS
+            if payload.get("secret_key_parts") is None
+            else _string_rules(payload, "secret_key_parts", reject_blank=False)
+        )
+        return cls(
+            # Folding and de-duplication happen in ``__post_init__``, so a policy built in code gets
+            # exactly what a policy loaded from JSON gets.
+            secret_key_parts=secret_key_parts,
+            patterns=_string_rules(payload, "patterns", reject_blank=True),
+            literals=_string_rules(payload, "literals", reject_blank=True),
+            replacement=parse_str(payload, "replacement", default=REDACTION_PLACEHOLDER),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "secret_key_parts": list(self.secret_key_parts),
+            "patterns": list(self.patterns),
+            "literals": list(self.literals),
+            "replacement": self.replacement,
+        }
+
+    def merged(
+        self,
+        *,
+        secret_key_parts: tuple[str, ...] = (),
+        patterns: tuple[str, ...] = (),
+        literals: tuple[str, ...] = (),
+    ) -> RedactionPolicy:
+        """This policy widened by the given rules. Redaction only ever adds, never subtracts."""
+        return RedactionPolicy(
+            secret_key_parts=dedupe((*self.secret_key_parts, *secret_key_parts)),
+            patterns=dedupe((*self.patterns, *patterns)),
+            literals=dedupe((*self.literals, *literals)),
+            replacement=self.replacement,
+        )
+
+    @property
+    def digest(self) -> str:
+        """An id for this policy, for a receipt to record *which* rules were applied.
+
+        The receipt records the digest rather than the policy because the policy itself can name
+        secrets — a `literals` entry is a secret by construction.
+
+        Keyed, under a key minted once per process. An unkeyed digest would have defeated the very
+        purpose above: the observer that receives `redaction_digest` also knows the canonical JSON
+        shape, so it could hash candidate literals until one matched, and a `literals` entry is
+        exactly the kind of low-entropy secret — a PIN, a password, a tenant token — that a
+        ten-thousand-guess search recovers instantly. Keying removes the oracle without weakening
+        what a receipt consumer actually needs, which is to tell two policies apart within a run.
+
+        The cost is that the digest identifies a policy *within one process*, not across processes
+        or restarts. That is not a property that can be recovered by choosing a better hash: any
+        digest that both is reproducible by an outsider and distinguishes policies by their secret
+        values is a guessing oracle for those values. A deployment that needs cross-process joins
+        needs a shared key, which is a deployment-time secret rather than a kernel default.
+        """
+        return canonical_hmac_sha256(self.to_json(), _DIGEST_KEY)
+
+    def names_a_secret(self, key: str) -> bool:
+        """Whether `key` names a secret under this policy.
+
+        Folds the candidate through `_folded_key`, the same function `__post_init__` folds the rules
+        through — the two must agree, and they have twice not.
+        """
+        folded = _folded_key(key)
+        return any(part in folded for part in self.secret_key_parts)
+
+    def redact_text(self, text: str) -> str:
+        """Apply `literals` then `patterns` to free text.
+
+        The order is fixed and the tuples are ordered, which is what makes redaction deterministic:
+        the same text under the same policy always yields the same output, so a digest taken over a
+        redacted view is comparable across processes.
+        """
+        for literal in self.literals:
+            text = text.replace(literal, self.replacement)
+        for pattern in self.patterns:
+            text = _compiled(pattern).sub(self.replacement, text)
+        return text
+
+
+@runtime_checkable
+class Redactor(Protocol):
+    """How to remove what a `RedactionPolicy` names.
+
+    One method, so a partial implementation is not a thing that can exist. The policy is a parameter
+    rather than constructor state because the same redactor serves consumers with different policies.
+
+    Two obligations, both checked by `conformance.run_redactor_contract`: the result must be
+    deterministic for a given value and policy, and a value under a key the policy calls a secret
+    must not survive into the output. A redactor that raises does not violate the contract — the
+    kernel treats a failure as fail-closed and drops to a digest — but it must not *silently* return
+    unredacted content.
+    """
+
+    def redact(self, value: Any, *, policy: RedactionPolicy) -> Any: ...
+
+
+class DefaultRedactor:
+    """Substring-and-regex redaction over JSON-shaped values.
+
+    Recurses into mappings and sequences, masking a mapping value outright when its key names a
+    secret and rewriting free text otherwise. Non-text scalars pass through unchanged: an `int` has
+    no substring to match, and coercing one to a string to check it would change the payload's shape
+    for every caller in order to catch nothing.
+    """
+
+    def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+        if isinstance(value, str):
+            return policy.redact_text(value)
+        if isinstance(value, Mapping):
+            return {
+                str(key): (
+                    policy.replacement
+                    if policy.names_a_secret(str(key))
+                    else self.redact(item, policy=policy)
+                )
+                for key, item in value.items()
+            }
+        # `str` is a Sequence, and bytes have no text semantics we may assume, so both are excluded.
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return [self.redact(item, policy=policy) for item in value]
+        return value
+
+
+def redacted_or_none(
+    value: Any,
+    *,
+    policy: RedactionPolicy,
+    redactor: Redactor | None = None,
+) -> Any | None:
+    """Redact `value`, or return `None` if the redactor failed.
+
+    The fail-closed primitive the capture pipeline is built on. A redactor is integrator code that
+    may call out to a classifier, a model, or a regex engine on adversarial input, so it *will*
+    sometimes raise or hang. When it raises, the only safe answer is to produce nothing: falling
+    through to the raw value would turn a redaction failure into a disclosure, which is the opposite
+    of what the policy asked for. `None` is distinguishable from a successful redaction to `""`, so
+    the caller can report the downgrade rather than mistake it for empty content.
+    """
+    # ``is None``, not truthiness. A redactor is an arbitrary object, and one backed by a rule set that
+    # defines ``__len__`` is falsy when it holds no rules -- which is precisely when substituting the
+    # weaker built-in rules is least acceptable, and it would be reported as a successful redaction.
+    applied = DefaultRedactor() if redactor is None else redactor
+    try:
+        return applied.redact(value, policy=policy)
+    except Exception:
+        return None
+
+
+@dataclass(frozen=True)
+class CapturePolicy:
+    """How much of a model call one consumer may see.
+
+    - `none` — nothing. The consumer still gets the receipt's metadata.
+    - `digest` — content digests and lengths only. Enough to correlate and to detect drift, with no
+      disclosure.
+    - `redacted` — content rewritten by `redactor` under `redaction`, dropping to `digest` if that
+      fails.
+    - `full` — content verbatim.
+
+    `full` is the default because the alternative is worse in practice: a kernel that defaults to
+    withholding content makes its own reference Studio render empty bubbles out of the box, and the
+    first thing every operator does is turn capture on globally — a broader grant than they needed.
+    Defaulting to `full` and attaching a narrower policy per consumer puts the choice where the
+    consumer is registered, which is the only place that knows what the consumer does with it.
+
+    `redaction` and `redactor` are read only in `redacted` mode, and are deliberately *not* rejected
+    in the others: the fail-closed downgrade produces a `digest`-mode policy that still carries the
+    redaction it failed to apply, so the pair must survive a mode change.
+
+    `to_json` carries `mode` and `redaction`. A `redactor` is live code and cannot round-trip, so
+    `restored_without_redactor` marks a policy that came back from JSON knowing it *had* one. Such a
+    policy does **not** fall back to `DefaultRedactor`: the capture pipeline treats it as a redaction
+    failure and downgrades to `digest` until the redactor is re-attached. Applying the built-in rules
+    instead would be the worst outcome available — the consumer would be told it received redacted
+    content while the classifier that masked more than key names and regexes is simply absent.
+    """
+
+    mode: CaptureMode = "full"
+    redaction: RedactionPolicy | None = None
+    redactor: Redactor | None = None
+    restored_without_redactor: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mode not in CAPTURE_MODES:
+            raise WireValidationError(f"capture mode must be one of: {', '.join(CAPTURE_MODES)}")
+
+    @property
+    def captures_content(self) -> bool:
+        """Whether this policy yields content at all, as opposed to metadata about it."""
+        return self.mode in {"redacted", "full"}
+
+    @property
+    def effective_redaction(self) -> RedactionPolicy:
+        return self.redaction if self.redaction is not None else RedactionPolicy()
+
+    @property
+    def effective_redactor(self) -> Redactor | None:
+        """The redactor to apply, or `None` when redaction cannot be performed at all.
+
+        `None` for a policy restored from JSON that knows it had a custom redactor. There is no correct
+        redactor to hand back in that case, and handing back `DefaultRedactor` is the disclosure the
+        marker exists to prevent — an external consumer reading this accessor would apply the built-in
+        rules and believe it had honoured the policy, while the pipeline downgraded the very same policy
+        to `digest`. One answer, not two.
+        """
+        if self.redactor is not None:
+            return self.redactor
+        return None if self.restored_without_redactor else DefaultRedactor()
+
+    @classmethod
+    def from_json(cls, payload: Any) -> CapturePolicy:
+        if payload is None:
+            return cls()
+        payload = require_object(payload, "capture_policy")
+        # Absent and explicit ``null`` both mean "no policy of its own", which resolves to the default
+        # via ``effective_redaction``. Anything else present is parsed, so a malformed value -- falsy
+        # ones included -- still raises rather than silently becoming the default.
+        redaction_payload = _optional_object(payload, "redaction")
+        return cls(
+            mode=parse_literal(payload, "mode", CAPTURE_MODES, default="full"),
+            redaction=(
+                RedactionPolicy.from_json(redaction_payload)
+                if redaction_payload is not None
+                else None
+            ),
+            restored_without_redactor=payload.get("redactor") is not None,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "redaction": self.redaction.to_json() if self.redaction is not None else None,
+            # Names the fact that a redactor was attached without claiming to carry it, so a
+            # round-trip cannot quietly turn custom redaction into the default. Set when the marker is
+            # already set too, not only when a redactor is attached: a restored policy has
+            # ``redactor is None``, so keying on that alone wrote ``null`` and the *second* hop cleared
+            # the marker and fell back to the built-in rules. A policy that crosses two services --
+            # config store to gateway to kernel -- is one hop, not zero.
+            "redactor": (
+                "custom" if (self.redactor is not None or self.restored_without_redactor) else None
+            ),
+        }
+
+
+def content_digest(value: Any) -> str:
+    """A stable digest of one captured content field, computed on the raw value.
+
+    Everything is hashed as canonical JSON under a key that names its shape, so a digest does not
+    depend on mapping order and two differently-shaped values cannot collide. The shape key is the
+    domain separator and it is why text does *not* simply hash its own UTF-8 bytes: a text field whose
+    content happened to equal the wrapper serialization of a structured value — `'{"value":["x"]}'` —
+    hashed identically to that value, which is the collision the wrapper was supposed to prevent.
+
+    Consequence for anything that records these: recompute with this function, not with a bare
+    `sha256sum` of the text. Nothing persists a `content_digest` yet, which is what makes changing it
+    free today; once the run-dir sidecar records one, it is frozen.
+    """
+    if isinstance(value, str):
+        return canonical_sha256({"text": value})
+    return canonical_sha256({"value": _jsonish(value)})
+
+
+def content_length(value: Any) -> int | None:
+    """Character length for text, `None` for anything else.
+
+    Deliberately not "length of the canonical JSON": for a structured payload that number measures
+    the serialization, not the content, and an operator reading it as a content size would be wrong.
+    A missing answer is better than a misleading one.
+    """
+    return len(value) if isinstance(value, str) else None
+
+
+def _jsonish(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _jsonish(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_jsonish(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+@dataclass(frozen=True)
+class ModelCallReceipt:
+    """What happened on one model call, without any of what was said.
+
+    The receipt is metadata only: digests, counts, timings, taxonomy. That is what makes it safe to
+    hand to every consumer regardless of its `CapturePolicy` — a `none`-mode observer still gets a
+    full receipt, because nothing in here discloses content. Content travels separately, gated by the
+    policy.
+
+    Two digests, because they answer different questions. `prompt_digest` covers the assembled prompt
+    and stays stable when tool definitions or generation settings change around it, which is what you
+    want when asking "did the model see the same thing twice". `request_digest` covers the whole
+    request and is the exact replay key. Both are computed on the raw request, *before* redaction, so
+    they identify what actually went to the provider and stay comparable across policy changes.
+
+    `attempts` and `provider_retried` are not the same fact and neither implies the other.
+    `attempts` counts the calls the kernel made to the adapter. `provider_retried` is the adapter
+    reporting that *it* retried internally — a gateway can retry three times inside one call the
+    kernel counts as one attempt, and a receipt that only had `attempts` would show that as a clean
+    single call.
+
+    `stop_reason` is a plain string rather than the provider `Literal`. A receipt is an audit record:
+    a provider that starts returning a fifth stop reason must be recordable without a kernel change,
+    and `core` cannot depend on `providers` in any case.
+    """
+
+    context: InvocationContext = field(default_factory=lambda: InvocationContext())
+    model: ModelConfig = field(default_factory=lambda: ModelConfig())
+    provider_name: str = ""
+    prompt_digest: str = ""
+    request_digest: str = ""
+    stop_reason: str = ""
+    usage: Mapping[str, int] = field(default_factory=dict)
+    latency_ms: int = 0
+    attempts: int = 1
+    provider_retried: bool = False
+    error_code: str = ""
+    provider_error_code: str = ""
+    retryable: bool = False
+    http_status: int | None = None
+    redaction_digest: str = ""
+    capture_downgrades: int = 0
+
+    def __post_init__(self) -> None:
+        if self.attempts < 1:
+            raise ValueError("model call attempts must be 1 or greater")
+        if self.latency_ms < 0:
+            raise ValueError("model call latency_ms must not be negative")
+        if self.capture_downgrades < 0:
+            raise ValueError("model call capture_downgrades must not be negative")
+        for key, value in self.usage.items():
+            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int):
+                raise WireValidationError("model call usage must be a mapping of str to int")
+            # Every other counter on this receipt refuses a negative, and usage is the one that gets
+            # summed: a single ``{"input_tokens": -100}`` in an audit payload silently subtracts from
+            # an aggregate, so a budget check undercounts rather than visibly failing.
+            if value < 0:
+                raise WireValidationError(f"model call usage {key!r} must not be negative")
+        object.__setattr__(self, "usage", dict(self.usage))
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether the call produced a turn. A failed call still gets a receipt."""
+        return self.error_code == ""
+
+    @property
+    def trace_id(self) -> str:
+        return self.context.trace_id
+
+    @property
+    def span_id(self) -> str:
+        return self.context.span_id
+
+    def with_error(self, exc: BaseException) -> ModelCallReceipt:
+        """This receipt marked failed, carrying whatever taxonomy the exception exposes.
+
+        `ModelAdapterError` classifies itself — provider code, retryability, HTTP status — and the
+        providers already raise it, so the runner does not re-derive any of that. Anything else is
+        recorded by its type name rather than its message: an arbitrary exception's message can carry
+        request content, and the whole point of the receipt is that it holds none.
+        """
+        error_code = getattr(exc, "error_code", "") or type(exc).__name__
+        return replace(
+            self,
+            error_code=str(error_code),
+            provider_error_code=str(getattr(exc, "provider_error_code", "") or ""),
+            retryable=bool(getattr(exc, "retryable", False)),
+            http_status=getattr(exc, "http_status", None),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "context": self.context.to_json(),
+            "model": self.model.to_json(),
+            "provider_name": self.provider_name,
+            "prompt_digest": self.prompt_digest,
+            "request_digest": self.request_digest,
+            "stop_reason": self.stop_reason,
+            "usage": dict(self.usage),
+            "latency_ms": self.latency_ms,
+            "attempts": self.attempts,
+            "provider_retried": self.provider_retried,
+            "error_code": self.error_code,
+            "provider_error_code": self.provider_error_code,
+            "retryable": self.retryable,
+            "http_status": self.http_status,
+            "redaction_digest": self.redaction_digest,
+            "capture_downgrades": self.capture_downgrades,
+        }
+
+    @classmethod
+    def from_json(cls, payload: Any) -> ModelCallReceipt:
+        payload = require_object(payload, "model_call_receipt")
+        usage = _optional_object(payload, "usage") or {}
+        context_payload = _optional_object(payload, "context")
+        model_payload = _optional_object(payload, "model")
+        raw_status = payload.get("http_status")
+        return cls(
+            context=(
+                InvocationContext.from_json(context_payload)
+                if context_payload is not None
+                else InvocationContext()
+            ),
+            model=_parsed_model_config(model_payload),
+            provider_name=parse_str(payload, "provider_name"),
+            prompt_digest=parse_str(payload, "prompt_digest"),
+            request_digest=parse_str(payload, "request_digest"),
+            stop_reason=parse_str(payload, "stop_reason"),
+            usage=usage,
+            latency_ms=parse_int(payload, "latency_ms"),
+            attempts=parse_int(payload, "attempts", default=1),
+            provider_retried=parse_bool(payload, "provider_retried"),
+            error_code=parse_str(payload, "error_code"),
+            provider_error_code=parse_str(payload, "provider_error_code"),
+            retryable=parse_bool(payload, "retryable"),
+            http_status=None if raw_status is None else parse_int(payload, "http_status"),
+            redaction_digest=parse_str(payload, "redaction_digest"),
+            capture_downgrades=parse_int(payload, "capture_downgrades"),
+        )
+
+
+@dataclass(frozen=True)
+class ModelCallCapture:
+    """One model call as a single consumer is allowed to see it.
+
+    `mode` is the mode *actually applied*, which is not always the mode the policy asked for:
+    `downgraded_from` is set when redaction failed and this consumer dropped to `digest`. The pair is
+    what lets a consumer tell "there was no content" apart from "there was content I was not given",
+    which a single mode field cannot express.
+
+    `digests` and `lengths` describe the **raw** content, never the redacted view. That is the whole
+    reason the digest is taken first: two consumers on different policies see different text but agree
+    on the identity of what the provider was sent, so a digest can join a redacted record to a full
+    one — and, later, key a replay.
+    """
+
+    receipt: ModelCallReceipt
+    mode: CaptureMode = "none"
+    downgraded_from: str = ""
+    content: Mapping[str, Any] | None = None
+    digests: Mapping[str, str] = field(default_factory=dict)
+    lengths: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.mode not in CAPTURE_MODES:
+            raise WireValidationError(f"capture mode must be one of: {', '.join(CAPTURE_MODES)}")
+        object.__setattr__(self, "digests", dict(self.digests))
+        object.__setattr__(self, "lengths", dict(self.lengths))
+        if self.content is not None:
+            object.__setattr__(self, "content", dict(self.content))
+
+    @property
+    def was_downgraded(self) -> bool:
+        return self.downgraded_from != ""
+
+
+@runtime_checkable
+class ModelIOObserver(Protocol):
+    """A consumer of settled model calls.
+
+    One required member. `close` is declared separately by `ClosableModelIOObserver`, because a member
+    with a default in a `Protocol` body reaches only classes that explicitly inherit it — for
+    structural typing it is *required*, and declaring `close` here would reject every observer that
+    does not define one. The pipeline probes for it with `getattr`.
+
+    An observer must not raise, and if it does the kernel swallows it: an exporter that is down is not
+    a reason to fail a model call the provider has already billed for. It must also treat the capture
+    as read-only. Each consumer gets its own capture and its own receipt: the counts and taxonomy
+    agree across consumers, but a `none`-mode receipt has its content-derived digests cleared, so two
+    receipts from one call are not necessarily equal.
+    """
+
+    def on_model_call(self, capture: ModelCallCapture) -> None: ...
+
+
+@runtime_checkable
+class ClosableModelIOObserver(Protocol):
+    """An observer that owns a resource to release. Opt-in; see `ModelIOObserver`."""
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class ModelIOSubscription:
+    """One observer and the policy that governs what it sees.
+
+    The policy lives here rather than on the observer, so registering the same exporter twice under
+    two policies is a normal thing to do — and so an observer cannot widen its own grant.
+    """
+
+    observer: ModelIOObserver
+    policy: CapturePolicy = field(default_factory=lambda: CapturePolicy())
+
+
+def redacted_fields_or_none(
+    content: Mapping[str, Any],
+    *,
+    policy: RedactionPolicy,
+    redactor: Redactor | None = None,
+) -> Mapping[str, Any] | None:
+    """Redact a field mapping, or return `None` if the redactor failed *or* misbehaved.
+
+    `Redactor.redact` is typed `Any -> Any`, so a third-party implementation can return a scalar or a
+    list for a mapping input — plausibly, since "mask the whole payload" is a tempting one-liner. The
+    pipeline needs fields back to deliver fields, and converting a non-mapping result here rather than
+    at the call site is what keeps that failure inside the fail-closed path: raised outside it, the
+    exception would escape `dispatch_model_call` and fail a model call the provider has already been
+    paid for.
+
+    A shape violation is treated exactly like a raise. It is a contract violation either way, and the
+    consumer that asked for redacted content gets metadata instead of a guess.
+
+    The redactor is handed a **fully detached** payload it may treat as its own, so an implementation
+    that edits mappings and lists in place is legal. Nothing in the `Redactor` contract forbids that, and
+    it is the natural way to write one — but with only the outer mapping copied it mutated the caller's
+    settled payload *and* the input the next redacted subscription would see, so the first consumer's
+    rules silently became everyone's. Detached per call rather than once per dispatch, precisely because
+    an in-place redactor would otherwise contaminate its peers.
+    """
+    redacted = redacted_or_none(_detached_content(content), policy=policy, redactor=redactor)
+    if not isinstance(redacted, Mapping):
+        return None
+    return {str(key): value for key, value in redacted.items()}
+
+
+def _detached_content(content: Mapping[str, Any]) -> Mapping[str, Any]:
+    """A copy of `content` that shares no nested structure with the caller's payload.
+
+    `dict(content)` copies only the outer mapping, so a nested message list stayed shared: a caller that
+    mutated its own payload after dispatch changed captures observers had already retained, while the
+    digests kept describing the pre-mutation value. A capture is meant to be a settled record.
+
+    For `full` mode this is done once per dispatch and shared by those subscriptions rather than copied
+    per observer. Content can carry resolved media, and copying that per subscriber is real cost for a
+    case an observer is already forbidden to cause — treating the capture as read-only is part of the
+    `ModelIOObserver` contract, whereas a caller mutating its own dict violates nothing. Redaction is the
+    opposite: an in-place redactor is legal, so each redacted subscription gets its own copy.
+
+    A payload holding something `deepcopy` refuses falls back to the shallow copy: degraded isolation is
+    survivable, failing a model call the provider has already been paid for is not.
+    """
+    try:
+        return copy.deepcopy(dict(content))
+    except Exception:
+        return dict(content)
+
+
+def _resolve_capture(
+    policy: CapturePolicy, content: Mapping[str, Any]
+) -> tuple[CaptureMode, str, Mapping[str, Any] | None]:
+    """Decide what one subscription sees, as `(mode, downgraded_from, content)`."""
+    if policy.mode == "none":
+        return "none", "", None
+    if policy.mode == "digest":
+        return "digest", "", None
+    if policy.mode == "full":
+        return "full", "", content
+    if policy.effective_redactor is None:
+        # A policy that came back from JSON knowing it *had* a custom redactor, and no longer has one.
+        # Silently applying the built-in rules would be the worst outcome available: the consumer is
+        # told it received redacted content while a classifier that masked more than key names and
+        # regexes is simply absent. Missing machinery is a redaction failure, not a weaker redaction.
+        return "digest", "redacted", None
+    redacted = redacted_fields_or_none(
+        content, policy=policy.effective_redaction, redactor=policy.redactor
+    )
+    if redacted is None:
+        # Fail closed. This consumer asked for redacted content and the redactor could not produce it,
+        # so it gets what ``digest`` would have given it -- never the raw value.
+        return "digest", "redacted", None
+    return "redacted", "", redacted
+
+
+# Receipt fields derived from the call's content. A ``none``-mode consumer must not receive these:
+# ``none`` promises no content metadata, and a digest of a short prompt is recoverable by hashing
+# candidates. Token counts, timings and taxonomy stay -- they are metadata about the call rather than
+# about what was said, and withholding them would leave an accounting or alerting consumer unable to
+# do its job for no privacy gain.
+_CONTENT_DERIVED_RECEIPT_FIELDS = ("prompt_digest", "request_digest")
+
+
+def _receipt_for_subscription(
+    receipt: ModelCallReceipt, *, mode: CaptureMode, policy: CapturePolicy
+) -> ModelCallReceipt:
+    """The receipt one subscription receives: narrowed to its mode, and naming its own rules.
+
+    ``redaction_digest`` is a *per-subscription* fact, not a per-call one. There is no single applied
+    policy at call level -- that is the whole point of attaching one per registration -- so the
+    caller's receipt cannot carry a meaningful value and two redacted consumers with different rules
+    would otherwise get identical audit records. It is set only when redaction actually ran: a
+    downgraded subscription applied no rules at all, and stamping the policy it *failed* to apply
+    would read as "these rules were applied", which ``downgraded_from`` already reports correctly.
+    """
+    changes: dict[str, Any] = {
+        "redaction_digest": policy.effective_redaction.digest if mode == "redacted" else "",
+    }
+    if mode == "none":
+        changes.update(dict.fromkeys(_CONTENT_DERIVED_RECEIPT_FIELDS, ""))
+    return replace(receipt, **changes)
+
+
+def dispatch_model_call(
+    *,
+    receipt: ModelCallReceipt,
+    content: Mapping[str, Any],
+    subscriptions: Sequence[ModelIOSubscription],
+) -> ModelCallReceipt:
+    """Deliver one settled model call to every subscription under its own policy.
+
+    Returns the caller's receipt plus `capture_downgrades`. The count is resolved in a first pass
+    *before* any delivery, so every observer agrees on it. Delivering as we go would hand the first
+    observer a count of zero and the last the true total, and a receipt that disagrees with itself
+    across consumers is worse than no count at all.
+
+    What each observer receives is that receipt narrowed to its mode: a `none`-mode consumer gets the
+    content-derived digests cleared, because `none` promises no content metadata and the receipt's
+    `prompt_digest` would otherwise walk straight past the per-field digests this function withholds.
+    The receipt *returned* keeps them — the caller is the kernel, which computed them.
+
+    Digests and lengths are computed once, on the raw content, and shared. Beyond the cost, that is
+    what makes them comparable: a per-observer digest taken after redaction would differ by policy and
+    could not join anything.
+
+    An observer that raises is skipped and the rest still run. The call already happened and the
+    provider has already been paid; a broken exporter does not get to undo that.
+    """
+    if not subscriptions:
+        return receipt
+
+    full_content = (
+        _detached_content(content)
+        if any(subscription.policy.mode == "full" for subscription in subscriptions)
+        else content
+    )
+
+    resolved = [
+        _resolve_capture(subscription.policy, full_content if subscription.policy.mode == "full" else content)
+        for subscription in subscriptions
+    ]
+    downgrades = sum(1 for _mode, downgraded_from, _payload in resolved if downgraded_from)
+
+    # Only if somebody will actually see them. Hashing walks every field and, for a value with no JSON
+    # form, materializes a string of it -- so a run wired to nothing but a ``none``-mode observer was
+    # paying to digest resolved media it then discarded. Keyed on the *resolved* modes, not the declared
+    # ones: a subscription downgraded from ``redacted`` lands on ``digest`` and does see this metadata.
+    reveals_any_metadata = any(mode != "none" for mode, _downgraded_from, _payload in resolved)
+    digests = (
+        {key: content_digest(value) for key, value in content.items()} if reveals_any_metadata else {}
+    )
+    lengths = (
+        {
+            key: length
+            for key, value in content.items()
+            if (length := content_length(value)) is not None
+        }
+        if reveals_any_metadata
+        else {}
+    )
+    settled = replace(receipt, capture_downgrades=receipt.capture_downgrades + downgrades)
+
+    for subscription, (mode, downgraded_from, payload) in zip(subscriptions, resolved, strict=True):
+        reveals_metadata = mode != "none"
+        capture = ModelCallCapture(
+            receipt=_receipt_for_subscription(settled, mode=mode, policy=subscription.policy),
+            mode=mode,
+            downgraded_from=downgraded_from,
+            content=payload,
+            digests=digests if reveals_metadata else {},
+            lengths=lengths if reveals_metadata else {},
+        )
+        try:
+            subscription.observer.on_model_call(capture)
+        except Exception:
+            continue
+    return settled
+
+
+def close_model_io_subscriptions(subscriptions: Sequence[ModelIOSubscription]) -> None:
+    """Release every observer that declared a `close`, once each, tolerating failures.
+
+    Probed with `getattr` rather than required, which is what keeps `close` off the base protocol.
+
+    De-duplicated by identity, because registering one exporter under two policies is a shape
+    `ModelIOSubscription` explicitly supports. Closing it once per subscription asks a `close` that
+    flushes or commits to be idempotent, and the failure mode is quiet: the second call's exception is
+    swallowed by the same guard that makes a broken exporter survivable.
+    """
+    seen: set[int] = set()
+    for subscription in subscriptions:
+        observer = subscription.observer
+        if id(observer) in seen:
+            continue
+        seen.add(id(observer))
+        close = getattr(observer, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except Exception:
+            continue

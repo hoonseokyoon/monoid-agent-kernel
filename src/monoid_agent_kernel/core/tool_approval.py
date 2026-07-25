@@ -4,22 +4,17 @@ from collections.abc import Mapping
 from typing import Any
 
 from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core.model_io import DEFAULT_SECRET_KEY_PARTS, REDACTION_PLACEHOLDER
 from monoid_agent_kernel.tools.base import ToolSpec
 
 TOOL_APPROVAL_TASK_KIND = "tool_approval"
 TOOL_APPROVAL_RESULT_TYPE = "tool_approval_result"
 
-_REDACTED = "[redacted]"
-_SECRET_KEY_PARTS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "bearer",
-    "credential",
-    "password",
-    "secret",
-    "token",
-)
+# The secret-key list and placeholder now live in ``core.model_io``, where the model-I/O capture
+# policies need the same answer. Approvals had them first; two copies would drift, and the drift
+# would be invisible until one surface masked something the other did not.
+_REDACTED = REDACTION_PLACEHOLDER
+_SECRET_KEY_PARTS = DEFAULT_SECRET_KEY_PARTS
 _APPROVE_VALUES = {"1", "allow", "allowed", "approve", "approved", "true", "y", "yes"}
 _DENY_VALUES = {"0", "deny", "denied", "false", "n", "no", "reject", "rejected"}
 
