@@ -17,6 +17,11 @@ out in commit messages and here.
   `AgentLoop`. Capture is opt-in through `subscriptions`; a runner wired to no observer does no
   digesting. It lives at the package root rather than under `core/` because it names the provider
   vocabulary it drives, and `core` does not import `providers`.
+- Added `ModelTurn.provider_retried` and `TurnComplete.provider_retried`, how an adapter reports that
+  it retried internally before producing a turn. The kernel counts one adapter call per turn however
+  many attempts happen inside it, so without this an audit receipt records a call that failed twice
+  and succeeded on the third try as a clean single attempt. `GatewayModelAdapter` sets it on both its
+  retry paths; adapters with no retry loop leave it `False`, which is exactly true of them.
 - Added `ModelCallAborted`, raised when a caller's `should_abort` predicate stops an in-flight
   streamed call. Distinct from `TurnInterrupted` because the runner knows nothing about turns;
   `AgentLoop` translates it at its own boundary.

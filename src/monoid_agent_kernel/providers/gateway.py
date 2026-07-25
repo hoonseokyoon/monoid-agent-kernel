@@ -4,7 +4,7 @@ import json
 import random
 import time
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, ClassVar
 from urllib.error import HTTPError, URLError
@@ -85,7 +85,10 @@ class GatewayModelAdapter:
                         "LLM gateway returned invalid JSON",
                         provider_error_code=GATEWAY_BAD_RESPONSE,
                     ) from exc
-                return _parse_gateway_response(data)
+                # ``attempt > 1`` means this call only succeeded because the retry loop ran.
+                # The kernel counts it as one adapter call, so the receipt would otherwise show a
+                # twice-failed call as a clean single attempt.
+                return replace(_parse_gateway_response(data), provider_retried=attempt > 1)
             except ModelAdapterError as exc:
                 last_error = exc
                 if not _should_retry(exc, attempt, max_attempts, retry.retry_on):
@@ -167,6 +170,12 @@ class GatewayModelAdapter:
                             raise error
                         committed = True
                         async for chunk in _aiter_sse_chunks(response):
+                            # Retries here are all pre-commit, so reaching this point after the
+                            # first attempt means the stream was retried. The caller folds the
+                            # chunks into the turn, so the terminal chunk is the only place to
+                            # record it.
+                            if attempt > 1 and isinstance(chunk, TurnComplete):
+                                chunk = replace(chunk, provider_retried=True)
                             yield chunk
                 return
             except _StreamRetry as retry_signal:

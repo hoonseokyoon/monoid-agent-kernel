@@ -97,6 +97,11 @@ class ModelTurn:
     reasoning: tuple[dict[str, Any], ...] = ()
     # Why the turn ended (promoted from ``raw``). ``None`` when the adapter does not report one.
     stop_reason: StopReason | None = None
+    # Whether the adapter retried internally before producing this turn. The kernel counts one
+    # adapter call per turn no matter how many attempts happened inside it, so without this an
+    # audit record shows a call that failed twice and succeeded on the third try as a clean single
+    # attempt. Adapters with no retry loop leave it False, which is exactly true of them.
+    provider_retried: bool = False
 
 
 @dataclass(frozen=True)
@@ -293,6 +298,10 @@ class TurnComplete:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning: tuple[dict[str, Any], ...] = ()
     stop_reason: StopReason | None = None
+    # Mirrors :attr:`ModelTurn.provider_retried`. On the streaming path the turn is assembled by the
+    # caller out of chunks, so an adapter that retried before committing its stream has no other
+    # place to say so.
+    provider_retried: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -301,6 +310,7 @@ class TurnComplete:
             "usage": dict(self.usage),
             "reasoning": [dict(item) for item in self.reasoning],
             "stop_reason": self.stop_reason,
+            "provider_retried": self.provider_retried,
         }
 
 
@@ -319,6 +329,7 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     usage: dict[str, int] = {}
     reasoning: tuple[dict[str, Any], ...] = ()
     stop_reason: StopReason | None = None
+    provider_retried = False
     for chunk in chunks:
         if isinstance(chunk, TextDelta):
             text_parts.append(chunk.text)
@@ -342,6 +353,8 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
                 reasoning = chunk.reasoning
             if chunk.stop_reason is not None:
                 stop_reason = chunk.stop_reason
+            if chunk.provider_retried:
+                provider_retried = True
     tool_calls: list[ToolCall] = []
     for index in order:
         slot = slots[index]
@@ -370,4 +383,5 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         usage=normalize_usage(usage) if usage else {},
         reasoning=reasoning,
         stop_reason=stop_reason,
+        provider_retried=provider_retried,
     )
