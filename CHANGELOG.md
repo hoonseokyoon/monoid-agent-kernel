@@ -7,6 +7,22 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking for third-party synchronous adapters and tools.** A synchronous `next_turn` and a
+  synchronous tool handler now observe run cancellation and the run deadline, instead of taking
+  effect only once the call returns. Both previously let a wedged provider or handler outlast every
+  run boundary; a run now reports `cancelled` or `run_timeout` within its cancel-grace window and
+  abandons the call. Python cannot force-stop a worker thread, so the call is abandoned rather than
+  stopped: it keeps running with its late outcome discarded, an awaitable returned too late is
+  closed unawaited, and an abandoned tool handler may still be writing to the workspace. Sync
+  adapters and tools should still enforce a timeout at their own I/O edge. Adapters needing prompt
+  resource release should expose `anext_turn` or a coroutine `next_turn`.
+- Abandoned synchronous calls no longer run on the event loop's default executor. `asyncio.run`
+  joins that executor's workers before returning, which made a run deadline enforced internally but
+  unobservable to the caller — it produced its result on time, then blocked at loop shutdown until
+  the provider returned on its own.
+
 ## [0.19.2] - 2026-07-19
 
 ### Added

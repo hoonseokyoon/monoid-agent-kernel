@@ -269,10 +269,12 @@ Run cancellation and the session deadline cancel an in-flight native `anext_turn
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
 cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provider task is detached
 so a cancellation-suppressing adapter cannot block the run result. Turn interrupt and pause remain
-step-boundary signals for non-streamed model calls. A synchronous adapter runs through
-`asyncio.to_thread`; Python cannot force-stop that worker thread, so cancellation and the run
-deadline take effect after `next_turn` returns. Sync adapters should enforce their own provider I/O
-timeout and idempotency policy.
+step-boundary signals for non-streamed model calls. A synchronous `next_turn` observes the same two
+run boundaries: Python cannot force-stop its worker thread, so exceeding a boundary *abandons* the
+call rather than stopping it. The run reports `cancelled` or `run_timeout` within
+`async_model_cancel_grace_s` while the worker keeps going and its late outcome is discarded. Sync
+adapters should still enforce their own provider I/O timeout and idempotency policy, because the
+kernel can stop waiting for a call it cannot stop.
 
 `ModelRequest` carries:
 
@@ -324,9 +326,13 @@ external boundary.
 Run cancellation and the run deadline cancel an in-flight native async handler and preserve the
 run-level `cancelled` or `run_timeout` result. Cleanup has a bounded
 `AgentLoop.async_tool_cancel_grace_s` window; a handler that suppresses cancellation is detached
-after that window so it cannot block the run result. A synchronous Python call cannot be
-force-stopped safely; its worker completes before the next run-boundary check. Sync tools that
-perform external I/O should apply their own operation timeout and idempotency policy.
+after that window so it cannot block the run result. A synchronous handler observes the same two
+boundaries and the same window, but cannot be force-stopped, so it is detached without ever
+receiving a cancellation to clean up after — the position a cancellation-suppressing async handler
+already ends in. A detached handler may still be writing to the workspace after the run stopped
+waiting for it, and an awaitable it returns too late is closed unawaited. Sync tools that perform
+external I/O should apply their own operation timeout and idempotency policy, because the kernel
+can stop waiting for a handler it cannot stop.
 
 `ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
 errors become failed tool observations. A handler-local `CancelledError` maps to
