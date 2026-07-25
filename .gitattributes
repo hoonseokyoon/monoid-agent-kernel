@@ -1,2 +1,3 @@
+*.py text eol=lf
 .nvmrc text eol=lf
 src/monoid_agent_kernel/reference/studio/web/dist/assets/*.js whitespace=-trailing-space
