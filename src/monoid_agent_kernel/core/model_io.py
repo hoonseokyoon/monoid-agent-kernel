@@ -88,6 +88,28 @@ def _optional_object(payload: Mapping[str, Any], key: str) -> dict[str, Any] | N
     return None if value is None else require_object(value, key)
 
 
+def _parsed_model_config(payload: Mapping[str, Any] | None) -> ModelConfig:
+    """`ModelConfig.from_json` with its failures translated into wire-validation failures.
+
+    `ModelConfig` and its nested `ReasoningConfig` / `ModelRetryConfig` are typed `dict | None` and
+    trust it, so a malformed *nested* object — `{"model": {"reasoning": []}}` — reaches `.get` on a list
+    and raises `AttributeError`. Checking the outer object is not enough, and enumerating the nested
+    fields here would couple this module to another type's shape and go stale the moment
+    `ModelConfig` grows a field.
+
+    So the translation happens at this boundary, which is the one that made the promise: this module's
+    `from_json` documents `WireValidationError` for malformed input, and a consumer handling corrupt
+    audit records through that exception must not instead get an `AttributeError`. Teaching
+    `ModelConfig.from_json` to validate its own payload is the deeper fix and belongs with that type.
+    """
+    try:
+        return ModelConfig.from_json(payload)
+    except WireValidationError:
+        raise
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise WireValidationError(f"model must be a valid model config: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class RedactionPolicy:
     """What counts as sensitive in a model call's prompt and output.
@@ -358,8 +380,14 @@ class CapturePolicy:
             "mode": self.mode,
             "redaction": self.redaction.to_json() if self.redaction is not None else None,
             # Names the fact that a redactor was attached without claiming to carry it, so a
-            # round-trip cannot quietly turn custom redaction into the default.
-            "redactor": "custom" if self.redactor is not None else None,
+            # round-trip cannot quietly turn custom redaction into the default. Set when the marker is
+            # already set too, not only when a redactor is attached: a restored policy has
+            # ``redactor is None``, so keying on that alone wrote ``null`` and the *second* hop cleared
+            # the marker and fell back to the built-in rules. A policy that crosses two services --
+            # config store to gateway to kernel -- is one hop, not zero.
+            "redactor": (
+                "custom" if (self.redactor is not None or self.restored_without_redactor) else None
+            ),
         }
 
 
@@ -511,8 +539,6 @@ class ModelCallReceipt:
         payload = require_object(payload, "model_call_receipt")
         usage = _optional_object(payload, "usage") or {}
         context_payload = _optional_object(payload, "context")
-        # ``ModelConfig.from_json`` assumes a dict-or-None and would raise ``AttributeError`` on any
-        # other type, so the object check has to happen here rather than being left to it.
         model_payload = _optional_object(payload, "model")
         raw_status = payload.get("http_status")
         return cls(
@@ -521,7 +547,7 @@ class ModelCallReceipt:
                 if context_payload is not None
                 else InvocationContext()
             ),
-            model=ModelConfig.from_json(model_payload),
+            model=_parsed_model_config(model_payload),
             provider_name=parse_str(payload, "provider_name"),
             prompt_digest=parse_str(payload, "prompt_digest"),
             request_digest=parse_str(payload, "request_digest"),

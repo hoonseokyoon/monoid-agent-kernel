@@ -310,6 +310,26 @@ def test_json_round_trip_names_a_custom_redactor_without_carrying_it() -> None:
     assert restored.restored_without_redactor is True
 
 
+def test_the_lost_redactor_marker_survives_repeated_round_trips() -> None:
+    """One hop set the marker; the second used to clear it and fall back to the built-in rules.
+
+    A restored policy has `redactor is None`, so keying the serialized marker on the redactor alone
+    wrote `null` on the way back out. A policy that crosses two services — config store to gateway to
+    kernel — is one hop, not zero, so this was reachable by the deployment the marker exists for.
+    """
+
+    class Custom:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return dict.fromkeys(value, "[classified]")
+
+    policy = CapturePolicy(mode="redacted", redactor=Custom())
+
+    for _hop in range(4):
+        policy = CapturePolicy.from_json(policy.to_json())
+        assert policy.restored_without_redactor is True
+        assert policy.to_json()["redactor"] == "custom"
+
+
 def test_from_json_without_a_redactor_does_not_claim_one_was_lost() -> None:
     restored = CapturePolicy.from_json({"mode": "digest"})
 

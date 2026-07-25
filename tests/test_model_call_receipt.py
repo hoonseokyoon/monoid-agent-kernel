@@ -207,6 +207,36 @@ def test_from_json_still_treats_absent_and_null_nested_payloads_as_defaults(key:
     assert ModelCallReceipt.from_json({key: None}) == ModelCallReceipt()
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"reasoning": []},
+        {"reasoning": "high"},
+        {"retry": []},
+        {"timeout_s": "soon"},
+    ],
+)
+def test_from_json_rejects_a_malformed_nested_model_config(model: dict[str, object]) -> None:
+    """Checking the outer object is not enough.
+
+    `ModelConfig` and its nested `ReasoningConfig` / `ModelRetryConfig` are typed `dict | None` and
+    trust it, so a malformed nested object reached `.get` on a list and raised `AttributeError`. A
+    consumer handling corrupt audit records through the documented validation exception would crash
+    instead — so this module translates at its own boundary, which is the one that made the promise.
+    """
+    with pytest.raises(WireValidationError, match="model must be a valid model config"):
+        ModelCallReceipt.from_json({"model": model})
+
+
+def test_from_json_still_accepts_a_well_formed_nested_model_config() -> None:
+    """The containment must not have been bought by rejecting valid nested configs."""
+    restored = ModelCallReceipt.from_json(
+        {"model": {"provider": "openai", "model": "gpt-5.5", "reasoning": {}, "retry": {}}}
+    )
+
+    assert (restored.model.provider, restored.model.model) == ("openai", "gpt-5.5")
+
+
 def test_from_json_rejects_a_non_object_and_a_mistyped_field() -> None:
     with pytest.raises(WireValidationError):
         ModelCallReceipt.from_json("not-an-object")
