@@ -24,6 +24,7 @@ from monoid_agent_kernel.core.streaming import QueueEventSink
 from monoid_agent_kernel.core.tool_surface import tool_surface_manifest
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.core.workspace_index import build_workspace_index
+from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
     public_error_message,
@@ -49,6 +50,7 @@ class _RunResources:
     started: float
     deadline: float | None
     static_segments: tuple[str, ...]
+    model_runner: ModelCallRunner
 
 
 @dataclass(frozen=True)
@@ -172,6 +174,15 @@ class LoopBootstrapper:
             if loop.spec.limits.max_duration_s is not None
             else None
         )
+        # Built once and shared by all three publications below. The runner reads the loop's
+        # cancellation token through a callable rather than capturing it: ``astream`` installs one
+        # on a run already in progress, so a token captured here would be a token nobody cancels.
+        model_runner = ModelCallRunner(
+            adapter=loop.model_adapter,
+            current_cancellation_token=lambda: loop.cancellation_token,
+            cancel_grace_s=loop.async_model_cancel_grace_s,
+            thread_name=f"nar-model-call-{loop.spec.run_id}",
+        )
         # Publish partial ownership as soon as recorder/task resources exist. If a provider,
         # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.
         loop._bootstrap_resources = _RunResources(
@@ -182,6 +193,7 @@ class LoopBootstrapper:
             started=started,
             deadline=deadline,
             static_segments=(),
+            model_runner=model_runner,
         )
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))
@@ -198,6 +210,7 @@ class LoopBootstrapper:
             started=started,
             deadline=deadline,
             static_segments=(),
+            model_runner=model_runner,
         )
         initial_runtime_config = loop._current_runtime_config(base_registry)
         initial_bound_catalog = compile_bound_tool_catalog(initial_runtime_config, base_registry)
@@ -274,6 +287,7 @@ class LoopBootstrapper:
             started=started,
             deadline=deadline,
             static_segments=tuple(static_segments),
+            model_runner=model_runner,
         )
 
 

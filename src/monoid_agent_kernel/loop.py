@@ -20,6 +20,7 @@ from monoid_agent_kernel.core._sync_bridge import (
     start_abandonable_sync_call,
 )
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
+from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointStore,
@@ -114,6 +115,7 @@ from monoid_agent_kernel.core.side_effect_policy import (
 )
 from monoid_agent_kernel.errors import (
     ModelAdapterError,
+    ModelCallAborted,
     AgentConfigError,
     NativeAgentError,
     PermissionDenied,
@@ -160,7 +162,6 @@ from monoid_agent_kernel.providers.base import (
     ReasoningDelta,
     TextDelta,
     ToolObservation,
-    assemble_streamed_turn,
     format_async_result_text,
 )
 from monoid_agent_kernel.public_view import (
@@ -1580,181 +1581,56 @@ class AgentLoop:
         self._owned_loop = None
         self._owned_loop_thread = None
 
-    async def _acall_model(self, request: ModelRequest, deadline: float | None) -> ModelTurn:
-        """Invoke the model adapter, awaiting an async adapter natively or offloading a
-        sync ``next_turn`` to a thread so the event loop is never blocked on the LLM call.
-
-        Backward compatible: an adapter exposing ``async def anext_turn`` is awaited; a
-        coroutine ``next_turn`` is awaited; a plain sync ``next_turn`` runs in a thread.
-
-        Every shape observes run cancellation and the run deadline through the same race in
-        ``_await_native_model_call``, so the adapter's async-ness never changes when a run
-        stops. A sync ``next_turn`` cannot be interrupted, so its thread is *abandoned*
-        rather than cancelled -- see that method's note.
-
-        While a stream is active and the adapter supports ``astream_turn``, the streaming
-        path is preferred: token chunks are relayed to the stream queue and folded into a
-        ``ModelTurn`` so the rest of the turn is identical to the non-streamed path."""
-        adapter = self.model_adapter
-        sink = self._stream_sink
-        if sink is not None and sink.active:
-            astream_turn = getattr(adapter, "astream_turn", None)
-            if astream_turn is not None:
-                return await self._acall_model_streaming(astream_turn, request, sink, deadline)
-        if self.emit_output_deltas:
-            astream_turn = getattr(adapter, "astream_turn", None)
-            if astream_turn is not None:
-                return await self._acall_model_emitting_deltas(astream_turn, request, deadline)
-        anext = getattr(adapter, "anext_turn", None)
-        if anext is not None:
-            return await self._await_native_model_call(anext(request), deadline)
-        next_turn = adapter.next_turn
-        if inspect.iscoroutinefunction(next_turn):
-            return await self._await_native_model_call(next_turn(request), deadline)
-        return await self._await_native_model_call(
-            start_abandonable_sync_call(
-                lambda: next_turn(request),
-                thread_name=f"nar-model-call-{self.spec.run_id}",
-            ),
-            deadline,
-        )
-
-    async def _await_native_model_call(
-        self,
-        pending: Awaitable[ModelTurn] | AbandonableSyncCall[ModelTurn],
-        deadline: float | None,
+    async def _acall_model(
+        self, request: ModelRequest, deadline: float | None, runner: ModelCallRunner
     ) -> ModelTurn:
-        """Await native model I/O while propagating run cancellation and the run deadline.
+        """Run one model call through the runner, choosing what this run wants to see of it.
 
-        Interrupt and pause remain step-boundary signals for one-shot model calls. They are
-        intentionally absent from this race and are checked by ``_apump_turn`` after the model
-        returns. Cancellation and deadlines are run boundaries, so they cancel the provider task
-        immediately and wait only a bounded interval for cooperative cleanup.
+        The dispatch, the cancel/deadline race and the receipt live in ``ModelCallRunner``. What
+        stays here is the part that is genuinely about *this* run: which consumer the chunks go to,
+        and whether a cooperative stop applies.
 
-        A synchronous adapter cannot be interrupted: its thread keeps running to completion.
-        Cancelling its future therefore *abandons* the call -- the run stops waiting within
-        ``async_model_cancel_grace_s`` and the detached outcome is consumed so late cleanup cannot
-        warn, but the provider's socket and CPU work continue until the adapter returns on its own.
-        Abandoning is only real because the thread is a daemon nobody joins, which is why the call
-        goes through ``start_abandonable_sync_call`` rather than ``asyncio.to_thread``.
-        Adapters that must release resources promptly should expose ``anext_turn`` or a coroutine
-        ``next_turn``.
+        Three cases, and they are not symmetric. A live ``RunStream`` relays every chunk to its
+        queue and does **not** honour the turn interrupt -- that has always been a step-boundary
+        signal on this path, and making the stream stop early here would be a behaviour change
+        wearing a refactor's clothes. An autonomous run emitting deltas turns text and reasoning
+        into events and *does* stop immediately, which is what ``interrupt_turn`` means to a caller
+        with no queue to close. Everything else takes the one-shot path.
+
+        ``ModelCallAborted`` is translated here because the runner knows nothing about turns. Left
+        untranslated it would reach the loop's generic failure handler and terminalize a session
+        that is supposed to park and stay alive.
         """
 
-        sync_call = pending if isinstance(pending, AbandonableSyncCall) else None
-        task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
-        loop = asyncio.get_running_loop()
-        cancelled: asyncio.Future[None] = loop.create_future()
-        outcome_consumed = False
+        delta_consumer: Callable[[ModelStreamChunk], None] | None = None
+        should_abort: Callable[[], bool] | None = None
+        sink = self._stream_sink
+        if sink is not None and sink.active:
+            delta_consumer = sink.push_delta
+        elif self.emit_output_deltas:
+            assert self._session is not None
+            recorder = self._session.res.recorder
 
-        def signal_cancelled() -> None:
-            def resolve() -> None:
-                if not cancelled.done():
-                    cancelled.set_result(None)
+            def delta_consumer(chunk: ModelStreamChunk) -> None:  # noqa: F811
+                if isinstance(chunk, TextDelta) and chunk.text:
+                    recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
+                elif isinstance(chunk, ReasoningDelta) and chunk.text:
+                    # Display-only reasoning summary (DX-13b): a separate event so a consumer
+                    # renders it in a "thinking" view, distinct from the answer text.
+                    recorder.emit("model.reasoning.delta", data={"text": chunk.text}, level="debug")
 
-            loop.call_soon_threadsafe(resolve)
+            should_abort = lambda: self._interrupt_requested  # noqa: E731
 
-        remove_callback = (
-            self.cancellation_token.add_cancel_callback(signal_cancelled)
-            if self.cancellation_token is not None
-            else lambda: None
-        )
-        timeout = None if deadline is None else max(0.0, deadline - time.time())
         try:
-            await asyncio.wait(
-                {task, cancelled},
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
+            turn, _receipt = await runner.acall(
+                request,
+                deadline=deadline,
+                delta_consumer=delta_consumer,
+                should_abort=should_abort,
             )
-            self._check_model_cancel_or_deadline(deadline)
-            if task.done():
-                outcome_consumed = True
-                return task.result()
-            if cancelled.done():
-                raise RunCancelled("run cancelled")
-            raise RunTimeout("run exceeded max duration")
-        finally:
-            remove_callback()
-            if not cancelled.done():
-                cancelled.cancel()
-            if not task.done():
-                await detach_unfinished_call(
-                    task, sync_call, grace_s=self.async_model_cancel_grace_s
-                )
-            elif not outcome_consumed:
-                consume_task_outcome(task)
-
-    async def _acall_model_streaming(
-        self,
-        astream_turn: Callable[[ModelRequest], Any],
-        request: ModelRequest,
-        sink: QueueEventSink,
-        deadline: float | None,
-    ) -> ModelTurn:
-        """Drive an adapter's ``astream_turn``: relay each chunk to the live stream and
-        accumulate them into the turn's ``ModelTurn`` (see ``assemble_streamed_turn``)."""
-        agen = astream_turn(request)
-
-        async def consume() -> ModelTurn:
-            chunks: list[ModelStreamChunk] = []
-            try:
-                async for chunk in agen:
-                    sink.push_delta(chunk)
-                    chunks.append(chunk)
-            finally:
-                # Provider async iterators own network resources. Cooperative cancellation enters
-                # their ``finally`` and then explicitly closes the iterator; stubborn cleanup is
-                # detached by ``_await_native_model_call`` after its bounded grace interval.
-                aclose = getattr(agen, "aclose", None)
-                if aclose is not None:
-                    await aclose()
-            return assemble_streamed_turn(chunks)
-
-        return await self._await_native_model_call(consume(), deadline)
-
-    async def _acall_model_emitting_deltas(
-        self,
-        astream_turn: Callable[[ModelRequest], Any],
-        request: ModelRequest,
-        deadline: float | None,
-    ) -> ModelTurn:
-        """Autonomous-drive streaming (no RunStream queue): drive ``astream_turn`` and emit each
-        text fragment as a ``model.output.delta`` event, so an event-stream consumer renders
-        tokens live. Tool-call/usage chunks are folded only — the assembled ``ModelTurn`` is
-        identical to the one-shot path, so the rest of the turn is unchanged."""
-        assert self._session is not None
-        recorder = self._session.res.recorder
-        agen = astream_turn(request)
-
-        async def consume() -> ModelTurn:
-            chunks: list[ModelStreamChunk] = []
-            try:
-                async for chunk in agen:
-                    chunks.append(chunk)
-                    if isinstance(chunk, TextDelta) and chunk.text:
-                        recorder.emit(
-                            "model.output.delta", data={"text": chunk.text}, level="debug"
-                        )
-                    elif isinstance(chunk, ReasoningDelta) and chunk.text:
-                        # Display-only reasoning summary (DX-13b): a separate event so a consumer
-                        # renders it in a "thinking" view, distinct from the answer text.
-                        recorder.emit(
-                            "model.reasoning.delta", data={"text": chunk.text}, level="debug"
-                        )
-                    # Immediate stop: when a turn interrupt arrives mid-stream, abort the in-flight
-                    # generation now (don't wait for the next step boundary). The text already
-                    # streamed stays; the except in arun_until_suspended parks the live session.
-                    if self._interrupt_requested:
-                        raise TurnInterrupted("turn interrupted")
-            finally:
-                # Close the generator so the provider's stream/connection is released promptly
-                # (on a normal drain this is a no-op; on a bounded abort it cancels the wire).
-                aclose = getattr(agen, "aclose", None)
-                if aclose is not None:
-                    await aclose()
-            return assemble_streamed_turn(chunks)
-
-        return await self._await_native_model_call(consume(), deadline)
+        except ModelCallAborted as exc:
+            raise TurnInterrupted("turn interrupted") from exc
+        return turn
 
     def _record_failure(
         self,
@@ -2976,7 +2852,7 @@ class AgentLoop:
                 }
             )
             try:
-                turn = await self._acall_model(request, deadline)
+                turn = await self._acall_model(request, deadline, res.model_runner)
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
@@ -4469,18 +4345,6 @@ class AgentLoop:
         # Run-level cancel (terminal) takes precedence over a turn-level interrupt (non-terminal).
         if self._interrupt_requested:
             raise TurnInterrupted("turn interrupted")
-
-    def _check_model_cancel_or_deadline(self, deadline: float | None) -> None:
-        """Check only terminal run boundaries while native model I/O is in flight.
-
-        Turn interrupt and pause keep their existing step-boundary behavior for non-streamed
-        adapters and are handled by ``_check_run_boundary`` after the model returns.
-        """
-
-        if self.cancellation_token is not None and self.cancellation_token.requested:
-            raise RunCancelled("run cancelled")
-        if deadline is not None and time.time() >= deadline:
-            raise RunTimeout("run exceeded max duration")
 
     def _emit_side_effect_event(
         self,
