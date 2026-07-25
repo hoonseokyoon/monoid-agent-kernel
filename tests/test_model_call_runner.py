@@ -23,7 +23,7 @@ from monoid_agent_kernel.errors import (
     RunCancelled,
     RunTimeout,
 )
-from monoid_agent_kernel.model_call import ModelCallRunner, _wire_value
+from monoid_agent_kernel.model_call import ModelCallRunner, _digest, _prompt_payload
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
@@ -443,19 +443,83 @@ def test_the_replay_key_distinguishes_tools_sharing_an_id() -> None:
     assert len(keys) == 3
 
 
-def test_a_tool_field_json_cannot_carry_does_not_break_the_replay_key() -> None:
-    """The tool payload is read off the dataclass, so a future non-JSON-able field would reach it.
+@pytest.mark.parametrize(
+    ("label", "request_"),
+    [
+        (
+            "mixed mapping keys in a tool field",
+            ModelRequest(
+                instruction="hi",
+                system_prompt="s",
+                tools=(
+                    ToolSpec(
+                        id="t",
+                        description="d",
+                        input_schema={"type": "object"},
+                        capability="read",
+                        side_effect="read",
+                        handler=lambda **kwargs: None,
+                        guidance={1: "x", "kind": "y"},
+                    ),
+                ),
+            ),
+        ),
+        (
+            "a value JSON has no form for, in messages",
+            ModelRequest(
+                instruction="hi", system_prompt="s", tools=(), messages=({"role": "user", "x": object()},)
+            ),
+        ),
+        (
+            "mixed keys nested deep in messages",
+            ModelRequest(
+                instruction="hi", system_prompt="s", tools=(), messages=({"deep": {"a": {2: "b"}}},)
+            ),
+        ),
+    ],
+)
+def test_a_payload_the_serializer_cannot_carry_does_not_kill_the_call(
+    label: str, request_: ModelRequest
+) -> None:
+    """A digest is bookkeeping about a call, never a precondition for making one.
 
-    Hashing must degrade to a stable string rather than raise: failing a model call because a tool
-    definition grew an exotic field would be a poor trade for a digest.
+    Digests are computed before the adapter is reached, so a value the canonical serializer chokes
+    on stopped the call from happening at all. `{1: "x", "kind": "y"}` is the sharp case: plain
+    `json.dumps` accepts it, but canonical JSON sorts keys and sorting `int` against `str` raises.
+
+    Parametrized across all three payload sources on purpose. The first guard covered only tool
+    fields and left `messages` and `observations` — both caller-filled — able to kill a call.
     """
+    del label
 
-    class Exotic:
-        def __repr__(self) -> str:
-            return "<exotic>"
+    class Adapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
 
-    assert _wire_value(Exotic()) == "<exotic>"
-    assert _wire_value({"ok": 1}) == {"ok": 1}
+    async def run() -> Any:
+        turn, receipt = await ModelCallRunner(adapter=Adapter()).acall(request_)
+        return turn, receipt
+
+    turn, receipt = asyncio.run(run())
+    assert turn.final_text == "answer"
+    assert receipt.request_digest != ""
+
+
+def test_a_cyclic_payload_terminates_instead_of_exhausting_the_stack() -> None:
+    cyclic: dict[str, Any] = {}
+    cyclic["self"] = cyclic
+
+    assert _digest({"value": cyclic}) != ""
+
+
+def test_normalization_does_not_disturb_an_ordinary_digest() -> None:
+    """Counterweight: a normalizer that flattened everything would pass the tests above."""
+    first = ModelRequest(instruction="hi", system_prompt="s", tools=())
+    second = ModelRequest(instruction="bye", system_prompt="s", tools=())
+
+    assert _digest(_prompt_payload(first)) == _digest(_prompt_payload(first))
+    assert _digest(_prompt_payload(first)) != _digest(_prompt_payload(second))
 
 
 def test_the_prompt_digest_distinguishes_by_reference_continuations() -> None:

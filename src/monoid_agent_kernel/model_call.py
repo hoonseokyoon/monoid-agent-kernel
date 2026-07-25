@@ -23,7 +23,6 @@ inherits classification without inheriting a retry loop.
 from __future__ import annotations
 
 import inspect
-import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
@@ -87,14 +86,46 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
     }
 
 
-def _wire_value(value: Any) -> Any:
-    """`value` if JSON can carry it, else a stable string form, so hashing never raises."""
+_MAX_DIGEST_DEPTH = 32
 
-    try:
-        json.dumps(value)
-    except TypeError:
-        return repr(value)
-    return value
+
+def _canonical_ready(value: Any, depth: int = 0) -> Any:
+    """`value` reshaped so the canonical serializer can always carry it.
+
+    Digests are computed on every call, *before* the adapter is reached, so a value the serializer
+    chokes on stops the call from happening at all. A digest must never be able to do that: it is
+    bookkeeping about a call, not a precondition for making one.
+
+    Applied to the whole payload rather than to selected fields. The first attempt guarded only the
+    tool definitions, which left `messages` and `observations` -- both `dict[str, Any]` a caller
+    fills -- able to kill a call outright. Guarding at the one place every digest passes through is
+    what makes the property universal instead of true of the fields somebody remembered.
+
+    Mapping keys are stringified because canonical JSON sorts them, and sorting mixed key types
+    raises. Depth is bounded so a cyclic or pathologically nested payload terminates rather than
+    exhausting the stack.
+
+    Anything JSON has no form for degrades to `repr`, which for a default `__repr__` embeds an
+    address and so digests differently each run. That is the deliberate direction: an unstable
+    replay key always misses and costs a re-run, while a stable-but-lossy one -- hashing the type
+    name, say -- would let two unrelated objects claim the same call.
+    """
+
+    if depth > _MAX_DIGEST_DEPTH:
+        return "<max-depth>"
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _canonical_ready(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_ready(item, depth + 1) for item in value]
+    return repr(value)
+
+
+def _digest(payload: dict[str, Any]) -> str:
+    """The one place a model-call digest is taken, so normalization cannot be skipped at one."""
+
+    return canonical_sha256(_canonical_ready(payload))
 
 
 def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
@@ -111,7 +142,7 @@ def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
     """
 
     return {
-        field_.name: _wire_value(getattr(spec, field_.name))
+        field_.name: getattr(spec, field_.name)
         for field_ in fields(spec)
         if not callable(getattr(spec, field_.name))
     }
@@ -275,8 +306,8 @@ class ModelCallRunner:
             context=context if context is not None else InvocationContext(),
             model=model,
             provider_name=str(getattr(self.adapter, "provider_name", "") or ""),
-            prompt_digest=canonical_sha256(_prompt_payload(request)),
-            request_digest=canonical_sha256(_request_payload(request, model)),
+            prompt_digest=_digest(_prompt_payload(request)),
+            request_digest=_digest(_request_payload(request, model)),
         )
         try:
             turn = await self._adrive(request, deadline, should_abort, delta_consumer)
