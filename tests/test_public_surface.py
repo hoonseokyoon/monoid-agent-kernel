@@ -84,6 +84,7 @@ EXPECTED_CONTRACTS_ALL = [
     "ModelIOObserver",
     "ClosableModelIOObserver",
     "ModelIOSubscription",
+    "ModelCallRunner",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

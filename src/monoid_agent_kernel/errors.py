@@ -100,6 +100,19 @@ class TurnPaused(NativeAgentError):
     error_code = "paused"
 
 
+class ModelCallAborted(NativeAgentError):
+    """Raised when a caller's ``should_abort`` predicate stops an in-flight model call.
+
+    Distinct from :class:`TurnInterrupted` because the model-call runner is reusable and knows
+    nothing about turns: a gateway or a batch driver aborting a stream is not interrupting a
+    conversational turn. :class:`~monoid_agent_kernel.loop.AgentLoop` translates this into
+    ``TurnInterrupted`` at its own boundary, which is what keeps the session non-terminal — left
+    untranslated it would reach the loop's generic failure handler and terminalize the run.
+    """
+
+    error_code = "model_call_aborted"
+
+
 def error_code_for_exception(exc: Exception) -> str:
     code = getattr(exc, "error_code", None)
     return str(code) if code else "internal_error"

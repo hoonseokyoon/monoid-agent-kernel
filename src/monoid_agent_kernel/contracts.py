@@ -111,6 +111,10 @@ from monoid_agent_kernel.core.model_io import (
     Redactor,
 )
 
+# Model call execution (adapter dispatch + cancel/deadline race + capture). Above ``core`` because
+# it names the provider vocabulary it drives; see the module docstring.
+from monoid_agent_kernel.model_call import ModelCallRunner
+
 # Output validation (post-response conformance; checked at the settle points)
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
@@ -322,6 +326,7 @@ __all__ = [
     "ModelIOObserver",
     "ClosableModelIOObserver",
     "ModelIOSubscription",
+    "ModelCallRunner",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

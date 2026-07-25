@@ -9,6 +9,17 @@ out in commit messages and here.
 
 ### Added
 
+- Added `ModelCallRunner`, which executes one model call against any adapter shape — a blocking
+  `next_turn`, a coroutine `next_turn`, `anext_turn`, or a streamed `astream_turn` — through a single
+  cancel/deadline race, and returns the turn with a `ModelCallReceipt` describing it. Which shape is
+  used is a function of the call's own arguments, so the runner is usable outside a run: a gateway or
+  a batch driver gets deadline and cancellation semantics that previously existed only inside
+  `AgentLoop`. Capture is opt-in through `subscriptions`; a runner wired to no observer does no
+  digesting. It lives at the package root rather than under `core/` because it names the provider
+  vocabulary it drives, and `core` does not import `providers`.
+- Added `ModelCallAborted`, raised when a caller's `should_abort` predicate stops an in-flight
+  streamed call. Distinct from `TurnInterrupted` because the runner knows nothing about turns;
+  `AgentLoop` translates it at its own boundary.
 - Added `MultimodalModelAdapter` and `ProviderNamedModelAdapter`, opt-in protocols that declare the
   optional capability attributes the loop probes with `getattr` (`supports_multimodal` and
   `provider_name`). Implementing them is never required; they exist so the attribute names and
