@@ -398,7 +398,10 @@ class AgentToolContext(ToolContext):
     # keeps each call's authorization valid for that call's whole lifetime.
     _call_var: ContextVar[CallContext] = field(
         default_factory=lambda: ContextVar(
-            "monoid_current_tool_call", default=CallContext("", None, None)
+            # noqa is for ruff's B039, which reads any constructor call as a mutable default.
+            # ``CallContext`` is a frozen dataclass, so this default cannot be mutated in place.
+            "monoid_current_tool_call",
+            default=CallContext("", None, None),  # noqa: B039
         ),
         repr=False,
         compare=False,

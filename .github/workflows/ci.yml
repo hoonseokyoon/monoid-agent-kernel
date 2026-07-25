@@ -36,7 +36,11 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install lint tooling
-        run: python -m pip install ruff
+        # Pinned deliberately. Unpinned, this job lints every branch with whatever ruff released
+        # most recently: 0.16.0 expanded the default rule set and turned every green branch red
+        # overnight (532 findings repo-wide, none of them regressions). Bump this pin in a commit
+        # that also fixes the new findings, so the migration is reviewable on its own.
+        run: python -m pip install ruff==0.15.6
       - name: Lint
         run: ruff check src tests
 
