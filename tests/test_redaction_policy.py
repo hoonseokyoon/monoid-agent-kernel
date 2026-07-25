@@ -76,6 +76,31 @@ def test_a_programmatic_rule_is_normalized_too() -> None:
     }
 
 
+def test_a_hyphenated_rule_matches_the_keys_it_was_written_for() -> None:
+    """The same bug as case-folding, one transformation short — and it matched *nothing*.
+
+    `names_a_secret` folds the candidate's hyphens to underscores, so a rule that kept its hyphens
+    could never meet one: `("api-key",)` failed against `x-api-key` and against the literal `api-key`
+    too, since the candidate had already become `api_key`. Both sides now fold through `_folded_key`.
+    """
+    policy = RedactionPolicy(secret_key_parts=("api-key", "X-Trace-Secret"))
+
+    assert policy.secret_key_parts == ("api_key", "x_trace_secret")
+    for key in ("api-key", "x-api-key", "api_key", "API-KEY", "x_trace_secret"):
+        assert policy.names_a_secret(key) is True, key
+    assert DefaultRedactor().redact({"x-api-key": "sk-leaks"}, policy=policy) == {
+        "x-api-key": REDACTION_PLACEHOLDER
+    }
+
+
+def test_a_rule_built_in_code_and_one_loaded_from_json_normalize_identically() -> None:
+    """The two paths drifting is what let this ship twice, so pin the parity rather than each side."""
+    assert (
+        RedactionPolicy(secret_key_parts=("API-KEY",)).secret_key_parts
+        == RedactionPolicy.from_json({"secret_key_parts": ["API-KEY"]}).secret_key_parts
+    )
+
+
 def test_merged_normalizes_the_rules_it_adds() -> None:
     widened = RedactionPolicy(secret_key_parts=()).merged(secret_key_parts=("Nonce", "NONCE"))
 
@@ -105,6 +130,24 @@ def test_two_policies_differing_only_in_rule_case_are_equal_and_digest_alike() -
 )
 def test_from_json_rejects_malformed_rule_lists(payload: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
+        RedactionPolicy.from_json(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"patterns": [None]},
+        {"patterns": [123]},
+        {"literals": [None]},
+        {"secret_key_parts": [None]},
+        {"secret_key_parts": [{"key": "api_key"}]},
+    ],
+)
+def test_from_json_rejects_a_non_string_rule_element(payload: dict[str, Any]) -> None:
+    """`str_tuple` coerced with `str()`, so `[None]` became the pattern `"None"` — a rule matching the
+    literal text "None" and nothing an operator intended, accepted while captures stayed labelled
+    `redacted`. For a security policy a malformed rule has to be a load error."""
+    with pytest.raises(WireValidationError, match="must be an array of strings"):
         RedactionPolicy.from_json(payload)
 
 

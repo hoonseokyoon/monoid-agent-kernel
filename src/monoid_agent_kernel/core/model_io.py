@@ -29,7 +29,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import TypeAdapter, ValidationError
 
-from monoid_agent_kernel._policy_util import dedupe, str_tuple
+from monoid_agent_kernel._policy_util import dedupe
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -66,6 +66,40 @@ CAPTURE_MODES: tuple[CaptureMode, ...] = ("none", "digest", "redacted", "full")
 @lru_cache(maxsize=512)
 def _compiled(pattern: str) -> re.Pattern[str]:
     return re.compile(pattern)
+
+
+def _folded_key(text: str) -> str:
+    """The form secret-key matching happens in: stripped, lowercased, hyphens as underscores.
+
+    One function, used for both the *rule* and the *candidate*. Keeping two copies of "how a key is
+    normalized" is what produced this bug twice: first the rule was not lowercased, so `("API_KEY",)`
+    matched nothing; then the rule kept its hyphens, so `("api-key",)` matched nothing — including the
+    literal key `api-key`, since the candidate had already become `api_key`. Both sides now fold here or
+    neither does.
+    """
+    return text.strip().lower().replace("-", "_")
+
+
+def _string_rules(payload: Mapping[str, Any], key: str, *, reject_blank: bool) -> tuple[str, ...]:
+    """A validated tuple of rule strings: absent or null give `()`, anything malformed raises.
+
+    Element-wise, not just container-wise. `_policy_util.str_tuple` coerces with `str()`, so
+    `{"patterns": [None]}` became the pattern `"None"` — a rule that matches the literal text "None" and
+    nothing an operator intended — and the policy was accepted while captures went on being labelled
+    `redacted`. For a security policy, a malformed rule has to be a load error, not a rule that silently
+    does something else.
+    """
+    value = _absent_as_empty(payload, key)
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise WireValidationError(f"{key} must be an array of strings")
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise WireValidationError(f"{key} must be an array of strings")
+        if reject_blank and not item.strip():
+            raise WireValidationError(f"empty {key} entry is not allowed")
+        items.append(item)
+    return tuple(items)
 
 
 def _absent_as_empty(payload: Mapping[str, Any], key: str) -> Any:
@@ -176,7 +210,7 @@ class RedactionPolicy:
         object.__setattr__(
             self,
             "secret_key_parts",
-            dedupe(part.strip().lower() for part in self.secret_key_parts if part.strip()),
+            dedupe(_folded_key(part) for part in self.secret_key_parts if part.strip()),
         )
 
     @classmethod
@@ -184,28 +218,17 @@ class RedactionPolicy:
         if payload is None:
             return cls()
         payload = require_object(payload, "redaction_policy")
-        raw_parts = payload.get("secret_key_parts")
         secret_key_parts = (
             DEFAULT_SECRET_KEY_PARTS
-            if raw_parts is None
-            else str_tuple(
-                raw_parts,
-                type_error="secret_key_parts must be an array of strings",
-                normalize=True,
-            )
+            if payload.get("secret_key_parts") is None
+            else _string_rules(payload, "secret_key_parts", reject_blank=False)
         )
         return cls(
-            secret_key_parts=dedupe(secret_key_parts),
-            patterns=str_tuple(
-                _absent_as_empty(payload, "patterns"),
-                type_error="patterns must be an array of strings",
-                empty_error="empty redaction pattern is not allowed",
-            ),
-            literals=str_tuple(
-                _absent_as_empty(payload, "literals"),
-                type_error="literals must be an array of strings",
-                empty_error="empty redaction literal is not allowed",
-            ),
+            # Folding and de-duplication happen in ``__post_init__``, so a policy built in code gets
+            # exactly what a policy loaded from JSON gets.
+            secret_key_parts=secret_key_parts,
+            patterns=_string_rules(payload, "patterns", reject_blank=True),
+            literals=_string_rules(payload, "literals", reject_blank=True),
             replacement=parse_str(payload, "replacement", default=REDACTION_PLACEHOLDER),
         )
 
@@ -242,9 +265,13 @@ class RedactionPolicy:
         return canonical_sha256(self.to_json())
 
     def names_a_secret(self, key: str) -> bool:
-        """Whether `key` names a secret under this policy."""
-        lowered = key.lower().replace("-", "_")
-        return any(part in lowered for part in self.secret_key_parts)
+        """Whether `key` names a secret under this policy.
+
+        Folds the candidate through `_folded_key`, the same function `__post_init__` folds the rules
+        through — the two must agree, and they have twice not.
+        """
+        folded = _folded_key(key)
+        return any(part in folded for part in self.secret_key_parts)
 
     def redact_text(self, text: str) -> str:
         """Apply `literals` then `patterns` to free text.
