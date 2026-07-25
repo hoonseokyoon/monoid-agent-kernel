@@ -374,10 +374,19 @@ and idempotency policy, because the kernel can stop waiting for a handler it can
 A handler's call authorization follows the handler, including into threads it starts itself: a
 `ToolContext` operation delegated to a joined child thread is checked against the same binding scope
 as the parent. It also stays valid for a handler the run has abandoned, so a detached handler keeps
-its own scope rather than picking up whichever call the run moved on to. One case is not covered: a
-thread descended from an *abandoned* handler reads the run's current call instead of its own, because
-nothing links a thread to its creator. Handlers that outlive their run and fan out to further threads
-should re-check their own authorization rather than relying on `ToolContext` to narrow for them.
+its own scope rather than picking up whichever call the run moved on to.
+
+Outside a tool call there is no binding whose scope could authorize anything, so scoped `ToolContext`
+operations — path checks, shell execution, web access — **refuse** rather than fall back to the
+run-level permission policy. Every scope check narrows only under a non-empty allow/deny list, so
+treating "no call" as an empty scope would grant the widest authorization in the run at the moment it
+is least warranted. This is what bounds a thread descended from an *abandoned* handler: once the run
+gives up on the parent, the thread is refused. One narrower case remains: while some *other* call is
+live, such a thread reads that call's authorization instead of its own, because nothing links a
+thread to its creator — Python exposes no parent edges — so it cannot be told apart from the live
+call's own child thread. It borrows a scope rather than escaping scoping. Handlers that outlive their
+run and fan out to further threads should re-check their own authorization rather than relying on
+`ToolContext` to narrow for them.
 
 `ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
 errors become failed tool observations. A handler-local `CancelledError` maps to

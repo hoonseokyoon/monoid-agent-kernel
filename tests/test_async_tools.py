@@ -561,6 +561,77 @@ def test_sync_tool_child_thread_keeps_the_call_authorization(tmp_path: Path) -> 
     assert seen == [False]
 
 
+def test_child_thread_of_an_abandoned_handler_is_refused_not_widened(tmp_path: Path) -> None:
+    """Once the run has given up on a handler, its descendant threads lose authorization.
+
+    The fallback that carries a call's scope into a handler-spawned thread is a single shared slot,
+    and a descendant thread cannot be told apart from the live call's own child -- Python exposes no
+    thread-to-creator link. So the fallback is cleared when the call ends, and an absent call now
+    *refuses* scoped operations. Returning an empty ``CallContext`` there would read as "this call
+    narrows nothing", handing the descendant the full run-level permission policy: a strictly wider
+    authorization than its parent ever held.
+    """
+    seen: list[bool] = []
+    child_started = threading.Event()
+    release_child = threading.Event()
+    child_finished = threading.Event()
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+
+                def in_child_thread() -> None:
+                    child_started.set()
+                    release_child.wait(timeout=10)
+                    # Allowed by the run-level permission policy, denied by the binding's scope --
+                    # so ``True`` here would mean the scope check was skipped entirely.
+                    seen.append(ctx.path_allowed("secrets/key.txt", "read"))
+                    child_finished.set()
+
+                threading.Thread(target=in_child_thread, daemon=True).start()
+                child_started.wait(timeout=10)
+                # Outlive the deadline and the grace, so the run abandons this worker.
+                threading.Event().wait(timeout=10)
+                return ToolResult(ok=True, content={})  # pragma: no cover - never reached
+
+            return [
+                ToolSpec(
+                    id="sync.abandoned_parent",
+                    description="sync tool abandoned while a child thread is still parked",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="read",
+                    handler=handler,
+                )
+            ]
+
+    result = asyncio.run(
+        AgentLoop(
+            spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+            model_adapter=FakeModelAdapter(
+                turns=[ModelTurn(tool_calls=(fake_tool_call("sync_abandoned_parent", {}, "c1"),))]
+            ),
+            runtime_config_provider=runtime_provider(
+                runtime_config(
+                    bindings=(
+                        tool_binding("sync.abandoned_parent", scope=ToolScope(allowed_paths=("notes/*",))),
+                    )
+                )
+            ),
+            tool_providers=(Provider(),),
+            async_tool_cancel_grace_s=0.05,
+        ).arun_once("go")
+    )
+
+    assert result.error_code == "run_timeout"
+    release_child.set()
+    assert child_finished.wait(timeout=10) is True
+    assert seen == [False]
+
+
 def _late_awaitable_provider(
     workers: list[threading.Thread], returned: list[object]
 ) -> type:

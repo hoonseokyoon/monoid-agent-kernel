@@ -447,10 +447,11 @@ class AgentToolContext(ToolContext):
     # that call's whole lifetime. ``ContextVar`` values do not reach a thread the handler starts
     # itself, though, which is what ``_call_fallback`` covers.
     #
-    # Residual, and narrow: a thread descended from an *abandoned* handler reads the fallback, which
-    # by then holds whatever call the run moved on to (or no call, once the run is over). Bounding
-    # that needs an empty scope to mean "deny" rather than "no narrowing", which is a run-wide
-    # decision about non-tool callers too, not one to make from inside this accessor.
+    # Residual, and narrower than fail-open: a thread descended from an *abandoned* handler whose run
+    # has already moved on to another call reads that other call's authorization from the fallback.
+    # It borrows a scope it was not granted rather than widening to the run policy. Closing even that
+    # needs a thread-to-creator link, which Python does not expose -- ``threading.enumerate()`` has no
+    # parent edges -- so a descendant thread is indistinguishable from the live call's own child.
     _call_var: ContextVar[CallContext | None] = field(
         default_factory=lambda: ContextVar("monoid_current_tool_call", default=None),
         repr=False,
@@ -463,22 +464,51 @@ class AgentToolContext(ToolContext):
     # to the run-level permission policy while the parent handler is still under a restricted
     # authorization. This attribute is deliberately *not* authoritative: the ContextVar wins wherever
     # it is set, which is what keeps an abandoned worker on its own authorization after the run has
-    # moved on to another call.
-    _call_fallback: CallContext = field(
-        default_factory=lambda: CallContext("", None, None),
-        repr=False,
-        compare=False,
-    )
+    # moved on to another call. ``None`` means no call is in flight *on this thread's tier*, which is
+    # a refusal for authorization-bearing operations rather than an unrestricted scope.
+    _call_fallback: CallContext | None = field(default=None, repr=False, compare=False)
 
-    @property
-    def _current_call(self) -> CallContext:
+    def _live_call(self) -> CallContext | None:
         call = self._call_var.get()
         return self._call_fallback if call is None else call
 
-    @_current_call.setter
-    def _current_call(self, call: CallContext) -> None:
+    def _enter_call(self, call: CallContext) -> None:
         self._call_var.set(call)
         self._call_fallback = call
+
+    def _exit_call(self) -> None:
+        self._call_var.set(None)
+        self._call_fallback = None
+
+    @property
+    def _current_call(self) -> CallContext:
+        """The call an operation is *correlated* with, or an empty context outside any call.
+
+        Read only by operations that want the call's identifiers -- turn id, tool event id -- to
+        parent an event or tag a job. Authorization-bearing operations must read
+        ``_authorized_call`` instead: every scope check in this codebase narrows only under a
+        non-empty tuple (``path_allowed`` below, ``shell.py:232`` on command prefixes, ``web.py:102``
+        on domains), so handing them an empty ``CallContext`` widens authorization to the run-level
+        permission policy instead of denying.
+        """
+        call = self._live_call()
+        return CallContext("", None, None) if call is None else call
+
+    @property
+    def _authorized_call(self) -> CallContext:
+        """The call an authorization-bearing operation is acting for; refuses when there is none.
+
+        Outside a live tool call there is no binding whose scope could authorize the operation, so
+        the only safe answer is to refuse. Returning an empty ``CallContext`` here would read as
+        "this call narrows nothing" and grant the full run-level policy.
+        """
+        call = self._live_call()
+        if call is None:
+            raise ToolExecutionError(
+                "no tool call is in flight; scoped operations are refused",
+                error_code="tool_call_not_in_flight",
+            )
+        return call
 
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
@@ -525,13 +555,13 @@ class AgentToolContext(ToolContext):
             rel = self.workspace.normalize(path)
             permission_operation = operation if operation in {"read", "write", "artifact", "run"} else "read"
             self.permission_policy.check_paths(permission_operation, (rel,))  # type: ignore[arg-type]
-            scope = self._current_call.scope
+            scope = self._authorized_call.scope
             if scope.allowed_paths and not matches_path_patterns(rel, scope.allowed_paths):
                 return False
             if scope.denied_paths and matches_path_patterns(rel, scope.denied_paths):
                 return False
             return True
-        except (PermissionDenied, WorkspaceError, ValueError):
+        except (PermissionDenied, WorkspaceError, ValueError, ToolExecutionError):
             return False
 
     def update_plan(self, items: list[dict[str, Any]]) -> None:
@@ -542,7 +572,7 @@ class AgentToolContext(ToolContext):
         self.pending_finish = FinishResult(summary, tuple(outputs), notes)
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.shell_service.execute(args, self._current_call)
+        return self.shell_service.execute(args, self._authorized_call)
 
     def run_script(self, args: dict[str, Any]) -> dict[str, Any]:
         """Run a pre-resolved ``argv`` (skill.run_script) through the shell machinery —
@@ -551,7 +581,7 @@ class AgentToolContext(ToolContext):
         carries ``argv`` (the real command) plus a ``command`` label for the preview."""
         argv = [str(part) for part in args.get("argv") or ()]
         rest = {key: value for key, value in args.items() if key != "argv"}
-        return self.shell_service.execute(rest, self._current_call, argv_override=argv)
+        return self.shell_service.execute(rest, self._authorized_call, argv_override=argv)
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self.jobs_service.list_jobs()
@@ -623,13 +653,15 @@ class AgentToolContext(ToolContext):
         )
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.search(args, self._current_call, capability_token=self.capability_token("web.search"))
+        return self.web_service.search(args, self._authorized_call, capability_token=self.capability_token("web.search"))
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.fetch(args, self._current_call, capability_token=self.capability_token("web.fetch"))
+        return self.web_service.fetch(args, self._authorized_call, capability_token=self.capability_token("web.fetch"))
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.context(args, self._current_call, capability_token=self.capability_token("web.context"))
+        return self.web_service.context(
+            args, self._authorized_call, capability_token=self.capability_token("web.context")
+        )
 
     def configure_tool_search(self, entries: tuple[ToolSearchEntry, ...], max_results: int) -> None:
         self.tool_search_entries = entries
@@ -3871,16 +3903,18 @@ class AgentLoop:
         deadline: float | None,
     ) -> ToolResult:
         spec = bound_tool.base_spec
-        context._current_call = CallContext(
-            tool_call_id=call_id,
-            turn_id=turn_id,
-            tool_event_id=started_event.event_id,
-            binding_id=bound_tool.binding_id,
-            tool_id=bound_tool.base_spec.id,
-            model_name=bound_tool.model_name,
-            authorization=authorization,
-            scope=authorization.scope,
-            runtime=bound_tool.runtime,
+        context._enter_call(
+            CallContext(
+                tool_call_id=call_id,
+                turn_id=turn_id,
+                tool_event_id=started_event.event_id,
+                binding_id=bound_tool.binding_id,
+                tool_id=bound_tool.base_spec.id,
+                model_name=bound_tool.model_name,
+                authorization=authorization,
+                scope=authorization.scope,
+                runtime=bound_tool.runtime,
+            )
         )
         try:
             handler = spec.handler
@@ -3903,7 +3937,7 @@ class AgentLoop:
             if not isinstance(result, ToolResult):
                 raise TypeError("tool handler must return ToolResult")
         finally:
-            context._current_call = CallContext("", None, None)
+            context._exit_call()
         return result
 
     async def _await_native_tool_handler(

@@ -23,9 +23,14 @@ out in commit messages and here.
   scope as its parent, instead of seeing no call at all and widening to the run-level permission
   policy — an authorization bypass for threaded handlers. The per-call isolation that keeps an
   abandoned handler on its own scope is unchanged; the two are resolved from separate tiers because
-  neither alone is correct. Still uncovered, and documented in `docs/CONTRACTS.md`: a thread
-  descended from an *abandoned* handler reads the run's current call, since nothing links a thread
-  to its creator.
+  neither alone is correct.
+- Scoped `ToolContext` operations — `path_allowed`, shell execution, web search/fetch/context — now
+  refuse when no tool call is in flight, instead of applying the run-level permission policy
+  unnarrowed. Every scope check narrows only under a non-empty allow/deny list, so an absent call
+  read as an empty scope granted the widest authorization in the run. This bounds a thread descended
+  from a handler the run has abandoned: it is refused once the parent's call ends. The narrower
+  remaining case is documented in `docs/CONTRACTS.md` — while another call is live, such a thread
+  borrows that call's scope, because nothing links a thread to its creator.
 - `ModelAdapter` and `AsyncModelAdapter` no longer declare optional capability attributes, which had
   made them **required** members for structural typing and rejected a third-party adapter that
   implements only `next_turn` — the default assigned in a protocol body reaches explicitly
