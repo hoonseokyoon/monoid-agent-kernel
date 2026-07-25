@@ -102,6 +102,7 @@ from monoid_agent_kernel.core.model_io import (
     DEFAULT_SECRET_KEY_PARTS,
     CapturePolicy,
     DefaultRedactor,
+    ModelCallReceipt,
     RedactionPolicy,
     Redactor,
 )
@@ -312,6 +313,7 @@ __all__ = [
     "Redactor",
     "DefaultRedactor",
     "DEFAULT_SECRET_KEY_PARTS",
+    "ModelCallReceipt",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

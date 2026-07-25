@@ -22,14 +22,18 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from monoid_agent_kernel._policy_util import dedupe, str_tuple
 from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.wire_validation import (
     WireValidationError,
+    parse_bool,
+    parse_int,
     parse_literal,
     parse_str,
     require_object,
@@ -320,3 +324,134 @@ class CapturePolicy:
             # round-trip cannot quietly turn custom redaction into the default.
             "redactor": "custom" if self.redactor is not None else None,
         }
+
+
+@dataclass(frozen=True)
+class ModelCallReceipt:
+    """What happened on one model call, without any of what was said.
+
+    The receipt is metadata only: digests, counts, timings, taxonomy. That is what makes it safe to
+    hand to every consumer regardless of its `CapturePolicy` — a `none`-mode observer still gets a
+    full receipt, because nothing in here discloses content. Content travels separately, gated by the
+    policy.
+
+    Two digests, because they answer different questions. `prompt_digest` covers the assembled prompt
+    and stays stable when tool definitions or generation settings change around it, which is what you
+    want when asking "did the model see the same thing twice". `request_digest` covers the whole
+    request and is the exact replay key. Both are computed on the raw request, *before* redaction, so
+    they identify what actually went to the provider and stay comparable across policy changes.
+
+    `attempts` and `provider_retried` are not the same fact and neither implies the other.
+    `attempts` counts the calls the kernel made to the adapter. `provider_retried` is the adapter
+    reporting that *it* retried internally — a gateway can retry three times inside one call the
+    kernel counts as one attempt, and a receipt that only had `attempts` would show that as a clean
+    single call.
+
+    `stop_reason` is a plain string rather than the provider `Literal`. A receipt is an audit record:
+    a provider that starts returning a fifth stop reason must be recordable without a kernel change,
+    and `core` cannot depend on `providers` in any case.
+    """
+
+    context: InvocationContext = field(default_factory=lambda: InvocationContext())
+    model: ModelConfig = field(default_factory=lambda: ModelConfig())
+    provider_name: str = ""
+    prompt_digest: str = ""
+    request_digest: str = ""
+    stop_reason: str = ""
+    usage: Mapping[str, int] = field(default_factory=dict)
+    latency_ms: int = 0
+    attempts: int = 1
+    provider_retried: bool = False
+    error_code: str = ""
+    provider_error_code: str = ""
+    retryable: bool = False
+    http_status: int | None = None
+    redaction_digest: str = ""
+    capture_downgrades: int = 0
+
+    def __post_init__(self) -> None:
+        if self.attempts < 1:
+            raise ValueError("model call attempts must be 1 or greater")
+        if self.latency_ms < 0:
+            raise ValueError("model call latency_ms must not be negative")
+        if self.capture_downgrades < 0:
+            raise ValueError("model call capture_downgrades must not be negative")
+        for key, value in self.usage.items():
+            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int):
+                raise WireValidationError("model call usage must be a mapping of str to int")
+        object.__setattr__(self, "usage", dict(self.usage))
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether the call produced a turn. A failed call still gets a receipt."""
+        return self.error_code == ""
+
+    @property
+    def trace_id(self) -> str:
+        return self.context.trace_id
+
+    @property
+    def span_id(self) -> str:
+        return self.context.span_id
+
+    def with_error(self, exc: BaseException) -> ModelCallReceipt:
+        """This receipt marked failed, carrying whatever taxonomy the exception exposes.
+
+        `ModelAdapterError` classifies itself — provider code, retryability, HTTP status — and the
+        providers already raise it, so the runner does not re-derive any of that. Anything else is
+        recorded by its type name rather than its message: an arbitrary exception's message can carry
+        request content, and the whole point of the receipt is that it holds none.
+        """
+        error_code = getattr(exc, "error_code", "") or type(exc).__name__
+        return replace(
+            self,
+            error_code=str(error_code),
+            provider_error_code=str(getattr(exc, "provider_error_code", "") or ""),
+            retryable=bool(getattr(exc, "retryable", False)),
+            http_status=getattr(exc, "http_status", None),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "context": self.context.to_json(),
+            "model": self.model.to_json(),
+            "provider_name": self.provider_name,
+            "prompt_digest": self.prompt_digest,
+            "request_digest": self.request_digest,
+            "stop_reason": self.stop_reason,
+            "usage": dict(self.usage),
+            "latency_ms": self.latency_ms,
+            "attempts": self.attempts,
+            "provider_retried": self.provider_retried,
+            "error_code": self.error_code,
+            "provider_error_code": self.provider_error_code,
+            "retryable": self.retryable,
+            "http_status": self.http_status,
+            "redaction_digest": self.redaction_digest,
+            "capture_downgrades": self.capture_downgrades,
+        }
+
+    @classmethod
+    def from_json(cls, payload: Any) -> ModelCallReceipt:
+        payload = require_object(payload, "model_call_receipt")
+        raw_usage = payload.get("usage")
+        usage = require_object(raw_usage, "usage") if raw_usage is not None else {}
+        raw_status = payload.get("http_status")
+        return cls(
+            context=InvocationContext.from_json(payload.get("context") or {}),
+            model=ModelConfig.from_json(payload.get("model")),
+            provider_name=parse_str(payload, "provider_name"),
+            prompt_digest=parse_str(payload, "prompt_digest"),
+            request_digest=parse_str(payload, "request_digest"),
+            stop_reason=parse_str(payload, "stop_reason"),
+            usage=usage,
+            latency_ms=parse_int(payload, "latency_ms"),
+            attempts=parse_int(payload, "attempts", default=1),
+            provider_retried=parse_bool(payload, "provider_retried"),
+            error_code=parse_str(payload, "error_code"),
+            provider_error_code=parse_str(payload, "provider_error_code"),
+            retryable=parse_bool(payload, "retryable"),
+            http_status=None if raw_status is None else parse_int(payload, "http_status"),
+            redaction_digest=parse_str(payload, "redaction_digest"),
+            capture_downgrades=parse_int(payload, "capture_downgrades"),
+        )

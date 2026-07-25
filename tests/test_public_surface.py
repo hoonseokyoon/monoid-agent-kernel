@@ -79,6 +79,7 @@ EXPECTED_CONTRACTS_ALL = [
     "Redactor",
     "DefaultRedactor",
     "DEFAULT_SECRET_KEY_PARTS",
+    "ModelCallReceipt",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",
