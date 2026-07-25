@@ -8,6 +8,7 @@ import json
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextvars import ContextVar, copy_context
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any, TypeVar
 
@@ -223,16 +224,29 @@ def _start_abandonable_sync_call(
     loop = asyncio.get_running_loop()
     future: asyncio.Future[_T] = loop.create_future()
     outcome: list[tuple[bool, Any]] = []
+    # Match ``asyncio.to_thread``, which runs its target in a copy of the caller's context. Without
+    # this the worker would start with an empty context, so a sync adapter or handler reading
+    # credentials, tenant identity, or tracing state from a ``ContextVar`` would see defaults. The
+    # copy is also what keeps an abandoned worker's tool-call authorization alive: it is taken after
+    # the call's ``CallContext`` is set, and the caller's later reset cannot reach into it.
+    caller_context = copy_context()
+
+    def discard_late_awaitable() -> None:
+        """Close an awaitable that arrived after the run gave up on the call.
+
+        A sync tool handler may return one. Nothing downstream will await this one, so closing it
+        here runs its cleanup and keeps it from surfacing as an unawaited-coroutine warning.
+        """
+
+        succeeded, payload = outcome[0]
+        if succeeded and inspect.iscoroutine(payload):
+            payload.close()
 
     def deliver() -> None:
-        succeeded, payload = outcome[0]
         if future.done():
-            if succeeded and inspect.iscoroutine(payload):
-                # A sync tool handler may return an awaitable. This one arrived after the run
-                # abandoned the call, so nothing will ever await it: close it here rather than
-                # let it surface as an unawaited-coroutine warning at collection.
-                payload.close()
+            discard_late_awaitable()
             return
+        succeeded, payload = outcome[0]
         if succeeded:
             future.set_result(payload)
         else:
@@ -240,13 +254,15 @@ def _start_abandonable_sync_call(
 
     def worker() -> None:
         try:
-            outcome.append((True, call()))
+            outcome.append((True, caller_context.run(call)))
         except BaseException as exc:  # surfaced to the awaiter, never swallowed here
             outcome.append((False, exc))
         try:
             loop.call_soon_threadsafe(deliver)
         except RuntimeError:
-            pass  # the run was abandoned and its loop has since closed
+            # The run was abandoned and its loop has since closed, so ``deliver`` will never run.
+            # Nothing will await a late awaitable either, so discard it here instead.
+            discard_late_awaitable()
 
     threading.Thread(target=worker, name=thread_name, daemon=True).start()
     return future
@@ -351,7 +367,29 @@ class AgentToolContext(ToolContext):
     skill_activation_count: int = 0
     skills_activated: list[str] = field(default_factory=list)
     _requested_tool_loads: list[str] = field(default_factory=list)
-    _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
+    # The authorization of the tool call currently executing, held in a ``ContextVar`` rather than a
+    # plain attribute so it is scoped to whoever is running the call. A shared attribute was only
+    # safe while exactly one call could be in flight: when the run abandons a handler that outran a
+    # cancel or deadline, the ``finally`` that clears this would otherwise strip the *still running*
+    # handler's scope, and ``path_allowed`` treats an empty scope as "no narrowing" -- so an
+    # abandoned worker would silently widen to the run-level permission policy. A copied context per
+    # handler (``asyncio`` does this per task, ``_start_abandonable_sync_call`` per worker thread)
+    # keeps each call's authorization valid for that call's whole lifetime.
+    _call_var: ContextVar[CallContext] = field(
+        default_factory=lambda: ContextVar(
+            "monoid_current_tool_call", default=CallContext("", None, None)
+        ),
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def _current_call(self) -> CallContext:
+        return self._call_var.get()
+
+    @_current_call.setter
+    def _current_call(self, call: CallContext) -> None:
+        self._call_var.set(call)
 
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]

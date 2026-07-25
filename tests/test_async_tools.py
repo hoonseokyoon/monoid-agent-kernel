@@ -5,6 +5,7 @@ import inspect
 import json
 import threading
 import time
+from contextvars import ContextVar
 from pathlib import Path
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
@@ -29,6 +30,9 @@ def _spec(tmp_path: Path, *, limits: RunLimits | None = None) -> AgentRunSpec:
         run_root=tmp_path / "runs",
         limits=limits or RunLimits(),
     )
+
+
+_TENANT: ContextVar[str] = ContextVar("test_tenant", default="unset")
 
 
 def _event_types(run_dir: Path) -> list[str]:
@@ -304,19 +308,96 @@ def test_run_cancellation_abandons_blocking_sync_tool(tmp_path: Path) -> None:
     assert workers[0].is_alive() is True
 
 
-def test_awaitable_from_abandoned_sync_tool_is_closed(tmp_path: Path) -> None:
-    """A sync handler may return an awaitable. If the run abandoned the call before it did, that
-    awaitable is closed rather than left for the collector to warn about.
+def test_sync_tool_handler_sees_caller_context_variables(tmp_path: Path) -> None:
+    """A sync handler runs in a copy of the caller's context, as ``asyncio.to_thread`` did.
 
-    The close lands on the event loop, so it is only observable where the loop outlives the
-    abandonment -- the deployed shape, as the reference backend keeps one loop for many runs. Under
-    a bare ``asyncio.run`` the loop is already closed and there is nothing left to close it on.
+    Hosts put request-scoped state -- credentials, tenant identity, tracing -- in ``ContextVar``s, so
+    a worker started with an empty context would silently read defaults.
+    """
+    seen: list[str] = []
+
+    @tool(id="sync.tenant")
+    def read_tenant() -> dict:
+        seen.append(_TENANT.get())
+        return {"tenant": _TENANT.get()}
+
+    async def run() -> object:
+        _TENANT.set("acme")
+        adapter = FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("sync_tenant", {}, "c1"),)),
+                ModelTurn(final_text="done"),
+            ]
+        )
+        return await AgentLoop.from_tools(_spec(tmp_path), adapter, [read_tenant]).arun_once("go")
+
+    result = asyncio.run(run())
+
+    assert result.status == "completed"
+    assert seen == ["acme"]
+
+
+def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> None:
+    """An abandoned handler keeps the authorization of the call it was invoked for.
+
+    The run clears the current call in a ``finally`` as soon as it stops waiting, but the worker is
+    still running. Were that state shared, the worker's later ``path_allowed`` / shell / web calls
+    would read an empty scope -- and an empty scope applies no allow-list or deny-list narrowing at
+    all, so the abandoned worker would widen to the run-level permission policy.
     """
     workers: list[threading.Thread] = []
-    returned: list[object] = []
+    late_tool_id: list[str] = []
 
-    # A raw ``ToolSpec`` handler, because that is the shape that can return an awaitable at all --
-    # the ``@tool`` decorator wraps whatever the function returns in a ``ToolResult``.
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                workers.append(threading.current_thread())
+                # Outlive the deadline and the grace window, then read the call back.
+                threading.Event().wait(timeout=1.5)
+                late_tool_id.append(ctx._current_call.tool_id)  # type: ignore[attr-defined]
+                return ToolResult(ok=True, content={})
+
+            return [
+                ToolSpec(
+                    id="sync.late_scope",
+                    description="sync tool that outlives its run",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="read",
+                    handler=handler,
+                )
+            ]
+
+    result = asyncio.run(
+        AgentLoop(
+            spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+            model_adapter=FakeModelAdapter(
+                turns=[ModelTurn(tool_calls=(fake_tool_call("sync_late_scope", {}, "c1"),))]
+            ),
+            runtime_config_provider=runtime_provider(
+                runtime_config(bindings=(tool_binding("sync.late_scope"),))
+            ),
+            tool_providers=(Provider(),),
+            async_tool_cancel_grace_s=0.05,
+        ).arun_once("go")
+    )
+
+    assert result.status == "limited"
+    assert result.error_code == "run_timeout"
+    workers[0].join(timeout=10)
+    assert late_tool_id == ["sync.late_scope"]
+
+
+def _late_awaitable_provider(
+    workers: list[threading.Thread], returned: list[object]
+) -> type:
+    """A raw-``ToolSpec`` provider whose sync handler returns an awaitable only after its run has
+    given up on it. Raw, because that is the shape that can return an awaitable at all -- the
+    ``@tool`` decorator wraps whatever the function returns in a ``ToolResult``."""
+
     class Provider:
         def get_tools(self, context: ToolContext) -> list[ToolSpec]:
             del context
@@ -328,7 +409,6 @@ def test_awaitable_from_abandoned_sync_tool_is_closed(tmp_path: Path) -> None:
             def handler(_ctx: ToolContext, args: dict) -> ToolResult:
                 del args
                 workers.append(threading.current_thread())
-                # Outlive the deadline and the grace window, then hand back an awaitable anyway.
                 threading.Event().wait(timeout=1.5)
                 coroutine = late_result()
                 returned.append(coroutine)
@@ -345,18 +425,36 @@ def test_awaitable_from_abandoned_sync_tool_is_closed(tmp_path: Path) -> None:
                 )
             ]
 
-    async def run() -> object:
-        adapter = FakeModelAdapter(
+    return Provider
+
+
+def _late_awaitable_loop(tmp_path: Path, provider: type) -> AgentLoop:
+    return AgentLoop(
+        spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+        model_adapter=FakeModelAdapter(
             turns=[ModelTurn(tool_calls=(fake_tool_call("sync_late_awaitable", {}, "c1"),))]
-        )
-        result = await AgentLoop(
-            spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
-            model_adapter=adapter,
-            runtime_config_provider=runtime_provider(
-                runtime_config(bindings=(tool_binding("sync.late_awaitable"),))
-            ),
-            tool_providers=(Provider(),),
-            async_tool_cancel_grace_s=0.05,
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(bindings=(tool_binding("sync.late_awaitable"),))
+        ),
+        tool_providers=(provider(),),
+        async_tool_cancel_grace_s=0.05,
+    )
+
+
+def test_awaitable_from_abandoned_sync_tool_is_closed(tmp_path: Path) -> None:
+    """A sync handler may return an awaitable. If the run abandoned the call before it did, that
+    awaitable is closed rather than left for the collector to warn about.
+
+    Here the loop is still running when it arrives -- the deployed shape, as the reference backend
+    keeps one loop across many runs.
+    """
+    workers: list[threading.Thread] = []
+    returned: list[object] = []
+
+    async def run() -> object:
+        result = await _late_awaitable_loop(
+            tmp_path, _late_awaitable_provider(workers, returned)
         ).arun_once("go")
         # Wait on the abandoned worker without blocking the loop, then let its queued callback run.
         await asyncio.to_thread(workers[0].join, 10)
@@ -367,6 +465,25 @@ def test_awaitable_from_abandoned_sync_tool_is_closed(tmp_path: Path) -> None:
 
     assert result.status == "limited"
     assert result.error_code == "run_timeout"
+    assert inspect.getcoroutinestate(returned[0]) == inspect.CORO_CLOSED
+
+
+def test_awaitable_from_abandoned_sync_tool_is_closed_after_loop_shutdown(tmp_path: Path) -> None:
+    """The same awaitable, arriving after ``asyncio.run`` closed the loop.
+
+    Delivery cannot be scheduled at all then, so the close has to happen on the worker's own thread
+    instead -- otherwise this is exactly the case that leaks an unawaited coroutine.
+    """
+    workers: list[threading.Thread] = []
+    returned: list[object] = []
+
+    result = asyncio.run(
+        _late_awaitable_loop(tmp_path, _late_awaitable_provider(workers, returned)).arun_once("go")
+    )
+
+    assert result.status == "limited"
+    assert result.error_code == "run_timeout"
+    workers[0].join(timeout=10)
     assert inspect.getcoroutinestate(returned[0]) == inspect.CORO_CLOSED
 
 

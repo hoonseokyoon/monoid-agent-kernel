@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from contextvars import ContextVar
 from pathlib import Path
 
 from support.process import python_command as _python_command
@@ -166,6 +167,40 @@ def test_never_returning_coroutine_next_turn_observes_run_cancellation(tmp_path:
     assert result.status == "limited"
     assert result.error_code == "cancelled"
     assert cleaned_up is True
+
+
+_TENANT: ContextVar[str] = ContextVar("test_tenant", default="unset")
+
+
+def test_sync_next_turn_sees_caller_context_variables(tmp_path: Path) -> None:
+    """A sync adapter runs in a copy of the caller's context, as ``asyncio.to_thread`` did.
+
+    This is the call site where host-supplied ``ContextVar`` state matters most -- provider
+    credentials and tracing context -- and a worker on an empty context would read defaults.
+    """
+    seen: list[str] = []
+
+    class ContextReadingSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            seen.append(_TENANT.get())
+            return ModelTurn(response_id="r1", final_text="ok")
+
+    async def run() -> object:
+        _TENANT.set("acme")
+        loop = AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=ContextReadingSyncAdapter(),  # type: ignore[arg-type]
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+        )
+        return await loop.arun_once("go")
+
+    result = asyncio.run(run())
+
+    assert result.status == "completed"
+    assert seen == ["acme"]
 
 
 def _block_like_a_stuck_provider() -> None:
