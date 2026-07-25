@@ -7,7 +7,6 @@ from typing import Any
 
 import pytest
 
-from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.model_io import (
     REDACTION_PLACEHOLDER,
     CapturePolicy,
@@ -93,11 +92,14 @@ def test_none_mode_strips_the_receipts_content_derived_digests_too() -> None:
 
     assert delivered.prompt_digest == ""
     assert delivered.request_digest == ""
-    # Everything that is metadata about the *call* rather than about what was said still arrives.
-    # Withholding it would break an accounting consumer for no privacy gain.
-    assert delivered.redaction_digest == "sha-policy"
+    # Metadata about the *call* rather than about what was said still arrives. Withholding it would
+    # break an accounting consumer for no privacy gain.
     assert dict(delivered.usage) == {"input_tokens": 5}
     assert delivered.latency_ms == 12
+    # ``redaction_digest`` is empty because this subscription applied no rules -- see
+    # ``test_the_redaction_digest_names_each_subscriptions_own_rules``. The caller's value is not
+    # passed through: it cannot be meaningful at call level, where there is no single policy.
+    assert delivered.redaction_digest == ""
     # The receipt returned to the kernel keeps them: it computed them.
     assert (returned.prompt_digest, returned.request_digest) == ("sha-prompt", "sha-request")
 
@@ -174,7 +176,7 @@ def test_digests_describe_the_raw_content_under_every_policy() -> None:
     )
 
     assert full.digests == redacted.digests
-    assert redacted.digests["api_key"] == sha256_bytes(b"sk-live-secret")
+    assert redacted.digests["api_key"] == content_digest("sk-live-secret")
     # The view differs even though the identity does not.
     assert full.content != redacted.content
 
@@ -206,6 +208,64 @@ def test_content_digest_does_not_collide_across_shapes() -> None:
     assert content_digest({"a": 1, "b": 2}) == content_digest({"b": 2, "a": 1})
     assert content_length("abc") == 3
     assert content_length({"a": 1}) is None
+
+
+def test_text_is_domain_separated_from_the_structured_wrapper() -> None:
+    """The regression that made text hash under its own shape key.
+
+    Hashing text as bare UTF-8 bytes while wrapping structured values meant a text field whose content
+    happened to equal the wrapper serialization collided with the value it wraps — the exact collision
+    the wrapper existed to prevent, just moved.
+    """
+    assert content_digest('{"value":["x"]}') != content_digest(["x"])
+    assert content_digest('{"text":"x"}') != content_digest("x")
+    # Still stable and still order-independent, which is what a join key needs.
+    assert content_digest("abc") == content_digest("abc")
+
+
+def test_the_redaction_digest_names_each_subscriptions_own_rules() -> None:
+    """It is a per-subscription fact, not a per-call one.
+
+    There is no single applied policy at call level — that is the point of attaching one per
+    registration — so two redacted consumers with different rules would otherwise get identical audit
+    records, and neither could say which rules produced its view.
+    """
+    strict = RedactionPolicy(literals=("alpha",))
+    lax = RedactionPolicy(literals=("beta",))
+
+    _receipt, (first, second) = _dispatch(
+        CapturePolicy(mode="redacted", redaction=strict),
+        CapturePolicy(mode="redacted", redaction=lax),
+        content={"final_text": "alpha beta"},
+    )
+
+    assert first.receipt.redaction_digest == strict.digest
+    assert second.receipt.redaction_digest == lax.digest
+    assert first.content != second.content
+
+
+@pytest.mark.parametrize("mode", ["none", "digest", "full"])
+def test_a_mode_that_applies_no_rules_reports_no_redaction_digest(mode: str) -> None:
+    _receipt, (capture,) = _dispatch(
+        CapturePolicy(mode=mode, redaction=RedactionPolicy(literals=("alpha",)))  # type: ignore[arg-type]
+    )
+
+    assert capture.receipt.redaction_digest == ""
+
+
+def test_a_downgraded_subscription_reports_no_redaction_digest() -> None:
+    """It applied no rules at all. Stamping the policy it *failed* to apply would read as "these rules
+    were applied", which `downgraded_from` already reports correctly."""
+    _receipt, (capture,) = _dispatch(
+        CapturePolicy(
+            mode="redacted",
+            redaction=RedactionPolicy(literals=("alpha",)),
+            redactor=FailingRedactor(),
+        )
+    )
+
+    assert (capture.mode, capture.downgraded_from) == ("digest", "redacted")
+    assert capture.receipt.redaction_digest == ""
 
 
 # --- fail closed ---------------------------------------------------------------------------
@@ -447,6 +507,34 @@ def test_close_is_optional_and_failures_are_tolerated() -> None:
     )
 
     assert closing.closed is True
+
+
+def test_a_shared_observer_is_closed_once() -> None:
+    """Registering one exporter under two policies is a shape `ModelIOSubscription` supports, so
+    closing per subscription would ask a `close` that flushes or commits to be idempotent — and the
+    second call's exception is swallowed by the guard that makes a broken exporter survivable."""
+
+    class CountingClose:
+        def __init__(self) -> None:
+            self.closes = 0
+
+        def on_model_call(self, capture: ModelCallCapture) -> None:
+            del capture
+
+        def close(self) -> None:
+            self.closes += 1
+
+    shared, other = CountingClose(), CountingClose()
+
+    close_model_io_subscriptions(
+        (
+            ModelIOSubscription(shared, CapturePolicy(mode="full")),
+            ModelIOSubscription(other, CapturePolicy(mode="full")),
+            ModelIOSubscription(shared, CapturePolicy(mode="none")),
+        )
+    )
+
+    assert (shared.closes, other.closes) == (1, 1)
 
 
 def test_the_protocols_split_the_required_member_from_the_optional_one() -> None:

@@ -57,6 +57,43 @@ def test_from_json_normalizes_and_dedupes_secret_key_parts() -> None:
     assert policy.secret_key_parts == ("api_key", "secret")
 
 
+def test_a_programmatic_rule_is_normalized_too() -> None:
+    """The regression: normalizing only in `from_json` left every programmatic caller broken.
+
+    `names_a_secret` folds the *candidate* key to lowercase, so an un-normalized rule could never
+    match — `secret_key_parts=("API_KEY",)` matched nothing and the value it was written to mask was
+    delivered inside a `redacted` capture. The built-in list is already lowercase, which is exactly
+    what hid it.
+    """
+    policy = RedactionPolicy(secret_key_parts=("API_KEY", " api_key ", "Nonce", ""))
+
+    assert policy.secret_key_parts == ("api_key", "nonce")
+    assert policy.names_a_secret("api_key") is True
+    assert policy.names_a_secret("API_KEY") is True
+    assert policy.names_a_secret("x-nonce") is True
+    assert DefaultRedactor().redact({"API_KEY": "sk-leaks"}, policy=policy) == {
+        "API_KEY": REDACTION_PLACEHOLDER
+    }
+
+
+def test_merged_normalizes_the_rules_it_adds() -> None:
+    widened = RedactionPolicy(secret_key_parts=()).merged(secret_key_parts=("Nonce", "NONCE"))
+
+    assert widened.secret_key_parts == ("nonce",)
+
+
+def test_two_policies_differing_only_in_rule_case_are_equal_and_digest_alike() -> None:
+    """A consequence of normalizing in the constructor, and the behaviour an audit record wants: the
+    same rules written two ways are the same rules."""
+    assert RedactionPolicy(secret_key_parts=("API_KEY",)) == RedactionPolicy(
+        secret_key_parts=("api_key",)
+    )
+    assert (
+        RedactionPolicy(secret_key_parts=("API_KEY",)).digest
+        == RedactionPolicy(secret_key_parts=("api_key",)).digest
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [

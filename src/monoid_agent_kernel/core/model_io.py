@@ -27,7 +27,7 @@ from functools import lru_cache
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from monoid_agent_kernel._policy_util import dedupe, str_tuple
-from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.wire_validation import (
@@ -102,6 +102,17 @@ class RedactionPolicy:
                 _compiled(pattern)
             except re.error as exc:
                 raise ValueError(f"invalid redaction pattern {pattern!r}: {exc}") from exc
+        # Normalized here, not only in ``from_json``. ``names_a_secret`` folds the *candidate* key to
+        # lowercase, so an un-normalized rule can never match: ``secret_key_parts=("API_KEY",)`` was a
+        # rule that silently matched nothing, and the value it was written to mask was delivered in a
+        # ``redacted`` capture. The defaults are already lowercase, which is exactly what hid it.
+        # Doing it in the constructor covers ``merged`` and every programmatic caller at once, and
+        # makes two policies that differ only in rule case compare -- and digest -- equal.
+        object.__setattr__(
+            self,
+            "secret_key_parts",
+            dedupe(part.strip().lower() for part in self.secret_key_parts if part.strip()),
+        )
 
     @classmethod
     def from_json(cls, payload: Any) -> RedactionPolicy:
@@ -332,12 +343,18 @@ class CapturePolicy:
 def content_digest(value: Any) -> str:
     """A stable digest of one captured content field, computed on the raw value.
 
-    Text hashes its UTF-8 bytes; anything else hashes as canonical JSON, so a digest does not depend
-    on mapping order. Wrapped in a single-key object rather than hashed directly, so a string and a
-    list containing that string cannot collide.
+    Everything is hashed as canonical JSON under a key that names its shape, so a digest does not
+    depend on mapping order and two differently-shaped values cannot collide. The shape key is the
+    domain separator and it is why text does *not* simply hash its own UTF-8 bytes: a text field whose
+    content happened to equal the wrapper serialization of a structured value — `'{"value":["x"]}'` —
+    hashed identically to that value, which is the collision the wrapper was supposed to prevent.
+
+    Consequence for anything that records these: recompute with this function, not with a bare
+    `sha256sum` of the text. Nothing persists a `content_digest` yet, which is what makes changing it
+    free today; once the run-dir sidecar records one, it is frozen.
     """
     if isinstance(value, str):
-        return sha256_bytes(value.encode("utf-8"))
+        return canonical_sha256({"text": value})
     return canonical_sha256({"value": _jsonish(value)})
 
 
@@ -617,16 +634,30 @@ def _resolve_capture(
 
 # Receipt fields derived from the call's content. A ``none``-mode consumer must not receive these:
 # ``none`` promises no content metadata, and a digest of a short prompt is recoverable by hashing
-# candidates. Everything else on the receipt stays -- token counts, timings, taxonomy and the
-# *policy* digest are metadata about the call rather than about what was said, and withholding them
-# would leave an accounting or alerting consumer unable to do its job for no privacy gain.
+# candidates. Token counts, timings and taxonomy stay -- they are metadata about the call rather than
+# about what was said, and withholding them would leave an accounting or alerting consumer unable to
+# do its job for no privacy gain.
 _CONTENT_DERIVED_RECEIPT_FIELDS = ("prompt_digest", "request_digest")
 
 
-def _receipt_for_mode(receipt: ModelCallReceipt, mode: CaptureMode) -> ModelCallReceipt:
-    if mode != "none":
-        return receipt
-    return replace(receipt, **dict.fromkeys(_CONTENT_DERIVED_RECEIPT_FIELDS, ""))
+def _receipt_for_subscription(
+    receipt: ModelCallReceipt, *, mode: CaptureMode, policy: CapturePolicy
+) -> ModelCallReceipt:
+    """The receipt one subscription receives: narrowed to its mode, and naming its own rules.
+
+    ``redaction_digest`` is a *per-subscription* fact, not a per-call one. There is no single applied
+    policy at call level -- that is the whole point of attaching one per registration -- so the
+    caller's receipt cannot carry a meaningful value and two redacted consumers with different rules
+    would otherwise get identical audit records. It is set only when redaction actually ran: a
+    downgraded subscription applied no rules at all, and stamping the policy it *failed* to apply
+    would read as "these rules were applied", which ``downgraded_from`` already reports correctly.
+    """
+    changes: dict[str, Any] = {
+        "redaction_digest": policy.effective_redaction.digest if mode == "redacted" else "",
+    }
+    if mode == "none":
+        changes.update(dict.fromkeys(_CONTENT_DERIVED_RECEIPT_FIELDS, ""))
+    return replace(receipt, **changes)
 
 
 def dispatch_model_call(
@@ -669,7 +700,7 @@ def dispatch_model_call(
     for subscription, (mode, downgraded_from, payload) in zip(subscriptions, resolved, strict=True):
         reveals_metadata = mode != "none"
         capture = ModelCallCapture(
-            receipt=_receipt_for_mode(settled, mode),
+            receipt=_receipt_for_subscription(settled, mode=mode, policy=subscription.policy),
             mode=mode,
             downgraded_from=downgraded_from,
             content=payload,
@@ -684,12 +715,22 @@ def dispatch_model_call(
 
 
 def close_model_io_subscriptions(subscriptions: Sequence[ModelIOSubscription]) -> None:
-    """Release every observer that declared a `close`, tolerating failures.
+    """Release every observer that declared a `close`, once each, tolerating failures.
 
     Probed with `getattr` rather than required, which is what keeps `close` off the base protocol.
+
+    De-duplicated by identity, because registering one exporter under two policies is a shape
+    `ModelIOSubscription` explicitly supports. Closing it once per subscription asks a `close` that
+    flushes or commits to be idempotent, and the failure mode is quiet: the second call's exception is
+    swallowed by the same guard that makes a broken exporter survivable.
     """
+    seen: set[int] = set()
     for subscription in subscriptions:
-        close = getattr(subscription.observer, "close", None)
+        observer = subscription.observer
+        if id(observer) in seen:
+            continue
+        seen.add(id(observer))
+        close = getattr(observer, "close", None)
         if not callable(close):
             continue
         try:
