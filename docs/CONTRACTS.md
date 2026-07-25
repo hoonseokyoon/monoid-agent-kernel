@@ -363,6 +363,14 @@ disposed rather than left dangling — a coroutine is closed, and a future or ta
 its outcome consumed. Sync tools that perform external I/O should apply their own operation timeout
 and idempotency policy, because the kernel can stop waiting for a handler it cannot stop.
 
+A handler's call authorization follows the handler, including into threads it starts itself: a
+`ToolContext` operation delegated to a joined child thread is checked against the same binding scope
+as the parent. It also stays valid for a handler the run has abandoned, so a detached handler keeps
+its own scope rather than picking up whichever call the run moved on to. One case is not covered: a
+thread descended from an *abandoned* handler reads the run's current call instead of its own, because
+nothing links a thread to its creator. Handlers that outlive their run and fan out to further threads
+should re-check their own authorization rather than relying on `ToolContext` to narrow for them.
+
 `ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
 errors become failed tool observations. A handler-local `CancelledError` maps to
 `tool_handler_cancelled`; run-token cancellation and deadlines retain their run-level outcome.

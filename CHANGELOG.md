@@ -18,6 +18,14 @@ out in commit messages and here.
 
 ### Fixed
 
+- A synchronous tool handler's call authorization now reaches threads the handler starts itself. A
+  `ToolContext` operation delegated to a joined child thread is checked against the same binding
+  scope as its parent, instead of seeing no call at all and widening to the run-level permission
+  policy — an authorization bypass for threaded handlers. The per-call isolation that keeps an
+  abandoned handler on its own scope is unchanged; the two are resolved from separate tiers because
+  neither alone is correct. Still uncovered, and documented in `docs/CONTRACTS.md`: a thread
+  descended from an *abandoned* handler reads the run's current call, since nothing links a thread
+  to its creator.
 - `ModelAdapter` and `AsyncModelAdapter` no longer declare optional capability attributes, which had
   made them **required** members for structural typing and rejected a third-party adapter that
   implements only `next_turn` — the default assigned in a protocol body reaches explicitly

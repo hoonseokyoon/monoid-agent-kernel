@@ -16,6 +16,7 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 from monoid_agent_kernel import tool
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityLease
+from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.errors import ToolExecutionError
 from monoid_agent_kernel.loop import AgentLoop, _start_abandonable_sync_call
@@ -469,6 +470,67 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
     assert result.error_code == "run_timeout"
     workers[0].join(timeout=10)
     assert late_tool_id == ["sync.late_scope"]
+
+
+def test_sync_tool_child_thread_keeps_the_call_authorization(tmp_path: Path) -> None:
+    """A thread the handler starts itself is still bound by the call's scope.
+
+    Delegating a ``ToolContext`` operation to a joined child thread is a normal handler shape. A new
+    ``threading.Thread`` starts with an empty context, so a ``ContextVar`` alone reads unset there --
+    and an empty scope applies no allow-list narrowing at all, so the child would widen to the
+    run-level permission policy while its parent is still under a restricted authorization.
+    """
+    seen: list[bool] = []
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+
+                def in_child_thread() -> None:
+                    # Outside the binding's allowed_paths, so a scoped call must refuse it.
+                    seen.append(ctx.path_allowed("secrets/key.txt", "read"))
+
+                child = threading.Thread(target=in_child_thread)
+                child.start()
+                child.join(timeout=5)
+                return ToolResult(ok=True, content={})
+
+            return [
+                ToolSpec(
+                    id="sync.child_thread",
+                    description="sync tool that delegates to a joined child thread",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="read",
+                    handler=handler,
+                )
+            ]
+
+    result = asyncio.run(
+        AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=FakeModelAdapter(
+                turns=[
+                    ModelTurn(tool_calls=(fake_tool_call("sync_child_thread", {}, "c1"),)),
+                    ModelTurn(final_text="done"),
+                ]
+            ),
+            runtime_config_provider=runtime_provider(
+                runtime_config(
+                    bindings=(
+                        tool_binding("sync.child_thread", scope=ToolScope(allowed_paths=("notes/*",))),
+                    )
+                )
+            ),
+            tool_providers=(Provider(),),
+        ).arun_once("go")
+    )
+
+    assert result.status == "completed"
+    assert seen == [False]
 
 
 def _late_awaitable_provider(
