@@ -7,6 +7,64 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added
+
+- Added `MultimodalModelAdapter` and `ProviderNamedModelAdapter`, opt-in protocols that declare the
+  optional capability attributes the loop probes with `getattr` (`supports_multimodal` and
+  `provider_name`). Implementing them is never required; they exist so the attribute names and
+  meanings are part of the checked contract and typed callers can narrow to "an adapter that reports
+  this". Each member is a read-only property, so a `ClassVar`, an instance attribute, and a property
+  all satisfy it.
+
+### Fixed
+
+- A synchronous tool handler's call authorization now reaches threads the handler starts itself. A
+  `ToolContext` operation delegated to a joined child thread is checked against the same binding
+  scope as its parent, instead of seeing no call at all and widening to the run-level permission
+  policy — an authorization bypass for threaded handlers. The per-call isolation that keeps an
+  abandoned handler on its own scope is unchanged; the two are resolved from separate tiers because
+  neither alone is correct.
+- Scoped `ToolContext` operations — `path_allowed`, shell execution, web search/fetch/context — now
+  refuse when no tool call is in flight, instead of applying the run-level permission policy
+  unnarrowed. Every scope check narrows only under a non-empty allow/deny list, so an absent call
+  read as an empty scope granted the widest authorization in the run. This bounds a thread descended
+  from a handler the run has abandoned: it is refused once the parent's call ends. The narrower
+  remaining case is documented in `docs/CONTRACTS.md` — while another call is live, such a thread
+  borrows that call's scope, because nothing links a thread to its creator.
+- `ModelAdapter` and `AsyncModelAdapter` no longer declare optional capability attributes, which had
+  made them **required** members for structural typing and rejected a third-party adapter that
+  implements only `next_turn` — the default assigned in a protocol body reaches explicitly
+  inheriting classes, not structural implementations. `supports_multimodal` and
+  `wire_image_encoding` had this effect since they were introduced; the attributes are unchanged at
+  runtime, where the loop has always probed them with `getattr` and a default.
+
+### Changed
+
+- **Breaking for third-party synchronous adapters and tools.** A synchronous `next_turn` and a
+  synchronous tool handler now observe run cancellation and the run deadline, instead of taking
+  effect only once the call returns. Both previously let a wedged provider or handler outlast every
+  run boundary; a run now reports `cancelled` or `run_timeout` within its cancel-grace window and
+  abandons the call. Python cannot force-stop a worker thread, so the call is abandoned rather than
+  stopped: it keeps running with its late outcome discarded, an awaitable returned too late is
+  closed unawaited, and an abandoned tool handler may still be writing to the workspace. Sync
+  adapters and tools should still enforce a timeout at their own I/O edge. Adapters needing prompt
+  resource release should expose `anext_turn` or a coroutine `next_turn`.
+- The configured cancel grace now applies to a synchronous call's worker thread, so a sync adapter or
+  tool handler that returns inside the grace settles normally instead of being abandoned on the spot.
+  Cancelling a sync call's waiter completes it immediately — there is no coroutine to throw
+  `CancelledError` into — so the previous wait granted no grace at all to the one shape that needed
+  it. A handler that lands inside the window now finishes its workspace writes before the run
+  finalizes rather than racing it, and is not reported as abandoned. The grace is not an extension of
+  the deadline: the run still reports `cancelled` or `run_timeout`.
+- An awaitable returned by an abandoned synchronous call is now disposed whatever its shape: a
+  coroutine is closed, and a future or task is cancelled and its outcome consumed. Previously only
+  coroutines were handled, so in a persistent backend loop a returned task kept running after the
+  run was cancelled and a future completing with an exception was never consumed.
+- Abandoned synchronous calls no longer run on the event loop's default executor. `asyncio.run`
+  joins that executor's workers before returning, which made a run deadline enforced internally but
+  unobservable to the caller — it produced its result on time, then blocked at loop shutdown until
+  the provider returned on its own.
+
 ## [0.19.2] - 2026-07-19
 
 ### Added

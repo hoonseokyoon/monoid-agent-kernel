@@ -5,11 +5,13 @@ import base64
 import fnmatch
 import inspect
 import json
+import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextvars import ContextVar, copy_context
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
 from monoid_agent_kernel.core.cancellation import CancellationToken
@@ -195,6 +197,147 @@ def _consume_task_outcome(task: asyncio.Future[Any]) -> None:
         pass
 
 
+_LOGGER = logging.getLogger("monoid_agent_kernel.loop")
+
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _AbandonableSyncCall(Generic[_T]):
+    """A blocking call in flight on a daemon thread, as the two handles an awaiter needs.
+
+    ``result`` is the cancellable waiter: cancelling it releases the awaiter, which is the whole
+    point of the daemon thread. It says nothing about the worker, which cannot be interrupted and
+    keeps running. ``settled`` completes only when the worker actually delivers its outcome, and is
+    never cancelled -- so a caller that wants to grant the worker a bounded grace period must wait
+    on ``settled``, not on ``result``. ``warn_if_unsettled`` reports the abandonment once that
+    grace has expired; it is the awaiter's call to make, because only the awaiter knows the grace.
+    """
+
+    result: asyncio.Future[_T]
+    settled: asyncio.Future[None]
+    warn_if_unsettled: Callable[[], None]
+
+
+def _start_abandonable_sync_call(
+    call: Callable[[], _T],
+    *,
+    thread_name: str,
+) -> _AbandonableSyncCall[_T]:
+    """Run a blocking call on a daemon thread, exposed as futures on the running loop.
+
+    Used for both halves of the sync surface -- a sync ``next_turn`` and a sync tool handler --
+    so each observes run cancellation and the run deadline like its async counterpart.
+
+    ``asyncio.to_thread`` is unusable for a call the run may have to abandon: it borrows the
+    event loop's *default* executor, and ``asyncio.run`` joins every worker in that executor
+    before returning. A callee that never returns would hang the caller at loop shutdown even
+    though the run itself already produced its ``run_timeout`` or ``cancelled`` result -- the
+    deadline would be enforced internally but unobservable from the documented async entry point.
+    A daemon thread is joined by nobody, neither loop shutdown nor the interpreter's exit hooks,
+    so cancelling the returned ``result`` future really does release the caller.
+
+    The abandoned worker still runs to completion; its late outcome is dropped, because ``result``
+    is already cancelled by then, and delivery is skipped outright once the loop has closed. The
+    returned ``settled`` future is what an awaiter waits on to grant the worker a bounded grace
+    period: cancelling ``result`` completes it instantly -- there is no coroutine to throw
+    ``CancelledError`` into -- so waiting on ``result`` after cancelling it would grant no grace at
+    all.
+
+    Known limitation, in two parts. Nothing can reclaim the thread of a call that never returns, and
+    the run no longer waits for it, so an implementation that wedges *permanently* accumulates one
+    thread per abandoned call across runs; each abandonment is logged as a warning so that growth is
+    visible rather than silent. And a thread per call gives up the bound a shared executor provided:
+    ``asyncio.to_thread`` queued behind the default executor's ``max_workers``, while this starts a
+    thread immediately. Within one run sync calls are sequential, so the exposure is a process
+    driving many runs at once, where a burst can reach the process thread limit and fail calls that
+    would otherwise succeed.
+
+    Both bounds want admission control -- a decision about how much concurrent work a *process*
+    admits, informed by run and tenant policy -- so neither belongs in this helper, which only knows
+    about one call. A dedicated pool here would not settle it either: it would trade an unbounded
+    thread count for a queue whose depth and eviction are the same policy question, and a wedged
+    call would hold a pool slot instead of a thread. Tracked for a later release; hosts running many
+    concurrent sessions with synchronous adapters or tools should bound admission themselves.
+    """
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[_T] = loop.create_future()
+    settled: asyncio.Future[None] = loop.create_future()
+    outcome: list[tuple[bool, Any]] = []
+    # Match ``asyncio.to_thread``, which runs its target in a copy of the caller's context. Without
+    # this the worker would start with an empty context, so a sync adapter or handler reading
+    # credentials, tenant identity, or tracing state from a ``ContextVar`` would see defaults. The
+    # copy is also what keeps an abandoned worker's tool-call authorization alive: it is taken after
+    # the call's ``CallContext`` is set, and the caller's later reset cannot reach into it.
+    caller_context = copy_context()
+
+    def discard_late_awaitable(*, on_live_loop: bool) -> None:
+        """Dispose an awaitable that arrived after the run gave up on the call.
+
+        A sync tool handler may return one, and the normal path accepts any awaitable, so the late
+        path has to handle the same shapes. Nothing downstream will await this one: a coroutine is
+        closed so its cleanup runs and it cannot surface as an unawaited-coroutine warning, and a
+        future or task is cancelled and consumed so it stops running and cannot surface as a
+        never-retrieved exception. Any other awaitable has no generic disposal and is left alone.
+
+        ``on_live_loop`` is False when the run's loop has already closed. Cancelling a future there
+        is unsafe -- it schedules callbacks on the dead loop -- and a still-pending future can no
+        longer run, so there is nothing to stop and no outcome to read. An *already settled* one is
+        different: reading its outcome touches no loop, and an unretrieved exception is exactly what
+        warns at collection, so that case is consumed rather than skipped.
+        """
+
+        succeeded, payload = outcome[0]
+        if not succeeded:
+            return
+        if inspect.iscoroutine(payload):
+            payload.close()
+        elif isinstance(payload, asyncio.Future):
+            if on_live_loop:
+                payload.cancel()
+                payload.add_done_callback(_consume_task_outcome)
+            elif payload.done():
+                _consume_task_outcome(payload)
+
+    def deliver() -> None:
+        if not settled.done():
+            settled.set_result(None)
+        if future.done():
+            discard_late_awaitable(on_live_loop=True)
+            return
+        succeeded, payload = outcome[0]
+        if succeeded:
+            future.set_result(payload)
+        else:
+            future.set_exception(payload)
+
+    def warn_if_unsettled() -> None:
+        if settled.done():
+            return
+        _LOGGER.warning(
+            "abandoned a synchronous call still running on %r: the run stopped waiting for it, but "
+            "nothing can reclaim its thread until it returns on its own. An implementation that "
+            "never returns leaks one thread per abandoned call; enforce a timeout at its I/O edge.",
+            thread_name,
+        )
+
+    def worker() -> None:
+        try:
+            outcome.append((True, caller_context.run(call)))
+        except BaseException as exc:  # surfaced to the awaiter, never swallowed here
+            outcome.append((False, exc))
+        try:
+            loop.call_soon_threadsafe(deliver)
+        except RuntimeError:
+            # The run was abandoned and its loop has since closed, so ``deliver`` will never run.
+            # Nothing will await a late awaitable either, so discard it here instead.
+            discard_late_awaitable(on_live_loop=False)
+
+    threading.Thread(target=worker, name=thread_name, daemon=True).start()
+    return _AbandonableSyncCall(result=future, settled=settled, warn_if_unsettled=warn_if_unsettled)
+
+
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     """True if a tool binding matches any fnmatch pattern. Matched against the binding's
     tool id, binding id, and model name, so subagent allow/deny lists accept ids
@@ -294,7 +437,78 @@ class AgentToolContext(ToolContext):
     skill_activation_count: int = 0
     skills_activated: list[str] = field(default_factory=list)
     _requested_tool_loads: list[str] = field(default_factory=list)
-    _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
+    # The authorization of the tool call currently executing, resolved from two tiers because
+    # neither alone is safe. A ``ContextVar`` is authoritative: a shared attribute was only correct
+    # while exactly one call could be in flight, since the ``finally`` that clears it would strip the
+    # scope of a *still running* handler the run had abandoned, and ``path_allowed`` treats an empty
+    # scope as "no narrowing" -- so the abandoned worker would silently widen to the run-level
+    # permission policy. A copied context per handler (``asyncio`` does this per task,
+    # ``_start_abandonable_sync_call`` per worker thread) keeps each call's authorization valid for
+    # that call's whole lifetime. ``ContextVar`` values do not reach a thread the handler starts
+    # itself, though, which is what ``_call_fallback`` covers.
+    #
+    # Residual, and narrower than fail-open: a thread descended from an *abandoned* handler whose run
+    # has already moved on to another call reads that other call's authorization from the fallback.
+    # It borrows a scope it was not granted rather than widening to the run policy. Closing even that
+    # needs a thread-to-creator link, which Python does not expose -- ``threading.enumerate()`` has no
+    # parent edges -- so a descendant thread is indistinguishable from the live call's own child.
+    _call_var: ContextVar[CallContext | None] = field(
+        default_factory=lambda: ContextVar("monoid_current_tool_call", default=None),
+        repr=False,
+        compare=False,
+    )
+    # Fallback for threads a handler starts itself. A new ``threading.Thread`` begins with an empty
+    # context, so ``_call_var`` reads unset there -- and a handler that delegates a ``ToolContext``
+    # operation to a joined child thread is a normal shape, not an abuse. Without this the child
+    # would see no call at all and ``path_allowed`` would apply no binding-level narrowing, widening
+    # to the run-level permission policy while the parent handler is still under a restricted
+    # authorization. This attribute is deliberately *not* authoritative: the ContextVar wins wherever
+    # it is set, which is what keeps an abandoned worker on its own authorization after the run has
+    # moved on to another call. ``None`` means no call is in flight *on this thread's tier*, which is
+    # a refusal for authorization-bearing operations rather than an unrestricted scope.
+    _call_fallback: CallContext | None = field(default=None, repr=False, compare=False)
+
+    def _live_call(self) -> CallContext | None:
+        call = self._call_var.get()
+        return self._call_fallback if call is None else call
+
+    def _enter_call(self, call: CallContext) -> None:
+        self._call_var.set(call)
+        self._call_fallback = call
+
+    def _exit_call(self) -> None:
+        self._call_var.set(None)
+        self._call_fallback = None
+
+    @property
+    def _current_call(self) -> CallContext:
+        """The call an operation is *correlated* with, or an empty context outside any call.
+
+        Read only by operations that want the call's identifiers -- turn id, tool event id -- to
+        parent an event or tag a job. Authorization-bearing operations must read
+        ``_authorized_call`` instead: every scope check in this codebase narrows only under a
+        non-empty tuple (``path_allowed`` below, ``shell.py:232`` on command prefixes, ``web.py:102``
+        on domains), so handing them an empty ``CallContext`` widens authorization to the run-level
+        permission policy instead of denying.
+        """
+        call = self._live_call()
+        return CallContext("", None, None) if call is None else call
+
+    @property
+    def _authorized_call(self) -> CallContext:
+        """The call an authorization-bearing operation is acting for; refuses when there is none.
+
+        Outside a live tool call there is no binding whose scope could authorize the operation, so
+        the only safe answer is to refuse. Returning an empty ``CallContext`` here would read as
+        "this call narrows nothing" and grant the full run-level policy.
+        """
+        call = self._live_call()
+        if call is None:
+            raise ToolExecutionError(
+                "no tool call is in flight; scoped operations are refused",
+                error_code="tool_call_not_in_flight",
+            )
+        return call
 
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
@@ -341,13 +555,13 @@ class AgentToolContext(ToolContext):
             rel = self.workspace.normalize(path)
             permission_operation = operation if operation in {"read", "write", "artifact", "run"} else "read"
             self.permission_policy.check_paths(permission_operation, (rel,))  # type: ignore[arg-type]
-            scope = self._current_call.scope
+            scope = self._authorized_call.scope
             if scope.allowed_paths and not matches_path_patterns(rel, scope.allowed_paths):
                 return False
             if scope.denied_paths and matches_path_patterns(rel, scope.denied_paths):
                 return False
             return True
-        except (PermissionDenied, WorkspaceError, ValueError):
+        except (PermissionDenied, WorkspaceError, ValueError, ToolExecutionError):
             return False
 
     def update_plan(self, items: list[dict[str, Any]]) -> None:
@@ -358,7 +572,7 @@ class AgentToolContext(ToolContext):
         self.pending_finish = FinishResult(summary, tuple(outputs), notes)
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.shell_service.execute(args, self._current_call)
+        return self.shell_service.execute(args, self._authorized_call)
 
     def run_script(self, args: dict[str, Any]) -> dict[str, Any]:
         """Run a pre-resolved ``argv`` (skill.run_script) through the shell machinery —
@@ -367,7 +581,7 @@ class AgentToolContext(ToolContext):
         carries ``argv`` (the real command) plus a ``command`` label for the preview."""
         argv = [str(part) for part in args.get("argv") or ()]
         rest = {key: value for key, value in args.items() if key != "argv"}
-        return self.shell_service.execute(rest, self._current_call, argv_override=argv)
+        return self.shell_service.execute(rest, self._authorized_call, argv_override=argv)
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self.jobs_service.list_jobs()
@@ -439,13 +653,15 @@ class AgentToolContext(ToolContext):
         )
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.search(args, self._current_call, capability_token=self.capability_token("web.search"))
+        return self.web_service.search(args, self._authorized_call, capability_token=self.capability_token("web.search"))
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.fetch(args, self._current_call, capability_token=self.capability_token("web.fetch"))
+        return self.web_service.fetch(args, self._authorized_call, capability_token=self.capability_token("web.fetch"))
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.context(args, self._current_call, capability_token=self.capability_token("web.context"))
+        return self.web_service.context(
+            args, self._authorized_call, capability_token=self.capability_token("web.context")
+        )
 
     def configure_tool_search(self, entries: tuple[ToolSearchEntry, ...], max_results: int) -> None:
         self.tool_search_entries = entries
@@ -1489,6 +1705,16 @@ class AgentLoop:
         loop.call_soon_threadsafe(loop.stop)
         if self._owned_loop_thread is not None:
             self._owned_loop_thread.join(timeout=5)
+        # An abandoned sync worker can deliver into the window between ``stop`` and ``close``.
+        # ``call_soon_threadsafe`` accepts a callback there -- the loop is stopped, not closed -- but
+        # a stopped loop never runs it and closing drops it, so a late awaitable would go undisposed
+        # and warn at collection. The loop thread has exited by now, so this thread is free to drive
+        # one more iteration and flush what is already queued. ``running is None`` because an async
+        # caller closing from its own loop cannot drive a second loop here; that path keeps the plain
+        # stop-and-close, and a worker arriving after the close still self-disposes on the
+        # ``RuntimeError`` from ``call_soon_threadsafe``.
+        if running is None and not loop.is_closed():
+            loop.run_until_complete(asyncio.sleep(0))
         loop.close()
         self._owned_loop = None
         self._owned_loop_thread = None
@@ -1499,6 +1725,11 @@ class AgentLoop:
 
         Backward compatible: an adapter exposing ``async def anext_turn`` is awaited; a
         coroutine ``next_turn`` is awaited; a plain sync ``next_turn`` runs in a thread.
+
+        Every shape observes run cancellation and the run deadline through the same race in
+        ``_await_native_model_call``, so the adapter's async-ness never changes when a run
+        stops. A sync ``next_turn`` cannot be interrupted, so its thread is *abandoned*
+        rather than cancelled -- see that method's note.
 
         While a stream is active and the adapter supports ``astream_turn``, the streaming
         path is preferred: token chunks are relayed to the stream queue and folded into a
@@ -1519,11 +1750,17 @@ class AgentLoop:
         next_turn = adapter.next_turn
         if inspect.iscoroutinefunction(next_turn):
             return await self._await_native_model_call(next_turn(request), deadline)
-        return await asyncio.to_thread(next_turn, request)
+        return await self._await_native_model_call(
+            _start_abandonable_sync_call(
+                lambda: next_turn(request),
+                thread_name=f"nar-model-call-{self.spec.run_id}",
+            ),
+            deadline,
+        )
 
     async def _await_native_model_call(
         self,
-        pending: Awaitable[ModelTurn],
+        pending: Awaitable[ModelTurn] | _AbandonableSyncCall[ModelTurn],
         deadline: float | None,
     ) -> ModelTurn:
         """Await native model I/O while propagating run cancellation and the run deadline.
@@ -1532,9 +1769,19 @@ class AgentLoop:
         intentionally absent from this race and are checked by ``_apump_turn`` after the model
         returns. Cancellation and deadlines are run boundaries, so they cancel the provider task
         immediately and wait only a bounded interval for cooperative cleanup.
+
+        A synchronous adapter cannot be interrupted: its thread keeps running to completion.
+        Cancelling its future therefore *abandons* the call -- the run stops waiting within
+        ``async_model_cancel_grace_s`` and the detached outcome is consumed so late cleanup cannot
+        warn, but the provider's socket and CPU work continue until the adapter returns on its own.
+        Abandoning is only real because the thread is a daemon nobody joins, which is why the call
+        goes through ``_start_abandonable_sync_call`` rather than ``asyncio.to_thread``.
+        Adapters that must release resources promptly should expose ``anext_turn`` or a coroutine
+        ``next_turn``.
         """
 
-        task = asyncio.ensure_future(pending)
+        sync_call = pending if isinstance(pending, _AbandonableSyncCall) else None
+        task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
         loop = asyncio.get_running_loop()
         cancelled: asyncio.Future[None] = loop.create_future()
         outcome_consumed = False
@@ -1570,16 +1817,39 @@ class AgentLoop:
             if not cancelled.done():
                 cancelled.cancel()
             if not task.done():
-                task.cancel()
-                done, _pending = await asyncio.wait(
-                    {task}, timeout=max(0.0, self.async_model_cancel_grace_s)
+                await self._detach_unfinished_call(
+                    task, sync_call, grace_s=self.async_model_cancel_grace_s
                 )
-                if task not in done:
-                    task.add_done_callback(_consume_task_outcome)
-                else:
-                    _consume_task_outcome(task)
             elif not outcome_consumed:
                 _consume_task_outcome(task)
+
+    async def _detach_unfinished_call(
+        self,
+        task: asyncio.Future[Any],
+        sync_call: _AbandonableSyncCall[Any] | None,
+        *,
+        grace_s: float,
+    ) -> None:
+        """Release the awaiter's hold on a call that outlived a run boundary.
+
+        Cancelling ``task`` is what frees the awaiter. For a native async call that also *delivers*
+        the cancellation, so the grace interval is spent letting the callee's cleanup run. A sync
+        call has no cancellation to deliver and its waiter is a plain future, so cancelling it
+        completes it immediately: waiting on it would grant no grace at all. The grace is spent
+        waiting on the worker's own completion instead, which is what the interval is for -- a
+        worker that finishes inside it lands its writes before the run finalizes rather than racing
+        it, and is never reported as abandoned.
+        """
+
+        task.cancel()
+        watched: asyncio.Future[Any] = task if sync_call is None else sync_call.settled
+        done, _pending = await asyncio.wait({watched}, timeout=max(0.0, grace_s))
+        if sync_call is not None and watched not in done:
+            sync_call.warn_if_unsettled()
+        if task.done():
+            _consume_task_outcome(task)
+        else:
+            task.add_done_callback(_consume_task_outcome)
 
     async def _acall_model_streaming(
         self,
@@ -3633,16 +3903,18 @@ class AgentLoop:
         deadline: float | None,
     ) -> ToolResult:
         spec = bound_tool.base_spec
-        context._current_call = CallContext(
-            tool_call_id=call_id,
-            turn_id=turn_id,
-            tool_event_id=started_event.event_id,
-            binding_id=bound_tool.binding_id,
-            tool_id=bound_tool.base_spec.id,
-            model_name=bound_tool.model_name,
-            authorization=authorization,
-            scope=authorization.scope,
-            runtime=bound_tool.runtime,
+        context._enter_call(
+            CallContext(
+                tool_call_id=call_id,
+                turn_id=turn_id,
+                tool_event_id=started_event.event_id,
+                binding_id=bound_tool.binding_id,
+                tool_id=bound_tool.base_spec.id,
+                model_name=bound_tool.model_name,
+                authorization=authorization,
+                scope=authorization.scope,
+                runtime=bound_tool.runtime,
+            )
         )
         try:
             handler = spec.handler
@@ -3653,25 +3925,46 @@ class AgentLoop:
                 pending = handler(context, arguments)
                 result = await self._await_native_tool_handler(pending, deadline)
             else:
-                result = await asyncio.to_thread(handler, context, arguments)
+                result = await self._await_native_tool_handler(
+                    _start_abandonable_sync_call(
+                        lambda: handler(context, arguments),
+                        thread_name=f"nar-tool-{self.spec.run_id}",
+                    ),
+                    deadline,
+                )
                 if inspect.isawaitable(result):
                     result = await self._await_native_tool_handler(result, deadline)
             if not isinstance(result, ToolResult):
                 raise TypeError("tool handler must return ToolResult")
         finally:
-            context._current_call = CallContext("", None, None)
+            context._exit_call()
         return result
 
     async def _await_native_tool_handler(
         self,
-        pending: Awaitable[ToolResult],
+        pending: Awaitable[ToolResult] | _AbandonableSyncCall[ToolResult],
         deadline: float | None,
     ) -> ToolResult:
-        """Await a native handler with run cancellation and deadline propagation."""
+        """Await a handler with run cancellation and deadline propagation.
 
-        task = asyncio.ensure_future(pending)
+        Both handler shapes come through here: a native async handler, and a sync handler wrapped
+        by ``_start_abandonable_sync_call``. A sync handler cannot be interrupted, so exceeding a
+        run boundary *abandons* it -- the same outcome an async handler that suppresses
+        cancellation already gets once ``async_tool_cancel_grace_s`` expires. It is the run
+        boundary that is reported (``cancelled`` / ``run_timeout``), not a tool failure: a
+        handler-local ``CancelledError`` keeps its distinct ``tool_handler_cancelled`` meaning.
+
+        An abandoned handler may still be writing to the workspace after the run has stopped
+        waiting for it. That is why abandonment is bounded by a grace interval rather than
+        immediate, and why blocking integrations should still enforce a timeout at their own I/O
+        edge -- the kernel can stop *waiting* for a handler, but it cannot stop the handler.
+        """
+
+        sync_call = pending if isinstance(pending, _AbandonableSyncCall) else None
+        task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
         loop = asyncio.get_running_loop()
         cancelled: asyncio.Future[None] = loop.create_future()
+        outcome_consumed = False
 
         def signal_cancelled() -> None:
             def resolve() -> None:
@@ -3694,6 +3987,7 @@ class AgentLoop:
             )
             self._check_run_boundary(deadline)
             if task in done:
+                outcome_consumed = True
                 try:
                     return task.result()
                 except asyncio.CancelledError as exc:
@@ -3709,14 +4003,15 @@ class AgentLoop:
             if not cancelled.done():
                 cancelled.cancel()
             if not task.done():
-                task.cancel()
-                done, _pending = await asyncio.wait(
-                    {task}, timeout=max(0.0, self.async_tool_cancel_grace_s)
+                await self._detach_unfinished_call(
+                    task, sync_call, grace_s=self.async_tool_cancel_grace_s
                 )
-                if task not in done:
-                    task.add_done_callback(_consume_task_outcome)
-                else:
-                    _consume_task_outcome(task)
+            elif not outcome_consumed:
+                # The handler finished -- possibly by raising -- in the same loop turn that made a
+                # run boundary observable, so ``_check_run_boundary`` raised before anything read the
+                # outcome. Nothing downstream will read it now either, and an unretrieved exception
+                # surfaces as a "Future exception was never retrieved" warning at collection.
+                _consume_task_outcome(task)
 
     def _finalize_tool_call(
         self,

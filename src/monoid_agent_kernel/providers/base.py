@@ -151,18 +151,14 @@ class ModelAdapter(Protocol):
     (see :func:`assemble_streamed_turn`) so a streamed turn produces the same orchestration
     events and checkpoints as a non-streamed one. When absent, ``astream`` falls back to the
     one-shot path above and simply emits no token deltas.
-    """
 
-    # Optional capability flag. The loop reads it via
-    # ``getattr(adapter, "supports_multimodal", False)``; an adapter that can
-    # accept non-text content parts sets it True. Defaulting off keeps existing
-    # adapters valid without declaring it. When True, the loop resolves by-reference
-    # media in the by-value ``messages`` log to wire blocks before the call.
-    supports_multimodal: bool = False
-    # The wire encoding a multimodal adapter expects for resolved media. The loop reads
-    # it via ``getattr(adapter, "wire_image_encoding", "base64")``. Only ``"base64"``
-    # is implemented today; ``"url"`` / ``"file_id"`` are reserved for later phases.
-    wire_image_encoding: str = "base64"
+    Optional capabilities: an adapter may additionally expose ``supports_multimodal`` /
+    ``wire_image_encoding`` (see :class:`MultimodalModelAdapter`) and ``provider_name``
+    (see :class:`ProviderNamedModelAdapter`). The engine reads each with ``getattr`` and a
+    neutral default, so they are deliberately NOT members of this protocol — declaring them
+    here would make them required for structural typing and reject an otherwise valid
+    third-party adapter that omits them.
+    """
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         ...
@@ -173,13 +169,58 @@ class AsyncModelAdapter(Protocol):
 
     An adapter may implement this contract without a synchronous ``next_turn`` method. The
     engine awaits ``anext_turn`` directly and preserves the same retry, event, and checkpoint
-    behavior as the synchronous adapter path.
+    behavior as the synchronous adapter path. The optional capabilities described on
+    :class:`ModelAdapter` apply here too, and are likewise not members of this protocol.
     """
 
-    supports_multimodal: bool = False
-    wire_image_encoding: str = "base64"
-
     async def anext_turn(self, request: ModelRequest) -> ModelTurn: ...
+
+
+# --- Optional adapter capabilities -----------------------------------------------------
+# Opt-in extensions, each declaring one capability the engine probes with ``getattr`` and a
+# default. Implementing them is never required: a bare ``ModelAdapter`` stays valid, and the
+# engine's behavior is identical whether an adapter declares the attribute or omits it. They
+# exist so the attribute names and meanings are part of the checked contract rather than a
+# convention, and so typed callers can narrow to "an adapter that reports this".
+#
+# Each member is declared as a read-only property, not an annotated attribute. That is what
+# makes the shipped adapters — which use ``ClassVar`` — satisfy these protocols: a protocol
+# member annotated ``name: str`` demands an *instance* variable and rejects a ``ClassVar``,
+# while a read-only property is satisfied by a ``ClassVar``, an instance attribute, and a
+# property alike.
+
+
+class MultimodalModelAdapter(Protocol):
+    """An adapter that accepts non-text content parts.
+
+    ``supports_multimodal`` True makes the loop resolve by-reference media in the by-value
+    ``messages`` log to wire blocks before the call; the loop reads it via
+    ``getattr(adapter, "supports_multimodal", False)``, so omitting it means "text only".
+
+    A multimodal adapter may also expose ``wire_image_encoding`` to name the encoding it
+    expects for resolved media, read via ``getattr(adapter, "wire_image_encoding", "base64")``.
+    Only ``"base64"`` is implemented today; ``"url"`` / ``"file_id"`` are reserved for later
+    phases. It is deliberately not a member of this protocol: it is a parameter of the
+    capability rather than the capability itself, every shipped multimodal adapter relies on
+    its default, and adding it here would reject them all.
+    """
+
+    @property
+    def supports_multimodal(self) -> bool: ...
+
+
+class ProviderNamedModelAdapter(Protocol):
+    """An adapter that identifies whose opaque reasoning items it produces.
+
+    The loop reads ``provider_name`` via ``getattr(adapter, "provider_name", None)`` and tags
+    captured :attr:`ModelTurn.reasoning` with provider+model, so items only round-trip back to
+    a matching adapter and model. Omitting it means "do not tag": reasoning is not replayed,
+    which is the correct neutral behavior for an adapter with no provider-native reasoning
+    artifacts.
+    """
+
+    @property
+    def provider_name(self) -> str: ...
 
 
 class StreamingModelAdapter(Protocol):

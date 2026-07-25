@@ -265,14 +265,50 @@ one-shot contract for token streaming. `AgentLoop.astream` prefers the streaming
 its chunks into the same `ModelTurn`, event, error, and checkpoint path. Autonomous runs use the
 stream when `emit_output_deltas=True`.
 
+Two further opt-in protocols declare optional capability attributes:
+
+- `MultimodalModelAdapter.supports_multimodal: bool` — the loop resolves by-reference media in the
+  by-value `messages` log to wire blocks before the call. A multimodal adapter may also expose
+  `wire_image_encoding` (default `"base64"`); that attribute is not a protocol member because it
+  parameterizes the capability rather than declaring it.
+- `ProviderNamedModelAdapter.provider_name: str` — tags captured `ModelTurn.reasoning` with
+  provider+model so opaque reasoning items only round-trip back to a matching adapter and model.
+  Omitting it means "do not tag".
+
+Implementing them is never required. The loop probes each attribute with `getattr` and a neutral
+default, and behaves identically whether an adapter declares it or omits it, so the attributes are
+deliberately **not** members of `ModelAdapter` / `AsyncModelAdapter`: a protocol member is required
+for structural typing even when the protocol body assigns it a default, which would reject an
+adapter that implements only `next_turn`. Each member is declared as a read-only property so a
+`ClassVar`, an instance attribute, and a property all satisfy it.
+
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
 cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provider task is detached
 so a cancellation-suppressing adapter cannot block the run result. Turn interrupt and pause remain
-step-boundary signals for non-streamed model calls. A synchronous adapter runs through
-`asyncio.to_thread`; Python cannot force-stop that worker thread, so cancellation and the run
-deadline take effect after `next_turn` returns. Sync adapters should enforce their own provider I/O
-timeout and idempotency policy.
+step-boundary signals for non-streamed model calls. A synchronous `next_turn` observes the same two
+run boundaries: Python cannot force-stop its worker thread, so exceeding a boundary *abandons* the
+call rather than stopping it. The grace interval applies to the worker itself — a call that returns
+inside `async_model_cancel_grace_s` settles normally and is not abandoned, so the boundary is
+reported once the worker has stopped rather than while it races run finalization. Only a call still
+running when the grace expires is abandoned: the run reports `cancelled` or `run_timeout` while the
+worker keeps going and its late outcome is discarded. A settled worker does not change the outcome —
+the grace is not an extension of the deadline. Sync adapters should still enforce their own provider
+I/O timeout and idempotency policy, because the kernel can stop waiting for a call it cannot stop.
+
+Abandonment is not free, and this is a known limitation rather than a settled guarantee: nothing can
+reclaim the thread of a call that never returns, and the run no longer blocks to throttle the next
+attempt, so an implementation that wedges *permanently* accumulates one thread per abandoned call
+across runs. Each abandonment is logged as a warning on the `monoid_agent_kernel.loop` logger so the
+growth is visible; there is currently no cap on outstanding abandoned calls.
+
+Nor is there a bound on *healthy* concurrent sync calls. A dedicated daemon thread per call is what
+makes abandonment possible, but it gives up the thread-pool bound a shared executor provided: within
+one run sync calls are sequential, so this is a per-process concern for a host driving many runs at
+once, where a burst can reach the process thread limit and fail calls that would otherwise succeed.
+Hosts that run many concurrent sessions with synchronous adapters or tools should bound admission
+themselves until the kernel does. Both bounds belong with per-call resource policy rather than with
+the dispatch helper, and are tracked for a later release.
 
 `ModelRequest` carries:
 
@@ -324,9 +360,33 @@ external boundary.
 Run cancellation and the run deadline cancel an in-flight native async handler and preserve the
 run-level `cancelled` or `run_timeout` result. Cleanup has a bounded
 `AgentLoop.async_tool_cancel_grace_s` window; a handler that suppresses cancellation is detached
-after that window so it cannot block the run result. A synchronous Python call cannot be
-force-stopped safely; its worker completes before the next run-boundary check. Sync tools that
-perform external I/O should apply their own operation timeout and idempotency policy.
+after that window so it cannot block the run result. A synchronous handler observes the same two
+boundaries and the same window, but cannot be force-stopped, so it is detached without ever
+receiving a cancellation to clean up after — the position a cancellation-suppressing async handler
+already ends in. The window applies to the worker thread: a handler that returns inside it settles
+normally and is never detached, which is what keeps its workspace writes ahead of run finalization
+instead of racing it. A handler still running when the window expires is detached and may still be
+writing to the workspace after the run stopped waiting for it. An awaitable it returns too late is
+disposed rather than left dangling — a coroutine is closed, and a future or task is cancelled and
+its outcome consumed. Sync tools that perform external I/O should apply their own operation timeout
+and idempotency policy, because the kernel can stop waiting for a handler it cannot stop.
+
+A handler's call authorization follows the handler, including into threads it starts itself: a
+`ToolContext` operation delegated to a joined child thread is checked against the same binding scope
+as the parent. It also stays valid for a handler the run has abandoned, so a detached handler keeps
+its own scope rather than picking up whichever call the run moved on to.
+
+Outside a tool call there is no binding whose scope could authorize anything, so scoped `ToolContext`
+operations — path checks, shell execution, web access — **refuse** rather than fall back to the
+run-level permission policy. Every scope check narrows only under a non-empty allow/deny list, so
+treating "no call" as an empty scope would grant the widest authorization in the run at the moment it
+is least warranted. This is what bounds a thread descended from an *abandoned* handler: once the run
+gives up on the parent, the thread is refused. One narrower case remains: while some *other* call is
+live, such a thread reads that call's authorization instead of its own, because nothing links a
+thread to its creator — Python exposes no parent edges — so it cannot be told apart from the live
+call's own child thread. It borrows a scope rather than escaping scoping. Handlers that outlive their
+run and fan out to further threads should re-check their own authorization rather than relying on
+`ToolContext` to narrow for them.
 
 `ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
 errors become failed tool observations. A handler-local `CancelledError` maps to
