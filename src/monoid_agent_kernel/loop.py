@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import Any
+from typing import Any, TypeVar
 
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
 from monoid_agent_kernel.core.cancellation import CancellationToken
@@ -195,17 +195,22 @@ def _consume_task_outcome(task: asyncio.Future[Any]) -> None:
         pass
 
 
-def _start_abandonable_sync_model_call(
-    next_turn: Callable[[ModelRequest], ModelTurn],
-    request: ModelRequest,
+_T = TypeVar("_T")
+
+
+def _start_abandonable_sync_call(
+    call: Callable[[], _T],
     *,
     thread_name: str,
-) -> asyncio.Future[ModelTurn]:
-    """Run a blocking ``next_turn`` on a daemon thread, exposed as a future on the running loop.
+) -> asyncio.Future[_T]:
+    """Run a blocking call on a daemon thread, exposed as a future on the running loop.
+
+    Used for both halves of the sync surface -- a sync ``next_turn`` and a sync tool handler --
+    so each observes run cancellation and the run deadline like its async counterpart.
 
     ``asyncio.to_thread`` is unusable for a call the run may have to abandon: it borrows the
     event loop's *default* executor, and ``asyncio.run`` joins every worker in that executor
-    before returning. A provider that never returns would hang the caller at loop shutdown even
+    before returning. A callee that never returns would hang the caller at loop shutdown even
     though the run itself already produced its ``run_timeout`` or ``cancelled`` result -- the
     deadline would be enforced internally but unobservable from the documented async entry point.
     A daemon thread is joined by nobody, neither loop shutdown nor the interpreter's exit hooks,
@@ -216,12 +221,17 @@ def _start_abandonable_sync_model_call(
     """
 
     loop = asyncio.get_running_loop()
-    future: asyncio.Future[ModelTurn] = loop.create_future()
+    future: asyncio.Future[_T] = loop.create_future()
     outcome: list[tuple[bool, Any]] = []
 
     def deliver() -> None:
         succeeded, payload = outcome[0]
         if future.done():
+            if succeeded and inspect.iscoroutine(payload):
+                # A sync tool handler may return an awaitable. This one arrived after the run
+                # abandoned the call, so nothing will ever await it: close it here rather than
+                # let it surface as an unawaited-coroutine warning at collection.
+                payload.close()
             return
         if succeeded:
             future.set_result(payload)
@@ -230,7 +240,7 @@ def _start_abandonable_sync_model_call(
 
     def worker() -> None:
         try:
-            outcome.append((True, next_turn(request)))
+            outcome.append((True, call()))
         except BaseException as exc:  # surfaced to the awaiter, never swallowed here
             outcome.append((False, exc))
         try:
@@ -1572,8 +1582,9 @@ class AgentLoop:
         if inspect.iscoroutinefunction(next_turn):
             return await self._await_native_model_call(next_turn(request), deadline)
         return await self._await_native_model_call(
-            _start_abandonable_sync_model_call(
-                next_turn, request, thread_name=f"nar-model-call-{self.spec.run_id}"
+            _start_abandonable_sync_call(
+                lambda: next_turn(request),
+                thread_name=f"nar-model-call-{self.spec.run_id}",
             ),
             deadline,
         )
@@ -3719,7 +3730,13 @@ class AgentLoop:
                 pending = handler(context, arguments)
                 result = await self._await_native_tool_handler(pending, deadline)
             else:
-                result = await asyncio.to_thread(handler, context, arguments)
+                result = await self._await_native_tool_handler(
+                    _start_abandonable_sync_call(
+                        lambda: handler(context, arguments),
+                        thread_name=f"nar-tool-{self.spec.run_id}",
+                    ),
+                    deadline,
+                )
                 if inspect.isawaitable(result):
                     result = await self._await_native_tool_handler(result, deadline)
             if not isinstance(result, ToolResult):
@@ -3733,7 +3750,20 @@ class AgentLoop:
         pending: Awaitable[ToolResult],
         deadline: float | None,
     ) -> ToolResult:
-        """Await a native handler with run cancellation and deadline propagation."""
+        """Await a handler with run cancellation and deadline propagation.
+
+        Both handler shapes come through here: a native async handler, and a sync handler wrapped
+        by ``_start_abandonable_sync_call``. A sync handler cannot be interrupted, so exceeding a
+        run boundary *abandons* it -- the same outcome an async handler that suppresses
+        cancellation already gets once ``async_tool_cancel_grace_s`` expires. It is the run
+        boundary that is reported (``cancelled`` / ``run_timeout``), not a tool failure: a
+        handler-local ``CancelledError`` keeps its distinct ``tool_handler_cancelled`` meaning.
+
+        An abandoned handler may still be writing to the workspace after the run has stopped
+        waiting for it. That is why abandonment is bounded by a grace interval rather than
+        immediate, and why blocking integrations should still enforce a timeout at their own I/O
+        edge -- the kernel can stop *waiting* for a handler, but it cannot stop the handler.
+        """
 
         task = asyncio.ensure_future(pending)
         loop = asyncio.get_running_loop()

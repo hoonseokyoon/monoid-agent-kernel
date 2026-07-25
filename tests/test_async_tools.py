@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import threading
 import time
@@ -220,6 +221,153 @@ def test_run_deadline_cancels_native_async_tool(tmp_path: Path) -> None:
     assert result.status == "limited"
     assert result.error_code == "run_timeout"
     assert cleaned_up is True
+
+
+def _block_like_a_stuck_handler() -> None:
+    """Block the way a wedged sync handler does: with no way for the run to release it.
+
+    Deliberately not an event the test can set -- releasing the worker would hide whether the run
+    was freed on its own. The bound only keeps a regression to a failure instead of a hung session;
+    it is far above the ~1s these runs take, so it never fires in a passing run and the daemon
+    worker simply outlives the test.
+    """
+
+    threading.Event().wait(timeout=20)
+
+
+def test_run_deadline_abandons_blocking_sync_tool(tmp_path: Path) -> None:
+    """A blocking sync handler observes the run deadline like a native async handler.
+
+    The worker cannot be interrupted, so the run abandons it after the grace interval. That has to
+    survive ``asyncio.run`` returning, which joins the default executor's workers and would leave
+    the deadline enforced internally but unobservable from outside -- hence the liveness assertion.
+    """
+    workers: list[threading.Thread] = []
+
+    @tool(id="sync.block")
+    def block() -> dict:
+        workers.append(threading.current_thread())
+        _block_like_a_stuck_handler()
+        return {"late": True}
+
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(tool_calls=(fake_tool_call("sync_block", {}, "c1"),))]
+    )
+    result = asyncio.run(
+        AgentLoop.from_tools(
+            _spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+            adapter,
+            [block],
+            async_tool_cancel_grace_s=0.2,
+        ).arun_once("go")
+    )
+
+    assert result.status == "limited"
+    assert result.error_code == "run_timeout"
+    assert workers[0].is_alive() is True
+
+
+def test_run_cancellation_abandons_blocking_sync_tool(tmp_path: Path) -> None:
+    token = CancellationToken()
+    started = threading.Event()
+    workers: list[threading.Thread] = []
+
+    @tool(id="sync.block_forever")
+    def block_forever() -> dict:
+        workers.append(threading.current_thread())
+        started.set()
+        _block_like_a_stuck_handler()
+        return {"late": True}
+
+    async def run() -> object:
+        adapter = FakeModelAdapter(
+            turns=[ModelTurn(tool_calls=(fake_tool_call("sync_block_forever", {}, "c1"),))]
+        )
+        loop = AgentLoop.from_tools(
+            _spec(tmp_path),
+            adapter,
+            [block_forever],
+            cancellation_token=token,
+            async_tool_cancel_grace_s=0.2,
+        )
+        pending = asyncio.create_task(loop.arun_once("go"))
+        await asyncio.to_thread(started.wait, 5)
+        token.cancel()
+        return await asyncio.wait_for(pending, timeout=10)
+
+    result = asyncio.run(run())
+
+    assert result.status == "limited"
+    # The run boundary is reported, not a tool failure: ``tool_handler_cancelled`` stays reserved
+    # for a handler-local ``CancelledError``.
+    assert result.error_code == "cancelled"
+    assert workers[0].is_alive() is True
+
+
+def test_awaitable_from_abandoned_sync_tool_is_closed(tmp_path: Path) -> None:
+    """A sync handler may return an awaitable. If the run abandoned the call before it did, that
+    awaitable is closed rather than left for the collector to warn about.
+
+    The close lands on the event loop, so it is only observable where the loop outlives the
+    abandonment -- the deployed shape, as the reference backend keeps one loop for many runs. Under
+    a bare ``asyncio.run`` the loop is already closed and there is nothing left to close it on.
+    """
+    workers: list[threading.Thread] = []
+    returned: list[object] = []
+
+    # A raw ``ToolSpec`` handler, because that is the shape that can return an awaitable at all --
+    # the ``@tool`` decorator wraps whatever the function returns in a ``ToolResult``.
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            async def late_result() -> ToolResult:
+                # pragma: no cover - abandoned before anything awaits it
+                return ToolResult(ok=True, content={"late": True})
+
+            def handler(_ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                workers.append(threading.current_thread())
+                # Outlive the deadline and the grace window, then hand back an awaitable anyway.
+                threading.Event().wait(timeout=1.5)
+                coroutine = late_result()
+                returned.append(coroutine)
+                return coroutine  # type: ignore[return-value]
+
+            return [
+                ToolSpec(
+                    id="sync.late_awaitable",
+                    description="sync tool returning an awaitable",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="read",
+                    handler=handler,
+                )
+            ]
+
+    async def run() -> object:
+        adapter = FakeModelAdapter(
+            turns=[ModelTurn(tool_calls=(fake_tool_call("sync_late_awaitable", {}, "c1"),))]
+        )
+        result = await AgentLoop(
+            spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+            model_adapter=adapter,
+            runtime_config_provider=runtime_provider(
+                runtime_config(bindings=(tool_binding("sync.late_awaitable"),))
+            ),
+            tool_providers=(Provider(),),
+            async_tool_cancel_grace_s=0.05,
+        ).arun_once("go")
+        # Wait on the abandoned worker without blocking the loop, then let its queued callback run.
+        await asyncio.to_thread(workers[0].join, 10)
+        await asyncio.sleep(0)
+        return result
+
+    result = asyncio.run(run())
+
+    assert result.status == "limited"
+    assert result.error_code == "run_timeout"
+    assert inspect.getcoroutinestate(returned[0]) == inspect.CORO_CLOSED
 
 
 def test_stubborn_async_tool_cleanup_cannot_block_run_cancellation(tmp_path: Path) -> None:
