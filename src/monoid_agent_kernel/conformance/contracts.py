@@ -338,6 +338,7 @@ def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutc
     except Exception as exc:
         outcomes.append(_error("REDACTOR-03-FAILURE-IS-CONTAINED", REDACTOR_CONTRACT_PROFILE, exc))
 
+
     try:
         mapping_result = factory().redact(payload, policy=policy)
         text_result = factory().redact("a sk-abc123 line", policy=policy)
@@ -362,6 +363,31 @@ def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutc
         )
     except Exception as exc:
         outcomes.append(_error("REDACTOR-04-PRESERVES-THE-VALUE-SHAPE", REDACTOR_CONTRACT_PROFILE, exc))
+
+    try:
+        redacted = factory().redact(payload, policy=policy)
+        free_text = factory().redact("a sk-abc123 line with hunter2 in it", policy=policy)
+        rendered = json.dumps(_jsonish({"payload": redacted, "text": free_text}))
+        outcomes.append(
+            outcome_from_observations(
+                "REDACTOR-05-NO-POLICY-TEXT-LEAK",
+                REDACTOR_CONTRACT_PROFILE,
+                (
+                    # The other axes of a RedactionPolicy. Key names are no help in a paragraph, and
+                    # model *output* is all paragraph, so a redactor that masks only secret-named keys
+                    # protects the request side and leaks the response side entirely.
+                    observation("pattern_in_a_mapping_value", expected=False, actual="sk-abc123" in rendered),
+                    observation("literal_in_a_mapping_value", expected=False, actual="hunter2" in rendered),
+                    # Inside a list, where a recursive implementation can easily stop descending.
+                    observation("pattern_inside_a_list", expected=False, actual="sk-xyz789" in rendered),
+                    # And on a bare string, the shape a final_text capture actually has.
+                    observation("pattern_in_free_text", expected=False, actual="sk-abc123" in str(free_text)),
+                    observation("literal_in_free_text", expected=False, actual="hunter2" in str(free_text)),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(_error("REDACTOR-05-NO-POLICY-TEXT-LEAK", REDACTOR_CONTRACT_PROFILE, exc))
 
     return tuple(outcomes)
 

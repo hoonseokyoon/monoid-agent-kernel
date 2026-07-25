@@ -86,6 +86,19 @@ def test_from_json_rejects_a_non_object_and_a_mistyped_field() -> None:
         InvocationContext.from_json({"attributes": "not-an-object"})
 
 
+@pytest.mark.parametrize("attributes", [[], 0, False, ""])
+def test_from_json_rejects_falsy_attributes_of_the_wrong_type(attributes: object) -> None:
+    """Same absent-vs-falsy rule as `core.model_io`, so the two halves of one receipt payload cannot
+    disagree about what a malformed field means."""
+    with pytest.raises(WireValidationError):
+        InvocationContext.from_json({"attributes": attributes})
+
+
+def test_from_json_treats_absent_and_null_attributes_as_empty() -> None:
+    assert InvocationContext.from_json({}) == InvocationContext()
+    assert InvocationContext.from_json({"attributes": None}) == InvocationContext()
+
+
 # --- Trace context: carried, never enforced -------------------------------------------------
 
 

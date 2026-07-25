@@ -108,6 +108,20 @@ def test_from_json_rejects_malformed_rule_lists(payload: dict[str, Any]) -> None
         RedactionPolicy.from_json(payload)
 
 
+@pytest.mark.parametrize("payload", [{"patterns": ""}, {"literals": ""}, {"patterns": 0}])
+def test_from_json_rejects_a_falsy_value_of_the_wrong_type(payload: dict[str, Any]) -> None:
+    """The `payload.get(key) or ()` idiom read these as an empty list, so a malformed configuration
+    silently disabled text masking while still producing captures labelled `redacted`."""
+    with pytest.raises(ValueError, match="must be an array of strings"):
+        RedactionPolicy.from_json(payload)
+
+
+@pytest.mark.parametrize("key", ["patterns", "literals"])
+def test_from_json_still_treats_absent_and_null_rule_lists_as_empty(key: str) -> None:
+    assert RedactionPolicy.from_json({}) == RedactionPolicy()
+    assert RedactionPolicy.from_json({key: None}) == RedactionPolicy()
+
+
 def test_an_invalid_regex_fails_when_the_policy_is_built() -> None:
     """Not mid-call: a policy is configuration, and configuration errors belong at load time."""
     with pytest.raises(ValueError, match="invalid redaction pattern"):

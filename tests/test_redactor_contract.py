@@ -31,6 +31,7 @@ def test_shipped_redactors_satisfy_the_contract(redactor_factory: Callable[[], R
         "REDACTOR-02-NO-DEFAULT-SECRET-LEAK",
         "REDACTOR-03-FAILURE-IS-CONTAINED",
         "REDACTOR-04-PRESERVES-THE-VALUE-SHAPE",
+        "REDACTOR-05-NO-POLICY-TEXT-LEAK",
     ]
     assert all(outcome.status == "passed" for outcome in outcomes), [
         (outcome.rule_id, outcome.status, outcome.error) for outcome in outcomes
@@ -83,6 +84,38 @@ def test_the_contract_catches_a_redactor_that_ignores_the_default_secret_keys() 
 
     assert statuses["REDACTOR-01-DETERMINISTIC"] == "passed"
     assert statuses["REDACTOR-02-NO-DEFAULT-SECRET-LEAK"] == "failed"
+    # It does apply the free-text rules, so the two leak rules are genuinely independent axes rather
+    # than one rule split in two.
+    assert statuses["REDACTOR-05-NO-POLICY-TEXT-LEAK"] == "passed"
+
+
+def test_the_contract_catches_a_redactor_that_only_masks_secret_named_keys() -> None:
+    """The mirror of `TextOnly`, and the hole that let a leaking redactor be certified.
+
+    Key names are no help in a paragraph, and model *output* is all paragraph, so a key-only redactor
+    protects the request side and leaks the response side in full. Every rule but the new one passes.
+    """
+
+    class KeyOnly:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: (
+                        policy.replacement
+                        if policy.names_a_secret(str(key))
+                        else self.redact(item, policy=policy)
+                    )
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [self.redact(item, policy=policy) for item in value]
+            return value
+
+    statuses = _statuses(run_redactor_contract(KeyOnly))
+
+    assert statuses["REDACTOR-02-NO-DEFAULT-SECRET-LEAK"] == "passed"
+    assert statuses["REDACTOR-04-PRESERVES-THE-VALUE-SHAPE"] == "passed"
+    assert statuses["REDACTOR-05-NO-POLICY-TEXT-LEAK"] == "failed"
 
 
 def test_the_contract_catches_a_redactor_that_masks_everything() -> None:

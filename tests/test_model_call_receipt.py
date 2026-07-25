@@ -180,6 +180,33 @@ def test_from_json_distinguishes_an_absent_http_status_from_zero() -> None:
     assert ModelCallReceipt.from_json({"http_status": 0}).http_status == 0
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"context": []},
+        {"context": False},
+        {"context": 0},
+        {"model": []},
+        {"model": "gpt-5.5"},
+        {"usage": 0},
+    ],
+)
+def test_from_json_rejects_a_falsy_malformed_nested_payload(payload: dict[str, object]) -> None:
+    """A falsy wrong type used to be read as "absent", so `{"context": []}` was accepted as an
+    anonymous invocation and a corrupt audit record silently lost its run and trace attribution.
+
+    `{"model": []}` additionally used to raise `AttributeError` out of `ModelConfig.from_json`, which
+    assumes dict-or-None — a crash on untrusted input rather than a rejection.
+    """
+    with pytest.raises(WireValidationError):
+        ModelCallReceipt.from_json(payload)
+
+
+@pytest.mark.parametrize("key", ["context", "model", "usage"])
+def test_from_json_still_treats_absent_and_null_nested_payloads_as_defaults(key: str) -> None:
+    assert ModelCallReceipt.from_json({key: None}) == ModelCallReceipt()
+
+
 def test_from_json_rejects_a_non_object_and_a_mistyped_field() -> None:
     with pytest.raises(WireValidationError):
         ModelCallReceipt.from_json("not-an-object")

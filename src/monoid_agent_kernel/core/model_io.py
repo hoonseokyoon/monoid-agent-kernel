@@ -65,6 +65,29 @@ def _compiled(pattern: str) -> re.Pattern[str]:
     return re.compile(pattern)
 
 
+def _absent_as_empty(payload: Mapping[str, Any], key: str) -> Any:
+    """`()` when `key` is absent or explicitly null, the raw value otherwise.
+
+    Deliberately not `payload.get(key) or ()`, the idiom used elsewhere in this repo. That reads a
+    *falsy wrong type* as an empty list, so `{"patterns": ""}` silently disabled text masking and still
+    produced captures labelled `redacted` — the validator downstream never saw the bad value. Here the
+    only shortcut is for genuinely absent or null; anything present reaches the type check.
+    """
+    value = payload.get(key, None)
+    return () if value is None else value
+
+
+def _optional_object(payload: Mapping[str, Any], key: str) -> dict[str, Any] | None:
+    """A present object, or `None` when absent/null. A falsy wrong type still raises.
+
+    Same hazard as `_absent_as_empty`, one level up: `{"context": []}` read as "no context" would
+    accept a corrupt audit record as an anonymous invocation and quietly drop its run and trace
+    attribution.
+    """
+    value = payload.get(key, None)
+    return None if value is None else require_object(value, key)
+
+
 @dataclass(frozen=True)
 class RedactionPolicy:
     """What counts as sensitive in a model call's prompt and output.
@@ -132,12 +155,12 @@ class RedactionPolicy:
         return cls(
             secret_key_parts=dedupe(secret_key_parts),
             patterns=str_tuple(
-                payload.get("patterns") or (),
+                _absent_as_empty(payload, "patterns"),
                 type_error="patterns must be an array of strings",
                 empty_error="empty redaction pattern is not allowed",
             ),
             literals=str_tuple(
-                payload.get("literals") or (),
+                _absent_as_empty(payload, "literals"),
                 type_error="literals must be an array of strings",
                 empty_error="empty redaction literal is not allowed",
             ),
@@ -317,14 +340,14 @@ class CapturePolicy:
             return cls()
         payload = require_object(payload, "capture_policy")
         # Absent and explicit ``null`` both mean "no policy of its own", which resolves to the default
-        # via ``effective_redaction``. Only a present object is parsed, so a malformed one still
-        # raises rather than silently becoming the default.
-        raw_redaction = payload.get("redaction")
+        # via ``effective_redaction``. Anything else present is parsed, so a malformed value -- falsy
+        # ones included -- still raises rather than silently becoming the default.
+        redaction_payload = _optional_object(payload, "redaction")
         return cls(
             mode=parse_literal(payload, "mode", CAPTURE_MODES, default="full"),
             redaction=(
-                RedactionPolicy.from_json(require_object(raw_redaction, "redaction"))
-                if raw_redaction is not None
+                RedactionPolicy.from_json(redaction_payload)
+                if redaction_payload is not None
                 else None
             ),
             restored_without_redactor=payload.get("redactor") is not None,
@@ -486,12 +509,19 @@ class ModelCallReceipt:
     @classmethod
     def from_json(cls, payload: Any) -> ModelCallReceipt:
         payload = require_object(payload, "model_call_receipt")
-        raw_usage = payload.get("usage")
-        usage = require_object(raw_usage, "usage") if raw_usage is not None else {}
+        usage = _optional_object(payload, "usage") or {}
+        context_payload = _optional_object(payload, "context")
+        # ``ModelConfig.from_json`` assumes a dict-or-None and would raise ``AttributeError`` on any
+        # other type, so the object check has to happen here rather than being left to it.
+        model_payload = _optional_object(payload, "model")
         raw_status = payload.get("http_status")
         return cls(
-            context=InvocationContext.from_json(payload.get("context") or {}),
-            model=ModelConfig.from_json(payload.get("model")),
+            context=(
+                InvocationContext.from_json(context_payload)
+                if context_payload is not None
+                else InvocationContext()
+            ),
+            model=ModelConfig.from_json(model_payload),
             provider_name=parse_str(payload, "provider_name"),
             prompt_digest=parse_str(payload, "prompt_digest"),
             request_digest=parse_str(payload, "request_digest"),

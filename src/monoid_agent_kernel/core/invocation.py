@@ -117,8 +117,12 @@ class InvocationContext:
     @classmethod
     def from_json(cls, payload: Any) -> InvocationContext:
         payload = require_object(payload, "invocation context")
+        # Absent and explicit ``null`` both mean "no attributes"; anything else present is checked, so
+        # a falsy wrong type cannot pass for an empty map. Same rule as ``core.model_io`` uses, so the
+        # two halves of one receipt payload do not disagree about what a malformed field means.
+        raw_attributes = payload.get("attributes")
         attributes_payload = (
-            require_object(payload["attributes"], "attributes") if "attributes" in payload else {}
+            {} if raw_attributes is None else require_object(raw_attributes, "attributes")
         )
         return cls(
             run_id=parse_str(payload, "run_id"),
