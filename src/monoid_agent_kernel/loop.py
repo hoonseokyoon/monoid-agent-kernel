@@ -15,8 +15,7 @@ from typing import Any
 
 from monoid_agent_kernel.core._sync_bridge import (
     AbandonableSyncCall,
-    consume_task_outcome,
-    detach_unfinished_call,
+    await_abandonable_call,
     start_abandonable_sync_call,
 )
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
@@ -3669,58 +3668,22 @@ class AgentLoop:
         edge -- the kernel can stop *waiting* for a handler, but it cannot stop the handler.
         """
 
-        sync_call = pending if isinstance(pending, AbandonableSyncCall) else None
-        task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
-        loop = asyncio.get_running_loop()
-        cancelled: asyncio.Future[None] = loop.create_future()
-        outcome_consumed = False
-
-        def signal_cancelled() -> None:
-            def resolve() -> None:
-                if not cancelled.done():
-                    cancelled.set_result(None)
-
-            loop.call_soon_threadsafe(resolve)
-
-        remove_callback = (
-            self.cancellation_token.add_cancel_callback(signal_cancelled)
-            if self.cancellation_token is not None
-            else lambda: None
-        )
-        timeout = None if deadline is None else max(0.0, deadline - time.time())
         try:
-            done, _pending = await asyncio.wait(
-                {task, cancelled},
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
+            return await await_abandonable_call(
+                pending,
+                deadline=deadline,
+                token=self.cancellation_token,
+                grace_s=self.async_tool_cancel_grace_s,
+                check_boundary=self._check_run_boundary,
             )
-            self._check_run_boundary(deadline)
-            if task in done:
-                outcome_consumed = True
-                try:
-                    return task.result()
-                except asyncio.CancelledError as exc:
-                    raise ToolExecutionError(
-                        "async tool handler was cancelled",
-                        error_code="tool_handler_cancelled",
-                    ) from exc
-            if cancelled in done:
-                raise RunCancelled("run cancelled")
-            raise RunTimeout("run exceeded max duration")
-        finally:
-            remove_callback()
-            if not cancelled.done():
-                cancelled.cancel()
-            if not task.done():
-                await detach_unfinished_call(
-                    task, sync_call, grace_s=self.async_tool_cancel_grace_s
-                )
-            elif not outcome_consumed:
-                # The handler finished -- possibly by raising -- in the same loop turn that made a
-                # run boundary observable, so ``_check_run_boundary`` raised before anything read the
-                # outcome. Nothing downstream will read it now either, and an unretrieved exception
-                # surfaces as a "Future exception was never retrieved" warning at collection.
-                consume_task_outcome(task)
+        except asyncio.CancelledError as exc:
+            # Distinct from the run boundaries the shared race raises: a handler cancelled from
+            # inside keeps its own ``tool_handler_cancelled`` meaning rather than being reported as
+            # the run stopping.
+            raise ToolExecutionError(
+                "async tool handler was cancelled",
+                error_code="tool_handler_cancelled",
+            ) from exc
 
     def _finalize_tool_call(
         self,

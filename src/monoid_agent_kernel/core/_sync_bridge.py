@@ -14,10 +14,14 @@ import asyncio
 import inspect
 import logging
 import threading
+import time
 from collections.abc import Callable
 from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
+
+from monoid_agent_kernel.core.cancellation import CancellationToken
+from monoid_agent_kernel.errors import RunCancelled, RunTimeout
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.core.sync_bridge")
 
@@ -167,6 +171,79 @@ def start_abandonable_sync_call(
 
     threading.Thread(target=worker, name=thread_name, daemon=True).start()
     return AbandonableSyncCall(result=future, settled=settled, warn_if_unsettled=warn_if_unsettled)
+
+
+async def await_abandonable_call(
+    pending: Any,
+    *,
+    deadline: float | None,
+    token: CancellationToken | None,
+    grace_s: float,
+    check_boundary: Callable[[float | None], None],
+) -> Any:
+    """Await a call while propagating run cancellation and the run deadline.
+
+    The one race behind both halves of the kernel's async surface -- a model call and a tool
+    handler. It was written twice and the copies had already drifted: one tested `task in done`
+    against the set `asyncio.wait` returned, the other `task.done()`. Equivalent in practice, since
+    nothing awaits between the two statements, but the pair is exactly the shape that stops being
+    equivalent the day someone adds an await.
+
+    What the two callers genuinely differ on is passed in. `check_boundary` is the caller's notion
+    of which boundaries are terminal *while this kind of call is in flight*: a model call answers to
+    cancellation and the deadline only, a tool handler also answers to interrupt and pause.
+    `grace_s` is how long an abandoned worker gets to settle.
+
+    A synchronous callee cannot be interrupted: its thread keeps running to completion. Cancelling
+    its future therefore *abandons* the call -- the run stops waiting within `grace_s` and the
+    detached outcome is consumed so late cleanup cannot warn, but the callee's socket and CPU work
+    continue until it returns on its own. Abandoning is only real because the thread is a daemon
+    nobody joins.
+
+    `asyncio.CancelledError` from the callee is left to propagate: the two callers report it
+    differently and neither meaning belongs here.
+    """
+
+    sync_call = pending if isinstance(pending, AbandonableSyncCall) else None
+    task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
+    loop = asyncio.get_running_loop()
+    cancelled: asyncio.Future[None] = loop.create_future()
+    outcome_consumed = False
+
+    def signal_cancelled() -> None:
+        def resolve() -> None:
+            if not cancelled.done():
+                cancelled.set_result(None)
+
+        loop.call_soon_threadsafe(resolve)
+
+    remove_callback = (
+        token.add_cancel_callback(signal_cancelled) if token is not None else lambda: None
+    )
+    timeout = None if deadline is None else max(0.0, deadline - time.time())
+    try:
+        await asyncio.wait({task, cancelled}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        # Checked before the result is read, so a boundary that lands in the same tick as a
+        # completed call still wins. A run told to stop must not report work it decided not to do.
+        check_boundary(deadline)
+        if task.done():
+            outcome_consumed = True
+            return task.result()
+        if cancelled.done():
+            raise RunCancelled("run cancelled")
+        raise RunTimeout("run exceeded max duration")
+    finally:
+        remove_callback()
+        if not cancelled.done():
+            cancelled.cancel()
+        if not task.done():
+            await detach_unfinished_call(task, sync_call, grace_s=grace_s)
+        elif not outcome_consumed:
+            # The callee finished -- possibly by raising -- in the same loop turn that made a run
+            # boundary observable, so ``check_boundary`` raised before anything read the outcome.
+            # Nothing downstream will read it now either, and an unretrieved exception surfaces as a
+            # "Future exception was never retrieved" warning at collection.
+            consume_task_outcome(task)
 
 
 async def detach_unfinished_call(

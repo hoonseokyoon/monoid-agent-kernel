@@ -22,7 +22,6 @@ inherits classification without inheriting a retry loop.
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -30,9 +29,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from monoid_agent_kernel.core._sync_bridge import (
-    AbandonableSyncCall,
-    consume_task_outcome,
-    detach_unfinished_call,
+    await_abandonable_call,
     start_abandonable_sync_call,
 )
 from monoid_agent_kernel.core._util import canonical_sha256
@@ -321,61 +318,18 @@ class ModelCallRunner:
 
         return await self._aawait(consume(), deadline)
 
-    async def _aawait(
-        self,
-        pending: Any,
-        deadline: float | None,
-    ) -> ModelTurn:
-        """Await model I/O while propagating cancellation and the deadline.
+    async def _aawait(self, pending: Any, deadline: float | None) -> ModelTurn:
+        """Await model I/O against the shared cancel/deadline race.
 
-        A synchronous adapter cannot be interrupted: its thread keeps running to completion.
-        Cancelling its future therefore *abandons* the call -- the caller stops waiting within
-        `cancel_grace_s` and the detached outcome is consumed so late cleanup cannot warn, but the
-        provider's socket and CPU work continue until the adapter returns on its own. Abandoning is
-        only real because the thread is a daemon nobody joins, which is why the call goes through
-        `start_abandonable_sync_call` rather than `asyncio.to_thread`. Adapters that must release
-        resources promptly should expose `anext_turn` or a coroutine `next_turn`.
+        Only terminal run boundaries apply while a model call is in flight. Interrupt and pause are
+        step-boundary signals for a one-shot call and are the caller's to check after the model
+        returns; on a streamed call the caller's `should_abort` covers the cooperative stop.
         """
 
-        sync_call = pending if isinstance(pending, AbandonableSyncCall) else None
-        task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
-        loop = asyncio.get_running_loop()
-        cancelled: asyncio.Future[None] = loop.create_future()
-        outcome_consumed = False
-
-        def signal_cancelled() -> None:
-            def resolve() -> None:
-                if not cancelled.done():
-                    cancelled.set_result(None)
-
-            loop.call_soon_threadsafe(resolve)
-
-        token = self._token()
-        remove_callback = (
-            token.add_cancel_callback(signal_cancelled) if token is not None else lambda: None
+        return await await_abandonable_call(
+            pending,
+            deadline=deadline,
+            token=self._token(),
+            grace_s=self.cancel_grace_s,
+            check_boundary=self._check_cancel_or_deadline,
         )
-        timeout = None if deadline is None else max(0.0, deadline - time.time())
-        try:
-            await asyncio.wait(
-                {task, cancelled},
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            # Checked before the result is read, so a cancellation that lands in the same tick as a
-            # completed call still wins. A run that was told to stop must not report a turn it
-            # happened to finish.
-            self._check_cancel_or_deadline(deadline)
-            if task.done():
-                outcome_consumed = True
-                return task.result()
-            if cancelled.done():
-                raise RunCancelled("run cancelled")
-            raise RunTimeout("run exceeded max duration")
-        finally:
-            remove_callback()
-            if not cancelled.done():
-                cancelled.cancel()
-            if not task.done():
-                await detach_unfinished_call(task, sync_call, grace_s=self.cancel_grace_s)
-            elif not outcome_consumed:
-                consume_task_outcome(task)
