@@ -118,7 +118,10 @@ def _parsed_model_config(payload: Mapping[str, Any] | None) -> ModelConfig:
         parsed = ModelConfig.from_json(payload)
     except WireValidationError:
         raise
-    except (AttributeError, TypeError, ValueError) as exc:
+    # ``OverflowError`` is an ``ArithmeticError``, not a ``ValueError``, so it needs naming: JSON decodes
+    # an oversized exponent such as ``1e999`` to ``inf``, and ``int(inf)`` raises it. A corrupt audit
+    # record must not be able to crash a consumer that rejects corrupt audit records.
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
         raise WireValidationError(f"model must be a valid model config: {exc}") from exc
     try:
         _MODEL_CONFIG_ADAPTER.validate_python(parsed.to_json())
@@ -316,8 +319,12 @@ def redacted_or_none(
     of what the policy asked for. `None` is distinguishable from a successful redaction to `""`, so
     the caller can report the downgrade rather than mistake it for empty content.
     """
+    # ``is None``, not truthiness. A redactor is an arbitrary object, and one backed by a rule set that
+    # defines ``__len__`` is falsy when it holds no rules -- which is precisely when substituting the
+    # weaker built-in rules is least acceptable, and it would be reported as a successful redaction.
+    applied = DefaultRedactor() if redactor is None else redactor
     try:
-        return (redactor or DefaultRedactor()).redact(value, policy=policy)
+        return applied.redact(value, policy=policy)
     except Exception:
         return None
 

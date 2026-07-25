@@ -228,6 +228,18 @@ def test_from_json_rejects_a_malformed_nested_model_config(model: dict[str, obje
         ModelCallReceipt.from_json({"model": model})
 
 
+def test_from_json_rejects_an_oversized_numeric_exponent() -> None:
+    """`OverflowError` is an `ArithmeticError`, not a `ValueError`, so it escaped the translation.
+
+    JSON decodes `1e999` to `inf` and `int(inf)` raises it — so a corrupt audit record could crash the
+    consumer whose job is to reject corrupt audit records.
+    """
+    payload = json.loads('{"model": {"timeout_s": 1e999}}')
+
+    with pytest.raises(WireValidationError, match="model must be a valid model config"):
+        ModelCallReceipt.from_json(payload)
+
+
 def test_from_json_still_accepts_a_well_formed_nested_model_config() -> None:
     """The containment must not have been bought by rejecting valid nested configs."""
     restored = ModelCallReceipt.from_json(

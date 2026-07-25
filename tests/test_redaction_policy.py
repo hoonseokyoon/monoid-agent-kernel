@@ -242,6 +242,32 @@ def test_redacted_or_none_distinguishes_failure_from_redacting_to_empty() -> Non
     assert redacted_or_none("", policy=policy) == ""
 
 
+def test_a_falsy_custom_redactor_is_still_the_one_that_runs() -> None:
+    """`redactor or DefaultRedactor()` replaced any redactor with a false truth value.
+
+    A redactor backed by a rule set that defines `__len__` is falsy when it holds no rules — precisely
+    when substituting the weaker built-in rules is least acceptable, and the capture was still reported
+    as successfully redacted.
+    """
+
+    class RuleSetRedactor:
+        def __init__(self, rules: tuple[str, ...] = ()) -> None:
+            self.rules = list(rules)
+
+        def __len__(self) -> int:
+            return len(self.rules)
+
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return dict.fromkeys(value, "[classified]")
+
+    empty = RuleSetRedactor()
+    assert bool(empty) is False
+
+    assert redacted_or_none({"note": "plain text"}, policy=RedactionPolicy(), redactor=empty) == {
+        "note": "[classified]"
+    }
+
+
 def test_redacted_or_none_defaults_to_the_built_in_redactor() -> None:
     assert redacted_or_none({"token": "t"}, policy=RedactionPolicy()) == {
         "token": REDACTION_PLACEHOLDER
