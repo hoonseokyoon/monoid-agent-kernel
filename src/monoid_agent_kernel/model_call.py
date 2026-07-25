@@ -117,12 +117,18 @@ def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
     }
 
 
-def _request_payload(request: ModelRequest) -> dict[str, Any]:
-    """The whole request, as the thing `request_digest` identifies -- the replay key."""
+def _request_payload(request: ModelRequest, model: ModelConfig) -> dict[str, Any]:
+    """The whole request, as the thing `request_digest` identifies -- the replay key.
+
+    `model` is the *effective* config, resolved by the caller, not `request.model`. The request's
+    is optional and the shipped adapters fall back to their own, so hashing `request.model or
+    ModelConfig()` gave two calls on differently-configured adapters the same replay key -- and
+    stamped the receipt with the default model rather than the one that ran.
+    """
 
     payload = _prompt_payload(request)
     payload["tools"] = [_tool_payload(spec) for spec in request.tools]
-    payload["model"] = (request.model or ModelConfig()).to_json()
+    payload["model"] = model.to_json()
     return payload
 
 
@@ -208,6 +214,20 @@ class ModelCallRunner:
     """Observers of settled calls. Empty by default: capture is opt-in, and a runner wired to
     nothing does no digesting at all."""
 
+    def _effective_model(self, request: ModelRequest) -> ModelConfig:
+        """The config the adapter will actually run under.
+
+        `ModelRequest.model` is optional and every shipped adapter falls back to its own
+        `self.config`, so a receipt built from the request alone reports the *default* model no
+        matter which one served the call -- a fabricated audit field, not merely a missing one.
+        Probed via `getattr` and type-checked: see `ConfiguredModelAdapter`.
+        """
+
+        if request.model is not None:
+            return request.model
+        configured = getattr(self.adapter, "config", None)
+        return configured if isinstance(configured, ModelConfig) else ModelConfig()
+
     def _token(self) -> CancellationToken | None:
         return None if self.current_cancellation_token is None else self.current_cancellation_token()
 
@@ -250,12 +270,13 @@ class ModelCallRunner:
         """
 
         started = time.monotonic()
+        model = self._effective_model(request)
         receipt = ModelCallReceipt(
             context=context if context is not None else InvocationContext(),
-            model=request.model or ModelConfig(),
+            model=model,
             provider_name=str(getattr(self.adapter, "provider_name", "") or ""),
             prompt_digest=canonical_sha256(_prompt_payload(request)),
-            request_digest=canonical_sha256(_request_payload(request)),
+            request_digest=canonical_sha256(_request_payload(request, model)),
         )
         try:
             turn = await self._adrive(request, deadline, should_abort, delta_consumer)

@@ -17,7 +17,12 @@ from monoid_agent_kernel.core.model_io import (
     ModelIOSubscription,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
-from monoid_agent_kernel.errors import ModelCallAborted, RunCancelled, RunTimeout
+from monoid_agent_kernel.errors import (
+    ModelAdapterError,
+    ModelCallAborted,
+    RunCancelled,
+    RunTimeout,
+)
 from monoid_agent_kernel.model_call import ModelCallRunner, _wire_value
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -541,6 +546,110 @@ def test_an_adapter_that_retried_internally_says_so_in_the_receipt() -> None:
 
     # Counterweight: an adapter with no retry loop reports False, which is true of it.
     assert asyncio.run(_receipt_for(REQUEST)).provider_retried is False
+
+
+class _ConfiguredAdapter:
+    """Stands in for the shipped adapters: falls back to `self.config` when the request omits one."""
+
+    def __init__(self, model: str) -> None:
+        self.config = ModelConfig(model=model)
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        return ModelTurn(final_text="answer")
+
+
+def test_the_receipt_records_the_model_the_adapter_actually_ran() -> None:
+    """`ModelRequest.model` is optional and adapters fall back to their own config.
+
+    Reading only the request stamped every such receipt with `ModelConfig()`'s default model — a
+    fabricated audit field rather than a missing one, and one that happens to look plausible.
+    """
+
+    async def receipt_for(model: str) -> Any:
+        _turn, receipt = await ModelCallRunner(adapter=_ConfiguredAdapter(model)).acall(REQUEST)
+        return receipt
+
+    first = asyncio.run(receipt_for("gpt-5.5"))
+    second = asyncio.run(receipt_for("claude-opus-5"))
+
+    assert first.model.model == "gpt-5.5"
+    assert second.model.model == "claude-opus-5"
+    # ...and two calls that ran under different models are not the same call.
+    assert first.request_digest != second.request_digest
+
+
+def test_an_explicit_request_model_still_wins_over_the_adapter_config() -> None:
+    """The counterweight: resolving the fallback must not start ignoring what the caller asked for."""
+    request = ModelRequest(
+        instruction="hi", system_prompt="sys", tools=(), model=ModelConfig(model="explicit")
+    )
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(adapter=_ConfiguredAdapter("fallback")).acall(request)
+        return receipt
+
+    assert asyncio.run(run()).model.model == "explicit"
+
+
+def test_an_adapter_that_exhausted_its_retries_says_so_on_the_failure() -> None:
+    """The failed call is the one most likely to have been retried.
+
+    Recording the marker only on success denied retries in exactly the exhausted-budget case — the
+    one an audit trail is for.
+    """
+
+    class ExhaustedAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            raise ModelAdapterError(
+                "all attempts failed",
+                provider_error_code="gateway_timeout",
+                retryable=True,
+                provider_retried=True,
+            )
+
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=ExhaustedAdapter(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(REQUEST)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+    receipt = observer.captures[0].receipt
+    assert receipt.succeeded is False
+    assert receipt.provider_retried is True
+    # ``retryable`` is a forecast about a future attempt; ``provider_retried`` is a fact about
+    # attempts already made. Independent, and both recorded.
+    assert receipt.retryable is True
+
+
+def test_a_failure_without_retries_does_not_claim_any() -> None:
+    """Counterweight: "always true on failure" would pass the test above."""
+
+    class FailingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            raise ModelAdapterError("one and done", provider_error_code="gateway_bad_request")
+
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=FailingAdapter(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(REQUEST)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+    assert observer.captures[0].receipt.provider_retried is False
 
 
 def test_a_retried_stream_reports_the_retry_through_the_terminal_chunk() -> None:

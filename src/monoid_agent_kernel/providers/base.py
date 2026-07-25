@@ -228,6 +228,23 @@ class ProviderNamedModelAdapter(Protocol):
     def provider_name(self) -> str: ...
 
 
+class ConfiguredModelAdapter(Protocol):
+    """An adapter that carries its own fallback :class:`ModelConfig`.
+
+    ``ModelRequest.model`` is optional, and the shipped adapters fall back to ``self.config`` when
+    it is absent — so the config the provider actually ran under is not always visible in the
+    request. A caller recording what a call *was* reads ``config`` via
+    ``getattr(adapter, "config", None)`` to resolve it; omitting it means "the request carries the
+    whole story", which is correct for an adapter with no configuration of its own.
+
+    Declared for the same reason as :class:`ProviderNamedModelAdapter`: the attribute was already
+    being read, and a probed attribute that no protocol names is a contract nobody can check.
+    """
+
+    @property
+    def config(self) -> ModelConfig: ...
+
+
 class StreamingModelAdapter(Protocol):
     """Optional token-streaming extension for a sync or async model adapter."""
 

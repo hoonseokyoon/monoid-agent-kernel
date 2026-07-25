@@ -32,11 +32,18 @@ class ModelAdapterError(NativeAgentError):
         provider_error_code: str | None = None,
         retryable: bool = False,
         http_status: int | None = None,
+        provider_retried: bool = False,
     ) -> None:
         super().__init__(message, error_code=error_code)
         self.provider_error_code = provider_error_code or ""
         self.retryable = retryable
         self.http_status = http_status
+        # Whether the adapter's own retry loop ran before giving up. ``retryable`` is a forecast
+        # about a *future* attempt; this is a fact about attempts already made, and the two are
+        # independent -- an exhausted retry budget leaves a retryable error that will not be
+        # retried again. Without it a failed audit record denies retries in exactly the case where
+        # they happened most.
+        self.provider_retried = provider_retried
 
 
 class PermissionDenied(NativeAgentError):

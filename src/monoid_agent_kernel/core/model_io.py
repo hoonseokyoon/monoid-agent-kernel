@@ -597,6 +597,10 @@ class ModelCallReceipt:
             provider_error_code=str(getattr(exc, "provider_error_code", "") or ""),
             retryable=bool(getattr(exc, "retryable", False)),
             http_status=getattr(exc, "http_status", None),
+            # A failed call is the one most likely to have been retried, so the marker has to
+            # survive the failure path too -- recording it only on success would deny retries in
+            # exactly the exhausted-budget case.
+            provider_retried=bool(getattr(exc, "provider_retried", False)),
         )
 
     def to_json(self) -> dict[str, Any]:

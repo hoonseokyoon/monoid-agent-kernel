@@ -68,71 +68,80 @@ class GatewayModelAdapter:
         retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
-        for attempt in range(1, max_attempts + 1):
-            http_request = Request(
-                url,
-                data=body,
-                headers=self._headers(),
-                method="POST",
-            )
-            try:
-                with urlopen(http_request, timeout=config.timeout_s) as response:
-                    response_body = response.read()
+        attempt = 0
+        try:
+            for attempt in range(1, max_attempts + 1):
+                http_request = Request(
+                    url,
+                    data=body,
+                    headers=self._headers(),
+                    method="POST",
+                )
                 try:
-                    data = json.loads(response_body.decode("utf-8"))
-                except json.JSONDecodeError as exc:
-                    raise ModelAdapterError(
-                        "LLM gateway returned invalid JSON",
-                        provider_error_code=GATEWAY_BAD_RESPONSE,
-                    ) from exc
-                # ``attempt > 1`` means this call only succeeded because the retry loop ran.
-                # The kernel counts it as one adapter call, so the receipt would otherwise show a
-                # twice-failed call as a clean single attempt.
-                return replace(_parse_gateway_response(data), provider_retried=attempt > 1)
-            except ModelAdapterError as exc:
-                last_error = exc
-                if not _should_retry(exc, attempt, max_attempts, retry.retry_on):
-                    raise
-                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
-            except HTTPError as exc:
-                last_error = _error_from_http_error(exc)
-                if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
-                    raise last_error from exc
-                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
-            except URLError as exc:
-                last_error = ModelAdapterError(
-                    f"LLM gateway request failed: {exc.reason}",
-                    provider_error_code=GATEWAY_NETWORK_ERROR,
-                    retryable=True,
-                )
-                if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
-                    raise last_error from exc
-                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
-            except TimeoutError as exc:
-                last_error = ModelAdapterError(
-                    "LLM gateway request timed out",
-                    provider_error_code=GATEWAY_TIMEOUT,
-                    retryable=True,
-                )
-                if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
-                    raise last_error from exc
-                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
-            except OSError as exc:
-                # A bare connection-level error (reset / aborted / broken pipe), e.g. raised
-                # mid-read after urlopen() returned, is transient and retryable like a
-                # URLError. URLError/TimeoutError (both OSError subclasses) are handled above,
-                # so this catches only the raw connection failures they miss.
-                last_error = ModelAdapterError(
-                    f"LLM gateway connection error: {exc}",
-                    provider_error_code=GATEWAY_NETWORK_ERROR,
-                    retryable=True,
-                )
-                if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
-                    raise last_error from exc
-                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
-        if last_error is not None:
-            raise last_error
-        raise ModelAdapterError("LLM gateway request failed", provider_error_code=GATEWAY_NETWORK_ERROR)
+                    with urlopen(http_request, timeout=config.timeout_s) as response:
+                        response_body = response.read()
+                    try:
+                        data = json.loads(response_body.decode("utf-8"))
+                    except json.JSONDecodeError as exc:
+                        raise ModelAdapterError(
+                            "LLM gateway returned invalid JSON",
+                            provider_error_code=GATEWAY_BAD_RESPONSE,
+                        ) from exc
+                    # ``attempt > 1`` means this call only succeeded because the retry loop ran.
+                    # The kernel counts it as one adapter call, so the receipt would otherwise show a
+                    # twice-failed call as a clean single attempt.
+                    return replace(_parse_gateway_response(data), provider_retried=attempt > 1)
+                except ModelAdapterError as exc:
+                    last_error = exc
+                    if not _should_retry(exc, attempt, max_attempts, retry.retry_on):
+                        raise
+                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+                except HTTPError as exc:
+                    last_error = _error_from_http_error(exc)
+                    if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
+                        raise last_error from exc
+                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+                except URLError as exc:
+                    last_error = ModelAdapterError(
+                        f"LLM gateway request failed: {exc.reason}",
+                        provider_error_code=GATEWAY_NETWORK_ERROR,
+                        retryable=True,
+                    )
+                    if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
+                        raise last_error from exc
+                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+                except TimeoutError as exc:
+                    last_error = ModelAdapterError(
+                        "LLM gateway request timed out",
+                        provider_error_code=GATEWAY_TIMEOUT,
+                        retryable=True,
+                    )
+                    if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
+                        raise last_error from exc
+                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+                except OSError as exc:
+                    # A bare connection-level error (reset / aborted / broken pipe), e.g. raised
+                    # mid-read after urlopen() returned, is transient and retryable like a
+                    # URLError. URLError/TimeoutError (both OSError subclasses) are handled above,
+                    # so this catches only the raw connection failures they miss.
+                    last_error = ModelAdapterError(
+                        f"LLM gateway connection error: {exc}",
+                        provider_error_code=GATEWAY_NETWORK_ERROR,
+                        retryable=True,
+                    )
+                    if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
+                        raise last_error from exc
+                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+            if last_error is not None:
+                raise last_error
+            raise ModelAdapterError("LLM gateway request failed", provider_error_code=GATEWAY_NETWORK_ERROR)
+        # Marked in one place rather than at each ``raise`` inside the loop: there are five
+        # of those plus the exhausted-budget one, and a scheme needing every site updated is
+        # one that eventually misses a site. ``attempt`` holds whichever attempt was in flight.
+        except ModelAdapterError as exc:
+            if attempt > 1:
+                exc.provider_retried = True
+            raise
 
     async def astream_turn(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
         """Stream a turn from the gateway's SSE endpoint, yielding ``ModelStreamChunk``.
@@ -157,50 +166,58 @@ class GatewayModelAdapter:
         retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
-        for attempt in range(1, max_attempts + 1):
-            committed = False
-            try:
-                async with httpx.AsyncClient(timeout=config.timeout_s) as client:
-                    async with client.stream("POST", url, headers=headers, content=body) as response:
-                        if response.status_code != 200:
-                            detail = (await response.aread()).decode("utf-8", errors="replace")
-                            error = _error_from_status_body(response.status_code, detail)
-                            if _should_retry(error, attempt, max_attempts, retry.retry_on):
-                                raise _StreamRetry(error)
-                            raise error
-                        committed = True
-                        async for chunk in _aiter_sse_chunks(response):
-                            # Retries here are all pre-commit, so reaching this point after the
-                            # first attempt means the stream was retried. The caller folds the
-                            # chunks into the turn, so the terminal chunk is the only place to
-                            # record it.
-                            if attempt > 1 and isinstance(chunk, TurnComplete):
-                                chunk = replace(chunk, provider_retried=True)
-                            yield chunk
-                return
-            except _StreamRetry as retry_signal:
-                last_error = retry_signal.error
-                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
-            except httpx.HTTPError as exc:
-                if committed:
-                    # The stream already started; replaying would duplicate deltas. Terminal.
-                    raise ModelAdapterError(
-                        f"LLM gateway stream interrupted: {exc}",
+        attempt = 0
+        try:
+            for attempt in range(1, max_attempts + 1):
+                committed = False
+                try:
+                    async with httpx.AsyncClient(timeout=config.timeout_s) as client:
+                        async with client.stream("POST", url, headers=headers, content=body) as response:
+                            if response.status_code != 200:
+                                detail = (await response.aread()).decode("utf-8", errors="replace")
+                                error = _error_from_status_body(response.status_code, detail)
+                                if _should_retry(error, attempt, max_attempts, retry.retry_on):
+                                    raise _StreamRetry(error)
+                                raise error
+                            committed = True
+                            async for chunk in _aiter_sse_chunks(response):
+                                # Retries here are all pre-commit, so reaching this point after the
+                                # first attempt means the stream was retried. The caller folds the
+                                # chunks into the turn, so the terminal chunk is the only place to
+                                # record it.
+                                if attempt > 1 and isinstance(chunk, TurnComplete):
+                                    chunk = replace(chunk, provider_retried=True)
+                                yield chunk
+                    return
+                except _StreamRetry as retry_signal:
+                    last_error = retry_signal.error
+                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+                except httpx.HTTPError as exc:
+                    if committed:
+                        # The stream already started; replaying would duplicate deltas. Terminal.
+                        raise ModelAdapterError(
+                            f"LLM gateway stream interrupted: {exc}",
+                            provider_error_code=GATEWAY_NETWORK_ERROR,
+                            retryable=False,
+                        ) from exc
+                    error = ModelAdapterError(
+                        f"LLM gateway stream connection error: {exc}",
                         provider_error_code=GATEWAY_NETWORK_ERROR,
-                        retryable=False,
-                    ) from exc
-                error = ModelAdapterError(
-                    f"LLM gateway stream connection error: {exc}",
-                    provider_error_code=GATEWAY_NETWORK_ERROR,
-                    retryable=True,
-                )
-                if not _should_retry(error, attempt, max_attempts, retry.retry_on):
-                    raise error from exc
-                last_error = error
-                _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
-        if last_error is not None:
-            raise last_error
-        raise ModelAdapterError("LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR)
+                        retryable=True,
+                    )
+                    if not _should_retry(error, attempt, max_attempts, retry.retry_on):
+                        raise error from exc
+                    last_error = error
+                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
+            if last_error is not None:
+                raise last_error
+            raise ModelAdapterError("LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR)
+        # Same marking as the sync path. Stream retries are all pre-commit, so an error
+        # escaping after the first attempt means the stream really was retried.
+        except ModelAdapterError as exc:
+            if attempt > 1:
+                exc.provider_retried = True
+            raise
 
     def _resolve_gateway_url(self, config: ModelConfig) -> str:
         url = self.gateway_url or config.gateway_url or self.config.gateway_url or getenv(DEFAULT_GATEWAY_URL_ENV)
