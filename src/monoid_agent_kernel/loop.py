@@ -195,6 +195,53 @@ def _consume_task_outcome(task: asyncio.Future[Any]) -> None:
         pass
 
 
+def _start_abandonable_sync_model_call(
+    next_turn: Callable[[ModelRequest], ModelTurn],
+    request: ModelRequest,
+    *,
+    thread_name: str,
+) -> asyncio.Future[ModelTurn]:
+    """Run a blocking ``next_turn`` on a daemon thread, exposed as a future on the running loop.
+
+    ``asyncio.to_thread`` is unusable for a call the run may have to abandon: it borrows the
+    event loop's *default* executor, and ``asyncio.run`` joins every worker in that executor
+    before returning. A provider that never returns would hang the caller at loop shutdown even
+    though the run itself already produced its ``run_timeout`` or ``cancelled`` result -- the
+    deadline would be enforced internally but unobservable from the documented async entry point.
+    A daemon thread is joined by nobody, neither loop shutdown nor the interpreter's exit hooks,
+    so cancelling the returned future really does release the caller.
+
+    The abandoned worker still runs to completion; its late outcome is dropped, because the future
+    is already cancelled by then, and delivery is skipped outright once the loop has closed.
+    """
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[ModelTurn] = loop.create_future()
+    outcome: list[tuple[bool, Any]] = []
+
+    def deliver() -> None:
+        succeeded, payload = outcome[0]
+        if future.done():
+            return
+        if succeeded:
+            future.set_result(payload)
+        else:
+            future.set_exception(payload)
+
+    def worker() -> None:
+        try:
+            outcome.append((True, next_turn(request)))
+        except BaseException as exc:  # surfaced to the awaiter, never swallowed here
+            outcome.append((False, exc))
+        try:
+            loop.call_soon_threadsafe(deliver)
+        except RuntimeError:
+            pass  # the run was abandoned and its loop has since closed
+
+    threading.Thread(target=worker, name=thread_name, daemon=True).start()
+    return future
+
+
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     """True if a tool binding matches any fnmatch pattern. Matched against the binding's
     tool id, binding id, and model name, so subagent allow/deny lists accept ids
@@ -1525,7 +1572,10 @@ class AgentLoop:
         if inspect.iscoroutinefunction(next_turn):
             return await self._await_native_model_call(next_turn(request), deadline)
         return await self._await_native_model_call(
-            asyncio.to_thread(next_turn, request), deadline
+            _start_abandonable_sync_model_call(
+                next_turn, request, thread_name=f"nar-model-call-{self.spec.run_id}"
+            ),
+            deadline,
         )
 
     async def _await_native_model_call(
@@ -1540,12 +1590,14 @@ class AgentLoop:
         returns. Cancellation and deadlines are run boundaries, so they cancel the provider task
         immediately and wait only a bounded interval for cooperative cleanup.
 
-        A synchronous adapter offloaded with ``asyncio.to_thread`` cannot be interrupted: the
-        thread keeps running to completion. Cancelling its future therefore *abandons* the call
-        -- the run stops waiting within ``async_model_cancel_grace_s`` and the detached outcome is
-        consumed so late cleanup cannot warn, but the provider's socket and CPU work continue
-        until the adapter returns on its own. Adapters that must release resources promptly
-        should expose ``anext_turn`` or a coroutine ``next_turn``.
+        A synchronous adapter cannot be interrupted: its thread keeps running to completion.
+        Cancelling its future therefore *abandons* the call -- the run stops waiting within
+        ``async_model_cancel_grace_s`` and the detached outcome is consumed so late cleanup cannot
+        warn, but the provider's socket and CPU work continue until the adapter returns on its own.
+        Abandoning is only real because the thread is a daemon nobody joins, which is why the call
+        goes through ``_start_abandonable_sync_model_call`` rather than ``asyncio.to_thread``.
+        Adapters that must release resources promptly should expose ``anext_turn`` or a coroutine
+        ``next_turn``.
         """
 
         task = asyncio.ensure_future(pending)
