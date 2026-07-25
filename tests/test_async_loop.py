@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from contextvars import ContextVar
 from pathlib import Path
+
+import pytest
 
 from support.process import python_command as _python_command
 from support.runtime import runtime_config, runtime_provider, tool_binding
@@ -252,6 +255,71 @@ def test_never_returning_sync_next_turn_observes_run_deadline(tmp_path: Path) ->
     assert result.status == "limited"
     assert result.error_code == "run_timeout"
     assert workers[0].is_alive() is True
+
+
+def test_abandoning_a_sync_next_turn_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Abandonment is logged, because nothing can reclaim the thread of a call that never returns.
+
+    A permanently wedged adapter leaks one thread per abandoned call, and the run no longer blocks
+    to throttle the next attempt, so the growth has to be visible rather than silent.
+    """
+    workers: list[threading.Thread] = []
+
+    class NeverReturningSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            workers.append(threading.current_thread())
+            _block_like_a_stuck_provider()
+            return ModelTurn(response_id="late", final_text="late")
+
+    async def run() -> object:
+        loop = AgentLoop(
+            spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+            model_adapter=NeverReturningSyncAdapter(),  # type: ignore[arg-type]
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            async_model_cancel_grace_s=0.2,
+        )
+        result = await loop.arun_once("go")
+        await asyncio.sleep(0)  # let the future's done callback run
+        return result
+
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.loop"):
+        result = asyncio.run(run())
+
+    assert result.error_code == "run_timeout"
+    assert workers[0].is_alive() is True
+    warnings = [r.getMessage() for r in caplog.records if r.name == "monoid_agent_kernel.loop"]
+    assert len(warnings) == 1
+    assert "abandoned a synchronous call" in warnings[0]
+
+
+def test_completed_sync_next_turn_does_not_warn(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The warning is specific to abandonment: a call that returns in time is silent."""
+
+    class PromptSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(response_id="r1", final_text="ok")
+
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.loop"):
+        result = asyncio.run(
+            AgentLoop(
+                spec=_spec(tmp_path),
+                model_adapter=PromptSyncAdapter(),  # type: ignore[arg-type]
+                runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            ).arun_once("go")
+        )
+
+    assert result.status == "completed"
+    assert [r for r in caplog.records if r.name == "monoid_agent_kernel.loop"] == []
 
 
 def test_never_returning_sync_next_turn_observes_run_cancellation(tmp_path: Path) -> None:

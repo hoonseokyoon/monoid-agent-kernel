@@ -276,6 +276,12 @@ call rather than stopping it. The run reports `cancelled` or `run_timeout` withi
 adapters should still enforce their own provider I/O timeout and idempotency policy, because the
 kernel can stop waiting for a call it cannot stop.
 
+Abandonment is not free, and this is a known limitation rather than a settled guarantee: nothing can
+reclaim the thread of a call that never returns, and the run no longer blocks to throttle the next
+attempt, so an implementation that wedges *permanently* accumulates one thread per abandoned call
+across runs. Each abandonment is logged as a warning on the `monoid_agent_kernel.loop` logger so the
+growth is visible; there is currently no cap on outstanding abandoned calls.
+
 `ModelRequest` carries:
 
 - `instruction`

@@ -5,6 +5,7 @@ import base64
 import fnmatch
 import inspect
 import json
+import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -196,6 +197,8 @@ def _consume_task_outcome(task: asyncio.Future[Any]) -> None:
         pass
 
 
+_LOGGER = logging.getLogger("monoid_agent_kernel.loop")
+
 _T = TypeVar("_T")
 
 
@@ -219,6 +222,12 @@ def _start_abandonable_sync_call(
 
     The abandoned worker still runs to completion; its late outcome is dropped, because the future
     is already cancelled by then, and delivery is skipped outright once the loop has closed.
+
+    Known limitation: nothing can reclaim the thread of a call that never returns, and the run no
+    longer waits for it, so an implementation that wedges *permanently* accumulates one thread per
+    abandoned call across runs. Each abandonment is logged as a warning so that growth is visible
+    rather than silent; bounding it needs admission control, which belongs with the rest of the
+    per-call resource policy rather than here.
     """
 
     loop = asyncio.get_running_loop()
@@ -251,6 +260,18 @@ def _start_abandonable_sync_call(
             future.set_result(payload)
         else:
             future.set_exception(payload)
+
+    def note_if_abandoned(settled: asyncio.Future[_T]) -> None:
+        if outcome or not settled.cancelled():
+            return
+        _LOGGER.warning(
+            "abandoned a synchronous call still running on %r: the run stopped waiting for it, but "
+            "nothing can reclaim its thread until it returns on its own. An implementation that "
+            "never returns leaks one thread per abandoned call; enforce a timeout at its I/O edge.",
+            thread_name,
+        )
+
+    future.add_done_callback(note_if_abandoned)
 
     def worker() -> None:
         try:
@@ -1644,7 +1665,7 @@ class AgentLoop:
         ``async_model_cancel_grace_s`` and the detached outcome is consumed so late cleanup cannot
         warn, but the provider's socket and CPU work continue until the adapter returns on its own.
         Abandoning is only real because the thread is a daemon nobody joins, which is why the call
-        goes through ``_start_abandonable_sync_model_call`` rather than ``asyncio.to_thread``.
+        goes through ``_start_abandonable_sync_call`` rather than ``asyncio.to_thread``.
         Adapters that must release resources promptly should expose ``anext_turn`` or a coroutine
         ``next_turn``.
         """
