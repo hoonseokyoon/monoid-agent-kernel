@@ -163,6 +163,12 @@ class ModelAdapter(Protocol):
     # it via ``getattr(adapter, "wire_image_encoding", "base64")``. Only ``"base64"``
     # is implemented today; ``"url"`` / ``"file_id"`` are reserved for later phases.
     wire_image_encoding: str = "base64"
+    # Identifies whose opaque reasoning items ``ModelTurn.reasoning`` holds. The loop reads
+    # it via ``getattr(adapter, "provider_name", None)`` and tags captured reasoning with
+    # provider+model, so items only round-trip back to a matching adapter and model. The
+    # empty default means "do not tag": reasoning is not replayed, which is the correct
+    # neutral behavior for an adapter with no provider-native reasoning artifacts.
+    provider_name: str = ""
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         ...
@@ -178,6 +184,7 @@ class AsyncModelAdapter(Protocol):
 
     supports_multimodal: bool = False
     wire_image_encoding: str = "base64"
+    provider_name: str = ""
 
     async def anext_turn(self, request: ModelRequest) -> ModelTurn: ...
 
