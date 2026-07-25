@@ -265,6 +265,23 @@ one-shot contract for token streaming. `AgentLoop.astream` prefers the streaming
 its chunks into the same `ModelTurn`, event, error, and checkpoint path. Autonomous runs use the
 stream when `emit_output_deltas=True`.
 
+Two further opt-in protocols declare optional capability attributes:
+
+- `MultimodalModelAdapter.supports_multimodal: bool` — the loop resolves by-reference media in the
+  by-value `messages` log to wire blocks before the call. A multimodal adapter may also expose
+  `wire_image_encoding` (default `"base64"`); that attribute is not a protocol member because it
+  parameterizes the capability rather than declaring it.
+- `ProviderNamedModelAdapter.provider_name: str` — tags captured `ModelTurn.reasoning` with
+  provider+model so opaque reasoning items only round-trip back to a matching adapter and model.
+  Omitting it means "do not tag".
+
+Implementing them is never required. The loop probes each attribute with `getattr` and a neutral
+default, and behaves identically whether an adapter declares it or omits it, so the attributes are
+deliberately **not** members of `ModelAdapter` / `AsyncModelAdapter`: a protocol member is required
+for structural typing even when the protocol body assigns it a default, which would reject an
+adapter that implements only `next_turn`. Each member is declared as a read-only property so a
+`ClassVar`, an instance attribute, and a property all satisfy it.
+
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
 cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provider task is detached

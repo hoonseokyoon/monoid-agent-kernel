@@ -7,6 +7,24 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added
+
+- Added `MultimodalModelAdapter` and `ProviderNamedModelAdapter`, opt-in protocols that declare the
+  optional capability attributes the loop probes with `getattr` (`supports_multimodal` and
+  `provider_name`). Implementing them is never required; they exist so the attribute names and
+  meanings are part of the checked contract and typed callers can narrow to "an adapter that reports
+  this". Each member is a read-only property, so a `ClassVar`, an instance attribute, and a property
+  all satisfy it.
+
+### Fixed
+
+- `ModelAdapter` and `AsyncModelAdapter` no longer declare optional capability attributes, which had
+  made them **required** members for structural typing and rejected a third-party adapter that
+  implements only `next_turn` — the default assigned in a protocol body reaches explicitly
+  inheriting classes, not structural implementations. `supports_multimodal` and
+  `wire_image_encoding` had this effect since they were introduced; the attributes are unchanged at
+  runtime, where the loop has always probed them with `getattr` and a default.
+
 ### Changed
 
 - **Breaking for third-party synchronous adapters and tools.** A synchronous `next_turn` and a

@@ -94,6 +94,8 @@ EXPECTED_CONTRACTS_ALL = [
     "ModelAdapter",
     "AsyncModelAdapter",
     "StreamingModelAdapter",
+    "MultimodalModelAdapter",
+    "ProviderNamedModelAdapter",
     "ModelRequest",
     "ModelTurn",
     "ToolCall",
@@ -197,6 +199,76 @@ def test_contracts_public_surface_is_intentional() -> None:
     import monoid_agent_kernel.contracts as contracts
 
     assert contracts.__all__ == EXPECTED_CONTRACTS_ALL
+
+
+_OPTIONAL_ADAPTER_CAPABILITIES = ("supports_multimodal", "wire_image_encoding", "provider_name")
+
+
+def test_base_adapter_protocols_do_not_require_optional_capabilities() -> None:
+    """The base adapter protocols must declare only their required call method.
+
+    A protocol member is required for structural typing even when the protocol body assigns
+    it a default -- the default only reaches classes that explicitly inherit the protocol.
+    Declaring an optional capability here therefore rejects a third-party adapter that
+    implements ``next_turn`` and nothing else, which the engine accepts at runtime because it
+    probes every capability with ``getattr`` and a default.
+    """
+    from monoid_agent_kernel.providers.base import AsyncModelAdapter, ModelAdapter
+
+    for protocol in (ModelAdapter, AsyncModelAdapter):
+        for name in _OPTIONAL_ADAPTER_CAPABILITIES:
+            assert not hasattr(protocol, name), f"{protocol.__name__}.{name} is a protocol member"
+            assert name not in getattr(protocol, "__annotations__", {}), (
+                f"{protocol.__name__}.{name} is an annotated protocol member"
+            )
+
+
+def test_optional_capability_protocols_accept_classvar_implementations() -> None:
+    """Each opt-in capability member stays a read-only property.
+
+    Every shipped adapter declares these as ``ClassVar``. A protocol member annotated
+    ``name: str`` demands an instance variable and rejects a ``ClassVar``; a read-only
+    property is satisfied by a ``ClassVar``, an instance attribute, and a property alike.
+    """
+    from monoid_agent_kernel.providers.base import (
+        MultimodalModelAdapter,
+        ProviderNamedModelAdapter,
+    )
+
+    declared = {
+        MultimodalModelAdapter: ("supports_multimodal",),
+        ProviderNamedModelAdapter: ("provider_name",),
+    }
+    for protocol, names in declared.items():
+        for name in names:
+            member = protocol.__dict__.get(name)
+            assert isinstance(member, property), f"{protocol.__name__}.{name} is not a property"
+            assert member.fset is None, f"{protocol.__name__}.{name} must be read-only"
+
+
+def test_optional_capability_protocols_are_satisfied_by_shipped_adapters() -> None:
+    """An opt-in protocol must stay satisfiable by the adapters this package ships.
+
+    A capability protocol is only useful if it accepts the adapters that actually have the
+    capability. Adding a member the shipped adapters leave to its default -- as
+    ``wire_image_encoding`` is -- would reject every one of them.
+    """
+    from monoid_agent_kernel.providers.base import (
+        MultimodalModelAdapter,
+        ProviderNamedModelAdapter,
+    )
+    from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
+
+    expected = {
+        MultimodalModelAdapter: (OpenAIModelAdapter,),
+        ProviderNamedModelAdapter: (OpenAIModelAdapter,),
+    }
+    for protocol, adapters in expected.items():
+        members = tuple(name for name, value in protocol.__dict__.items() if isinstance(value, property))
+        assert members, protocol.__name__
+        for adapter in adapters:
+            for name in members:
+                assert hasattr(adapter, name), f"{adapter.__name__} lacks {protocol.__name__}.{name}"
 
 
 def test_package_root_mirrors_contracts_surface() -> None:
