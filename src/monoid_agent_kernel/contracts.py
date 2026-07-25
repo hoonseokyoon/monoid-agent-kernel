@@ -94,6 +94,9 @@ from monoid_agent_kernel.core.capability import (
 # Context providers (pluggable static + per-turn system context)
 from monoid_agent_kernel.core.context import ContextProvider, TurnContext
 
+# Invocation identity (who is asking for a model call; usable without an agent run)
+from monoid_agent_kernel.core.invocation import InvocationContext
+
 # Output validation (post-response conformance; checked at the settle points)
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
@@ -293,6 +296,8 @@ __all__ = [
     "ToolSearchConfig",
     "ContextProvider",
     "TurnContext",
+    # Model call kernel
+    "InvocationContext",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

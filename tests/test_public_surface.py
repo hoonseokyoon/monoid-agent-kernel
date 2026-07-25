@@ -72,6 +72,8 @@ EXPECTED_CONTRACTS_ALL = [
     "ToolSearchConfig",
     "ContextProvider",
     "TurnContext",
+    # Model call kernel
+    "InvocationContext",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",
