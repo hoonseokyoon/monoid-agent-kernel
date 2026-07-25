@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from monoid_agent_kernel.conformance.report import (
     ConformanceRuleOutcome,
@@ -15,6 +16,7 @@ from monoid_agent_kernel.conformance.report import (
     outcome_from_observations,
     safe_exception_summary,
 )
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.capability import (
     CapabilityBroker,
     CapabilityDenial,
@@ -24,9 +26,11 @@ from monoid_agent_kernel.core.capability import (
     scope_within,
 )
 from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint, load_latest_checked
+from monoid_agent_kernel.core.model_io import RedactionPolicy, Redactor, redacted_or_none
 
 STORE_CONTRACT_PROFILE = "checkpoint-store-contract"
 BROKER_CONTRACT_PROFILE = "capability-broker-contract"
+REDACTOR_CONTRACT_PROFILE = "redactor-contract"
 
 
 class CheckpointStoreFactory(Protocol):
@@ -35,6 +39,10 @@ class CheckpointStoreFactory(Protocol):
 
 class CapabilityBrokerFactory(Protocol):
     def __call__(self) -> CapabilityBroker: ...
+
+
+class RedactorFactory(Protocol):
+    def __call__(self) -> Redactor: ...
 
 
 @contextmanager
@@ -230,6 +238,106 @@ def run_capability_broker_contract(
             )
         )
     return tuple(outcomes)
+
+
+def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutcome, ...]:
+    """Execute the obligations a `Redactor` owes the model-I/O capture pipeline.
+
+    A redactor is the one place an integrator can silently turn "redacted" into "disclosed", so the
+    rules check the two properties the pipeline actually depends on — a stable result, and no
+    survival of a value the policy named a secret — plus the caller-side guarantee that a redactor
+    which fails produces nothing rather than raw content.
+    """
+
+    outcomes: list[ConformanceRuleOutcome] = []
+    policy = RedactionPolicy(patterns=(r"sk-[A-Za-z0-9]+",), literals=("hunter2",))
+    payload = {
+        "api_key": "sk-live-must-not-survive",
+        "prompt": "the key is sk-abc123 and the password is hunter2",
+        "nested": {"Authorization": "Bearer must-not-survive", "count": 7},
+        "items": ["sk-xyz789", 3, None],
+    }
+
+    try:
+        redactor = factory()
+        first = redactor.redact(payload, policy=policy)
+        second = factory().redact(payload, policy=policy)
+        outcomes.append(
+            outcome_from_observations(
+                "REDACTOR-01-DETERMINISTIC",
+                REDACTOR_CONTRACT_PROFILE,
+                (
+                    # Canonical JSON, so key order cannot make two equal results look different.
+                    observation(
+                        "repeated_redaction_is_identical",
+                        expected=canonical_sha256({"value": _jsonish(first)}),
+                        actual=canonical_sha256({"value": _jsonish(second)}),
+                    ),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(_error("REDACTOR-01-DETERMINISTIC", REDACTOR_CONTRACT_PROFILE, exc))
+
+    try:
+        redacted = factory().redact(payload, policy=policy)
+        rendered = json.dumps(_jsonish(redacted))
+        outcomes.append(
+            outcome_from_observations(
+                "REDACTOR-02-NO-DEFAULT-SECRET-LEAK",
+                REDACTOR_CONTRACT_PROFILE,
+                (
+                    # A secret-named key must not survive at any depth, in a mapping or inside a list.
+                    observation("top_level_secret_key", expected=False, actual="sk-live-must-not-survive" in rendered),
+                    observation("nested_secret_key", expected=False, actual="Bearer must-not-survive" in rendered),
+                    # Non-secret data must survive, or "redact everything" would pass every rule.
+                    observation("non_secret_value_survives", expected=True, actual="7" in rendered),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(_error("REDACTOR-02-NO-DEFAULT-SECRET-LEAK", REDACTOR_CONTRACT_PROFILE, exc))
+
+    try:
+        raised = redacted_or_none(payload, policy=policy, redactor=_FailingRedactor())
+        survived = redacted_or_none(payload, policy=policy, redactor=factory())
+        outcomes.append(
+            outcome_from_observations(
+                "REDACTOR-03-FAILURE-IS-CONTAINED",
+                REDACTOR_CONTRACT_PROFILE,
+                (
+                    # A raising redactor yields nothing. Falling back to the raw value would turn a
+                    # redaction failure into a disclosure -- the opposite of what was asked for.
+                    observation("failure_yields_nothing", expected=True, actual=raised is None),
+                    observation("failure_does_not_propagate", expected=True, actual=True),
+                    # ``None`` has to mean failure, not "redacted to empty", or the caller cannot
+                    # tell a downgrade from empty content.
+                    observation("success_is_distinguishable", expected=True, actual=survived is not None),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(_error("REDACTOR-03-FAILURE-IS-CONTAINED", REDACTOR_CONTRACT_PROFILE, exc))
+
+    return tuple(outcomes)
+
+
+class _FailingRedactor:
+    """A redactor that always fails, for the fail-closed rule."""
+
+    def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+        raise RuntimeError("redactor unavailable")
+
+
+def _jsonish(value: Any) -> Any:
+    """Coerce a redacted payload to JSON-safe types so it can be digested and searched."""
+    if isinstance(value, Mapping):
+        return {str(key): _jsonish(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonish(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 def _error(rule_id: str, profile_id: str, exc: Exception) -> ConformanceRuleOutcome:

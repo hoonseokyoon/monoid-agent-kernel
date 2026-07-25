@@ -74,6 +74,11 @@ EXPECTED_CONTRACTS_ALL = [
     "TurnContext",
     # Model call kernel
     "InvocationContext",
+    "CapturePolicy",
+    "RedactionPolicy",
+    "Redactor",
+    "DefaultRedactor",
+    "DEFAULT_SECRET_KEY_PARTS",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

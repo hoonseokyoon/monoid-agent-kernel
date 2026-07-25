@@ -9,6 +9,7 @@ import pytest
 from monoid_agent_kernel.conformance.contracts import (
     run_capability_broker_contract,
     run_checkpoint_store_contract,
+    run_redactor_contract,
 )
 from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityBroker
 from monoid_agent_kernel.core.checkpoint import (
@@ -16,6 +17,7 @@ from monoid_agent_kernel.core.checkpoint import (
     CheckpointStore,
     LocalFsCheckpointStore,
 )
+from monoid_agent_kernel.core.model_io import DefaultRedactor
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.capability import (
     DenyAllBroker,
@@ -110,6 +112,41 @@ def test_broker_contract_reports_invalid_result_without_raising() -> None:
     assert outcomes[0].observations[0].observation_id == "grant_union"
     assert outcomes[0].observations[0].actual is False
     assert outcomes[1].error == "broker returned an invalid outcome"
+
+
+def test_contract_suites_are_reachable_through_the_public_conformance_package() -> None:
+    """An external implementer imports `monoid_agent_kernel.conformance`, not the private module
+    path, and depends on the rule ids being stable and ordered. Assert the surface they actually use,
+    including the rule-id sequence a report is keyed by."""
+    import monoid_agent_kernel.conformance as conformance
+
+    assert conformance.run_redactor_contract is run_redactor_contract
+    assert "RedactorFactory" in conformance.__all__
+
+    outcomes = conformance.run_redactor_contract(DefaultRedactor)
+
+    assert [outcome.rule_id for outcome in outcomes] == [
+        "REDACTOR-01-DETERMINISTIC",
+        "REDACTOR-02-NO-DEFAULT-SECRET-LEAK",
+        "REDACTOR-03-FAILURE-IS-CONTAINED",
+    ]
+    assert all(outcome.profile_id == "redactor-contract" for outcome in outcomes)
+    assert all(outcome.status == "passed" for outcome in outcomes)
+
+
+def test_redactor_contract_redacts_exception_details() -> None:
+    secret = "redactor-secret-must-not-enter-report"
+
+    class FailingRedactor:
+        def redact(self, value: object, *, policy: object) -> object:
+            del value, policy
+            raise RuntimeError(secret)
+
+    outcomes = run_redactor_contract(FailingRedactor)  # type: ignore[arg-type]
+
+    assert outcomes[0].status == "error"
+    assert outcomes[0].error == "RuntimeError: details redacted"
+    assert all(secret not in str(outcome.to_json()) for outcome in outcomes)
 
 
 def test_broker_contract_redacts_exception_details() -> None:
