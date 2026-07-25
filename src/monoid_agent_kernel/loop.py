@@ -11,7 +11,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar, copy_context
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import Any, TypeVar
+from typing import Any, Generic, TypeVar
 
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
 from monoid_agent_kernel.core.cancellation import CancellationToken
@@ -202,12 +202,29 @@ _LOGGER = logging.getLogger("monoid_agent_kernel.loop")
 _T = TypeVar("_T")
 
 
+@dataclass(frozen=True)
+class _AbandonableSyncCall(Generic[_T]):
+    """A blocking call in flight on a daemon thread, as the two handles an awaiter needs.
+
+    ``result`` is the cancellable waiter: cancelling it releases the awaiter, which is the whole
+    point of the daemon thread. It says nothing about the worker, which cannot be interrupted and
+    keeps running. ``settled`` completes only when the worker actually delivers its outcome, and is
+    never cancelled -- so a caller that wants to grant the worker a bounded grace period must wait
+    on ``settled``, not on ``result``. ``warn_if_unsettled`` reports the abandonment once that
+    grace has expired; it is the awaiter's call to make, because only the awaiter knows the grace.
+    """
+
+    result: asyncio.Future[_T]
+    settled: asyncio.Future[None]
+    warn_if_unsettled: Callable[[], None]
+
+
 def _start_abandonable_sync_call(
     call: Callable[[], _T],
     *,
     thread_name: str,
-) -> asyncio.Future[_T]:
-    """Run a blocking call on a daemon thread, exposed as a future on the running loop.
+) -> _AbandonableSyncCall[_T]:
+    """Run a blocking call on a daemon thread, exposed as futures on the running loop.
 
     Used for both halves of the sync surface -- a sync ``next_turn`` and a sync tool handler --
     so each observes run cancellation and the run deadline like its async counterpart.
@@ -218,10 +235,14 @@ def _start_abandonable_sync_call(
     though the run itself already produced its ``run_timeout`` or ``cancelled`` result -- the
     deadline would be enforced internally but unobservable from the documented async entry point.
     A daemon thread is joined by nobody, neither loop shutdown nor the interpreter's exit hooks,
-    so cancelling the returned future really does release the caller.
+    so cancelling the returned ``result`` future really does release the caller.
 
-    The abandoned worker still runs to completion; its late outcome is dropped, because the future
-    is already cancelled by then, and delivery is skipped outright once the loop has closed.
+    The abandoned worker still runs to completion; its late outcome is dropped, because ``result``
+    is already cancelled by then, and delivery is skipped outright once the loop has closed. The
+    returned ``settled`` future is what an awaiter waits on to grant the worker a bounded grace
+    period: cancelling ``result`` completes it instantly -- there is no coroutine to throw
+    ``CancelledError`` into -- so waiting on ``result`` after cancelling it would grant no grace at
+    all.
 
     Known limitation: nothing can reclaim the thread of a call that never returns, and the run no
     longer waits for it, so an implementation that wedges *permanently* accumulates one thread per
@@ -232,6 +253,7 @@ def _start_abandonable_sync_call(
 
     loop = asyncio.get_running_loop()
     future: asyncio.Future[_T] = loop.create_future()
+    settled: asyncio.Future[None] = loop.create_future()
     outcome: list[tuple[bool, Any]] = []
     # Match ``asyncio.to_thread``, which runs its target in a copy of the caller's context. Without
     # this the worker would start with an empty context, so a sync adapter or handler reading
@@ -240,20 +262,34 @@ def _start_abandonable_sync_call(
     # the call's ``CallContext`` is set, and the caller's later reset cannot reach into it.
     caller_context = copy_context()
 
-    def discard_late_awaitable() -> None:
-        """Close an awaitable that arrived after the run gave up on the call.
+    def discard_late_awaitable(*, on_live_loop: bool) -> None:
+        """Dispose an awaitable that arrived after the run gave up on the call.
 
-        A sync tool handler may return one. Nothing downstream will await this one, so closing it
-        here runs its cleanup and keeps it from surfacing as an unawaited-coroutine warning.
+        A sync tool handler may return one, and the normal path accepts any awaitable, so the late
+        path has to handle the same shapes. Nothing downstream will await this one: a coroutine is
+        closed so its cleanup runs and it cannot surface as an unawaited-coroutine warning, and a
+        future or task is cancelled and consumed so it stops running and cannot surface as a
+        never-retrieved exception. Any other awaitable has no generic disposal and is left alone.
+
+        ``on_live_loop`` is False when the run's loop has already closed. A future or task bound to
+        a closed loop can no longer run, and cancelling it there would try to schedule callbacks on
+        the dead loop, so only the loop-independent coroutine close is safe.
         """
 
         succeeded, payload = outcome[0]
-        if succeeded and inspect.iscoroutine(payload):
+        if not succeeded:
+            return
+        if inspect.iscoroutine(payload):
             payload.close()
+        elif on_live_loop and isinstance(payload, asyncio.Future):
+            payload.cancel()
+            payload.add_done_callback(_consume_task_outcome)
 
     def deliver() -> None:
+        if not settled.done():
+            settled.set_result(None)
         if future.done():
-            discard_late_awaitable()
+            discard_late_awaitable(on_live_loop=True)
             return
         succeeded, payload = outcome[0]
         if succeeded:
@@ -261,8 +297,8 @@ def _start_abandonable_sync_call(
         else:
             future.set_exception(payload)
 
-    def note_if_abandoned(settled: asyncio.Future[_T]) -> None:
-        if outcome or not settled.cancelled():
+    def warn_if_unsettled() -> None:
+        if settled.done():
             return
         _LOGGER.warning(
             "abandoned a synchronous call still running on %r: the run stopped waiting for it, but "
@@ -270,8 +306,6 @@ def _start_abandonable_sync_call(
             "never returns leaks one thread per abandoned call; enforce a timeout at its I/O edge.",
             thread_name,
         )
-
-    future.add_done_callback(note_if_abandoned)
 
     def worker() -> None:
         try:
@@ -283,10 +317,10 @@ def _start_abandonable_sync_call(
         except RuntimeError:
             # The run was abandoned and its loop has since closed, so ``deliver`` will never run.
             # Nothing will await a late awaitable either, so discard it here instead.
-            discard_late_awaitable()
+            discard_late_awaitable(on_live_loop=False)
 
     threading.Thread(target=worker, name=thread_name, daemon=True).start()
-    return future
+    return _AbandonableSyncCall(result=future, settled=settled, warn_if_unsettled=warn_if_unsettled)
 
 
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
@@ -1653,7 +1687,7 @@ class AgentLoop:
 
     async def _await_native_model_call(
         self,
-        pending: Awaitable[ModelTurn],
+        pending: Awaitable[ModelTurn] | _AbandonableSyncCall[ModelTurn],
         deadline: float | None,
     ) -> ModelTurn:
         """Await native model I/O while propagating run cancellation and the run deadline.
@@ -1673,7 +1707,8 @@ class AgentLoop:
         ``next_turn``.
         """
 
-        task = asyncio.ensure_future(pending)
+        sync_call = pending if isinstance(pending, _AbandonableSyncCall) else None
+        task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
         loop = asyncio.get_running_loop()
         cancelled: asyncio.Future[None] = loop.create_future()
         outcome_consumed = False
@@ -1709,16 +1744,39 @@ class AgentLoop:
             if not cancelled.done():
                 cancelled.cancel()
             if not task.done():
-                task.cancel()
-                done, _pending = await asyncio.wait(
-                    {task}, timeout=max(0.0, self.async_model_cancel_grace_s)
+                await self._detach_unfinished_call(
+                    task, sync_call, grace_s=self.async_model_cancel_grace_s
                 )
-                if task not in done:
-                    task.add_done_callback(_consume_task_outcome)
-                else:
-                    _consume_task_outcome(task)
             elif not outcome_consumed:
                 _consume_task_outcome(task)
+
+    async def _detach_unfinished_call(
+        self,
+        task: asyncio.Future[Any],
+        sync_call: _AbandonableSyncCall[Any] | None,
+        *,
+        grace_s: float,
+    ) -> None:
+        """Release the awaiter's hold on a call that outlived a run boundary.
+
+        Cancelling ``task`` is what frees the awaiter. For a native async call that also *delivers*
+        the cancellation, so the grace interval is spent letting the callee's cleanup run. A sync
+        call has no cancellation to deliver and its waiter is a plain future, so cancelling it
+        completes it immediately: waiting on it would grant no grace at all. The grace is spent
+        waiting on the worker's own completion instead, which is what the interval is for -- a
+        worker that finishes inside it lands its writes before the run finalizes rather than racing
+        it, and is never reported as abandoned.
+        """
+
+        task.cancel()
+        watched: asyncio.Future[Any] = task if sync_call is None else sync_call.settled
+        done, _pending = await asyncio.wait({watched}, timeout=max(0.0, grace_s))
+        if sync_call is not None and watched not in done:
+            sync_call.warn_if_unsettled()
+        if task.done():
+            _consume_task_outcome(task)
+        else:
+            task.add_done_callback(_consume_task_outcome)
 
     async def _acall_model_streaming(
         self,
@@ -3809,7 +3867,7 @@ class AgentLoop:
 
     async def _await_native_tool_handler(
         self,
-        pending: Awaitable[ToolResult],
+        pending: Awaitable[ToolResult] | _AbandonableSyncCall[ToolResult],
         deadline: float | None,
     ) -> ToolResult:
         """Await a handler with run cancellation and deadline propagation.
@@ -3827,7 +3885,8 @@ class AgentLoop:
         edge -- the kernel can stop *waiting* for a handler, but it cannot stop the handler.
         """
 
-        task = asyncio.ensure_future(pending)
+        sync_call = pending if isinstance(pending, _AbandonableSyncCall) else None
+        task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
         loop = asyncio.get_running_loop()
         cancelled: asyncio.Future[None] = loop.create_future()
 
@@ -3867,14 +3926,9 @@ class AgentLoop:
             if not cancelled.done():
                 cancelled.cancel()
             if not task.done():
-                task.cancel()
-                done, _pending = await asyncio.wait(
-                    {task}, timeout=max(0.0, self.async_tool_cancel_grace_s)
+                await self._detach_unfinished_call(
+                    task, sync_call, grace_s=self.async_tool_cancel_grace_s
                 )
-                if task not in done:
-                    task.add_done_callback(_consume_task_outcome)
-                else:
-                    _consume_task_outcome(task)
 
     def _finalize_tool_call(
         self,

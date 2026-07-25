@@ -288,10 +288,13 @@ cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provid
 so a cancellation-suppressing adapter cannot block the run result. Turn interrupt and pause remain
 step-boundary signals for non-streamed model calls. A synchronous `next_turn` observes the same two
 run boundaries: Python cannot force-stop its worker thread, so exceeding a boundary *abandons* the
-call rather than stopping it. The run reports `cancelled` or `run_timeout` within
-`async_model_cancel_grace_s` while the worker keeps going and its late outcome is discarded. Sync
-adapters should still enforce their own provider I/O timeout and idempotency policy, because the
-kernel can stop waiting for a call it cannot stop.
+call rather than stopping it. The grace interval applies to the worker itself — a call that returns
+inside `async_model_cancel_grace_s` settles normally and is not abandoned, so the boundary is
+reported once the worker has stopped rather than while it races run finalization. Only a call still
+running when the grace expires is abandoned: the run reports `cancelled` or `run_timeout` while the
+worker keeps going and its late outcome is discarded. A settled worker does not change the outcome —
+the grace is not an extension of the deadline. Sync adapters should still enforce their own provider
+I/O timeout and idempotency policy, because the kernel can stop waiting for a call it cannot stop.
 
 Abandonment is not free, and this is a known limitation rather than a settled guarantee: nothing can
 reclaim the thread of a call that never returns, and the run no longer blocks to throttle the next
@@ -352,10 +355,13 @@ run-level `cancelled` or `run_timeout` result. Cleanup has a bounded
 after that window so it cannot block the run result. A synchronous handler observes the same two
 boundaries and the same window, but cannot be force-stopped, so it is detached without ever
 receiving a cancellation to clean up after — the position a cancellation-suppressing async handler
-already ends in. A detached handler may still be writing to the workspace after the run stopped
-waiting for it, and an awaitable it returns too late is closed unawaited. Sync tools that perform
-external I/O should apply their own operation timeout and idempotency policy, because the kernel
-can stop waiting for a handler it cannot stop.
+already ends in. The window applies to the worker thread: a handler that returns inside it settles
+normally and is never detached, which is what keeps its workspace writes ahead of run finalization
+instead of racing it. A handler still running when the window expires is detached and may still be
+writing to the workspace after the run stopped waiting for it. An awaitable it returns too late is
+disposed rather than left dangling — a coroutine is closed, and a future or task is cancelled and
+its outcome consumed. Sync tools that perform external I/O should apply their own operation timeout
+and idempotency policy, because the kernel can stop waiting for a handler it cannot stop.
 
 `ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
 errors become failed tool observations. A handler-local `CancelledError` maps to

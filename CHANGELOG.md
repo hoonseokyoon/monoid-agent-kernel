@@ -36,6 +36,17 @@ out in commit messages and here.
   closed unawaited, and an abandoned tool handler may still be writing to the workspace. Sync
   adapters and tools should still enforce a timeout at their own I/O edge. Adapters needing prompt
   resource release should expose `anext_turn` or a coroutine `next_turn`.
+- The configured cancel grace now applies to a synchronous call's worker thread, so a sync adapter or
+  tool handler that returns inside the grace settles normally instead of being abandoned on the spot.
+  Cancelling a sync call's waiter completes it immediately — there is no coroutine to throw
+  `CancelledError` into — so the previous wait granted no grace at all to the one shape that needed
+  it. A handler that lands inside the window now finishes its workspace writes before the run
+  finalizes rather than racing it, and is not reported as abandoned. The grace is not an extension of
+  the deadline: the run still reports `cancelled` or `run_timeout`.
+- An awaitable returned by an abandoned synchronous call is now disposed whatever its shape: a
+  coroutine is closed, and a future or task is cancelled and its outcome consumed. Previously only
+  coroutines were handled, so in a persistent backend loop a returned task kept running after the
+  run was cancelled and a future completing with an exception was never consumed.
 - Abandoned synchronous calls no longer run on the event loop's default executor. `asyncio.run`
   joins that executor's workers before returning, which made a run deadline enforced internally but
   unobservable to the caller — it produced its result on time, then blocked at loop shutdown until

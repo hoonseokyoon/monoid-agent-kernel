@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import threading
 import time
 from contextvars import ContextVar
 from pathlib import Path
+
+import pytest
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
@@ -15,7 +18,7 @@ from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityLease
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.errors import ToolExecutionError
-from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.loop import AgentLoop, _start_abandonable_sync_call
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference.capability import HumanEscalationBroker
@@ -306,6 +309,83 @@ def test_run_cancellation_abandons_blocking_sync_tool(tmp_path: Path) -> None:
     # for a handler-local ``CancelledError``.
     assert result.error_code == "cancelled"
     assert workers[0].is_alive() is True
+
+
+def test_sync_tool_finishing_within_the_grace_is_not_abandoned(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cancel grace applies to the worker thread, not just to its cancellable waiter.
+
+    Cancelling a sync call's waiter completes it instantly -- there is no coroutine to throw
+    ``CancelledError`` into -- so waiting on the waiter after cancelling it would grant no grace at
+    all and abandon every in-flight handler on the spot. The grace exists so a handler that is
+    about to finish lands its writes before the run finalizes instead of racing it.
+
+    The run still reports ``run_timeout``: the grace is not an extension of the deadline. What it
+    buys is a settled worker and no abandonment.
+    """
+    workers: list[threading.Thread] = []
+
+    @tool(id="sync.almost_done")
+    def almost_done() -> dict:
+        workers.append(threading.current_thread())
+        # Outlasts the run deadline, finishes well inside the grace below.
+        time.sleep(1.3)
+        return {"late": True}
+
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(tool_calls=(fake_tool_call("sync_almost_done", {}, "c1"),))]
+    )
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.loop"):
+        result = asyncio.run(
+            AgentLoop.from_tools(
+                _spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+                adapter,
+                [almost_done],
+                async_tool_cancel_grace_s=5.0,
+            ).arun_once("go")
+        )
+
+    assert result.status == "limited"
+    assert result.error_code == "run_timeout"
+    assert workers[0].is_alive() is False
+    assert [record for record in caplog.records if "abandoned a synchronous call" in record.message] == []
+
+
+def test_late_task_from_abandoned_sync_tool_is_cancelled() -> None:
+    """A late awaitable that is a task or future is disposed, not only a coroutine.
+
+    The normal path accepts any awaitable a sync handler returns, so the late path has to handle the
+    same shapes. Left alone in a persistent backend loop, a returned task keeps running after the
+    run was cancelled, and a future that completes with an exception is never consumed.
+    """
+    ran: list[str] = []
+
+    async def scenario() -> asyncio.Future[None]:
+        loop = asyncio.get_running_loop()
+
+        async def keeps_running() -> None:
+            await asyncio.sleep(0.3)
+            ran.append("finished")
+
+        task = loop.create_task(keeps_running())
+        release = threading.Event()
+
+        def call() -> asyncio.Future[None]:
+            release.wait(timeout=5)
+            return task
+
+        pending = _start_abandonable_sync_call(call, thread_name="nar-test-late-task")
+        pending.result.cancel()  # the run gave up on the call
+        release.set()  # ... and only now does the handler return its task
+        await asyncio.wait({pending.settled}, timeout=5)
+        await asyncio.sleep(0.5)  # long enough for the task to have finished, had it survived
+        return task
+
+    task = asyncio.run(scenario())
+
+    assert task.cancelled() is True
+    assert ran == []
 
 
 def test_sync_tool_handler_sees_caller_context_variables(tmp_path: Path) -> None:
