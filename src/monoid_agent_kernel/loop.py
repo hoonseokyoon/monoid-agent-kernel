@@ -244,11 +244,21 @@ def _start_abandonable_sync_call(
     ``CancelledError`` into -- so waiting on ``result`` after cancelling it would grant no grace at
     all.
 
-    Known limitation: nothing can reclaim the thread of a call that never returns, and the run no
-    longer waits for it, so an implementation that wedges *permanently* accumulates one thread per
-    abandoned call across runs. Each abandonment is logged as a warning so that growth is visible
-    rather than silent; bounding it needs admission control, which belongs with the rest of the
-    per-call resource policy rather than here.
+    Known limitation, in two parts. Nothing can reclaim the thread of a call that never returns, and
+    the run no longer waits for it, so an implementation that wedges *permanently* accumulates one
+    thread per abandoned call across runs; each abandonment is logged as a warning so that growth is
+    visible rather than silent. And a thread per call gives up the bound a shared executor provided:
+    ``asyncio.to_thread`` queued behind the default executor's ``max_workers``, while this starts a
+    thread immediately. Within one run sync calls are sequential, so the exposure is a process
+    driving many runs at once, where a burst can reach the process thread limit and fail calls that
+    would otherwise succeed.
+
+    Both bounds want admission control -- a decision about how much concurrent work a *process*
+    admits, informed by run and tenant policy -- so neither belongs in this helper, which only knows
+    about one call. A dedicated pool here would not settle it either: it would trade an unbounded
+    thread count for a queue whose depth and eviction are the same policy question, and a wedged
+    call would hold a pool slot instead of a thread. Tracked for a later release; hosts running many
+    concurrent sessions with synchronous adapters or tools should bound admission themselves.
     """
 
     loop = asyncio.get_running_loop()

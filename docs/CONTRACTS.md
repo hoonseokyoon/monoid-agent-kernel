@@ -302,6 +302,14 @@ attempt, so an implementation that wedges *permanently* accumulates one thread p
 across runs. Each abandonment is logged as a warning on the `monoid_agent_kernel.loop` logger so the
 growth is visible; there is currently no cap on outstanding abandoned calls.
 
+Nor is there a bound on *healthy* concurrent sync calls. A dedicated daemon thread per call is what
+makes abandonment possible, but it gives up the thread-pool bound a shared executor provided: within
+one run sync calls are sequential, so this is a per-process concern for a host driving many runs at
+once, where a burst can reach the process thread limit and fail calls that would otherwise succeed.
+Hosts that run many concurrent sessions with synchronous adapters or tools should bound admission
+themselves until the kernel does. Both bounds belong with per-call resource policy rather than with
+the dispatch helper, and are tracked for a later release.
+
 `ModelRequest` carries:
 
 - `instruction`
