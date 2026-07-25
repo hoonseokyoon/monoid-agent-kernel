@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 
 from support.process import python_command as _python_command
@@ -165,6 +166,83 @@ def test_never_returning_coroutine_next_turn_observes_run_cancellation(tmp_path:
     assert result.status == "limited"
     assert result.error_code == "cancelled"
     assert cleaned_up is True
+
+
+def test_never_returning_sync_next_turn_observes_run_deadline(tmp_path: Path) -> None:
+    """A blocking sync ``next_turn`` observes the run deadline like an async adapter.
+
+    The offloaded thread cannot be interrupted, so the run abandons it after the cancel
+    grace interval instead of waiting for the provider to return.
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    class NeverReturningSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            started.set()
+            # Released by the test so the abandoned worker does not outlive the run.
+            release.wait(timeout=10)
+            return ModelTurn(response_id="late", final_text="late")
+
+    async def run() -> object:
+        loop = AgentLoop(
+            spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+            model_adapter=NeverReturningSyncAdapter(),  # type: ignore[arg-type]
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            async_model_cancel_grace_s=0.2,
+        )
+        try:
+            return await asyncio.wait_for(loop.arun_once("go"), timeout=10)
+        finally:
+            # Release before ``asyncio.run`` shuts down its default executor, which joins
+            # every worker thread -- including the one this run abandoned.
+            release.set()
+
+    result = asyncio.run(run())
+
+    assert started.is_set() is True
+    assert result.status == "limited"
+    assert result.error_code == "run_timeout"
+
+
+def test_never_returning_sync_next_turn_observes_run_cancellation(tmp_path: Path) -> None:
+    token = CancellationToken()
+    started = threading.Event()
+    release = threading.Event()
+
+    class NeverReturningSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            started.set()
+            release.wait(timeout=10)
+            return ModelTurn(response_id="late", final_text="late")
+
+    async def run() -> object:
+        loop = AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=NeverReturningSyncAdapter(),  # type: ignore[arg-type]
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            cancellation_token=token,
+            async_model_cancel_grace_s=0.2,
+        )
+        pending = asyncio.create_task(loop.arun_once("go"))
+        try:
+            await asyncio.to_thread(started.wait, 5)
+            token.cancel()
+            return await asyncio.wait_for(pending, timeout=10)
+        finally:
+            release.set()
+
+    result = asyncio.run(run())
+
+    assert started.is_set() is True
+    assert result.status == "limited"
+    assert result.error_code == "cancelled"
 
 
 def test_blocked_async_stream_cleanup_cannot_block_run_cancellation(tmp_path: Path) -> None:

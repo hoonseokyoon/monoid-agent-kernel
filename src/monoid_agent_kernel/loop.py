@@ -1500,6 +1500,11 @@ class AgentLoop:
         Backward compatible: an adapter exposing ``async def anext_turn`` is awaited; a
         coroutine ``next_turn`` is awaited; a plain sync ``next_turn`` runs in a thread.
 
+        Every shape observes run cancellation and the run deadline through the same race in
+        ``_await_native_model_call``, so the adapter's async-ness never changes when a run
+        stops. A sync ``next_turn`` cannot be interrupted, so its thread is *abandoned*
+        rather than cancelled -- see that method's note.
+
         While a stream is active and the adapter supports ``astream_turn``, the streaming
         path is preferred: token chunks are relayed to the stream queue and folded into a
         ``ModelTurn`` so the rest of the turn is identical to the non-streamed path."""
@@ -1519,7 +1524,9 @@ class AgentLoop:
         next_turn = adapter.next_turn
         if inspect.iscoroutinefunction(next_turn):
             return await self._await_native_model_call(next_turn(request), deadline)
-        return await asyncio.to_thread(next_turn, request)
+        return await self._await_native_model_call(
+            asyncio.to_thread(next_turn, request), deadline
+        )
 
     async def _await_native_model_call(
         self,
@@ -1532,6 +1539,13 @@ class AgentLoop:
         intentionally absent from this race and are checked by ``_apump_turn`` after the model
         returns. Cancellation and deadlines are run boundaries, so they cancel the provider task
         immediately and wait only a bounded interval for cooperative cleanup.
+
+        A synchronous adapter offloaded with ``asyncio.to_thread`` cannot be interrupted: the
+        thread keeps running to completion. Cancelling its future therefore *abandons* the call
+        -- the run stops waiting within ``async_model_cancel_grace_s`` and the detached outcome is
+        consumed so late cleanup cannot warn, but the provider's socket and CPU work continue
+        until the adapter returns on its own. Adapters that must release resources promptly
+        should expose ``anext_turn`` or a coroutine ``next_turn``.
         """
 
         task = asyncio.ensure_future(pending)
