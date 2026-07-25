@@ -275,9 +275,12 @@ def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutc
     }
 
     try:
+        # One instance, called twice -- not two instances called once. A ``CapturePolicy`` holds its
+        # redactor for the life of the policy, so per-instance state is exactly the nondeterminism
+        # production would hit, and constructing a second instance would hide it behind a fresh one.
         redactor = factory()
         first = redactor.redact(payload, policy=policy)
-        second = factory().redact(payload, policy=policy)
+        second = redactor.redact(payload, policy=policy)
         outcomes.append(
             outcome_from_observations(
                 "REDACTOR-01-DETERMINISTIC",
@@ -334,6 +337,31 @@ def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutc
         )
     except Exception as exc:
         outcomes.append(_error("REDACTOR-03-FAILURE-IS-CONTAINED", REDACTOR_CONTRACT_PROFILE, exc))
+
+    try:
+        mapping_result = factory().redact(payload, policy=policy)
+        text_result = factory().redact("a sk-abc123 line", policy=policy)
+        outcomes.append(
+            outcome_from_observations(
+                "REDACTOR-04-PRESERVES-THE-VALUE-SHAPE",
+                REDACTOR_CONTRACT_PROFILE,
+                (
+                    # "Mask the whole payload" is a tempting one-liner that satisfies every leak rule
+                    # and then hands the pipeline a scalar where it needs fields. The pipeline itself
+                    # fails closed on this, but a redactor that trips it silently loses its consumer's
+                    # content, so the contract names it rather than leaving it to be discovered.
+                    observation("mapping_stays_a_mapping", expected=True, actual=isinstance(mapping_result, Mapping)),
+                    observation("text_stays_text", expected=True, actual=isinstance(text_result, str)),
+                    observation(
+                        "mapping_keys_are_preserved",
+                        expected=sorted(payload),
+                        actual=sorted(mapping_result) if isinstance(mapping_result, Mapping) else None,
+                    ),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(_error("REDACTOR-04-PRESERVES-THE-VALUE-SHAPE", REDACTOR_CONTRACT_PROFILE, exc))
 
     return tuple(outcomes)
 

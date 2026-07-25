@@ -21,6 +21,7 @@ from monoid_agent_kernel.core.model_io import (
     content_digest,
     content_length,
     dispatch_model_call,
+    redacted_fields_or_none,
 )
 from monoid_agent_kernel.core.wire_validation import WireValidationError
 
@@ -67,6 +68,52 @@ def test_one_call_serves_a_different_view_to_each_consumer() -> None:
     assert full.content == CONTENT
     assert digest.content is None and digest.digests != {}
     assert none_.content is None and none_.digests == {}
+
+
+def test_none_mode_strips_the_receipts_content_derived_digests_too() -> None:
+    """Clearing the per-field digests is not enough: `prompt_digest` walks straight past them.
+
+    `none` promises no content metadata, and a digest of a short prompt is recoverable by hashing
+    candidates, so a `none`-mode consumer holding `prompt_digest` has the guarantee in name only.
+    """
+    recorder = Recorder()
+
+    returned = dispatch_model_call(
+        receipt=ModelCallReceipt(
+            prompt_digest="sha-prompt",
+            request_digest="sha-request",
+            redaction_digest="sha-policy",
+            usage={"input_tokens": 5},
+            latency_ms=12,
+        ),
+        content=CONTENT,
+        subscriptions=(ModelIOSubscription(recorder, CapturePolicy(mode="none")),),
+    )
+    delivered = recorder.captures[0].receipt
+
+    assert delivered.prompt_digest == ""
+    assert delivered.request_digest == ""
+    # Everything that is metadata about the *call* rather than about what was said still arrives.
+    # Withholding it would break an accounting consumer for no privacy gain.
+    assert delivered.redaction_digest == "sha-policy"
+    assert dict(delivered.usage) == {"input_tokens": 5}
+    assert delivered.latency_ms == 12
+    # The receipt returned to the kernel keeps them: it computed them.
+    assert (returned.prompt_digest, returned.request_digest) == ("sha-prompt", "sha-request")
+
+
+def test_only_none_mode_loses_the_receipt_digests() -> None:
+    recorders = [Recorder() for _ in range(3)]
+    dispatch_model_call(
+        receipt=ModelCallReceipt(prompt_digest="sha-prompt"),
+        content=CONTENT,
+        subscriptions=tuple(
+            ModelIOSubscription(recorder, CapturePolicy(mode=mode))
+            for recorder, mode in zip(recorders, ("full", "digest", "redacted"), strict=True)
+        ),
+    )
+
+    assert [r.captures[0].receipt.prompt_digest for r in recorders] == ["sha-prompt"] * 3
 
 
 def test_none_mode_withholds_even_the_digest() -> None:
@@ -185,6 +232,111 @@ def test_a_failing_redactor_downgrades_only_its_own_subscription() -> None:
     assert full.content == CONTENT and full.was_downgraded is False
     assert digest.mode == "digest" and digest.downgraded_from == ""
     assert receipt.capture_downgrades == 1
+
+
+def test_a_policy_restored_without_its_custom_redactor_downgrades() -> None:
+    """Missing machinery is a redaction failure, not a weaker redaction.
+
+    A custom redactor cannot round-trip through JSON. Applying the built-in rules to a policy that
+    knows it had one would be the worst outcome available: the consumer is told it received redacted
+    content while the classifier that masked more than key names and regexes is simply absent.
+    """
+
+    class Classifier:
+        """Masks far more than the built-in rules do."""
+
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return dict.fromkeys(value, "[classified]")
+
+    restored = CapturePolicy.from_json(
+        CapturePolicy(mode="redacted", redactor=Classifier()).to_json()
+    )
+    assert restored.restored_without_redactor is True and restored.redactor is None
+
+    receipt, (capture,) = _dispatch(restored)
+
+    assert capture.mode == "digest"
+    assert capture.downgraded_from == "redacted"
+    assert capture.content is None
+    assert receipt.capture_downgrades == 1
+
+
+def test_a_policy_with_its_redactor_reattached_redacts_normally() -> None:
+    """The downgrade is about the absence, not about having come from JSON."""
+
+    class Classifier:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return dict.fromkeys(value, "[classified]")
+
+    restored = CapturePolicy.from_json(
+        CapturePolicy(mode="redacted", redactor=Classifier()).to_json()
+    )
+    reattached = CapturePolicy(
+        mode=restored.mode, redaction=restored.redaction, redactor=Classifier()
+    )
+
+    _receipt, (capture,) = _dispatch(reattached)
+
+    assert capture.mode == "redacted"
+    assert capture.content == dict.fromkeys(CONTENT, "[classified]")
+
+
+def test_a_redactor_returning_a_non_mapping_is_contained_not_raised() -> None:
+    """Resolution happens outside the per-observer guard, so this used to escape `dispatch_model_call`
+    and fail a model call the provider had already been paid for.
+
+    `Redactor.redact` is typed `Any -> Any`, and "mask the whole payload" is a tempting one-liner that
+    satisfies every leak rule, so this is a reachable third-party shape rather than a contrived one.
+    """
+
+    class MaskAll:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return policy.replacement
+
+    class ReturnsAList:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return list(value)
+
+    receipt, (scalar, listed, unaffected) = _dispatch(
+        CapturePolicy(mode="redacted", redactor=MaskAll()),
+        CapturePolicy(mode="redacted", redactor=ReturnsAList()),
+        CapturePolicy(mode="full"),
+    )
+
+    assert (scalar.mode, scalar.downgraded_from, scalar.content) == ("digest", "redacted", None)
+    assert (listed.mode, listed.downgraded_from, listed.content) == ("digest", "redacted", None)
+    assert unaffected.content == CONTENT
+    assert receipt.capture_downgrades == 2
+
+
+def test_a_redactor_returning_a_mapping_subclass_is_accepted() -> None:
+    """The check is on the shape the pipeline needs, not on `dict` exactly."""
+    from collections import OrderedDict
+
+    class Ordered:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return OrderedDict((key, "[masked]") for key in value)
+
+    _receipt, (capture,) = _dispatch(CapturePolicy(mode="redacted", redactor=Ordered()))
+
+    assert capture.mode == "redacted"
+    assert capture.content == dict.fromkeys(CONTENT, "[masked]")
+
+
+def test_redacted_fields_or_none_reports_both_failure_modes_as_none() -> None:
+    class Scalar:
+        def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
+            return "flattened"
+
+    assert (
+        redacted_fields_or_none(CONTENT, policy=RedactionPolicy(), redactor=FailingRedactor())
+        is None
+    )
+    assert redacted_fields_or_none(CONTENT, policy=RedactionPolicy(), redactor=Scalar()) is None
+    assert redacted_fields_or_none(CONTENT, policy=RedactionPolicy()) == {
+        "final_text": "the key is sk-abc123",
+        "api_key": REDACTION_PLACEHOLDER,
+    }
 
 
 def test_every_observer_sees_the_same_downgrade_count() -> None:

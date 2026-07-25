@@ -131,6 +131,7 @@ def test_contract_suites_are_reachable_through_the_public_conformance_package() 
         "REDACTOR-01-DETERMINISTIC",
         "REDACTOR-02-NO-DEFAULT-SECRET-LEAK",
         "REDACTOR-03-FAILURE-IS-CONTAINED",
+        "REDACTOR-04-PRESERVES-THE-VALUE-SHAPE",
     ]
     assert all(outcome.profile_id == "redactor-contract" for outcome in outcomes)
     assert all(outcome.status == "passed" for outcome in outcomes)

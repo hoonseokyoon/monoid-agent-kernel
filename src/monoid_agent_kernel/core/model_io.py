@@ -270,9 +270,12 @@ class CapturePolicy:
     in the others: the fail-closed downgrade produces a `digest`-mode policy that still carries the
     redaction it failed to apply, so the pair must survive a mode change.
 
-    `to_json` carries `mode` and `redaction`. A `redactor` is live code and cannot round-trip, so a
-    policy restored from JSON falls back to `DefaultRedactor`; code that wires a custom redactor must
-    re-attach it, and `restored_without_redactor` says whether that is needed.
+    `to_json` carries `mode` and `redaction`. A `redactor` is live code and cannot round-trip, so
+    `restored_without_redactor` marks a policy that came back from JSON knowing it *had* one. Such a
+    policy does **not** fall back to `DefaultRedactor`: the capture pipeline treats it as a redaction
+    failure and downgrades to `digest` until the redactor is re-attached. Applying the built-in rules
+    instead would be the worst outcome available — the consumer would be told it received redacted
+    content while the classifier that masked more than key names and regexes is simply absent.
     """
 
     mode: CaptureMode = "full"
@@ -535,7 +538,9 @@ class ModelIOObserver(Protocol):
 
     An observer must not raise, and if it does the kernel swallows it: an exporter that is down is not
     a reason to fail a model call the provider has already billed for. It must also treat the capture
-    as read-only; each consumer gets its own capture, but the receipt inside is shared.
+    as read-only. Each consumer gets its own capture and its own receipt: the counts and taxonomy
+    agree across consumers, but a `none`-mode receipt has its content-derived digests cleared, so two
+    receipts from one call are not necessarily equal.
     """
 
     def on_model_call(self, capture: ModelCallCapture) -> None: ...
@@ -560,7 +565,33 @@ class ModelIOSubscription:
     policy: CapturePolicy = field(default_factory=lambda: CapturePolicy())
 
 
-def _resolve_capture(policy: CapturePolicy, content: Mapping[str, Any]) -> tuple[CaptureMode, str, Mapping[str, Any] | None]:
+def redacted_fields_or_none(
+    content: Mapping[str, Any],
+    *,
+    policy: RedactionPolicy,
+    redactor: Redactor | None = None,
+) -> Mapping[str, Any] | None:
+    """Redact a field mapping, or return `None` if the redactor failed *or* misbehaved.
+
+    `Redactor.redact` is typed `Any -> Any`, so a third-party implementation can return a scalar or a
+    list for a mapping input — plausibly, since "mask the whole payload" is a tempting one-liner. The
+    pipeline needs fields back to deliver fields, and converting a non-mapping result here rather than
+    at the call site is what keeps that failure inside the fail-closed path: raised outside it, the
+    exception would escape `dispatch_model_call` and fail a model call the provider has already been
+    paid for.
+
+    A shape violation is treated exactly like a raise. It is a contract violation either way, and the
+    consumer that asked for redacted content gets metadata instead of a guess.
+    """
+    redacted = redacted_or_none(dict(content), policy=policy, redactor=redactor)
+    if not isinstance(redacted, Mapping):
+        return None
+    return {str(key): value for key, value in redacted.items()}
+
+
+def _resolve_capture(
+    policy: CapturePolicy, content: Mapping[str, Any]
+) -> tuple[CaptureMode, str, Mapping[str, Any] | None]:
     """Decide what one subscription sees, as `(mode, downgraded_from, content)`."""
     if policy.mode == "none":
         return "none", "", None
@@ -568,14 +599,34 @@ def _resolve_capture(policy: CapturePolicy, content: Mapping[str, Any]) -> tuple
         return "digest", "", None
     if policy.mode == "full":
         return "full", "", dict(content)
-    redacted = redacted_or_none(
-        dict(content), policy=policy.effective_redaction, redactor=policy.redactor
+    if policy.restored_without_redactor and policy.redactor is None:
+        # A policy that came back from JSON knowing it *had* a custom redactor, and no longer has one.
+        # Silently applying the built-in rules would be the worst outcome available: the consumer is
+        # told it received redacted content while a classifier that masked more than key names and
+        # regexes is simply absent. Missing machinery is a redaction failure, not a weaker redaction.
+        return "digest", "redacted", None
+    redacted = redacted_fields_or_none(
+        content, policy=policy.effective_redaction, redactor=policy.redactor
     )
     if redacted is None:
         # Fail closed. This consumer asked for redacted content and the redactor could not produce it,
         # so it gets what ``digest`` would have given it -- never the raw value.
         return "digest", "redacted", None
-    return "redacted", "", dict(redacted)
+    return "redacted", "", redacted
+
+
+# Receipt fields derived from the call's content. A ``none``-mode consumer must not receive these:
+# ``none`` promises no content metadata, and a digest of a short prompt is recoverable by hashing
+# candidates. Everything else on the receipt stays -- token counts, timings, taxonomy and the
+# *policy* digest are metadata about the call rather than about what was said, and withholding them
+# would leave an accounting or alerting consumer unable to do its job for no privacy gain.
+_CONTENT_DERIVED_RECEIPT_FIELDS = ("prompt_digest", "request_digest")
+
+
+def _receipt_for_mode(receipt: ModelCallReceipt, mode: CaptureMode) -> ModelCallReceipt:
+    if mode != "none":
+        return receipt
+    return replace(receipt, **dict.fromkeys(_CONTENT_DERIVED_RECEIPT_FIELDS, ""))
 
 
 def dispatch_model_call(
@@ -586,10 +637,15 @@ def dispatch_model_call(
 ) -> ModelCallReceipt:
     """Deliver one settled model call to every subscription under its own policy.
 
-    Returns the receipt the observers were given: the same one, plus `capture_downgrades`. The count
-    is resolved in a first pass *before* any delivery, so every observer sees the same receipt.
-    Delivering as we go would hand the first observer a count of zero and the last the true total, and
-    a receipt that disagrees with itself across consumers is worse than no count at all.
+    Returns the caller's receipt plus `capture_downgrades`. The count is resolved in a first pass
+    *before* any delivery, so every observer agrees on it. Delivering as we go would hand the first
+    observer a count of zero and the last the true total, and a receipt that disagrees with itself
+    across consumers is worse than no count at all.
+
+    What each observer receives is that receipt narrowed to its mode: a `none`-mode consumer gets the
+    content-derived digests cleared, because `none` promises no content metadata and the receipt's
+    `prompt_digest` would otherwise walk straight past the per-field digests this function withholds.
+    The receipt *returned* keeps them — the caller is the kernel, which computed them.
 
     Digests and lengths are computed once, on the raw content, and shared. Beyond the cost, that is
     what makes them comparable: a per-observer digest taken after redaction would differ by policy and
@@ -613,7 +669,7 @@ def dispatch_model_call(
     for subscription, (mode, downgraded_from, payload) in zip(subscriptions, resolved, strict=True):
         reveals_metadata = mode != "none"
         capture = ModelCallCapture(
-            receipt=settled,
+            receipt=_receipt_for_mode(settled, mode),
             mode=mode,
             downgraded_from=downgraded_from,
             content=payload,

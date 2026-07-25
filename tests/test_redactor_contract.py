@@ -30,6 +30,7 @@ def test_shipped_redactors_satisfy_the_contract(redactor_factory: Callable[[], R
         "REDACTOR-01-DETERMINISTIC",
         "REDACTOR-02-NO-DEFAULT-SECRET-LEAK",
         "REDACTOR-03-FAILURE-IS-CONTAINED",
+        "REDACTOR-04-PRESERVES-THE-VALUE-SHAPE",
     ]
     assert all(outcome.status == "passed" for outcome in outcomes), [
         (outcome.rule_id, outcome.status, outcome.error) for outcome in outcomes
@@ -55,8 +56,10 @@ def test_the_contract_catches_a_nondeterministic_redactor() -> None:
                 return {**redacted, "_pass": str(self.calls)}
             return redacted
 
-    shared = Counting()
-    statuses = _statuses(run_redactor_contract(lambda: shared))
+    # Passed as the class, not as a shared instance. The determinism rule calls one redactor twice,
+    # because a CapturePolicy holds its redactor for the life of the policy -- constructing a second
+    # instance would hide exactly the per-instance state production would hit.
+    statuses = _statuses(run_redactor_contract(Counting))
 
     assert statuses["REDACTOR-01-DETERMINISTIC"] == "failed"
     assert statuses["REDACTOR-02-NO-DEFAULT-SECRET-LEAK"] == "passed"
@@ -92,6 +95,9 @@ def test_the_contract_catches_a_redactor_that_masks_everything() -> None:
     statuses = _statuses(run_redactor_contract(MaskAll))
 
     assert statuses["REDACTOR-02-NO-DEFAULT-SECRET-LEAK"] == "failed"
+    # And it hands the pipeline a scalar where fields are needed, which is its own rule: the pipeline
+    # fails closed on that, so a redactor tripping it silently loses its consumer's content.
+    assert statuses["REDACTOR-04-PRESERVES-THE-VALUE-SHAPE"] == "failed"
 
 
 def test_a_raising_redactor_reports_an_error_rather_than_taking_the_suite_down() -> None:
