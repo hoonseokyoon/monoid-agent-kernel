@@ -298,13 +298,29 @@ async def detach_unfinished_call(
     waiting on the worker's own completion instead, which is what the interval is for -- a
     worker that finishes inside it lands its writes before the run finalizes rather than racing
     it, and is never reported as abandoned.
+
+    Both halves report. The warning used to be gated on there being a sync call, so an async callee
+    whose cleanup outran the grace was detached in silence -- and it has the same unbounded shape:
+    the task and whatever it holds stay alive with nobody to reclaim them, one per abandonment, on a
+    loop that may run for days. For a streamed model call that is an open provider connection pool.
+    Visible growth rather than silent growth is the property this module claims for itself, and it
+    was only ever true of the half that happened to be written first.
     """
 
     task.cancel()
     watched: asyncio.Future[Any] = task if sync_call is None else sync_call.settled
     done, _pending = await asyncio.wait({watched}, timeout=max(0.0, grace_s))
-    if sync_call is not None and watched not in done:
-        sync_call.warn_if_unsettled()
+    if watched not in done:
+        if sync_call is not None:
+            sync_call.warn_if_unsettled()
+        else:
+            _LOGGER.warning(
+                "abandoned an asynchronous call whose cleanup outran the %.3gs grace interval: the "
+                "run stopped waiting for it, and nothing will reclaim the task or what it holds "
+                "until its cleanup returns on its own. An implementation that never returns leaks "
+                "one task per abandoned call; enforce a timeout at its I/O edge.",
+                grace_s,
+            )
     if task.done():
         consume_task_outcome(task)
     else:

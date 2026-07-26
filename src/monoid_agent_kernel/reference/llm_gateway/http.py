@@ -144,18 +144,13 @@ def make_llm_gateway_handler(
             provider_retried: bool = False,
         ) -> None:
             self._write_json(
-                {
-                    "error": message,
-                    "error_code": error_code,
-                    "retryable": retryable,
-                    "http_status": int(status),
-                    # A retry the gateway's *backend* made before failing. The client can only see
-                    # its own attempts, so without this a call the provider retried and then failed
-                    # was recorded as a clean single attempt -- and a failure is where that record
-                    # matters most. Defaults False: an error the gateway raised on its own, before
-                    # reaching a provider, involved no provider attempt at all.
-                    "provider_retried": provider_retried,
-                },
+                _error_body(
+                    status,
+                    message,
+                    error_code=error_code,
+                    retryable=retryable,
+                    provider_retried=provider_retried,
+                ),
                 status=status,
             )
 
@@ -194,24 +189,57 @@ def make_llm_gateway_handler(
     return LlmGatewayHttpHandler
 
 
+def _error_body(
+    status: HTTPStatus,
+    message: str,
+    *,
+    error_code: str = GATEWAY_BAD_RESPONSE,
+    retryable: bool = False,
+    provider_retried: bool = False,
+) -> dict[str, Any]:
+    """The fields every gateway error carries, whatever transport reports it.
+
+    One definition rather than one per writer. The non-200 body and the SSE error frame are read
+    back by the same client code, and while they were written separately they came to disagree:
+    ``provider_retried`` reached one and not the other.
+
+    ``provider_retried`` is a retry the gateway's *backend* made before failing. The client can only
+    see its own attempts, so without it a call the provider retried and then failed was recorded as
+    a clean single attempt -- and a failure is where that record matters most. It defaults False,
+    which is what an error the gateway raised on its own, before reaching a provider, means.
+    """
+
+    return {
+        "error": message,
+        "error_code": error_code,
+        "retryable": retryable,
+        "http_status": int(status),
+        "provider_retried": provider_retried,
+    }
+
+
 def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict[str, Any]:
-    """Mid-stream error as an SSE frame, mirroring ``_write_error``'s fields so the client maps
-    it back to a ModelAdapterError identically to a non-200 response."""
+    """Mid-stream error as an SSE frame, carrying ``_error_body``'s fields so the client maps it
+    back to a ModelAdapterError identically to a non-200 response."""
     if isinstance(exc, ModelAdapterError):
         return {
             "type": "error",
-            "error": str(exc),
-            "error_code": exc.provider_error_code or GATEWAY_BAD_RESPONSE,
-            "retryable": exc.retryable,
-            "http_status": int(_model_error_status(exc)),
-            "provider_retried": exc.provider_retried,
+            **_error_body(
+                _model_error_status(exc),
+                str(exc),
+                error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
+                retryable=exc.retryable,
+                provider_retried=exc.provider_retried,
+            ),
         }
     return {
         "type": "error",
-        "error": redact_internal_error(_LOGGER, handler, exc),
-        "error_code": GATEWAY_SERVER_ERROR,
-        "retryable": True,
-        "http_status": int(HTTPStatus.INTERNAL_SERVER_ERROR),
+        **_error_body(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            redact_internal_error(_LOGGER, handler, exc),
+            error_code=GATEWAY_SERVER_ERROR,
+            retryable=True,
+        ),
     }
 
 

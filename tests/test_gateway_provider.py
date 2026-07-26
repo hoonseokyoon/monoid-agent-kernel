@@ -574,3 +574,128 @@ def test_a_backend_retry_survives_a_failed_gateway_call() -> None:
     silent = json.dumps({"error": "refused", "error_code": "gateway_bad_request"})
     assert _error_from_status_body(400, silent).provider_retried is False
     assert _stream_error_frame(None, ModelAdapterError("refused"))["provider_retried"] is False
+
+
+def _http_error(status: int, body: str) -> HTTPError:
+    return HTTPError("http://gateway.invalid", status, "err", {}, io.BytesIO(body.encode("utf-8")))
+
+
+def test_every_error_constructor_reads_the_backend_retry() -> None:
+    """All five, not four. `_error_from_http_error` is the sync `next_turn` HTTP path — the
+    ordinary 400/401/quota failure — and it was the one the round-trip test never called. Today only
+    its delegation to `_error_from_status_body` holds the field; nothing stopped a copy coming back.
+    """
+    from monoid_agent_kernel.providers.gateway import _error_from_http_error
+
+    body = json.dumps(
+        {"error": "refused", "error_code": "gateway_bad_request", "provider_retried": True}
+    )
+    assert _error_from_http_error(_http_error(400, body)).provider_retried is True
+    clean = json.dumps({"error": "refused", "error_code": "gateway_bad_request"})
+    assert _error_from_http_error(_http_error(400, clean)).provider_retried is False
+
+
+def test_a_non_200_body_carries_the_backend_retry_end_to_end() -> None:
+    """The server half of the same fact. `_stream_error_frame` was covered; `_write_error` was not."""
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+    from monoid_agent_kernel.reference.llm_gateway.http import _error_body
+
+    body = _error_body(400, "refused", error_code="gateway_bad_request", provider_retried=True)
+    assert _error_from_status_body(400, json.dumps(body)).provider_retried is True
+    plain = _error_body(400, "refused", error_code="gateway_bad_request")
+    assert _error_from_status_body(400, json.dumps(plain)).provider_retried is False
+
+
+def test_a_first_attempt_failure_does_not_claim_a_retry() -> None:
+    """The false-positive direction. Every other test asks whether a real retry is recorded; this
+    asks whether an imaginary one is, which a boundary slip on `_stamp_retry` would produce for
+    every single-attempt failure in the system.
+    """
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(gateway_url="http://gateway.invalid"), token="t"
+    )
+    with pytest.raises(ModelAdapterError) as caught:
+        _drive_urlopen_error(adapter, _http_error(401, json.dumps({"error": "nope"})))
+    assert getattr(caught.value, "provider_retried", False) is False
+
+
+def _drive_urlopen_error(adapter: GatewayModelAdapter, error: Exception) -> None:
+    import monoid_agent_kernel.providers.gateway as gateway_module
+
+    original = gateway_module.urlopen
+    try:
+        gateway_module.urlopen = lambda *_a, **_k: (_ for _ in ()).throw(error)
+        adapter.next_turn(ModelRequest(system_prompt="s", instruction="hi", tools=()))
+    finally:
+        gateway_module.urlopen = original
+
+
+def test_the_retry_loops_ask_for_the_schedule_of_the_attempt_that_failed(
+    monkeypatch: Any,
+) -> None:
+    """What the loops *pass* the schedule, which no test bound.
+
+    `_retry_delay` is tested in isolation, so shifting the loops' argument by one moved every
+    backoff a step up the curve — real extra seconds per retry — with nothing failing. Recorded
+    rather than slept through, so this stays fast.
+    """
+    import monoid_agent_kernel.providers.gateway as gateway_module
+
+    asked: list[int] = []
+    monkeypatch.setattr(
+        gateway_module, "_retry_delay", lambda attempt, *_a: asked.append(attempt) or 0.0
+    )
+    attempts = {"n": 0}
+
+    def _urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        attempts["n"] += 1
+        raise URLError("reset")
+
+    monkeypatch.setattr(gateway_module, "urlopen", _urlopen)
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid", retry=ModelRetryConfig(max_attempts=3)
+        ),
+        token="t",
+    )
+    with pytest.raises(ModelAdapterError):
+        adapter.next_turn(ModelRequest(system_prompt="s", instruction="hi", tools=()))
+
+    assert attempts["n"] == 3
+    # Indexed by the attempt that just failed: 1 then 2, never 2 then 3.
+    assert asked == [1, 2]
+
+
+def test_the_retry_is_reported_before_the_wait_not_after_it(monkeypatch: Any) -> None:
+    """Ordering across the backoff, which every other fixture hides by stubbing the wait to zero.
+
+    The wait is a window the run can end inside — the worker sleeps on its thread while the event
+    loop stays free to time out and abandon it — so a report issued after it is a report that may
+    never happen.
+    """
+    import monoid_agent_kernel.providers.gateway as gateway_module
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        gateway_module,
+        "_sleep_before_retry",
+        lambda *_a: order.append("wait"),
+    )
+    monkeypatch.setattr(
+        gateway_module, "report_provider_retried", lambda: order.append("report")
+    )
+
+    def _urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        raise URLError("reset")
+
+    monkeypatch.setattr(gateway_module, "urlopen", _urlopen)
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid", retry=ModelRetryConfig(max_attempts=3)
+        ),
+        token="t",
+    )
+    with pytest.raises(ModelAdapterError):
+        adapter.next_turn(ModelRequest(system_prompt="s", instruction="hi", tools=()))
+
+    assert order == ["report", "wait", "report", "wait"]

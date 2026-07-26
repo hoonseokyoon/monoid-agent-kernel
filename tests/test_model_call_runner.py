@@ -1616,3 +1616,144 @@ def test_a_sync_adapter_raising_stopiteration_does_not_hang_the_run() -> None:
 
     with pytest.raises(RuntimeError, match="StopIteration"):
         asyncio.run(run())
+
+
+# --- receipt fields nothing was pinning ----------------------------------------------------------
+
+
+def test_a_zero_count_is_a_count_and_a_bad_key_costs_only_its_entry() -> None:
+    """`_recordable_usage` drops what the receipt would refuse, and nothing else.
+
+    A zero is a real count -- an accounting consumer must see `0`, not a missing key -- and a
+    non-string key would raise from `ModelCallReceipt.__post_init__`, failing a call the provider
+    has already been paid for, which is the one thing this helper exists to prevent.
+    """
+
+    class OddUsageAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(
+                final_text="answer",
+                usage={"input_tokens": 5, "cached_tokens": 0, "bad": -3, "flag": True, 7: 1},
+            )
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(adapter=OddUsageAdapter()).acall(REQUEST)
+        return receipt
+
+    assert dict(asyncio.run(run()).usage) == {"input_tokens": 5, "cached_tokens": 0}
+
+
+def test_an_adapter_that_reports_no_stop_reason_records_an_empty_one() -> None:
+    """`ModelTurn.stop_reason` is `None` when the adapter does not report one.
+
+    Written through `str()` unguarded, that becomes the literal `"None"` in an audit field -- a
+    value indistinguishable from an adapter that really said "None".
+    """
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(adapter=SyncAdapter()).acall(REQUEST)
+        return receipt
+
+    assert asyncio.run(run()).stop_reason == ""
+
+
+def test_a_by_reference_call_shows_an_empty_message_log_not_a_null_one() -> None:
+    """The display surface keeps its container shape even when the request carried none."""
+    observer = RecordingObserver()
+    runner = ModelCallRunner(
+        adapter=SyncAdapter(),
+        subscriptions=(ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="full")),),
+    )
+
+    async def run() -> None:
+        await runner.acall(replace(REQUEST, messages=None, previous_turn_handle="prev"))
+
+    asyncio.run(run())
+    assert observer.captures[0].content["messages"] == []
+
+
+def test_a_resolver_that_answers_nothing_still_leaves_the_key_empty() -> None:
+    """The third way an adapter declines a destination: answering, with nothing.
+
+    Unguarded, `str(None)` puts the text `"None"` into the replay key -- a destination no adapter
+    has, shared by every adapter that returns `None`.
+    """
+
+    class Vague:
+        def resolve_destination(self, config: ModelConfig) -> Any:
+            del config
+            return None
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(adapter=Vague()).acall(REQUEST)
+        return receipt
+
+    empty = _digest(_request_payload(REQUEST, ModelConfig(), provider="", destination=""))
+    stringified = _digest(_request_payload(REQUEST, ModelConfig(), provider="", destination="None"))
+    assert asyncio.run(run()).request_digest == empty
+    assert empty != stringified, "the two must be distinguishable for this test to mean anything"
+
+
+def test_a_config_of_the_wrong_type_is_not_written_into_the_receipt() -> None:
+    """`config` is probed, so an adapter may expose anything under that name."""
+
+    class MisConfigured:
+        config = "gpt-5.5"  # a string, not a ModelConfig
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(adapter=MisConfigured()).acall(REQUEST)
+        return receipt
+
+    assert asyncio.run(run()).model == ModelConfig()
+
+
+def test_a_receipt_that_already_recorded_a_retry_keeps_it_through_a_failure() -> None:
+    """`with_error` combines rather than assigns. Guards a second caller, so tested directly."""
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+
+    receipt = ModelCallReceipt(provider_retried=True)
+    assert receipt.with_error(RuntimeError("boom")).provider_retried is True
+    assert ModelCallReceipt().with_error(RuntimeError("boom")).provider_retried is False
+
+
+def test_an_abandoned_async_call_is_reported_the_way_an_abandoned_thread_is(
+    caplog: Any,
+) -> None:
+    """Both halves of the bridge report; only one used to.
+
+    An async callee whose cleanup outran the grace was detached in silence, and it has the same
+    unbounded shape as the sync one -- one task, and everything it holds, per abandonment, on a loop
+    that may run for days. Measured before this fix: 400 abandonments, 400 pending tasks, 400 live
+    generators, zero log lines, while the sync half emitted 400.
+    """
+
+    class StubbornCleanupAdapter:
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            try:
+                yield TextDelta("ans")
+                await asyncio.sleep(30)
+            finally:
+                await asyncio.sleep(30)  # cleanup that outruns any grace
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=StubbornCleanupAdapter(), cancel_grace_s=0.02).acall(
+            REQUEST, delta_consumer=lambda chunk: None, deadline=time.time() + 0.05
+        )
+
+    with caplog.at_level("WARNING", logger="monoid_agent_kernel.core.sync_bridge"):
+        with pytest.raises(RunTimeout):
+            asyncio.run(run())
+
+    assert any("abandoned an asynchronous call" in record.message for record in caplog.records), (
+        "an abandoned async call must be as visible as an abandoned thread"
+    )

@@ -95,6 +95,12 @@ out in commit messages and here.
   runtime, where the loop has always probed them with `getattr` and a default.
 
 ### Changed
+- An abandoned *asynchronous* call is now logged the way an abandoned thread already was. The
+  warning was gated on there being a synchronous call, so a callee whose cleanup outran the grace
+  interval was detached in silence — with the same unbounded shape as the sync case: one task, and
+  everything it holds, per abandonment, on a loop that may run for days. For a streamed model call
+  that is an open provider connection pool. Measured before the fix: 400 abandonments produced 400
+  pending tasks and zero log lines, while the sync half produced 400.
 - A model call is no longer lost, nor left without a receipt, because an adapter returned something
   slightly off-shape. `stop_reason`, `usage`, and `tool_calls` are read defensively, the same way
   `provider_retried` already was and for the same stated reason — a third-party adapter may return
