@@ -241,6 +241,15 @@ class GatewayModelAdapter:
             _stamp_retry(exc, attempt)
             raise
 
+    def resolve_destination(self, config: ModelConfig) -> str:
+        """Where a call under ``config`` would go. See ``AddressedModelAdapter``.
+
+        Delegates to the same resolution the request itself uses, so a replay key and the actual
+        request can never disagree about the destination.
+        """
+
+        return self._resolve_gateway_url(config)
+
     def _resolve_gateway_url(self, config: ModelConfig) -> str:
         url = self.gateway_url or config.gateway_url or self.config.gateway_url or getenv(DEFAULT_GATEWAY_URL_ENV)
         if not url:

@@ -122,11 +122,15 @@ def _digest(payload: dict[str, Any]) -> str:
     happens, it simply is not replayable -- while a fabricated key returns the wrong call. An empty
     digest means *no key*; two unreplayable calls both carry `""` and are not thereby the same call.
 
-    Circular references, unencodable primitives and unserializable objects all arrive here as an
-    exception from the encoder, which is why one `except` covers what previously needed a cycle
-    tracker, a depth cap and three separate value guards. Output is capped so a payload built from
-    shared references cannot expand without bound; passing the cap also means no key, since a
-    prefix would stand for the whole.
+    Every encoder failure means the same thing here -- no key -- so the clause catches `Exception`
+    rather than a list of types. Naming them was itself a bug found four times over: circular
+    references, unencodable primitives, unserializable objects, then a `dict` subclass whose
+    `items()` raises. The question is never which exception the encoder chose, only whether it
+    finished. `BaseException` is deliberately not caught: a cancellation or an interrupt is not a
+    statement about the payload.
+
+    Output is capped so a payload built from shared references cannot expand without bound; passing
+    the cap also means no key, since a prefix would stand for the whole.
     """
 
     hasher = hashlib.sha256()
@@ -138,7 +142,7 @@ def _digest(payload: dict[str, Any]) -> str:
             if encoded > _MAX_DIGEST_BYTES:
                 return ""
             hasher.update(raw)
-    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+    except Exception:
         return ""
     return hasher.hexdigest()
 
@@ -163,18 +167,28 @@ def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
     }
 
 
-def _request_payload(request: ModelRequest, model: ModelConfig) -> dict[str, Any]:
+def _request_payload(
+    request: ModelRequest, model: ModelConfig, *, provider: str, destination: str
+) -> dict[str, Any]:
     """The whole request, as the thing `request_digest` identifies -- the replay key.
 
-    `model` is the *effective* config, resolved by the caller, not `request.model`. The request's
-    is optional and the shipped adapters fall back to their own, so hashing `request.model or
-    ModelConfig()` gave two calls on differently-configured adapters the same replay key -- and
-    stamped the receipt with the default model rather than the one that ran.
+    `model` is the *effective* config, resolved by the caller, not `request.model`. The request's is
+    optional and the shipped adapters fall back to their own, so hashing `request.model or
+    ModelConfig()` gave two calls on differently-configured adapters the same replay key.
+
+    `provider` and `destination` are here because the same request answered by a different service
+    is a different call. A config alone does not identify the service: an adapter may route by a
+    per-instance override or an environment variable, so two adapters holding identical configs can
+    address different hosts. `destination` is hashed and never recorded, so an internal hostname
+    stays internal, and it is empty for an adapter that does not expose one -- see
+    `AddressedModelAdapter`.
     """
 
     payload = _prompt_payload(request)
     payload["tools"] = [_tool_payload(spec) for spec in request.tools]
     payload["model"] = model.to_json()
+    payload["provider"] = provider
+    payload["destination"] = destination
     return payload
 
 
@@ -274,6 +288,21 @@ class ModelCallRunner:
         configured = getattr(self.adapter, "config", None)
         return configured if isinstance(configured, ModelConfig) else ModelConfig()
 
+    def _destination(self, model: ModelConfig) -> str:
+        """Where this adapter would send a call under `model`, or `""` if it does not say.
+
+        Probed and tolerant of failure for the same reason every other probe here is: a replay key
+        is bookkeeping, and an adapter that cannot answer must not thereby lose its call.
+        """
+
+        resolve = getattr(self.adapter, "resolve_destination", None)
+        if not callable(resolve):
+            return ""
+        try:
+            return str(resolve(model) or "")
+        except Exception:
+            return ""
+
     def _token(self) -> CancellationToken | None:
         return None if self.current_cancellation_token is None else self.current_cancellation_token()
 
@@ -317,12 +346,20 @@ class ModelCallRunner:
 
         started = time.monotonic()
         model = self._effective_model(request)
+        provider = str(getattr(self.adapter, "provider_name", "") or "")
         receipt = ModelCallReceipt(
             context=context if context is not None else InvocationContext(),
             model=model,
-            provider_name=str(getattr(self.adapter, "provider_name", "") or ""),
+            provider_name=provider,
             prompt_digest=_digest(_prompt_payload(request)),
-            request_digest=_digest(_request_payload(request, model)),
+            request_digest=_digest(
+                _request_payload(
+                    request,
+                    model,
+                    provider=provider,
+                    destination=self._destination(model),
+                )
+            ),
         )
         try:
             turn = await self._adrive(request, deadline, should_abort, delta_consumer)

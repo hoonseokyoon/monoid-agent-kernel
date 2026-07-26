@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from typing import Any
@@ -32,9 +33,15 @@ from monoid_agent_kernel.providers.base import (
     ToolObservation,
     TurnComplete,
 )
+from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.tools.base import ToolSpec
 
 REQUEST = ModelRequest(instruction="hi", system_prompt="sys", tools=())
+
+
+def _raises(self: Any, *args: Any, **kwargs: Any) -> Any:
+    del self, args, kwargs
+    raise RuntimeError("container hook exploded")
 
 
 class SyncAdapter:
@@ -578,6 +585,85 @@ def test_a_key_json_coerces_digests_as_the_provider_would_receive_it() -> None:
     """
     assert _digest({"v": {2: "b"}}) == _digest({"v": {"2": "b"}}) != ""
     assert _digest({"v": {1: "x", "kind": "y"}}) == ""
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(lambda: type("HostileDict", (dict,), {"items": _raises})(a=1), id="dict-items"),
+        pytest.param(lambda: type("HostileList", (list,), {"__iter__": _raises})([1]), id="list-iter"),
+    ],
+)
+def test_a_container_hook_that_raises_costs_the_key_not_the_call(factory: Any) -> None:
+    """A `dict` or `list` subclass can raise from inside the encoder, from a type it accepts.
+
+    The guard used to name four exception types and this was a fifth. Which exception the encoder
+    chose is never the question -- only whether it finished -- so the clause catches `Exception`.
+    `BaseException` deliberately still escapes: a cancellation is not a statement about the payload.
+    """
+    assert _digest({"v": factory()}) == ""
+
+
+def test_the_replay_key_separates_calls_to_different_destinations() -> None:
+    """Two adapters with identical configs can address different services.
+
+    `GatewayModelAdapter` lets a per-instance `gateway_url` outrank the config, so a config-only key
+    matched calls that went to different hosts and could return different answers. The destination
+    is hashed rather than recorded, so an internal hostname stays internal.
+    """
+    config = ModelConfig(model="m", gateway_url="http://shared.invalid/x")
+
+    def keyed(url: str) -> str:
+        adapter = GatewayModelAdapter(config=config, gateway_url=url, token="t")
+        observer = RecordingObserver()
+
+        async def run() -> None:
+            with contextlib.suppress(Exception):
+                await ModelCallRunner(
+                    adapter=adapter,
+                    subscriptions=(
+                        ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+                    ),
+                ).acall(REQUEST)
+
+        asyncio.run(run())
+        return observer.captures[0].receipt.request_digest
+
+    first = keyed("http://tenant-a.invalid/x")
+    second = keyed("http://tenant-b.invalid/x")
+
+    assert first != second
+    assert first == keyed("http://tenant-a.invalid/x")
+    assert "tenant-a" not in first
+
+
+def test_an_adapter_that_names_no_destination_still_gets_a_key() -> None:
+    """The member is opt-in, and a resolver that raises must not cost the call its key either.
+
+    Refusing a key whenever the destination is unknown would refuse one for every adapter that
+    routes on config alone, which is most of them.
+    """
+
+    class Silent:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    class Unroutable:
+        def resolve_destination(self, config: ModelConfig) -> str:
+            del config
+            raise RuntimeError("no route")
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    async def key(adapter: Any) -> str:
+        _turn, receipt = await ModelCallRunner(adapter=adapter).acall(REQUEST)
+        return receipt.request_digest
+
+    assert asyncio.run(key(Silent())) != ""
+    assert asyncio.run(key(Unroutable())) != ""
 
 
 def test_a_marker_shaped_string_is_ordinary_caller_text() -> None:

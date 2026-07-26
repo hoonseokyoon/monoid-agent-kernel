@@ -245,6 +245,22 @@ class ConfiguredModelAdapter(Protocol):
     def config(self) -> ModelConfig: ...
 
 
+class AddressedModelAdapter(Protocol):
+    """An adapter that can say where a call will actually be sent.
+
+    An adapter may route by more than its :class:`ModelConfig` -- a per-instance override, an
+    environment variable, a tenant-specific host -- so the config alone does not identify the
+    service that answered. A caller recording a call's identity asks for the resolved destination
+    and folds it into that identity; omitting the member means "the config is the whole story",
+    which is correct for an adapter that routes on config alone.
+
+    The value is hashed, never recorded, so an internal hostname stays internal. Raising is
+    permitted and treated as "unknown".
+    """
+
+    def resolve_destination(self, config: ModelConfig) -> str: ...
+
+
 class StreamingModelAdapter(Protocol):
     """Optional token-streaming extension for a sync or async model adapter."""
 
