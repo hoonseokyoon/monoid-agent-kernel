@@ -474,7 +474,27 @@ class ModelCallRunner:
             ),
         )
         with collect_retry_reports() as progress:
+            # Whether the kernel got as far as reaching into the adapter, which is what `attempts`
+            # counts. A run already cancelled or past its deadline is refused below without the
+            # adapter being touched, and the receipt for that used to carry the default `attempts=1`
+            # -- telling a consumer summing the field that provider work happened when none did.
+            reached_adapter = False
             try:
+                # Before dispatch, not only inside the race. `_aawait` reports a boundary that had
+                # already been crossed, but by then the adapter has been invoked and the provider has
+                # been paid for work the run had already decided not to do. Checking here also covers
+                # the interval the caller cannot: building the receipt digests above happens between
+                # the caller's own boundary check and this line, so a deadline can expire in between.
+                #
+                # Nothing awaits between here and the dispatch, so the check cannot go stale within
+                # this task. A boundary crossed *after* dispatch is the race's business, which is why
+                # this is an addition to it rather than a replacement.
+                #
+                # Lifted out of `_adrive` so that refusing the call and dispatching it are
+                # distinguishable here; `_adrive` is called from nowhere else, so the check still
+                # exists once.
+                self._check_cancel_or_deadline(deadline)
+                reached_adapter = True
                 turn = await self._adrive(request, deadline, should_abort, delta_consumer, adapter)
             except BaseException as exc:
                 # What the adapter managed to say before this call stopped producing outcomes. A
@@ -489,10 +509,11 @@ class ModelCallRunner:
                 # whatever the observer threw. Turning capture on must not change how a provider
                 # failure is classified. `Exception` and not `BaseException`: a KeyboardInterrupt
                 # arriving during delivery should still stop everything.
+                failed = receipt.with_error(exc)
+                if not reached_adapter:
+                    failed = replace(failed, attempts=0)
                 with contextlib.suppress(Exception):
-                    self._publish(
-                        request, None, receipt.with_error(exc), elapsed_ms=self._ms_since(started)
-                    )
+                    self._publish(request, None, failed, elapsed_ms=self._ms_since(started))
                 raise
             # Read on this path too, so `report_provider_retried` means the same thing whatever
             # the call returns. Honoured only on failure, it would be a reporting seam that
@@ -559,16 +580,10 @@ class ModelCallRunner:
         delta_consumer: DeltaConsumer | None,
         adapter: Any,
     ) -> ModelTurn:
-        # Before dispatch, not only inside the race. `_aawait` reports a boundary that had already
-        # been crossed, but by then the adapter has been invoked and the provider has been paid for
-        # work the run had already decided not to do. Checking here also covers the interval the
-        # caller cannot: building the receipt digests happens between the caller's own boundary
-        # check and this line, so a deadline can expire in between.
-        #
-        # Nothing awaits between here and the dispatch below, so the check cannot go stale within
-        # this task. A boundary crossed *after* dispatch is the race's business, which is why this
-        # is an addition to it rather than a replacement.
-        self._check_cancel_or_deadline(deadline)
+        # The pre-dispatch boundary check that used to open this method now sits in `acall`, one
+        # statement above the call to this one, so that a call refused before the adapter is reached
+        # can be told apart from one that failed after -- `attempts=0` versus 1. Nothing awaits
+        # between there and here.
         astream_turn = getattr(adapter, "astream_turn", None)
         if delta_consumer is not None and astream_turn is not None:
             return await self._astream(

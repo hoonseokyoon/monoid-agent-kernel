@@ -297,6 +297,13 @@ single attempt. Report on the *decision*, before waiting or reconnecting: a call
 times out mid-retry never returns an outcome to carry the fact, and for a blocking `next_turn` the
 worker's eventual result is discarded entirely. Calling it is optional and inert outside a run.
 
+`ModelCallReceipt.attempts` may be **0**. A run whose cancellation or deadline was already past when
+the call was requested is refused before the adapter is reached, and a receipt is still written
+because a refused call belongs in the audit trail — so a consumer summing `attempts` must treat 0 as
+"no adapter call was made" rather than as a missing value. A failure *while* reaching into the
+adapter still counts as 1: the kernel did begin the call there. A payload that omits the field reads
+as 1, which is what older records mean.
+
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
 cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provider task is detached

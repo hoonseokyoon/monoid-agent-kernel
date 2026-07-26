@@ -201,6 +201,89 @@ def test_an_adapter_the_function_predicate_misses_is_still_actually_invoked(
     assert receipt.succeeded is True
 
 
+@pytest.mark.parametrize("boundary", ["cancelled", "deadline"])
+def test_a_call_refused_before_the_adapter_reports_no_attempt(boundary: str) -> None:
+    """`attempts` counts calls the kernel made to the adapter, so a refused call counts none.
+
+    A run already cancelled or past its deadline when the call is requested never reaches the
+    adapter. The receipt for that carried the default `attempts=1`, so a consumer summing the field
+    counted provider work that provably never happened -- against the receipt's own stated contract.
+
+    The receipt is still written, which is the point: a refused call belongs in the audit trail, and
+    the alternative fix -- publishing nothing -- would have removed the only record that a call was
+    requested and turned down.
+    """
+
+    class CountingAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            return ModelTurn(final_text="answer")
+
+    adapter = CountingAdapter()
+    observer = RecordingObserver()
+    token = CancellationToken()
+    if boundary == "cancelled":
+        token.cancel()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            current_cancellation_token=lambda: token,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(REQUEST, deadline=None if boundary == "cancelled" else time.time() - 1.0)
+
+    with pytest.raises((RunCancelled, RunTimeout)):
+        asyncio.run(run())
+
+    assert adapter.calls == 0, "the adapter must not have been reached at all"
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 0, "a call that never reached the adapter reported an adapter call"
+    assert receipt.succeeded is False
+    assert receipt.error_code in {"cancelled", "run_timeout"}
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "failed"])
+def test_a_call_that_did_reach_the_adapter_still_counts_one(outcome: str) -> None:
+    """The counterweight, so `attempts` does not simply become 0 everywhere.
+
+    Both outcomes, because the downgrade lives on the *failure* path: a counterweight that only
+    checked a successful call left "0 attempts for every failure" indistinguishable from the rule,
+    and that mutant passed. A provider that was called and then failed was still called.
+    """
+
+    class FailingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            raise ModelAdapterError("provider said no")
+
+    observer = RecordingObserver()
+    adapter: Any = SyncAdapter() if outcome == "succeeded" else FailingAdapter()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(REQUEST)
+
+    if outcome == "succeeded":
+        asyncio.run(run())
+    else:
+        with pytest.raises(ModelAdapterError):
+            asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.succeeded is (outcome == "succeeded")
+    assert receipt.attempts == 1, "the adapter was called, whatever it then did"
+
+
 @pytest.mark.parametrize(
     ("adapter_factory", "expect_worker"),
     [(CallableObjectAdapter, False), (SyncAdapter, True)],

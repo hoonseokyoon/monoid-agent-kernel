@@ -74,6 +74,15 @@ out in commit messages and here.
 
 ### Fixed
 
+- A model call the kernel refuses before reaching the adapter now reports `attempts=0` instead of 1.
+  A run already cancelled, or past its deadline, when the call is requested never touches the
+  adapter — but the receipt carried the default 1, so a consumer summing `attempts` counted provider
+  work that provably never happened, against the field's own documented meaning ("the calls the
+  kernel made to the adapter"). `ModelCallReceipt` accepted no such value before: `attempts` was
+  validated as ≥ 1, and **0 is now legal** — read it as "no adapter call was made", not as a missing
+  value. A receipt is still written for a refused call, because that is precisely the kind of call an
+  audit trail is for; a failure *while* reaching into the adapter still counts as 1. A payload that
+  omits the field still reads as 1, so older records are unchanged.
 - An adapter whose `next_turn` is a callable object with an async `__call__`, or a synchronous
   `next_turn` that returns an awaitable, is now driven correctly. `inspect.iscoroutinefunction`
   answers for a function and says no to both, so the call went to the synchronous worker and the

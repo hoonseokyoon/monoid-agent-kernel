@@ -530,6 +530,13 @@ class ModelCallReceipt:
     kernel counts as one attempt, and a receipt that only had `attempts` would show that as a clean
     single call.
 
+    `attempts` may be **0**: a run whose cancellation or deadline was already past when the call was
+    requested is refused before the adapter is reached, and a receipt is still written because a
+    refused call is part of the audit trail. It used to carry the default 1, which told a consumer
+    summing `attempts` that provider work happened when none did. 0 means exactly that — no adapter
+    call was made. A failure *while* reaching into the adapter still counts as 1: the kernel did begin
+    the call there.
+
     `stop_reason` is a plain string rather than the provider `Literal`. A receipt is an audit record:
     a provider that starts returning a fifth stop reason must be recordable without a kernel change,
     and `core` cannot depend on `providers` in any case.
@@ -553,8 +560,8 @@ class ModelCallReceipt:
     capture_downgrades: int = 0
 
     def __post_init__(self) -> None:
-        if self.attempts < 1:
-            raise ValueError("model call attempts must be 1 or greater")
+        if self.attempts < 0:
+            raise ValueError("model call attempts must not be negative")
         if self.latency_ms < 0:
             raise ValueError("model call latency_ms must not be negative")
         if self.capture_downgrades < 0:

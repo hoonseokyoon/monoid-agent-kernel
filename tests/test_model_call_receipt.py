@@ -39,7 +39,7 @@ def test_defaults_describe_a_successful_single_attempt_call() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"attempts": 0}, "attempts must be 1 or greater"),
+        ({"attempts": -1}, "attempts must not be negative"),
         ({"latency_ms": -1}, "latency_ms must not be negative"),
         ({"capture_downgrades": -1}, "capture_downgrades must not be negative"),
     ],
@@ -47,6 +47,24 @@ def test_defaults_describe_a_successful_single_attempt_call() -> None:
 def test_impossible_counts_are_rejected(kwargs: dict[str, int], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         ModelCallReceipt(**kwargs)  # type: ignore[arg-type]
+
+
+def test_zero_attempts_is_a_real_count_not_an_impossible_one() -> None:
+    """A call refused before the adapter is reached made no adapter call, and says so.
+
+    `attempts` used to be required to be at least 1, which forced a refused call -- a run already
+    cancelled or past its deadline when the call was requested -- to claim one adapter call. A
+    consumer summing the field then counted provider work that provably never happened. Dropping the
+    receipt instead was the other option and the wrong one: a refused call is part of the audit
+    trail, which is exactly why one is written for it.
+    """
+    refused = ModelCallReceipt(attempts=0, error_code="cancelled")
+    assert refused.attempts == 0
+    assert refused.succeeded is False
+    # And it survives the wire, since an audit record that cannot be read back is not one.
+    assert ModelCallReceipt.from_json(refused.to_json()).attempts == 0
+    # A payload that never mentions the field still reads as one call, for older records.
+    assert ModelCallReceipt.from_json({}).attempts == 1
 
 
 def test_usage_must_be_whole_token_counts() -> None:
