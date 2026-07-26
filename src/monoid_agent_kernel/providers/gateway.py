@@ -67,10 +67,11 @@ class GatewayModelAdapter:
     token: str | None = None
     token_env: str = DEFAULT_GATEWAY_TOKEN_ENV
     token_file: Path | None = None
-    # Optional token source, consulted per request (``_headers`` already re-resolves every call).
-    # When set, it takes precedence over the static token/file/env — so a backend can supply a
-    # callable that re-mints a fresh gateway token near expiry, keeping a long run (one that outlives
-    # the token TTL) authenticated without a restart. ``None`` = today's static behavior.
+    # Optional token source, consulted per HTTP attempt — every retry re-resolves, on both the
+    # blocking and the streamed path, not once per call. When set, it takes precedence over the
+    # static token/file/env — so a backend can supply a callable that re-mints a fresh gateway token
+    # near expiry, keeping a long run (one that outlives the token TTL) authenticated without a
+    # restart. ``None`` = today's static behavior.
     token_provider: Callable[[], str | None] | None = None
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
@@ -205,7 +206,6 @@ class GatewayModelAdapter:
         config = request.model or self.config
         url = self._resolve_gateway_url(config).rstrip("/") + "/stream"
         body = json.dumps(self._payload(request), ensure_ascii=False).encode("utf-8")
-        headers = self._headers()
         retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
@@ -259,6 +259,15 @@ class GatewayModelAdapter:
                             retry.jitter_s,
                         )
                     committed = False  # reset per attempt; see the binding above the loop
+                    # Resolved per attempt, like the sync loop resolves it. Hoisted out of the loop
+                    # it was the one thing a retry did not refresh: ``token_provider`` re-mints near
+                    # expiry (see the field), and a backoff is exactly where a token crosses that
+                    # line -- the wait is up to ``max_delay_s`` long and the run may already be
+                    # minutes old. A stale header then failed attempt 2 with a 401, which is
+                    # ``gateway_auth_error`` and *not* retryable, so a run the sync path recovered
+                    # ended terminally here. The URL and the body are hoisted because neither can
+                    # change between attempts; a credential can.
+                    headers = self._headers()
                     try:
                         async with client.stream("POST", url, headers=headers, content=body) as response:
                             if response.status_code != 200:

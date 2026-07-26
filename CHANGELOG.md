@@ -74,6 +74,14 @@ out in commit messages and here.
 
 ### Fixed
 
+- A retried streamed gateway call now carries a freshly resolved token, as the blocking one always
+  did. `astream_turn` resolved its headers once above the retry loop, alongside the URL and the body
+  — but neither of those can change between attempts and a credential can. A `token_provider` that
+  re-mints near expiry (what `reference.backend` supplies, at `expires_at - refresh_skew_s`) crosses
+  that line during exactly the window a backoff opens: the wait runs to `max_delay_s` and the run may
+  already be minutes old. The retry then replayed the expired token, came back 401 — which is
+  `gateway_auth_error` and *not* retryable — and ended the whole call terminally, where the blocking
+  path recovered. Pre-existing: the previous release resolved the streamed headers in the same place.
 - A transport failure from the streaming client's own lifecycle is classified again. Hoisting the
   `httpx.AsyncClient` out of the retry loop (below) left its construction, `__aenter__` and pool
   teardown outside the per-attempt handler, so an `httpx.CloseError` or `PoolTimeout` escaped as a

@@ -9,10 +9,11 @@ Async tests use asyncio.run from sync functions (no pytest-asyncio), matching th
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -534,3 +535,115 @@ def test_a_failure_in_the_clients_own_lifecycle_is_still_classified(
     assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
     assert caught.value.retryable is retryable
     assert fragment in str(caught.value)
+
+
+def _token_minting_adapter() -> tuple[GatewayModelAdapter, list[str]]:
+    """An adapter whose token is re-minted on every resolution, as a backend's source is.
+
+    `reference.backend.loop_factory._GatewayTokenSource` re-issues once the current token is within
+    `refresh_skew_s` of expiry, so a long run sees a *different* token part-way through. Minting on
+    every call is the same behaviour with the clock removed.
+    """
+
+    minted: list[str] = []
+
+    def provider() -> str:
+        minted.append(f"tok-{len(minted) + 1}")
+        return minted[-1]
+
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid",
+            retry=ModelRetryConfig(max_attempts=3, initial_delay_s=0, jitter_s=0),
+        ),
+        token_provider=provider,
+    )
+    return adapter, minted
+
+
+def test_both_transports_re_resolve_the_token_on_every_attempt(monkeypatch: Any) -> None:
+    """A retry has to carry a fresh credential, and the streamed loop carried the stale one.
+
+    The streamed path resolved its headers once, above the retry loop, next to the URL and the body
+    -- and those two genuinely cannot change between attempts. A credential can: the backoff is up
+    to `max_delay_s` long, the run may already be minutes old, and a token source that re-mints near
+    expiry crosses that line exactly during a wait. Attempt 2 then replayed the expired token and
+    came back 401, which is `gateway_auth_error` and not retryable, so the whole call ended
+    terminally -- where the blocking loop, which rebuilds its request per attempt, recovered.
+
+    Both halves in one test on purpose: this is a rule *about* the two loops agreeing, and the
+    existing `token_provider` test states it by calling `_headers()` twice directly, which no request
+    path has to obey. Driving one loop here would leave the claim exactly as unbound as it was.
+    """
+    httpx = pytest.importorskip("httpx")
+    # Stubbed at the schedule, so the one patch covers the blocking wait and the awaited one.
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+    request = ModelRequest(instruction="go", system_prompt="s", tools=())
+
+    def sent_by_the_blocking_loop() -> list[str]:
+        adapter, _minted = _token_minting_adapter()
+        sent: list[str] = []
+        attempts = {"n": 0}
+
+        class _Body(io.BytesIO):
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+        def _urlopen(http_request: Any, timeout: float | None = None) -> Any:
+            sent.append(http_request.headers["Authorization"])
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise URLError("reset before the response")
+            return _Body(json.dumps({"final_text": "hi", "turn_handle": "t1"}).encode("utf-8"))
+
+        monkeypatch.setattr(gateway_module, "urlopen", _urlopen)
+        adapter.next_turn(request)
+        return sent
+
+    def sent_by_the_streaming_loop() -> list[str]:
+        adapter, _minted = _token_minting_adapter()
+        sent: list[str] = []
+        attempts = {"n": 0}
+
+        class _Response:
+            status_code = 200
+
+            async def __aenter__(self) -> Any:
+                return self
+
+            async def __aexit__(self, *_args: Any) -> None:
+                return None
+
+            async def aiter_lines(self):  # noqa: ANN202
+                yield 'data: {"type":"turn_complete","response_id":"turn_1"}'
+                yield ""
+
+        class _Client:
+            def __init__(self, **_kwargs: Any) -> None:
+                return None
+
+            async def __aenter__(self) -> Any:
+                return self
+
+            async def __aexit__(self, *_args: Any) -> None:
+                return None
+
+            def stream(self, *_args: Any, **kwargs: Any) -> Any:
+                sent.append(kwargs["headers"]["Authorization"])
+                attempts["n"] += 1
+                if attempts["n"] == 1:
+                    raise httpx.HTTPError("reset before the stream committed")
+                return _Response()
+
+        monkeypatch.setattr(httpx, "AsyncClient", _Client)
+        _stream(adapter)
+        return sent
+
+    fresh_on_the_retry = ["Bearer tok-1", "Bearer tok-2"]
+    assert sent_by_the_blocking_loop() == fresh_on_the_retry
+    assert sent_by_the_streaming_loop() == fresh_on_the_retry, (
+        "the streamed loop resolved the token once per call and replayed it on the retry"
+    )
