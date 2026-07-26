@@ -44,6 +44,22 @@ GATEWAY_BAD_RESPONSE = "gateway_bad_response"
 GATEWAY_BAD_REQUEST = "gateway_bad_request"
 
 
+def _stamp_retry(error: BaseException, attempt: int) -> None:
+    """Record on an escaping error that the adapter's retry loop had already run.
+
+    Read back by ``ModelCallReceipt.with_error`` through ``getattr``, so an exception that refuses
+    the attribute (``__slots__``) simply reports no retry rather than replacing the provider's
+    failure with an AttributeError.
+    """
+
+    if attempt <= 1:
+        return
+    try:
+        error.provider_retried = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 @dataclass
 class GatewayModelAdapter:
     config: ModelConfig
@@ -138,9 +154,12 @@ class GatewayModelAdapter:
         # Marked in one place rather than at each ``raise`` inside the loop: there are five
         # of those plus the exhausted-budget one, and a scheme needing every site updated is
         # one that eventually misses a site. ``attempt`` holds whichever attempt was in flight.
-        except ModelAdapterError as exc:
-            if attempt > 1:
-                exc.provider_retried = True
+        except Exception as exc:
+            # Any escaping type, not just ModelAdapterError: an attempt can be retried and the
+            # final one still fail on something else entirely -- a body that is not valid UTF-8
+            # raises UnicodeDecodeError at the decode step -- and a failure receipt that denies the
+            # retry is wrong regardless of which exception carried it.
+            _stamp_retry(exc, attempt)
             raise
 
     async def astream_turn(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
@@ -214,9 +233,12 @@ class GatewayModelAdapter:
             raise ModelAdapterError("LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR)
         # Same marking as the sync path. Stream retries are all pre-commit, so an error
         # escaping after the first attempt means the stream really was retried.
-        except ModelAdapterError as exc:
-            if attempt > 1:
-                exc.provider_retried = True
+        except Exception as exc:
+            # Any escaping type, not just ModelAdapterError: an attempt can be retried and the
+            # final one still fail on something else entirely -- a body that is not valid UTF-8
+            # raises UnicodeDecodeError at the decode step -- and a failure receipt that denies the
+            # retry is wrong regardless of which exception carried it.
+            _stamp_retry(exc, attempt)
             raise
 
     def _resolve_gateway_url(self, config: ModelConfig) -> str:

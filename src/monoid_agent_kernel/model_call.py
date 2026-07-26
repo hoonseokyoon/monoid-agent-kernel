@@ -109,7 +109,7 @@ def _canonical_ready(value: Any) -> tuple[Any, bool]:
 
     **Three separate things bound the work, because they fail differently.**
 
-    `ancestors` catches a reference back to something already on the current path. A depth cap alone
+    `path` catches a reference back to something already on the current path. A depth cap alone
     does not: it terminates a single self-reference in `depth` steps, but a cycle reached through
     *two* references per level expands `2**depth` nodes first -- 4 billion at this cap, which hangs
     rather than terminates. Only the path matters, not everything seen: an object appearing twice in
@@ -122,12 +122,16 @@ def _canonical_ready(value: Any) -> tuple[Any, bool]:
     `budget` bounds total work for the shape neither of the others sees: an acyclic graph whose
     levels each reference the next twice is exponential with no repeat on any single path.
 
-    Returns the reshaped payload and whether any bound **lost information**. A cycle marker does
-    not: it says "this points back at an ancestor", which is the complete truth about that edge and
-    is why a cyclic payload still gets a real digest. Truncation and the depth cap do lose content,
-    and a digest taken over a truncated payload would silently stand for "everything up to here" --
-    two requests differing only past the cut would match. Callers turn that flag into an absent
-    digest rather than an ordinary-looking one.
+    Returns the reshaped payload and whether any bound **lost information**. A cycle marker names
+    the depth it points back to, which is what makes it lossless: a bare marker said *that* an edge
+    looped without saying *where*, so `root -> child -> root` and `root -> child -> child` both
+    became `[["<cycle>"]]` and shared a replay key. Depth identifies the target exactly, since a
+    path holds one object per position.
+
+    Truncation, the depth cap and an unrepresentable value do lose content. A digest over a
+    truncated payload would silently stand for "everything up to here" -- two requests differing
+    only past the cut would match -- so callers turn that flag into an absent digest rather than an
+    ordinary-looking one.
 
     Containers stop iterating once the budget is gone. Returning the marker per element still
     walked every element of a very wide payload, so the advertised total-work bound bounded
@@ -136,8 +140,12 @@ def _canonical_ready(value: Any) -> tuple[Any, bool]:
 
     remaining = [_MAX_DIGEST_NODES]
     lost_content = [False]
+    # id -> the depth it sits at on the path currently being walked. A set would say *that* an edge
+    # points back at an ancestor without saying *which*, and `root -> child -> root` would normalize
+    # identically to `root -> child -> child`.
+    path: dict[int, int] = {}
 
-    def walk(item: Any, depth: int, ancestors: frozenset[int]) -> Any:
+    def walk(item: Any, depth: int) -> Any:
         # No entry guard: the containers below stop before spending a child they cannot afford, so
         # by the time this runs the budget has already been checked. An entry guard as well would be
         # a second copy of the same rule, reachable only if the budget started at zero.
@@ -148,28 +156,40 @@ def _canonical_ready(value: Any) -> tuple[Any, bool]:
         if item is None or isinstance(item, (str, int, float, bool)):
             return item
         marker = id(item)
-        if marker in ancestors:
-            return "<cycle>"
-        inner = ancestors | {marker}
-        if isinstance(item, Mapping):
-            mapped: dict[str, Any] = {}
-            for key, child in item.items():
-                if remaining[0] <= 0:
-                    lost_content[0] = True
-                    break
-                mapped[str(key)] = walk(child, depth + 1, inner)
-            return mapped
-        if isinstance(item, (list, tuple)):
-            listed: list[Any] = []
-            for child in item:
-                if remaining[0] <= 0:
-                    lost_content[0] = True
-                    break
-                listed.append(walk(child, depth + 1, inner))
-            return listed
-        return repr(item)
+        if marker in path:
+            return f"<cycle:{path[marker]}>"
+        path[marker] = depth
+        try:
+            if isinstance(item, Mapping):
+                mapped: dict[str, Any] = {}
+                for key, child in item.items():
+                    if remaining[0] <= 0:
+                        lost_content[0] = True
+                        break
+                    mapped[str(key)] = walk(child, depth + 1)
+                return mapped
+            if isinstance(item, (list, tuple)):
+                listed: list[Any] = []
+                for child in item:
+                    if remaining[0] <= 0:
+                        lost_content[0] = True
+                        break
+                    listed.append(walk(child, depth + 1))
+                return listed
+            try:
+                return repr(item)
+            except Exception:
+                # A `__repr__` that raises would otherwise abort the call while the receipt is being
+                # built, before the adapter is ever reached -- the exact thing this function exists
+                # to prevent. Nothing is known about the value, so the payload is lossy.
+                lost_content[0] = True
+                return "<unrepresentable>"
+        finally:
+            # Popped on the way out so the entry is scoped to the path, not to everything seen. A
+            # sibling reusing the same object is ordinary sharing, not a cycle.
+            del path[marker]
 
-    normalized = walk(value, 0, frozenset())
+    normalized = walk(value, 0)
     return normalized, lost_content[0]
 
 

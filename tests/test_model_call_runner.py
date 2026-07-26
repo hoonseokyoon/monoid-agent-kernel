@@ -23,7 +23,13 @@ from monoid_agent_kernel.errors import (
     RunCancelled,
     RunTimeout,
 )
-from monoid_agent_kernel.model_call import ModelCallRunner, _digest, _prompt_payload
+from monoid_agent_kernel import model_call
+from monoid_agent_kernel.model_call import (
+    ModelCallRunner,
+    _canonical_ready,
+    _digest,
+    _prompt_payload,
+)
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
@@ -534,7 +540,9 @@ def _shared_acyclic_graph() -> Any:
         ("acyclic but exponentially shared", _shared_acyclic_graph, False),
     ],
 )
-def test_a_pathological_payload_terminates_quickly(label: str, factory: Any, keyed: bool) -> None:
+def test_a_pathological_payload_terminates_quickly(
+    label: str, factory: Any, keyed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Three shapes, because they defeat three different bounds — and two outcomes.
 
     An earlier version used only the self cycle, which a depth cap alone terminates in `depth`
@@ -550,12 +558,68 @@ def test_a_pathological_payload_terminates_quickly(label: str, factory: Any, key
     content, so it must not.
     """
     del label
-    started = time.monotonic()
+    # A small budget makes the exponential shape terminate in thousands of nodes instead of a
+    # million, so the assertion below is about behaviour rather than about how fast this machine is.
+    # The earlier version asserted wall-clock < 5s and failed CI at 5.79s under coverage
+    # instrumentation -- a timing assertion is a machine-speed assertion wearing a correctness
+    # costume. If a bound is ever removed the traversal does not slow down, it fails to terminate,
+    # and pytest-timeout is what catches that.
+    monkeypatch.setattr(model_call, "_MAX_DIGEST_NODES", 5_000)
 
     digest = _digest({"value": factory()})
 
     assert (digest != "") is keyed
-    assert time.monotonic() - started < 5.0
+
+
+def test_two_different_cyclic_graphs_do_not_share_a_replay_key() -> None:
+    """A bare cycle marker said *that* an edge looped without saying *where*.
+
+    `root -> child -> root` and `root -> child -> child` both became `[["<cycle>"]]` and were handed
+    the same non-empty replay key, so a consumer could return the wrong call. Encoding the depth the
+    edge points back to identifies the target exactly, because a path holds one object per position.
+    """
+    back_to_root: list[Any] = []
+    child: list[Any] = [back_to_root]
+    back_to_root.append(child)
+
+    self_looping: list[Any] = []
+    self_looping.append(self_looping)
+    holding: list[Any] = [self_looping]
+
+    assert _digest({"v": back_to_root}) != _digest({"v": holding})
+    # Both keep a key: a depth-tagged marker is the whole truth about the edge, so nothing is lost.
+    assert _digest({"v": back_to_root}) != ""
+    assert _digest({"v": holding}) != ""
+
+
+def test_a_repr_that_raises_does_not_abort_the_call() -> None:
+    """The normalizer exists so digest bookkeeping cannot become a precondition for the call.
+
+    `repr` was the one remaining way for a caller's value to break that: a custom `__repr__` that
+    raises propagated out while the receipt was being built, before the adapter was ever reached.
+    """
+
+    class Hostile:
+        def __repr__(self) -> str:
+            raise RuntimeError("repr exploded")
+
+    request = ModelRequest(
+        instruction="hi", system_prompt="s", tools=(), messages=({"x": Hostile()},)
+    )
+
+    class Adapter:
+        def next_turn(self, model_request: ModelRequest) -> ModelTurn:
+            del model_request
+            return ModelTurn(final_text="answer")
+
+    async def run() -> Any:
+        turn, receipt = await ModelCallRunner(adapter=Adapter()).acall(request)
+        return turn, receipt
+
+    turn, receipt = asyncio.run(run())
+    assert turn.final_text == "answer"
+    # Nothing is known about the value, so the payload is lossy and gets no replay key.
+    assert receipt.prompt_digest == ""
 
 
 def test_an_object_shared_between_siblings_is_not_treated_as_a_cycle() -> None:
@@ -938,21 +1002,21 @@ def test_a_cycle_still_gets_a_real_digest() -> None:
     assert _digest({"value": cyclic}) != ""
 
 
-def test_the_work_budget_bounds_work_and_not_only_allocation() -> None:
+def test_the_work_budget_stops_the_traversal_not_merely_the_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Returning a marker per element still walked every element of a very wide payload.
 
-    Timing rather than counting, because the claim is about work done, and the earlier version was
-    linear in the payload's full width no matter what the budget said.
+    Asserted on the produced structure rather than on elapsed time: the budget's promise is that
+    traversal *stops*, and a normalized list shorter than its source is direct evidence of that,
+    where a stopwatch only ever measures the machine.
     """
-    timings = []
-    for width in (2_000_000, 8_000_000):
-        payload = {"messages": [list(range(width))]}
-        started = time.monotonic()
-        _digest(payload)
-        timings.append(time.monotonic() - started)
+    monkeypatch.setattr(model_call, "_MAX_DIGEST_NODES", 500)
+    normalized, lost_content = _canonical_ready({"messages": [list(range(100_000))]})
 
-    # Four times the width must not cost meaningfully more once the budget is exhausted.
-    assert timings[1] < timings[0] * 2.5
+    kept = normalized["messages"][0]
+    assert len(kept) < 500, "traversal must stop at the budget, not run the full width"
+    assert lost_content is True
 
 
 def test_no_subscriptions_means_no_capture_work() -> None:

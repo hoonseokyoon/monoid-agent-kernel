@@ -371,3 +371,98 @@ def test_adapters_send_full_messages_by_value(tmp_path: Path) -> None:
     assert any(it.get("type") == "function_call" and it.get("call_id") == "c1" for it in items)
     assert any(it.get("type") == "function_call_output" and it.get("call_id") == "c1" for it in items)
     assert "previous_response_id" not in oa_payload
+
+
+def test_gateway_reports_the_retry_on_a_successful_turn(monkeypatch) -> None:
+    """`attempts` and `provider_retried` are different facts and only the adapter knows the second.
+
+    The kernel counts one adapter call per turn however many attempts happened inside it, so
+    without this a call that failed once and succeeded on the retry is recorded as a clean single
+    attempt.
+    """
+    calls = 0
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"turn_handle":"turn_ok","final_text":"done","usage":{"total_tokens":1}}'
+
+    def fake_urlopen(request, timeout):
+        del request, timeout
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionResetError("connection reset by peer")
+        return Response()
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.time.sleep", lambda _delay: None)
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=3, initial_delay_s=0, jitter_s=0),
+        ),
+        token="run-token",
+    )
+
+    turn = adapter.next_turn(ModelRequest(instruction="hi", system_prompt="s", tools=()))
+
+    assert turn.provider_retried is True
+
+    # Counterweight: a call that succeeds first time reports no retry.
+    calls = 1
+    assert adapter.next_turn(
+        ModelRequest(instruction="hi", system_prompt="s", tools=())
+    ).provider_retried is False
+
+
+def test_gateway_keeps_retry_evidence_when_the_final_failure_is_not_an_adapter_error(
+    monkeypatch,
+) -> None:
+    """A retried attempt can still end in something that is not a `ModelAdapterError`.
+
+    A body that is not valid UTF-8 raises `UnicodeDecodeError` at the decode step, which used to
+    escape unstamped — so the failure receipt denied a retry that had demonstrably happened. The
+    marker has to survive whichever exception type carries the failure out.
+    """
+    calls = 0
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b"\xff\xfe not utf-8"
+
+    def fake_urlopen(request, timeout):
+        del request, timeout
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionResetError("connection reset by peer")
+        return Response()
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.time.sleep", lambda _delay: None)
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=3, initial_delay_s=0, jitter_s=0),
+        ),
+        token="run-token",
+    )
+
+    try:
+        adapter.next_turn(ModelRequest(instruction="hi", system_prompt="s", tools=()))
+    except UnicodeDecodeError as exc:
+        assert getattr(exc, "provider_retried", False) is True
+    else:  # pragma: no cover - the decode must fail for this test to mean anything
+        raise AssertionError("expected the invalid body to raise")
