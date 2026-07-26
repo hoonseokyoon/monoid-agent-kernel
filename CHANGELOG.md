@@ -117,6 +117,13 @@ out in commit messages and here.
   it: the race reported a boundary that had already been crossed, but by then the request was out
   and the provider had been paid for work the run had already decided not to do. The refusal still
   publishes a failure receipt, so a call the run declined is recorded rather than absent.
+- `GatewayModelAdapter.astream_turn` no longer blocks the event loop while it waits to retry. The
+  backoff used a blocking sleep called from inside an async generator, so the whole loop stopped for
+  the length of the wait — up to `max_delay_s` per retry, 4.5s at the default policy, measured as a
+  100ms heartbeat ticking zero times. Nothing else in the run progressed, and the run's own
+  cancellation and deadline are raced on that loop, so a run told to stop kept waiting for a provider
+  it had already given up on. The wait is now awaited; the schedule is unchanged and shared with the
+  sync path, which keeps its blocking sleep because it runs on a thread.
 - An adapter that cancels its *own* call is now reported as `ModelAdapterError`
   (`model_adapter_cancelled`) instead of raising `asyncio.CancelledError` out of the run. The two
   are different events — the run stopping versus the adapter failing — and only the second is the

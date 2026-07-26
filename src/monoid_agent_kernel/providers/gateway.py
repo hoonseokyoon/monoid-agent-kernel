@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import time
@@ -87,12 +88,25 @@ class GatewayModelAdapter:
         try:
             for attempt in range(1, max_attempts + 1):
                 if attempt > 1:
-                    # Reported before the attempt, because this call may never produce an outcome
-                    # anyone reads. A blocking ``next_turn`` runs on a thread the run abandons when
-                    # it is cancelled or times out; the receipt is then built from the boundary the
+                    # Reported before the wait, not after it. This call may never produce an outcome
+                    # anyone reads: a blocking ``next_turn`` runs on a thread the run abandons when
+                    # it is cancelled or times out, the receipt is then built from the boundary the
                     # race raised, and whatever this worker eventually returns or raises is
-                    # discarded. The channel is the only thing that crosses that abandonment.
+                    # discarded. The channel is the only thing that crosses that abandonment -- and
+                    # the backoff wait is a window the run can end inside, since the event loop stays
+                    # free while this thread sleeps.
                     report_provider_retried()
+                    # Waited here rather than at each retry site below. There were five of those and
+                    # the schedule had to be repeated at every one; a rule written five times is one
+                    # that eventually differs in one place. ``attempt - 1`` is the attempt that just
+                    # failed, which is what the schedule is indexed by.
+                    _sleep_before_retry(
+                        attempt - 1,
+                        retry.initial_delay_s,
+                        retry.max_delay_s,
+                        retry.backoff_multiplier,
+                        retry.jitter_s,
+                    )
                 http_request = Request(
                     url,
                     data=body,
@@ -126,12 +140,10 @@ class GatewayModelAdapter:
                     last_error = exc
                     if not _should_retry(exc, attempt, max_attempts, retry.retry_on):
                         raise
-                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
                 except HTTPError as exc:
                     last_error = _error_from_http_error(exc)
                     if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
                         raise last_error from exc
-                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
                 except URLError as exc:
                     last_error = ModelAdapterError(
                         f"LLM gateway request failed: {exc.reason}",
@@ -140,7 +152,6 @@ class GatewayModelAdapter:
                     )
                     if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
                         raise last_error from exc
-                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
                 except TimeoutError as exc:
                     last_error = ModelAdapterError(
                         "LLM gateway request timed out",
@@ -149,7 +160,6 @@ class GatewayModelAdapter:
                     )
                     if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
                         raise last_error from exc
-                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
                 except OSError as exc:
                     # A bare connection-level error (reset / aborted / broken pipe), e.g. raised
                     # mid-read after urlopen() returned, is transient and retryable like a
@@ -162,7 +172,6 @@ class GatewayModelAdapter:
                     )
                     if not _should_retry(last_error, attempt, max_attempts, retry.retry_on):
                         raise last_error from exc
-                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
             if last_error is not None:
                 raise last_error
             raise ModelAdapterError("LLM gateway request failed", provider_error_code=GATEWAY_NETWORK_ERROR)
@@ -220,6 +229,19 @@ class GatewayModelAdapter:
                     # yes, one iteration earlier. An empty ``TextDelta`` concatenates to nothing,
                     # so the assembled turn and any relay of the deltas are unchanged.
                     yield TextDelta(text="", provider_retried=True)
+                    # Awaited, and after both reports. The blocking sleep this replaces held the
+                    # event loop for the whole backoff, so nothing else in the run progressed and
+                    # the run's own cancel/deadline race -- which lives on that loop -- could not
+                    # fire: a run told to stop kept waiting for a provider it had given up on.
+                    # Now that the wait yields, it is also a window the run can end inside, which
+                    # is why the evidence above goes out first.
+                    await _asleep_before_retry(
+                        attempt - 1,
+                        retry.initial_delay_s,
+                        retry.max_delay_s,
+                        retry.backoff_multiplier,
+                        retry.jitter_s,
+                    )
                 committed = False
                 try:
                     async with httpx.AsyncClient(timeout=config.timeout_s) as client:
@@ -241,7 +263,6 @@ class GatewayModelAdapter:
                     return
                 except _StreamRetry as retry_signal:
                     last_error = retry_signal.error
-                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
                 except httpx.HTTPError as exc:
                     if committed:
                         # The stream already started; replaying would duplicate deltas. Terminal.
@@ -258,7 +279,6 @@ class GatewayModelAdapter:
                     if not _should_retry(error, attempt, max_attempts, retry.retry_on):
                         raise error from exc
                     last_error = error
-                    _sleep_before_retry(attempt, retry.initial_delay_s, retry.max_delay_s, retry.backoff_multiplier, retry.jitter_s)
             if last_error is not None:
                 raise last_error
             raise ModelAdapterError("LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR)
@@ -560,6 +580,26 @@ def _should_retry(
     )
 
 
+def _retry_delay(
+    attempt: int,
+    initial_delay_s: float,
+    max_delay_s: float,
+    backoff_multiplier: float,
+    jitter_s: float,
+) -> float:
+    """How long to wait after ``attempt`` failed, before the next one.
+
+    The schedule itself, separated from waiting on it, because the two callers wait differently and
+    a backoff policy that differed between the sync and the streamed path would be a difference
+    nobody chose.
+    """
+
+    delay = min(max_delay_s, initial_delay_s * (backoff_multiplier ** max(0, attempt - 1)))
+    if jitter_s > 0:
+        delay += random.uniform(0, jitter_s)
+    return delay
+
+
 def _sleep_before_retry(
     attempt: int,
     initial_delay_s: float,
@@ -567,8 +607,29 @@ def _sleep_before_retry(
     backoff_multiplier: float,
     jitter_s: float,
 ) -> None:
-    delay = min(max_delay_s, initial_delay_s * (backoff_multiplier ** max(0, attempt - 1)))
-    if jitter_s > 0:
-        delay += random.uniform(0, jitter_s)
+    """Block the calling thread. Only correct off the event loop -- see ``_asleep_before_retry``."""
+
+    delay = _retry_delay(attempt, initial_delay_s, max_delay_s, backoff_multiplier, jitter_s)
     if delay > 0:
         time.sleep(delay)
+
+
+async def _asleep_before_retry(
+    attempt: int,
+    initial_delay_s: float,
+    max_delay_s: float,
+    backoff_multiplier: float,
+    jitter_s: float,
+) -> None:
+    """Wait without holding the event loop.
+
+    ``astream_turn`` used the blocking sleep, which froze the whole loop for the length of the
+    backoff -- up to ``max_delay_s`` per retry. Nothing else in the run progressed, and the run's own
+    cancellation and deadline are raced on that loop, so a run told to stop kept waiting for a
+    provider it had already given up on. Measured at the default policy: a 4.5s backoff let a 100ms
+    heartbeat tick zero times.
+    """
+
+    delay = _retry_delay(attempt, initial_delay_s, max_delay_s, backoff_multiplier, jitter_s)
+    if delay > 0:
+        await asyncio.sleep(delay)

@@ -214,7 +214,9 @@ def _retried_stream_adapter(monkeypatch, *, body: list[str]) -> Any:
             return _Response()
 
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    monkeypatch.setattr("monoid_agent_kernel.providers.gateway._sleep_before_retry", lambda *_a: None)
+    # Stubbed at the schedule, not at either sleeper: one patch then covers the blocking wait and
+    # the awaited one, so a test cannot start sleeping for real because a path switched sleepers.
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway._retry_delay", lambda *_a: 0.0)
     adapter = GatewayModelAdapter(
         ModelConfig(
             gateway_url="http://gateway.local/internal/llm/turns",
@@ -337,3 +339,73 @@ def test_gateway_adapter_raises_on_mid_stream_error_frame() -> None:
         with pytest.raises(ModelAdapterError) as excinfo:
             asyncio.run(_collect(adapter.astream_turn(request)))
     assert excinfo.value.provider_error_code == "gateway_server_error"
+
+
+def test_the_streamed_backoff_waits_without_holding_the_event_loop(monkeypatch: Any) -> None:
+    """The streamed retry path must not use the blocking wait.
+
+    It did, and the blocking sleep is called from inside an async generator: the whole event loop
+    stopped for the length of the backoff -- up to ``max_delay_s`` per retry, 4.5s at the default
+    policy. Nothing else in the run progressed, and the run's own cancel/deadline race lives on that
+    loop, so a run told to stop kept waiting for a provider it had already given up on.
+
+    Asserted on which wait the path took rather than on elapsed time, so it cannot go flaky on a
+    loaded machine while still pinning the property exactly.
+    """
+    from monoid_agent_kernel.providers import gateway
+
+    blocking: list[Any] = []
+    awaited: list[Any] = []
+
+    async def _fake_await(*args: Any) -> None:
+        awaited.append(args)
+
+    monkeypatch.setattr(gateway, "_sleep_before_retry", lambda *args: blocking.append(args))
+    monkeypatch.setattr(gateway, "_asleep_before_retry", _fake_await)
+
+    adapter, _attempts = _retried_stream_adapter(
+        monkeypatch,
+        body=[
+            'data: {"type":"text_delta","text":"hi"}',
+            "",
+            'data: {"type":"turn_complete","response_id":"turn_1"}',
+            "",
+        ],
+    )
+    _stream(adapter)
+
+    assert awaited, "the streamed retry must wait on the event loop, not block it"
+    assert blocking == [], "the streamed retry must not use the blocking wait"
+
+
+def test_the_async_backoff_lets_other_tasks_run() -> None:
+    """And the awaited wait really does yield -- the counterweight to the test above.
+
+    Checking only *which* function the path calls would pass even if that function blocked.
+    """
+    from monoid_agent_kernel.providers import gateway
+
+    async def run() -> list[int]:
+        ticks: list[int] = []
+
+        async def tick() -> None:
+            for _ in range(5):
+                await asyncio.sleep(0)
+                ticks.append(1)
+
+        task = asyncio.create_task(tick())
+        await gateway._asleep_before_retry(1, 0.05, 1.0, 1.0, 0.0)
+        task.cancel()
+        return ticks
+
+    assert len(asyncio.run(run())) == 5
+
+
+def test_both_waits_follow_one_schedule() -> None:
+    """The sync and streamed paths must not drift apart on backoff policy."""
+    from monoid_agent_kernel.providers import gateway
+
+    args = (2, 0.5, 4.0, 2.0, 0.0)
+    assert gateway._retry_delay(*args) == 1.0
+    # Capped, and the cap applies to both because both read the same schedule.
+    assert gateway._retry_delay(9, 0.5, 4.0, 2.0, 0.0) == 4.0
