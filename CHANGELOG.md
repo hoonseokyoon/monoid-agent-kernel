@@ -82,6 +82,13 @@ out in commit messages and here.
   already be minutes old. The retry then replayed the expired token, came back 401 — which is
   `gateway_auth_error` and *not* retryable — and ended the whole call terminally, where the blocking
   path recovered. Pre-existing: the previous release resolved the streamed headers in the same place.
+- The CLI now holds open an adapter that offers `open`/`close` without also being a context manager.
+  It probed `open` and then used `with`, so the very shape the probe invites — the lifecycle pair
+  `AgentLoop` and `LoopSession` use, and the one `OpenAIModelAdapter`'s own `__enter__` delegates to
+  — raised `TypeError` before the first turn, outside the CLI's error handling, ending the run in a
+  raw traceback after `run_id` and `run_dir` had already been printed. Adapters with no client to
+  hold are still left alone, and one offering `open` without `close` now fails at startup rather than
+  during teardown, where the run's result is already in hand and has nowhere to go.
 - A transport failure from the streaming client's own lifecycle is classified again. Hoisting the
   `httpx.AsyncClient` out of the retry loop (below) left its construction, `__aenter__` and pool
   teardown outside the per-attempt handler, so an `httpx.CloseError` or `PoolTimeout` escaped as a

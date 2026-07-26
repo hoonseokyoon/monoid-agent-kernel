@@ -331,9 +331,17 @@ def run(
     # open across turns should: the direct-OpenAI one builds a client per call otherwise, which
     # costs far more than the request it carries. Duck-typed because only some adapters have a
     # client to hold -- the gateway adapter owns its httpx client per call by design.
+    #
+    # Driven through the pair that is probed. ``enter_context`` needed ``__enter__``/``__exit__``
+    # instead, so the ``open``/``close`` adapter this probe invites -- the lifecycle pair the rest
+    # of the kernel uses, on ``AgentLoop`` and ``LoopSession`` -- raised ``TypeError`` before the
+    # first turn, outside the handler above, killing the run with a bare traceback. Registering the
+    # bound ``close`` resolves it eagerly, so an adapter offering ``open`` without ``close`` fails
+    # here rather than at teardown, with the run's result already in hand and nowhere to go.
     with contextlib.ExitStack() as adapter_scope:
         if callable(getattr(model_adapter, "open", None)):
-            adapter_scope.enter_context(model_adapter)
+            model_adapter.open()
+            adapter_scope.callback(model_adapter.close)
         result = AgentLoop(
             spec=spec,
             subagent_definitions=subagent_definitions,

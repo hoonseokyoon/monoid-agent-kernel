@@ -1021,8 +1021,9 @@ def test_openai_scope_outlives_a_call_that_fails(monkeypatch: pytest.MonkeyPatch
     assert still_open == 0, f"{still_open} connection(s) still open server-side"
 
 
+@pytest.mark.parametrize("context_manager", [False, True], ids=["open-close-only", "also-a-cm"])
 def test_cli_run_scopes_an_adapter_that_can_hold_its_client(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, context_manager: bool
 ) -> None:
     """The run's one adapter is opened around every turn and closed after.
 
@@ -1030,6 +1031,12 @@ def test_cli_run_scopes_an_adapter_that_can_hold_its_client(
     happen inside ``run_once``, so without a scope here the direct-OpenAI adapter builds and
     throws away a client per turn. Adapters with no client to hold -- the fakes, the gateway one
     -- have no ``open`` and are left alone, which every other CLI test above covers.
+
+    Both shapes, because the CLI probes ``open`` and once used ``__enter__``. This stub used to
+    implement all four members, so it could not tell the two apart -- and the ``open``/``close``
+    adapter the probe invites (the lifecycle pair ``AgentLoop`` and ``LoopSession`` use, and all
+    ``OpenAIModelAdapter``'s own context manager delegates to) died with ``TypeError`` before the
+    first turn, outside the CLI's error handler, so the run ended in a raw traceback.
     """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -1046,17 +1053,19 @@ def test_cli_run_scopes_an_adapter_that_can_hold_its_client(
         def close(self) -> None:
             events.append("close")
 
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            events.append("turn")
+            return self._inner.next_turn(request)
+
+    class _ScopedContextManagerAdapter(_ScopedAdapter):
         def __enter__(self) -> _ScopedAdapter:
             return self.open()
 
         def __exit__(self, *_exc: object) -> None:
             self.close()
 
-        def next_turn(self, request: ModelRequest) -> ModelTurn:
-            events.append("turn")
-            return self._inner.next_turn(request)
-
-    monkeypatch.setattr("monoid_agent_kernel.cli._model_adapter", lambda *_a, **_k: _ScopedAdapter())
+    build = _ScopedContextManagerAdapter if context_manager else _ScopedAdapter
+    monkeypatch.setattr("monoid_agent_kernel.cli._model_adapter", lambda *_a, **_k: build())
     config_file = _write_config(tmp_path / "runtime.json", "run.finish")
 
     result = CliRunner().invoke(
