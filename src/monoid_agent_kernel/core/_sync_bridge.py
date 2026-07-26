@@ -162,7 +162,10 @@ def start_abandonable_sync_call(
             # ``Future.set_exception`` refuses ``StopIteration`` by contract and raises TypeError.
             # That TypeError would surface here, inside a ``call_soon_threadsafe`` callback, where
             # nothing awaits it -- so the future stayed pending forever while ``settled`` was
-            # already resolved, and the run hung with no warning and no deadline able to end it.
+            # already resolved. A deadline still released the awaiter, and asyncio's default handler
+            # still logged the escaping TypeError; what was lost is that the callee's actual failure
+            # never arrived, this module's own abandonment warning stayed silent (it watches
+            # ``settled``, which is done), and a run with no deadline hung outright.
             # A callee raising it is ordinary: ``next(...)`` on an exhausted iterator does.
             future.set_exception(
                 RuntimeError("synchronous call raised StopIteration").with_traceback(
@@ -244,11 +247,12 @@ async def await_abandonable_call(
 
         loop.call_soon_threadsafe(resolve)
 
-    # Everything from here on is inside the ``try``, because the call is already running: the task
-    # exists above, and a blocking callee's thread was started before this function was entered.
+    # Every step that can fail is inside the ``try`` below, because the call is already running: the
+    # task exists above, and a blocking callee's thread was started before this function was entered.
     # Registration or the timeout arithmetic failing used to skip the ``finally`` entirely, so the
     # call was neither cancelled, detached, nor consumed -- it ran to completion behind a run that
-    # had already reported a failure.
+    # had already reported a failure. (The ``def`` here cannot fail; it is a default so the
+    # ``finally`` can call it unconditionally even if registration never ran.)
     def remove_callback() -> None:
         return None
 

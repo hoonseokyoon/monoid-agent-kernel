@@ -314,8 +314,10 @@ I/O timeout and idempotency policy, because the kernel can stop waiting for a ca
 Abandonment is not free, and this is a known limitation rather than a settled guarantee: nothing can
 reclaim the thread of a call that never returns, and the run no longer blocks to throttle the next
 attempt, so an implementation that wedges *permanently* accumulates one thread per abandoned call
-across runs. Each abandonment is logged as a warning on the `monoid_agent_kernel.loop` logger so the
-growth is visible; there is currently no cap on outstanding abandoned calls.
+across runs. Each abandonment is logged as a warning on the `monoid_agent_kernel.core.sync_bridge`
+logger — both the synchronous and the asynchronous half — so the growth is visible; there is
+currently no cap on outstanding abandoned calls. A streamed call whose `aclose()` outruns the same
+grace is abandoned too, and warns on `monoid_agent_kernel.model_call`.
 
 Nor is there a bound on *healthy* concurrent sync calls. A dedicated daemon thread per call is what
 makes abandonment possible, but it gives up the thread-pool bound a shared executor provided: within

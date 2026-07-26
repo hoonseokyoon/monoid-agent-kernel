@@ -174,13 +174,18 @@ class LoopBootstrapper:
             if loop.spec.limits.max_duration_s is not None
             else None
         )
-        # Built once and shared by all three publications below. The runner reads the loop's
-        # cancellation token through a callable rather than capturing it: ``astream`` installs one
-        # on a run already in progress, so a token captured here would be a token nobody cancels.
+        # Built once and shared by all three publications below, so every loop field it needs is
+        # read through a callable rather than captured here. Not only the cancellation token, whose
+        # case is the loudest -- ``astream`` installs one on a run already in progress, so a captured
+        # token is one nobody cancels. ``model_adapter`` and ``async_model_cancel_grace_s`` are
+        # public mutable fields the loop reads live everywhere else, and a snapshot of either made
+        # this runner disagree with the code around it rather than merely go stale.
         model_runner = ModelCallRunner(
             adapter=loop.model_adapter,
+            current_adapter=lambda: loop.model_adapter,
             current_cancellation_token=lambda: loop.cancellation_token,
             cancel_grace_s=loop.async_model_cancel_grace_s,
+            current_cancel_grace_s=lambda: loop.async_model_cancel_grace_s,
             thread_name=f"nar-model-call-{loop.spec.run_id}",
         )
         # Publish partial ownership as soon as recorder/task resources exist. If a provider,

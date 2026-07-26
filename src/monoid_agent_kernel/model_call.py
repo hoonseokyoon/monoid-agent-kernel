@@ -27,6 +27,7 @@ import contextlib
 import hashlib
 import inspect
 import json
+import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
@@ -35,6 +36,7 @@ from typing import Any
 from monoid_agent_kernel.core._sync_bridge import (
     CalleeCancelled,
     await_abandonable_call,
+    consume_task_outcome,
     start_abandonable_sync_call,
 )
 from monoid_agent_kernel.core.cancellation import CancellationToken
@@ -60,6 +62,8 @@ from monoid_agent_kernel.providers.base import (
     mark_provider_retried,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
+
+_LOGGER = logging.getLogger("monoid_agent_kernel.model_call")
 
 DeltaConsumer = Callable[[ModelStreamChunk], None]
 """Receives every chunk of a streamed call, in order, as it arrives.
@@ -241,9 +245,11 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
 
     `messages` is always a list here, even when the request carried `None` -- deliberately unlike
     `_prompt_payload`, which keeps those apart because a replay key must. This is a display surface,
-    not a key, and every field on it is a container a consumer walks; one that is sometimes `None`
-    makes each of them special-case the by-reference shape to learn nothing, since the shape is
-    already legible from `previous_turn_handle` and `observations` in this same dict.
+    not a key: `messages` and `observations` are the two fields a consumer *walks*, and normalising
+    both means neither has to special-case the by-reference shape to learn nothing, since that shape
+    is already legible from `previous_turn_handle` and `observations` in this same dict. The scalars
+    are not normalised to match and do not need to be -- `instruction` is handed through as `None` in
+    exactly that by-reference case, because nothing iterates it.
 
     Not a claim that `None` would break redaction -- it does not. `RedactionPolicy` holds rules and
     answers questions (`names_a_secret`, `redact_text`); the walking is a `Redactor`'s, and the
@@ -292,7 +298,17 @@ class ModelCallRunner:
     adapter: Any
     """The model adapter. Typed `Any` because the optional members are probed with `getattr`, as
     the protocols in `providers/base.py` intend -- declaring the optional members would make them
-    required for structural typing and reject a third-party adapter implementing only `next_turn`."""
+    required for structural typing and reject a third-party adapter implementing only `next_turn`.
+
+    Used when `current_adapter` is unset, which is the standalone case: a caller holding one adapter
+    for the runner's lifetime passes it here and never thinks about the distinction."""
+
+    current_adapter: Callable[[], Any] | None = None
+    """Returns the adapter to call **at the moment of the call**, for a host whose adapter can change
+    between calls. `AgentLoop.model_adapter` is a public mutable field, and the loop reads it live
+    everywhere *else* -- for `supports_multimodal`, for `wire_image_encoding`, and for the
+    `provider_name` it attributes the answer to. A runner holding a snapshot therefore did not merely
+    go stale: the request was shaped for and attributed to one adapter while another answered it."""
 
     current_cancellation_token: Callable[[], CancellationToken | None] | None = None
     """Returns the token to observe **at the moment of the call**, not a token captured at
@@ -301,7 +317,16 @@ class ModelCallRunner:
     the streaming path."""
 
     cancel_grace_s: float = 1.0
-    """How long an abandoned call's worker is given to settle before it is reported as leaked."""
+    """How long an abandoned call's worker is given to settle before it is reported as leaked.
+
+    Used when `current_cancel_grace_s` is unset, the same way `adapter` is."""
+
+    current_cancel_grace_s: Callable[[], float] | None = None
+    """Returns the grace to apply **at the moment it is spent**, for the same reason
+    `current_adapter` exists: `AgentLoop.async_model_cancel_grace_s` is a public mutable field, and
+    its tool-side twin is still read live at every use. A snapshot made the model and tool halves of
+    one knob disagree -- a grace raised after `open()` abandoned the model worker on the old value,
+    ~150x early in the case that found it."""
 
     thread_name: str = "nar-model-call"
     """Thread name for a blocking `next_turn`. Carries the run id in kernel use, so a leaked worker
@@ -317,7 +342,7 @@ class ModelCallRunner:
     no subscriptions and still pays that; anyone trimming the cost should start there and not
     expect this field to gate it."""
 
-    def _effective_model(self, request: ModelRequest) -> ModelConfig:
+    def _effective_model(self, request: ModelRequest, adapter: Any) -> ModelConfig:
         """The config the adapter will actually run under.
 
         `ModelRequest.model` is optional and every shipped adapter falls back to its own
@@ -337,28 +362,53 @@ class ModelCallRunner:
         # admits nothing else -- the receipt cannot say "unknown". That is a known limit of this
         # field, not a distinction being drawn.
         try:
-            configured = getattr(self.adapter, "config", None)
+            configured = getattr(adapter, "config", None)
         except Exception:
             configured = None
         return configured if isinstance(configured, ModelConfig) else ModelConfig()
 
-    def _destination(self, model: ModelConfig) -> str:
+    def _destination(self, model: ModelConfig, adapter: Any) -> str:
         """Where this adapter would send a call under `model`, or `""` if it does not say.
 
         Probed and tolerant of failure for the same reason every other probe here is: a replay key
         is bookkeeping, and an adapter that cannot answer must not thereby lose its call.
+
+        The `getattr` is inside the `try`, not before it. Tolerating only the *call* left the
+        *lookup* undefended, so an adapter exposing `resolve_destination` as a property that raised
+        still lost its call -- the one shape the rule above exists to rule out, surviving in the
+        probe the other two were written to imitate.
         """
 
-        resolve = getattr(self.adapter, "resolve_destination", None)
-        if not callable(resolve):
-            return ""
         try:
+            resolve = getattr(adapter, "resolve_destination", None)
+            if not callable(resolve):
+                return ""
             return str(resolve(model) or "")
         except Exception:
             return ""
 
     def _token(self) -> CancellationToken | None:
         return None if self.current_cancellation_token is None else self.current_cancellation_token()
+
+    def _current_adapter(self) -> Any:
+        """The adapter for one call. Read **once** per call and threaded through from there.
+
+        Reading it again per probe would let a host that swaps adapters mid-call produce a receipt
+        describing a mixture of two, which is worse than describing either. One read per call is also
+        exactly what the loop did before this runner existed.
+        """
+
+        return self.adapter if self.current_adapter is None else self.current_adapter()
+
+    def _grace_s(self) -> float:
+        """The grace, read where it is spent rather than per call: a call has no single moment the
+        interval belongs to, and the tool half is read live at each use too."""
+
+        return (
+            self.cancel_grace_s
+            if self.current_cancel_grace_s is None
+            else self.current_cancel_grace_s()
+        )
 
     def _check_cancel_or_deadline(self, deadline: float | None) -> None:
         """Check only terminal run boundaries while model I/O is in flight.
@@ -399,12 +449,13 @@ class ModelCallRunner:
         """
 
         started = time.monotonic()
-        model = self._effective_model(request)
+        adapter = self._current_adapter()
+        model = self._effective_model(request, adapter)
         # Same tolerance as the other two adapter probes, and for the same reason. Undefended, a
         # `provider_name` property that raised -- or whose `str()` did -- lost the call before the
         # adapter was ever invoked, over a field nothing reads for control flow.
         try:
-            provider = str(getattr(self.adapter, "provider_name", "") or "")
+            provider = str(getattr(adapter, "provider_name", "") or "")
         except Exception:
             provider = ""
         receipt = ModelCallReceipt(
@@ -417,13 +468,13 @@ class ModelCallRunner:
                     request,
                     model,
                     provider=provider,
-                    destination=self._destination(model),
+                    destination=self._destination(model, adapter),
                 )
             ),
         )
         with collect_retry_reports() as progress:
             try:
-                turn = await self._adrive(request, deadline, should_abort, delta_consumer)
+                turn = await self._adrive(request, deadline, should_abort, delta_consumer, adapter)
             except BaseException as exc:
                 # What the adapter managed to say before this call stopped producing outcomes. A
                 # boundary raised by the race is not something the adapter can stamp, and an
@@ -505,6 +556,7 @@ class ModelCallRunner:
         deadline: float | None,
         should_abort: ShouldAbort | None,
         delta_consumer: DeltaConsumer | None,
+        adapter: Any,
     ) -> ModelTurn:
         # Before dispatch, not only inside the race. `_aawait` reports a boundary that had already
         # been crossed, but by then the adapter has been invoked and the provider has been paid for
@@ -516,15 +568,15 @@ class ModelCallRunner:
         # this task. A boundary crossed *after* dispatch is the race's business, which is why this
         # is an addition to it rather than a replacement.
         self._check_cancel_or_deadline(deadline)
-        astream_turn = getattr(self.adapter, "astream_turn", None)
+        astream_turn = getattr(adapter, "astream_turn", None)
         if delta_consumer is not None and astream_turn is not None:
             return await self._astream(
                 astream_turn, request, deadline, delta_consumer, should_abort
             )
-        anext_turn = getattr(self.adapter, "anext_turn", None)
+        anext_turn = getattr(adapter, "anext_turn", None)
         if anext_turn is not None:
             return await self._aawait(anext_turn(request), deadline)
-        next_turn = self.adapter.next_turn
+        next_turn = adapter.next_turn
         if inspect.iscoroutinefunction(next_turn):
             return await self._aawait(next_turn(request), deadline)
         return await self._aawait(
@@ -578,12 +630,13 @@ class ModelCallRunner:
                 # hung the run, with no boundary able to fire, because the abort is raised inside
                 # this task and so no grace interval applies to it.
                 #
-                # The grace is the same one an abandoned call gets; a close that outlives it is
-                # left running rather than waited on.
+                # The grace is the same one an abandoned call gets, and outliving it means being
+                # abandoned the same way: detached and warned about, not waited on. See
+                # `_aclose_within_grace` for why the bound cannot be `asyncio.wait_for`.
                 aclose = getattr(agen, "aclose", None)
                 if aclose is not None:
-                    with contextlib.suppress(Exception, asyncio.TimeoutError):
-                        await asyncio.wait_for(aclose(), timeout=max(0.0, self.cancel_grace_s))
+                    with contextlib.suppress(Exception):
+                        await self._aclose_within_grace(aclose)
             return assemble_streamed_turn(chunks)
 
         try:
@@ -596,6 +649,50 @@ class ModelCallRunner:
             if retried:
                 mark_provider_retried(exc)
             raise
+
+    async def _aclose_within_grace(self, aclose: Callable[[], Any]) -> None:
+        """Close a provider's stream, spending at most the grace interval on its cleanup.
+
+        `asyncio.wait_for` is the obvious spelling and does **not** bound this. On timeout it
+        cancels the close and then *awaits that cancellation to complete*, so a cleanup that
+        suppresses `CancelledError` holds the run for as long as it wants: a close that ignored
+        cancellation for 5s took 4.6s against a 0.05s grace, ~90x over. A real bound has to stop
+        waiting, which means detaching -- `core._sync_bridge` already does exactly this for a call
+        that outlives a run boundary, down to consuming the outcome so the abandoned task does not
+        resurface as an unretrieved exception at collection.
+
+        Abandoning is the lesser harm, not a good outcome, so it warns for the reason
+        `detach_unfinished_call` warns: one leak per abandoned stream, on a loop that may run for
+        days, is the kind of growth that has to be visible to be fixed. The grace is spent *before*
+        cancelling rather than after, because unlike an in-flight call a close is already the
+        cleanup -- cancelling it first would pre-empt the very work the interval exists to allow. A
+        slow-but-cancellable close is therefore warned about and then reclaimed immediately; the
+        message says so rather than claiming a leak that did not happen.
+        """
+
+        closing = asyncio.ensure_future(aclose())
+        try:
+            grace_s = self._grace_s()
+            done, _pending = await asyncio.wait({closing}, timeout=max(0.0, grace_s))
+            if closing in done:
+                return
+            _LOGGER.warning(
+                "a provider stream's close outran the %.3gs grace interval: the run stopped waiting "
+                "for it and cancelled it. A close that honours the cancellation is reclaimed at "
+                "that point; one that suppresses it keeps the generator and any connection it holds "
+                "alive, one per streamed call, with nothing left to reclaim them. Enforce a timeout "
+                "at the provider's I/O edge.",
+                grace_s,
+            )
+        finally:
+            # Also covers the run boundary firing *here*: this runs inside the stream task's
+            # `finally`, so the cancellation that abandons the call lands on this await too.
+            if not closing.done():
+                closing.cancel()
+            if closing.done():
+                consume_task_outcome(closing)
+            else:
+                closing.add_done_callback(consume_task_outcome)
 
     async def _aawait(self, pending: Any, deadline: float | None) -> ModelTurn:
         """Await model I/O against the shared cancel/deadline race.
@@ -619,7 +716,7 @@ class ModelCallRunner:
                 pending,
                 deadline=deadline,
                 token=self._token(),
-                grace_s=self.cancel_grace_s,
+                grace_s=self._grace_s(),
                 check_boundary=self._check_cancel_or_deadline,
             )
         except CalleeCancelled as exc:

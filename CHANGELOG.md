@@ -74,6 +74,15 @@ out in commit messages and here.
 
 ### Fixed
 
+- Extracting the model call into `ModelCallRunner` no longer freezes two of the loop's public
+  mutable fields at bootstrap. `model_adapter` and `async_model_cancel_grace_s` were captured by
+  value where the loop had read them live on every call, so an adapter assigned after `open()` was
+  ignored — while the request was still *shaped* for it (`supports_multimodal`,
+  `wire_image_encoding`) and the answer still *attributed* to it (`provider_name` on the assistant
+  message). A grace raised after `open()` was likewise ignored, abandoning a model worker ~150x
+  earlier than configured, while the tool half of the same knob honoured it. Both are now read
+  through callables, as the cancellation token already was; the adapter is read exactly once per
+  call so a receipt cannot describe a mixture of two.
 - A synchronous tool handler's call authorization now reaches threads the handler starts itself. A
   `ToolContext` operation delegated to a joined child thread is checked against the same binding
   scope as its parent, instead of seeing no call at all and widening to the run-level permission
@@ -107,17 +116,24 @@ out in commit messages and here.
   any turn-shaped object. A `usage=None`, which `examples/custom_model_adapter.py` invites by calling
   usage "optional", raised from inside the receipt's own construction, so no receipt was produced at
   all and an answer the provider had already been paid for was discarded over a token counter.
-  `provider_name` and `config` probes are tolerated the same way `resolve_destination` already was.
-- A synchronous adapter or tool handler that raises `StopIteration` no longer hangs the run forever.
+  The `provider_name`, `config` and `resolve_destination` probes are all now tolerated at the
+  *lookup* as well as the call, so an adapter exposing any of them as a property that raises keeps
+  its call; `resolve_destination` previously guarded only the call.
+- A synchronous adapter or tool handler that raises `StopIteration` no longer loses its failure.
   `asyncio.Future.set_exception` refuses `StopIteration` by contract; the refusal surfaced inside a
-  thread-safe callback where nothing awaited it, so the awaiting future stayed pending and no
-  deadline could end the run. It now surfaces as a `RuntimeError` naming the cause. Raising it is
-  ordinary — `next(...)` on an exhausted iterator does.
+  thread-safe callback where nothing awaited it, so the awaiting future stayed pending. A deadline
+  still released the run, but the callee's actual failure never arrived, the kernel's abandonment
+  warning stayed silent, and a run configured without a deadline hung. It now surfaces as a
+  `RuntimeError` naming the cause. Raising it is ordinary — `next(...)` on an exhausted iterator
+  does.
 - A provider stream whose `aclose()` raises or hangs no longer replaces the call's own outcome. It
   runs in a `finally`, so a raising close turned a caller's abort into a terminal failure — killing
   the session that `ModelCallAborted` exists to keep parked — and a hanging one hung the run, since
   the abort is raised inside the awaited task and no run boundary is pending to bound it. The close
-  is now bounded by the same grace an abandoned call gets, and its failure is not the call's.
+  now gets the same grace an abandoned call gets and is then detached, and its failure is not the
+  call's. The bound is a detach rather than `asyncio.wait_for`, which cancels on timeout and then
+  awaits that cancellation — so a close suppressing `CancelledError` still ran ~90x past the grace.
+  An abandoned close warns on the `monoid_agent_kernel.model_call` logger.
 - Capture failing no longer changes how a provider failure is classified. The failure receipt is
   published under a guard, so a `ModelAdapterError` carrying `retryable` and `http_status` reaches
   the caller even when delivery raises — the docstring promised delivery *before* the re-raise, and

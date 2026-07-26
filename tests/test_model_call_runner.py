@@ -1757,3 +1757,224 @@ def test_an_abandoned_async_call_is_reported_the_way_an_abandoned_thread_is(
     assert any("abandoned an asynchronous call" in record.message for record in caplog.records), (
         "an abandoned async call must be as visible as an abandoned thread"
     )
+
+
+class _CancelSuppressingCloseAdapter:
+    """A provider whose stream cleanup ignores cancellation until it is released.
+
+    The adversarial shape the grace exists to bound. A close doing its own blocking teardown --
+    draining a socket, retrying a release call -- can swallow the cancellation meant to stop it.
+    """
+
+    def __init__(self, release: asyncio.Event) -> None:
+        self._release = release
+
+    async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+        del request
+        try:
+            yield TextDelta("ans")
+        except GeneratorExit:
+            while not self._release.is_set():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._release.wait()
+
+
+async def _time_a_suppressed_close(grace: float, rescue_after: float) -> float:
+    """How long `acall` takes when the stream's close refuses to be cancelled.
+
+    `rescue_after` releases the close from a *separate* task so a regression fails on the elapsed
+    assertion instead of hanging: the awaiting path is exactly the one that stops being bounded.
+    """
+
+    release = asyncio.Event()
+    runner = ModelCallRunner(adapter=_CancelSuppressingCloseAdapter(release), cancel_grace_s=grace)
+
+    async def rescue() -> None:
+        await asyncio.sleep(rescue_after)
+        release.set()
+
+    rescuer = asyncio.ensure_future(rescue())
+    started = time.monotonic()
+    try:
+        with pytest.raises(ModelCallAborted):
+            await runner.acall(REQUEST, delta_consumer=lambda chunk: None, should_abort=lambda: True)
+        return time.monotonic() - started
+    finally:
+        release.set()
+        rescuer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await rescuer
+
+
+def test_a_stream_close_that_suppresses_cancellation_cannot_outlast_the_grace() -> None:
+    """The grace is only a bound if outrunning it means being *detached*.
+
+    `asyncio.wait_for` reads like the bound and is not one: on timeout it cancels the close and then
+    awaits that cancellation, so a close that suppresses `CancelledError` holds the run for as long
+    as it likes. Measured with that spelling and a 0.05s grace: 4.59s, ~90x over.
+
+    The abort matters here. On the cancel and deadline paths a boundary is already pending and
+    `detach_unfinished_call` bounds the whole task; on abort and on ordinary completion nothing else
+    is watching, so this is the only bound there is.
+    """
+
+    elapsed = asyncio.run(_time_a_suppressed_close(grace=0.05, rescue_after=3.0))
+    assert elapsed < 0.6, (
+        f"a 0.05s grace let a cancel-suppressing close hold the call for {elapsed:.2f}s; "
+        "the close is being awaited rather than detached"
+    )
+
+
+def test_an_abandoned_stream_close_says_what_it_leaves_behind(caplog: Any) -> None:
+    """Abandoning is the lesser harm, not a free one, so it is visible.
+
+    Same reason the sync and async halves of the bridge warn: one generator and its connection per
+    abandoned stream, on a loop that may run for days, is growth an operator has to be able to see.
+    """
+
+    with caplog.at_level("WARNING", logger="monoid_agent_kernel.model_call"):
+        asyncio.run(_time_a_suppressed_close(grace=0.05, rescue_after=3.0))
+
+    assert any("outran the" in record.message for record in caplog.records), (
+        "an abandoned stream close must be as visible as an abandoned call"
+    )
+
+
+def test_a_close_that_finishes_in_time_is_not_reported_as_abandoned(caplog: Any) -> None:
+    """Counterweight: the warning must not fire for every streamed call.
+
+    A rule that reports the ordinary case teaches operators to filter it out, which costs exactly
+    the abandonment the previous test pins.
+    """
+
+    class PromptCloseAdapter:
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            yield TextDelta("ans")
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=PromptCloseAdapter(), cancel_grace_s=0.05).acall(
+            REQUEST, delta_consumer=lambda chunk: None
+        )
+
+    with caplog.at_level("WARNING", logger="monoid_agent_kernel.model_call"):
+        asyncio.run(run())
+
+    assert not caplog.records, f"an ordinary close was reported as abandoned: {caplog.records}"
+
+
+def test_a_destination_probe_that_raises_on_lookup_still_keeps_the_call() -> None:
+    """The probe is tolerant at the lookup, not only at the call.
+
+    `resolve_destination` is opt-in, so an adapter may expose it as a property -- and a property that
+    raised took the whole call down, over a replay key. The sibling probes guarded the `getattr`;
+    this one guarded only the invocation, which is the half a `def` happens to exercise.
+    """
+
+    class RaisingLookup:
+        @property
+        def resolve_destination(self) -> Any:
+            raise RuntimeError("probe exploded")
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    async def run() -> Any:
+        turn, receipt = await ModelCallRunner(adapter=RaisingLookup()).acall(REQUEST)
+        return turn, receipt
+
+    turn, receipt = asyncio.run(run())
+    assert turn.final_text == "answer"
+    assert receipt.request_digest == _digest(
+        _request_payload(REQUEST, ModelConfig(), provider="", destination="")
+    )
+
+
+def test_a_host_whose_adapter_changes_is_read_once_per_call_and_not_once_per_probe() -> None:
+    """The seam that lets a host swap adapters, and the limit on how far that goes.
+
+    Read *per call*, so a swap between calls takes effect -- the loop's `model_adapter` is public and
+    mutable, and everything around the runner reads it live. Read *once*, so one call cannot be
+    answered by one adapter and attributed to another: the receipt names a provider, a model and a
+    destination, and three probes reading a moving field would describe a mixture of adapters that
+    never ran.
+    """
+
+    class Marked:
+        def __init__(self, tag: str) -> None:
+            self.provider_name = tag
+            self.requests = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.requests += 1
+            return ModelTurn(final_text=f"FROM-{self.provider_name}")
+
+    first, second = Marked("FIRST"), Marked("SECOND")
+    live = [first]
+    reads: list[int] = []
+
+    def current() -> Any:
+        reads.append(len(reads))
+        return live[0]
+
+    async def run() -> Any:
+        runner = ModelCallRunner(adapter=first, current_adapter=current)
+        one = await runner.acall(REQUEST)
+        live[0] = second
+        two = await runner.acall(REQUEST)
+        return one, two
+
+    (turn_one, receipt_one), (turn_two, receipt_two) = asyncio.run(run())
+
+    assert turn_one.final_text == "FROM-FIRST"
+    assert turn_two.final_text == "FROM-SECOND", "a swap between calls must take effect"
+    assert receipt_one.provider_name == "FIRST"
+    assert receipt_two.provider_name == "SECOND", "the receipt must name the adapter that answered"
+    assert (first.requests, second.requests) == (1, 1)
+    assert reads == [0, 1], f"the adapter must be read exactly once per call, was read {len(reads)}x"
+
+
+def test_the_grace_is_read_where_it_is_spent() -> None:
+    """A host may raise the grace after the runner was built; the tool half already allows it.
+
+    Observable through the close bound: a 0.15s close fits inside a live 0.4s grace and is not
+    reported, but outruns the 0.01s the runner was constructed with.
+    """
+
+    class SlowCloseAdapter:
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            try:
+                yield TextDelta("ans")
+            finally:
+                await asyncio.sleep(0.15)
+
+    async def run() -> None:
+        runner = ModelCallRunner(
+            adapter=SlowCloseAdapter(),
+            cancel_grace_s=0.01,
+            current_cancel_grace_s=lambda: 0.4,
+        )
+        await runner.acall(REQUEST, delta_consumer=lambda chunk: None)
+
+    import logging as _logging
+
+    records: list[Any] = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record: Any) -> None:
+            records.append(record)
+
+    logger = _logging.getLogger("monoid_agent_kernel.model_call")
+    handler = _Capture()
+    logger.addHandler(handler)
+    try:
+        asyncio.run(run())
+    finally:
+        logger.removeHandler(handler)
+
+    assert not records, (
+        "the close fit inside the live grace but was judged against the constructed one"
+    )

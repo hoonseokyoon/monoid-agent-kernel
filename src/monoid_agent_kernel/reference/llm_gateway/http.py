@@ -200,8 +200,9 @@ def _error_body(
     """The fields every gateway error carries, whatever transport reports it.
 
     One definition rather than one per writer. The non-200 body and the SSE error frame are read
-    back by the same client code, and while they were written separately they came to disagree:
-    ``provider_retried`` reached one and not the other.
+    back by the same client code but were written separately, so every field added to one had to be
+    remembered for the other -- ``provider_retried`` was added to both in the same commit only
+    because they were reviewed together. One definition removes the chance to forget.
 
     ``provider_retried`` is a retry the gateway's *backend* made before failing. The client can only
     see its own attempts, so without it a call the provider retried and then failed was recorded as
