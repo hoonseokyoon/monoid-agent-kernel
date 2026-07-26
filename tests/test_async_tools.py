@@ -154,6 +154,45 @@ def test_tool_local_cancelled_error_becomes_failed_observation(tmp_path: Path) -
     assert "tool.call.failed" in _event_types(result.run_dir)
 
 
+def test_host_cancelling_the_run_task_is_not_reported_as_a_tool_failure(tmp_path: Path) -> None:
+    """The other kind of ``CancelledError``: the host cancelling the task that drives the run.
+
+    ``tool_handler_cancelled`` belongs to a handler that cancelled *itself* -- the test above.
+    Cancellation delivered to the awaiting task means the host stopped the run, and catching it
+    alongside the handler's own turned it into one failed tool observation with the run carrying on
+    to the next model call: work the host had already stopped.
+    """
+
+    @tool(id="async.block")
+    async def block() -> dict:
+        started.set()
+        await asyncio.sleep(30)
+        return {"late": True}
+
+    started = asyncio.Event()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("async_block", {}, "c1"),)),
+            ModelTurn(final_text="a step the run must never take"),
+        ]
+    )
+
+    async def run() -> None:
+        pending = asyncio.create_task(
+            AgentLoop.from_tools(_spec(tmp_path), adapter, [block]).arun_once("go")
+        )
+        await asyncio.wait_for(started.wait(), timeout=10)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    asyncio.run(run())
+
+    # The second turn is on the adapter and was never asked for: the run stopped where it was
+    # cancelled rather than resuming past a tool call it recorded as failed.
+    assert len(adapter.requests) == 1
+
+
 def test_unexpected_async_tool_error_fails_run_and_clears_call_context(tmp_path: Path) -> None:
     cleared = asyncio.Event()
 

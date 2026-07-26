@@ -15,6 +15,7 @@ from typing import Any
 
 from monoid_agent_kernel.core._sync_bridge import (
     AbandonableSyncCall,
+    CalleeCancelled,
     await_abandonable_call,
     start_abandonable_sync_call,
 )
@@ -3676,10 +3677,14 @@ class AgentLoop:
                 grace_s=self.async_tool_cancel_grace_s,
                 check_boundary=self._check_run_boundary,
             )
-        except asyncio.CancelledError as exc:
+        except CalleeCancelled as exc:
             # Distinct from the run boundaries the shared race raises: a handler cancelled from
             # inside keeps its own ``tool_handler_cancelled`` meaning rather than being reported as
             # the run stopping.
+            #
+            # Only the *handler's* cancellation, never a plain ``CancelledError``. Cancellation
+            # delivered to this task is the host stopping the run, and catching it here reported
+            # one failed tool call and carried on with the next step.
             raise ToolExecutionError(
                 "async tool handler was cancelled",
                 error_code="tool_handler_cancelled",

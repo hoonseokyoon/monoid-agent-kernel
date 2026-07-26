@@ -28,6 +28,20 @@ _LOGGER = logging.getLogger("monoid_agent_kernel.core.sync_bridge")
 _T = TypeVar("_T")
 
 
+class CalleeCancelled(Exception):
+    """The callee's own cancellation, told apart from cancellation delivered to the awaiter.
+
+    ``await_abandonable_call`` raises this only for a ``CancelledError`` read off the callee's
+    result. A ``CancelledError`` propagating out of that function is therefore always the awaiting
+    task's own -- the host cancelling the run -- and has to keep propagating.
+
+    The distinction needs a separate type because both arrive as the same exception class and a
+    caller cannot tell them apart afterwards. Catching plain ``CancelledError`` around the call
+    turned a cancelled *run* into one failed tool call and let the run continue issuing model and
+    tool work the host had already stopped.
+    """
+
+
 def consume_task_outcome(task: asyncio.Future[Any]) -> None:
     """Retrieve a detached task outcome so late cleanup cannot emit an unhandled warning."""
 
@@ -200,8 +214,10 @@ async def await_abandonable_call(
     continue until it returns on its own. Abandoning is only real because the thread is a daemon
     nobody joins.
 
-    `asyncio.CancelledError` from the callee is left to propagate: the two callers report it
-    differently and neither meaning belongs here.
+    `asyncio.CancelledError` from the callee surfaces as `CalleeCancelled`: the two callers report
+    it differently and neither meaning belongs here, but neither can report it at all if it cannot
+    be told from the cancellation the host delivered to the awaiting task. Anything raising plain
+    `CancelledError` out of here is that second kind.
     """
 
     sync_call = pending if isinstance(pending, AbandonableSyncCall) else None
@@ -228,7 +244,10 @@ async def await_abandonable_call(
         check_boundary(deadline)
         if task.done():
             outcome_consumed = True
-            return task.result()
+            try:
+                return task.result()
+            except asyncio.CancelledError as exc:
+                raise CalleeCancelled from exc
         if cancelled.done():
             raise RunCancelled("run cancelled")
         raise RunTimeout("run exceeded max duration")
