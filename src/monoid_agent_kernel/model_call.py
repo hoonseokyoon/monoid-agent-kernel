@@ -54,6 +54,7 @@ from monoid_agent_kernel.providers.base import (
     ModelStreamChunk,
     ModelTurn,
     assemble_streamed_turn,
+    collect_retry_reports,
     mark_provider_retried,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
@@ -381,19 +382,30 @@ class ModelCallRunner:
                 )
             ),
         )
-        try:
-            turn = await self._adrive(request, deadline, should_abort, delta_consumer)
-        except BaseException as exc:
-            self._publish(
-                request, None, receipt.with_error(exc), elapsed_ms=self._ms_since(started)
+        with collect_retry_reports() as progress:
+            try:
+                turn = await self._adrive(request, deadline, should_abort, delta_consumer)
+            except BaseException as exc:
+                # What the adapter managed to say before this call stopped producing outcomes. A
+                # boundary raised by the race is not something the adapter can stamp, and an
+                # abandoned worker's eventual exception is never read, so for a call the run gave
+                # up on this is the only surviving evidence that a retry happened.
+                if progress.retried:
+                    mark_provider_retried(exc)
+                self._publish(
+                    request, None, receipt.with_error(exc), elapsed_ms=self._ms_since(started)
+                )
+                raise
+            # Read on this path too, so `report_provider_retried` means the same thing whatever
+            # the call returns. Honoured only on failure, it would be a reporting seam that
+            # silently stops working for adapters that retry and then succeed -- which is most of
+            # the time a retry loop runs.
+            settled = self._publish(
+                request,
+                turn,
+                self._completed(receipt, turn, retried=progress.retried),
+                elapsed_ms=self._ms_since(started),
             )
-            raise
-        settled = self._publish(
-            request,
-            turn,
-            self._completed(receipt, turn),
-            elapsed_ms=self._ms_since(started),
-        )
         return turn, settled
 
     @staticmethod
@@ -401,15 +413,19 @@ class ModelCallRunner:
         return max(0, int((time.monotonic() - started) * 1000))
 
     @staticmethod
-    def _completed(receipt: ModelCallReceipt, turn: ModelTurn) -> ModelCallReceipt:
+    def _completed(
+        receipt: ModelCallReceipt, turn: ModelTurn, *, retried: bool = False
+    ) -> ModelCallReceipt:
         return replace(
             receipt,
             stop_reason=str(turn.stop_reason or ""),
             usage=_recordable_usage(turn.usage),
             # Probed rather than read as an attribute: a third-party adapter may return any
             # turn-shaped object, and a missing flag means "did not retry", which is true of every
-            # adapter with no retry loop.
-            provider_retried=bool(getattr(turn, "provider_retried", False)),
+            # adapter with no retry loop. Combined with what the adapter reported through the
+            # channel, since either alone is a partial view and neither can contradict the other:
+            # both only ever say that a retry happened.
+            provider_retried=retried or bool(getattr(turn, "provider_retried", False)),
         )
 
     def _publish(

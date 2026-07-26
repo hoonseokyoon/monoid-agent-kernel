@@ -38,6 +38,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCallDelta,
     ToolObservation,
     TurnComplete,
+    report_provider_retried,
 )
 from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.tools.base import ToolSpec
@@ -1315,3 +1316,95 @@ def test_no_subscriptions_means_no_capture_work() -> None:
     receipt = asyncio.run(run())
     assert receipt.capture_downgrades == 0
     assert receipt.prompt_digest != ""
+
+
+# --- retry reported by an adapter whose call never returns an outcome -----------------------------
+
+
+def test_a_retry_survives_a_blocking_adapter_the_run_abandons() -> None:
+    """The one carrier that crosses abandonment.
+
+    A blocking ``next_turn`` keeps running on a thread nobody reads once the run stops waiting, and
+    the receipt is built from the ``RunTimeout`` the race raised -- which the adapter never touched.
+    A run that timed out *because* the provider was retrying is the case most likely to matter, and
+    it recorded a clean single attempt.
+    """
+
+    class RetryingBlockingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            report_provider_retried()  # entering its second attempt
+            time.sleep(3)  # which never finishes
+            return ModelTurn(final_text="never")  # pragma: no cover
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=RetryingBlockingAdapter(), cancel_grace_s=0.05).acall(
+            REQUEST, deadline=time.time() + 0.1
+        )
+
+    with pytest.raises(RunTimeout) as caught:
+        asyncio.run(run())
+    assert getattr(caught.value, "provider_retried", False) is True
+
+
+def test_a_blocking_adapter_that_did_not_retry_claims_nothing() -> None:
+    """The counterweight: the channel reports what happened, not that a call was abandoned."""
+
+    class BlockingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            time.sleep(3)
+            return ModelTurn(final_text="never")  # pragma: no cover
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=BlockingAdapter(), cancel_grace_s=0.05).acall(
+            REQUEST, deadline=time.time() + 0.1
+        )
+
+    with pytest.raises(RunTimeout) as caught:
+        asyncio.run(run())
+    assert getattr(caught.value, "provider_retried", False) is False
+
+
+def test_a_reported_retry_reaches_a_successful_receipt_too() -> None:
+    """Honoured whatever the call returns.
+
+    Read only on failure it would be a seam that silently stops working for adapters that retry and
+    then succeed -- which is most of the time a retry loop runs.
+    """
+
+    class RecoveringAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            report_provider_retried()
+            return ModelTurn(final_text="answer")  # the turn itself does not say so
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(adapter=RecoveringAdapter()).acall(REQUEST)
+        return receipt
+
+    assert asyncio.run(run()).provider_retried is True
+
+
+def test_the_retry_channel_does_not_leak_between_calls() -> None:
+    """One call's report must not colour the next. The channel is per-call, not per-runner."""
+    runner = ModelCallRunner(adapter=SyncAdapter())
+
+    class OnceRetryingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            report_provider_retried()
+            return ModelTurn(final_text="answer")
+
+    async def run() -> tuple[Any, Any]:
+        _t, first = await ModelCallRunner(adapter=OnceRetryingAdapter()).acall(REQUEST)
+        _t2, second = await runner.acall(REQUEST)
+        return first, second
+
+    first, second = asyncio.run(run())
+    assert (first.provider_retried, second.provider_retried) == (True, False)
+
+
+def test_reporting_a_retry_outside_a_runner_is_inert() -> None:
+    """An adapter used directly is not broken by calling the seam with nobody listening."""
+    report_provider_retried()  # must not raise

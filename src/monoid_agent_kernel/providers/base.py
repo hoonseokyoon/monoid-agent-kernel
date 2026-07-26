@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -390,6 +392,56 @@ def mark_provider_retried(error: BaseException) -> None:
         error.provider_retried = True  # type: ignore[attr-defined]
     except Exception:
         pass
+
+
+@dataclass
+class RetryProgress:
+    """What an adapter has managed to report about a call that may never return one.
+
+    Every other carrier of `provider_retried` belongs to an *outcome* -- a turn, a chunk, an
+    exception the adapter raised. A call the run abandons produces none of them: a blocking
+    `next_turn` keeps running on a thread nobody reads, and the failure the receipt is built from
+    is the `RunCancelled`/`RunTimeout` the race raised, which the adapter never touched. A run that
+    timed out *because* the provider was retrying is the case most likely to matter, and it was the
+    one case that recorded a clean single attempt.
+
+    Mutated rather than replaced, because that is what crosses a thread: the worker runs under a
+    copy of the caller's context, so `ContextVar.set` there is invisible here, while a write to the
+    object both sides already hold is not.
+    """
+
+    retried: bool = False
+
+
+_RETRY_PROGRESS: ContextVar[RetryProgress | None] = ContextVar(
+    "monoid_agent_kernel_retry_progress", default=None
+)
+
+
+def report_provider_retried() -> None:
+    """Called by an adapter when its own retry loop is about to make another attempt.
+
+    Optional and inert by default: an adapter that never calls it is reported as never retrying,
+    which is exactly true of one with no retry loop, and a call made outside a runner does nothing.
+    Report on the *decision* to retry, not on the next attempt's success -- an attempt that never
+    completes is precisely the one whose evidence is otherwise lost.
+    """
+
+    progress = _RETRY_PROGRESS.get()
+    if progress is not None:
+        progress.retried = True
+
+
+@contextmanager
+def collect_retry_reports() -> Iterator[RetryProgress]:
+    """Install a channel for `report_provider_retried` for the duration of one call."""
+
+    progress = RetryProgress()
+    token = _RETRY_PROGRESS.set(progress)
+    try:
+        yield progress
+    finally:
+        _RETRY_PROGRESS.reset(token)
 
 
 def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:

@@ -30,6 +30,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCallDelta,
     TurnComplete,
     mark_provider_retried,
+    report_provider_retried,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
@@ -85,6 +86,13 @@ class GatewayModelAdapter:
         attempt = 0
         try:
             for attempt in range(1, max_attempts + 1):
+                if attempt > 1:
+                    # Reported before the attempt, because this call may never produce an outcome
+                    # anyone reads. A blocking ``next_turn`` runs on a thread the run abandons when
+                    # it is cancelled or times out; the receipt is then built from the boundary the
+                    # race raised, and whatever this worker eventually returns or raises is
+                    # discarded. The channel is the only thing that crosses that abandonment.
+                    report_provider_retried()
                 http_request = Request(
                     url,
                     data=body,
@@ -195,6 +203,23 @@ class GatewayModelAdapter:
         attempt = 0
         try:
             for attempt in range(1, max_attempts + 1):
+                if attempt > 1:
+                    # Same report the sync loop makes, for the same reason: a stream cancelled
+                    # before this attempt commits leaves the chunk below undelivered too.
+                    report_provider_retried()
+                    # Before the attempt, not after it commits. The retry is already certain here
+                    # -- the previous iteration decided it -- and this line always runs, while a
+                    # commit may never happen: a run cancelled or timed out while attempt 2 was
+                    # connecting produced no chunk at all, and the receipt is built from the
+                    # ``RunCancelled``/``RunTimeout`` the race raises, not from anything the
+                    # adapter can stamp. Both carriers missed and a retried call was recorded as a
+                    # clean single attempt.
+                    #
+                    # An earlier fix put this at commit, calling that "the first moment the retry
+                    # is certain". That was wrong: certainty arrives when ``_should_retry`` says
+                    # yes, one iteration earlier. An empty ``TextDelta`` concatenates to nothing,
+                    # so the assembled turn and any relay of the deltas are unchanged.
+                    yield TextDelta(text="", provider_retried=True)
                 committed = False
                 try:
                     async with httpx.AsyncClient(timeout=config.timeout_s) as client:
@@ -206,17 +231,6 @@ class GatewayModelAdapter:
                                     raise _StreamRetry(error)
                                 raise error
                             committed = True
-                            if attempt > 1:
-                                # Retries here are all pre-commit, so this is both the first moment
-                                # the retry is certain and the last one guaranteed to happen. The
-                                # evidence is emitted here rather than left to the body because the
-                                # body is not a carrier anything can count on: a 200 stream may
-                                # yield no recognized chunk at all -- an empty body, or only frames
-                                # this version forwards past -- and a stream cancelled right after
-                                # commit yields none either. Both cases recorded the opposite audit
-                                # fact. An empty ``TextDelta`` concatenates to nothing, so the
-                                # assembled turn and any relay of the deltas are unchanged.
-                                yield TextDelta(text="", provider_retried=True)
                             async for chunk in _aiter_sse_chunks(response):
                                 # Also on each chunk, so a chunk forwarded on its own still says
                                 # which stream it came from. Same ``attempt`` in the same scope as

@@ -30,6 +30,15 @@ out in commit messages and here.
   evidence matters; `GatewayModelAdapter` marks the retry when the stream commits, which is the first
   moment it is certain and the last one guaranteed to happen. Adapters with no retry loop leave it
   `False`, which is exactly true of them.
+- Added `report_provider_retried()`, the seam an adapter uses to say its own retry loop is about to
+  make another attempt. Every other carrier of that fact belongs to an *outcome* — a turn, a chunk,
+  an exception the adapter raised — and a call the run abandons produces none of them: a blocking
+  `next_turn` keeps running on a thread nobody reads, and the receipt is built from the
+  `RunCancelled`/`RunTimeout` the race raised, which the adapter never touched. A run that timed out
+  *because* the provider was retrying is the case most likely to matter, and it was the one case
+  that recorded a clean single attempt. Optional and inert by default: an adapter that never calls it
+  reports no retry, which is exactly true of one with no retry loop. `ModelCallRunner` honours it on
+  success and failure alike, combined with what the outcome itself reports, never over it.
 - The reference LLM gateway protocol now carries `provider_retried` — on the one-shot turn result,
   on each streamed delta frame, and on `turn_complete`. Two independent retry loops sit on that
   path and the client can only observe its own, so a gateway whose backend retried, answering a
