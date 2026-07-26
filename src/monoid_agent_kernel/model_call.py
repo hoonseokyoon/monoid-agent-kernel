@@ -606,12 +606,25 @@ class ModelCallRunner:
 
         agen = astream_turn(request)
         retried = False
+        # Cleared the moment this call stops driving the stream, and read before every delivery.
+        #
+        # The kernel can stop *waiting* for a provider; it cannot stop one. That is the premise
+        # `detach_unfinished_call` and `_aclose_within_grace` are both built on, and a stream is the
+        # one place where a callee outliving the run does more than leak: `consume` runs as its own
+        # task, so a generator that survives the cancellation the boundary delivers goes on yielding
+        # into `delta_consumer` after `acall` has already raised. That consumer belongs to one call.
+        # In `AgentLoop` it is a `QueueEventSink` the *next* turn rebinds to a fresh queue, so the
+        # abandoned stream's tokens arrived in the next turn's stream -- output attributed to a turn
+        # that never produced it, which is worse than the leak the grace interval already accepts.
+        driving = True
 
         async def consume() -> ModelTurn:
             nonlocal retried
             chunks: list[ModelStreamChunk] = []
             try:
                 async for chunk in agen:
+                    if not driving:
+                        break
                     if getattr(chunk, "provider_retried", False):
                         retried = True
                     chunks.append(chunk)
@@ -649,6 +662,11 @@ class ModelCallRunner:
             if retried:
                 mark_provider_retried(exc)
             raise
+        finally:
+            # In a `finally` and not only on the failure path: an abandoned `consume` outlives an
+            # ordinary return too, and the flag has to be cleared before this frame hands control
+            # back to `acall` for "no chunk after the call ended" to be a rule rather than a race.
+            driving = False
 
     async def _aclose_within_grace(self, aclose: Callable[[], Any]) -> None:
         """Close a provider's stream, spending at most the grace interval on its cleanup.

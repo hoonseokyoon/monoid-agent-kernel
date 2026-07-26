@@ -74,6 +74,16 @@ out in commit messages and here.
 
 ### Fixed
 
+- A stream the run has given up on no longer delivers its remaining chunks into the *next* turn.
+  Pre-existing — it reproduces identically on the previous release, which had the same unguarded
+  relay at both of its streamed drive sites — and fixed here because this release rewrote that code
+  into one place. The kernel can stop waiting for a provider but cannot stop one, and the stream
+  drive runs as its own task, so a generator that survives the cancellation a boundary delivers goes
+  on yielding into a `delta_consumer` belonging to a call that already raised. That consumer is
+  `QueueEventSink.push_delta`, and one sink serves a whole run — the next turn rebinds it to a fresh
+  queue — so an abandoned turn's tokens surfaced as the following turn's output. Measured before the
+  fix: 13 chunks delivered after the boundary released the call. Deliveries now stop the moment the
+  driving call ends.
 - Extracting the model call into `ModelCallRunner` no longer freezes two of the loop's public
   mutable fields at bootstrap. `model_adapter` and `async_model_cancel_grace_s` were captured by
   value where the loop had read them live on every call, so an adapter assigned after `open()` was

@@ -21,6 +21,7 @@ from monoid_agent_kernel.core.model_io import (
     ModelIOSubscription,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.streaming import QueueEventSink
 from monoid_agent_kernel.errors import (
     ModelAdapterError,
     ModelCallAborted,
@@ -2055,3 +2056,124 @@ def test_a_bookkeeping_failure_does_not_orphan_the_call_it_already_started(caplo
         "around it fails"
     )
     assert finished.wait(timeout=5.0), "the worker should still finish; it is abandoned, not killed"
+
+
+# --- a stream the run gave up on must stop talking to the call that started it -------------------
+
+
+class _CancellationSurvivingStreamAdapter:
+    """A provider whose stream keeps producing after the run has cancelled it.
+
+    The same callee shape `detach_unfinished_call` and `_aclose_within_grace` are both built for:
+    the kernel can stop *waiting* for a provider, it cannot stop one. Spelled here as a suppressed
+    `CancelledError` around the inner read, which is what a client that treats a dropped read as a
+    hiccup and reconnects does to the cancellation aimed at it.
+    """
+
+    provider_name = "survivor"
+
+    def __init__(self, tag: str, chunks: int = 40, per_chunk_s: float = 0.02) -> None:
+        self._tag = tag
+        self._chunks = chunks
+        self._per_chunk_s = per_chunk_s
+
+    async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+        del request
+        for index in range(self._chunks):
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.sleep(self._per_chunk_s)
+            yield TextDelta(text=f"{self._tag}-{index}")
+
+
+def test_a_stream_the_run_gave_up_on_stops_reaching_its_consumer() -> None:
+    """`delta_consumer` belongs to one call, so nothing may reach it once that call has ended.
+
+    `consume` runs as its own task, and that is what lets the two exist at once: the boundary
+    releases `acall`, but a generator that survives the cancellation delivered to that task keeps
+    yielding, and every later chunk was handed straight to the consumer of a call that had already
+    raised `RunTimeout`. Nothing notices serially -- with the awaiting side gone there is no second
+    call to confuse it with -- so the whole defect lives in the overlap.
+
+    Measured before the guard: 19 of 25 chunks arrived after `acall` returned, 5 runs out of 5.
+    """
+
+    delivered: list[tuple[float, str]] = []
+
+    async def run() -> float:
+        runner = ModelCallRunner(
+            adapter=_CancellationSurvivingStreamAdapter("gone"), cancel_grace_s=0.02
+        )
+        with pytest.raises(RunTimeout):
+            await runner.acall(
+                REQUEST,
+                deadline=time.time() + 0.10,
+                delta_consumer=lambda chunk: delivered.append((time.monotonic(), chunk.text)),
+            )
+        ended = time.monotonic()
+        await asyncio.sleep(0.4)  # long enough for many more chunks to be produced
+        return ended
+
+    ended = asyncio.run(run())
+
+    assert delivered, "this test is meaningless unless the stream reached the consumer at all"
+    late = [text for at, text in delivered if at > ended]
+    assert not late, (
+        f"{len(late)} chunk(s) reached the consumer after the call raised: {late[:5]}; an "
+        "abandoned stream is still driving a consumer that belongs to a finished call"
+    )
+
+
+def test_one_turns_tokens_cannot_arrive_in_the_next_turns_stream() -> None:
+    """The consequence that makes the rule above more than tidiness.
+
+    `AgentLoop` passes `QueueEventSink.push_delta` as the consumer, and one sink is reused for every
+    turn of a run -- `activate` rebinds it to the next turn's queue. So an abandoned stream that
+    went on calling its consumer was not talking to nobody: its chunks were routed into the *next*
+    turn's live stream, and a caller of `astream` saw the previous turn's tokens presented as this
+    turn's output. Measured before the guard: 19 foreign chunks in the second turn's queue, 5/5.
+    """
+
+    class TurnTwoAdapter:
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            for index in range(3):
+                await asyncio.sleep(0.05)
+                yield TextDelta(text=f"turn-two-{index}")
+
+    async def run() -> list[str]:
+        loop = asyncio.get_running_loop()
+        sink = QueueEventSink()
+
+        first_queue: asyncio.Queue[Any] = asyncio.Queue()
+        sink.activate(first_queue, loop)
+        abandoned = ModelCallRunner(
+            adapter=_CancellationSurvivingStreamAdapter("turn-one"), cancel_grace_s=0.02
+        )
+        with pytest.raises(RunTimeout):
+            await abandoned.acall(
+                REQUEST, deadline=time.time() + 0.10, delta_consumer=sink.push_delta
+            )
+
+        # The next turn reuses the sink, rebound to its own queue -- the loop's own wiring.
+        second_queue: asyncio.Queue[Any] = asyncio.Queue()
+        sink.activate(second_queue, loop)
+        await ModelCallRunner(adapter=TurnTwoAdapter(), cancel_grace_s=0.02).acall(
+            REQUEST, delta_consumer=sink.push_delta
+        )
+        await asyncio.sleep(0.3)  # the abandoned stream's remaining chunks would land in here
+        sink.deactivate()
+
+        drained: list[str] = []
+        while not second_queue.empty():
+            drained.append(getattr(second_queue.get_nowait(), "text", ""))
+        return drained
+
+    drained = asyncio.run(run())
+
+    assert any(text.startswith("turn-two") for text in drained), (
+        "this test is meaningless unless the second turn's own tokens reached its queue"
+    )
+    foreign = [text for text in drained if text.startswith("turn-one")]
+    assert not foreign, (
+        f"the abandoned turn's tokens were delivered into the next turn's stream: {foreign[:5]}"
+    )
