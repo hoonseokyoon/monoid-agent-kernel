@@ -48,6 +48,7 @@ from monoid_agent_kernel.providers.base import (
     ModelStreamChunk,
     ModelTurn,
     assemble_streamed_turn,
+    mark_provider_retried,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
@@ -457,14 +458,24 @@ class ModelCallRunner:
 
         The assembled turn is identical in shape to a one-shot turn, so nothing downstream of the
         call has to know the answer arrived in pieces.
+
+        A call that fails never produces a turn, so retry evidence seen on the wire has to be
+        carried by the exception instead. `assemble_streamed_turn` handles the success half; this
+        holds the same fact for the half where there is nothing to assemble -- a stream cancelled or
+        aborted after a retried attempt committed. Stamping the exception is how the adapters
+        already report it, and `with_error` already reads it back.
         """
 
         agen = astream_turn(request)
+        retried = False
 
         async def consume() -> ModelTurn:
+            nonlocal retried
             chunks: list[ModelStreamChunk] = []
             try:
                 async for chunk in agen:
+                    if getattr(chunk, "provider_retried", False):
+                        retried = True
                     chunks.append(chunk)
                     delta_consumer(chunk)
                     if should_abort is not None and should_abort():
@@ -478,7 +489,16 @@ class ModelCallRunner:
                     await aclose()
             return assemble_streamed_turn(chunks)
 
-        return await self._aawait(consume(), deadline)
+        try:
+            return await self._aawait(consume(), deadline)
+        except BaseException as exc:
+            # Wraps `_aawait`, not just `consume`: the abort raised inside the loop is only one of
+            # the ways this ends. `RunCancelled` and `RunTimeout` are raised by the race *around*
+            # the stream and never pass through the adapter, so they are exactly the exceptions the
+            # provider had no opportunity to stamp.
+            if retried:
+                mark_provider_retried(exc)
+            raise
 
     async def _aawait(self, pending: Any, deadline: float | None) -> ModelTurn:
         """Await model I/O against the shared cancel/deadline race.

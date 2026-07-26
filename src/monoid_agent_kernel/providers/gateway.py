@@ -29,6 +29,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
+    mark_provider_retried,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
@@ -54,10 +55,7 @@ def _stamp_retry(error: BaseException, attempt: int) -> None:
 
     if attempt <= 1:
         return
-    try:
-        error.provider_retried = True  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    mark_provider_retried(error)
 
 
 @dataclass
@@ -201,10 +199,11 @@ class GatewayModelAdapter:
                             committed = True
                             async for chunk in _aiter_sse_chunks(response):
                                 # Retries here are all pre-commit, so reaching this point after the
-                                # first attempt means the stream was retried. The caller folds the
-                                # chunks into the turn, so the terminal chunk is the only place to
-                                # record it.
-                                if attempt > 1 and isinstance(chunk, TurnComplete):
+                                # first attempt means the stream was retried. Marked on every chunk
+                                # rather than the terminal one: a call cancelled or aborted
+                                # mid-stream never reaches ``TurnComplete``, and a receipt that
+                                # learned of the retry only there denied one that had happened.
+                                if attempt > 1:
                                     chunk = replace(chunk, provider_retried=True)
                                 yield chunk
                     return

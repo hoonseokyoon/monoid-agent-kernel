@@ -971,6 +971,50 @@ def test_a_retried_stream_reports_the_retry_through_the_terminal_chunk() -> None
     assert asyncio.run(run()).provider_retried is True
 
 
+def test_a_retried_stream_keeps_its_evidence_when_the_call_never_completes() -> None:
+    """A call that never completes produces no turn, so the retry has to ride the exception.
+
+    The terminal chunk used to be the only carrier, which meant the evidence existed only for calls
+    that finished -- and a failed call is the one an audit trail is for. `RunCancelled` is the
+    sharpest case: it is raised by the cancel/deadline race *around* the stream and never passes
+    through the adapter, so it is precisely the exception no provider can stamp for itself.
+    """
+
+    def hanging(*, retried: bool) -> Any:
+        token = CancellationToken()
+
+        class HangingStream:
+            async def astream_turn(self, request: ModelRequest) -> Any:
+                del request
+                yield TextDelta("partial", provider_retried=retried)
+                token.cancel()
+                await asyncio.sleep(30)
+                yield TurnComplete(response_id="never reached")  # pragma: no cover
+
+        observer = RecordingObserver()
+
+        async def run() -> None:
+            await ModelCallRunner(
+                adapter=HangingStream(),
+                current_cancellation_token=lambda: token,
+                subscriptions=(
+                    ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+                ),
+            ).acall(REQUEST, delta_consumer=lambda chunk: None)
+
+        with pytest.raises(RunCancelled):
+            asyncio.run(run())
+        return observer.captures[0].receipt
+
+    receipt = hanging(retried=True)
+    assert receipt.succeeded is False
+    assert receipt.error_code == "cancelled"
+    assert receipt.provider_retried is True
+
+    # Counterweight: "always true once a stream is cancelled" would pass the assertion above.
+    assert hanging(retried=False).provider_retried is False
+
+
 def test_the_receipt_carries_the_invocation_context() -> None:
     context = InvocationContext(run_id="run-1", step_id="step-2", attempt=3)
 

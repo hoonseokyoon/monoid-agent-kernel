@@ -276,14 +276,29 @@ class StreamingModelAdapter(Protocol):
 # P4a exercises these via ``FakeStreamingModelAdapter``.
 
 
+# Every chunk type carries ``provider_retried``, not only ``TurnComplete``, because the terminal
+# chunk is not guaranteed to arrive. Stream retries are pre-commit, so an adapter knows it retried
+# the moment the stream commits -- but a run cancelled or aborted mid-stream ends without a terminal
+# chunk, and evidence that rides only that one is evidence a cancelled call can never report. The
+# failure receipt then denied a retry that demonstrably happened.
+#
+# The flag says the *stream* was retried, not that this particular fragment was; a fragment is
+# simply the earliest place the fact can be put where a consumer will see it.
+
+
 @dataclass(frozen=True)
 class TextDelta:
     """A fragment of assistant output text."""
 
     text: str
+    provider_retried: bool = False
 
     def to_json(self) -> dict[str, Any]:
-        return {"type": "text_delta", "text": self.text}
+        return {
+            "type": "text_delta",
+            "text": self.text,
+            "provider_retried": self.provider_retried,
+        }
 
 
 @dataclass(frozen=True)
@@ -294,9 +309,14 @@ class ReasoningDelta:
     reasoning artifacts ride :attr:`TurnComplete.reasoning`, not these deltas)."""
 
     text: str
+    provider_retried: bool = False
 
     def to_json(self) -> dict[str, Any]:
-        return {"type": "reasoning_delta", "text": self.text}
+        return {
+            "type": "reasoning_delta",
+            "text": self.text,
+            "provider_retried": self.provider_retried,
+        }
 
 
 @dataclass(frozen=True)
@@ -309,6 +329,7 @@ class ToolCallDelta:
     arguments_fragment: str = ""
     id: str | None = None
     name: str | None = None
+    provider_retried: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -317,6 +338,7 @@ class ToolCallDelta:
             "arguments_fragment": self.arguments_fragment,
             "id": self.id,
             "name": self.name,
+            "provider_retried": self.provider_retried,
         }
 
 
@@ -350,6 +372,24 @@ class TurnComplete:
 ModelStreamChunk = TextDelta | ReasoningDelta | ToolCallDelta | TurnComplete
 
 
+def mark_provider_retried(error: BaseException) -> None:
+    """Record on an escaping error that the adapter's retry loop had already run.
+
+    Read back by ``ModelCallReceipt.with_error`` through ``getattr``, so an exception that refuses
+    the attribute (``__slots__``) simply reports no retry rather than replacing the failure being
+    reported with an AttributeError.
+
+    Shared rather than written once per caller: the adapter stamps a failure it raises itself, and
+    the runner stamps one raised *around* a stream it had already seen retry. Two copies of a rule
+    about which exceptions accept an attribute is two copies that can disagree.
+    """
+
+    try:
+        error.provider_retried = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     """Fold a streamed chunk sequence into the same :class:`ModelTurn` a one-shot turn
     would produce: concatenate text; group tool-call argument fragments by ``index`` and
@@ -364,6 +404,10 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     stop_reason: StopReason | None = None
     provider_retried = False
     for chunk in chunks:
+        # Read off every chunk, not just the terminal one: a retried stream says so from its first
+        # fragment onward so the fact survives a call that never reaches ``TurnComplete``.
+        if getattr(chunk, "provider_retried", False):
+            provider_retried = True
         if isinstance(chunk, TextDelta):
             text_parts.append(chunk.text)
         elif isinstance(chunk, ToolCallDelta):
@@ -386,8 +430,6 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
                 reasoning = chunk.reasoning
             if chunk.stop_reason is not None:
                 stop_reason = chunk.stop_reason
-            if chunk.provider_retried:
-                provider_retried = True
     tool_calls: list[ToolCall] = []
     for index in order:
         slot = slots[index]

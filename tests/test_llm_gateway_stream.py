@@ -20,7 +20,7 @@ import pytest
 from support.http import serving
 from support.runtime import runtime_config, runtime_provider
 
-from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ModelRetryConfig, RunLimits
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import (
@@ -173,6 +173,77 @@ def test_gateway_adapter_astream_turn_round_trips() -> None:
     assert turn.final_text == "hi"
     assert turn.tool_calls[0].arguments == {"x": 1}
     assert turn.response_id.startswith("turn_")
+
+
+def test_gateway_marks_a_retried_stream_from_its_first_chunk(monkeypatch) -> None:
+    """Retry evidence has to reach the wire before the terminal chunk does.
+
+    Stream retries are all pre-commit, so the adapter knows it retried the moment the stream
+    commits. Attaching that fact to ``TurnComplete`` alone lost it whenever a call was cancelled or
+    aborted mid-stream: the terminal chunk never arrived, and the failure receipt then reported no
+    retry for a call the gateway had demonstrably retried.
+    """
+    httpx = pytest.importorskip("httpx")
+    attempts = 0
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"text_delta","text":"hi"}'
+            yield ""
+            yield 'data: {"type":"turn_complete","response_id":"turn_1"}'
+            yield ""
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.HTTPError("connection reset before the stream committed")
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway._sleep_before_retry", lambda *_a: None)
+
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=3, initial_delay_s=0, jitter_s=0),
+        ),
+        token="run-token",
+    )
+    chunks = asyncio.run(
+        _collect(adapter.astream_turn(ModelRequest(instruction="go", system_prompt="s", tools=())))
+    )
+
+    assert attempts == 2
+    # The first chunk already carries it, not only the last. That is the whole fix: a consumer that
+    # never sees the terminal chunk has still seen the evidence.
+    assert isinstance(chunks[0], TextDelta)
+    assert [chunk.provider_retried for chunk in chunks] == [True, True]
+
+    # Counterweight: a stream that commits first time marks nothing.
+    attempts = 1
+    clean = asyncio.run(
+        _collect(adapter.astream_turn(ModelRequest(instruction="go", system_prompt="s", tools=())))
+    )
+    assert [chunk.provider_retried for chunk in clean] == [False, False]
 
 
 def test_agentloop_astream_over_gateway_streams_real_tokens(tmp_path: Path) -> None:
