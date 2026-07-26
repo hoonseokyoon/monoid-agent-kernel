@@ -87,39 +87,65 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
 
 
 _MAX_DIGEST_DEPTH = 32
+_MAX_DIGEST_NODES = 100_000
 
 
-def _canonical_ready(value: Any, depth: int = 0) -> Any:
+def _canonical_ready(value: Any) -> Any:
     """`value` reshaped so the canonical serializer can always carry it.
 
     Digests are computed on every call, *before* the adapter is reached, so a value the serializer
     chokes on stops the call from happening at all. A digest must never be able to do that: it is
     bookkeeping about a call, not a precondition for making one.
 
-    Applied to the whole payload rather than to selected fields. The first attempt guarded only the
+    Applied to the whole payload rather than to selected fields. An earlier attempt guarded only the
     tool definitions, which left `messages` and `observations` -- both `dict[str, Any]` a caller
-    fills -- able to kill a call outright. Guarding at the one place every digest passes through is
-    what makes the property universal instead of true of the fields somebody remembered.
+    fills -- able to kill a call outright.
 
     Mapping keys are stringified because canonical JSON sorts them, and sorting mixed key types
-    raises. Depth is bounded so a cyclic or pathologically nested payload terminates rather than
-    exhausting the stack.
-
-    Anything JSON has no form for degrades to `repr`, which for a default `__repr__` embeds an
-    address and so digests differently each run. That is the deliberate direction: an unstable
+    raises. Anything JSON has no form for degrades to `repr`, which for a default `__repr__` embeds
+    an address and so digests differently each run. That is the deliberate direction: an unstable
     replay key always misses and costs a re-run, while a stable-but-lossy one -- hashing the type
     name, say -- would let two unrelated objects claim the same call.
+
+    **Three separate things bound the work, because they fail differently.**
+
+    `ancestors` catches a reference back to something already on the current path. A depth cap alone
+    does not: it terminates a single self-reference in `depth` steps, but a cycle reached through
+    *two* references per level expands `2**depth` nodes first -- 4 billion at this cap, which hangs
+    rather than terminates. Only the path matters, not everything seen: an object appearing twice in
+    sibling branches is ordinary sharing, and replacing it would make the digest depend on whether a
+    caller happened to share an object rather than on the value, so two logically equal payloads
+    would digest differently.
+
+    `depth` bounds recursion for a payload that is merely very deep, with no repetition to catch.
+
+    `budget` bounds total work for the shape neither of the others sees: an acyclic graph whose
+    levels each reference the next twice is exponential with no repeat on any single path. Its
+    truncation marker makes the outcome deterministic for a given payload, which a stack overflow
+    would not be.
     """
 
-    if depth > _MAX_DIGEST_DEPTH:
-        return "<max-depth>"
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _canonical_ready(item, depth + 1) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_canonical_ready(item, depth + 1) for item in value]
-    return repr(value)
+    remaining = [_MAX_DIGEST_NODES]
+
+    def walk(item: Any, depth: int, ancestors: frozenset[int]) -> Any:
+        if remaining[0] <= 0:
+            return "<truncated>"
+        remaining[0] -= 1
+        if depth > _MAX_DIGEST_DEPTH:
+            return "<max-depth>"
+        if item is None or isinstance(item, (str, int, float, bool)):
+            return item
+        marker = id(item)
+        if marker in ancestors:
+            return "<cycle>"
+        inner = ancestors | {marker}
+        if isinstance(item, Mapping):
+            return {str(key): walk(child, depth + 1, inner) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [walk(child, depth + 1, inner) for child in item]
+        return repr(item)
+
+    return walk(value, 0, frozenset())
 
 
 def _digest(payload: dict[str, Any]) -> str:

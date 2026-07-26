@@ -506,11 +506,60 @@ def test_a_payload_the_serializer_cannot_carry_does_not_kill_the_call(
     assert receipt.request_digest != ""
 
 
-def test_a_cyclic_payload_terminates_instead_of_exhausting_the_stack() -> None:
+def _self_cycle() -> dict[str, Any]:
     cyclic: dict[str, Any] = {}
     cyclic["self"] = cyclic
+    return cyclic
 
-    assert _digest({"value": cyclic}) != ""
+
+def _branching_cycle() -> list[Any]:
+    cyclic: list[Any] = []
+    cyclic.extend((cyclic, cyclic))
+    return cyclic
+
+
+def _shared_acyclic_graph() -> Any:
+    """Exponential to traverse, but no reference repeats on any single path."""
+    level: Any = "leaf"
+    for _ in range(40):
+        level = [level, level]
+    return level
+
+
+@pytest.mark.parametrize(
+    ("label", "factory"),
+    [
+        ("self cycle", _self_cycle),
+        ("cycle reached through two references", _branching_cycle),
+        ("acyclic but exponentially shared", _shared_acyclic_graph),
+    ],
+)
+def test_a_pathological_payload_terminates_quickly(label: str, factory: Any) -> None:
+    """Three shapes, because they defeat three different bounds.
+
+    The first version of this test used only the self cycle, which a depth cap alone terminates in
+    `depth` steps — so it certified "cycles are safe" while a cycle reached through two references
+    per level still expanded `2**depth` nodes, four billion at the real cap. One shape stood in for
+    a claim about all of them.
+
+    The third has no cycle at all: nothing repeats on any single path, so ancestor tracking cannot
+    see it and only a work budget bounds it.
+    """
+    del label
+    started = time.monotonic()
+
+    digest = _digest({"value": factory()})
+
+    assert digest != ""
+    assert time.monotonic() - started < 5.0
+
+
+def test_an_object_shared_between_siblings_is_not_treated_as_a_cycle() -> None:
+    """Only the path counts. Replacing every repeat would make the digest depend on whether the
+    caller happened to share an object, so two logically equal payloads would digest differently."""
+    shared = {"k": 1}
+
+    assert _digest({"a": shared, "b": shared}) == _digest({"a": {"k": 1}, "b": {"k": 1}})
 
 
 def test_normalization_does_not_disturb_an_ordinary_digest() -> None:
