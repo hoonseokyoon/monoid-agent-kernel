@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import json
 import os
 import threading
@@ -41,6 +43,30 @@ class _ClientScope:
     sync_client: Any = None
     async_client: Any = None
     loop: asyncio.AbstractEventLoop | None = None
+
+
+async def _release_response_stream(stream: Any) -> None:
+    """Close one call's response stream, whoever owns the client it came from.
+
+    Duck-typed and tolerant of both spellings: the SDK's async stream closes with a coroutine, a
+    stand-in may close synchronously, and one that offers no ``close`` at all has nothing to release.
+
+    Swallowed, for the reason the kernel's own stream cleanup gives: this runs in a ``finally``, so
+    whatever it raises *replaces* the call's outcome -- and a provider whose close raised would then
+    destroy a turn whose tokens had already been delivered, or turn a user's interrupt into a terminal
+    failure. The client close below still runs, and is the authoritative cleanup when this call owns
+    the client.
+    """
+
+    if stream is None:
+        return
+    closer = getattr(stream, "close", None)
+    if closer is None:
+        return
+    with contextlib.suppress(Exception):
+        outcome = closer()
+        if inspect.isawaitable(outcome):
+            await outcome
 
 
 def _loop_is_live(loop: asyncio.AbstractEventLoop | None) -> bool:
@@ -330,6 +356,9 @@ class OpenAIModelAdapter:
         # being a raw exception, which the loop cannot classify at all.
         try:
             client, call_owned = self._async_client(AsyncOpenAI, key)
+            # Bound before the request, so the cleanup below can run even when creating the stream is
+            # what failed -- there is nothing to release then, and it must not raise looking.
+            stream: Any = None
             try:
                 try:
                     stream = await client.responses.create(**payload, stream=True, timeout=config.timeout_s)
@@ -373,6 +402,14 @@ class OpenAIModelAdapter:
                         if response is not None and hasattr(response, "model_dump"):
                             final_data = response.model_dump()
             finally:
+                # The response is released per call, whether or not this call owns the client.
+                # Leaving an `async for` does not close the iterator it drove, and closing the
+                # client used to be the only cleanup here -- which happened to cover it *unscoped*,
+                # because tearing the pool down took the response with it. Inside a scope the client
+                # outlives the call, so every turn aborted before the stream drained left its
+                # response and connection checked out until the scope ended. Measured: three aborted
+                # turns, three connections still open server-side inside the scope.
+                await _release_response_stream(stream)
                 if call_owned:
                     await client.close()
         except ModelAdapterError:

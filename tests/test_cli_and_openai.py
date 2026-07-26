@@ -1034,6 +1034,50 @@ def test_openai_scope_rebuilds_a_client_whose_loop_is_gone(monkeypatch: pytest.M
     # path only promises not to *reuse* the dead client.
 
 
+def test_openai_astream_releases_a_stream_it_abandons_inside_a_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-call response has to be released per call, even when the client is not.
+
+    Leaving an `async for` does not close the iterator it drove, and the call's `finally` only closed
+    the *client* -- and only when the call owned it. Unscoped that was enough by accident: tearing the
+    pool down took the response with it. Inside a scope the client outlives the call, so every turn
+    aborted before the stream drained -- cancelled, deadlined, or stopped by `should_abort`, all
+    ordinary -- left its response and connection checked out until the whole scope ended. Enough of
+    them exhaust the pool and later calls stall waiting for a connection that will never come back.
+
+    Measured *inside* the scope, which is the whole point: after it, the client is closed and both
+    behaviours look identical.
+    """
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "AsyncOpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter, request = _standin_adapter(), _standin_request()
+
+        async def abandon_repeatedly() -> int:
+            async with adapter:
+                for _ in range(_STANDIN_CALLS):
+                    stream = adapter.astream_turn(request)
+                    await anext(stream)  # parked mid-response
+                    await stream.aclose()
+                # Still inside the scope: the client is alive by design, the responses must not be.
+                for _ in range(250):
+                    if server.live == 0:
+                        break
+                    await asyncio.sleep(0.02)
+                return server.live
+
+        live_inside_the_scope = asyncio.run(abandon_repeatedly())
+        after = _wait_for_no_open_connections(server)
+
+    assert len(built) == 1, "the scope must still reuse one client"
+    assert live_inside_the_scope == 0, (
+        f"{live_inside_the_scope} response connection(s) still checked out inside the scope after "
+        f"{_STANDIN_CALLS} aborted turns"
+    )
+    assert after == 0, f"{after} connection(s) still open server-side"
+
+
 def test_openai_scope_rebuilds_a_client_closed_underneath_it(monkeypatch: pytest.MonkeyPatch) -> None:
     """A scope holds a client it does not exclusively control, so it checks before handing it out.
 

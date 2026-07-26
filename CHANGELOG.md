@@ -74,6 +74,15 @@ out in commit messages and here.
 
 ### Fixed
 
+- A streamed direct-OpenAI turn now releases its response even when the client is reused. Leaving an
+  `async for` does not close the iterator it drove, and the call's cleanup only closed the *client*,
+  and only when the call owned it — which covered this by accident for an unscoped call, since tearing
+  the pool down took the response with it. Inside a scope (`async with adapter` / `aopen`) the client
+  outlives the call, so every turn aborted before the stream drained — cancelled, deadlined, or
+  stopped by `should_abort`, all ordinary — left its response and connection checked out until the
+  whole scope ended. Measured: three aborted turns, three connections still open server-side inside
+  the scope. Enough of them exhaust the pool and later calls stall waiting for a connection that never
+  comes back. This only ever affected the scope feature added in this release, not the previous one.
 - A live model call is no longer left running silently when the bookkeeping around its wait fails.
   `_aawait` resolved the cancel/deadline race's arguments in its own argument list, and on the
   blocking path the call is already a daemon worker inside the provider by then — so a
