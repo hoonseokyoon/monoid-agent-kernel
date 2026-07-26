@@ -1345,6 +1345,60 @@ def test_cli_run_scopes_an_adapter_that_can_hold_its_client(
     assert events == ["open", "turn", "close"]
 
 
+@pytest.mark.parametrize("failing", ["open", "close"])
+def test_cli_run_reports_an_adapter_lifecycle_failure_as_a_cli_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failing: str
+) -> None:
+    """Both lifecycle calls sit below the handler that normalizes every other startup failure.
+
+    A pool that fails to construct, or to tear down, ended `monoid run` in a bare traceback. The
+    close case carries a second failure: the run's outcome was echoed *after* the scope unwound, and
+    an exception from a cleanup callback replaces whatever is leaving the block — so a teardown that
+    raised swallowed the status of a run that had completed.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class _LifecycleFailure:
+        def __init__(self) -> None:
+            self._inner = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+
+        def open(self) -> _LifecycleFailure:
+            if failing == "open":
+                raise RuntimeError("pool construction failed")
+            return self
+
+        def close(self) -> None:
+            if failing == "close":
+                raise RuntimeError("pool teardown failed")
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            return self._inner.next_turn(request)
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli._model_adapter", lambda *_a, **_k: _LifecycleFailure()
+    )
+    config_file = _write_config(tmp_path / "runtime.json", "run.finish")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(tmp_path / "runs"), "--runtime-config-file", str(config_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, RuntimeError), (
+        "the lifecycle failure escaped as a traceback instead of a reported CLI error"
+    )
+    assert f"{failing}() failed" in result.output, result.output
+    if failing == "close":
+        assert "status: completed" in result.output, (
+            f"a failing teardown swallowed the outcome of a completed run: {result.output}"
+        )
+
+
 def test_cli_run_refuses_an_adapter_offering_open_without_close(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

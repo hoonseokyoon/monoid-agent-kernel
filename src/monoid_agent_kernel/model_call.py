@@ -233,6 +233,29 @@ def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
     }
 
 
+def _safe_repr(value: Any) -> str:
+    """A printable stand-in for an object that may refuse to describe itself.
+
+    The last step of the capture surface's fallback, and the one that made the fallback not a
+    fallback: an object with no ``__dict__`` for ``vars()`` *and* a ``__repr__`` that raises took the
+    exception all the way out through ``_publish``, discarding a turn the provider had already
+    produced. A display surface must not be able to fail a call that already happened -- which is the
+    reason the fallback exists in the first place.
+
+    The type's name is read in its own attempt, because that is an attribute lookup on the type and a
+    metaclass can make it raise too.
+    """
+
+    try:
+        return repr(value)
+    except Exception:
+        pass
+    try:
+        return f"<unrepresentable {type(value).__name__}>"
+    except Exception:
+        return "<unrepresentable>"
+
+
 def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, Any]:
     """What an observer may be shown of one call, before any redaction.
 
@@ -275,7 +298,7 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
             try:
                 calls.append(dict(vars(call)))
             except Exception:
-                calls.append({"repr": repr(call)})
+                calls.append({"repr": _safe_repr(call)})
         content["tool_calls"] = calls
     return content
 

@@ -1694,6 +1694,46 @@ def test_a_tool_call_the_adapter_built_oddly_costs_its_own_entry() -> None:
     assert "repr" in tool_calls[0], "an entry that cannot be walked must still say what it was"
 
 
+def test_a_tool_call_that_refuses_to_describe_itself_still_costs_only_its_own_entry() -> None:
+    """The fallback needs a fallback, or it is not one.
+
+    The test above uses a `__slots__` object, which `vars()` rejects and `repr()` handles -- so the
+    fallback was only ever exercised on an object that cooperates with it. One that refuses *both*
+    took the exception out through `_publish`, and that is not a lost display entry: the turn had
+    already been produced, so a provider answer the run had been paid for was discarded by the code
+    whose whole purpose is to keep that from happening.
+    """
+
+    class Hostile:
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            raise RuntimeError("repr exploded")
+
+    class HostileAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer", tool_calls=(Hostile(),))  # type: ignore[arg-type]
+
+    observer = RecordingObserver()
+
+    async def run() -> Any:
+        turn, _receipt = await ModelCallRunner(
+            adapter=HostileAdapter(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="full")),
+            ),
+        ).acall(REQUEST)
+        return turn
+
+    assert asyncio.run(run()).final_text == "answer", "the provider's answer was discarded"
+    assert len(observer.captures) == 1, "the capture was lost with it"
+    tool_calls = observer.captures[0].content["tool_calls"]
+    assert len(tool_calls) == 1, f"the entry vanished instead of degrading: {tool_calls}"
+    # Degraded, not silent: the record says something was there and that it could not be described.
+    assert tool_calls[0]["repr"] == "<unrepresentable Hostile>"
+
+
 def test_a_raising_probe_does_not_lose_the_call() -> None:
     """`provider_name` and `config` answer bookkeeping, so neither can cost the call.
 

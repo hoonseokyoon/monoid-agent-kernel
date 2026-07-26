@@ -74,6 +74,19 @@ out in commit messages and here.
 
 ### Fixed
 
+- An adapter whose `open()` or `close()` raises now ends `monoid run` with a reported error instead of
+  a bare traceback — a connection pool failing to construct or to tear down is the ordinary way in.
+  Both calls sat below the handler that normalizes every other startup failure. The teardown case
+  carried a second fault: the run's status and summary were echoed *after* the adapter scope unwound,
+  and an exception from a cleanup callback replaces whatever is leaving the block, so a failing
+  teardown silently swallowed the outcome of a run that had **completed**. The outcome is now echoed
+  before the scope is released, so a cleanup failure costs the cleanup and not the result.
+- A tool call that refuses to describe itself no longer discards the turn it belongs to. The capture
+  surface falls back to `repr()` for an object `vars()` cannot walk — a `__slots__` object, say — but
+  an object that refuses *both* took the exception out through `_publish` after the provider had
+  already answered, so a paid-for turn was thrown away by the code whose purpose is to prevent
+  exactly that. The entry now degrades to `<unrepresentable TypeName>`: the record still says a tool
+  call was there and that it could not be described.
 - A model call the kernel refuses before reaching the adapter now reports `attempts=0` instead of 1.
   A run already cancelled, or past its deadline, when the call is requested never touches the
   adapter — but the receipt carried the default 1, so a consumer summing `attempts` counted provider

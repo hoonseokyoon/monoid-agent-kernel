@@ -352,8 +352,14 @@ def run(
                     f"model adapter {type(model_adapter).__name__} exposes open() without a "
                     "callable close(); nothing would release what open() allocates"
                 )
-            opener()
-            adapter_scope.callback(closer)
+            # Reported the way every other startup failure is. These two calls sit below the
+            # `except Exception` that normalizes the setup above, so an adapter whose pool
+            # construction or teardown raised ended the command in a bare traceback.
+            try:
+                opener()
+            except Exception as exc:
+                raise click.ClickException(f"model adapter open() failed: {exc}") from exc
+            adapter_scope.callback(_close_adapter, closer)
         result = AgentLoop(
             spec=spec,
             subagent_definitions=subagent_definitions,
@@ -375,9 +381,12 @@ def run(
                 else None
             ),
         ).run_once(instruction)
-    _human_echo(f"status: {result.status}", stream_json=stream_json)
-    if result.final_text:
-        _human_echo(f"summary: {result.final_text}", stream_json=stream_json)
+        # Inside the scope, so the outcome is reported before the adapter is released. An exception
+        # from a cleanup callback replaces whatever is leaving the block, so with these two lines
+        # outside it a teardown that raised swallowed the result of a run that had completed.
+        _human_echo(f"status: {result.status}", stream_json=stream_json)
+        if result.final_text:
+            _human_echo(f"summary: {result.final_text}", stream_json=stream_json)
     if result.error:
         raise click.ClickException(result.error)
 
@@ -1136,6 +1145,21 @@ def web_gateway_serve(
         click.echo("WebGateway stopped")
     finally:
         server.server_close()
+
+
+def _close_adapter(closer: Any) -> None:
+    """Release the adapter's scope, reporting a failure as a CLI error rather than a traceback.
+
+    Registered as the ``ExitStack`` callback rather than ``closer`` itself, so a teardown that raises
+    -- a connection pool failing to close is the ordinary way -- reads like every other failure this
+    command reports. The run's own outcome is echoed before the scope unwinds, so what is lost here is
+    only the cleanup, not the result.
+    """
+
+    try:
+        closer()
+    except Exception as exc:
+        raise click.ClickException(f"model adapter close() failed: {exc}") from exc
 
 
 def _human_echo(message: str, *, stream_json: bool) -> None:
