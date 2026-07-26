@@ -54,20 +54,17 @@ def _release_foreign_async_client(client: Any, loop: asyncio.AbstractEventLoop |
     """
     if loop is None or loop.is_closed() or not loop.is_running():
         return
+    # The outcome is deliberately not read, and nothing needs to read it. This used to attach a
+    # callback that retrieved and dropped the exception, to avoid "exception never retrieved" noise
+    # -- but that is `asyncio.Future` behaviour, and `run_coroutine_threadsafe` hands back a
+    # `concurrent.futures.Future`, which has no `__del__` and so reports nothing when it is
+    # collected unread. The asyncio task behind it is chained to that future, which does retrieve
+    # its exception. Measured on a handoff whose `close()` raises: no warning, no unraisable and no
+    # loop exception-handler call, read or unread. And there is no caller who could act on the
+    # result of a close this function documents as best-effort.
     try:
-        future = asyncio.run_coroutine_threadsafe(client.close(), loop)
+        asyncio.run_coroutine_threadsafe(client.close(), loop)
     except RuntimeError:  # pragma: no cover - the loop stopped between the check and the handoff
-        return
-    # Nobody is left to await this, and an unread failure on a future surfaces later as
-    # "exception never retrieved" noise against whichever thread collects it. Read and drop it:
-    # the close was best-effort by construction and there is no caller who could act on it.
-    future.add_done_callback(_swallow_future_result)
-
-
-def _swallow_future_result(future: Any) -> None:
-    try:
-        future.exception()
-    except BaseException:  # noqa: BLE001 - a cancelled handoff is as uninteresting as a failed one
         return
 
 
