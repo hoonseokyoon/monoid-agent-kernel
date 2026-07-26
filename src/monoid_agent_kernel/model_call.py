@@ -31,6 +31,7 @@ from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from monoid_agent_kernel.core._sync_bridge import (
+    CalleeCancelled,
     await_abandonable_call,
     start_abandonable_sync_call,
 )
@@ -42,7 +43,12 @@ from monoid_agent_kernel.core.model_io import (
     dispatch_model_call,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
-from monoid_agent_kernel.errors import ModelCallAborted, RunCancelled, RunTimeout
+from monoid_agent_kernel.errors import (
+    ModelAdapterError,
+    ModelCallAborted,
+    RunCancelled,
+    RunTimeout,
+)
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelStreamChunk,
@@ -516,12 +522,27 @@ class ModelCallRunner:
         Only terminal run boundaries apply while a model call is in flight. Interrupt and pause are
         step-boundary signals for a one-shot call and are the caller's to check after the model
         returns; on a streamed call the caller's `should_abort` covers the cooperative stop.
+
+        An adapter that cancels its *own* call failed; the run did not stop. `await_abandonable_call`
+        raises `CalleeCancelled` rather than `CancelledError` exactly so its two callers can each say
+        what it means to them -- the tool path names it `tool_handler_cancelled` -- and this is the
+        model half of that. Reported as a `ModelAdapterError` so it reaches the loop's
+        `except ModelAdapterError`, which records a `model_turn` naming the failure, instead of the
+        generic handler that rewraps with `str(exc)`: `CalleeCancelled` carries no message, so a run
+        failed with an empty one. Every dispatch shape funnels through here, so one translation
+        covers all five.
         """
 
-        return await await_abandonable_call(
-            pending,
-            deadline=deadline,
-            token=self._token(),
-            grace_s=self.cancel_grace_s,
-            check_boundary=self._check_cancel_or_deadline,
-        )
+        try:
+            return await await_abandonable_call(
+                pending,
+                deadline=deadline,
+                token=self._token(),
+                grace_s=self.cancel_grace_s,
+                check_boundary=self._check_cancel_or_deadline,
+            )
+        except CalleeCancelled as exc:
+            raise ModelAdapterError(
+                "model adapter cancelled its own call",
+                error_code="model_adapter_cancelled",
+            ) from exc

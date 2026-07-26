@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from monoid_agent_kernel.core._sync_bridge import CalleeCancelled
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
@@ -370,6 +371,74 @@ def test_a_blocking_adapter_is_abandoned_rather_than_awaited() -> None:
     with pytest.raises(RunTimeout):
         asyncio.run(run())
     assert time.monotonic() - started < 2.0, "the run must not wait for the wedged worker"
+
+
+def test_an_adapter_that_cancels_itself_is_reported_as_an_adapter_failure() -> None:
+    """A callee's own cancellation is a failure of the call, not the run being stopped.
+
+    The shared race raises ``CalleeCancelled`` so each of its two callers can name it; the tool path
+    calls it ``tool_handler_cancelled``. Untranslated here it fell to the loop's generic handler,
+    which rewraps with ``str(exc)`` -- and ``CalleeCancelled`` carries no message, so the run failed
+    with an empty one. Checked on every dispatch shape because one funnel serves all of them.
+    """
+
+    class SelfCancellingAsync:
+        async def anext_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            raise asyncio.CancelledError
+
+    class SelfCancellingSync:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            raise asyncio.CancelledError
+
+    class SelfCancellingStream:
+        async def astream_turn(self, request: ModelRequest) -> Any:
+            del request
+            raise asyncio.CancelledError
+            yield  # pragma: no cover -- makes this an async generator
+
+    for label, adapter, kwargs in (
+        ("anext_turn", SelfCancellingAsync(), {}),
+        ("next_turn", SelfCancellingSync(), {}),
+        ("astream_turn", SelfCancellingStream(), {"delta_consumer": lambda chunk: None}),
+    ):
+        async def run(adapter: Any = adapter, kwargs: Any = kwargs) -> None:
+            await ModelCallRunner(adapter=adapter).acall(REQUEST, **kwargs)
+
+        with pytest.raises(ModelAdapterError) as caught:
+            asyncio.run(run())
+        assert str(caught.value), f"{label}: the failure must say something"
+        assert caught.value.error_code == "model_adapter_cancelled", label
+        assert isinstance(caught.value.__cause__, CalleeCancelled), (
+            f"{label}: the original cancellation must stay on the chain"
+        )
+
+
+def test_the_run_being_cancelled_is_not_reported_as_an_adapter_failure() -> None:
+    """The counterweight: only the *callee's* cancellation becomes an adapter error.
+
+    Without this, translating every cancellation would pass -- and would have turned a run the host
+    stopped into a provider's fault.
+    """
+    token = CancellationToken()
+
+    class SlowAdapter:
+        async def anext_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            token.cancel()
+            await asyncio.sleep(30)
+            return ModelTurn(final_text="never")  # pragma: no cover
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=SlowAdapter(),
+            current_cancellation_token=lambda: token,
+            cancel_grace_s=0.05,
+        ).acall(REQUEST)
+
+    with pytest.raises(RunCancelled):
+        asyncio.run(run())
 
 
 # --- receipts -----------------------------------------------------------------------------------
