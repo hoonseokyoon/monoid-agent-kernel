@@ -806,6 +806,48 @@ def test_openai_astream_closes_its_client_when_the_consumer_abandons_mid_stream(
     assert still_open == 0, f"{still_open} connection(s) still open server-side"
 
 
+def test_openai_astream_releases_its_client_before_the_terminal_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumer that stops at the last chunk stops *inside* a suspended generator.
+
+    `break` does not close an async generator, so a caller that reads the `TurnComplete` and stops
+    -- the ordinary shape, since that chunk is the end of the turn -- holds it parked at that yield
+    for as long as it keeps the reference. If the yield sat inside the region that owns the client,
+    the pool would stay open for exactly that long. The terminal chunk is built from the captured
+    response alone and needs nothing from the client, so it is yielded after the release.
+
+    The observation has to be made **on the live loop**. `asyncio.run` calls
+    `shutdown_asyncgens` on the way out, which closes every suspended generator and runs its
+    cleanup, so checking after the run reports "released" whichever side of the release the yield is
+    on. A real run's loop outlives the turn, which is what this reproduces.
+    """
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "AsyncOpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter, request = _standin_adapter(), _standin_request()
+
+        async def stop_at_the_end() -> tuple[Any, bool]:
+            stream = adapter.astream_turn(request)
+            last: Any = None
+            async for chunk in stream:
+                last = chunk
+                if isinstance(chunk, TurnComplete):
+                    break
+            # `stream` is still referenced and still parked at that yield.
+            return last, built[0].is_closed()
+
+        last, released_while_parked = asyncio.run(stop_at_the_end())
+        still_open = _wait_for_no_open_connections(server)
+
+    assert isinstance(last, TurnComplete), "the consumer must stop at the terminal chunk"
+    assert released_while_parked, (
+        "the pool was still open while the consumer held the generator parked at the terminal "
+        "chunk: the yield is inside the region that owns the client"
+    )
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
 def test_openai_astream_closes_its_client_when_the_provider_rejects_the_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

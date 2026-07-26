@@ -2154,30 +2154,36 @@ def test_a_stream_the_run_gave_up_on_stops_reaching_its_consumer() -> None:
     call to confuse it with -- so the whole defect lives in the overlap.
 
     Measured before the guard: 19 of 25 chunks arrived after `acall` returned, 5 runs out of 5.
+
+    Which side of the boundary a delivery fell on is decided by a flag flipped when `acall` returns,
+    not by comparing timestamps to it. This test used to stamp `time.monotonic()` on each delivery
+    and keep those `> ended`, and that filter cannot see a *single* late chunk: Windows'
+    `time.monotonic()` advances in 15.625ms steps, so the leaked chunk carried exactly `ended` and a
+    strict `>` dropped it. The version of the guard that delivers one chunk too many passed this test
+    5/5 while its sibling caught it.
     """
 
-    delivered: list[tuple[float, str]] = []
+    during: list[str] = []
+    after: list[str] = []
+    call_over = {"yes": False}
 
-    async def run() -> float:
+    def consume(chunk: Any) -> None:
+        (after if call_over["yes"] else during).append(chunk.text)
+
+    async def run() -> None:
         runner = ModelCallRunner(
             adapter=_CancellationSurvivingStreamAdapter("gone"), cancel_grace_s=0.02
         )
         with pytest.raises(RunTimeout):
-            await runner.acall(
-                REQUEST,
-                deadline=time.time() + 0.10,
-                delta_consumer=lambda chunk: delivered.append((time.monotonic(), chunk.text)),
-            )
-        ended = time.monotonic()
+            await runner.acall(REQUEST, deadline=time.time() + 0.10, delta_consumer=consume)
+        call_over["yes"] = True
         await asyncio.sleep(0.4)  # long enough for many more chunks to be produced
-        return ended
 
-    ended = asyncio.run(run())
+    asyncio.run(run())
 
-    assert delivered, "this test is meaningless unless the stream reached the consumer at all"
-    late = [text for at, text in delivered if at > ended]
-    assert not late, (
-        f"{len(late)} chunk(s) reached the consumer after the call raised: {late[:5]}; an "
+    assert during, "this test is meaningless unless the stream reached the consumer at all"
+    assert not after, (
+        f"{len(after)} chunk(s) reached the consumer after the call raised: {after[:5]}; an "
         "abandoned stream is still driving a consumer that belongs to a finished call"
     )
 
