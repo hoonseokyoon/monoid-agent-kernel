@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -97,6 +99,11 @@ class ModelTurn:
     reasoning: tuple[dict[str, Any], ...] = ()
     # Why the turn ended (promoted from ``raw``). ``None`` when the adapter does not report one.
     stop_reason: StopReason | None = None
+    # Whether the adapter retried internally before producing this turn. The kernel counts one
+    # adapter call per turn no matter how many attempts happened inside it, so without this an
+    # audit record shows a call that failed twice and succeeded on the third try as a clean single
+    # attempt. Adapters with no retry loop leave it False, which is exactly true of them.
+    provider_retried: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,11 +190,13 @@ class AsyncModelAdapter(Protocol):
 # exist so the attribute names and meanings are part of the checked contract rather than a
 # convention, and so typed callers can narrow to "an adapter that reports this".
 #
-# Each member is declared as a read-only property, not an annotated attribute. That is what
-# makes the shipped adapters — which use ``ClassVar`` — satisfy these protocols: a protocol
-# member annotated ``name: str`` demands an *instance* variable and rejects a ``ClassVar``,
-# while a read-only property is satisfied by a ``ClassVar``, an instance attribute, and a
-# property alike.
+# Each member that is a *value* is declared as a read-only property, not an annotated attribute.
+# That is what makes the shipped adapters — which use ``ClassVar`` — satisfy these protocols: a
+# protocol member annotated ``name: str`` demands an *instance* variable and rejects a
+# ``ClassVar``, while a read-only property is satisfied by a ``ClassVar``, an instance attribute,
+# and a property alike. A member that answers a *question* is a method instead, because it takes
+# an argument a property cannot carry — ``AddressedModelAdapter.resolve_destination`` is the one
+# such member today.
 
 
 class MultimodalModelAdapter(Protocol):
@@ -223,6 +232,39 @@ class ProviderNamedModelAdapter(Protocol):
     def provider_name(self) -> str: ...
 
 
+class ConfiguredModelAdapter(Protocol):
+    """An adapter that carries its own fallback :class:`ModelConfig`.
+
+    ``ModelRequest.model`` is optional, and the shipped adapters fall back to ``self.config`` when
+    it is absent — so the config the provider actually ran under is not always visible in the
+    request. A caller recording what a call *was* reads ``config`` via
+    ``getattr(adapter, "config", None)`` to resolve it; omitting it means "the request carries the
+    whole story", which is correct for an adapter with no configuration of its own.
+
+    Declared for the same reason as :class:`ProviderNamedModelAdapter`: the attribute was already
+    being read, and a probed attribute that no protocol names is a contract nobody can check.
+    """
+
+    @property
+    def config(self) -> ModelConfig: ...
+
+
+class AddressedModelAdapter(Protocol):
+    """An adapter that can say where a call will actually be sent.
+
+    An adapter may route by more than its :class:`ModelConfig` -- a per-instance override, an
+    environment variable, a tenant-specific host -- so the config alone does not identify the
+    service that answered. A caller recording a call's identity asks for the resolved destination
+    and folds it into that identity; omitting the member means "the config is the whole story",
+    which is correct for an adapter that routes on config alone.
+
+    The value is hashed, never recorded, so an internal hostname stays internal. Raising is
+    permitted and treated as "unknown".
+    """
+
+    def resolve_destination(self, config: ModelConfig) -> str: ...
+
+
 class StreamingModelAdapter(Protocol):
     """Optional token-streaming extension for a sync or async model adapter."""
 
@@ -238,14 +280,29 @@ class StreamingModelAdapter(Protocol):
 # P4a exercises these via ``FakeStreamingModelAdapter``.
 
 
+# Every chunk type carries ``provider_retried``, not only ``TurnComplete``, because the terminal
+# chunk is not guaranteed to arrive. Stream retries are pre-commit, so an adapter knows it retried
+# the moment the stream commits -- but a run cancelled or aborted mid-stream ends without a terminal
+# chunk, and evidence that rides only that one is evidence a cancelled call can never report. The
+# failure receipt then denied a retry that demonstrably happened.
+#
+# The flag says the *stream* was retried, not that this particular fragment was; a fragment is
+# simply the earliest place the fact can be put where a consumer will see it.
+
+
 @dataclass(frozen=True)
 class TextDelta:
     """A fragment of assistant output text."""
 
     text: str
+    provider_retried: bool = False
 
     def to_json(self) -> dict[str, Any]:
-        return {"type": "text_delta", "text": self.text}
+        return {
+            "type": "text_delta",
+            "text": self.text,
+            "provider_retried": self.provider_retried,
+        }
 
 
 @dataclass(frozen=True)
@@ -256,9 +313,14 @@ class ReasoningDelta:
     reasoning artifacts ride :attr:`TurnComplete.reasoning`, not these deltas)."""
 
     text: str
+    provider_retried: bool = False
 
     def to_json(self) -> dict[str, Any]:
-        return {"type": "reasoning_delta", "text": self.text}
+        return {
+            "type": "reasoning_delta",
+            "text": self.text,
+            "provider_retried": self.provider_retried,
+        }
 
 
 @dataclass(frozen=True)
@@ -271,6 +333,7 @@ class ToolCallDelta:
     arguments_fragment: str = ""
     id: str | None = None
     name: str | None = None
+    provider_retried: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -279,6 +342,7 @@ class ToolCallDelta:
             "arguments_fragment": self.arguments_fragment,
             "id": self.id,
             "name": self.name,
+            "provider_retried": self.provider_retried,
         }
 
 
@@ -293,6 +357,10 @@ class TurnComplete:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning: tuple[dict[str, Any], ...] = ()
     stop_reason: StopReason | None = None
+    # Mirrors :attr:`ModelTurn.provider_retried`. On the streaming path the turn is assembled by the
+    # caller out of chunks, so an adapter that retried before committing its stream has no other
+    # place to say so.
+    provider_retried: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -301,10 +369,79 @@ class TurnComplete:
             "usage": dict(self.usage),
             "reasoning": [dict(item) for item in self.reasoning],
             "stop_reason": self.stop_reason,
+            "provider_retried": self.provider_retried,
         }
 
 
 ModelStreamChunk = TextDelta | ReasoningDelta | ToolCallDelta | TurnComplete
+
+
+def mark_provider_retried(error: BaseException) -> None:
+    """Record on an escaping error that the adapter's retry loop had already run.
+
+    Read back by ``ModelCallReceipt.with_error`` through ``getattr``, so an exception that refuses
+    the attribute (``__slots__``) simply reports no retry rather than replacing the failure being
+    reported with an AttributeError.
+
+    Shared rather than written once per caller: the adapter stamps a failure it raises itself, and
+    the runner stamps one raised *around* a stream it had already seen retry. Two copies of a rule
+    about which exceptions accept an attribute is two copies that can disagree.
+    """
+
+    try:
+        error.provider_retried = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+@dataclass
+class RetryProgress:
+    """What an adapter has managed to report about a call that may never return one.
+
+    Every other carrier of `provider_retried` belongs to an *outcome* -- a turn, a chunk, an
+    exception the adapter raised. A call the run abandons produces none of them: a blocking
+    `next_turn` keeps running on a thread nobody reads, and the failure the receipt is built from
+    is the `RunCancelled`/`RunTimeout` the race raised, which the adapter never touched. A run that
+    timed out *because* the provider was retrying is the case most likely to matter, and it was the
+    one case that recorded a clean single attempt.
+
+    Mutated rather than replaced, because that is what crosses a thread: the worker runs under a
+    copy of the caller's context, so `ContextVar.set` there is invisible here, while a write to the
+    object both sides already hold is not.
+    """
+
+    retried: bool = False
+
+
+_RETRY_PROGRESS: ContextVar[RetryProgress | None] = ContextVar(
+    "monoid_agent_kernel_retry_progress", default=None
+)
+
+
+def report_provider_retried() -> None:
+    """Called by an adapter when its own retry loop is about to make another attempt.
+
+    Optional and inert by default: an adapter that never calls it is reported as never retrying,
+    which is exactly true of one with no retry loop, and a call made outside a runner does nothing.
+    Report on the *decision* to retry, not on the next attempt's success -- an attempt that never
+    completes is precisely the one whose evidence is otherwise lost.
+    """
+
+    progress = _RETRY_PROGRESS.get()
+    if progress is not None:
+        progress.retried = True
+
+
+@contextmanager
+def collect_retry_reports() -> Iterator[RetryProgress]:
+    """Install a channel for `report_provider_retried` for the duration of one call."""
+
+    progress = RetryProgress()
+    token = _RETRY_PROGRESS.set(progress)
+    try:
+        yield progress
+    finally:
+        _RETRY_PROGRESS.reset(token)
 
 
 def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
@@ -319,7 +456,12 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     usage: dict[str, int] = {}
     reasoning: tuple[dict[str, Any], ...] = ()
     stop_reason: StopReason | None = None
+    provider_retried = False
     for chunk in chunks:
+        # Read off every chunk, not just the terminal one: a retried stream says so from its first
+        # fragment onward so the fact survives a call that never reaches ``TurnComplete``.
+        if getattr(chunk, "provider_retried", False):
+            provider_retried = True
         if isinstance(chunk, TextDelta):
             text_parts.append(chunk.text)
         elif isinstance(chunk, ToolCallDelta):
@@ -370,4 +512,5 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         usage=normalize_usage(usage) if usage else {},
         reasoning=reasoning,
         stop_reason=stop_reason,
+        provider_retried=provider_retried,
     )

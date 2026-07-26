@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from dataclasses import replace
@@ -319,38 +320,78 @@ def run(
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
-    result = AgentLoop(
-        spec=spec,
-        subagent_definitions=subagent_definitions,
-        model_adapter=_model_adapter(
-            runtime_config.model or ModelConfig(),
-            llm_gateway_url=llm_gateway_url or (runtime_config.model.gateway_url if runtime_config.model else None),
-            llm_gateway_token_env=llm_gateway_token_env,
-            llm_gateway_token_file=llm_gateway_token_file,
-            allow_direct_provider_api=allow_direct_provider_api,
-        ),
-        tool_providers=providers + ((skill_provider,) if skill_provider is not None else ()),
-        context_providers=(skill_provider,) if skill_provider is not None else (),
-        capability_broker=broker,
-        event_sinks=tuple(extra_sinks),
-        status_file=not no_status_file,
-        permission_policy=spec.permission_policy,
-        runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),
-        web_gateway_client=(
-            WebGatewayClient(
-                web_gateway_url,
-                token_env=web_gateway_token_env,
-                token_file=web_gateway_token_file,
-            )
-            if _runtime_config_uses_web(runtime_config) and web_gateway_url
-            else None
-        ),
-    ).run_once(instruction)
-    _human_echo(f"status: {result.status}", stream_json=stream_json)
-    if result.final_text:
-        _human_echo(f"summary: {result.final_text}", stream_json=stream_json)
-    if result.error:
-        raise click.ClickException(result.error)
+    model_adapter = _model_adapter(
+        runtime_config.model or ModelConfig(),
+        llm_gateway_url=llm_gateway_url or (runtime_config.model.gateway_url if runtime_config.model else None),
+        llm_gateway_token_env=llm_gateway_token_env,
+        llm_gateway_token_file=llm_gateway_token_file,
+        allow_direct_provider_api=allow_direct_provider_api,
+    )
+    # One adapter serves every turn of this run, so an adapter that can hold its provider client
+    # open across turns should: the direct-OpenAI one builds a client per call otherwise, which
+    # costs far more than the request it carries. Duck-typed because only some adapters have a
+    # client to hold -- the gateway adapter owns its httpx client per call by design.
+    #
+    # Driven through the pair that is probed. ``enter_context`` needed ``__enter__``/``__exit__``
+    # instead, so the ``open``/``close`` adapter this probe invites -- the lifecycle pair the rest
+    # of the kernel uses, on ``AgentLoop`` and ``LoopSession`` -- raised ``TypeError`` before the
+    # first turn, outside the handler above, killing the run with a bare traceback.
+    #
+    # Both halves are resolved *before* either is called. Registering the bound ``close`` after
+    # ``open()`` looked like it failed early enough, and did not: ``open()`` had already allocated
+    # whatever it allocates -- a connection pool, for the adapter this exists for -- and the
+    # ``AttributeError`` from resolving the missing ``close`` then escaped past the handler above
+    # with nothing left able to release it. An adapter that offers one half of the pair is
+    # misconfigured, so it is reported as such, before it holds anything.
+    with contextlib.ExitStack() as adapter_scope:
+        opener = getattr(model_adapter, "open", None)
+        if callable(opener):
+            closer = getattr(model_adapter, "close", None)
+            if not callable(closer):
+                raise click.ClickException(
+                    f"model adapter {type(model_adapter).__name__} exposes open() without a "
+                    "callable close(); nothing would release what open() allocates"
+                )
+            # Reported the way every other startup failure is. These two calls sit below the
+            # `except Exception` that normalizes the setup above, so an adapter whose pool
+            # construction or teardown raised ended the command in a bare traceback.
+            try:
+                opener()
+            except Exception as exc:
+                raise click.ClickException(f"model adapter open() failed: {exc}") from exc
+            adapter_scope.push(_adapter_teardown(closer))
+        result = AgentLoop(
+            spec=spec,
+            subagent_definitions=subagent_definitions,
+            model_adapter=model_adapter,
+            tool_providers=providers + ((skill_provider,) if skill_provider is not None else ()),
+            context_providers=(skill_provider,) if skill_provider is not None else (),
+            capability_broker=broker,
+            event_sinks=tuple(extra_sinks),
+            status_file=not no_status_file,
+            permission_policy=spec.permission_policy,
+            runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),
+            web_gateway_client=(
+                WebGatewayClient(
+                    web_gateway_url,
+                    token_env=web_gateway_token_env,
+                    token_file=web_gateway_token_file,
+                )
+                if _runtime_config_uses_web(runtime_config) and web_gateway_url
+                else None
+            ),
+        ).run_once(instruction)
+        # All inside the scope, because an exception from a cleanup callback replaces whatever is
+        # leaving the block. With the echoes outside, a teardown that raised swallowed the result of a
+        # run that had completed. With the failure raised outside, it was never reached at all: the
+        # teardown error left the block first and `result.error` -- the provider failure an operator
+        # needs -- was simply never reported. Raised in here, it is the exception already on its way
+        # out, and the teardown demotes itself to a warning beside it.
+        _human_echo(f"status: {result.status}", stream_json=stream_json)
+        if result.final_text:
+            _human_echo(f"summary: {result.final_text}", stream_json=stream_json)
+        if result.error:
+            raise click.ClickException(result.error)
 
 
 @main.command()
@@ -1107,6 +1148,35 @@ def web_gateway_serve(
         click.echo("WebGateway stopped")
     finally:
         server.server_close()
+
+
+def _adapter_teardown(closer: Any) -> Any:
+    """Release the adapter, reporting a teardown failure without ever replacing a real one.
+
+    Registered with ``ExitStack.push`` rather than ``callback`` so it can see whether an exception is
+    already leaving the block. Raising from a cleanup callback *replaces* that exception: a failing
+    ``close()`` superseded the run's own failure, and the provider error an operator actually needs
+    disappeared behind "close() failed". Measured -- a run failed by a dead provider, reported only as
+    a teardown error.
+
+    With nothing else on its way out, the failure is still the command's error, because then it is the
+    only signal there is. Alongside a real failure it is a footnote, on stderr so it neither
+    supersedes the error nor lands in ``--stream-json`` output.
+    """
+
+    def _exit(exc_type: Any, exc: Any, tb: Any) -> bool:
+        del exc, tb
+        try:
+            closer()
+        except Exception as close_exc:
+            message = f"model adapter close() failed: {close_exc}"
+            if exc_type is not None:
+                click.echo(f"warning: {message}", err=True)
+                return False
+            raise click.ClickException(message) from close_exc
+        return False
+
+    return _exit
 
 
 def _human_echo(message: str, *, stream_json: bool) -> None:

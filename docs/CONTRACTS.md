@@ -265,7 +265,7 @@ one-shot contract for token streaming. `AgentLoop.astream` prefers the streaming
 its chunks into the same `ModelTurn`, event, error, and checkpoint path. Autonomous runs use the
 stream when `emit_output_deltas=True`.
 
-Two further opt-in protocols declare optional capability attributes:
+Four further opt-in protocols declare optional capability members:
 
 - `MultimodalModelAdapter.supports_multimodal: bool` — the loop resolves by-reference media in the
   by-value `messages` log to wire blocks before the call. A multimodal adapter may also expose
@@ -274,13 +274,35 @@ Two further opt-in protocols declare optional capability attributes:
 - `ProviderNamedModelAdapter.provider_name: str` — tags captured `ModelTurn.reasoning` with
   provider+model so opaque reasoning items only round-trip back to a matching adapter and model.
   Omitting it means "do not tag".
+- `ConfiguredModelAdapter.config: ModelConfig` — the adapter's own fallback, used when
+  `ModelRequest.model` is absent. A `ModelCallReceipt` reads it so it records the model the call
+  actually ran under rather than a default the call never used.
+- `AddressedModelAdapter.resolve_destination(config) -> str` — where a call under `config` would
+  actually be sent. Two adapters holding identical configs can address different hosts, so the
+  destination is folded into the receipt's replay key; it is hashed and never recorded, so an
+  internal hostname stays internal. Raising is permitted and read as "unknown".
 
 Implementing them is never required. The loop probes each attribute with `getattr` and a neutral
 default, and behaves identically whether an adapter declares it or omits it, so the attributes are
 deliberately **not** members of `ModelAdapter` / `AsyncModelAdapter`: a protocol member is required
 for structural typing even when the protocol body assigns it a default, which would reject an
-adapter that implements only `next_turn`. Each member is declared as a read-only property so a
-`ClassVar`, an instance attribute, and a property all satisfy it.
+adapter that implements only `next_turn`. Each member that is a *value* is declared as a read-only
+property so a `ClassVar`, an instance attribute, and a property all satisfy it;
+`resolve_destination` is a method because it answers for a given `ModelConfig`.
+
+An adapter with its own retry loop should call `report_provider_retried()` when it decides to make
+another attempt. The kernel counts one adapter call per turn however many attempts happen inside it,
+so without this a call that failed twice and succeeded on the third try is recorded as a clean
+single attempt. Report on the *decision*, before waiting or reconnecting: a call the run cancels or
+times out mid-retry never returns an outcome to carry the fact, and for a blocking `next_turn` the
+worker's eventual result is discarded entirely. Calling it is optional and inert outside a run.
+
+`ModelCallReceipt.attempts` may be **0**. A run whose cancellation or deadline was already past when
+the call was requested is refused before the adapter is reached, and a receipt is still written
+because a refused call belongs in the audit trail — so a consumer summing `attempts` must treat 0 as
+"no adapter call was made" rather than as a missing value. A failure *while* reaching into the
+adapter still counts as 1: the kernel did begin the call there. A payload that omits the field reads
+as 1, which is what older records mean.
 
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
@@ -299,8 +321,10 @@ I/O timeout and idempotency policy, because the kernel can stop waiting for a ca
 Abandonment is not free, and this is a known limitation rather than a settled guarantee: nothing can
 reclaim the thread of a call that never returns, and the run no longer blocks to throttle the next
 attempt, so an implementation that wedges *permanently* accumulates one thread per abandoned call
-across runs. Each abandonment is logged as a warning on the `monoid_agent_kernel.loop` logger so the
-growth is visible; there is currently no cap on outstanding abandoned calls.
+across runs. Each abandonment is logged as a warning on the `monoid_agent_kernel.core.sync_bridge`
+logger — both the synchronous and the asynchronous half — so the growth is visible; there is
+currently no cap on outstanding abandoned calls. A streamed call whose `aclose()` outruns the same
+grace is abandoned too, and warns on `monoid_agent_kernel.model_call`.
 
 Nor is there a bound on *healthy* concurrent sync calls. A dedicated daemon thread per call is what
 makes abandonment possible, but it gives up the thread-pool bound a shared executor provided: within

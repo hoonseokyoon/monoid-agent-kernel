@@ -287,12 +287,12 @@ def test_abandoning_a_sync_next_turn_warns(
         await asyncio.sleep(0)  # let the future's done callback run
         return result
 
-    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.loop"):
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.core.sync_bridge"):
         result = asyncio.run(run())
 
     assert result.error_code == "run_timeout"
     assert workers[0].is_alive() is True
-    warnings = [r.getMessage() for r in caplog.records if r.name == "monoid_agent_kernel.loop"]
+    warnings = [r.getMessage() for r in caplog.records if r.name == "monoid_agent_kernel.core.sync_bridge"]
     assert len(warnings) == 1
     assert "abandoned a synchronous call" in warnings[0]
 
@@ -309,7 +309,7 @@ def test_completed_sync_next_turn_does_not_warn(
             del request
             return ModelTurn(response_id="r1", final_text="ok")
 
-    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.loop"):
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.core.sync_bridge"):
         result = asyncio.run(
             AgentLoop(
                 spec=_spec(tmp_path),
@@ -319,7 +319,7 @@ def test_completed_sync_next_turn_does_not_warn(
         )
 
     assert result.status == "completed"
-    assert [r for r in caplog.records if r.name == "monoid_agent_kernel.loop"] == []
+    assert [r for r in caplog.records if r.name == "monoid_agent_kernel.core.sync_bridge"] == []
 
 
 def test_never_returning_sync_next_turn_observes_run_cancellation(tmp_path: Path) -> None:
@@ -669,3 +669,69 @@ def test_astream_parks_on_external_task(tmp_path: Path) -> None:
     assert suspension.has_external is True
     assert len(suspension.awaiting_task_ids) == 1
     assert "run.awaiting_input" in _event_types(items)
+
+
+class _MarkedAdapter:
+    """Names itself in its answer, so the receipt and the response can be checked against each
+    other rather than only against a literal."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+        self.provider_name = tag
+        self.requests = 0
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        self.requests += 1
+        return ModelTurn(final_text=f"FROM-{self.tag}")
+
+
+def test_a_model_adapter_swapped_after_open_answers_the_next_turn(tmp_path: Path) -> None:
+    """`model_adapter` is a public mutable field, and the loop reads it live *everywhere else*.
+
+    Extracting the call into `ModelCallRunner` captured it once at bootstrap. That is not merely
+    stale: `supports_multimodal` and `wire_image_encoding` shape the request from the live field, and
+    the `provider_name` recorded on the assistant message comes from it too -- so a swapped adapter
+    got a request shaped for it, and an answer attributed to it, that a different adapter produced.
+    """
+
+    first, second = _MarkedAdapter("FIRST"), _MarkedAdapter("SECOND")
+
+    async def run() -> object:
+        loop = _loop(tmp_path, first)
+        await loop.aopen()
+        loop.model_adapter = second
+        try:
+            return await loop.asubmit("go")
+        finally:
+            await loop.aclose()
+
+    result = asyncio.run(run())
+    assert getattr(result, "final_text", None) == "FROM-SECOND"
+    assert (first.requests, second.requests) == (0, 1)
+
+
+def test_the_two_halves_of_the_cancel_grace_knob_agree(tmp_path: Path) -> None:
+    """`async_model_cancel_grace_s` and its tool-side twin are both public mutable fields.
+
+    The tool half is read at every use; the model half was captured at bootstrap, so raising the
+    grace after `open()` abandoned a model worker on the old value -- ~150x early in the case that
+    found it -- while an identically-timed tool call honoured the new one. A knob whose two halves
+    disagree is worse than one that is simply wrong.
+    """
+
+    async def observed_grace(where: str, mutate_to: float | None) -> float:
+        loop = _loop(tmp_path / where, FakeModelAdapter(), "fs.write")
+        loop.async_model_cancel_grace_s = 0.02
+        await loop.aopen()
+        if mutate_to is not None:
+            loop.async_model_cancel_grace_s = mutate_to
+        try:
+            return loop._bootstrap_resources.model_runner._grace_s()
+        finally:
+            await loop.aclose()
+
+    assert asyncio.run(observed_grace("unchanged", None)) == pytest.approx(0.02)
+    assert asyncio.run(observed_grace("raised", 3.0)) == pytest.approx(3.0), (
+        "the model half of the grace must follow the field the tool half already follows"
+    )

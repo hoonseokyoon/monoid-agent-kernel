@@ -8,6 +8,7 @@ import threading
 import time
 from contextvars import ContextVar
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,7 +20,8 @@ from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityLease
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import RunCancelled, ToolExecutionError
-from monoid_agent_kernel.loop import AgentLoop, _start_abandonable_sync_call
+from monoid_agent_kernel.core._sync_bridge import start_abandonable_sync_call
+from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference.capability import HumanEscalationBroker
@@ -110,6 +112,65 @@ def test_async_and_sync_tool_handlers_use_native_and_worker_paths_sequentially(
     assert lifecycle == ["tool.call.started", "tool.call.finished"] * 3
 
 
+def test_a_sync_tool_handler_may_hand_back_an_awaitable(tmp_path: Path) -> None:
+    """The second defence on the tool half, and the twin of the model half's.
+
+    A handler can be an ordinary function and still return something awaitable -- it delegates to an
+    async client, or it is a callable object no predicate over functions recognises. The dispatch
+    awaits what comes back rather than treating it as the result. Unbound until now: dropping the
+    fallback passed the whole tool suite, because the shape it breaks is one nothing exercised.
+
+    Its failure mode differs from the model half's, which is why this is worth its own test rather
+    than an argument from the shared predicate: here `isinstance(result, ToolResult)` rejects the
+    coroutine loudly, where the model dispatch had no such check and recorded a clean success for a
+    provider it never called.
+    """
+    ran: list[str] = []
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> Any:
+                del ctx, args
+
+                async def finish() -> ToolResult:
+                    ran.append("awaited")
+                    return ToolResult(ok=True, content={"done": True})
+
+                return finish()
+
+            return [
+                ToolSpec(
+                    id="sync.awaitable",
+                    description="a sync handler that returns an awaitable",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="read",
+                    handler=handler,
+                )
+            ]
+
+    result = asyncio.run(
+        AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=FakeModelAdapter(
+                turns=[
+                    ModelTurn(tool_calls=(fake_tool_call("sync_awaitable", {}, "c1"),)),
+                    ModelTurn(final_text="done"),
+                ]
+            ),
+            runtime_config_provider=runtime_provider(
+                runtime_config(bindings=(tool_binding("sync.awaitable"),))
+            ),
+            tool_providers=(Provider(),),
+        ).arun_once("go")
+    )
+
+    assert result.status == "completed"
+    assert ran == ["awaited"], "the awaitable was taken as the result instead of being awaited"
+
+
 def test_async_tool_controlled_error_becomes_ordered_failed_observation(tmp_path: Path) -> None:
     @tool(id="async.fail")
     async def fail() -> dict:
@@ -151,6 +212,45 @@ def test_tool_local_cancelled_error_becomes_failed_observation(tmp_path: Path) -
     assert error["code"] == "tool_handler_cancelled"
     assert error["retryable"] is True
     assert "tool.call.failed" in _event_types(result.run_dir)
+
+
+def test_host_cancelling_the_run_task_is_not_reported_as_a_tool_failure(tmp_path: Path) -> None:
+    """The other kind of ``CancelledError``: the host cancelling the task that drives the run.
+
+    ``tool_handler_cancelled`` belongs to a handler that cancelled *itself* -- the test above.
+    Cancellation delivered to the awaiting task means the host stopped the run, and catching it
+    alongside the handler's own turned it into one failed tool observation with the run carrying on
+    to the next model call: work the host had already stopped.
+    """
+
+    @tool(id="async.block")
+    async def block() -> dict:
+        started.set()
+        await asyncio.sleep(30)
+        return {"late": True}
+
+    started = asyncio.Event()
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("async_block", {}, "c1"),)),
+            ModelTurn(final_text="a step the run must never take"),
+        ]
+    )
+
+    async def run() -> None:
+        pending = asyncio.create_task(
+            AgentLoop.from_tools(_spec(tmp_path), adapter, [block]).arun_once("go")
+        )
+        await asyncio.wait_for(started.wait(), timeout=10)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    asyncio.run(run())
+
+    # The second turn is on the adapter and was never asked for: the run stopped where it was
+    # cancelled rather than resuming past a tool call it recorded as failed.
+    assert len(adapter.requests) == 1
 
 
 def test_unexpected_async_tool_error_fails_run_and_clears_call_context(tmp_path: Path) -> None:
@@ -337,7 +437,7 @@ def test_sync_tool_finishing_within_the_grace_is_not_abandoned(
     adapter = FakeModelAdapter(
         turns=[ModelTurn(tool_calls=(fake_tool_call("sync_almost_done", {}, "c1"),))]
     )
-    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.loop"):
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.core.sync_bridge"):
         result = asyncio.run(
             AgentLoop.from_tools(
                 _spec(tmp_path, limits=RunLimits(max_duration_s=1)),
@@ -376,7 +476,7 @@ def test_late_task_from_abandoned_sync_tool_is_cancelled() -> None:
             release.wait(timeout=5)
             return task
 
-        pending = _start_abandonable_sync_call(call, thread_name="nar-test-late-task")
+        pending = start_abandonable_sync_call(call, thread_name="nar-test-late-task")
         pending.result.cancel()  # the run gave up on the call
         release.set()  # ... and only now does the handler return its task
         await asyncio.wait({pending.settled}, timeout=5)
@@ -748,7 +848,7 @@ def test_late_failed_future_from_abandoned_sync_call_is_consumed_after_loop_shut
             release.wait(timeout=5)
             return failed
 
-        _start_abandonable_sync_call(call, thread_name="nar-test-late-failed").result.cancel()
+        start_abandonable_sync_call(call, thread_name="nar-test-late-failed").result.cancel()
 
     asyncio.run(scenario())  # the loop is closed once this returns
     release.set()  # ... and only now does the call return its future

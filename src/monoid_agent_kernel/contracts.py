@@ -111,6 +111,10 @@ from monoid_agent_kernel.core.model_io import (
     Redactor,
 )
 
+# Model call execution (adapter dispatch + cancel/deadline race + capture). Above ``core`` because
+# it names the provider vocabulary it drives; see the module docstring.
+from monoid_agent_kernel.model_call import ModelCallRunner
+
 # Output validation (post-response conformance; checked at the settle points)
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
@@ -155,7 +159,11 @@ from monoid_agent_kernel.core.content import (
 
 # Model adapter contract
 from monoid_agent_kernel.providers.base import (
+    AddressedModelAdapter,
     AsyncModelAdapter,
+    ConfiguredModelAdapter,
+    mark_provider_retried,
+    report_provider_retried,
     ModelAdapter,
     ModelRequest,
     ModelStreamChunk,
@@ -322,6 +330,7 @@ __all__ = [
     "ModelIOObserver",
     "ClosableModelIOObserver",
     "ModelIOSubscription",
+    "ModelCallRunner",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",
@@ -348,6 +357,13 @@ __all__ = [
     "StreamingModelAdapter",
     "MultimodalModelAdapter",
     "ProviderNamedModelAdapter",
+    "ConfiguredModelAdapter",
+    "AddressedModelAdapter",
+    # Adapter-facing seams. An adapter with its own retry loop reports through these; nothing else
+    # can observe a retry that happened inside one adapter call, and a call the run abandons never
+    # returns an outcome to carry it.
+    "report_provider_retried",
+    "mark_provider_retried",
     "ModelRequest",
     "ModelTurn",
     "ToolCall",

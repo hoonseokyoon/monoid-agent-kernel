@@ -9,15 +9,175 @@ out in commit messages and here.
 
 ### Added
 
-- Added `MultimodalModelAdapter` and `ProviderNamedModelAdapter`, opt-in protocols that declare the
-  optional capability attributes the loop probes with `getattr` (`supports_multimodal` and
-  `provider_name`). Implementing them is never required; they exist so the attribute names and
-  meanings are part of the checked contract and typed callers can narrow to "an adapter that reports
-  this". Each member is a read-only property, so a `ClassVar`, an instance attribute, and a property
-  all satisfy it.
+- Added `ModelCallRunner`, which executes one model call against any adapter shape — a blocking
+  `next_turn`, a coroutine `next_turn`, `anext_turn`, or a streamed `astream_turn` — through a single
+  cancel/deadline race, and returns the turn with a `ModelCallReceipt` describing it. Which shape is
+  used is a function of the call's own arguments, so the runner is usable outside a run: a gateway or
+  a batch driver gets deadline and cancellation semantics that previously existed only inside
+  `AgentLoop`. Delivery of content to observers is opt-in through `subscriptions`, but the receipt's
+  digests are computed on every call, because they identify the call whether or not anyone is
+  watching. A digest is empty when canonical JSON cannot carry the payload, or when the encoded
+  output passes its size cap: it is documented as an
+  exact replay key, and one taken over a truncated payload would match two requests that differ only
+  past the cut, so no key is issued rather than a misleading one. Read an empty digest as *no key*,
+  never as a key. It lives at the package root rather than under `core/` because it names the
+  provider vocabulary it drives, and `core` does not import `providers`.
+- Added `provider_retried` to `ModelTurn`, `TurnComplete`, and every streamed chunk (`TextDelta`,
+  `ReasoningDelta`, `ToolCallDelta`), how an adapter reports that it retried internally before
+  producing a turn. The kernel counts one adapter call per turn however many attempts happen inside
+  it, so without this an audit receipt records a call that failed twice and succeeded on the third
+  try as a clean single attempt. It is on every chunk rather than only the terminal one because a
+  stream that is cancelled mid-flight never reaches its terminal chunk, and that is exactly when the
+  evidence matters; `GatewayModelAdapter` marks the retry when it *decides* to retry — before the
+  backoff wait and before reconnecting — because the retry is already certain there — `_should_retry` said
+  yes at the end of the previous attempt — and every later point can be missed. Adapters with no retry loop leave it `False`, which is exactly true
+  of them.
+- `AgentLoop.astream` consumers now see one extra empty `TextDelta` per gateway retry. It is how the
+  adapter reports a retry the stream itself may never live long enough to describe, and it
+  concatenates to nothing, so the assembled turn is unchanged — but a consumer counting or rendering
+  raw chunks will see it. Runs that emit `model.output.delta` events are unaffected: that path
+  filters on non-empty text.
+- Added `report_provider_retried()`, the seam an adapter uses to say its own retry loop is about to
+  make another attempt. Every other carrier of that fact belongs to an *outcome* — a turn, a chunk,
+  an exception the adapter raised — and a call the run abandons produces none of them: a blocking
+  `next_turn` keeps running on a thread nobody reads, and the receipt is built from the
+  `RunCancelled`/`RunTimeout` the race raised, which the adapter never touched. A run that timed out
+  *because* the provider was retrying is the case most likely to matter, and it was the one case
+  that recorded a clean single attempt. Optional and inert by default: an adapter that never calls it
+  reports no retry, which is exactly true of one with no retry loop. `ModelCallRunner` honours it on
+  success and failure alike, combined with what the outcome itself reports, never over it.
+- The reference LLM gateway protocol now carries `provider_retried` on the one-shot turn result, `turn_complete`, the
+  error payloads (non-200 body, 200-with-`error` body, SSE error frame), and — when true — each
+  streamed delta frame. Two independent retry loops
+  sit on that path and the client can only observe its own, so a gateway whose backend retried,
+  answering a request the client got right the first time, recorded a clean single attempt. On the
+  failure side that gap showed only when the client's own retry loop did not run — a 400/401/quota,
+  the ordinary failure — because otherwise the client's own marker masked it.
+  `GatewayModelAdapter` combines the two facts rather than assigning its own over the wire's. A
+  gateway that omits the field reads as "did not retry", which is the only thing a wire that never
+  mentions it can mean. `report_provider_retried` and `mark_provider_retried` are exported from
+  `contracts` and the package root: an adapter author has to be able to name the seam the docs tell
+  them to use.
+- Added `ModelCallAborted`, raised when a caller's `should_abort` predicate stops an in-flight
+  streamed call. Distinct from `TurnInterrupted` because the runner knows nothing about turns;
+  `AgentLoop` translates it at its own boundary.
+- Added `MultimodalModelAdapter`, `ProviderNamedModelAdapter`, `ConfiguredModelAdapter`, and
+  `AddressedModelAdapter`, opt-in protocols that declare the optional capability members the kernel
+  probes with `getattr` (`supports_multimodal`, `provider_name`, `config`, and
+  `resolve_destination`). Implementing them is never required; they exist so the names and meanings
+  are part of the checked contract and typed callers can narrow to "an adapter that reports this".
+  Each member that is a value is a read-only property, so a `ClassVar`, an instance attribute, and a
+  property all satisfy it; `resolve_destination` is a method because it answers for a given
+  `ModelConfig`. The last two are what let a `ModelCallReceipt` name the model a call actually ran
+  under and tell two hosts apart behind identical configs — the destination is hashed into the replay
+  key and never recorded, so an internal hostname stays internal.
 
 ### Fixed
 
+- A streamed direct-OpenAI turn now releases its response even when the client is reused. Leaving an
+  `async for` does not close the iterator it drove, and the call's cleanup only closed the *client*,
+  and only when the call owned it — which covered this by accident for an unscoped call, since tearing
+  the pool down took the response with it. Inside a scope (`async with adapter` / `aopen`) the client
+  outlives the call, so every turn aborted before the stream drained — cancelled, deadlined, or
+  stopped by `should_abort`, all ordinary — left its response and connection checked out until the
+  whole scope ended. Measured: three aborted turns, three connections still open server-side inside
+  the scope. Enough of them exhaust the pool and later calls stall waiting for a connection that never
+  comes back. This only ever affected the scope feature added in this release, not the previous one.
+- A live model call is no longer left running silently when the bookkeeping around its wait fails.
+  `_aawait` resolved the cancel/deadline race's arguments in its own argument list, and on the
+  blocking path the call is already a daemon worker inside the provider by then — so a
+  `current_cancel_grace_s` that raised landed between starting the call and entering the wait that
+  owns the cleanup, leaving the worker with its future neither detached nor consumed, and with no
+  report. Silence is the one thing this path claims never to do. The values are resolved before the
+  wait now, and a failure detaches the call through the ordinary path, so the abandonment is
+  reported like any other. The same shape as the registration failure already guarded a layer down.
+- An adapter whose `open()` or `close()` raises now ends `monoid run` with a reported error instead of
+  a bare traceback — a connection pool failing to construct or to tear down is the ordinary way in.
+  Both calls sat below the handler that normalizes every other startup failure. The teardown case
+  carried a second fault: the run's status and summary were echoed *after* the adapter scope unwound,
+  and an exception from a cleanup callback replaces whatever is leaving the block, so a failing
+  teardown silently swallowed the outcome of a run that had **completed**. The outcome is now echoed
+  before the scope is released, so a cleanup failure costs the cleanup and not the result.
+  A teardown failure never supersedes a real one, either: raising from a cleanup callback replaces the
+  exception leaving the block, so a failing `close()` alongside a failed run reported only
+  `close() failed` and the provider error an operator needs disappeared. It is the command's error
+  only when nothing else is wrong; beside a real failure it is a warning on stderr.
+- A tool call that refuses to describe itself no longer discards the turn it belongs to. The capture
+  surface falls back to `repr()` for an object `vars()` cannot walk — a `__slots__` object, say — but
+  an object that refuses *both* took the exception out through `_publish` after the provider had
+  already answered, so a paid-for turn was thrown away by the code whose purpose is to prevent
+  exactly that. The entry now degrades to `<unrepresentable TypeName>`: the record still says a tool
+  call was there and that it could not be described.
+- A model call the kernel refuses before reaching the adapter now reports `attempts=0` instead of 1.
+  A run already cancelled, or past its deadline, when the call is requested never touches the
+  adapter — but the receipt carried the default 1, so a consumer summing `attempts` counted provider
+  work that provably never happened, against the field's own documented meaning ("the calls the
+  kernel made to the adapter"). `ModelCallReceipt` accepted no such value before: `attempts` was
+  validated as ≥ 1, and **0 is now legal** — read it as "no adapter call was made", not as a missing
+  value. A receipt is still written for a refused call, because that is precisely the kind of call an
+  audit trail is for; a failure *while* reaching into the adapter still counts as 1. A payload that
+  omits the field still reads as 1, so older records are unchanged.
+- An adapter whose `next_turn` is a callable object with an async `__call__`, or a synchronous
+  `next_turn` that returns an awaitable, is now driven correctly. `inspect.iscoroutinefunction`
+  answers for a function and says no to both, so the call went to the synchronous worker and the
+  awaitable it produced was handed back *as the turn*. Nothing downstream reads a coroutine as a
+  failure — every receipt field read is defensive — so the receipt recorded a **successful model call
+  for a provider that was never invoked**, and the caller got an object whose every turn field was
+  missing. The tool half already defended both shapes; the question "does calling this produce an
+  awaitable?" now has one answer, `is_async_callable`, shared by both dispatch halves, because asking
+  it two different ways is how the halves came to disagree.
+- A retried streamed gateway call now carries a freshly resolved token, as the blocking one always
+  did. `astream_turn` resolved its headers once above the retry loop, alongside the URL and the body
+  — but neither of those can change between attempts and a credential can. A `token_provider` that
+  re-mints near expiry (what `reference.backend` supplies, at `expires_at - refresh_skew_s`) crosses
+  that line during exactly the window a backoff opens: the wait runs to `max_delay_s` and the run may
+  already be minutes old. The retry then replayed the expired token, came back 401 — which is
+  `gateway_auth_error` and *not* retryable — and ended the whole call terminally, where the blocking
+  path recovered. Pre-existing: the previous release resolved the streamed headers in the same place.
+- The CLI now holds open an adapter that offers `open`/`close` without also being a context manager.
+  It probed `open` and then used `with`, so the very shape the probe invites — the lifecycle pair
+  `AgentLoop` and `LoopSession` use, and the one `OpenAIModelAdapter`'s own `__enter__` delegates to
+  — raised `TypeError` before the first turn, outside the CLI's error handling, ending the run in a
+  raw traceback after `run_id` and `run_dir` had already been printed. Adapters with no client to
+  hold are still left alone. One offering `open` without a callable `close` is reported as
+  misconfigured before `open()` runs, so nothing it would have allocated is left with no way to be
+  released.
+- An adapter held open across two *concurrently running* event loops no longer has one loop's client
+  closed under it. `OpenAIModelAdapter`'s scope drops a cached async client that belongs to another
+  loop, on the grounds that its sockets live there — but "belongs to another loop" was not
+  distinguished from "belongs to a loop that has moved on", so a second run asking for a client was
+  enough to schedule a `close()` onto the first run's still-running loop and cut off a call in
+  flight. Reuse now belongs to whichever loop the scope holds; a call from another live loop gets a
+  client it owns and closes, exactly as an unscoped call does, and the scope is left untouched.
+- A transport failure from the streaming client's own lifecycle is classified again. Hoisting the
+  `httpx.AsyncClient` out of the retry loop (below) left its construction, `__aenter__` and pool
+  teardown outside the per-attempt handler, so an `httpx.CloseError` or `PoolTimeout` escaped as a
+  raw `httpx` exception. That is not merely a worse message: `_recoverable_turn_error` keys off
+  `retryable` and a 4xx `http_status`, neither of which a raw `httpx` error carries, so a failure
+  that had ended one turn recoverably — session alive, turn re-attemptable — terminalized the whole
+  run and wrote `failure.json` instead. Now classified as `gateway_network_error`, retryable unless
+  deltas were already committed, matching the previous release. One difference remains by design:
+  a client whose *construction* fails is no longer retried per attempt (1 attempt, not 3), since the
+  client is built once per call.
+- A stream the run has given up on no longer delivers its remaining chunks into the *next* turn.
+  Pre-existing — it reproduces identically on the previous release, which had the same unguarded
+  relay at both of its streamed drive sites — and fixed here because this release rewrote that code
+  into one place. The kernel can stop waiting for a provider but cannot stop one, and the stream
+  drive runs as its own task, so a generator that survives the cancellation a boundary delivers goes
+  on yielding into a `delta_consumer` belonging to a call that already raised. That consumer is
+  `QueueEventSink.push_delta`, and one sink serves a whole run — the next turn rebinds it to a fresh
+  queue — so an abandoned turn's tokens surfaced as the following turn's output. Measured before the
+  fix: 13 chunks delivered after the boundary released the call. Deliveries now stop the moment the
+  driving call ends.
+- Extracting the model call into `ModelCallRunner` no longer freezes two of the loop's public
+  mutable fields at bootstrap. `model_adapter` and `async_model_cancel_grace_s` were captured by
+  value where the loop had read them live on every call, so an adapter assigned after `open()` was
+  ignored — while the request was still *shaped* for it (`supports_multimodal`,
+  `wire_image_encoding`) and the answer still *attributed* to it (`provider_name` on the assistant
+  message). A grace raised after `open()` was likewise ignored, abandoning a model worker ~150x
+  earlier than configured, while the tool half of the same knob honoured it. Both are now read
+  through callables, as the cancellation token already was; the adapter is read exactly once per
+  call so a receipt cannot describe a mixture of two.
 - A synchronous tool handler's call authorization now reaches threads the handler starts itself. A
   `ToolContext` operation delegated to a joined child thread is checked against the same binding
   scope as its parent, instead of seeing no call at all and widening to the run-level permission
@@ -39,6 +199,46 @@ out in commit messages and here.
   runtime, where the loop has always probed them with `getattr` and a default.
 
 ### Changed
+- An abandoned *asynchronous* call is now logged the way an abandoned thread already was. The
+  warning was gated on there being a synchronous call, so a callee whose cleanup outran the grace
+  interval was detached in silence — with the same unbounded shape as the sync case: one task, and
+  everything it holds, per abandonment, on a loop that may run for days. For a streamed model call
+  that is an open provider connection pool. Measured before the fix: 400 abandonments produced 400
+  pending tasks and zero log lines, while the sync half produced 400.
+- A model call is no longer lost, nor left without a receipt, because an adapter returned something
+  slightly off-shape. `stop_reason`, `usage`, and `tool_calls` are read defensively, the same way
+  `provider_retried` already was and for the same stated reason — a third-party adapter may return
+  any turn-shaped object. A `usage=None`, which `examples/custom_model_adapter.py` invites by calling
+  usage "optional", raised from inside the receipt's own construction, so no receipt was produced at
+  all and an answer the provider had already been paid for was discarded over a token counter.
+  The `provider_name`, `config` and `resolve_destination` probes are all now tolerated at the
+  *lookup* as well as the call, so an adapter exposing any of them as a property that raises keeps
+  its call; `resolve_destination` previously guarded only the call.
+- A synchronous adapter or tool handler that raises `StopIteration` no longer loses its failure.
+  `asyncio.Future.set_exception` refuses `StopIteration` by contract; the refusal surfaced inside a
+  thread-safe callback where nothing awaited it, so the awaiting future stayed pending. A deadline
+  still released the run, but the callee's actual failure never arrived, the kernel's abandonment
+  warning stayed silent, and a run configured without a deadline hung. It now surfaces as a
+  `RuntimeError` naming the cause. Raising it is ordinary — `next(...)` on an exhausted iterator
+  does.
+- A provider stream whose `aclose()` raises or hangs no longer replaces the call's own outcome. It
+  runs in a `finally`, so a raising close turned a caller's abort into a terminal failure — killing
+  the session that `ModelCallAborted` exists to keep parked — and a hanging one hung the run, since
+  the abort is raised inside the awaited task and no run boundary is pending to bound it. The close
+  now gets the same grace an abandoned call gets and is then detached, and its failure is not the
+  call's. The bound is a detach rather than `asyncio.wait_for`, which cancels on timeout and then
+  awaits that cancellation — so a close suppressing `CancelledError` still ran ~90x past the grace.
+  An abandoned close warns on the `monoid_agent_kernel.model_call` logger.
+- Capture failing no longer changes how a provider failure is classified. The failure receipt is
+  published under a guard, so a `ModelAdapterError` carrying `retryable` and `http_status` reaches
+  the caller even when delivery raises — the docstring promised delivery *before* the re-raise, and
+  it had become delivery *instead of* it.
+- A bookkeeping failure in the cancel/deadline race no longer orphans a call it had already started.
+  Cancellation-callback registration and the timeout arithmetic now sit inside the `try`, so the
+  `finally` that cancels, detaches, and consumes the call always runs; previously a raising
+  `add_cancel_callback` left the adapter running to completion behind a run that had reported a
+  failure.
+
 
 - **Breaking for third-party synchronous adapters and tools.** A synchronous `next_turn` and a
   synchronous tool handler now observe run cancellation and the run deadline, instead of taking
@@ -64,6 +264,34 @@ out in commit messages and here.
   joins that executor's workers before returning, which made a run deadline enforced internally but
   unobservable to the caller — it produced its result on time, then blocked at loop shutdown until
   the provider returned on its own.
+- The abandoned-synchronous-call warning now logs under `monoid_agent_kernel.core.sync_bridge`
+  instead of `monoid_agent_kernel.loop`. The bridge that runs a blocking call on a daemon thread
+  moved into `core` so the model-call runner can share it with the tool path, and a logger naming a
+  module it no longer lives in would misdirect anyone reading the warning. Deployments filtering
+  this warning by logger name need to add the new one; the message text is unchanged.
+- A run whose deadline has expired or whose cancellation has been requested no longer reaches the
+  provider. The boundary is checked before the adapter is dispatched, not only in the race around
+  it: the race reported a boundary that had already been crossed, but by then the request was out
+  and the provider had been paid for work the run had already decided not to do. The refusal still
+  publishes a failure receipt, so a call the run declined is recorded rather than absent.
+- `GatewayModelAdapter.astream_turn` no longer blocks the event loop while it waits to retry. The
+  backoff used a blocking sleep called from inside an async generator, so the whole loop stopped for
+  the length of the wait — up to `max_delay_s` per retry; the default policy reaches 1.1s on its second
+  backoff, and a longer configured one was measured freezing a 100ms heartbeat for a full 4.5s wait. Nothing else in the run progressed, and the run's own
+  cancellation and deadline are raced on that loop, so a run told to stop kept waiting for a provider
+  it had already given up on. The wait is now awaited; the schedule is unchanged and shared with the
+  sync path, which keeps its blocking sleep because it runs on a thread.
+- `GatewayModelAdapter.astream_turn` builds one `httpx.AsyncClient` per *call* rather than per
+  *attempt*. Constructing one is synchronous and not cheap — ~285ms warm — and inside the retry loop
+  that cost was paid again on every retry, with the event loop unavailable throughout: the same
+  defect as the blocking backoff above, one statement later. Retries now also reuse the connection
+  pool. A host counting client constructions, or relying on a fresh pool per attempt, will see the
+  difference.
+- An adapter that cancels its *own* call is now reported as `ModelAdapterError`
+  (`model_adapter_cancelled`) instead of raising `asyncio.CancelledError` out of the run. The two
+  are different events — the run stopping versus the adapter failing — and only the second is the
+  adapter's. Callers that distinguished them by catching `CancelledError` around a run should catch
+  `ModelAdapterError` for this case; cancellation of the run itself is unchanged.
 
 ## [0.19.2] - 2026-07-19
 
