@@ -4,8 +4,8 @@ Core-internal only. The supported public surface is exported from
 ``monoid_agent_kernel.contracts`` and the package root.
 
 Both halves of the kernel's synchronous surface need this: a sync ``next_turn`` on a model adapter
-and a sync tool handler. It lives here rather than in ``loop`` because ``core.model_call`` needs it
-too, and ``core`` never imports from ``loop``.
+and a sync tool handler. It lives here rather than in ``loop`` because ``model_call`` needs it too
+and ``loop`` imports ``model_call``, so leaving it in ``loop`` would close a cycle.
 """
 
 from __future__ import annotations

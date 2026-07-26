@@ -21,20 +21,28 @@ out in commit messages and here.
   past the cut, so no key is issued rather than a misleading one. Read an empty digest as *no key*,
   never as a key. It lives at the package root rather than under `core/` because it names the
   provider vocabulary it drives, and `core` does not import `providers`.
-- Added `ModelTurn.provider_retried` and `TurnComplete.provider_retried`, how an adapter reports that
-  it retried internally before producing a turn. The kernel counts one adapter call per turn however
-  many attempts happen inside it, so without this an audit receipt records a call that failed twice
-  and succeeded on the third try as a clean single attempt. `GatewayModelAdapter` sets it on both its
-  retry paths; adapters with no retry loop leave it `False`, which is exactly true of them.
+- Added `provider_retried` to `ModelTurn`, `TurnComplete`, and every streamed chunk (`TextDelta`,
+  `ReasoningDelta`, `ToolCallDelta`), how an adapter reports that it retried internally before
+  producing a turn. The kernel counts one adapter call per turn however many attempts happen inside
+  it, so without this an audit receipt records a call that failed twice and succeeded on the third
+  try as a clean single attempt. It is on every chunk rather than only the terminal one because a
+  stream that is cancelled mid-flight never reaches its terminal chunk, and that is exactly when the
+  evidence matters; `GatewayModelAdapter` marks the retry when the stream commits, which is the first
+  moment it is certain and the last one guaranteed to happen. Adapters with no retry loop leave it
+  `False`, which is exactly true of them.
 - Added `ModelCallAborted`, raised when a caller's `should_abort` predicate stops an in-flight
   streamed call. Distinct from `TurnInterrupted` because the runner knows nothing about turns;
   `AgentLoop` translates it at its own boundary.
-- Added `MultimodalModelAdapter` and `ProviderNamedModelAdapter`, opt-in protocols that declare the
-  optional capability attributes the loop probes with `getattr` (`supports_multimodal` and
-  `provider_name`). Implementing them is never required; they exist so the attribute names and
-  meanings are part of the checked contract and typed callers can narrow to "an adapter that reports
-  this". Each member is a read-only property, so a `ClassVar`, an instance attribute, and a property
-  all satisfy it.
+- Added `MultimodalModelAdapter`, `ProviderNamedModelAdapter`, `ConfiguredModelAdapter`, and
+  `AddressedModelAdapter`, opt-in protocols that declare the optional capability members the kernel
+  probes with `getattr` (`supports_multimodal`, `provider_name`, `config`, and
+  `resolve_destination`). Implementing them is never required; they exist so the names and meanings
+  are part of the checked contract and typed callers can narrow to "an adapter that reports this".
+  Each member that is a value is a read-only property, so a `ClassVar`, an instance attribute, and a
+  property all satisfy it; `resolve_destination` is a method because it answers for a given
+  `ModelConfig`. The last two are what let a `ModelCallReceipt` name the model a call actually ran
+  under and tell two hosts apart behind identical configs — the destination is hashed into the replay
+  key and never recorded, so an internal hostname stays internal.
 
 ### Fixed
 
@@ -89,6 +97,16 @@ out in commit messages and here.
   moved into `core` so the model-call runner can share it with the tool path, and a logger naming a
   module it no longer lives in would misdirect anyone reading the warning. Deployments filtering
   this warning by logger name need to add the new one; the message text is unchanged.
+- A run whose deadline has expired or whose cancellation has been requested no longer reaches the
+  provider. The boundary is checked before the adapter is dispatched, not only in the race around
+  it: the race reported a boundary that had already been crossed, but by then the request was out
+  and the provider had been paid for work the run had already decided not to do. The refusal still
+  publishes a failure receipt, so a call the run declined is recorded rather than absent.
+- An adapter that cancels its *own* call is now reported as `ModelAdapterError`
+  (`model_adapter_cancelled`) instead of raising `asyncio.CancelledError` out of the run. The two
+  are different events — the run stopping versus the adapter failing — and only the second is the
+  adapter's. Callers that distinguished them by catching `CancelledError` around a run should catch
+  `ModelAdapterError` for this case; cancellation of the run itself is unchanged.
 
 ## [0.19.2] - 2026-07-19
 
