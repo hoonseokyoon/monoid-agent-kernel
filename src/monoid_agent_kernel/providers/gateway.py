@@ -233,8 +233,14 @@ class GatewayModelAdapter:
                         #
                         # An earlier fix put this at commit, calling that "the first moment the retry
                         # is certain". That was wrong: certainty arrives when ``_should_retry`` says
-                        # yes, one iteration earlier. An empty ``TextDelta`` concatenates to nothing,
-                        # so the assembled turn and any relay of the deltas are unchanged.
+                        # yes, at the end of the previous iteration, and nothing between there and
+                        # here can revoke it.
+                        #
+                        # An empty ``TextDelta`` concatenates to nothing, so the assembled turn is
+                        # unchanged. A *live stream* is not: ``QueueEventSink.push_delta`` relays
+                        # every chunk, so a caller of ``AgentLoop.astream`` sees one extra empty
+                        # text chunk per retry. The event-emitting consumer filters on
+                        # ``chunk.text`` and sees nothing new.
                         yield TextDelta(text="", provider_retried=True)
                         # Awaited, and after both reports. The blocking sleep this replaces held the
                         # event loop for the whole backoff, so nothing else in the run progressed and
@@ -624,10 +630,11 @@ async def _asleep_before_retry(
     """Wait without holding the event loop.
 
     ``astream_turn`` used the blocking sleep, which froze the whole loop for the length of the
-    backoff -- up to ``max_delay_s`` per retry. Nothing else in the run progressed, and the run's own
-    cancellation and deadline are raced on that loop, so a run told to stop kept waiting for a
-    provider it had already given up on. Measured at the default policy: a 4.5s backoff let a 100ms
-    heartbeat tick zero times.
+    backoff -- up to ``max_delay_s`` per retry, and the default policy reaches 1.1s on its second
+    backoff (0.5s then 1.0s, plus up to 0.1s jitter). Nothing else in the run progressed, and the
+    run's own cancellation and deadline are raced on that loop, so a run told to stop kept waiting
+    for a provider it had already given up on: measured with a longer configured backoff, a 4.5s
+    wait let a 100ms heartbeat tick zero times.
     """
 
     delay = _retry_delay(attempt, initial_delay_s, max_delay_s, backoff_multiplier, jitter_s)

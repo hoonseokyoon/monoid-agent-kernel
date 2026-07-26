@@ -22,6 +22,8 @@ inherits classification without inheriting a retry loop.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -239,10 +241,14 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
 
     `messages` is always a list here, even when the request carried `None` -- deliberately unlike
     `_prompt_payload`, which keeps those apart because a replay key must. This is a display surface,
-    not a key: a `RedactionPolicy` iterates the field to mask messages one at a time, so handing it
-    `None` on the ordinary by-reference path would break every such policy in order to record a
-    shape distinction nothing here keys on. The shape stays legible anyway -- a by-reference call
-    carries its `previous_turn_handle` and `observations` in this same dict.
+    not a key, and every field on it is a container a consumer walks; one that is sometimes `None`
+    makes each of them special-case the by-reference shape to learn nothing, since the shape is
+    already legible from `previous_turn_handle` and `observations` in this same dict.
+
+    Not a claim that `None` would break redaction -- it does not. `RedactionPolicy` holds rules and
+    answers questions (`names_a_secret`, `redact_text`); the walking is a `Redactor`'s, and the
+    shipped `DefaultRedactor` returns `None` untouched. An earlier version of this note said
+    otherwise and was wrong about both halves.
     """
 
     content: dict[str, Any] = {
@@ -253,8 +259,17 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
         "previous_turn_handle": request.previous_turn_handle or "",
     }
     if turn is not None:
-        content["output_text"] = turn.final_text or ""
-        content["tool_calls"] = [dict(call.__dict__) for call in turn.tool_calls]
+        content["output_text"] = getattr(turn, "final_text", "") or ""
+        # Probed and per-call, so one tool call the adapter built oddly costs its own entry rather
+        # than the whole record. A `__slots__` object has no `__dict__` and used to raise from here,
+        # which is a display surface failing a call that already happened.
+        calls: list[dict[str, Any]] = []
+        for call in getattr(turn, "tool_calls", ()) or ():
+            try:
+                calls.append(dict(vars(call)))
+            except Exception:
+                calls.append({"repr": repr(call)})
+        content["tool_calls"] = calls
     return content
 
 
@@ -262,10 +277,11 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
 class ModelCallRunner:
     """Runs one model call against an adapter, whatever shape that adapter is.
 
-    Five adapter shapes reach the same semantics -- a streamed call relayed to a consumer, a
-    streamed call with no consumer, `anext_turn`, a coroutine `next_turn`, and a blocking
-    `next_turn` on an abandonable daemon thread. All five go through the same cancel/deadline race,
-    so an adapter's async-ness never changes when a run stops.
+    Four dispatch shapes reach the same semantics -- a streamed call relayed to a consumer,
+    `anext_turn`, a coroutine `next_turn`, and a blocking `next_turn` on an abandonable daemon
+    thread. All four go through the same cancel/deadline race, so an adapter's async-ness never
+    changes when a run stops. A streaming-capable adapter called *without* a consumer is not a
+    fifth shape: it takes one of the other three, because streaming is selected by the argument.
 
     Which shape is used is a function of the **call arguments**, never of state held elsewhere: a
     streamed drive happens when the caller passes a `delta_consumer` and the adapter can stream.
@@ -274,7 +290,7 @@ class ModelCallRunner:
     """
 
     adapter: Any
-    """The model adapter. Typed `Any` because the five shapes are probed with `getattr`, exactly as
+    """The model adapter. Typed `Any` because the optional members are probed with `getattr`, as
     the protocols in `providers/base.py` intend -- declaring the optional members would make them
     required for structural typing and reject a third-party adapter implementing only `next_turn`."""
 
@@ -292,8 +308,14 @@ class ModelCallRunner:
     in a thread dump names the run that leaked it."""
 
     subscriptions: Sequence[ModelIOSubscription] = ()
-    """Observers of settled calls. Empty by default: capture is opt-in, and a runner wired to
-    nothing does no digesting at all."""
+    """Observers of settled calls. Empty by default -- *delivery* of content is opt-in.
+
+    Identifying the call is not: `prompt_digest` and `request_digest` are computed on every call,
+    before anything looks at this field, because they describe the call whether or not anyone is
+    watching. That costs two canonical-JSON encodes and two SHA-256 passes over the serialized
+    prompt per call, which is why `_MAX_DIGEST_BYTES` bounds it. `AgentLoop` builds its runner with
+    no subscriptions and still pays that; anyone trimming the cost should start there and not
+    expect this field to gate it."""
 
     def _effective_model(self, request: ModelRequest) -> ModelConfig:
         """The config the adapter will actually run under.
@@ -306,7 +328,18 @@ class ModelCallRunner:
 
         if request.model is not None:
             return request.model
-        configured = getattr(self.adapter, "config", None)
+        # Tolerant of a raising probe for the reason `_destination` gives: a replay key is
+        # bookkeeping, and an adapter that cannot answer must not thereby lose its call. Plain
+        # `getattr(..., None)` swallowed only `AttributeError`, so a `config` property that raised
+        # anything else took the whole call down.
+        #
+        # A raising probe and an absent one both land on the default here, because the return type
+        # admits nothing else -- the receipt cannot say "unknown". That is a known limit of this
+        # field, not a distinction being drawn.
+        try:
+            configured = getattr(self.adapter, "config", None)
+        except Exception:
+            configured = None
         return configured if isinstance(configured, ModelConfig) else ModelConfig()
 
     def _destination(self, model: ModelConfig) -> str:
@@ -367,7 +400,13 @@ class ModelCallRunner:
 
         started = time.monotonic()
         model = self._effective_model(request)
-        provider = str(getattr(self.adapter, "provider_name", "") or "")
+        # Same tolerance as the other two adapter probes, and for the same reason. Undefended, a
+        # `provider_name` property that raised -- or whose `str()` did -- lost the call before the
+        # adapter was ever invoked, over a field nothing reads for control flow.
+        try:
+            provider = str(getattr(self.adapter, "provider_name", "") or "")
+        except Exception:
+            provider = ""
         receipt = ModelCallReceipt(
             context=context if context is not None else InvocationContext(),
             model=model,
@@ -392,9 +431,16 @@ class ModelCallRunner:
                 # up on this is the only surviving evidence that a retry happened.
                 if progress.retried:
                     mark_provider_retried(exc)
-                self._publish(
-                    request, None, receipt.with_error(exc), elapsed_ms=self._ms_since(started)
-                )
+                # Guarded, because the docstring promises the receipt is delivered *before the
+                # exception is re-raised* -- and a raising observer made it delivered *instead of*
+                # it, replacing a `ModelAdapterError` carrying `retryable` and `http_status` with
+                # whatever the observer threw. Turning capture on must not change how a provider
+                # failure is classified. `Exception` and not `BaseException`: a KeyboardInterrupt
+                # arriving during delivery should still stop everything.
+                with contextlib.suppress(Exception):
+                    self._publish(
+                        request, None, receipt.with_error(exc), elapsed_ms=self._ms_since(started)
+                    )
                 raise
             # Read on this path too, so `report_provider_retried` means the same thing whatever
             # the call returns. Honoured only on failure, it would be a reporting seam that
@@ -416,10 +462,18 @@ class ModelCallRunner:
     def _completed(
         receipt: ModelCallReceipt, turn: ModelTurn, *, retried: bool = False
     ) -> ModelCallReceipt:
+        # Every field read defensively, for the reason the `provider_retried` probe below already
+        # gives: a third-party adapter may return any turn-shaped object. Read as hard attributes,
+        # a `usage=None` -- which `examples/custom_model_adapter.py` invites by calling usage
+        # "optional" -- raised `AttributeError` from inside the argument list of `_publish`, so
+        # *no* receipt was produced at all and an answer the provider had already been paid for was
+        # discarded over a token counter. `_recordable_usage` already refuses to fail a paid call
+        # over a malformed usage *value*; this is the same rule for a malformed usage *type*.
+        usage = getattr(turn, "usage", None)
         return replace(
             receipt,
-            stop_reason=str(turn.stop_reason or ""),
-            usage=_recordable_usage(turn.usage),
+            stop_reason=str(getattr(turn, "stop_reason", "") or ""),
+            usage=_recordable_usage(usage if isinstance(usage, Mapping) else {}),
             # Probed rather than read as an attribute: a third-party adapter may return any
             # turn-shaped object, and a missing flag means "did not retry", which is true of every
             # adapter with no retry loop. Combined with what the adapter reported through the
@@ -513,12 +567,23 @@ class ModelCallRunner:
                     if should_abort is not None and should_abort():
                         raise ModelCallAborted("model call aborted")
             finally:
-                # Provider async iterators own network resources. Cooperative cancellation enters
-                # their ``finally`` and then explicitly closes the iterator; stubborn cleanup is
-                # detached by ``_aawait`` after its bounded grace interval.
+                # Provider async iterators own network resources, so the iterator is closed
+                # explicitly rather than left to finalization.
+                #
+                # Bounded and swallowed, because this runs in a ``finally``: whatever it raises or
+                # however long it blocks *replaces* the call's own outcome. A provider whose close
+                # raised turned a user's `interrupt_turn` into a terminal failure -- the session the
+                # `ModelCallAborted` type exists to keep parked was killed by its cleanup -- and
+                # destroyed successful turns whose tokens had already been relayed. One that hung
+                # hung the run, with no boundary able to fire, because the abort is raised inside
+                # this task and so no grace interval applies to it.
+                #
+                # The grace is the same one an abandoned call gets; a close that outlives it is
+                # left running rather than waited on.
                 aclose = getattr(agen, "aclose", None)
                 if aclose is not None:
-                    await aclose()
+                    with contextlib.suppress(Exception, asyncio.TimeoutError):
+                        await asyncio.wait_for(aclose(), timeout=max(0.0, self.cancel_grace_s))
             return assemble_streamed_turn(chunks)
 
         try:
@@ -546,7 +611,7 @@ class ModelCallRunner:
         `except ModelAdapterError`, which records a `model_turn` naming the failure, instead of the
         generic handler that rewraps with `str(exc)`: `CalleeCancelled` carries no message, so a run
         failed with an empty one. Every dispatch shape funnels through here, so one translation
-        covers all five.
+        covers all of them.
         """
 
         try:

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import time
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -1408,3 +1409,210 @@ def test_the_retry_channel_does_not_leak_between_calls() -> None:
 def test_reporting_a_retry_outside_a_runner_is_inert() -> None:
     """An adapter used directly is not broken by calling the seam with nobody listening."""
     report_provider_retried()  # must not raise
+
+
+# --- a broken adapter must not cost the call, the receipt, or the run ----------------------------
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [
+        ModelTurn(final_text="answer", usage=None),  # type: ignore[arg-type]
+        None,
+        {"final_text": "answer"},
+    ],
+    ids=["usage-is-None", "returns-None", "returns-a-dict"],
+)
+def test_a_turn_shaped_result_still_produces_a_receipt(turn: Any) -> None:
+    """A receipt is produced whether the call succeeded or failed -- including this way.
+
+    Read as hard attributes, a `usage=None` (which `examples/custom_model_adapter.py` invites by
+    calling usage "optional") raised from inside `_publish`'s argument list, so *no* receipt was
+    produced at all and an answer the provider had already been paid for was discarded over a token
+    counter.
+    """
+
+    class OddAdapter:
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            return turn
+
+    observer = RecordingObserver()
+    runner = ModelCallRunner(
+        adapter=OddAdapter(),
+        subscriptions=(ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="full")),),
+    )
+
+    async def run() -> Any:
+        with contextlib.suppress(Exception):
+            return await runner.acall(REQUEST)
+        return None
+
+    asyncio.run(run())
+    assert len(observer.captures) == 1, "the call happened, so the audit trail must record it"
+
+
+def test_a_tool_call_the_adapter_built_oddly_costs_its_own_entry() -> None:
+    """A display surface must not fail a call that already happened."""
+
+    class Slotted:
+        __slots__ = ("id",)
+
+        def __init__(self) -> None:
+            self.id = "c1"
+
+    class OddAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer", tool_calls=(Slotted(),))  # type: ignore[arg-type]
+
+    observer = RecordingObserver()
+    runner = ModelCallRunner(
+        adapter=OddAdapter(),
+        subscriptions=(ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="full")),),
+    )
+
+    async def run() -> Any:
+        turn, _receipt = await runner.acall(REQUEST)
+        return turn
+
+    assert asyncio.run(run()).final_text == "answer"
+    assert len(observer.captures) == 1
+
+
+def test_a_raising_probe_does_not_lose_the_call() -> None:
+    """`provider_name` and `config` answer bookkeeping, so neither can cost the call.
+
+    Undefended, a property that raised took the call down before the adapter was ever invoked.
+    """
+
+    class HostileAdapter:
+        @property
+        def provider_name(self) -> str:
+            raise RuntimeError("provider_name exploded")
+
+        @property
+        def config(self) -> ModelConfig:
+            raise RuntimeError("config exploded")
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    async def run() -> Any:
+        turn, receipt = await ModelCallRunner(adapter=HostileAdapter()).acall(REQUEST)
+        return turn, receipt
+
+    turn, receipt = asyncio.run(run())
+    assert turn.final_text == "answer"
+    assert receipt.provider_name == ""
+
+
+def test_capture_failing_does_not_replace_the_providers_failure() -> None:
+    """Turning capture on must not change how a provider failure is classified.
+
+    The docstring promises the receipt is delivered *before* the exception is re-raised; when
+    delivery itself blew up it was delivered *instead of* it, and a `ModelAdapterError` carrying
+    `retryable` and `http_status` reached the loop as capture's exception, losing the classification
+    the loop's own `except ModelAdapterError` depends on.
+
+    Injected where the per-observer guard cannot help: `content_digest` runs over the whole content
+    before any observer is called, and `_jsonish` falls through to `str(value)`.
+    """
+
+    class Unprintable:
+        def __str__(self) -> str:
+            raise ValueError("no str")
+
+    class FailingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            raise ModelAdapterError("provider 503", retryable=True, http_status=503)
+
+    runner = ModelCallRunner(
+        adapter=FailingAdapter(),
+        subscriptions=(
+            ModelIOSubscription(
+                observer=RecordingObserver(), policy=CapturePolicy(mode="digest")
+            ),
+        ),
+    )
+    request = replace(REQUEST, messages=[{"role": "user", "content": Unprintable()}])
+
+    async def run() -> None:
+        await runner.acall(request)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+    assert caught.value.http_status == 503
+    assert caught.value.retryable is True
+
+    # Counterweight: with no subscriptions the same call already reported correctly, so this test
+    # must be failing on the capture path rather than on the adapter's own error.
+    async def uncaptured() -> None:
+        await ModelCallRunner(adapter=FailingAdapter()).acall(request)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(uncaptured())
+
+
+@pytest.mark.parametrize("mode", ["raises", "hangs"], ids=["close-raises", "close-hangs"])
+def test_a_cleanup_that_misbehaves_does_not_become_the_calls_outcome(mode: str) -> None:
+    """The stream's `aclose()` runs in a `finally`, so what it does replaces the call's outcome.
+
+    A provider whose close raised turned a caller's abort into a terminal failure -- killing the
+    session that `ModelCallAborted` exists to keep parked. One whose close hung hung the run
+    outright: the abort is raised *inside* the awaited task, so no run boundary is pending and no
+    grace interval applies to it.
+
+    Only reachable when the stream is still live, which is exactly when a caller stops it early --
+    a drained generator's `aclose()` is a no-op.
+    """
+
+    class HostileCloseAdapter:
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            try:
+                yield TextDelta("ans")
+                yield TextDelta("wer")
+            except GeneratorExit:
+                if mode == "hangs":
+                    await asyncio.sleep(30)
+                raise RuntimeError("close exploded") from None
+
+    seen: list[Any] = []
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=HostileCloseAdapter(), cancel_grace_s=0.05).acall(
+            REQUEST, delta_consumer=seen.append, should_abort=lambda: len(seen) >= 1
+        )
+
+    started = time.monotonic()
+    with pytest.raises(ModelCallAborted):
+        asyncio.run(run())
+    assert time.monotonic() - started < 5.0, "a stuck close must not outlast the grace interval"
+
+
+def test_a_sync_adapter_raising_stopiteration_does_not_hang_the_run() -> None:
+    """`Future.set_exception` refuses `StopIteration`, and the refusal used to strand the awaiter.
+
+    The TypeError surfaced inside a `call_soon_threadsafe` callback where nothing awaited it, so the
+    future stayed pending forever and no deadline could end the run. A callee raising it is
+    ordinary: `next(...)` on an exhausted iterator does.
+    """
+
+    class ExhaustedAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return next(iter(()))  # type: ignore[call-overload]
+
+    async def run() -> None:
+        # Given a deadline deliberately, so a regression fails this test instead of hanging it: the
+        # stranded awaiter is only ever released by a boundary, and `RunTimeout` here means the
+        # callee's failure never arrived.
+        await ModelCallRunner(adapter=ExhaustedAdapter(), cancel_grace_s=0.05).acall(
+            REQUEST, deadline=time.time() + 1.0
+        )
+
+    with pytest.raises(RuntimeError, match="StopIteration"):
+        asyncio.run(run())

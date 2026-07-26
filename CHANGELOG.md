@@ -16,7 +16,8 @@ out in commit messages and here.
   a batch driver gets deadline and cancellation semantics that previously existed only inside
   `AgentLoop`. Delivery of content to observers is opt-in through `subscriptions`, but the receipt's
   digests are computed on every call, because they identify the call whether or not anyone is
-  watching. A digest is empty when the payload exceeded normalization bounds: it is documented as an
+  watching. A digest is empty when canonical JSON cannot carry the payload, or when the encoded
+  output passes its size cap: it is documented as an
   exact replay key, and one taken over a truncated payload would match two requests that differ only
   past the cut, so no key is issued rather than a misleading one. Read an empty digest as *no key*,
   never as a key. It lives at the package root rather than under `core/` because it names the
@@ -28,9 +29,14 @@ out in commit messages and here.
   try as a clean single attempt. It is on every chunk rather than only the terminal one because a
   stream that is cancelled mid-flight never reaches its terminal chunk, and that is exactly when the
   evidence matters; `GatewayModelAdapter` marks the retry when it *decides* to retry — before the
-  backoff wait and before reconnecting — because that is the first moment the retry is certain and
-  every later one can be missed. Adapters with no retry loop leave it `False`, which is exactly true
+  backoff wait and before reconnecting — because the retry is already certain there — `_should_retry` said
+  yes at the end of the previous attempt — and every later point can be missed. Adapters with no retry loop leave it `False`, which is exactly true
   of them.
+- `AgentLoop.astream` consumers now see one extra empty `TextDelta` per gateway retry. It is how the
+  adapter reports a retry the stream itself may never live long enough to describe, and it
+  concatenates to nothing, so the assembled turn is unchanged — but a consumer counting or rendering
+  raw chunks will see it. Runs that emit `model.output.delta` events are unaffected: that path
+  filters on non-empty text.
 - Added `report_provider_retried()`, the seam an adapter uses to say its own retry loop is about to
   make another attempt. Every other carrier of that fact belongs to an *outcome* — a turn, a chunk,
   an exception the adapter raised — and a call the run abandons produces none of them: a blocking
@@ -40,9 +46,9 @@ out in commit messages and here.
   that recorded a clean single attempt. Optional and inert by default: an adapter that never calls it
   reports no retry, which is exactly true of one with no retry loop. `ModelCallRunner` honours it on
   success and failure alike, combined with what the outcome itself reports, never over it.
-- The reference LLM gateway protocol now carries `provider_retried` on every payload that can report
-  a call: the one-shot turn result, each streamed delta frame, `turn_complete`, and — equally — the
-  error payloads (non-200 body, 200-with-`error` body, SSE error frame). Two independent retry loops
+- The reference LLM gateway protocol now carries `provider_retried` on the one-shot turn result, `turn_complete`, the
+  error payloads (non-200 body, 200-with-`error` body, SSE error frame), and — when true — each
+  streamed delta frame. Two independent retry loops
   sit on that path and the client can only observe its own, so a gateway whose backend retried,
   answering a request the client got right the first time, recorded a clean single attempt. On the
   failure side that gap showed only when the client's own retry loop did not run — a 400/401/quota,
@@ -89,6 +95,33 @@ out in commit messages and here.
   runtime, where the loop has always probed them with `getattr` and a default.
 
 ### Changed
+- A model call is no longer lost, nor left without a receipt, because an adapter returned something
+  slightly off-shape. `stop_reason`, `usage`, and `tool_calls` are read defensively, the same way
+  `provider_retried` already was and for the same stated reason — a third-party adapter may return
+  any turn-shaped object. A `usage=None`, which `examples/custom_model_adapter.py` invites by calling
+  usage "optional", raised from inside the receipt's own construction, so no receipt was produced at
+  all and an answer the provider had already been paid for was discarded over a token counter.
+  `provider_name` and `config` probes are tolerated the same way `resolve_destination` already was.
+- A synchronous adapter or tool handler that raises `StopIteration` no longer hangs the run forever.
+  `asyncio.Future.set_exception` refuses `StopIteration` by contract; the refusal surfaced inside a
+  thread-safe callback where nothing awaited it, so the awaiting future stayed pending and no
+  deadline could end the run. It now surfaces as a `RuntimeError` naming the cause. Raising it is
+  ordinary — `next(...)` on an exhausted iterator does.
+- A provider stream whose `aclose()` raises or hangs no longer replaces the call's own outcome. It
+  runs in a `finally`, so a raising close turned a caller's abort into a terminal failure — killing
+  the session that `ModelCallAborted` exists to keep parked — and a hanging one hung the run, since
+  the abort is raised inside the awaited task and no run boundary is pending to bound it. The close
+  is now bounded by the same grace an abandoned call gets, and its failure is not the call's.
+- Capture failing no longer changes how a provider failure is classified. The failure receipt is
+  published under a guard, so a `ModelAdapterError` carrying `retryable` and `http_status` reaches
+  the caller even when delivery raises — the docstring promised delivery *before* the re-raise, and
+  it had become delivery *instead of* it.
+- A bookkeeping failure in the cancel/deadline race no longer orphans a call it had already started.
+  Cancellation-callback registration and the timeout arithmetic now sit inside the `try`, so the
+  `finally` that cancels, detaches, and consumes the call always runs; previously a raising
+  `add_cancel_callback` left the adapter running to completion behind a run that had reported a
+  failure.
+
 
 - **Breaking for third-party synchronous adapters and tools.** A synchronous `next_turn` and a
   synchronous tool handler now observe run cancellation and the run deadline, instead of taking
@@ -126,8 +159,8 @@ out in commit messages and here.
   publishes a failure receipt, so a call the run declined is recorded rather than absent.
 - `GatewayModelAdapter.astream_turn` no longer blocks the event loop while it waits to retry. The
   backoff used a blocking sleep called from inside an async generator, so the whole loop stopped for
-  the length of the wait — up to `max_delay_s` per retry, 4.5s at the default policy, measured as a
-  100ms heartbeat ticking zero times. Nothing else in the run progressed, and the run's own
+  the length of the wait — up to `max_delay_s` per retry; the default policy reaches 1.1s on its second
+  backoff, and a longer configured one was measured freezing a 100ms heartbeat for a full 4.5s wait. Nothing else in the run progressed, and the run's own
   cancellation and deadline are raced on that loop, so a run told to stop kept waiting for a provider
   it had already given up on. The wait is now awaited; the schedule is unchanged and shared with the
   sync path, which keeps its blocking sleep because it runs on a thread.

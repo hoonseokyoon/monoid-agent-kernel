@@ -158,6 +158,17 @@ def start_abandonable_sync_call(
         succeeded, payload = outcome[0]
         if succeeded:
             future.set_result(payload)
+        elif isinstance(payload, StopIteration):
+            # ``Future.set_exception`` refuses ``StopIteration`` by contract and raises TypeError.
+            # That TypeError would surface here, inside a ``call_soon_threadsafe`` callback, where
+            # nothing awaits it -- so the future stayed pending forever while ``settled`` was
+            # already resolved, and the run hung with no warning and no deadline able to end it.
+            # A callee raising it is ordinary: ``next(...)`` on an exhausted iterator does.
+            future.set_exception(
+                RuntimeError("synchronous call raised StopIteration").with_traceback(
+                    payload.__traceback__
+                )
+            )
         else:
             future.set_exception(payload)
 
@@ -233,11 +244,18 @@ async def await_abandonable_call(
 
         loop.call_soon_threadsafe(resolve)
 
-    remove_callback = (
-        token.add_cancel_callback(signal_cancelled) if token is not None else lambda: None
-    )
-    timeout = None if deadline is None else max(0.0, deadline - time.time())
+    # Everything from here on is inside the ``try``, because the call is already running: the task
+    # exists above, and a blocking callee's thread was started before this function was entered.
+    # Registration or the timeout arithmetic failing used to skip the ``finally`` entirely, so the
+    # call was neither cancelled, detached, nor consumed -- it ran to completion behind a run that
+    # had already reported a failure.
+    def remove_callback() -> None:
+        return None
+
     try:
+        if token is not None:
+            remove_callback = token.add_cancel_callback(signal_cancelled)
+        timeout = None if deadline is None else max(0.0, deadline - time.time())
         await asyncio.wait({task, cancelled}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         # Checked before the result is read, so a boundary that lands in the same tick as a
         # completed call still wins. A run told to stop must not report work it decided not to do.
