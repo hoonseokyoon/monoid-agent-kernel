@@ -98,6 +98,10 @@ out in commit messages and here.
   and an exception from a cleanup callback replaces whatever is leaving the block, so a failing
   teardown silently swallowed the outcome of a run that had **completed**. The outcome is now echoed
   before the scope is released, so a cleanup failure costs the cleanup and not the result.
+  A teardown failure never supersedes a real one, either: raising from a cleanup callback replaces the
+  exception leaving the block, so a failing `close()` alongside a failed run reported only
+  `close() failed` and the provider error an operator needs disappeared. It is the command's error
+  only when nothing else is wrong; beside a real failure it is a warning on stderr.
 - A tool call that refuses to describe itself no longer discards the turn it belongs to. The capture
   surface falls back to `repr()` for an object `vars()` cannot walk — a `__slots__` object, say — but
   an object that refuses *both* took the exception out through `_publish` after the provider had

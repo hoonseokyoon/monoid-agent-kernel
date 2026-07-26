@@ -1443,6 +1443,57 @@ def test_cli_run_reports_an_adapter_lifecycle_failure_as_a_cli_error(
         )
 
 
+def test_cli_run_keeps_the_real_failure_when_teardown_also_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cleanup failure is a footnote to a real failure, never a replacement for it.
+
+    Raising from an `ExitStack` callback *replaces* the exception leaving the block, so making a
+    failing `close()` report itself as a CLI error -- which it must, when nothing else is wrong --
+    turned it into a mask. Measured: a run failed by a dead provider reported only
+    `close() failed`, with the provider error nowhere in the output. `result.error` was raised after
+    the scope, so it was never even reached.
+
+    Both are reported now: the run's failure as the command's error, the teardown as a warning beside
+    it. The counterweight -- a clean run whose teardown fails, where the teardown *is* the error -- is
+    `test_cli_run_reports_an_adapter_lifecycle_failure_as_a_cli_error[close]`.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class _FailingRunAndTeardown:
+        def open(self) -> _FailingRunAndTeardown:
+            return self
+
+        def close(self) -> None:
+            raise RuntimeError("pool teardown failed")
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            raise ModelAdapterError("the provider is down")
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli._model_adapter", lambda *_a, **_k: _FailingRunAndTeardown()
+    )
+    config_file = _write_config(tmp_path / "runtime.json", "run.finish")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(tmp_path / "runs"), "--runtime-config-file", str(config_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "the provider is down" in result.output, (
+        f"the teardown masked the failure that actually needs diagnosing: {result.output}"
+    )
+    assert "close() failed" in result.output, (
+        f"the teardown failure was swallowed instead of demoted: {result.output}"
+    )
+
+
 def test_cli_run_refuses_an_adapter_offering_open_without_close(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

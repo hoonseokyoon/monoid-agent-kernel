@@ -359,7 +359,7 @@ def run(
                 opener()
             except Exception as exc:
                 raise click.ClickException(f"model adapter open() failed: {exc}") from exc
-            adapter_scope.callback(_close_adapter, closer)
+            adapter_scope.push(_adapter_teardown(closer))
         result = AgentLoop(
             spec=spec,
             subagent_definitions=subagent_definitions,
@@ -381,14 +381,17 @@ def run(
                 else None
             ),
         ).run_once(instruction)
-        # Inside the scope, so the outcome is reported before the adapter is released. An exception
-        # from a cleanup callback replaces whatever is leaving the block, so with these two lines
-        # outside it a teardown that raised swallowed the result of a run that had completed.
+        # All inside the scope, because an exception from a cleanup callback replaces whatever is
+        # leaving the block. With the echoes outside, a teardown that raised swallowed the result of a
+        # run that had completed. With the failure raised outside, it was never reached at all: the
+        # teardown error left the block first and `result.error` -- the provider failure an operator
+        # needs -- was simply never reported. Raised in here, it is the exception already on its way
+        # out, and the teardown demotes itself to a warning beside it.
         _human_echo(f"status: {result.status}", stream_json=stream_json)
         if result.final_text:
             _human_echo(f"summary: {result.final_text}", stream_json=stream_json)
-    if result.error:
-        raise click.ClickException(result.error)
+        if result.error:
+            raise click.ClickException(result.error)
 
 
 @main.command()
@@ -1147,19 +1150,33 @@ def web_gateway_serve(
         server.server_close()
 
 
-def _close_adapter(closer: Any) -> None:
-    """Release the adapter's scope, reporting a failure as a CLI error rather than a traceback.
+def _adapter_teardown(closer: Any) -> Any:
+    """Release the adapter, reporting a teardown failure without ever replacing a real one.
 
-    Registered as the ``ExitStack`` callback rather than ``closer`` itself, so a teardown that raises
-    -- a connection pool failing to close is the ordinary way -- reads like every other failure this
-    command reports. The run's own outcome is echoed before the scope unwinds, so what is lost here is
-    only the cleanup, not the result.
+    Registered with ``ExitStack.push`` rather than ``callback`` so it can see whether an exception is
+    already leaving the block. Raising from a cleanup callback *replaces* that exception: a failing
+    ``close()`` superseded the run's own failure, and the provider error an operator actually needs
+    disappeared behind "close() failed". Measured -- a run failed by a dead provider, reported only as
+    a teardown error.
+
+    With nothing else on its way out, the failure is still the command's error, because then it is the
+    only signal there is. Alongside a real failure it is a footnote, on stderr so it neither
+    supersedes the error nor lands in ``--stream-json`` output.
     """
 
-    try:
-        closer()
-    except Exception as exc:
-        raise click.ClickException(f"model adapter close() failed: {exc}") from exc
+    def _exit(exc_type: Any, exc: Any, tb: Any) -> bool:
+        del exc, tb
+        try:
+            closer()
+        except Exception as close_exc:
+            message = f"model adapter close() failed: {close_exc}"
+            if exc_type is not None:
+                click.echo(f"warning: {message}", err=True)
+                return False
+            raise click.ClickException(message) from close_exc
+        return False
+
+    return _exit
 
 
 def _human_echo(message: str, *, stream_json: bool) -> None:
