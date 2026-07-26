@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from dataclasses import replace
@@ -319,33 +320,41 @@ def run(
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
-    result = AgentLoop(
-        spec=spec,
-        subagent_definitions=subagent_definitions,
-        model_adapter=_model_adapter(
-            runtime_config.model or ModelConfig(),
-            llm_gateway_url=llm_gateway_url or (runtime_config.model.gateway_url if runtime_config.model else None),
-            llm_gateway_token_env=llm_gateway_token_env,
-            llm_gateway_token_file=llm_gateway_token_file,
-            allow_direct_provider_api=allow_direct_provider_api,
-        ),
-        tool_providers=providers + ((skill_provider,) if skill_provider is not None else ()),
-        context_providers=(skill_provider,) if skill_provider is not None else (),
-        capability_broker=broker,
-        event_sinks=tuple(extra_sinks),
-        status_file=not no_status_file,
-        permission_policy=spec.permission_policy,
-        runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),
-        web_gateway_client=(
-            WebGatewayClient(
-                web_gateway_url,
-                token_env=web_gateway_token_env,
-                token_file=web_gateway_token_file,
-            )
-            if _runtime_config_uses_web(runtime_config) and web_gateway_url
-            else None
-        ),
-    ).run_once(instruction)
+    model_adapter = _model_adapter(
+        runtime_config.model or ModelConfig(),
+        llm_gateway_url=llm_gateway_url or (runtime_config.model.gateway_url if runtime_config.model else None),
+        llm_gateway_token_env=llm_gateway_token_env,
+        llm_gateway_token_file=llm_gateway_token_file,
+        allow_direct_provider_api=allow_direct_provider_api,
+    )
+    # One adapter serves every turn of this run, so an adapter that can hold its provider client
+    # open across turns should: the direct-OpenAI one builds a client per call otherwise, which
+    # costs far more than the request it carries. Duck-typed because only some adapters have a
+    # client to hold -- the gateway adapter owns its httpx client per call by design.
+    with contextlib.ExitStack() as adapter_scope:
+        if callable(getattr(model_adapter, "open", None)):
+            adapter_scope.enter_context(model_adapter)
+        result = AgentLoop(
+            spec=spec,
+            subagent_definitions=subagent_definitions,
+            model_adapter=model_adapter,
+            tool_providers=providers + ((skill_provider,) if skill_provider is not None else ()),
+            context_providers=(skill_provider,) if skill_provider is not None else (),
+            capability_broker=broker,
+            event_sinks=tuple(extra_sinks),
+            status_file=not no_status_file,
+            permission_policy=spec.permission_policy,
+            runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),
+            web_gateway_client=(
+                WebGatewayClient(
+                    web_gateway_url,
+                    token_env=web_gateway_token_env,
+                    token_file=web_gateway_token_file,
+                )
+                if _runtime_config_uses_web(runtime_config) and web_gateway_url
+                else None
+            ),
+        ).run_once(instruction)
     _human_echo(f"status: {result.status}", stream_json=stream_json)
     if result.final_text:
         _human_echo(f"summary: {result.final_text}", stream_json=stream_json)

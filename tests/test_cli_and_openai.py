@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import threading
+import time
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
 
+from support.http import serving
 from support.runtime import runtime_config, tool_binding
 
 from monoid_agent_kernel.cli import main
@@ -301,6 +308,68 @@ class _AsyncStream:
             raise StopAsyncIteration from None
 
 
+class _StubClient:
+    """Stands in for an SDK client: ``responses``, ``close()`` and ``is_closed()``.
+
+    The close half is part of the contract, not decoration -- it is how the adapter releases the
+    connection pool, and it is what the scope calls at its end. Two of these stubs used to model
+    only ``responses``, and the tests passed while every pool the adapter opened was leaked.
+    ``close()`` is sync here and awaited in :class:`_StubAsyncClient`, mirroring the SDK's split.
+    """
+
+    def __init__(self, responses: Any, close_error: Exception | None = None) -> None:
+        self.responses = responses
+        self.closed = False
+        self._close_error = close_error
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    def _mark_closed(self) -> None:
+        self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
+
+    def close(self) -> None:
+        self._mark_closed()
+
+
+class _StubAsyncClient(_StubClient):
+    async def close(self) -> None:  # type: ignore[override]
+        self._mark_closed()
+
+
+def _stub_openai(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    responses: Any,
+    *,
+    close_error: Exception | None = None,
+) -> list[_StubClient]:
+    """Patch ``openai.OpenAI``/``openai.AsyncOpenAI`` to hand out a stub client.
+
+    Returns the list the adapter's constructions land in. ``close_error`` makes the teardown
+    itself fail, which is a failure surface the adapter owns and has to classify.
+    """
+    stub = _StubAsyncClient if attribute == "AsyncOpenAI" else _StubClient
+    built: list[_StubClient] = []
+
+    def _build(**_kwargs: Any) -> _StubClient:
+        built.append(stub(responses, close_error))
+        return built[-1]
+
+    monkeypatch.setattr(f"openai.{attribute}", _build)
+    return built
+
+
+def _async_stream_responses(events: list) -> Any:
+    class _Responses:
+        async def create(self, **kwargs):  # noqa: ANN003, ANN202
+            return _AsyncStream(events)
+
+    return _Responses()
+
+
 def test_openai_astream_yields_reasoning_delta_then_text(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("openai")  # exercises the real SDK stream; skip on a minimal install
     # DX-13b: a reasoning-summary stream event maps to a ReasoningDelta, distinct from the
@@ -311,15 +380,7 @@ def test_openai_astream_yields_reasoning_delta_then_text(monkeypatch: pytest.Mon
         _Ev("response.completed", response=_StreamResp()),
     ]
 
-    class _Responses:
-        async def create(self, **kwargs):  # noqa: ANN003, ANN202
-            return _AsyncStream(events)
-
-    class _AsyncClient:
-        def __init__(self, **kwargs) -> None:  # noqa: ANN003
-            self.responses = _Responses()
-
-    monkeypatch.setattr("openai.AsyncOpenAI", _AsyncClient)
+    _stub_openai(monkeypatch, "AsyncOpenAI", _async_stream_responses(events))
     adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"), api_key="test", allow_direct_provider_api=True)
     request = ModelRequest(instruction="hi", system_prompt="", tools=())
 
@@ -352,15 +413,7 @@ def test_openai_astream_captures_incomplete_stop_reason(monkeypatch: pytest.Monk
         _Ev("response.incomplete", response=_IncompleteResp()),
     ]
 
-    class _Responses:
-        async def create(self, **kwargs):  # noqa: ANN003, ANN202
-            return _AsyncStream(events)
-
-    class _AsyncClient:
-        def __init__(self, **kwargs) -> None:  # noqa: ANN003
-            self.responses = _Responses()
-
-    monkeypatch.setattr("openai.AsyncOpenAI", _AsyncClient)
+    _stub_openai(monkeypatch, "AsyncOpenAI", _async_stream_responses(events))
     adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"), api_key="test", allow_direct_provider_api=True)
     request = ModelRequest(instruction="hi", system_prompt="", tools=())
 
@@ -515,11 +568,7 @@ def test_openai_adapter_maps_provider_400_to_model_adapter_error(monkeypatch: py
         def create(self, **kwargs):  # noqa: ANN003
             raise _FakeBadRequest()
 
-    class _FakeClient:
-        def __init__(self, **kwargs) -> None:  # noqa: ANN003
-            self.responses = _FakeResponses()
-
-    monkeypatch.setattr("openai.OpenAI", _FakeClient)
+    built = _stub_openai(monkeypatch, "OpenAI", _FakeResponses())
     adapter = OpenAIModelAdapter(ModelConfig(), api_key="test", allow_direct_provider_api=True)
     request = ModelRequest(instruction="my secret prompt", system_prompt="", tools=())
     with pytest.raises(ModelAdapterError) as excinfo:
@@ -529,3 +578,496 @@ def test_openai_adapter_maps_provider_400_to_model_adapter_error(monkeypatch: py
     assert err.retryable is False
     assert err.provider_error_code == "unsupported_value"
     assert "secret prompt" not in str(err)  # no prompt/body leak
+    # A rejected call still owns its client: the throwing path releases the pool too.
+    assert [client.closed for client in built] == [True]
+
+
+# --- Client ownership: the adapter must not leak its HTTP connection pool --------------
+#
+# Driven against a local stand-in with the real SDK over a real socket, because the property is
+# what the SDK's httpx connection pool does -- a hand-written stub cannot show it. Mirrors the
+# gateway streaming tests' shape (``serving`` + ``asyncio.run``, no pytest-asyncio).
+
+
+_STANDIN_RESPONSE: dict[str, Any] = {
+    "id": "resp_1",
+    "object": "response",
+    "created_at": 0,
+    "model": "gpt-5.5",
+    "status": "completed",
+    "output": [
+        {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Hi", "annotations": []}],
+        }
+    ],
+    "parallel_tool_calls": False,
+    "tool_choice": "auto",
+    "tools": [],
+    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+}
+
+# A text delta ahead of the terminal event on purpose: it gives the abandonment test a yield
+# *inside* the stream loop to park on, which is the position the leak depended on.
+_STANDIN_SSE = "".join(
+    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+    for event in (
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Hi",
+            "logprobs": [],
+        },
+        {"type": "response.completed", "sequence_number": 2, "response": _STANDIN_RESPONSE},
+    )
+).encode("utf-8")
+
+_STANDIN_ERROR = json.dumps(
+    {"error": {"message": "unsupported value", "type": "invalid_request_error", "code": "unsupported_value"}}
+).encode("utf-8")
+
+# Three, not one: one call proves a client is closed, several prove nothing accumulates across
+# calls -- the reported symptom was open connections growing with the call count.
+_STANDIN_CALLS = 3
+
+
+class _ResponsesStandIn(BaseHTTPRequestHandler):
+    """Enough of the Responses API to drive the real SDK.
+
+    ``HTTP/1.1`` with a ``Content-Length`` deliberately: the connection is then keep-alive, so a
+    pool that is never closed holds a socket open here and the server's count sees it. Serves the
+    streamed and non-streamed shapes off the request's own ``stream`` flag.
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        self.server.track(+1)
+
+    def finish(self) -> None:
+        self.server.track(-1)
+        super().finish()
+
+    def do_GET(self) -> None:  # /healthz, which ``serving`` polls before yielding
+        self._respond(200, b"ok", "text/plain")
+
+    def do_POST(self) -> None:
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.server.status != 200:
+            self._respond(self.server.status, _STANDIN_ERROR, "application/json")
+        elif json.loads(body).get("stream"):
+            self._respond(200, _STANDIN_SSE, "text/event-stream")
+        else:
+            self._respond(200, json.dumps(_STANDIN_RESPONSE).encode("utf-8"), "application/json")
+
+    def _respond(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args: Any) -> None:
+        return None  # keep pytest output clean
+
+
+class _StandInServer(ThreadingHTTPServer):
+    """Counts connections that are still open.
+
+    The client-side ``is_closed()`` assertions say the adapter released the client; this says the
+    sockets actually went away, observed from outside the code under test.
+    """
+
+    def __init__(self, status: int = 200) -> None:
+        super().__init__(("127.0.0.1", 0), _ResponsesStandIn)
+        self.status = status
+        self.live = 0
+        self._live_lock = threading.Lock()
+
+    def track(self, delta: int) -> None:
+        with self._live_lock:
+            self.live += delta
+
+
+@contextlib.contextmanager
+def _responses_stand_in(monkeypatch: pytest.MonkeyPatch, *, status: int = 200) -> Iterator[_StandInServer]:
+    """Serve the stand-in and point the SDK at it via ``OPENAI_BASE_URL``."""
+    server = _StandInServer(status)
+    with serving(server) as base_url:
+        monkeypatch.setenv("OPENAI_BASE_URL", f"{base_url}/v1")
+        yield server
+
+
+def _recording_client(monkeypatch: pytest.MonkeyPatch, attribute: str) -> list[Any]:
+    """Keep every real SDK client the adapter builds, so a test can ask whether it was closed.
+
+    The adapter builds one per call and never exposes it, and subclassing leaves the SDK's own
+    construction and pool behaviour intact.
+    """
+    import openai
+
+    built: list[Any] = []
+    real = getattr(openai, attribute)
+
+    class _Recorded(real):  # type: ignore[misc, valid-type]
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(openai, attribute, _Recorded)
+    return built
+
+
+def _standin_adapter() -> OpenAIModelAdapter:
+    return OpenAIModelAdapter(ModelConfig(model="gpt-5.5"), api_key="test", allow_direct_provider_api=True)
+
+
+def _standin_request() -> ModelRequest:
+    return ModelRequest(instruction="hi", system_prompt="sys", tools=())
+
+
+def _wait_for_no_open_connections(server: _StandInServer, *, timeout_s: float = 10.0) -> int:
+    """Poll until the server sees no open connection, and report what is left if it never does.
+
+    Closing the client closes the socket, so a call that owns its client lands here in
+    milliseconds; polling rather than sleeping a fixed interval keeps that from being a timing
+    assumption on a loaded machine.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if server.live == 0:
+            return 0
+        time.sleep(0.02)
+    return server.live
+
+
+def test_openai_astream_closes_its_client_when_the_stream_is_drained(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A client built per call has to be released per call.
+
+    Nothing closed these, so each drained call left an httpx pool holding its keep-alive socket
+    open until a garbage collection that may never come -- server-side connections climbed with
+    the call count, and the finaliser that eventually ran tried to ``aclose()`` on a loop that had
+    already closed. The gateway adapter never had this: its client lives in an ``async with``.
+    """
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "AsyncOpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter, request = _standin_adapter(), _standin_request()
+
+        async def drain() -> list[list[Any]]:
+            return [[chunk async for chunk in adapter.astream_turn(request)] for _ in range(_STANDIN_CALLS)]
+
+        calls = asyncio.run(drain())
+        still_open = _wait_for_no_open_connections(server)
+
+    assert len(built) == _STANDIN_CALLS  # the adapter builds one client per call
+    assert [client.is_closed() for client in built] == [True] * _STANDIN_CALLS
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+    # And the turn survives the ownership: closing the client must not cost the terminal chunk.
+    turn = assemble_streamed_turn(calls[-1])
+    assert turn.final_text == "Hi"
+    assert turn.usage["total_tokens"] == 5
+
+
+def test_openai_astream_closes_its_client_when_the_consumer_abandons_mid_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exit path a close written after the stream loop never reaches.
+
+    A consumer that stops early -- a cancelled run, a deadline, a caller that takes what it needs
+    -- closes the generator, and that throws ``GeneratorExit`` at the yield it is parked on. Only a
+    close bound to the generator's own exit runs then, which is why this is the case that decides
+    between ``async with`` and a close at the end of the body.
+    """
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "AsyncOpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter, request = _standin_adapter(), _standin_request()
+
+        async def abandon() -> Any:
+            stream = adapter.astream_turn(request)
+            first = await anext(stream)
+            await stream.aclose()
+            return first
+
+        first = asyncio.run(abandon())
+        still_open = _wait_for_no_open_connections(server)
+
+    # Parked inside the stream loop, not past it -- otherwise this asserts the drained case again.
+    assert isinstance(first, TextDelta) and first.text == "Hi"
+    assert [client.is_closed() for client in built] == [True]
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
+def test_openai_astream_closes_its_client_when_the_provider_rejects_the_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The third exit path: a call that raises still owns the pool it opened."""
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "AsyncOpenAI")
+    with _responses_stand_in(monkeypatch, status=400) as server:
+        adapter, request = _standin_adapter(), _standin_request()
+
+        async def drain() -> list[Any]:
+            return [chunk async for chunk in adapter.astream_turn(request)]
+
+        with pytest.raises(ModelAdapterError) as excinfo:
+            asyncio.run(drain())
+        still_open = _wait_for_no_open_connections(server)
+
+    assert excinfo.value.http_status == 400  # still classified, not swallowed by the new scope
+    assert [client.is_closed() for client in built] == [True]
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
+def test_openai_next_turn_closes_its_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sync path has no ``GeneratorExit`` to answer for, but the same unclosed pool."""
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "OpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        turns = [_standin_adapter().next_turn(_standin_request()) for _ in range(_STANDIN_CALLS)]
+        still_open = _wait_for_no_open_connections(server)
+
+    assert [turn.final_text for turn in turns] == ["Hi"] * _STANDIN_CALLS
+    assert [client.is_closed() for client in built] == [True] * _STANDIN_CALLS
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
+def test_openai_astream_classifies_a_failure_from_the_clients_own_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owning the client puts its teardown on this call's failure surface.
+
+    Closing a pool can fail -- ``httpx.CloseError`` is the realistic instance -- and an exception
+    raised in ``__aexit__`` *replaces* whatever was propagating through it. A classifier left
+    inside the block would therefore let a raw error out of a seam whose whole contract is
+    ``ModelAdapterError``: ``AgentLoop._recoverable_turn_error`` looks at no other type, so an
+    unclassified one terminalizes the run instead of ending a single turn. The gateway adapter
+    answers for the same surface on its own streamed path.
+    """
+    pytest.importorskip("openai")
+    events = [_Ev("response.output_text.delta", delta="Hi"), _Ev("response.completed", response=_StreamResp())]
+    built = _stub_openai(
+        monkeypatch,
+        "AsyncOpenAI",
+        _async_stream_responses(events),
+        close_error=RuntimeError("pool teardown failed"),
+    )
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"), api_key="test", allow_direct_provider_api=True)
+    request = ModelRequest(instruction="hi", system_prompt="", tools=())
+
+    async def _drain() -> list:
+        return [chunk async for chunk in adapter.astream_turn(request)]
+
+    with pytest.raises(ModelAdapterError) as excinfo:
+        asyncio.run(_drain())
+
+    assert excinfo.value.provider_error_code == "unclassified_provider_error"
+    assert "RuntimeError" in str(excinfo.value)  # the type aids debugging; no body is echoed
+    assert [client.closed for client in built] == [True]  # the teardown was reached, then failed
+
+
+def test_openai_next_turn_classifies_a_failure_from_the_clients_own_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync twin: ``__exit__`` sits inside the classified region too."""
+    pytest.importorskip("openai")
+
+    class _Responses:
+        def create(self, **_kwargs: Any) -> Any:
+            return _StreamResp()
+
+    built = _stub_openai(
+        monkeypatch, "OpenAI", _Responses(), close_error=RuntimeError("pool teardown failed")
+    )
+    adapter = OpenAIModelAdapter(ModelConfig(), api_key="test", allow_direct_provider_api=True)
+
+    with pytest.raises(ModelAdapterError) as excinfo:
+        adapter.next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert excinfo.value.provider_error_code == "unclassified_provider_error"
+    assert [client.closed for client in built] == [True]
+
+
+# --- Client reuse inside an explicit scope ---------------------------------------------
+#
+# The counterweight to the `*_closes_its_client_*` tests above: those pin what an unscoped call
+# does (own its client, close it), these pin what a scope changes (one client, closed once at the
+# end) and what it must not change.
+
+
+def test_openai_astream_reuses_one_client_across_calls_inside_a_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scope is what makes reuse safe, and reuse is the whole point of the scope.
+
+    Unscoped, every call pays a full client construction -- measured at ~0.95s warm against ~13ms
+    for the request itself, and on this path that cost is synchronous work sitting on the event
+    loop, so the run's own cancel/deadline race cannot fire while it runs. A caller that outlives
+    a call can pay it once instead.
+    """
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "AsyncOpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter, request = _standin_adapter(), _standin_request()
+
+        async def go() -> list[bool]:
+            async with adapter:
+                for _ in range(_STANDIN_CALLS):
+                    async for _chunk in adapter.astream_turn(request):
+                        pass
+                return [client.is_closed() for client in built]
+
+        during = asyncio.run(go())
+        still_open = _wait_for_no_open_connections(server)
+
+    assert len(built) == 1, "the scope must build one client, not one per call"
+    assert during == [False], "and hold it open between calls -- otherwise there is no reuse"
+    assert built[0].is_closed(), "the scope closes it on the way out"
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
+def test_openai_next_turn_reuses_one_client_across_calls_inside_a_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync twin. No loop affinity on this client, so the scope is a plain ``with``."""
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "OpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter = _standin_adapter()
+        with adapter:
+            turns = [adapter.next_turn(_standin_request()) for _ in range(_STANDIN_CALLS)]
+            during = [client.is_closed() for client in built]
+        still_open = _wait_for_no_open_connections(server)
+
+    assert [turn.final_text for turn in turns] == ["Hi"] * _STANDIN_CALLS
+    assert len(built) == 1
+    assert during == [False]
+    assert built[0].is_closed()
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
+def test_openai_scope_rebuilds_a_client_whose_loop_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scope can outlive the loop its client is bound to. The client cannot.
+
+    An ``AsyncOpenAI`` client's sockets belong to the loop that created them, so one carried over
+    from a finished loop is unusable rather than merely stale -- handing it out would fail on
+    first use. It has to be dropped and rebuilt, and quietly: a caller that spans loops has done
+    nothing wrong, only something the client cannot follow.
+    """
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "AsyncOpenAI")
+    with _responses_stand_in(monkeypatch):
+        adapter, request = _standin_adapter(), _standin_request()
+        adapter.open()
+
+        async def calls(close: bool = False) -> list[Any]:
+            # Two calls per loop, so the count below separates per-loop from per-call: caching
+            # off, this is four clients; shared across loops, one; correct, two.
+            chunks: list[Any] = []
+            for _ in range(2):
+                chunks = [chunk async for chunk in adapter.astream_turn(request)]
+            if close:
+                await adapter.aclose()
+            return chunks
+
+        asyncio.run(calls())  # loop A builds the scope's client and reuses it
+        first = built[0]
+        second = asyncio.run(calls(close=True))  # loop B cannot use A's, and ends the scope on B
+
+    assert len(built) == 2, "one client per loop -- not shared across, and not one per call"
+    assert built[1] is not first
+    assert assemble_streamed_turn(second).final_text == "Hi", "the rebuilt client really works"
+    assert built[1].is_closed(), "the scope closed the client belonging to the loop it ended on"
+    # Deliberately no server-side connection assertion: ``first`` belongs to a loop that no longer
+    # exists, and ``close()`` is a coroutine that can only run there, so nothing can close it.
+    # That is the limitation ending an async scope with ``aclose`` on its own loop avoids; this
+    # path only promises not to *reuse* the dead client.
+
+
+def test_openai_scope_outlives_a_call_that_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failing call must not close a client it does not own.
+
+    Unscoped, a call that raises releases its own pool on the way out -- that is the point of the
+    ``finally``. Scoped, the same ``finally`` has to keep its hands off: one provider rejection
+    closing the shared client would either end the reuse silently or, worse, leave later turns
+    holding a closed client.
+    """
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "OpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter = _standin_adapter()
+        with adapter:
+            server.status = 400
+            with pytest.raises(ModelAdapterError) as excinfo:
+                adapter.next_turn(_standin_request())
+            survived = not built[0].is_closed()
+            server.status = 200
+            turn = adapter.next_turn(_standin_request())
+        still_open = _wait_for_no_open_connections(server)
+
+    assert excinfo.value.http_status == 400  # still classified, scope or no scope
+    assert survived, "the failed call closed a client the scope owns"
+    assert turn.final_text == "Hi", "and the scope still works afterwards"
+    assert len(built) == 1, "the same client was reused, not rebuilt after the failure"
+    assert built[0].is_closed()
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
+def test_cli_run_scopes_an_adapter_that_can_hold_its_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The run's one adapter is opened around every turn and closed after.
+
+    Nothing else in the CLI can do this: the adapter is built once per run and all the turns
+    happen inside ``run_once``, so without a scope here the direct-OpenAI adapter builds and
+    throws away a client per turn. Adapters with no client to hold -- the fakes, the gateway one
+    -- have no ``open`` and are left alone, which every other CLI test above covers.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    events: list[str] = []
+
+    class _ScopedAdapter:
+        def __init__(self) -> None:
+            self._inner = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+
+        def open(self) -> _ScopedAdapter:
+            events.append("open")
+            return self
+
+        def close(self) -> None:
+            events.append("close")
+
+        def __enter__(self) -> _ScopedAdapter:
+            return self.open()
+
+        def __exit__(self, *_exc: object) -> None:
+            self.close()
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            events.append("turn")
+            return self._inner.next_turn(request)
+
+    monkeypatch.setattr("monoid_agent_kernel.cli._model_adapter", lambda *_a, **_k: _ScopedAdapter())
+    config_file = _write_config(tmp_path / "runtime.json", "run.finish")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(tmp_path / "runs"), "--runtime-config-file", str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # Order, not just membership: a close before the turn would defeat the reuse, and an open
+    # after it would never have covered the turn at all.
+    assert events == ["open", "turn", "close"]
