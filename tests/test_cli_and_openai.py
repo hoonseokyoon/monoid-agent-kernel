@@ -992,6 +992,57 @@ def test_openai_scope_rebuilds_a_client_whose_loop_is_gone(monkeypatch: pytest.M
     # path only promises not to *reuse* the dead client.
 
 
+def test_openai_scope_rebuilds_a_client_closed_underneath_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scope holds a client it does not exclusively control, so it checks before handing it out.
+
+    `test_openai_scope_rebuilds_a_client_whose_loop_is_gone` covers the other half of the same
+    condition -- a client bound to a loop that has moved on. This is the half where the client is
+    still on the right loop and simply closed: whoever holds the adapter can close the client
+    directly, and `close()`/`aclose()` themselves close it while another thread may still be inside a
+    call. Handing a closed client out fails on first use, and it fails for every remaining call in
+    the scope, because nothing would ever replace it.
+    """
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "AsyncOpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter, request = _standin_adapter(), _standin_request()
+
+        async def go() -> list[Any]:
+            async with adapter:
+                async for _chunk in adapter.astream_turn(request):
+                    pass
+                await built[0].close()  # closed underneath the scope, on the scope's own loop
+                return [chunk async for chunk in adapter.astream_turn(request)]
+
+        chunks = asyncio.run(go())
+        still_open = _wait_for_no_open_connections(server)
+
+    assert len(built) == 2, "a closed client was handed out again instead of being rebuilt"
+    assert built[1] is not built[0]
+    assert assemble_streamed_turn(chunks).final_text == "Hi", "the rebuilt client really works"
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
+def test_openai_sync_scope_rebuilds_a_client_closed_underneath_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync twin. Same guard, separate accessor -- and only one of the two was ever read."""
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "OpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter = _standin_adapter()
+        with adapter:
+            adapter.next_turn(_standin_request())
+            built[0].close()
+            turn = adapter.next_turn(_standin_request())
+        still_open = _wait_for_no_open_connections(server)
+
+    assert len(built) == 2, "a closed client was handed out again instead of being rebuilt"
+    assert built[1] is not built[0]
+    assert turn.final_text == "Hi", "the rebuilt client really works"
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
 def test_openai_scope_outlives_a_call_that_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failing call must not close a client it does not own.
 
