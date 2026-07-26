@@ -210,6 +210,9 @@ class GatewayModelAdapter:
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
         attempt = 0
+        # Bound before the client exists, because the client's own lifecycle can fail: `__aexit__`
+        # raises after the loop, where a loop-local would still be unbound if no attempt reached it.
+        committed = False
         try:
             # One client for the whole call, not one per attempt. Constructing it is synchronous and
             # not cheap -- measured at ~285ms warm here, and the event loop is unavailable for all of
@@ -255,7 +258,7 @@ class GatewayModelAdapter:
                             retry.backoff_multiplier,
                             retry.jitter_s,
                         )
-                    committed = False
+                    committed = False  # reset per attempt; see the binding above the loop
                     try:
                         async with client.stream("POST", url, headers=headers, content=body) as response:
                             if response.status_code != 200:
@@ -294,6 +297,30 @@ class GatewayModelAdapter:
             if last_error is not None:
                 raise last_error
             raise ModelAdapterError("LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR)
+        except httpx.HTTPError as exc:
+            # The client's own lifecycle -- construction, `__aenter__`, and the `__aexit__` that
+            # tears the pool down -- sits *outside* the per-attempt handler now that the client is
+            # hoisted out of the retry loop. Before the hoist it was inside, so those failures were
+            # classified like any other transport error; afterwards they escaped as raw `httpx`
+            # exceptions and only the catch-all below saw them.
+            #
+            # Unclassified is not merely less descriptive. `AgentLoop._recoverable_turn_error` keys
+            # off `retryable` and a 4xx `http_status`, both of which a raw `httpx` error lacks, so a
+            # failure that used to end one turn -- recoverably, with the session alive and the turn
+            # re-attemptable -- terminalized the whole run instead, wrote `failure.json`, and made no
+            # retry at all. `httpx.CloseError` from a pool teardown is an ordinary way to reach this.
+            #
+            # `committed` draws the same line the in-loop handler draws: once deltas have gone out,
+            # replaying would duplicate them, so a late failure is terminal rather than retryable.
+            error = ModelAdapterError(
+                f"LLM gateway stream interrupted: {exc}"
+                if committed
+                else f"LLM gateway stream connection error: {exc}",
+                provider_error_code=GATEWAY_NETWORK_ERROR,
+                retryable=not committed,
+            )
+            _stamp_retry(error, attempt)
+            raise error from exc
         # Same marking as the sync path. Stream retries are all pre-commit, so an error
         # escaping after the first attempt means the stream really was retried.
         except Exception as exc:

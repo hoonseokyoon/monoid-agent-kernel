@@ -22,6 +22,8 @@ from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ModelRetryConfig, RunLimits
 from monoid_agent_kernel.errors import ModelAdapterError
+import monoid_agent_kernel.providers.gateway as gateway_module
+from monoid_agent_kernel.providers.gateway import GATEWAY_NETWORK_ERROR
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -454,3 +456,81 @@ def test_the_streamed_retry_is_reported_before_the_wait_not_after_it(monkeypatch
     )
     marker = [c for c in chunks if getattr(c, "provider_retried", False)]
     assert marker, "the wire half of the evidence must also precede the wait"
+
+
+def _client_stub(httpx: Any, *, fail_at: str) -> Any:
+    """An `AsyncClient` whose *own lifecycle* fails, with the stream itself perfectly healthy."""
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):  # noqa: ANN202
+            yield 'data: {"type":"text_delta","text":"hi"}'
+            yield ""
+            yield 'data: {"type":"turn_complete","response_id":"turn_1"}'
+            yield ""
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            if fail_at == "construct":
+                raise httpx.ConnectError("pool construction failed")
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            if fail_at == "close":
+                raise httpx.CloseError("pool teardown failed")
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            return _Response()
+
+    return _Client
+
+
+@pytest.mark.parametrize(
+    ("fail_at", "retryable", "fragment"),
+    [("close", False, "interrupted"), ("construct", True, "connection error")],
+)
+def test_a_failure_in_the_clients_own_lifecycle_is_still_classified(
+    monkeypatch: Any, fail_at: str, retryable: bool, fragment: str
+) -> None:
+    """Hoisting the client out of the retry loop moved its lifecycle outside the handler.
+
+    Construction, `__aenter__` and the `__aexit__` that tears the pool down used to sit inside the
+    per-attempt `try`, so an `httpx` failure from any of them was classified like any other transport
+    error. After the hoist only `client.stream(...)` was covered, and those escaped raw.
+
+    Unclassified is not just less descriptive. `AgentLoop._recoverable_turn_error` keys off
+    `retryable` and a 4xx `http_status`, neither of which a raw `httpx` error carries, so a failure
+    that had ended one turn -- recoverably, session alive, turn re-attemptable -- terminalized the
+    whole run and wrote `failure.json` instead. `httpx.CloseError` from a pool teardown is an
+    ordinary way in.
+
+    `committed` draws the same line the in-loop handler draws: once deltas have gone out, replaying
+    would duplicate them, so a late failure is terminal rather than retryable.
+    """
+    httpx = pytest.importorskip("httpx")
+    monkeypatch.setattr(httpx, "AsyncClient", _client_stub(httpx, fail_at=fail_at))
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid",
+            retry=ModelRetryConfig(max_attempts=2),
+        ),
+        token="t",
+    )
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _stream(adapter)
+
+    assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
+    assert caught.value.retryable is retryable
+    assert fragment in str(caught.value)

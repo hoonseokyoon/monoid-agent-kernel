@@ -74,6 +74,16 @@ out in commit messages and here.
 
 ### Fixed
 
+- A transport failure from the streaming client's own lifecycle is classified again. Hoisting the
+  `httpx.AsyncClient` out of the retry loop (below) left its construction, `__aenter__` and pool
+  teardown outside the per-attempt handler, so an `httpx.CloseError` or `PoolTimeout` escaped as a
+  raw `httpx` exception. That is not merely a worse message: `_recoverable_turn_error` keys off
+  `retryable` and a 4xx `http_status`, neither of which a raw `httpx` error carries, so a failure
+  that had ended one turn recoverably — session alive, turn re-attemptable — terminalized the whole
+  run and wrote `failure.json` instead. Now classified as `gateway_network_error`, retryable unless
+  deltas were already committed, matching the previous release. One difference remains by design:
+  a client whose *construction* fails is no longer retried per attempt (1 attempt, not 3), since the
+  client is built once per call.
 - A stream the run has given up on no longer delivers its remaining chunks into the *next* turn.
   Pre-existing — it reproduces identically on the previous release, which had the same unguarded
   relay at both of its streamed drive sites — and fixed here because this release rewrote that code
@@ -196,6 +206,12 @@ out in commit messages and here.
   cancellation and deadline are raced on that loop, so a run told to stop kept waiting for a provider
   it had already given up on. The wait is now awaited; the schedule is unchanged and shared with the
   sync path, which keeps its blocking sleep because it runs on a thread.
+- `GatewayModelAdapter.astream_turn` builds one `httpx.AsyncClient` per *call* rather than per
+  *attempt*. Constructing one is synchronous and not cheap — ~285ms warm — and inside the retry loop
+  that cost was paid again on every retry, with the event loop unavailable throughout: the same
+  defect as the blocking backoff above, one statement later. Retries now also reuse the connection
+  pool. A host counting client constructions, or relying on a fresh pool per attempt, will see the
+  difference.
 - An adapter that cancels its *own* call is now reported as `ModelAdapterError`
   (`model_adapter_cancelled`) instead of raising `asyncio.CancelledError` out of the run. The two
   are different events — the run stopping versus the adapter failing — and only the second is the
