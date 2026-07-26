@@ -35,6 +35,7 @@ from typing import Any
 
 from monoid_agent_kernel.core._sync_bridge import (
     CalleeCancelled,
+    abandon_unwaited_call,
     await_abandonable_call,
     consume_task_outcome,
     is_async_callable,
@@ -787,12 +788,27 @@ class ModelCallRunner:
         covers all of them.
         """
 
+        # Resolved before the wait is entered, and not in the argument list, because `pending` is
+        # already live by the time this method runs -- on the blocking path it is a daemon worker
+        # inside the provider. `await_abandonable_call` sets its cleanup up inside itself, so an
+        # accessor raising here used to leave that worker running with its future neither detached
+        # nor consumed. Same shape as the registration failure the bridge already guards against:
+        # anything that can fail after a call is live has to release it.
+        #
+        # The static field is what the detach is given, not `_grace_s()`: that is the accessor which
+        # may have just raised.
+        try:
+            token = self._token()
+            grace_s = self._grace_s()
+        except BaseException:
+            await abandon_unwaited_call(pending, grace_s=self.cancel_grace_s)
+            raise
         try:
             return await await_abandonable_call(
                 pending,
                 deadline=deadline,
-                token=self._token(),
-                grace_s=self._grace_s(),
+                token=token,
+                grace_s=grace_s,
                 check_boundary=self._check_cancel_or_deadline,
             )
         except CalleeCancelled as exc:

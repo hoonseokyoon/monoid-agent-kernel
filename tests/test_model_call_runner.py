@@ -2350,6 +2350,71 @@ def test_a_bookkeeping_failure_does_not_orphan_the_call_it_already_started(caplo
     assert finished.wait(timeout=5.0), "the worker should still finish; it is abandoned, not killed"
 
 
+@pytest.mark.parametrize(
+    ("accessor", "starts_the_call"),
+    [("current_cancel_grace_s", True), ("current_cancellation_token", False)],
+)
+def test_a_race_accessor_that_raises_does_not_orphan_a_live_call(
+    caplog: Any, accessor: str, starts_the_call: bool
+) -> None:
+    """The sibling of the test above: the *other* thing that runs after the call is live.
+
+    `_aawait`'s race arguments were resolved in its own argument list, and `pending` is already a
+    running worker by then. An accessor raising there landed between starting the call and entering
+    the wait that owns the cleanup, so the worker was left running with nobody holding its outcome --
+    and silently, which is the one thing this module claims never to do. Measured before the fix:
+    `abandonment reported: False`.
+
+    The two accessors are genuinely not symmetric, which is why both are here. The pre-dispatch
+    boundary check resolves the *token* before anything is dispatched, so a token that raises fails
+    with no call to orphan -- `starts_the_call` is the assertion that pins that, and it breaks if the
+    token ever stops being read before dispatch. The grace has no such earlier reader. Guarding both
+    anyway: which accessor is touched first is an implementation detail, not a contract.
+    """
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            started.set()
+            release.wait(timeout=5)
+            return ModelTurn(final_text="nobody is waiting for this")
+
+    def hostile() -> Any:
+        raise RuntimeError("accessor exploded")
+
+    runner = ModelCallRunner(
+        adapter=BlockingAdapter(),
+        cancel_grace_s=0.02,
+        thread_name="nar-model-call-accessor-test",
+        **{accessor: hostile},
+    )
+
+    async def run() -> None:
+        await runner.acall(REQUEST)
+
+    try:
+        with caplog.at_level("WARNING", logger="monoid_agent_kernel.core.sync_bridge"):
+            with pytest.raises(RuntimeError, match="accessor exploded"):
+                asyncio.run(run())
+
+        assert started.is_set() is starts_the_call, (
+            "the accessor was resolved on the wrong side of dispatch"
+        )
+        reported = any("abandoned a synchronous call" in r.message for r in caplog.records)
+        assert reported is starts_the_call, (
+            "a call left running has to be detached and reported; one that never started has "
+            f"nothing to report. started={started.is_set()} reported={reported}"
+        )
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name == "nar-model-call-accessor-test":
+                thread.join(timeout=5)
+
+
 # --- a stream the run gave up on must stop talking to the call that started it -------------------
 
 

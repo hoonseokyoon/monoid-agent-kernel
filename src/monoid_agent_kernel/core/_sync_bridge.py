@@ -303,6 +303,22 @@ async def await_abandonable_call(
             consume_task_outcome(task)
 
 
+async def abandon_unwaited_call(pending: Any, *, grace_s: float) -> None:
+    """Release a call that was started but whose wait will never be entered.
+
+    ``await_abandonable_call`` sets up its cleanup *inside* itself, so anything that fails between
+    starting a call and entering that wait leaves the callee running with nobody holding its outcome:
+    a daemon worker still in the provider, and a future that will report an unretrieved exception
+    when it is collected. Normalizes ``pending`` the same way the wait does, so the two cannot
+    disagree about what a call is, and then hands it to the ordinary detach path -- an abandonment
+    here is a real abandonment and is reported like one.
+    """
+
+    sync_call = pending if isinstance(pending, AbandonableSyncCall) else None
+    task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
+    await detach_unfinished_call(task, sync_call, grace_s=grace_s)
+
+
 async def detach_unfinished_call(
     task: asyncio.Future[Any],
     sync_call: AbandonableSyncCall[Any] | None,

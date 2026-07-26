@@ -74,6 +74,14 @@ out in commit messages and here.
 
 ### Fixed
 
+- A live model call is no longer left running silently when the bookkeeping around its wait fails.
+  `_aawait` resolved the cancel/deadline race's arguments in its own argument list, and on the
+  blocking path the call is already a daemon worker inside the provider by then — so a
+  `current_cancel_grace_s` that raised landed between starting the call and entering the wait that
+  owns the cleanup, leaving the worker with its future neither detached nor consumed, and with no
+  report. Silence is the one thing this path claims never to do. The values are resolved before the
+  wait now, and a failure detaches the call through the ordinary path, so the abandonment is
+  reported like any other. The same shape as the registration failure already guarded a layer down.
 - An adapter whose `open()` or `close()` raises now ends `monoid run` with a reported error instead of
   a bare traceback — a connection pool failing to construct or to tear down is the ordinary way in.
   Both calls sat below the handler that normalizes every other startup failure. The teardown case
