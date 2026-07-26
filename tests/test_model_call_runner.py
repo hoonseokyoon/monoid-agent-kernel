@@ -198,18 +198,30 @@ def test_a_chunk_is_delivered_before_should_abort_is_polled() -> None:
 
     The order is observable: it decides whether the text a user already saw stays on screen. It
     stops the chunk *after* the one that was in flight, never the one already handed over.
+
+    The predicate counts its own polls, and must not be phrased in terms of what the consumer has
+    seen. `len(seen) >= 2` was self-referential: swapping the deliver and the poll shifted both sides
+    together and produced the same two chunks, so the mutant that stops the in-flight chunk survived
+    the whole suite. Counting polls is the one formulation the swap cannot compensate for.
     """
     adapter = StreamingAdapter(chunks=[TextDelta("one"), TextDelta("two"), TextDelta("three")])
     seen: list[Any] = []
+    polls = {"n": 0}
+
+    def should_abort() -> bool:
+        polls["n"] += 1
+        return polls["n"] >= 2
 
     async def run() -> None:
         await ModelCallRunner(adapter=adapter).acall(
-            REQUEST, delta_consumer=seen.append, should_abort=lambda: len(seen) >= 2
+            REQUEST, delta_consumer=seen.append, should_abort=should_abort
         )
 
     with pytest.raises(ModelCallAborted):
         asyncio.run(run())
-    assert [chunk.text for chunk in seen] == ["one", "two"]
+    assert [chunk.text for chunk in seen] == ["one", "two"], (
+        "the chunk whose arrival triggered the stop was retracted instead of delivered"
+    )
     assert adapter.closed is True, "the provider's generator must be closed on abort"
 
 
@@ -2004,6 +2016,53 @@ def test_a_close_is_granted_the_grace_and_the_grace_is_read_live(caplog: Any) ->
     )
     assert not caplog.records, (
         f"a close that finished inside the grace was reported as abandoned: {caplog.records}"
+    )
+
+
+def test_an_abandoned_call_is_granted_the_live_grace_not_the_constructed_one(caplog: Any) -> None:
+    """The other place the grace is spent, and the other half of the same live read.
+
+    `_aclose_within_grace` is not the only spender: a call the *boundary* ends is detached by
+    `detach_unfinished_call`, which waits on the task for the interval `_aawait` hands it. That site
+    read the same field and nothing observed which value it read, so the snapshot spelling passed --
+    on the path where the grace matters most, since a deadline or a cancel is the ordinary way a call
+    outlives the run.
+
+    The callee suppresses the cancellation and needs 50ms to finish. A zero grace waits none of it
+    and reports the abandonment; the live 0.5s covers it, and reports nothing. The absent warning is
+    the assertion because it separates "the cleanup finished" from "the cleanup never started".
+    """
+
+    released: list[str] = []
+
+    class CancelSuppressingAdapter:
+        async def anext_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)  # a pooled connection being handed back
+                released.append("released")
+            return ModelTurn(final_text="too late")
+
+    async def run() -> None:
+        runner = ModelCallRunner(
+            adapter=CancelSuppressingAdapter(),
+            cancel_grace_s=0.0,  # a snapshot that would grant the cleanup nothing
+            current_cancel_grace_s=lambda: 0.5,
+        )
+        # A deadline in the *near future*, not an expired one: a task cancelled before it has run
+        # never enters the adapter, so there would be no cleanup to grant anything to.
+        with pytest.raises(RunTimeout):
+            await runner.acall(REQUEST, deadline=time.time() + 0.05)
+
+    with caplog.at_level("WARNING", logger="monoid_agent_kernel.core.sync_bridge"):
+        asyncio.run(run())
+
+    assert released == ["released"], "the callee's cleanup was cut off before it could finish"
+    assert not caplog.records, (
+        "a callee that finished inside the grace was reported as abandoned, so the grace being "
+        f"spent is not the live one: {[r.message for r in caplog.records]}"
     )
 
 
