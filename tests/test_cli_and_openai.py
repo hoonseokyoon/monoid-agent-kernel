@@ -1085,6 +1085,83 @@ def test_openai_sync_scope_rebuilds_a_client_closed_underneath_it(
     assert still_open == 0, f"{still_open} connection(s) still open server-side"
 
 
+def test_openai_close_ends_the_scope_so_later_calls_own_their_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ending the scope has to *detach* it, not just close what it held.
+
+    `_take_scope` is the single place that does, for both `close()` and `aclose()`, and both halves
+    of `close()`'s contract rest on it. A scope merely read and left in place stays live: the next
+    call finds it, rebuilds into it because the old client is closed, and gets `call_owned=False` --
+    so nothing ever closes that client. The leak this whole scope mechanism exists to fix comes
+    straight back, on the ordinary path of a caller that keeps using the adapter afterwards. And
+    `close()` stops being idempotent, since a second call finds the same scope again.
+    """
+    pytest.importorskip("openai")
+    built = _recording_client(monkeypatch, "OpenAI")
+    with _responses_stand_in(monkeypatch) as server:
+        adapter = _standin_adapter()
+        with adapter:
+            adapter.next_turn(_standin_request())
+        adapter.close()  # idempotent: the scope is already gone
+        turn = adapter.next_turn(_standin_request())
+        still_open = _wait_for_no_open_connections(server)
+
+    assert turn.final_text == "Hi"
+    assert len(built) == 2, "the call after the scope must build its own client"
+    assert [client.is_closed() for client in built] == [True, True], (
+        "a call made after the scope ended must own and close its client; one that rebuilt into a "
+        "scope still holding on has nobody to close it"
+    )
+    assert still_open == 0, f"{still_open} connection(s) still open server-side"
+
+
+def test_openai_only_a_client_from_another_loop_is_handed_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Foreign and closed are different conditions, and only the first needs a handoff.
+
+    A cached client is dropped when it belongs to another loop *or* when it is simply closed. Only
+    the foreign one has anything left to release, and it costs a cross-loop handoff to do it.
+    Treating a merely-closed client as foreign schedules a second `close()` onto the loop already
+    running -- work on a client that has nothing left to give up.
+    """
+    pytest.importorskip("openai")
+    import monoid_agent_kernel.providers.openai as openai_adapter
+
+    handed_back: list[Any] = []
+    monkeypatch.setattr(
+        openai_adapter,
+        "_release_foreign_async_client",
+        lambda client, loop: handed_back.append(loop),
+    )
+    _recording_client(monkeypatch, "AsyncOpenAI")
+    with _responses_stand_in(monkeypatch):
+        adapter, request = _standin_adapter(), _standin_request()
+        adapter.open()
+
+        async def call_then_close_the_client() -> None:
+            async for _chunk in adapter.astream_turn(request):
+                pass
+            await adapter._scope.async_client.close()
+            async for _chunk in adapter.astream_turn(request):  # rebuilds, same loop
+                pass
+
+        asyncio.run(call_then_close_the_client())
+        closed_on_this_loop = list(handed_back)
+        asyncio.run(call_then_close_the_client())  # a second loop: the first loop's client is stale
+        across_loops = list(handed_back)
+        # Measured before this: ``close()`` hands its client back unconditionally, which would
+        # otherwise land in the counts above and hide what the accessor decided.
+        adapter.close()
+
+    assert closed_on_this_loop == [], (
+        "a closed client on the running loop was handed back for a close it does not need"
+    )
+    # Counterweight: the foreign case does get handed back, so this is not asserting "never".
+    assert len(across_loops) == 1, "a client bound to a loop that has moved on must be handed back"
+
+
 def test_openai_scope_outlives_a_call_that_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failing call must not close a client it does not own.
 
