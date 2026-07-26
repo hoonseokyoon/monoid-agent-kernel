@@ -159,7 +159,9 @@ from monoid_agent_kernel.core.content import (
 
 # Model adapter contract
 from monoid_agent_kernel.providers.base import (
+    AddressedModelAdapter,
     AsyncModelAdapter,
+    ConfiguredModelAdapter,
     ModelAdapter,
     ModelRequest,
     ModelStreamChunk,
@@ -353,6 +355,8 @@ __all__ = [
     "StreamingModelAdapter",
     "MultimodalModelAdapter",
     "ProviderNamedModelAdapter",
+    "ConfiguredModelAdapter",
+    "AddressedModelAdapter",
     "ModelRequest",
     "ModelTurn",
     "ToolCall",

@@ -188,11 +188,13 @@ class AsyncModelAdapter(Protocol):
 # exist so the attribute names and meanings are part of the checked contract rather than a
 # convention, and so typed callers can narrow to "an adapter that reports this".
 #
-# Each member is declared as a read-only property, not an annotated attribute. That is what
-# makes the shipped adapters — which use ``ClassVar`` — satisfy these protocols: a protocol
-# member annotated ``name: str`` demands an *instance* variable and rejects a ``ClassVar``,
-# while a read-only property is satisfied by a ``ClassVar``, an instance attribute, and a
-# property alike.
+# Each member that is a *value* is declared as a read-only property, not an annotated attribute.
+# That is what makes the shipped adapters — which use ``ClassVar`` — satisfy these protocols: a
+# protocol member annotated ``name: str`` demands an *instance* variable and rejects a
+# ``ClassVar``, while a read-only property is satisfied by a ``ClassVar``, an instance attribute,
+# and a property alike. A member that answers a *question* is a method instead, because it takes
+# an argument a property cannot carry — ``AddressedModelAdapter.resolve_destination`` is the one
+# such member today.
 
 
 class MultimodalModelAdapter(Protocol):

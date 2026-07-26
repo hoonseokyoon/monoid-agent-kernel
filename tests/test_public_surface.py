@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 import subprocess
 import sys
@@ -109,6 +110,8 @@ EXPECTED_CONTRACTS_ALL = [
     "StreamingModelAdapter",
     "MultimodalModelAdapter",
     "ProviderNamedModelAdapter",
+    "ConfiguredModelAdapter",
+    "AddressedModelAdapter",
     "ModelRequest",
     "ModelTurn",
     "ToolCall",
@@ -244,6 +247,7 @@ def test_optional_capability_protocols_accept_classvar_implementations() -> None
     property is satisfied by a ``ClassVar``, an instance attribute, and a property alike.
     """
     from monoid_agent_kernel.providers.base import (
+        ConfiguredModelAdapter,
         MultimodalModelAdapter,
         ProviderNamedModelAdapter,
     )
@@ -251,12 +255,27 @@ def test_optional_capability_protocols_accept_classvar_implementations() -> None
     declared = {
         MultimodalModelAdapter: ("supports_multimodal",),
         ProviderNamedModelAdapter: ("provider_name",),
+        ConfiguredModelAdapter: ("config",),
     }
     for protocol, names in declared.items():
         for name in names:
             member = protocol.__dict__.get(name)
             assert isinstance(member, property), f"{protocol.__name__}.{name} is not a property"
             assert member.fset is None, f"{protocol.__name__}.{name} must be read-only"
+
+
+def test_a_capability_that_takes_an_argument_is_declared_as_a_method() -> None:
+    """``AddressedModelAdapter`` is the one member of the family that is not a property.
+
+    ``resolve_destination`` answers *for a given config*, so it takes an argument and a property
+    cannot express it. Pinned rather than left implicit because the family's rule is the opposite
+    one, and a member silently turned into a property would drop the parameter that makes it useful.
+    """
+    from monoid_agent_kernel.providers.base import AddressedModelAdapter
+
+    member = AddressedModelAdapter.__dict__.get("resolve_destination")
+    assert callable(member) and not isinstance(member, property)
+    assert "config" in inspect.signature(member).parameters
 
 
 def test_optional_capability_protocols_are_satisfied_by_shipped_adapters() -> None:
@@ -266,22 +285,35 @@ def test_optional_capability_protocols_are_satisfied_by_shipped_adapters() -> No
     capability. Adding a member the shipped adapters leave to its default -- as
     ``wire_image_encoding`` is -- would reject every one of them.
     """
+    from monoid_agent_kernel.core.spec import ModelConfig
     from monoid_agent_kernel.providers.base import (
+        AddressedModelAdapter,
+        ConfiguredModelAdapter,
         MultimodalModelAdapter,
         ProviderNamedModelAdapter,
     )
+    from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
     from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
 
     expected = {
-        MultimodalModelAdapter: (OpenAIModelAdapter,),
+        MultimodalModelAdapter: (OpenAIModelAdapter, GatewayModelAdapter),
         ProviderNamedModelAdapter: (OpenAIModelAdapter,),
+        ConfiguredModelAdapter: (OpenAIModelAdapter, GatewayModelAdapter),
+        AddressedModelAdapter: (GatewayModelAdapter,),
     }
     for protocol, adapters in expected.items():
-        members = tuple(name for name, value in protocol.__dict__.items() if isinstance(value, property))
+        members = tuple(name for name in protocol.__dict__ if not name.startswith("_"))
         assert members, protocol.__name__
         for adapter in adapters:
+            # Checked on an *instance*, not the class. ``config`` is a dataclass field, so it does
+            # not exist on the class at all -- a class-level check would report every adapter as
+            # failing to carry the config every one of them actually has. Methods and ``ClassVar``
+            # capabilities answer the same either way, so one instance check covers the family.
+            instance = adapter(config=ModelConfig())
             for name in members:
-                assert hasattr(adapter, name), f"{adapter.__name__} lacks {protocol.__name__}.{name}"
+                assert hasattr(instance, name), (
+                    f"{adapter.__name__} lacks {protocol.__name__}.{name}"
+                )
 
 
 def test_package_root_mirrors_contracts_surface() -> None:
