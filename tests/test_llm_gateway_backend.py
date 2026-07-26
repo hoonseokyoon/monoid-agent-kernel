@@ -11,6 +11,7 @@ import pytest
 from support.http import (
     http_get_json as _json_get,
     http_json,
+    serving,
     wait_http_ready as _wait_http_ready,
 )
 from support.runtime import runtime_config
@@ -446,16 +447,27 @@ def test_llm_gateway_offline_provider_answers_without_a_key() -> None:
 
 
 class _OneShotRetriedBackend:
-    """A backend adapter whose own retry loop ran, and that cannot stream."""
+    """A backend adapter whose own retry loop ran, and that cannot stream.
 
-    def __init__(self, *, retried: bool) -> None:
+    ``shape`` picks what the turn contains, because that decides which synthesized chunk is the
+    *only* carrier of the retry: a turn with text has a `TextDelta` to hold it, one with neither text
+    nor tool calls has nothing but the terminal chunk.
+    """
+
+    def __init__(self, *, retried: bool, shape: str = "text") -> None:
         self._retried = retried
+        self._shape = shape
 
     def next_turn(self, request):
         del request
         return ModelTurn(
             response_id="r1",
-            final_text="done",
+            final_text="done" if self._shape == "text" else None,
+            tool_calls=(
+                (ToolCall(id="c1", name="fs_read", arguments={"path": "A.md"}),)
+                if self._shape == "tools"
+                else ()
+            ),
             usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
             provider_retried=self._retried,
         )
@@ -475,12 +487,12 @@ class _RetriedBackend(_OneShotRetriedBackend):
         )
 
 
-def _retried_gateway(retried: bool, *, streams: bool = True):
+def _retried_gateway(retried: bool, *, streams: bool = True, shape: str = "text"):
     manager = _token_manager()
     backend = _RetriedBackend if streams else _OneShotRetriedBackend
     gateway = LlmGatewayBackend(
         token_manager=manager,
-        provider_adapter_factory=lambda claims, config: backend(retried=retried),
+        provider_adapter_factory=lambda claims, config: backend(retried=retried, shape=shape),
     )
     return gateway, _llm_token(manager)
 
@@ -519,12 +531,71 @@ def test_a_backend_retry_survives_the_streamed_gateway_round_trip(retried: bool)
 
 
 @pytest.mark.parametrize("retried", [True, False])
-def test_a_backend_that_cannot_stream_still_reports_its_retry(retried: bool) -> None:
-    """The synthesized deltas stand in for a stream, so they carry what the turn reported."""
-    gateway, token = _retried_gateway(retried, streams=False)
+@pytest.mark.parametrize(
+    ("shape", "expected_types"),
+    [
+        ("text", ["text_delta", "turn_complete"]),
+        ("tools", ["tool_call_delta", "turn_complete"]),
+        ("silent", ["turn_complete"]),
+    ],
+)
+def test_a_backend_that_cannot_stream_still_reports_its_retry(
+    retried: bool, shape: str, expected_types: list[str]
+) -> None:
+    """The synthesized deltas stand in for a stream, so they carry what the turn reported.
+
+    Every shape, because each one moves where the evidence has to survive. Only the text case was
+    exercised, and there a `TextDelta` carries the fact into the assembled turn, which is what the
+    terminal frame is built from -- so the flag on the synthesized `ToolCallDelta` and on the
+    synthesized `TurnComplete` was redundant and free to be dropped. A turn with neither text nor
+    tool calls has *nothing* but the terminal chunk, and dropping it there loses the retry outright.
+    """
+    gateway, token = _retried_gateway(retried, streams=False, shape=shape)
     frames = list(gateway.handle_turn_stream(token, _payload()))
-    assert [frame["type"] for frame in frames] == ["text_delta", "turn_complete"]
+    assert [frame["type"] for frame in frames] == expected_types
     assert all(frame.get("provider_retried", False) is retried for frame in frames)
+
+
+@pytest.mark.parametrize("retried", [True, False])
+def test_a_failing_backends_retry_reaches_the_wire_too(retried: bool) -> None:
+    """A failure is where the retry matters most, and it travels by a different route.
+
+    On the success side the turn carries the fact. A provider that *fails* produces no turn, so the
+    error body is the only carrier -- and it is the case where the client's own loop contributes
+    nothing to mask a loss, since a 400 is not retryable. `_write_exception` reads the fact off the
+    exception for exactly this; nothing observed that it did.
+    """
+
+    class _FailingBackend:
+        def next_turn(self, request):
+            del request
+            raise ModelAdapterError(
+                "upstream said no",
+                provider_error_code="gateway_bad_request",
+                retryable=False,
+                http_status=400,
+                provider_retried=retried,
+            )
+
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: _FailingBackend(),
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        with pytest.raises(HTTPError) as caught:
+            _json_post(f"{base_url}/internal/llm/turns", _payload(), token=_llm_token(manager))
+        body = json.loads(caught.value.read().decode("utf-8"))
+
+    assert caught.value.code == 400
+    assert body["error_code"] == "gateway_bad_request"
+    assert body["provider_retried"] is retried
+    # And the client reads back what the wire said, which is the half a receipt is built from.
+    error = pytest.raises(
+        ModelAdapterError, _parse_gateway_response, body
+    ).value
+    assert error.provider_retried is retried
 
 
 def test_the_clients_own_retry_is_combined_with_the_gateways_not_written_over_it() -> None:
