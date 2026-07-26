@@ -647,3 +647,212 @@ def test_both_transports_re_resolve_the_token_on_every_attempt(monkeypatch: Any)
     assert sent_by_the_streaming_loop() == fresh_on_the_retry, (
         "the streamed loop resolved the token once per call and replayed it on the retry"
     )
+
+
+def _status_client(httpx: Any, status: int, detail: str) -> tuple[Any, dict[str, int]]:
+    """An `AsyncClient` whose stream always answers `status`, counting the attempts."""
+
+    attempts = {"n": 0}
+
+    class _Response:
+        def __init__(self) -> None:
+            self.status_code = status
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aread(self) -> bytes:
+            return detail.encode("utf-8")
+
+        async def aiter_lines(self):  # noqa: ANN202 - unreachable: status is never 200 here
+            raise AssertionError("a non-200 response must not be streamed")
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            attempts["n"] += 1
+            return _Response()
+
+    return _Client, attempts
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_attempts", "code", "retried"),
+    [(401, 1, "gateway_auth_error", False), (503, 3, "gateway_server_error", True)],
+)
+def test_the_streamed_loop_retries_on_the_gate_not_on_the_attempt_budget(
+    monkeypatch: Any, status: int, expected_attempts: int, code: str, retried: bool
+) -> None:
+    """A non-200 is retried only if `_should_retry` says so, and a 401 never does.
+
+    The streamed loop's decision was unbound: a mutant that dropped the gate and kept only
+    `attempt < max_attempts` hammered a 401 three times and the whole suite stayed green. Two
+    independent reasons say no there -- `retryable` is false for a 4xx, and `gateway_auth_error` is
+    not in `retry_on` -- and neither was observed on this path. The 503 case holds the other side of
+    the gate open, so a mutant that simply never retries is caught too.
+
+    The escaping error's retry stamp rides along: three attempts exhausting the budget raise from
+    inside the loop, and the receipt that failure becomes must not describe a thrice-tried call as a
+    clean single attempt. The 401 is the counterweight -- one attempt, nothing to report.
+    """
+    httpx = pytest.importorskip("httpx")
+    client, attempts = _status_client(httpx, status, json.dumps({"error": f"HTTP {status}"}))
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid",
+            retry=ModelRetryConfig(max_attempts=3, initial_delay_s=0, jitter_s=0),
+        ),
+        token="t",
+    )
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _stream(adapter)
+
+    assert attempts["n"] == expected_attempts
+    assert caught.value.provider_error_code == code
+    assert caught.value.http_status == status
+    assert getattr(caught.value, "provider_retried", False) is retried
+
+
+def test_a_client_lifecycle_failure_after_a_retry_still_reports_the_retry(monkeypatch: Any) -> None:
+    """The retry stamp has to survive the *other* boundary too.
+
+    `test_a_failure_in_the_clients_own_lifecycle_is_still_classified` proves the client-lifecycle
+    handler classifies what escapes it, on a call that never retried. Its `_stamp_retry` was
+    unobserved: a receipt built from a pool teardown that failed *after* a retry reported a clean
+    single attempt, and this is the one boundary where no chunk and no turn survives to carry the
+    fact instead.
+    """
+    httpx = pytest.importorskip("httpx")
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+    attempts = {"n": 0}
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):  # noqa: ANN202
+            yield 'data: {"type":"turn_complete","response_id":"turn_1"}'
+            yield ""
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            raise httpx.CloseError("pool teardown failed")
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise httpx.HTTPError("reset before the stream committed")
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid",
+            retry=ModelRetryConfig(max_attempts=3, initial_delay_s=0, jitter_s=0),
+        ),
+        token="t",
+    )
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _stream(adapter)
+
+    assert attempts["n"] == 2, "the teardown must fail on a call that had already retried"
+    assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
+    assert getattr(caught.value, "provider_retried", False) is True
+
+
+def test_neither_loop_assigns_its_own_retry_verdict_over_the_wires(monkeypatch: Any) -> None:
+    """Two retry loops sit on this path and a receipt records that *either* one ran.
+
+    The gateway's backend can retry a request this client got right the first time, so a client that
+    wrote its own verdict over the wire's turned that into a clean single attempt. Both loops combine
+    instead -- and both were unbound: the test that carries this rule in its name calls
+    `_parse_gateway_response` directly, which is the parser, not the loop that decides what to do
+    with what it returns.
+
+    First attempt succeeds in both halves, so `attempt > 1` is false and only the wire's fact is
+    left to carry.
+    """
+    httpx = pytest.importorskip("httpx")
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(gateway_url="http://gateway.invalid"), token="t"
+    )
+
+    class _Body(io.BytesIO):
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    def _urlopen(_request: Any, timeout: float | None = None) -> Any:
+        payload = {"final_text": "hi", "turn_handle": "t1", "provider_retried": True}
+        return _Body(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(gateway_module, "urlopen", _urlopen)
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):  # noqa: ANN202
+            yield 'data: {"type":"text_delta","text":"hi","provider_retried":true}'
+            yield ""
+            yield 'data: {"type":"turn_complete","turn_handle":"t1","provider_retried":true}'
+            yield ""
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    request = ModelRequest(instruction="go", system_prompt="s", tools=())
+
+    blocking = adapter.next_turn(request)
+    streamed = _stream(adapter)
+
+    assert blocking.provider_retried is True, "the blocking loop overwrote the gateway's own retry"
+    assert [chunk.provider_retried for chunk in streamed] == [True, True], (
+        "the streamed loop overwrote the gateway's own retry"
+    )
+    assert assemble_streamed_turn(streamed).provider_retried is True
