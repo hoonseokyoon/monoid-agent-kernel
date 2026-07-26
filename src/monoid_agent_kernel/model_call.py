@@ -76,12 +76,18 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
     provider holds plus the `observations` produced since -- and in that second shape those two
     fields **are** the prompt. Hashing only `messages` made every by-reference continuation collide
     with every other, which is the ordinary case for a gateway client, not an edge one.
+
+    `messages` keeps `None` apart from `()`, because the wire does. Both shipped adapters select the
+    request shape with `messages is not None` -- an empty tuple sends an empty conversation and
+    drops the instruction, `None` sends the instruction or the handle. `or ()` read the field for
+    emptiness when the field's own meaning is presence, so two requests the provider answers
+    differently were handed one replay key.
     """
 
     return {
         "system_prompt": request.system_prompt,
         "instruction": request.instruction,
-        "messages": list(request.messages or ()),
+        "messages": None if request.messages is None else list(request.messages),
         "previous_turn_handle": request.previous_turn_handle,
         "observations": [observation.to_json() for observation in request.observations],
     }
@@ -222,6 +228,13 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
     carry the tool results the model is being shown. Omitting them did not merely give a `full`
     observer an incomplete picture -- it routed tool output around redaction entirely, since a
     policy can only mask a field it is handed. That is a disclosure hole, not a gap in coverage.
+
+    `messages` is always a list here, even when the request carried `None` -- deliberately unlike
+    `_prompt_payload`, which keeps those apart because a replay key must. This is a display surface,
+    not a key: a `RedactionPolicy` iterates the field to mask messages one at a time, so handing it
+    `None` on the ordinary by-reference path would break every such policy in order to record a
+    shape distinction nothing here keys on. The shape stays legible anyway -- a by-reference call
+    carries its `previous_turn_handle` and `observations` in this same dict.
     """
 
     content: dict[str, Any] = {

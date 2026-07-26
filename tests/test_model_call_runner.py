@@ -24,7 +24,12 @@ from monoid_agent_kernel.errors import (
     RunCancelled,
     RunTimeout,
 )
-from monoid_agent_kernel.model_call import ModelCallRunner, _digest, _prompt_payload
+from monoid_agent_kernel.model_call import (
+    ModelCallRunner,
+    _digest,
+    _prompt_payload,
+    _request_payload,
+)
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
@@ -762,6 +767,32 @@ def test_the_prompt_digest_distinguishes_by_reference_continuations() -> None:
             )
         ).prompt_digest
     )
+
+
+def test_an_absent_message_log_is_not_an_empty_one() -> None:
+    """`messages=None` and `messages=()` are different requests, so they get different keys.
+
+    Both shipped adapters pick the wire shape with `messages is not None`: an empty tuple sends an
+    empty conversation and drops the instruction, `None` sends the instruction. `or ()` asked
+    whether the field was empty when its meaning is whether it is present, so two requests the
+    provider answers differently were handed one replay key.
+
+    The wire halves are asserted too, not assumed. Without them this test would keep passing if the
+    adapters stopped distinguishing the two -- still green, but no longer testing what it says.
+    """
+    absent = ModelRequest(instruction="hi", system_prompt="s", tools=(), messages=None)
+    empty = ModelRequest(instruction="hi", system_prompt="s", tools=(), messages=())
+
+    sent = [GatewayModelAdapter(config=ModelConfig())._payload(r) for r in (absent, empty)]
+    assert "instruction" in sent[0] and "messages" not in sent[0]
+    assert sent[1]["messages"] == [] and "instruction" not in sent[1]
+
+    assert _digest(_prompt_payload(absent)) != _digest(_prompt_payload(empty))
+    keys = [
+        _digest(_request_payload(r, ModelConfig(), provider="p", destination="d"))
+        for r in (absent, empty)
+    ]
+    assert keys[0] != keys[1] and "" not in keys
 
 
 def test_tool_results_reach_the_redaction_policy() -> None:
