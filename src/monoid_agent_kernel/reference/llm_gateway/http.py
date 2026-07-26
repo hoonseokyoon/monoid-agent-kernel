@@ -103,6 +103,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
                     retryable=exc.retryable,
+                    provider_retried=exc.provider_retried,
                 )
             elif isinstance(exc, HttpRequestTooLarge):
                 self._write_error(
@@ -140,6 +141,7 @@ def make_llm_gateway_handler(
             *,
             error_code: str = GATEWAY_BAD_RESPONSE,
             retryable: bool = False,
+            provider_retried: bool = False,
         ) -> None:
             self._write_json(
                 {
@@ -147,6 +149,12 @@ def make_llm_gateway_handler(
                     "error_code": error_code,
                     "retryable": retryable,
                     "http_status": int(status),
+                    # A retry the gateway's *backend* made before failing. The client can only see
+                    # its own attempts, so without this a call the provider retried and then failed
+                    # was recorded as a clean single attempt -- and a failure is where that record
+                    # matters most. Defaults False: an error the gateway raised on its own, before
+                    # reaching a provider, involved no provider attempt at all.
+                    "provider_retried": provider_retried,
                 },
                 status=status,
             )
@@ -196,6 +204,7 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
             "error_code": exc.provider_error_code or GATEWAY_BAD_RESPONSE,
             "retryable": exc.retryable,
             "http_status": int(_model_error_status(exc)),
+            "provider_retried": exc.provider_retried,
         }
     return {
         "type": "error",

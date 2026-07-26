@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import time
 from pathlib import Path
-from urllib.error import HTTPError
+from typing import Any
+from urllib.error import HTTPError, URLError
 
+import pytest
 from click.testing import CliRunner
 
 from support.runtime import runtime_config
 
 from monoid_agent_kernel.cli import main
 from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig, ReasoningConfig
-from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.errors import ModelAdapterError, RunTimeout
 from monoid_agent_kernel.providers.base import ModelRequest, ToolObservation
 from monoid_agent_kernel.providers.gateway import GatewayModelAdapter, _parse_gateway_response
 from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
@@ -466,3 +470,107 @@ def test_gateway_keeps_retry_evidence_when_the_final_failure_is_not_an_adapter_e
         assert getattr(exc, "provider_retried", False) is True
     else:  # pragma: no cover - the decode must fail for this test to mean anything
         raise AssertionError("expected the invalid body to raise")
+
+
+def test_the_shipped_adapter_reports_its_retry_through_the_channel(monkeypatch: Any) -> None:
+    """Binds `GatewayModelAdapter` to the seam, not a hand-written fake to itself.
+
+    Every other channel test uses an adapter that calls `report_provider_retried` in its own body,
+    so deleting the call from the shipped adapter changed nothing that was checked. Mutation testing
+    found exactly that: the line the design rests on had no test holding it.
+
+    Driven through the abandonment the channel exists for -- the worker is still inside its second
+    attempt when the run's deadline expires, so nothing it returns is ever read.
+    """
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.providers import gateway as gateway_module
+
+    attempts = {"n": 0}
+
+    def _urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise URLError("connection reset")
+        time.sleep(3)  # the retried attempt never returns
+
+    monkeypatch.setattr(gateway_module, "urlopen", _urlopen)
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(gateway_url="http://gateway.invalid", retry=ModelRetryConfig(max_attempts=3)),
+        token="t",
+    )
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=adapter, cancel_grace_s=0.05).acall(
+            ModelRequest(system_prompt="s", instruction="hi", tools=()),
+            deadline=time.time() + 0.3,
+        )
+
+    with pytest.raises(RunTimeout) as caught:
+        asyncio.run(run())
+    assert attempts["n"] == 2, "the fixture must reach a retried attempt"
+    assert getattr(caught.value, "provider_retried", False) is True
+
+
+def test_a_shipped_adapter_that_never_retried_reports_nothing(monkeypatch: Any) -> None:
+    """The counterweight: abandonment alone must not be read as a retry."""
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.providers import gateway as gateway_module
+
+    attempts = {"n": 0}
+
+    def _urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        attempts["n"] += 1
+        time.sleep(3)  # the very first attempt wedges
+
+    monkeypatch.setattr(gateway_module, "urlopen", _urlopen)
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(gateway_url="http://gateway.invalid"), token="t"
+    )
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=adapter, cancel_grace_s=0.05).acall(
+            ModelRequest(system_prompt="s", instruction="hi", tools=()),
+            deadline=time.time() + 0.3,
+        )
+
+    with pytest.raises(RunTimeout) as caught:
+        asyncio.run(run())
+    assert attempts["n"] == 1
+    assert getattr(caught.value, "provider_retried", False) is False
+
+
+def test_a_backend_retry_survives_a_failed_gateway_call() -> None:
+    """The failure half of the wire, which is where this record matters most.
+
+    The success half was wired first and the failure half was left, so a gateway whose backend
+    retried and *then* failed still reported a clean single attempt. It shows only when this
+    client's own retry loop does not run -- a 400/401/quota, the ordinary failure -- because when
+    the client retries too, its own stamp masks the loss.
+    """
+    from monoid_agent_kernel.providers.gateway import (
+        _chunk_from_event,
+        _error_from_status_body,
+        _parse_gateway_response,
+    )
+    from monoid_agent_kernel.reference.llm_gateway.http import _stream_error_frame
+
+    retried_body = {"error": "refused", "error_code": "gateway_bad_request", "provider_retried": True}
+    with pytest.raises(ModelAdapterError) as one_shot:
+        _parse_gateway_response(retried_body)
+    assert one_shot.value.provider_retried is True
+
+    with pytest.raises(ModelAdapterError) as frame:
+        _chunk_from_event({"type": "error", **retried_body})
+    assert frame.value.provider_retried is True
+
+    assert _error_from_status_body(400, json.dumps(retried_body)).provider_retried is True
+
+    emitted = ModelAdapterError("refused", provider_error_code="gateway_bad_request")
+    emitted.provider_retried = True
+    assert _stream_error_frame(None, emitted)["provider_retried"] is True
+
+    # Counterweight: a wire that says nothing must not be read as claiming a retry.
+    silent = json.dumps({"error": "refused", "error_code": "gateway_bad_request"})
+    assert _error_from_status_body(400, silent).provider_retried is False
+    assert _stream_error_frame(None, ModelAdapterError("refused"))["provider_retried"] is False

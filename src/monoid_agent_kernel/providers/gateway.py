@@ -211,40 +211,46 @@ class GatewayModelAdapter:
         last_error: ModelAdapterError | None = None
         attempt = 0
         try:
-            for attempt in range(1, max_attempts + 1):
-                if attempt > 1:
-                    # Same report the sync loop makes, for the same reason: a stream cancelled
-                    # before this attempt commits leaves the chunk below undelivered too.
-                    report_provider_retried()
-                    # Before the attempt, not after it commits. The retry is already certain here
-                    # -- the previous iteration decided it -- and this line always runs, while a
-                    # commit may never happen: a run cancelled or timed out while attempt 2 was
-                    # connecting produced no chunk at all, and the receipt is built from the
-                    # ``RunCancelled``/``RunTimeout`` the race raises, not from anything the
-                    # adapter can stamp. Both carriers missed and a retried call was recorded as a
-                    # clean single attempt.
-                    #
-                    # An earlier fix put this at commit, calling that "the first moment the retry
-                    # is certain". That was wrong: certainty arrives when ``_should_retry`` says
-                    # yes, one iteration earlier. An empty ``TextDelta`` concatenates to nothing,
-                    # so the assembled turn and any relay of the deltas are unchanged.
-                    yield TextDelta(text="", provider_retried=True)
-                    # Awaited, and after both reports. The blocking sleep this replaces held the
-                    # event loop for the whole backoff, so nothing else in the run progressed and
-                    # the run's own cancel/deadline race -- which lives on that loop -- could not
-                    # fire: a run told to stop kept waiting for a provider it had given up on.
-                    # Now that the wait yields, it is also a window the run can end inside, which
-                    # is why the evidence above goes out first.
-                    await _asleep_before_retry(
-                        attempt - 1,
-                        retry.initial_delay_s,
-                        retry.max_delay_s,
-                        retry.backoff_multiplier,
-                        retry.jitter_s,
-                    )
-                committed = False
-                try:
-                    async with httpx.AsyncClient(timeout=config.timeout_s) as client:
+            # One client for the whole call, not one per attempt. Constructing it is synchronous and
+            # not cheap -- measured at ~285ms warm here, and the event loop is unavailable for all of
+            # it. Inside the loop that cost was paid again on every retry, and the run's cancel and
+            # deadline race lives on the blocked loop, so a run told to stop kept holding the provider
+            # past its own boundary -- the same defect the backoff wait had, at the next statement.
+            # Hoisting also lets retries reuse the connection pool instead of opening a fresh one.
+            async with httpx.AsyncClient(timeout=config.timeout_s) as client:
+                for attempt in range(1, max_attempts + 1):
+                    if attempt > 1:
+                        # Same report the sync loop makes, for the same reason: a stream cancelled
+                        # before this attempt commits leaves the chunk below undelivered too.
+                        report_provider_retried()
+                        # Before the attempt, not after it commits. The retry is already certain here
+                        # -- the previous iteration decided it -- and this line always runs, while a
+                        # commit may never happen: a run cancelled or timed out while attempt 2 was
+                        # connecting produced no chunk at all, and the receipt is built from the
+                        # ``RunCancelled``/``RunTimeout`` the race raises, not from anything the
+                        # adapter can stamp. Both carriers missed and a retried call was recorded as a
+                        # clean single attempt.
+                        #
+                        # An earlier fix put this at commit, calling that "the first moment the retry
+                        # is certain". That was wrong: certainty arrives when ``_should_retry`` says
+                        # yes, one iteration earlier. An empty ``TextDelta`` concatenates to nothing,
+                        # so the assembled turn and any relay of the deltas are unchanged.
+                        yield TextDelta(text="", provider_retried=True)
+                        # Awaited, and after both reports. The blocking sleep this replaces held the
+                        # event loop for the whole backoff, so nothing else in the run progressed and
+                        # the run's own cancel/deadline race -- which lives on that loop -- could not
+                        # fire: a run told to stop kept waiting for a provider it had given up on.
+                        # Now that the wait yields, it is also a window the run can end inside, which
+                        # is why the evidence above goes out first.
+                        await _asleep_before_retry(
+                            attempt - 1,
+                            retry.initial_delay_s,
+                            retry.max_delay_s,
+                            retry.backoff_multiplier,
+                            retry.jitter_s,
+                        )
+                    committed = False
+                    try:
                         async with client.stream("POST", url, headers=headers, content=body) as response:
                             if response.status_code != 200:
                                 detail = (await response.aread()).decode("utf-8", errors="replace")
@@ -260,25 +266,25 @@ class GatewayModelAdapter:
                                 if attempt > 1:
                                     chunk = replace(chunk, provider_retried=True)
                                 yield chunk
-                    return
-                except _StreamRetry as retry_signal:
-                    last_error = retry_signal.error
-                except httpx.HTTPError as exc:
-                    if committed:
-                        # The stream already started; replaying would duplicate deltas. Terminal.
-                        raise ModelAdapterError(
-                            f"LLM gateway stream interrupted: {exc}",
+                        return
+                    except _StreamRetry as retry_signal:
+                        last_error = retry_signal.error
+                    except httpx.HTTPError as exc:
+                        if committed:
+                            # The stream already started; replaying would duplicate deltas. Terminal.
+                            raise ModelAdapterError(
+                                f"LLM gateway stream interrupted: {exc}",
+                                provider_error_code=GATEWAY_NETWORK_ERROR,
+                                retryable=False,
+                            ) from exc
+                        error = ModelAdapterError(
+                            f"LLM gateway stream connection error: {exc}",
                             provider_error_code=GATEWAY_NETWORK_ERROR,
-                            retryable=False,
-                        ) from exc
-                    error = ModelAdapterError(
-                        f"LLM gateway stream connection error: {exc}",
-                        provider_error_code=GATEWAY_NETWORK_ERROR,
-                        retryable=True,
-                    )
-                    if not _should_retry(error, attempt, max_attempts, retry.retry_on):
-                        raise error from exc
-                    last_error = error
+                            retryable=True,
+                        )
+                        if not _should_retry(error, attempt, max_attempts, retry.retry_on):
+                            raise error from exc
+                        last_error = error
             if last_error is not None:
                 raise last_error
             raise ModelAdapterError("LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR)
@@ -388,6 +394,7 @@ def _parse_gateway_response(data: dict[str, Any]) -> ModelTurn:
             provider_error_code=str(data.get("error_code") or GATEWAY_BAD_RESPONSE),
             retryable=bool(data.get("retryable", False)),
             http_status=int(data["http_status"]) if data.get("http_status") is not None else None,
+            provider_retried=bool(data.get("provider_retried", False)),
         )
     raw_calls = data.get("tool_calls") or ()
     tool_calls: list[ToolCall] = []
@@ -504,13 +511,19 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             provider_error_code=str(event.get("error_code") or GATEWAY_BAD_RESPONSE),
             retryable=bool(event.get("retryable", False)),
             http_status=int(event["http_status"]) if event.get("http_status") is not None else None,
+            provider_retried=retried,
         )
     return None  # unknown frame type: forward-compatible, ignore
 
 
 def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
-    """Build a ModelAdapterError from a non-200 streaming response body (mirrors
-    ``_error_from_http_error`` for the streaming path)."""
+    """Build a ModelAdapterError from a non-200 response body.
+
+    Both transports land here: the streaming path passes the status and body it read, and
+    ``_error_from_http_error`` unwraps its ``HTTPError`` into the same two values. They were separate
+    near-identical copies, which is how one of them came to read a field the other did not.
+    """
+
     error_payload: dict[str, Any] = {}
     try:
         parsed = json.loads(detail)
@@ -526,28 +539,15 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         provider_error_code=provider_error_code,
         retryable=retryable,
         http_status=status,
+        # Read for the same reason as ``retryable``: it is a fact about the call the gateway is
+        # reporting, and a failure is where it matters most. ``retryable`` forecasts a *future*
+        # attempt; this records ones already made, upstream, by a retry loop this client cannot see.
+        provider_retried=bool(error_payload.get("provider_retried", False)),
     )
 
 
 def _error_from_http_error(exc: HTTPError) -> ModelAdapterError:
-    detail = exc.read().decode("utf-8", errors="replace")
-    error_payload: dict[str, Any] = {}
-    try:
-        parsed = json.loads(detail)
-        if isinstance(parsed, dict):
-            error_payload = parsed
-    except json.JSONDecodeError:
-        pass
-    status = int(exc.code)
-    provider_error_code = str(error_payload.get("error_code") or _error_code_for_http_status(status))
-    retryable = bool(error_payload.get("retryable", _retryable_for_http_status(status)))
-    message = str(error_payload.get("error") or detail or f"HTTP {status}")
-    return ModelAdapterError(
-        f"LLM gateway returned HTTP {status}: {message}",
-        provider_error_code=provider_error_code,
-        retryable=retryable,
-        http_status=status,
-    )
+    return _error_from_status_body(int(exc.code), exc.read().decode("utf-8", errors="replace"))
 
 
 def _error_code_for_http_status(status: int) -> str:

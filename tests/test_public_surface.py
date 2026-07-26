@@ -112,6 +112,8 @@ EXPECTED_CONTRACTS_ALL = [
     "ProviderNamedModelAdapter",
     "ConfiguredModelAdapter",
     "AddressedModelAdapter",
+    "report_provider_retried",
+    "mark_provider_retried",
     "ModelRequest",
     "ModelTurn",
     "ToolCall",

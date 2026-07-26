@@ -600,7 +600,12 @@ class ModelCallReceipt:
             # A failed call is the one most likely to have been retried, so the marker has to
             # survive the failure path too -- recording it only on success would deny retries in
             # exactly the exhausted-budget case.
-            provider_retried=bool(getattr(exc, "provider_retried", False)),
+            #
+            # Combined with what the receipt already holds rather than assigned over it. Today's one
+            # caller always passes a freshly built receipt, so nothing is lost yet; but every other
+            # place this fact travels had to learn the same rule, and a receipt that had recorded a
+            # retry before failing would silently unrecord it here.
+            provider_retried=self.provider_retried or bool(getattr(exc, "provider_retried", False)),
         )
 
     def to_json(self) -> dict[str, Any]:
