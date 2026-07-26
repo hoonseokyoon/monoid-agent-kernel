@@ -131,6 +131,10 @@ class LlmGatewayBackend:
             ],
             "usage": turn.usage,
             "stop_reason": turn.stop_reason,
+            # The backend adapter's own retry evidence. Dropping it here recorded a call the
+            # provider retried as a clean single attempt, since the client can only observe its
+            # own HTTP attempts and this call succeeded on the first of those.
+            "provider_retried": turn.provider_retried,
         }
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -182,20 +186,32 @@ class LlmGatewayBackend:
             # The provider can't stream: synthesize a minimal delta sequence from the
             # one-shot turn so consumers still see text/tool frames before turn_complete.
             turn = adapter.next_turn(model_request)
+            # The synthesized chunks carry the turn's retry evidence too. They stand in for a
+            # stream the provider could not produce, so anything the turn reports about the call
+            # has to survive the substitution.
             if turn.final_text:
-                collected.append(TextDelta(turn.final_text))
-                yield {"type": "text_delta", "text": turn.final_text}
+                chunk: ModelStreamChunk = TextDelta(
+                    turn.final_text, provider_retried=turn.provider_retried
+                )
+                collected.append(chunk)
+                yield _chunk_to_frame(chunk)
             for index, call in enumerate(turn.tool_calls):
                 chunk = ToolCallDelta(
                     index=index,
                     arguments_fragment=json.dumps(call.arguments, ensure_ascii=False),
                     id=call.id,
                     name=call.name,
+                    provider_retried=turn.provider_retried,
                 )
                 collected.append(chunk)
                 yield _chunk_to_frame(chunk)
             collected.append(
-                TurnComplete(response_id=turn.response_id, usage=turn.usage, stop_reason=turn.stop_reason)
+                TurnComplete(
+                    response_id=turn.response_id,
+                    usage=turn.usage,
+                    stop_reason=turn.stop_reason,
+                    provider_retried=turn.provider_retried,
+                )
             )
         # Assemble once: the same usage drives both the meter and the outgoing frame, and the
         # assembled response id is what the opaque turn_handle maps to for continuation.
@@ -208,6 +224,7 @@ class LlmGatewayBackend:
             "turn_handle": turn_handle,
             "usage": turn.usage,
             "stop_reason": turn.stop_reason,
+            "provider_retried": turn.provider_retried,
         }
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
@@ -315,13 +332,18 @@ def _chunk_to_frame(chunk: ModelStreamChunk) -> dict[str, Any] | None:
 
     The provider's ``TurnComplete`` is dropped: the gateway mints its own terminal frame
     carrying the opaque ``turn_handle`` instead of the provider's response id.
+
+    ``provider_retried`` rides every frame that carries it, not only the terminal one. A stream
+    cancelled mid-flight never reaches ``turn_complete``, and that is exactly when a client needs
+    to know the answer it did receive cost the provider more than one attempt.
     """
+    frame: dict[str, Any] | None = None
     if isinstance(chunk, TextDelta):
-        return {"type": "text_delta", "text": chunk.text}
-    if isinstance(chunk, ReasoningDelta):
-        return {"type": "reasoning_delta", "text": chunk.text}
-    if isinstance(chunk, ToolCallDelta):
-        frame: dict[str, Any] = {
+        frame = {"type": "text_delta", "text": chunk.text}
+    elif isinstance(chunk, ReasoningDelta):
+        frame = {"type": "reasoning_delta", "text": chunk.text}
+    elif isinstance(chunk, ToolCallDelta):
+        frame = {
             "type": "tool_call_delta",
             "index": chunk.index,
             "arguments_fragment": chunk.arguments_fragment,
@@ -330,8 +352,9 @@ def _chunk_to_frame(chunk: ModelStreamChunk) -> dict[str, Any] | None:
             frame["id"] = chunk.id
         if chunk.name is not None:
             frame["name"] = chunk.name
-        return frame
-    return None
+    if frame is not None and getattr(chunk, "provider_retried", False):
+        frame["provider_retried"] = True
+    return frame
 
 
 LLM_TURN_PROTOCOL_VERSION = namespaced_id("llm-turn.v1")

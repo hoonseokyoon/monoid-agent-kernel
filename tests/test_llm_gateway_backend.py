@@ -22,7 +22,8 @@ from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
 from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
-from monoid_agent_kernel.providers.base import ModelTurn, ToolCall
+from monoid_agent_kernel.providers.base import ModelTurn, TextDelta, ToolCall, TurnComplete
+from monoid_agent_kernel.providers.gateway import _chunk_from_event, _parse_gateway_response
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
@@ -442,3 +443,93 @@ def test_llm_gateway_offline_provider_answers_without_a_key() -> None:
     assert "echo model" in result["final_text"].lower()
     assert result["tool_calls"] == []
     assert result["usage"]["total_tokens"] > 0
+
+
+class _OneShotRetriedBackend:
+    """A backend adapter whose own retry loop ran, and that cannot stream."""
+
+    def __init__(self, *, retried: bool) -> None:
+        self._retried = retried
+
+    def next_turn(self, request):
+        del request
+        return ModelTurn(
+            response_id="r1",
+            final_text="done",
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            provider_retried=self._retried,
+        )
+
+
+class _RetriedBackend(_OneShotRetriedBackend):
+    """The same, able to stream. Separate class rather than a flag: the gateway selects the path
+    with ``getattr(adapter, "astream_turn", None)``, and an instance cannot hide a class attribute.
+    """
+
+    async def astream_turn(self, request):
+        del request
+        yield TextDelta(text="do", provider_retried=self._retried)
+        yield TextDelta(text="ne", provider_retried=self._retried)
+        yield TurnComplete(
+            response_id="r1", usage={}, stop_reason="stop", provider_retried=self._retried
+        )
+
+
+def _retried_gateway(retried: bool, *, streams: bool = True):
+    manager = _token_manager()
+    backend = _RetriedBackend if streams else _OneShotRetriedBackend
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda claims, config: backend(retried=retried),
+    )
+    return gateway, _llm_token(manager)
+
+
+@pytest.mark.parametrize("retried", [True, False])
+def test_a_backend_retry_survives_the_one_shot_gateway_round_trip(retried: bool) -> None:
+    """Two retry loops sit on this path and the client can only see its own.
+
+    A gateway whose backend retried, answering a request this client got right the first time,
+    recorded a clean single attempt -- the exact failure ``provider_retried`` exists to prevent.
+    The parametrization is the counterweight: a wire that always said "retried" would pass the
+    True case alone.
+    """
+    gateway, token = _retried_gateway(retried)
+    response = gateway.handle_turn(token, _payload())
+    assert response["provider_retried"] is retried
+    assert _parse_gateway_response(response).provider_retried is retried
+
+
+@pytest.mark.parametrize("retried", [True, False])
+def test_a_backend_retry_survives_the_streamed_gateway_round_trip(retried: bool) -> None:
+    """Carried by the delta frames, not only by ``turn_complete``.
+
+    A stream cancelled mid-flight never delivers the terminal frame, so evidence that rides only
+    there is lost exactly when it matters. Asserted on the frames *before* the terminal one.
+    """
+    gateway, token = _retried_gateway(retried)
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    deltas = [frame for frame in frames if frame["type"] != "turn_complete"]
+    assert deltas, "the fixture must produce frames before the terminal one"
+    assert all(frame.get("provider_retried", False) is retried for frame in deltas)
+    assert frames[-1]["provider_retried"] is retried
+
+    chunks = [_chunk_from_event(frame) for frame in frames]
+    assert all(chunk.provider_retried is retried for chunk in chunks if chunk is not None)
+
+
+@pytest.mark.parametrize("retried", [True, False])
+def test_a_backend_that_cannot_stream_still_reports_its_retry(retried: bool) -> None:
+    """The synthesized deltas stand in for a stream, so they carry what the turn reported."""
+    gateway, token = _retried_gateway(retried, streams=False)
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    assert [frame["type"] for frame in frames] == ["text_delta", "turn_complete"]
+    assert all(frame.get("provider_retried", False) is retried for frame in frames)
+
+
+def test_the_clients_own_retry_is_combined_with_the_gateways_not_written_over_it() -> None:
+    """``attempt > 1`` is one of two independent facts, and either one is worth recording."""
+    gateway, token = _retried_gateway(True)
+    response = gateway.handle_turn(token, _payload())
+    # The client succeeded on its first HTTP attempt, so its own loop contributes nothing.
+    assert _parse_gateway_response(response).provider_retried is True

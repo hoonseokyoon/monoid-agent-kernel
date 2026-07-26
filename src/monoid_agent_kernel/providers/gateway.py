@@ -101,10 +101,19 @@ class GatewayModelAdapter:
                             "LLM gateway returned invalid JSON",
                             provider_error_code=GATEWAY_BAD_RESPONSE,
                         ) from exc
-                    # ``attempt > 1`` means this call only succeeded because the retry loop ran.
-                    # The kernel counts it as one adapter call, so the receipt would otherwise show a
-                    # twice-failed call as a clean single attempt.
-                    return replace(_parse_gateway_response(data), provider_retried=attempt > 1)
+                    # ``attempt > 1`` means this call only succeeded because *this client's* retry
+                    # loop ran. The kernel counts it as one adapter call, so the receipt would
+                    # otherwise show a twice-failed call as a clean single attempt.
+                    #
+                    # Combined with what the response already carries, never assigned over it: the
+                    # gateway's own backend may have retried on a request this client got right the
+                    # first time, and overwriting turned that into a clean attempt. Two independent
+                    # retry loops sit on this path and either one having run is the fact a receipt
+                    # records.
+                    turn = _parse_gateway_response(data)
+                    if attempt > 1:
+                        turn = replace(turn, provider_retried=True)
+                    return turn
                 except ModelAdapterError as exc:
                     last_error = exc
                     if not _should_retry(exc, attempt, max_attempts, retry.retry_on):
@@ -388,6 +397,10 @@ def _parse_gateway_response(data: dict[str, Any]) -> ModelTurn:
         usage=normalize_usage(data.get("usage")),
         raw=data,
         stop_reason=stop_reason,
+        # A retry the gateway's own backend made. Absent from an older gateway, which reads as
+        # "did not retry" -- the same default an adapter with no retry loop carries, and the only
+        # thing a wire that never mentions it can honestly mean.
+        provider_retried=bool(data.get("provider_retried", False)),
     )
 
 
@@ -426,16 +439,22 @@ async def _aiter_sse_chunks(response: Any) -> AsyncIterator[ModelStreamChunk]:
 
 def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
     event_type = event.get("type")
+    # A retry the gateway's own backend made, as opposed to one this client's loop made. Read off
+    # every frame that carries it, because a stream cancelled mid-flight never delivers the
+    # terminal one. Absent reads as "did not retry", which is what a wire that never mentions it
+    # can honestly mean; the client's own ``attempt > 1`` is combined with this, never over it.
+    retried = bool(event.get("provider_retried", False))
     if event_type == "text_delta":
-        return TextDelta(text=str(event.get("text") or ""))
+        return TextDelta(text=str(event.get("text") or ""), provider_retried=retried)
     if event_type == "reasoning_delta":
-        return ReasoningDelta(text=str(event.get("text") or ""))
+        return ReasoningDelta(text=str(event.get("text") or ""), provider_retried=retried)
     if event_type == "tool_call_delta":
         return ToolCallDelta(
             index=int(event.get("index") or 0),
             arguments_fragment=str(event.get("arguments_fragment") or ""),
             id=event.get("id"),
             name=event.get("name"),
+            provider_retried=retried,
         )
     if event_type == "turn_complete":
         # The gateway's opaque turn_handle is the continuation handle the core stores.
@@ -443,6 +462,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             response_id=event.get("turn_handle") or event.get("response_id"),
             usage=normalize_usage(event.get("usage")),
             stop_reason=event.get("stop_reason"),
+            provider_retried=retried,
         )
     if event_type == "error":
         raise ModelAdapterError(

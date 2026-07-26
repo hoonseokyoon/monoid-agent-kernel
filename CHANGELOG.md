@@ -30,6 +30,12 @@ out in commit messages and here.
   evidence matters; `GatewayModelAdapter` marks the retry when the stream commits, which is the first
   moment it is certain and the last one guaranteed to happen. Adapters with no retry loop leave it
   `False`, which is exactly true of them.
+- The reference LLM gateway protocol now carries `provider_retried` — on the one-shot turn result,
+  on each streamed delta frame, and on `turn_complete`. Two independent retry loops sit on that
+  path and the client can only observe its own, so a gateway whose backend retried, answering a
+  request the client got right the first time, recorded a clean single attempt. `GatewayModelAdapter`
+  combines the two facts rather than assigning its own over the wire's. A gateway that omits the
+  field reads as "did not retry", which is the only thing a wire that never mentions it can mean.
 - Added `ModelCallAborted`, raised when a caller's `should_abort` predicate stops an in-flight
   streamed call. Distinct from `TurnInterrupted` because the runner knows nothing about turns;
   `AgentLoop` translates it at its own boundary.
