@@ -23,13 +23,7 @@ from monoid_agent_kernel.errors import (
     RunCancelled,
     RunTimeout,
 )
-from monoid_agent_kernel import model_call
-from monoid_agent_kernel.model_call import (
-    ModelCallRunner,
-    _canonical_ready,
-    _digest,
-    _prompt_payload,
-)
+from monoid_agent_kernel.model_call import ModelCallRunner, _digest, _prompt_payload
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
@@ -508,8 +502,10 @@ def test_a_payload_the_serializer_cannot_carry_does_not_kill_the_call(
         return turn, receipt
 
     turn, receipt = asyncio.run(run())
+    # The call is what must survive; whether the payload earns a key is a separate question, covered
+    # by the digest tests above. Asserting both here is what made this test wrong twice.
     assert turn.final_text == "answer"
-    assert receipt.request_digest != ""
+    assert isinstance(receipt.request_digest, str)
 
 
 def _self_cycle() -> dict[str, Any]:
@@ -533,50 +529,33 @@ def _shared_acyclic_graph() -> Any:
 
 
 @pytest.mark.parametrize(
-    ("label", "factory", "keyed"),
+    ("label", "factory"),
     [
-        ("self cycle", _self_cycle, True),
-        ("cycle reached through two references", _branching_cycle, True),
-        ("acyclic but exponentially shared", _shared_acyclic_graph, False),
+        ("self cycle", _self_cycle),
+        ("cycle reached through two references", _branching_cycle),
+        ("acyclic but exponentially shared", _shared_acyclic_graph),
     ],
 )
-def test_a_pathological_payload_terminates_quickly(
-    label: str, factory: Any, keyed: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Three shapes, because they defeat three different bounds — and two outcomes.
+def test_a_pathological_payload_gets_no_key_and_does_not_hang(label: str, factory: Any) -> None:
+    """None of these can be sent to a provider as JSON, so none of them is a replayable call.
 
-    An earlier version used only the self cycle, which a depth cap alone terminates in `depth`
-    steps, so it certified "cycles are safe" while a cycle reached through two references per level
-    still expanded `2**depth` nodes — four billion at the real cap. One shape stood in for a claim
-    about all of them.
+    Earlier versions reshaped each into something hashable and handed it a key. That is where the
+    collisions came from: a cycle marker two different graphs shared, then a marker a caller could
+    type verbatim. Refusing a key is both simpler and the only answer that cannot be wrong.
 
-    The third has no cycle at all: nothing repeats on any single path, so ancestor tracking cannot
-    see it and only the work budget bounds it.
-
-    `keyed` is the distinction that matters downstream. A cycle marker loses nothing — it states
-    exactly what that edge is — so a cyclic payload keeps a real replay key. Truncation drops
-    content, so it must not.
+    pytest-timeout is the net for a genuine hang; asserting wall-clock here would only measure the
+    machine, which is how this file broke CI once already.
     """
     del label
-    # A small budget makes the exponential shape terminate in thousands of nodes instead of a
-    # million, so the assertion below is about behaviour rather than about how fast this machine is.
-    # The earlier version asserted wall-clock < 5s and failed CI at 5.79s under coverage
-    # instrumentation -- a timing assertion is a machine-speed assertion wearing a correctness
-    # costume. If a bound is ever removed the traversal does not slow down, it fails to terminate,
-    # and pytest-timeout is what catches that.
-    monkeypatch.setattr(model_call, "_MAX_DIGEST_NODES", 5_000)
 
-    digest = _digest({"value": factory()})
-
-    assert (digest != "") is keyed
+    assert _digest({"value": factory()}) == ""
 
 
-def test_two_different_cyclic_graphs_do_not_share_a_replay_key() -> None:
-    """A bare cycle marker said *that* an edge looped without saying *where*.
+def test_two_different_cyclic_graphs_cannot_be_confused() -> None:
+    """`root -> child -> root` and `root -> child -> child` once shared a non-empty key.
 
-    `root -> child -> root` and `root -> child -> child` both became `[["<cycle>"]]` and were handed
-    the same non-empty replay key, so a consumer could return the wrong call. Encoding the depth the
-    edge points back to identifies the target exactly, because a path holds one object per position.
+    Neither has one now, which is the safe resolution: an empty digest is *no key*, so a consumer
+    cannot match them with each other or with anything else.
     """
     back_to_root: list[Any] = []
     child: list[Any] = [back_to_root]
@@ -584,42 +563,69 @@ def test_two_different_cyclic_graphs_do_not_share_a_replay_key() -> None:
 
     self_looping: list[Any] = []
     self_looping.append(self_looping)
-    holding: list[Any] = [self_looping]
 
-    assert _digest({"v": back_to_root}) != _digest({"v": holding})
-    # Both keep a key: a depth-tagged marker is the whole truth about the edge, so nothing is lost.
-    assert _digest({"v": back_to_root}) != ""
-    assert _digest({"v": holding}) != ""
+    assert _digest({"v": back_to_root}) == ""
+    assert _digest({"v": self_looping}) == ""
 
 
-def test_a_repr_that_raises_does_not_abort_the_call() -> None:
-    """The normalizer exists so digest bookkeeping cannot become a precondition for the call.
+def test_a_key_json_coerces_digests_as_the_provider_would_receive_it() -> None:
+    """A single non-string mapping key encodes fine -- sorting one key compares nothing -- and json
+    renders it as a string.
 
-    `repr` was the one remaining way for a caller's value to break that: a custom `__repr__` that
-    raises propagated out while the receipt was being built, before the adapter was ever reached.
+    So `{2: "b"}` and `{"2": "b"}` share a digest. That is correct rather than a collision: a
+    provider receives the same bytes for both, and this digest is defined as the identity of what
+    went over the wire. Only *mixed* key types in one mapping fail to sort, and those get no key.
+    """
+    assert _digest({"v": {2: "b"}}) == _digest({"v": {"2": "b"}}) != ""
+    assert _digest({"v": {1: "x", "kind": "y"}}) == ""
+
+
+def test_a_marker_shaped_string_is_ordinary_caller_text() -> None:
+    """No sentinel lives in the caller's string domain any more, so none can be forged.
+
+    `["<cycle:1>"]` used to normalize exactly like a list containing itself. It is now just a list
+    holding a string, and it keeps a real key.
+    """
+    literal = _digest({"v": ["<cycle:1>"]})
+
+    assert literal != ""
+    assert literal != _digest({"v": ["<cycle:0>"]})
+
+
+def test_objects_sharing_a_repr_do_not_share_a_key() -> None:
+    """Two unrelated objects whose `__repr__` agrees were reduced to the same text and keyed alike.
+
+    Nothing is reduced to `repr` now: a value canonical JSON cannot carry gets no key at all.
     """
 
-    class Hostile:
+    class Alpha:
         def __repr__(self) -> str:
-            raise RuntimeError("repr exploded")
+            return "<opaque>"
 
-    request = ModelRequest(
-        instruction="hi", system_prompt="s", tools=(), messages=({"x": Hostile()},)
-    )
+    class Beta:
+        def __repr__(self) -> str:
+            return "<opaque>"
 
-    class Adapter:
-        def next_turn(self, model_request: ModelRequest) -> ModelTurn:
-            del model_request
-            return ModelTurn(final_text="answer")
+    assert _digest({"v": Alpha()}) == ""
+    assert _digest({"v": Beta()}) == ""
 
-    async def run() -> Any:
-        turn, receipt = await ModelCallRunner(adapter=Adapter()).acall(request)
-        return turn, receipt
 
-    turn, receipt = asyncio.run(run())
-    assert turn.final_text == "answer"
-    # Nothing is known about the value, so the payload is lossy and gets no replay key.
-    assert receipt.prompt_digest == ""
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(lambda: chr(0xD800), id="lone-surrogate"),
+        # Passed as a factory: pytest builds a parametrize id with ``str(val)``, which trips the very
+        # integer-conversion limit this case is about.
+        pytest.param(lambda: 10**5000, id="int-past-str-conversion-limit"),
+    ],
+)
+def test_a_serializer_hostile_primitive_costs_the_key_not_the_call(factory: Any) -> None:
+    """These pass an `isinstance` check and then fail inside the encoder.
+
+    That is why the type-by-type guard was the wrong shape: the authority on what canonical JSON can
+    carry is the encoder, so it is now the thing consulted.
+    """
+    assert _digest({"v": factory()}) == ""
 
 
 def test_an_object_shared_between_siblings_is_not_treated_as_a_cycle() -> None:
@@ -993,30 +999,22 @@ def test_a_truncated_payload_gets_no_replay_key_rather_than_a_misleading_one() -
     assert _digest(_prompt_payload(ordinary)) not in {"", _digest(_prompt_payload(other))}
 
 
-def test_a_cycle_still_gets_a_real_digest() -> None:
-    """A cycle marker loses nothing -- "this points back at an ancestor" is the whole truth about
-    that edge -- so unlike truncation it must not cost the call its replay key."""
-    cyclic: dict[str, Any] = {}
-    cyclic["self"] = cyclic
+def test_an_unbounded_expansion_costs_the_key_rather_than_the_process() -> None:
+    """The output cap is what stops a payload built from shared references from expanding forever.
 
-    assert _digest({"value": cyclic}) != ""
-
-
-def test_the_work_budget_stops_the_traversal_not_merely_the_allocation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Returning a marker per element still walked every element of a very wide payload.
-
-    Asserted on the produced structure rather than on elapsed time: the budget's promise is that
-    traversal *stops*, and a normalized list shorter than its source is direct evidence of that,
-    where a stopwatch only ever measures the machine.
+    Asserted on the outcome, not on elapsed time: a bound that stopped working would not make this
+    slower, it would make it never finish, and pytest-timeout is the net for that.
     """
-    monkeypatch.setattr(model_call, "_MAX_DIGEST_NODES", 500)
-    normalized, lost_content = _canonical_ready({"messages": [list(range(100_000))]})
+    level: Any = "leaf"
+    for _ in range(40):
+        level = [level, level]
 
-    kept = normalized["messages"][0]
-    assert len(kept) < 500, "traversal must stop at the budget, not run the full width"
-    assert lost_content is True
+    assert _digest({"v": level}) == ""
+
+    # Counterweight: a large payload that genuinely encodes still gets a key, so the cap is not
+    # simply refusing everything big.
+    realistic = {"messages": [{"role": "assistant", "content": "x" * 200} for _ in range(2000)]}
+    assert _digest(realistic) != ""
 
 
 def test_no_subscriptions_means_no_capture_work() -> None:

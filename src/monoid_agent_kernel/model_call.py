@@ -22,7 +22,9 @@ inherits classification without inheriting a retry loop.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
@@ -32,7 +34,6 @@ from monoid_agent_kernel.core._sync_bridge import (
     await_abandonable_call,
     start_abandonable_sync_call,
 )
-from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
@@ -86,128 +87,60 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
     }
 
 
-_MAX_DIGEST_DEPTH = 32
-_MAX_DIGEST_NODES = 1_000_000
+# Bounds the encoder's output, not the input's shape. Comfortably above a resolved multimodal
+# request (base64 image parts ride in ``messages``) and far below the point where a deliberately
+# shared payload could expand without end.
+_MAX_DIGEST_BYTES = 4 * 1024 * 1024
 
-
-def _canonical_ready(value: Any) -> tuple[Any, bool]:
-    """`value` reshaped so the canonical serializer can always carry it.
-
-    Digests are computed on every call, *before* the adapter is reached, so a value the serializer
-    chokes on stops the call from happening at all. A digest must never be able to do that: it is
-    bookkeeping about a call, not a precondition for making one.
-
-    Applied to the whole payload rather than to selected fields. An earlier attempt guarded only the
-    tool definitions, which left `messages` and `observations` -- both `dict[str, Any]` a caller
-    fills -- able to kill a call outright.
-
-    Mapping keys are stringified because canonical JSON sorts them, and sorting mixed key types
-    raises. Anything JSON has no form for degrades to `repr`, which for a default `__repr__` embeds
-    an address and so digests differently each run. That is the deliberate direction: an unstable
-    replay key always misses and costs a re-run, while a stable-but-lossy one -- hashing the type
-    name, say -- would let two unrelated objects claim the same call.
-
-    **Three separate things bound the work, because they fail differently.**
-
-    `path` catches a reference back to something already on the current path. A depth cap alone
-    does not: it terminates a single self-reference in `depth` steps, but a cycle reached through
-    *two* references per level expands `2**depth` nodes first -- 4 billion at this cap, which hangs
-    rather than terminates. Only the path matters, not everything seen: an object appearing twice in
-    sibling branches is ordinary sharing, and replacing it would make the digest depend on whether a
-    caller happened to share an object rather than on the value, so two logically equal payloads
-    would digest differently.
-
-    `depth` bounds recursion for a payload that is merely very deep, with no repetition to catch.
-
-    `budget` bounds total work for the shape neither of the others sees: an acyclic graph whose
-    levels each reference the next twice is exponential with no repeat on any single path.
-
-    Returns the reshaped payload and whether any bound **lost information**. A cycle marker names
-    the depth it points back to, which is what makes it lossless: a bare marker said *that* an edge
-    looped without saying *where*, so `root -> child -> root` and `root -> child -> child` both
-    became `[["<cycle>"]]` and shared a replay key. Depth identifies the target exactly, since a
-    path holds one object per position.
-
-    Truncation, the depth cap and an unrepresentable value do lose content. A digest over a
-    truncated payload would silently stand for "everything up to here" -- two requests differing
-    only past the cut would match -- so callers turn that flag into an absent digest rather than an
-    ordinary-looking one.
-
-    Containers stop iterating once the budget is gone. Returning the marker per element still
-    walked every element of a very wide payload, so the advertised total-work bound bounded
-    allocation and not work.
-    """
-
-    remaining = [_MAX_DIGEST_NODES]
-    lost_content = [False]
-    # id -> the depth it sits at on the path currently being walked. A set would say *that* an edge
-    # points back at an ancestor without saying *which*, and `root -> child -> root` would normalize
-    # identically to `root -> child -> child`.
-    path: dict[int, int] = {}
-
-    def walk(item: Any, depth: int) -> Any:
-        # No entry guard: the containers below stop before spending a child they cannot afford, so
-        # by the time this runs the budget has already been checked. An entry guard as well would be
-        # a second copy of the same rule, reachable only if the budget started at zero.
-        remaining[0] -= 1
-        if depth > _MAX_DIGEST_DEPTH:
-            lost_content[0] = True
-            return "<max-depth>"
-        if item is None or isinstance(item, (str, int, float, bool)):
-            return item
-        marker = id(item)
-        if marker in path:
-            return f"<cycle:{path[marker]}>"
-        path[marker] = depth
-        try:
-            if isinstance(item, Mapping):
-                mapped: dict[str, Any] = {}
-                for key, child in item.items():
-                    if remaining[0] <= 0:
-                        lost_content[0] = True
-                        break
-                    mapped[str(key)] = walk(child, depth + 1)
-                return mapped
-            if isinstance(item, (list, tuple)):
-                listed: list[Any] = []
-                for child in item:
-                    if remaining[0] <= 0:
-                        lost_content[0] = True
-                        break
-                    listed.append(walk(child, depth + 1))
-                return listed
-            try:
-                return repr(item)
-            except Exception:
-                # A `__repr__` that raises would otherwise abort the call while the receipt is being
-                # built, before the adapter is ever reached -- the exact thing this function exists
-                # to prevent. Nothing is known about the value, so the payload is lossy.
-                lost_content[0] = True
-                return "<unrepresentable>"
-        finally:
-            # Popped on the way out so the entry is scoped to the path, not to everything seen. A
-            # sibling reusing the same object is ordinary sharing, not a cycle.
-            del path[marker]
-
-    normalized = walk(value, 0)
-    return normalized, lost_content[0]
+# The settings ``core._util.canonical_sha256`` serializes with, and the same object does the
+# encoding and the hashing here. A guard that checks one encoding while another does the hashing
+# is exactly how a payload once passed validation and then raised mid-hash.
+_CANONICAL_ENCODER = json.JSONEncoder(
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+    check_circular=True,
+)
 
 
 def _digest(payload: dict[str, Any]) -> str:
-    """The one place a model-call digest is taken, so normalization cannot be skipped at one.
+    """The canonical-JSON digest of `payload`, or `""` when canonical JSON cannot carry it.
 
-    Empty when normalization had to drop content. A digest is documented as the *exact* replay key,
-    and one taken over a truncated payload would stand for "everything up to the cut" -- two
-    requests differing only past it would produce the same key and a replay consumer would hand
-    back the wrong call. Refusing to issue a key is the safe half of that trade; the call still
-    happens, it simply is not replayable.
+    Streamed through the standard encoder rather than normalized first. Four rounds of review went
+    into a hand-written normalizer that reshaped anything into something hashable -- stringified
+    mapping keys, `<cycle:n>` markers, `repr` for values JSON had no form for -- and each fix
+    revealed another way for two different requests to land on one digest: a `repr` shared by
+    unrelated objects, a marker a caller could type as ordinary text, a lone surrogate that passed
+    the type check and then failed at encode.
 
-    Consumers must read an empty digest as *no key*, never as a key. Two unreplayable calls both
-    carry `""` and are not thereby the same call.
+    The premise was wrong. A `ModelRequest` carries what will be sent to a provider over HTTP, so a
+    payload canonical JSON cannot carry was never going to reach a model either. Reshaping it into
+    something hashable invented an identity for a request that does not exist, and inventing
+    identities is the one thing a replay key must not do.
+
+    So: hash what encodes, and issue no key for what does not. Refusing is safe -- the call still
+    happens, it simply is not replayable -- while a fabricated key returns the wrong call. An empty
+    digest means *no key*; two unreplayable calls both carry `""` and are not thereby the same call.
+
+    Circular references, unencodable primitives and unserializable objects all arrive here as an
+    exception from the encoder, which is why one `except` covers what previously needed a cycle
+    tracker, a depth cap and three separate value guards. Output is capped so a payload built from
+    shared references cannot expand without bound; passing the cap also means no key, since a
+    prefix would stand for the whole.
     """
 
-    normalized, lost_content = _canonical_ready(payload)
-    return "" if lost_content else canonical_sha256(normalized)
+    hasher = hashlib.sha256()
+    encoded = 0
+    try:
+        for chunk in _CANONICAL_ENCODER.iterencode(payload):
+            raw = chunk.encode("utf-8")
+            encoded += len(raw)
+            if encoded > _MAX_DIGEST_BYTES:
+                return ""
+            hasher.update(raw)
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+        return ""
+    return hasher.hexdigest()
 
 
 def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
