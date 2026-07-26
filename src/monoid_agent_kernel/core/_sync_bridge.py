@@ -42,6 +42,22 @@ class CalleeCancelled(Exception):
     """
 
 
+def is_async_callable(candidate: Any) -> bool:
+    """Whether calling ``candidate`` produces an awaitable rather than a finished value.
+
+    ``inspect.iscoroutinefunction`` answers for a *function*, and answers no for an object whose
+    ``__call__`` is one -- what a wrapper, a middleware layer, or a partially applied adapter
+    produces. Both dispatch halves have to ask this, and here rather than twice because they asked it
+    differently: the tool half checked ``__call__``, the model half did not, so a callable adapter
+    was run on the synchronous worker and the coroutine it returned was handed back as the turn.
+    Unawaited, which means the provider was never called at all, while the receipt recorded success.
+    """
+
+    return inspect.iscoroutinefunction(candidate) or inspect.iscoroutinefunction(
+        getattr(candidate, "__call__", None)
+    )
+
+
 def consume_task_outcome(task: asyncio.Future[Any]) -> None:
     """Retrieve a detached task outcome so late cleanup cannot emit an unhandled warning."""
 

@@ -17,6 +17,7 @@ from monoid_agent_kernel.core._sync_bridge import (
     AbandonableSyncCall,
     CalleeCancelled,
     await_abandonable_call,
+    is_async_callable,
     start_abandonable_sync_call,
 )
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
@@ -3627,9 +3628,7 @@ class AgentLoop:
         )
         try:
             handler = spec.handler
-            async_call = inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(
-                getattr(handler, "__call__", None)
-            )
+            async_call = is_async_callable(handler)
             if async_call:
                 pending = handler(context, arguments)
                 result = await self._await_native_tool_handler(pending, deadline)

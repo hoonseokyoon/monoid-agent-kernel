@@ -37,6 +37,7 @@ from monoid_agent_kernel.core._sync_bridge import (
     CalleeCancelled,
     await_abandonable_call,
     consume_task_outcome,
+    is_async_callable,
     start_abandonable_sync_call,
 )
 from monoid_agent_kernel.core.cancellation import CancellationToken
@@ -577,12 +578,21 @@ class ModelCallRunner:
         if anext_turn is not None:
             return await self._aawait(anext_turn(request), deadline)
         next_turn = adapter.next_turn
-        if inspect.iscoroutinefunction(next_turn):
+        if is_async_callable(next_turn):
             return await self._aawait(next_turn(request), deadline)
-        return await self._aawait(
+        turn = await self._aawait(
             start_abandonable_sync_call(lambda: next_turn(request), thread_name=self.thread_name),
             deadline,
         )
+        # Second line of defence, the same one the tool half keeps: an adapter can be synchronous
+        # and still hand back something awaitable -- it delegates to an async client, or its
+        # ``next_turn`` is a callable object no predicate recognised. Returned as-is, that awaitable
+        # became the turn. Nothing downstream reads a coroutine as a failure: the receipt's field
+        # reads are all defensive, so it recorded a *successful* call for a provider that was never
+        # invoked, and the caller got an object whose every turn field was missing.
+        if inspect.isawaitable(turn):
+            return await self._aawait(turn, deadline)
+        return turn
 
     async def _astream(
         self,

@@ -74,6 +74,15 @@ out in commit messages and here.
 
 ### Fixed
 
+- An adapter whose `next_turn` is a callable object with an async `__call__`, or a synchronous
+  `next_turn` that returns an awaitable, is now driven correctly. `inspect.iscoroutinefunction`
+  answers for a function and says no to both, so the call went to the synchronous worker and the
+  awaitable it produced was handed back *as the turn*. Nothing downstream reads a coroutine as a
+  failure — every receipt field read is defensive — so the receipt recorded a **successful model call
+  for a provider that was never invoked**, and the caller got an object whose every turn field was
+  missing. The tool half already defended both shapes; the question "does calling this produce an
+  awaitable?" now has one answer, `is_async_callable`, shared by both dispatch halves, because asking
+  it two different ways is how the halves came to disagree.
 - A retried streamed gateway call now carries a freshly resolved token, as the blocking one always
   did. `astream_turn` resolved its headers once above the retry loop, alongside the URL and the body
   — but neither of those can change between attempts and a credential can. A `token_provider` that

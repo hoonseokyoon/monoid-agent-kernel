@@ -98,6 +98,39 @@ class StreamingAdapter:
         return ModelTurn(final_text="one-shot fallback")
 
 
+class _AsyncCallableNextTurn:
+    """``next_turn`` as an object with an async ``__call__`` -- a wrapper or middleware layer."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, request: ModelRequest) -> ModelTurn:
+        del request
+        self.calls += 1
+        return ModelTurn(response_id="r", final_text="answer")
+
+
+class CallableObjectAdapter:
+    def __init__(self) -> None:
+        self.next_turn = _AsyncCallableNextTurn()
+
+
+class AwaitableReturningAdapter:
+    """A synchronous ``next_turn`` that hands back an awaitable -- it delegates to an async client."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def next_turn(self, request: ModelRequest) -> Any:
+        del request
+        self.calls += 1
+
+        async def answer() -> ModelTurn:
+            return ModelTurn(response_id="r", final_text="answer")
+
+        return answer()
+
+
 class RecordingObserver:
     def __init__(self) -> None:
         self.captures: list[ModelCallCapture] = []
@@ -110,13 +143,28 @@ class RecordingObserver:
 
 
 @pytest.mark.parametrize(
-    "adapter", [SyncAdapter(), CoroutineAdapter(), AsyncAdapter(), StreamingAdapter()]
+    "adapter",
+    [
+        SyncAdapter(),
+        CoroutineAdapter(),
+        AsyncAdapter(),
+        StreamingAdapter(),
+        CallableObjectAdapter(),
+        AwaitableReturningAdapter(),
+    ],
 )
 def test_every_adapter_shape_reaches_the_same_turn(adapter: Any) -> None:
     """The point of the runner: an adapter's async-ness is not observable in the result.
 
     ``StreamingAdapter`` is here with no ``delta_consumer``, so it lands on the one-shot path -- the
     shapes agree across the dispatch fork, not merely within one branch of it.
+
+    The last two shapes are the ones a predicate over *functions* misses. `iscoroutinefunction` says
+    no to an object whose `__call__` is async, and cannot say anything about a synchronous callable
+    that returns an awaitable -- both were run on the sync worker and the awaitable they produced was
+    handed back as the turn. `isinstance` is the assertion that catches it: nothing downstream reads
+    a coroutine as a failure, since every receipt field read is defensive, so the call was recorded
+    as a success for a provider that had never been invoked.
     """
 
     async def run() -> ModelTurn:
@@ -124,8 +172,70 @@ def test_every_adapter_shape_reaches_the_same_turn(adapter: Any) -> None:
         return turn
 
     turn = asyncio.run(run())
+    assert isinstance(turn, ModelTurn), f"the dispatch returned a {type(turn).__name__}, not a turn"
     assert turn.final_text in {"answer", "one-shot fallback"}
     assert turn.final_text is not None
+
+
+@pytest.mark.parametrize("adapter_factory", [CallableObjectAdapter, AwaitableReturningAdapter])
+def test_an_adapter_the_function_predicate_misses_is_still_actually_invoked(
+    adapter_factory: Any,
+) -> None:
+    """The sharper half: the provider has to have been *called*.
+
+    A coroutine handed back unawaited means the adapter body never ran -- no request was ever sent --
+    and the receipt still said the call succeeded. That is the worst shape a failure can take here:
+    an audit trail recording a provider call that did not happen.
+    """
+    adapter = adapter_factory()
+
+    async def run() -> tuple[ModelTurn, Any]:
+        return await ModelCallRunner(adapter=adapter).acall(REQUEST)
+
+    turn, receipt = asyncio.run(run())
+    invoked = getattr(adapter, "calls", None)
+    if invoked is None:
+        invoked = adapter.next_turn.calls
+    assert invoked == 1, "the adapter body never ran, so nothing was asked of the provider"
+    assert turn.final_text == "answer"
+    assert receipt.succeeded is True
+
+
+@pytest.mark.parametrize(
+    ("adapter_factory", "expect_worker"),
+    [(CallableObjectAdapter, False), (SyncAdapter, True)],
+)
+def test_an_async_callable_adapter_is_not_sent_to_a_worker_thread(
+    monkeypatch: Any, adapter_factory: Any, expect_worker: bool
+) -> None:
+    """Recognising the async callable, distinct from surviving it.
+
+    The awaitable fallback below the dispatch is what makes a missed async callable *correct*, so a
+    test that only checks the turn cannot tell the two defences apart. This one observes the dispatch
+    itself: an async callable must never be handed to `start_abandonable_sync_call`, which spawns a
+    dedicated daemon thread per call and hands its work back through a bridge the call does not need.
+    The synchronous shape is the counterweight -- the worker is where it belongs.
+    """
+    from monoid_agent_kernel import model_call as model_call_module
+
+    real = model_call_module.start_abandonable_sync_call
+    dispatched: list[str] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        dispatched.append(kwargs.get("thread_name", "?"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(model_call_module, "start_abandonable_sync_call", spy)
+
+    async def run() -> ModelTurn:
+        turn, _receipt = await ModelCallRunner(adapter=adapter_factory()).acall(REQUEST)
+        return turn
+
+    turn = asyncio.run(run())
+    assert isinstance(turn, ModelTurn)
+    assert bool(dispatched) is expect_worker, (
+        f"worker dispatch was {'skipped' if not dispatched else 'used'} for this shape"
+    )
 
 
 def test_anext_turn_is_preferred_over_next_turn() -> None:

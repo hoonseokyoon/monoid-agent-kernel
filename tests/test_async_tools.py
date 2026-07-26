@@ -8,6 +8,7 @@ import threading
 import time
 from contextvars import ContextVar
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -109,6 +110,65 @@ def test_async_and_sync_tool_handlers_use_native_and_worker_paths_sequentially(
         if event in {"tool.call.started", "tool.call.finished"}
     ]
     assert lifecycle == ["tool.call.started", "tool.call.finished"] * 3
+
+
+def test_a_sync_tool_handler_may_hand_back_an_awaitable(tmp_path: Path) -> None:
+    """The second defence on the tool half, and the twin of the model half's.
+
+    A handler can be an ordinary function and still return something awaitable -- it delegates to an
+    async client, or it is a callable object no predicate over functions recognises. The dispatch
+    awaits what comes back rather than treating it as the result. Unbound until now: dropping the
+    fallback passed the whole tool suite, because the shape it breaks is one nothing exercised.
+
+    Its failure mode differs from the model half's, which is why this is worth its own test rather
+    than an argument from the shared predicate: here `isinstance(result, ToolResult)` rejects the
+    coroutine loudly, where the model dispatch had no such check and recorded a clean success for a
+    provider it never called.
+    """
+    ran: list[str] = []
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> Any:
+                del ctx, args
+
+                async def finish() -> ToolResult:
+                    ran.append("awaited")
+                    return ToolResult(ok=True, content={"done": True})
+
+                return finish()
+
+            return [
+                ToolSpec(
+                    id="sync.awaitable",
+                    description="a sync handler that returns an awaitable",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="read",
+                    handler=handler,
+                )
+            ]
+
+    result = asyncio.run(
+        AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=FakeModelAdapter(
+                turns=[
+                    ModelTurn(tool_calls=(fake_tool_call("sync_awaitable", {}, "c1"),)),
+                    ModelTurn(final_text="done"),
+                ]
+            ),
+            runtime_config_provider=runtime_provider(
+                runtime_config(bindings=(tool_binding("sync.awaitable"),))
+            ),
+            tool_providers=(Provider(),),
+        ).arun_once("go")
+    )
+
+    assert result.status == "completed"
+    assert ran == ["awaited"], "the awaitable was taken as the result instead of being awaited"
 
 
 def test_async_tool_controlled_error_becomes_ordered_failed_observation(tmp_path: Path) -> None:
