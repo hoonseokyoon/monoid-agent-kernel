@@ -217,7 +217,12 @@ class OpenAIModelAdapter:
             if scope is None:
                 return factory(api_key=key), True
             cached = scope.async_client
-            if cached is not None and scope.loop is not loop and _loop_is_live(scope.loop):
+            # Asked of the scope's loop, not of the client it happens to be holding. The two are
+            # only ever set and cleared together, but that pairing is maintained in the branches
+            # below and in ``_take_scope``, and a check that has to be right depends on nothing it
+            # does not test itself. Keyed off the client, a scope whose loop outlived its client
+            # would be quietly taken over by whichever other loop asked next.
+            if scope.loop is not None and scope.loop is not loop and _loop_is_live(scope.loop):
                 return factory(api_key=key), True
             if cached is not None and (scope.loop is not loop or cached.is_closed()):
                 # Only one belonging to *another* loop has to be handed back. One that is merely
