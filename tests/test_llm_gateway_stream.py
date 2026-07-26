@@ -649,6 +649,69 @@ def test_both_transports_re_resolve_the_token_on_every_attempt(monkeypatch: Any)
     )
 
 
+def test_both_transports_honour_retry_on_for_a_transport_failure(monkeypatch: Any) -> None:
+    """`retry_on` is a policy, and a transport failure is not exempt from it on either loop.
+
+    Both loops classify a connection-level failure as retryable and then ask `_should_retry`, which
+    also requires the code to be listed in `retry_on`. That second question was unobserved on both
+    sides: a mutant that drops the gate and always loops still makes `max_attempts` attempts under
+    the default policy, so nothing separated it -- the difference only shows when the policy excludes
+    the code, which is precisely when a caller is relying on it.
+
+    `retry_on=("gateway_timeout",)` keeps timeouts retryable and takes `gateway_network_error` out,
+    so one attempt is the whole call.
+    """
+    httpx = pytest.importorskip("httpx")
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+    config = ModelConfig(
+        gateway_url="http://gateway.invalid",
+        retry=ModelRetryConfig(
+            max_attempts=3, initial_delay_s=0, jitter_s=0, retry_on=("gateway_timeout",)
+        ),
+    )
+    adapter = GatewayModelAdapter(config=config, token="t")
+    request = ModelRequest(instruction="go", system_prompt="s", tools=())
+
+    def blocking_attempts() -> int:
+        attempts = {"n": 0}
+
+        def _urlopen(_http_request: Any, timeout: float | None = None) -> Any:
+            attempts["n"] += 1
+            raise URLError("connection refused")
+
+        monkeypatch.setattr(gateway_module, "urlopen", _urlopen)
+        with pytest.raises(ModelAdapterError) as caught:
+            adapter.next_turn(request)
+        assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
+        return attempts["n"]
+
+    def streaming_attempts() -> int:
+        attempts = {"n": 0}
+
+        class _Client:
+            def __init__(self, **_kwargs: Any) -> None:
+                return None
+
+            async def __aenter__(self) -> Any:
+                return self
+
+            async def __aexit__(self, *_args: Any) -> None:
+                return None
+
+            def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+                attempts["n"] += 1
+                raise httpx.HTTPError("connection refused")
+
+        monkeypatch.setattr(httpx, "AsyncClient", _Client)
+        with pytest.raises(ModelAdapterError) as caught:
+            _stream(adapter)
+        assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
+        return attempts["n"]
+
+    assert blocking_attempts() == 1, "the blocking loop retried a code the policy excludes"
+    assert streaming_attempts() == 1, "the streamed loop retried a code the policy excludes"
+
+
 def _status_client(httpx: Any, status: int, detail: str) -> tuple[Any, dict[str, int]]:
     """An `AsyncClient` whose stream always answers `status`, counting the attempts."""
 
