@@ -663,9 +663,19 @@ class ModelCallRunner:
                 mark_provider_retried(exc)
             raise
         finally:
-            # In a `finally` and not only on the failure path: an abandoned `consume` outlives an
-            # ordinary return too, and the flag has to be cleared before this frame hands control
-            # back to `acall` for "no chunk after the call ended" to be a rule rather than a race.
+            # A `finally` rather than a line in the handler above, and deliberately *not* because a
+            # normal return can leave `consume` running -- it cannot. `await_abandonable_call`
+            # returns `task.result()` only once the task is done, so returning here means the drive
+            # already finished, and every other exit passes through the `except BaseException`.
+            # Clearing the flag there instead is, today, exactly equivalent: a mutation that moves
+            # this line into that handler survives the suite, and no test can be written against it.
+            #
+            # It stays here because the guarantee must not depend on that argument holding. It
+            # currently rests on two facts one edit away from changing -- that the handler catches
+            # every exception type and re-raises, and that `mark_provider_retried` cannot raise
+            # before the clear is reached (it swallows `Exception`). Add an early return, narrow the
+            # handler, or reorder those two statements, and an abandoned stream starts talking to a
+            # finished call again. A `finally` costs nothing and survives all three.
             driving = False
 
     async def _aclose_within_grace(self, aclose: Callable[[], Any]) -> None:
