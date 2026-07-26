@@ -430,6 +430,16 @@ class ModelCallRunner:
         should_abort: ShouldAbort | None,
         delta_consumer: DeltaConsumer | None,
     ) -> ModelTurn:
+        # Before dispatch, not only inside the race. `_aawait` reports a boundary that had already
+        # been crossed, but by then the adapter has been invoked and the provider has been paid for
+        # work the run had already decided not to do. Checking here also covers the interval the
+        # caller cannot: building the receipt digests happens between the caller's own boundary
+        # check and this line, so a deadline can expire in between.
+        #
+        # Nothing awaits between here and the dispatch below, so the check cannot go stale within
+        # this task. A boundary crossed *after* dispatch is the race's business, which is why this
+        # is an addition to it rather than a replacement.
+        self._check_cancel_or_deadline(deadline)
         astream_turn = getattr(self.adapter, "astream_turn", None)
         if delta_consumer is not None and astream_turn is not None:
             return await self._astream(

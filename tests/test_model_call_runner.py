@@ -1015,6 +1015,60 @@ def test_a_retried_stream_keeps_its_evidence_when_the_call_never_completes() -> 
     assert hanging(retried=False).provider_retried is False
 
 
+def test_a_boundary_already_crossed_is_never_paid_for() -> None:
+    """A run that has already stopped must not issue the call it decided not to make.
+
+    The cancel/deadline race reported the boundary correctly, but only after the request had been
+    handed to the adapter -- so the provider ran it and would bill for it. All three dispatch shapes
+    did this, and the receipt digests are built immediately before, which is time a deadline can
+    expire in.
+    """
+    calls: list[str] = []
+
+    class Sync:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            calls.append("sync")
+            return ModelTurn(final_text="billed")
+
+    class Async:
+        async def anext_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            calls.append("async")
+            return ModelTurn(final_text="billed")
+
+    class Stream:
+        async def astream_turn(self, request: ModelRequest) -> Any:
+            del request
+            calls.append("stream")
+            yield TurnComplete(response_id="r")
+
+    async def attempt(adapter: Any, *, expired: bool) -> None:
+        token = CancellationToken()
+        if not expired:
+            token.cancel()
+        extra = {"delta_consumer": (lambda chunk: None)} if isinstance(adapter, Stream) else {}
+        with pytest.raises(RunTimeout if expired else RunCancelled):
+            await ModelCallRunner(
+                adapter=adapter, current_cancellation_token=lambda: token
+            ).acall(REQUEST, deadline=(time.time() - 5) if expired else None, **extra)
+
+    async def run() -> None:
+        for adapter in (Sync(), Async(), Stream()):
+            for expired in (True, False):
+                await attempt(adapter, expired=expired)
+
+    asyncio.run(run())
+    assert calls == []
+
+    # Counterweight: a runner that dispatched nothing at all would pass the assertion above.
+    async def unblocked() -> None:
+        await ModelCallRunner(adapter=Sync()).acall(REQUEST, deadline=time.time() + 30)
+
+    asyncio.run(unblocked())
+    assert calls == ["sync"]
+
+
 def test_the_receipt_carries_the_invocation_context() -> None:
     context = InvocationContext(run_id="run-1", step_id="step-2", attempt=3)
 
