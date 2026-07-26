@@ -376,6 +376,12 @@ def test_the_streamed_backoff_waits_without_holding_the_event_loop(monkeypatch: 
 
     assert awaited, "the streamed retry must wait on the event loop, not block it"
     assert blocking == [], "the streamed retry must not use the blocking wait"
+    # Which schedule step it asked for, not merely that it waited. The args were already being
+    # recorded and never inspected, so shifting the streamed loop's index one step up the curve --
+    # real extra seconds per retry -- passed the whole suite.
+    assert [args[0] for args in awaited] == [1], (
+        "the backoff is indexed by the attempt that just failed"
+    )
 
 
 def test_the_async_backoff_lets_other_tasks_run() -> None:
@@ -409,3 +415,42 @@ def test_both_waits_follow_one_schedule() -> None:
     assert gateway._retry_delay(*args) == 1.0
     # Capped, and the cap applies to both because both read the same schedule.
     assert gateway._retry_delay(9, 0.5, 4.0, 2.0, 0.0) == 4.0
+
+
+def test_the_streamed_retry_is_reported_before_the_wait_not_after_it(monkeypatch: Any) -> None:
+    """The streamed twin of `test_the_retry_is_reported_before_the_wait_not_after_it`.
+
+    That test is named for "the loops" and binds one. The streamed case is the *stronger* one: its
+    wait actually yields, so the event loop stays free and the run's own cancel/deadline race can
+    fire inside the window. A report issued after the wait is therefore a report that genuinely may
+    never happen -- on the blocking path the loop is frozen and the race cannot fire at all.
+
+    Both reports go out before the wait: the channel one and the empty `TextDelta` that carries the
+    same fact on the wire, since a stream cancelled mid-backoff never commits a chunk to stamp.
+    """
+    from monoid_agent_kernel.providers import gateway
+
+    order: list[str] = []
+
+    async def _fake_await(*_args: Any) -> None:
+        order.append("wait")
+
+    monkeypatch.setattr(gateway, "_asleep_before_retry", _fake_await)
+    monkeypatch.setattr(gateway, "report_provider_retried", lambda: order.append("report"))
+
+    adapter, _attempts = _retried_stream_adapter(
+        monkeypatch,
+        body=[
+            'data: {"type":"text_delta","text":"hi"}',
+            "",
+            'data: {"type":"turn_complete","response_id":"turn_1"}',
+            "",
+        ],
+    )
+    chunks = _stream(adapter)
+
+    assert order == ["report", "wait"], (
+        "the streamed loop must report the retry before waiting, not after"
+    )
+    marker = [c for c in chunks if getattr(c, "provider_retried", False)]
+    assert marker, "the wire half of the evidence must also precede the wait"

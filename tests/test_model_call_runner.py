@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import threading
 import time
 from dataclasses import replace
 from typing import Any
@@ -1478,6 +1479,13 @@ def test_a_tool_call_the_adapter_built_oddly_costs_its_own_entry() -> None:
 
     assert asyncio.run(run()).final_text == "answer"
     assert len(observer.captures) == 1
+    # The half this test is named for, and did not check. Asserting only that the call survived
+    # made "the odd entry is dropped" indistinguishable from "the odd entry is preserved" -- and
+    # dropping it is worse than the crash it replaced: the record then claims the model made fewer
+    # tool calls than it made, silently, on the surface an audit reads.
+    tool_calls = observer.captures[0].content["tool_calls"]
+    assert len(tool_calls) == 1, f"the odd tool call vanished from the audit surface: {tool_calls}"
+    assert "repr" in tool_calls[0], "an entry that cannot be walked must still say what it was"
 
 
 def test_a_raising_probe_does_not_lose_the_call() -> None:
@@ -1670,7 +1678,21 @@ def test_a_by_reference_call_shows_an_empty_message_log_not_a_null_one() -> None
         await runner.acall(replace(REQUEST, messages=None, previous_turn_handle="prev"))
 
     asyncio.run(run())
-    assert observer.captures[0].content["messages"] == []
+    content = observer.captures[0].content
+    assert content["messages"] == []
+    # `previous_turn_handle` is normalized the same way and was left unbound, so only one of the two
+    # sibling guards was held. Checked on the *by-value* shape, where the request carries no handle
+    # and the surface must still show the empty string the code intends rather than `None`.
+    by_value = RecordingObserver()
+    asyncio.run(
+        ModelCallRunner(
+            adapter=SyncAdapter(),
+            subscriptions=(
+                ModelIOSubscription(observer=by_value, policy=CapturePolicy(mode="full")),
+            ),
+        ).acall(REQUEST)
+    )
+    assert by_value.captures[0].content["previous_turn_handle"] == ""
 
 
 def test_a_resolver_that_answers_nothing_still_leaves_the_key_empty() -> None:
@@ -1936,45 +1958,100 @@ def test_a_host_whose_adapter_changes_is_read_once_per_call_and_not_once_per_pro
     assert reads == [0, 1], f"the adapter must be read exactly once per call, was read {len(reads)}x"
 
 
-def test_the_grace_is_read_where_it_is_spent() -> None:
-    """A host may raise the grace after the runner was built; the tool half already allows it.
+def test_a_close_is_granted_the_grace_and_the_grace_is_read_live(caplog: Any) -> None:
+    """Two halves of one rule: cleanup is *given* the interval, and the interval is the live one.
 
-    Observable through the close bound: a 0.15s close fits inside a live 0.4s grace and is not
-    reported, but outruns the 0.01s the runner was constructed with.
+    Bounding a close is only half of it -- a bound of zero also bounds it. Nothing pinned that the
+    close gets any time at all, so `timeout=0.0` passed the entire suite while releasing no pooled
+    connection anywhere. The side effect is the assertion: a warning-only check cannot tell "the
+    cleanup finished" from "the cleanup never started".
+
+    The generator is deliberately left **suspended at a yield**. An earlier version of this test
+    drained it, which runs the `finally` during iteration and leaves `aclose()` a no-op -- it
+    exercised nothing, and passed. Only an abort mid-stream makes the close do real work.
     """
 
-    class SlowCloseAdapter:
+    released: list[str] = []
+
+    class ReleasingCloseAdapter:
         async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
             del request
             try:
                 yield TextDelta("ans")
-            finally:
-                await asyncio.sleep(0.15)
+                yield TextDelta("never consumed")
+            except GeneratorExit:
+                await asyncio.sleep(0.05)  # a pooled connection being handed back
+                released.append("released")
 
     async def run() -> None:
         runner = ModelCallRunner(
-            adapter=SlowCloseAdapter(),
-            cancel_grace_s=0.01,
-            current_cancel_grace_s=lambda: 0.4,
+            adapter=ReleasingCloseAdapter(),
+            cancel_grace_s=0.0,  # a snapshot that would grant the cleanup nothing
+            current_cancel_grace_s=lambda: 0.5,
         )
-        await runner.acall(REQUEST, delta_consumer=lambda chunk: None)
+        with pytest.raises(ModelCallAborted):
+            await runner.acall(
+                REQUEST, delta_consumer=lambda chunk: None, should_abort=lambda: True
+            )
 
-    import logging as _logging
-
-    records: list[Any] = []
-
-    class _Capture(_logging.Handler):
-        def emit(self, record: Any) -> None:
-            records.append(record)
-
-    logger = _logging.getLogger("monoid_agent_kernel.model_call")
-    handler = _Capture()
-    logger.addHandler(handler)
-    try:
+    with caplog.at_level("WARNING", logger="monoid_agent_kernel.model_call"):
         asyncio.run(run())
-    finally:
-        logger.removeHandler(handler)
 
-    assert not records, (
-        "the close fit inside the live grace but was judged against the constructed one"
+    assert released == ["released"], (
+        "the close was cut off before it could release anything: the grace is bounding cleanup to "
+        "nothing, or is being read from the constructed value rather than the live one"
     )
+    assert not caplog.records, (
+        f"a close that finished inside the grace was reported as abandoned: {caplog.records}"
+    )
+
+
+def test_a_bookkeeping_failure_does_not_orphan_the_call_it_already_started(caplog: Any) -> None:
+    """Registration runs *after* the call is live, so its failure must not skip the cleanup.
+
+    `start_abandonable_sync_call` starts the worker thread before `await_abandonable_call` is even
+    entered. With `add_cancel_callback` outside the `try`, a token that raised there skipped the
+    `finally` entirely: the call was neither cancelled, detached, nor consumed, and ran to completion
+    behind a run that had already reported a failure -- writing into a workspace nobody was waiting
+    on. The fix shipped with no test at all; nothing in the suite injects a raising registration, so
+    reverting it passed all 1987 tests.
+
+    The warning is the observable: reaching it means the `finally` ran and the worker was detached
+    and reported, rather than silently left behind.
+    """
+
+    class HostileToken(CancellationToken):
+        def add_cancel_callback(self, callback: Any) -> Any:
+            del callback
+            raise RuntimeError("registration exploded")
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    class BlockingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            started.set()
+            time.sleep(0.3)  # outlasts the grace, so an abandoned worker is reported
+            finished.set()
+            return ModelTurn(final_text="nobody is waiting for this")
+
+    runner = ModelCallRunner(
+        adapter=BlockingAdapter(),
+        current_cancellation_token=HostileToken,
+        cancel_grace_s=0.02,
+    )
+
+    async def run() -> None:
+        await runner.acall(REQUEST)
+
+    with caplog.at_level("WARNING", logger="monoid_agent_kernel.core.sync_bridge"):
+        with pytest.raises(RuntimeError, match="registration exploded"):
+            asyncio.run(run())
+
+    assert started.is_set(), "this test is meaningless unless the call really was already running"
+    assert any("abandoned a synchronous call" in record.message for record in caplog.records), (
+        "a call that was already running must still be detached and reported when the bookkeeping "
+        "around it fails"
+    )
+    assert finished.wait(timeout=5.0), "the worker should still finish; it is abandoned, not killed"
