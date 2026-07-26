@@ -335,13 +335,25 @@ def run(
     # Driven through the pair that is probed. ``enter_context`` needed ``__enter__``/``__exit__``
     # instead, so the ``open``/``close`` adapter this probe invites -- the lifecycle pair the rest
     # of the kernel uses, on ``AgentLoop`` and ``LoopSession`` -- raised ``TypeError`` before the
-    # first turn, outside the handler above, killing the run with a bare traceback. Registering the
-    # bound ``close`` resolves it eagerly, so an adapter offering ``open`` without ``close`` fails
-    # here rather than at teardown, with the run's result already in hand and nowhere to go.
+    # first turn, outside the handler above, killing the run with a bare traceback.
+    #
+    # Both halves are resolved *before* either is called. Registering the bound ``close`` after
+    # ``open()`` looked like it failed early enough, and did not: ``open()`` had already allocated
+    # whatever it allocates -- a connection pool, for the adapter this exists for -- and the
+    # ``AttributeError`` from resolving the missing ``close`` then escaped past the handler above
+    # with nothing left able to release it. An adapter that offers one half of the pair is
+    # misconfigured, so it is reported as such, before it holds anything.
     with contextlib.ExitStack() as adapter_scope:
-        if callable(getattr(model_adapter, "open", None)):
-            model_adapter.open()
-            adapter_scope.callback(model_adapter.close)
+        opener = getattr(model_adapter, "open", None)
+        if callable(opener):
+            closer = getattr(model_adapter, "close", None)
+            if not callable(closer):
+                raise click.ClickException(
+                    f"model adapter {type(model_adapter).__name__} exposes open() without a "
+                    "callable close(); nothing would release what open() allocates"
+                )
+            opener()
+            adapter_scope.callback(closer)
         result = AgentLoop(
             spec=spec,
             subagent_definitions=subagent_definitions,

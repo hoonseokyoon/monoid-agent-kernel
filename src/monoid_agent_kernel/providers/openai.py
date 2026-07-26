@@ -43,6 +43,15 @@ class _ClientScope:
     loop: asyncio.AbstractEventLoop | None = None
 
 
+def _loop_is_live(loop: asyncio.AbstractEventLoop | None) -> bool:
+    """Whether ``loop`` can still run work.
+
+    The one question both callers ask about a foreign loop, and they must answer it the same way:
+    a live loop can be handed a close, and a live loop is also one that may have a call in flight.
+    """
+    return loop is not None and not loop.is_closed() and loop.is_running()
+
+
 def _release_foreign_async_client(client: Any, loop: asyncio.AbstractEventLoop | None) -> None:
     """Best-effort close of an async client bound to a loop we are not running on.
 
@@ -51,8 +60,11 @@ def _release_foreign_async_client(client: Any, loop: asyncio.AbstractEventLoop |
     anything again, and there is nothing this side can do about the sockets it held. That is the
     reason an async scope should be ended with ``aclose()`` on its own loop -- this path exists to
     keep a *stale* client from being reused, not to promise it was tidied up.
+
+    Only ever called for a loop that has moved on: closing a client out from under a loop still
+    using it is what ``_async_client`` refuses to set up.
     """
-    if loop is None or loop.is_closed() or not loop.is_running():
+    if not _loop_is_live(loop):
         return
     # The outcome is deliberately not read, and nothing needs to read it. This used to attach a
     # callback that retrieved and dropped the exception, to avoid "exception never retrieved" noise
@@ -190,6 +202,13 @@ class OpenAIModelAdapter:
         A scoped client is reused only when it belongs to the loop this call is running on. Bound
         to a loop that has moved on it is unusable -- its sockets live there -- so it is dropped
         and rebuilt rather than handed out to fail on first use.
+
+        A loop that has *not* moved on is a different case, and the scope cannot serve it. One
+        adapter held open across two concurrently running loops -- two runs sharing it -- meant the
+        second loop's request treated the first loop's client as stale and scheduled a ``close()``
+        on it, cutting off a call in flight. Reuse belongs to whichever loop the scope holds; a call
+        from another live loop gets a client of its own and closes it, which is the same thing an
+        unscoped call does. The scope is left untouched, so the loop that owns it keeps its reuse.
         """
         loop = asyncio.get_running_loop()
         stale: tuple[Any, asyncio.AbstractEventLoop | None] | None = None
@@ -198,6 +217,8 @@ class OpenAIModelAdapter:
             if scope is None:
                 return factory(api_key=key), True
             cached = scope.async_client
+            if cached is not None and scope.loop is not loop and _loop_is_live(scope.loop):
+                return factory(api_key=key), True
             if cached is not None and (scope.loop is not loop or cached.is_closed()):
                 # Only one belonging to *another* loop has to be handed back. One that is merely
                 # closed has nothing left to release, and treating it as foreign would schedule a

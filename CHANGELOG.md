@@ -87,8 +87,16 @@ out in commit messages and here.
   `AgentLoop` and `LoopSession` use, and the one `OpenAIModelAdapter`'s own `__enter__` delegates to
   — raised `TypeError` before the first turn, outside the CLI's error handling, ending the run in a
   raw traceback after `run_id` and `run_dir` had already been printed. Adapters with no client to
-  hold are still left alone, and one offering `open` without `close` now fails at startup rather than
-  during teardown, where the run's result is already in hand and has nowhere to go.
+  hold are still left alone. One offering `open` without a callable `close` is reported as
+  misconfigured before `open()` runs, so nothing it would have allocated is left with no way to be
+  released.
+- An adapter held open across two *concurrently running* event loops no longer has one loop's client
+  closed under it. `OpenAIModelAdapter`'s scope drops a cached async client that belongs to another
+  loop, on the grounds that its sockets live there — but "belongs to another loop" was not
+  distinguished from "belongs to a loop that has moved on", so a second run asking for a client was
+  enough to schedule a `close()` onto the first run's still-running loop and cut off a call in
+  flight. Reuse now belongs to whichever loop the scope holds; a call from another live loop gets a
+  client it owns and closes, exactly as an unscoped call does, and the scope is left untouched.
 - A transport failure from the streaming client's own lifecycle is classified again. Hoisting the
   `httpx.AsyncClient` out of the retry loop (below) left its construction, `__aenter__` and pool
   teardown outside the per-attempt handler, so an `httpx.CloseError` or `PoolTimeout` escaped as a

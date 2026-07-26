@@ -1162,6 +1162,99 @@ def test_openai_only_a_client_from_another_loop_is_handed_back(
     assert len(across_loops) == 1, "a client bound to a loop that has moved on must be handed back"
 
 
+def test_openai_scope_does_not_close_a_client_another_live_loop_is_using() -> None:
+    """Reuse belongs to the loop the scope holds; another *live* loop gets its own client.
+
+    One adapter held open across two concurrently running loops -- two runs sharing it -- had the
+    second loop's request treat the first loop's client as stale, purely because a different loop
+    asked, and then schedule `close()` on it. That loop was still running, so the handoff succeeded
+    and cut off a call in flight.
+
+    "Moved on" and "still running" are different conditions and only the first is safe to release.
+    A call from another live loop now gets a client it owns and closes, which is what an unscoped
+    call does anyway, and the scope is left alone so its own loop keeps reusing.
+
+    Driven at the accessor rather than through `astream_turn`: the rule is about two loops racing for
+    one scope, and two real stand-in servers with real SDK clients would add network timing to a test
+    whose whole point is the handoff decision. The two loops here are genuinely concurrent -- loop A
+    is parked in an executor wait, so its loop is running when loop B asks.
+    """
+    closed: list[str] = []
+    built: list[Any] = []
+
+    class _FakeAsyncClient:
+        def __init__(self) -> None:
+            self.name = f"client-{len(built) + 1}"
+            self._closed = False
+
+        def is_closed(self) -> bool:
+            return self._closed
+
+        async def close(self) -> None:
+            self._closed = True
+            closed.append(self.name)
+
+    def factory(**_kwargs: Any) -> Any:
+        built.append(_FakeAsyncClient())
+        return built[-1]
+
+    adapter = OpenAIModelAdapter(
+        ModelConfig(model="gpt-5.5"), api_key="k", allow_direct_provider_api=True
+    )
+    adapter.open()
+    handed: dict[str, Any] = {}
+    a_has_client = threading.Event()
+    b_is_done = threading.Event()
+    failures: list[BaseException] = []
+
+    def loop_a() -> None:
+        async def go() -> None:
+            client, owned = adapter._async_client(factory, "k")
+            handed["a"] = (client.name, owned)
+            a_has_client.set()
+            # Parked here, so this loop is *running* while loop B asks for a client.
+            await asyncio.get_running_loop().run_in_executor(None, b_is_done.wait, 10)
+            handed["a_client_closed"] = client.is_closed()
+
+        try:
+            asyncio.run(go())
+        except BaseException as exc:  # noqa: BLE001 - reported on the main thread instead
+            failures.append(exc)
+
+    def loop_b() -> None:
+        try:
+            assert a_has_client.wait(10), "loop A never got a client"
+
+            async def go() -> None:
+                client, owned = adapter._async_client(factory, "k")
+                handed["b"] = (client.name, owned)
+                await asyncio.sleep(0.2)  # long enough for a scheduled cross-loop close to land
+
+            asyncio.run(go())
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(exc)
+        finally:
+            b_is_done.set()
+
+    threads = [threading.Thread(target=loop_a), threading.Thread(target=loop_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+    adapter.close()
+
+    assert not failures, f"a loop thread failed: {failures}"
+    assert all(not thread.is_alive() for thread in threads), "a loop thread did not finish"
+    assert handed["a"] == ("client-1", False), "the scope's own loop must keep reusing"
+    assert handed["b"] == ("client-2", True), (
+        "a call from another live loop must get a client of its own, and own it"
+    )
+    assert handed["a_client_closed"] is False, (
+        "loop A's client was closed while loop A was still using it"
+    )
+    assert closed == [], f"nothing should have been released here, closed: {closed}"
+
+
 def test_openai_scope_outlives_a_call_that_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failing call must not close a client it does not own.
 
@@ -1250,3 +1343,49 @@ def test_cli_run_scopes_an_adapter_that_can_hold_its_client(
     # Order, not just membership: a close before the turn would defeat the reuse, and an open
     # after it would never have covered the turn at all.
     assert events == ["open", "turn", "close"]
+
+
+def test_cli_run_refuses_an_adapter_offering_open_without_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Half a lifecycle pair is reported before anything is allocated, not after.
+
+    Registering the bound `close` after calling `open()` looked early enough and was not: `open()`
+    had already taken whatever it takes -- a connection pool, for the adapter this scope exists for
+    -- and the `AttributeError` from the missing `close` then escaped past the CLI's own handler,
+    with nothing left able to release it. `open()` must not have run at all.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    allocated: list[str] = []
+
+    class _OpenWithoutClose:
+        def __init__(self) -> None:
+            self._inner = FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+
+        def open(self) -> _OpenWithoutClose:
+            allocated.append("client")
+            return self
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            return self._inner.next_turn(request)
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli._model_adapter", lambda *_a, **_k: _OpenWithoutClose()
+    )
+    config_file = _write_config(tmp_path / "runtime.json", "run.finish")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(tmp_path / "runs"), "--runtime-config-file", str(config_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert allocated == [], "open() ran before the missing close() was noticed"
+    assert "close()" in result.output, f"the reason must reach the user: {result.output}"
+    assert not isinstance(result.exception, AttributeError), (
+        "the failure must be a reported CLI error, not a raw attribute lookup escaping the handler"
+    )
