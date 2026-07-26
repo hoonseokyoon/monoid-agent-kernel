@@ -197,12 +197,21 @@ class GatewayModelAdapter:
                                     raise _StreamRetry(error)
                                 raise error
                             committed = True
+                            if attempt > 1:
+                                # Retries here are all pre-commit, so this is both the first moment
+                                # the retry is certain and the last one guaranteed to happen. The
+                                # evidence is emitted here rather than left to the body because the
+                                # body is not a carrier anything can count on: a 200 stream may
+                                # yield no recognized chunk at all -- an empty body, or only frames
+                                # this version forwards past -- and a stream cancelled right after
+                                # commit yields none either. Both cases recorded the opposite audit
+                                # fact. An empty ``TextDelta`` concatenates to nothing, so the
+                                # assembled turn and any relay of the deltas are unchanged.
+                                yield TextDelta(text="", provider_retried=True)
                             async for chunk in _aiter_sse_chunks(response):
-                                # Retries here are all pre-commit, so reaching this point after the
-                                # first attempt means the stream was retried. Marked on every chunk
-                                # rather than the terminal one: a call cancelled or aborted
-                                # mid-stream never reaches ``TurnComplete``, and a receipt that
-                                # learned of the retry only there denied one that had happened.
+                                # Also on each chunk, so a chunk forwarded on its own still says
+                                # which stream it came from. Same ``attempt`` in the same scope as
+                                # the marker above, so the two cannot disagree.
                                 if attempt > 1:
                                     chunk = replace(chunk, provider_retried=True)
                                 yield chunk
