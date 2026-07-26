@@ -87,10 +87,10 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
 
 
 _MAX_DIGEST_DEPTH = 32
-_MAX_DIGEST_NODES = 100_000
+_MAX_DIGEST_NODES = 1_000_000
 
 
-def _canonical_ready(value: Any) -> Any:
+def _canonical_ready(value: Any) -> tuple[Any, bool]:
     """`value` reshaped so the canonical serializer can always carry it.
 
     Digests are computed on every call, *before* the adapter is reached, so a value the serializer
@@ -120,18 +120,30 @@ def _canonical_ready(value: Any) -> Any:
     `depth` bounds recursion for a payload that is merely very deep, with no repetition to catch.
 
     `budget` bounds total work for the shape neither of the others sees: an acyclic graph whose
-    levels each reference the next twice is exponential with no repeat on any single path. Its
-    truncation marker makes the outcome deterministic for a given payload, which a stack overflow
-    would not be.
+    levels each reference the next twice is exponential with no repeat on any single path.
+
+    Returns the reshaped payload and whether any bound **lost information**. A cycle marker does
+    not: it says "this points back at an ancestor", which is the complete truth about that edge and
+    is why a cyclic payload still gets a real digest. Truncation and the depth cap do lose content,
+    and a digest taken over a truncated payload would silently stand for "everything up to here" --
+    two requests differing only past the cut would match. Callers turn that flag into an absent
+    digest rather than an ordinary-looking one.
+
+    Containers stop iterating once the budget is gone. Returning the marker per element still
+    walked every element of a very wide payload, so the advertised total-work bound bounded
+    allocation and not work.
     """
 
     remaining = [_MAX_DIGEST_NODES]
+    lost_content = [False]
 
     def walk(item: Any, depth: int, ancestors: frozenset[int]) -> Any:
-        if remaining[0] <= 0:
-            return "<truncated>"
+        # No entry guard: the containers below stop before spending a child they cannot afford, so
+        # by the time this runs the budget has already been checked. An entry guard as well would be
+        # a second copy of the same rule, reachable only if the budget started at zero.
         remaining[0] -= 1
         if depth > _MAX_DIGEST_DEPTH:
+            lost_content[0] = True
             return "<max-depth>"
         if item is None or isinstance(item, (str, int, float, bool)):
             return item
@@ -140,18 +152,42 @@ def _canonical_ready(value: Any) -> Any:
             return "<cycle>"
         inner = ancestors | {marker}
         if isinstance(item, Mapping):
-            return {str(key): walk(child, depth + 1, inner) for key, child in item.items()}
+            mapped: dict[str, Any] = {}
+            for key, child in item.items():
+                if remaining[0] <= 0:
+                    lost_content[0] = True
+                    break
+                mapped[str(key)] = walk(child, depth + 1, inner)
+            return mapped
         if isinstance(item, (list, tuple)):
-            return [walk(child, depth + 1, inner) for child in item]
+            listed: list[Any] = []
+            for child in item:
+                if remaining[0] <= 0:
+                    lost_content[0] = True
+                    break
+                listed.append(walk(child, depth + 1, inner))
+            return listed
         return repr(item)
 
-    return walk(value, 0, frozenset())
+    normalized = walk(value, 0, frozenset())
+    return normalized, lost_content[0]
 
 
 def _digest(payload: dict[str, Any]) -> str:
-    """The one place a model-call digest is taken, so normalization cannot be skipped at one."""
+    """The one place a model-call digest is taken, so normalization cannot be skipped at one.
 
-    return canonical_sha256(_canonical_ready(payload))
+    Empty when normalization had to drop content. A digest is documented as the *exact* replay key,
+    and one taken over a truncated payload would stand for "everything up to the cut" -- two
+    requests differing only past it would produce the same key and a replay consumer would hand
+    back the wrong call. Refusing to issue a key is the safe half of that trade; the call still
+    happens, it simply is not replayable.
+
+    Consumers must read an empty digest as *no key*, never as a key. Two unreplayable calls both
+    carry `""` and are not thereby the same call.
+    """
+
+    normalized, lost_content = _canonical_ready(payload)
+    return "" if lost_content else canonical_sha256(normalized)
 
 
 def _tool_payload(spec: ToolSpec) -> dict[str, Any]:

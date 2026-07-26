@@ -14,9 +14,13 @@ out in commit messages and here.
   cancel/deadline race, and returns the turn with a `ModelCallReceipt` describing it. Which shape is
   used is a function of the call's own arguments, so the runner is usable outside a run: a gateway or
   a batch driver gets deadline and cancellation semantics that previously existed only inside
-  `AgentLoop`. Capture is opt-in through `subscriptions`; a runner wired to no observer does no
-  digesting. It lives at the package root rather than under `core/` because it names the provider
-  vocabulary it drives, and `core` does not import `providers`.
+  `AgentLoop`. Delivery of content to observers is opt-in through `subscriptions`, but the receipt's
+  digests are computed on every call, because they identify the call whether or not anyone is
+  watching. A digest is empty when the payload exceeded normalization bounds: it is documented as an
+  exact replay key, and one taken over a truncated payload would match two requests that differ only
+  past the cut, so no key is issued rather than a misleading one. Read an empty digest as *no key*,
+  never as a key. It lives at the package root rather than under `core/` because it names the
+  provider vocabulary it drives, and `core` does not import `providers`.
 - Added `ModelTurn.provider_retried` and `TurnComplete.provider_retried`, how an adapter reports that
   it retried internally before producing a turn. The kernel counts one adapter call per turn however
   many attempts happen inside it, so without this an audit receipt records a call that failed twice

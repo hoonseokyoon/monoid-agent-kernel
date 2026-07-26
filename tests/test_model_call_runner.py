@@ -527,30 +527,34 @@ def _shared_acyclic_graph() -> Any:
 
 
 @pytest.mark.parametrize(
-    ("label", "factory"),
+    ("label", "factory", "keyed"),
     [
-        ("self cycle", _self_cycle),
-        ("cycle reached through two references", _branching_cycle),
-        ("acyclic but exponentially shared", _shared_acyclic_graph),
+        ("self cycle", _self_cycle, True),
+        ("cycle reached through two references", _branching_cycle, True),
+        ("acyclic but exponentially shared", _shared_acyclic_graph, False),
     ],
 )
-def test_a_pathological_payload_terminates_quickly(label: str, factory: Any) -> None:
-    """Three shapes, because they defeat three different bounds.
+def test_a_pathological_payload_terminates_quickly(label: str, factory: Any, keyed: bool) -> None:
+    """Three shapes, because they defeat three different bounds — and two outcomes.
 
-    The first version of this test used only the self cycle, which a depth cap alone terminates in
-    `depth` steps — so it certified "cycles are safe" while a cycle reached through two references
-    per level still expanded `2**depth` nodes, four billion at the real cap. One shape stood in for
-    a claim about all of them.
+    An earlier version used only the self cycle, which a depth cap alone terminates in `depth`
+    steps, so it certified "cycles are safe" while a cycle reached through two references per level
+    still expanded `2**depth` nodes — four billion at the real cap. One shape stood in for a claim
+    about all of them.
 
     The third has no cycle at all: nothing repeats on any single path, so ancestor tracking cannot
-    see it and only a work budget bounds it.
+    see it and only the work budget bounds it.
+
+    `keyed` is the distinction that matters downstream. A cycle marker loses nothing — it states
+    exactly what that edge is — so a cyclic payload keeps a real replay key. Truncation drops
+    content, so it must not.
     """
     del label
     started = time.monotonic()
 
     digest = _digest({"value": factory()})
 
-    assert digest != ""
+    assert (digest != "") is keyed
     assert time.monotonic() - started < 5.0
 
 
@@ -897,8 +901,66 @@ def test_the_receipt_records_the_stop_reason_and_latency() -> None:
     assert dict(receipt.usage)["input_tokens"] == 3
 
 
+def test_a_truncated_payload_gets_no_replay_key_rather_than_a_misleading_one() -> None:
+    """Bounding the work created a way to collide, which is the failure this digest must not have.
+
+    Two requests differing only past the cut normalize to the same thing, so an ordinary-looking
+    digest would stand for "everything up to here" and a replay consumer would hand back the wrong
+    call. Refusing to issue a key is the safe half: the call still happens, it is just not
+    replayable.
+    """
+    huge = ModelRequest(
+        instruction="hi", system_prompt="s", tools=(), messages=({"v": list(range(1_000_100))},)
+    )
+    huge_but_different = ModelRequest(
+        instruction="hi",
+        system_prompt="s",
+        tools=(),
+        messages=({"v": list(range(1_000_099)) + [-999]},),
+    )
+
+    assert _digest(_prompt_payload(huge)) == ""
+    assert _digest(_prompt_payload(huge_but_different)) == ""
+
+    # Counterweight: ordinary payloads still get a key, and it still discriminates. "return empty
+    # always" would pass the assertions above.
+    ordinary = ModelRequest(instruction="hi", system_prompt="s", tools=())
+    other = ModelRequest(instruction="bye", system_prompt="s", tools=())
+    assert _digest(_prompt_payload(ordinary)) not in {"", _digest(_prompt_payload(other))}
+
+
+def test_a_cycle_still_gets_a_real_digest() -> None:
+    """A cycle marker loses nothing -- "this points back at an ancestor" is the whole truth about
+    that edge -- so unlike truncation it must not cost the call its replay key."""
+    cyclic: dict[str, Any] = {}
+    cyclic["self"] = cyclic
+
+    assert _digest({"value": cyclic}) != ""
+
+
+def test_the_work_budget_bounds_work_and_not_only_allocation() -> None:
+    """Returning a marker per element still walked every element of a very wide payload.
+
+    Timing rather than counting, because the claim is about work done, and the earlier version was
+    linear in the payload's full width no matter what the budget said.
+    """
+    timings = []
+    for width in (2_000_000, 8_000_000):
+        payload = {"messages": [list(range(width))]}
+        started = time.monotonic()
+        _digest(payload)
+        timings.append(time.monotonic() - started)
+
+    # Four times the width must not cost meaningfully more once the budget is exhausted.
+    assert timings[1] < timings[0] * 2.5
+
+
 def test_no_subscriptions_means_no_capture_work() -> None:
-    """Capture is opt-in. A runner wired to nothing still returns a usable receipt."""
+    """Delivery is opt-in; identifying the call is not.
+
+    The digests are computed either way, because they describe the call whether or not anyone is
+    watching. The CHANGELOG claimed otherwise and this test is what contradicted it.
+    """
 
     async def run() -> Any:
         _turn, receipt = await ModelCallRunner(adapter=SyncAdapter()).acall(REQUEST)
