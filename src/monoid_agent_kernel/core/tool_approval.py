@@ -82,7 +82,13 @@ def redact_tool_arguments(
     return {
         str(key): (
             _REDACTED
-            if _is_secret_key(str(key)) or str(key).lower() in prose_keys
+            if _is_secret_key(str(key))
+            # ``value is not None`` mirrors ``public_view.finish_args_preview``. Without it the two
+            # halves moved in opposite directions on ``notes: null`` — a legal call shape — and the
+            # approval preview badged an absent value as withheld, which is the exact behaviour the
+            # other half was changed to stop doing. Binding one half of a rule and not the other is
+            # what created the second door this ``prose_keys`` argument exists to close.
+            or (value is not None and str(key).lower() in prose_keys)
             else _redact_value(value)
         )
         for key, value in arguments.items()

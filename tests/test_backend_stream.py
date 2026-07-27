@@ -143,12 +143,28 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
     from monoid_agent_kernel.reference.backend import run_execution
 
     hydrated_kinds: list[Any] = []
+    hydrated_dirs: list[Any] = []
+    aliased: list[bool] = []
+    streamed_items: list[Any] = []
     original = run_execution.hydrate_settled_text
+    original_frame = run_execution.stream_item_frame
+
+    def frame_spy(item: Any) -> Any:
+        streamed_items.append(item)
+        return original_frame(item)
 
     def spy(events: Any, run_dir: Any) -> Any:
-        hydrated_kinds.extend(event.get("kind") for event in events)
+        hydrated_dirs.append(run_dir)
+        for event in events:
+            hydrated_kinds.append(event.get("kind"))
+            # The frame's ``data`` must not BE the AgentEvent's own dict. Filling it in place
+            # would write hydrated text into the event the bus owns and every sink shares.
+            aliased.append(
+                any(event.get("data") is getattr(item, "data", None) for item in streamed_items)
+            )
         return original(events, run_dir)
 
+    monkeypatch.setattr(run_execution, "stream_item_frame", frame_spy)
     monkeypatch.setattr(run_execution, "hydrate_settled_text", spy)
 
     workspace = _workspace(tmp_path)
@@ -162,6 +178,11 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
     assert any(frame["kind"] == "delta" for frame in frames)
     assert any(frame["kind"] == "event" for frame in frames)
     assert hydrated_kinds and set(hydrated_kinds) == {"event"}
+    # Resolved against the run's OWN directory. Passing the run *root* would resolve nothing and
+    # the live stream would silently lose its text.
+    run_id = frames[0]["run_id"]
+    assert hydrated_dirs and all(directory.name == run_id for directory in hydrated_dirs)
+    assert aliased and not any(aliased)
 
 
 def test_astream_run_programmatic_seam(tmp_path: Path, backend_factory: Any) -> None:

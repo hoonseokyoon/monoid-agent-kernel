@@ -32,7 +32,6 @@ from support.backend_harness import (
 )
 
 from monoid_agent_kernel.core.model_io import content_digest
-from monoid_agent_kernel.reference.backend import content_hydration
 from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
 
@@ -103,15 +102,65 @@ def test_a_missing_transcript_never_fails_the_read(tmp_path: Path) -> None:
 
 
 def test_a_malformed_line_does_not_hide_a_later_record(tmp_path: Path) -> None:
+    digest = content_digest("found anyway")
     with (tmp_path / "transcript.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
         handle.write("{not json\n")
-        handle.write(json.dumps({"kind": "model_turn", "final_text": "wrong kind"}) + "\n")
-    digest = _write_record(tmp_path, "found anyway")
+        # The decoy carries the wanted digest, so it reaches the digest check rather than being
+        # rejected earlier on `digest is None` — which is all the previous version tested.
+        #
+        # It does NOT pin the `kind` check, and nothing can: digest verification subsumes it. A
+        # wrong-kind record can only be accepted if its text hashes to the digest asked for, which
+        # makes it byte-identical to the record wanted. Verified — dropping the kind check leaves
+        # this green. The check stays as defence-in-depth against a future record shape that
+        # carries `final_text_digest` for another purpose; it is deliberately not observable today.
+        handle.write(
+            json.dumps(
+                {
+                    "kind": "model_turn",
+                    "final_text": "found anyway",
+                    "final_text_digest": digest,
+                }
+            )
+            + "\n"
+        )
+    _write_record(tmp_path, "found anyway")
     events = [_event(status="completed", final_text_digest=digest)]
 
     hydrate_settled_text(events, tmp_path)
 
     assert events[0]["data"]["final_text"] == "found anyway"
+
+
+def test_only_the_wanted_digest_is_resolved_when_several_records_exist(tmp_path: Path) -> None:
+    """A two-turn run writes several records; the page must get the one it asked for.
+
+    The `digest not in wanted` filter is not tidiness — with it removed, the scan takes the FIRST
+    settled-text record it meets and the wanted digest is never found, so the field silently stays
+    absent. No other fixture writes more than one record, so nothing else pins this.
+    """
+    first = _write_record(tmp_path, "first answer")
+    second = _write_record(tmp_path, "second answer")
+    assert first != second
+    events = [_event(status="completed", final_text_digest=second)]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert events[0]["data"]["final_text"] == "second answer"
+
+
+def test_a_page_wanting_two_digests_resolves_both(tmp_path: Path) -> None:
+    # The early exit stops at `len(found) == len(wanted)`; with one wanted digest that is
+    # indistinguishable from stopping at the first match.
+    first = _write_record(tmp_path, "first answer")
+    second = _write_record(tmp_path, "second answer")
+    events = [
+        _event(status="completed", final_text_digest=first),
+        _event(status="completed", final_text_digest=second),
+    ]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert [event["data"]["final_text"] for event in events] == ["first answer", "second answer"]
 
 
 def test_a_torn_utf8_sequence_does_not_fail_the_read(tmp_path: Path) -> None:
@@ -176,7 +225,12 @@ def test_the_transcript_is_not_opened_when_nothing_wants_text(tmp_path: Path, mo
     calls: list[Any] = []
     monkeypatch.setattr(content_hydration, "_resolve", lambda *a, **k: calls.append(a) or {})
 
-    content_hydration.hydrate_settled_text([_event(status="completed", final_text="present")], tmp_path)
+    # The event carries a digest AND the text. Without the digest this short-circuited on the
+    # missing digest instead of the text-present guard, so deleting that guard left it green.
+    digest = _write_record(tmp_path, "already inline")
+    content_hydration.hydrate_settled_text(
+        [_event(status="completed", final_text="present", final_text_digest=digest)], tmp_path
+    )
 
     assert calls == []
 
@@ -192,39 +246,59 @@ def _pad(run_dir: Path, byte_target: int) -> None:
             index += 1
 
 
-def test_the_newest_record_resolves_even_in_a_transcript_larger_than_the_budget(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    """The bound is anchored at the END of the file, and this is why.
+def test_position_in_the_transcript_does_not_decide_whether_text_resolves(tmp_path: Path) -> None:
+    """Any record for a wanted digest must be found, wherever it sits in the file.
 
-    ``settled_text`` records are appended and the transcript accumulates across every step and
-    every restore, so a bound counted from the *start* truncated exactly the region holding the
-    current run's text: old settled text resolved and the newest silently did not. Padding here
-    exceeds the budget on purpose — under the old front-anchored cap this test fails.
+    Two positional bounds were tried and both lost text in mirrored ways: a line cap counted from
+    the START dropped the newest settled text, and the same budget anchored at the END dropped the
+    oldest — which broke Studio catch-up, since it hydrates every committed event of a run at once
+    and so wants digests spanning the whole session.
+
+    The bound was anchored to the *file*; the reader's need is anchored to the *event set it was
+    asked about*. This pins the invariant that replaced it, from both ends of a padded transcript.
     """
-    monkeypatch.setattr(content_hydration, "MAX_SCAN_BYTES", 4_000)
-    _pad(tmp_path, 12_000)
-    digest = _write_record(tmp_path, "the newest answer")
-    events = [_event(status="completed", final_text_digest=digest)]
+    oldest = _write_record(tmp_path, "the first answer")
+    _pad(tmp_path, 200_000)
+    newest = _write_record(tmp_path, "the last answer")
+    _pad(tmp_path, 200_000)
+    events = [
+        _event(status="completed", final_text_digest=oldest),
+        _event(status="completed", final_text_digest=newest),
+    ]
 
     hydrate_settled_text(events, tmp_path)
 
-    assert events[0]["data"]["final_text"] == "the newest answer"
+    assert [event["data"]["final_text"] for event in events] == [
+        "the first answer",
+        "the last answer",
+    ]
 
 
-def test_a_record_older_than_the_budget_is_not_scanned(tmp_path: Path, monkeypatch: Any) -> None:
-    # The other side: the bound still bounds. An unbounded lookup would regress the resource
-    # limits this repo applies to its other readers.
-    #
-    # The leading pad matters. The reader discards the partial line its seek lands inside, so with
-    # the record written as line 1 this passed even when the seek was moved to byte 0 — the record
-    # was skipped as "the partial line" rather than excluded by the bound. Verified: that version
-    # survived the seek(0) mutant.
-    monkeypatch.setattr(content_hydration, "MAX_SCAN_BYTES", 4_000)
-    _pad(tmp_path, 500)
-    digest = _write_record(tmp_path, "an ancient answer")
-    _pad(tmp_path, 12_000)
-    events = [_event(status="completed", final_text_digest=digest)]
+def test_an_unresolvable_event_is_not_filled_with_another_events_text(tmp_path: Path) -> None:
+    """Serving the wrong text is the worst outcome available here, worse than serving none.
+
+    Needs a MIXED page: with nothing resolvable at all there is no other text to mis-fill from, so
+    a hydrator that ignores the digest entirely and takes whatever it found still passes. Verified
+    — the single-event version of this survived exactly that mutant.
+    """
+    resolvable = _write_record(tmp_path, "the answer that exists")
+    events = [
+        _event(status="completed", final_text_digest=resolvable),
+        _event(status="completed", final_text_digest=content_digest("lost to a crash")),
+    ]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert events[0]["data"]["final_text"] == "the answer that exists"
+    assert "final_text" not in events[1]["data"]
+
+
+def test_a_digest_with_no_record_anywhere_stays_absent(tmp_path: Path) -> None:
+    # The counterweight to "position never excludes": absence must still read as absence, or the
+    # test above would pass against a resolver that invented text.
+    _write_record(tmp_path, "a different answer")
+    _pad(tmp_path, 50_000)
+    events = [_event(status="completed", final_text_digest=content_digest("never recorded"))]
 
     hydrate_settled_text(events, tmp_path)
 

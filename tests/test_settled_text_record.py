@@ -397,6 +397,109 @@ def test_a_torn_transcript_tail_does_not_consume_the_next_record(tmp_path: Path)
     assert len(broken) == 1
 
 
+def test_a_restored_run_records_its_settled_text_from_finalize(tmp_path: Path) -> None:
+    """`finalize` is the SOLE writer on the restore path, and nothing else pinned it.
+
+    Every other test reaches `finalize` only after `checkpoint_on_settle` already wrote the same
+    content-keyed record, so the second call site is invisible — replacing its guard with
+    `if False:` left the whole suite green. A restored run emits `run.finished` with no
+    `turn.settled` at all, so deleting that call would publish a digest naming text that is not on
+    disk for every resumed run.
+    """
+    from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="unused")]),
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+    loop.restore(RunCheckpoint(run_id=spec.run_id, final_text="restored model answer"))
+    result = loop.close()
+
+    assert _events(result.run_dir, "turn.settled") == []  # the sole-writer precondition
+    records = _records(result.run_dir, "settled_text")
+    assert [record["final_text"] for record in records] == ["restored model answer"]
+
+
+def test_a_failed_write_does_not_mark_the_digest_as_recorded(tmp_path: Path) -> None:
+    """The de-dup set is marked only once the write succeeds.
+
+    Marked first, a raising write (a full disk mid-flush) recorded the digest as present with
+    nothing on disk, and a later call for the same text short-circuited and returned a digest that
+    resolves to nothing — the failure mode the whole write-before-emit ordering exists to avoid.
+    """
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    run_root = tmp_path / "runs"
+    (run_root / "run-fail").mkdir(parents=True)
+    recorder = AgentRecorder(run_root=run_root, run_id="run-fail", status_file=False)
+    try:
+        original_write = recorder._transcript_file.write
+
+        def failing_write(_payload: str) -> int:
+            raise OSError("no space left on device")
+
+        recorder._transcript_file.write = failing_write  # type: ignore[method-assign]
+        with pytest.raises(OSError):
+            recorder.settled_text("never landed")
+        recorder._transcript_file.write = original_write  # type: ignore[method-assign]
+
+        # The retry must actually write, not short-circuit on a digest it never recorded.
+        recorder.settled_text("never landed")
+    finally:
+        recorder.close()
+
+    assert [record["final_text"] for record in _records(run_root / "run-fail", "settled_text")] == [
+        "never landed"
+    ]
+
+
+def test_a_transcript_with_undecodable_bytes_is_reported(tmp_path: Path) -> None:
+    """A validator that turns detected corruption into silence is worse than one that crashes.
+
+    Strict whole-file decoding crashed `monoid validate` on a torn transcript, but repairing that
+    with `errors="replace"` made a *complete* record holding an undecodable byte parse, validate,
+    and the file report clean. The twin `_validate_event_file` detects and reports; so must this.
+    """
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="valid run")])
+    run_dir = _run(_spec(tmp_path), adapter)
+
+    with (run_dir / "transcript.jsonl").open("ab") as handle:
+        handle.write(
+            b'{"kind":"model_turn","step":9,"response_id":"r","final_text":"ab\xffcd",'
+            b'"tool_calls":[],"usage":{}}\n'
+        )
+
+    issues = validate_run_dir(run_dir)
+    assert any(
+        issue.path.startswith("transcript.jsonl:") and "UTF-8" in issue.message for issue in issues
+    ), issues
+
+
+def test_the_approval_preview_leaves_an_absent_notes_alone() -> None:
+    # The other half of the `notes: None` rule. Fixing it in `finish_args_preview` alone moved the
+    # two halves in opposite directions inside one commit — the approval preview then badged an
+    # absent value as withheld, which is exactly what the other half stopped doing.
+    from monoid_agent_kernel.core.tool_approval import build_tool_approval_task_request
+
+    request = build_tool_approval_task_request(
+        spec=_finish_spec(),
+        binding_id="run.finish",
+        model_name="run_finish",
+        call_name="run_finish",
+        call_id="c1",
+        arguments={"summary": "an answer", "notes": None},
+        reason="ask",
+        turn_id="turn_0001",
+        tool_event_id=None,
+    )
+
+    assert request["arguments_preview"]["notes"] is None
+
+
 def test_this_commit_does_not_change_the_settle_events(tmp_path: Path) -> None:
     """The no-op property. Hydration and the emit change land later; until then the events are
     byte-identical to what they were, so a Studio regression here cannot be blamed on the record.

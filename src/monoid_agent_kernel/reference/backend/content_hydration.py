@@ -15,10 +15,13 @@ was first planned as, and it missed two transports outright.
 which is what makes this a no-op until the emit change lands, and what keeps kernel-authored text
 (``"Stopped after reaching max steps."``, which never leaves the event) untouched.
 
-**Never fails a read.** Durability of the record is best-effort — no fsync, no append-tail repair —
-so a crash can leave a committed event whose digest resolves to nothing. Content-missing is a
-tolerated outcome: the field stays absent and the reader sees what it would have seen anyway.
-Raising here would turn a cosmetic gap into a dead endpoint.
+**Never fails a read.** Durability of the record is best-effort — no fsync, and the transcript's
+only repair confines a torn line rather than recovering it — so a committed event's digest can
+resolve to nothing. A crash is not the only cause: on a shared run root a second node can resume a
+run a live peer still owns (neither ``recover_runs`` nor ``resume_run`` consults the lease store),
+and two recorders then append to one transcript. Content-missing is a tolerated outcome either
+way: the field stays absent and the reader sees what it would have seen anyway. Raising here would
+turn a cosmetic gap into a dead endpoint.
 """
 
 from __future__ import annotations
@@ -35,18 +38,21 @@ SETTLED_TEXT_KIND = "settled_text"
 DIGEST_FIELD = "final_text_digest"
 TEXT_FIELD = "final_text"
 
-# The record is keyed by content digest, while every reader pages by ``seq``, so resolving a page
-# means a lookup rather than an offset. Bound it: this repo bounds its other readers (watch
-# batches, event-index slots) and an unbounded scan of an attacker-influenced file would regress
-# that.
+# No positional bound on the scan. Two earlier attempts both lost text, in mirrored ways: a cap
+# counting lines from the START dropped the newest settled text (the transcript grows by append),
+# and anchoring the same budget at the END dropped the oldest — which broke Studio catch-up, since
+# ``_read_committed_events`` hydrates every committed event of a run in one call and therefore
+# wants digests spanning the whole session.
 #
-# The bound is applied from the END of the file, which is the correction to a cap that used to
-# count lines from the start. ``settled_text`` records are *appended*, and the transcript
-# accumulates across every step and every restore of a run, so a front-anchored cap truncated
-# exactly the region holding the newest settled text: old text resolved and the current run's did
-# not. Scanning the tail also means the early-exit on "every wanted digest found" is a latency
-# optimisation rather than the thing keeping the cap honest.
-MAX_SCAN_BYTES = 8_000_000
+# The mistake both times was anchoring the bound to the *file* when the reader's need is anchored
+# to the *event set it was asked about*. Any positional window is wrong for a caller that asks
+# about events outside it, and hydration silently returning less than it holds is worse than being
+# slow: every consumer normalises an absent field to "" and hides it, so the loss is invisible.
+#
+# What is bounded is what actually needs to be: memory is O(len(wanted)), the file is read
+# streaming a line at a time, and the scan stops as soon as every wanted digest is resolved. The
+# cost is one pass over the transcript in the worst case, paid only once the emit change makes
+# events carry digests at all — and only for pages that are missing text.
 
 
 def hydrate_settled_text(events: Any, run_dir: Path) -> Any:
@@ -103,18 +109,13 @@ def _wanted_digests(events: Any) -> set[str]:
 def _resolve(transcript_path: Path, wanted: set[str]) -> dict[str, str]:
     found: dict[str, str] = {}
     try:
-        # Read bytes and decode per line rather than opening in text mode. Two reasons: seeking to
-        # a byte offset is only well-defined on a binary handle, and a crash can tear a multi-byte
-        # sequence mid-write — decoding is lazy, so strict text mode raises ``UnicodeDecodeError``
-        # from the iterator itself, which is a ``ValueError`` and slips past the ``OSError``
-        # handler below. That turned every read needing a digest into a failed request rather than
-        # the promised absent field. A replaced line then fails to parse as JSON, or fails the
-        # digest check, and is skipped like any other malformed record.
-        size = transcript_path.stat().st_size
+        # Read bytes and decode per line rather than opening in text mode: a crash can tear a
+        # multi-byte sequence mid-write, and decoding is lazy, so strict text mode raises
+        # ``UnicodeDecodeError`` from the iterator itself — a ``ValueError``, which slips past the
+        # ``OSError`` handler below and turned every read needing a digest into a failed request
+        # rather than the promised absent field. A replaced line then fails to parse as JSON, or
+        # fails the digest check, and is skipped like any other malformed record.
         with transcript_path.open("rb") as handle:
-            if size > MAX_SCAN_BYTES:
-                handle.seek(size - MAX_SCAN_BYTES)
-                handle.readline()  # discard the partial line the seek landed inside
             for raw_line in handle:
                 digest, text = _settled_text_entry(raw_line.decode("utf-8", errors="replace"))
                 if digest is None or text is None or digest not in wanted:
@@ -140,7 +141,11 @@ def _settled_text_entry(line: str) -> tuple[str | None, str | None]:
         return None, None
     try:
         record = json.loads(line)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # ``RecursionError`` as well as ``ValueError``: a deeply nested line makes the C scanner
+        # exceed the interpreter's stack, and the read path runs on a deeper HTTP-handler stack
+        # than the writer did. This module promises never to fail a read, and a corrupted or
+        # foreign run dir is exactly the case that promise exists for.
         # A torn tail, or a line another writer is mid-way through. The transcript has no
         # append-tail repair, so a malformed line is expected rather than exceptional.
         return None, None

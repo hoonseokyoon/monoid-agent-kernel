@@ -318,7 +318,9 @@ class AgentRecorder:
         is involved.
 
         Durability is best-effort and deliberately so: ``_write_jsonl`` flushes but does not fsync,
-        and the transcript has no append-tail repair. A crash can leave a committed event whose
+        and the transcript's only repair is ``_terminate_torn_transcript_tail``, which stops a torn
+        line eating the *next* record but does not recover the torn one. A crash can leave a
+        committed event whose
         digest resolves to nothing, so **content-missing is a tolerated read outcome** — hydration
         fills absent fields and never fails a read.
         """

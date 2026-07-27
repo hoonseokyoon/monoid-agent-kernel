@@ -1031,12 +1031,20 @@ def _validate_object(payload: Any, schema: dict[str, Any], issues: list[Validati
 
 
 def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
-    # ``errors="replace"``: a crash can tear a multi-byte sequence mid-write, and strict decoding
-    # raises ``UnicodeDecodeError`` — uncaught here, since the ``try`` below covers only
-    # ``json.loads`` — turning ``monoid validate`` into a traceback instead of a reported issue.
-    # The twin ``_validate_event_file`` already handles this; a replaced line simply fails to parse
-    # and is reported as invalid JSON, which is what a torn line is.
-    for index, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+    # Decode per line and REPORT undecodable bytes, matching the twin ``_validate_event_file``.
+    #
+    # Strict whole-file decoding raised ``UnicodeDecodeError`` out of ``monoid validate`` — the
+    # ``try`` below covers only ``json.loads`` — so a torn transcript crashed the validator. But
+    # ``errors="replace"`` is the wrong repair: a *complete* record whose string value holds an
+    # undecodable byte then parses, validates, and the file is reported clean. A validator that
+    # turns detected corruption into silence is worse than one that crashes, because the crash at
+    # least stops the caller. The twin detects and reports; do the same.
+    for index, raw_line in enumerate(path.read_bytes().split(b"\n"), start=1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            issues.append(ValidationIssue(f"{path.name}:{index}", "invalid UTF-8"))
+            continue
         if not line.strip():
             continue
         try:

@@ -361,6 +361,162 @@ def test_a_limit_reached_with_provenance_already_up_brings_it_down(tmp_path: Pat
     assert flagged is False
 
 
+def _run_with_provenance_already_up(
+    spec: AgentRunSpec, adapter: Any, *tool_ids: str, **loop_kwargs: Any
+) -> tuple[str, bool]:
+    """Drive a run whose flag is raised at the top of every pump.
+
+    That is the state the output-validator repair loop leaves behind — `loop.py:2970` `continue`s
+    and re-pumps after a settle raised the flag — and a validator *defect* raised from
+    `LoopSettleCoordinator.apply` reaches `_record_failure` the same way. The per-submit reset at
+    `loop.py:1208` has long since run, so only the site's OWN reset can bring the flag down.
+    """
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config(*(tool_ids or ("run.finish",)))),
+        **loop_kwargs,
+    )
+    seen = _watch(loop)
+    original_pump = loop._apump_turn
+
+    async def pump(state: RunState, res: Any, session: Any) -> Any:
+        state.final_text_is_model_output = True
+        return await original_pump(state, res, session)
+
+    loop._apump_turn = pump  # type: ignore[method-assign]
+    loop.run_once("go")
+    return _finished(seen)
+
+
+def _limit_scenarios() -> list[Any]:
+    """Every kernel-authored settle site, with the trigger that reaches it."""
+    return [
+        pytest.param(
+            {"max_steps": 1},
+            lambda: _tool_calling_adapter(),
+            ("fs.list", "run.finish"),
+            {},
+            "Stopped after reaching max steps.",
+            id="max-steps",
+        ),
+        pytest.param(
+            {"max_message_log_bytes": 10},
+            lambda: _tool_calling_adapter(),
+            ("fs.list", "run.finish"),
+            {},
+            "Stopped after reaching the conversation size limit.",
+            id="conversation-size",
+        ),
+        pytest.param(
+            {"max_tool_calls": 1},
+            lambda: FakeModelAdapter(
+                turns=[
+                    ModelTurn(
+                        response_id="r1",
+                        tool_calls=(
+                            fake_tool_call("fs_list", {"path": "."}, "c1"),
+                            fake_tool_call("fs_list", {"path": "."}, "c2"),
+                        ),
+                    )
+                ]
+            ),
+            ("fs.list", "run.finish"),
+            {},
+            "Stopped after reaching max tool calls.",
+            id="max-tool-calls",
+        ),
+        pytest.param(
+            {"max_delta_file_bytes": 10},
+            lambda: FakeModelAdapter(
+                turns=[
+                    ModelTurn(
+                        response_id="r1",
+                        tool_calls=(
+                            fake_tool_call(
+                                "fs_write", {"path": "big.txt", "content": "x" * 50}, "c1"
+                            ),
+                        ),
+                    ),
+                    ModelTurn(
+                        response_id="r2",
+                        tool_calls=(fake_tool_call("run_finish", {"summary": "done"}, "c2"),),
+                    ),
+                ]
+            ),
+            ("fs.write", "run.finish"),
+            {},
+            "Stopped after reaching the workspace change size limit.",
+            id="workspace-delta",
+        ),
+        pytest.param(
+            {"max_total_tokens": 10},
+            lambda: FakeModelAdapter(
+                turns=[
+                    ModelTurn(
+                        response_id="r1",
+                        tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),),
+                        usage={"input_tokens": 90, "output_tokens": 20, "total_tokens": 110},
+                    ),
+                    ModelTurn(response_id="r2", final_text="never reached"),
+                ]
+            ),
+            ("fs.list", "run.finish"),
+            {},
+            "Stopped after reaching the token budget.",
+            id="token-budget",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(("limits", "adapter_factory", "tools", "kwargs", "expected"), _limit_scenarios())
+def test_every_kernel_site_lowers_provenance_that_was_already_up(
+    tmp_path: Path,
+    limits: dict[str, Any],
+    adapter_factory: Any,
+    tools: tuple[str, ...],
+    kwargs: dict[str, Any],
+    expected: str,
+) -> None:
+    """Generalises the max-tool-calls counterweight to every kernel settle site.
+
+    The plain kernel tests above enter each site with the flag already `False` — the per-submit
+    reset ran first — so the site's own reset is a no-op *in those tests* and neutering it to a
+    self-assignment leaves them green. Verified: seven of the ten reset sites survived exactly
+    that mutant while only max-tool-calls, which had this counterweight, died.
+    """
+    text, flagged = _run_with_provenance_already_up(
+        _spec(tmp_path, **limits), adapter_factory(), *tools, **kwargs
+    )
+
+    assert text == expected
+    assert flagged is False
+
+
+def test_a_cancelled_run_lowers_provenance_that_was_already_up(tmp_path: Path) -> None:
+    token = CancellationToken()
+    token.cancel()
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="never reached")])
+
+    text, flagged = _run_with_provenance_already_up(
+        _spec(tmp_path), adapter, "run.finish", cancellation_token=token
+    )
+
+    assert text == "Stopped because the run was cancelled."
+    assert flagged is False
+
+
+def test_a_terminal_failure_lowers_provenance_that_was_already_up(tmp_path: Path) -> None:
+    # Reachable for real: a validator *defect* (any non-ValueError) raised from the settle
+    # coordinator reaches `_record_failure` with the flag up and model prose in `final_text`.
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1")])
+
+    text, flagged = _run_with_provenance_already_up(_spec(tmp_path), adapter)
+
+    assert text == ""
+    assert flagged is False
+
+
 def test_a_fresh_submit_resets_provenance(tmp_path: Path) -> None:
     # loop.py:1195 — the per-submit reset block.
     adapter = FakeModelAdapter(
