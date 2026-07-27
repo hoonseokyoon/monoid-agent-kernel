@@ -1004,11 +1004,60 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     transcript_path = run_dir / "transcript.jsonl"
     if transcript_path.exists():
         _validate_jsonl_file(transcript_path, TRANSCRIPT_RECORD_SCHEMA, issues)
+        _validate_settled_text_digests(transcript_path, issues)
     jobs_dir = run_dir / "artifacts" / "jobs"
     if jobs_dir.exists():
         for job_path in sorted(jobs_dir.glob("*/job.json")):
             _validate_json_file(job_path, JOB_SCHEMA, issues)
     return issues
+
+
+def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) -> None:
+    """Recompute each ``settled_text`` record's digest and length.
+
+    The schema can only say ``final_text_digest`` is *a string*, but the reader
+    (``reference.backend.content_hydration``) rejects any record whose text does not hash to the
+    digest it claims. Without this check the two disagree in the worst direction: a record whose
+    text was altered while its digest was left alone stays schema-valid, so ``monoid validate``
+    reports the run clean while an entitled reader silently resolves nothing and the final answer
+    is gone. Validation must not certify a record the reader will refuse.
+
+    Uses ``content_digest``/``content_length`` — the same functions the writer and the reader use —
+    rather than reimplementing the hash, so the three cannot drift apart.
+    """
+    from monoid_agent_kernel.core.model_io import content_digest, content_length
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return  # already reported by the schema pass
+    for index, raw_line in enumerate(raw.split(b"\n"), start=1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue  # already reported by the schema pass
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, RecursionError):
+            continue  # already reported by the schema pass
+        if not isinstance(record, dict) or record.get("kind") != "settled_text":
+            continue
+        text = record.get("final_text")
+        if not isinstance(text, str):
+            continue  # shape is the schema's job
+        label = f"{path.name}:{index}"
+        claimed = record.get("final_text_digest")
+        if claimed != content_digest(text):
+            issues.append(
+                ValidationIssue(label, "settled_text digest does not match final_text")
+            )
+        claimed_len = record.get("final_text_len")
+        if claimed_len != content_length(text):
+            issues.append(
+                ValidationIssue(label, "settled_text length does not match final_text")
+            )
 
 
 def _read_json_artifact(path: Path) -> tuple[Any, ValidationIssue | None]:

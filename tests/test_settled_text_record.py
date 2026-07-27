@@ -555,6 +555,60 @@ def test_a_deeply_nested_artifact_never_crashes_the_validator(tmp_path: Path, ar
     assert any(issue.path.startswith(artifact) for issue in issues), issues
 
 
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        pytest.param(
+            {"final_text": "TAMPERED answer"}, "digest does not match", id="text-altered"
+        ),
+        pytest.param(
+            {"final_text_digest": "0" * 64}, "digest does not match", id="digest-altered"
+        ),
+        pytest.param({"final_text_len": 999}, "length does not match", id="length-altered"),
+    ],
+)
+def test_validation_refuses_a_settled_text_record_the_reader_would_reject(
+    tmp_path: Path, mutate: dict[str, Any], expected: str
+) -> None:
+    """Validation must not certify a record the reader will refuse.
+
+    The schema can only say the digest is *a string*. The reader recomputes it and skips any
+    record that does not match, so without a semantic check the two disagree in the worst
+    direction: `monoid validate` reports the run clean while an entitled reader silently resolves
+    nothing and the final answer is gone. Verified before the fix — 0 issues reported, reader
+    resolved `None`.
+    """
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="the real answer")])
+    run_dir = _run(_spec(tmp_path), adapter)
+
+    path = run_dir / "transcript.jsonl"
+    rewritten: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("kind") == "settled_text":
+            record.update(mutate)
+            line = json.dumps(record, sort_keys=True)
+        rewritten.append(line)
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(rewritten) + "\n")
+
+    issues = validate_run_dir(run_dir)
+    assert any(
+        issue.path.startswith("transcript.jsonl:") and expected in issue.message
+        for issue in issues
+    ), issues
+
+
+def test_validation_accepts_an_intact_settled_text_record(tmp_path: Path) -> None:
+    # The counterweight: the digest check must not flag records the writer actually produced.
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="the real answer")])
+
+    run_dir = _run(_spec(tmp_path), adapter)
+
+    assert _records(run_dir, "settled_text")  # the record is really there
+    assert validate_run_dir(run_dir) == []
+
+
 def test_the_approval_preview_leaves_an_absent_notes_alone() -> None:
     # The other half of the `notes: None` rule. Fixing it in `finish_args_preview` alone moved the
     # two halves in opposite directions inside one commit — the approval preview then badged an
