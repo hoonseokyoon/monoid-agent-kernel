@@ -662,6 +662,17 @@ class RunState:
     provider_error_code: str = ""
     provider_http_status: int | None = None
     final_text: str = ""
+    # Whether ``final_text`` came from the model — its response text, or the ``summary`` argument of
+    # a ``run.finish`` tool call — rather than being authored by the kernel. Only model-authored text
+    # is content the fan-out event stream must not carry; a kernel string like "Stopped after
+    # reaching max steps." is ours to publish, and digesting it would cost the operator the one
+    # sentence explaining why the run stopped. Every write to ``final_text`` sets this in the same
+    # breath (pinned by ``tests/test_final_text_provenance.py``), because a site that forgets one
+    # direction leaks model output and the other hides a limit message.
+    #
+    # Deliberately NOT checkpointed: that would widen ``RunCheckpoint``, a compatibility-ledger
+    # artifact. Restore therefore fails closed — see ``_rehydrate``.
+    final_text_is_model_output: bool = False
     # Validated value from a successful output validator (process-local; surfaced as
     # AgentRunResult.final_output, never checkpointed). Only set on a successful settle.
     final_output: Any = None
@@ -1193,6 +1204,7 @@ class AgentLoop:
             state.provider_error_code = ""
             state.provider_http_status = None
             state.final_text = ""
+            state.final_text_is_model_output = False
             # A fresh user turn gets a fresh output-validation budget and a clean result value.
             state.output_retries = 0
             state.final_output = None
@@ -1223,6 +1235,7 @@ class AgentLoop:
                 if state.error_code == "cancelled"
                 else "Stopped after reaching max duration."
             )
+            state.final_text_is_model_output = False
             session.terminal = True
             result = replace(
                 Suspension(reason="terminal", status="limited"),
@@ -1661,6 +1674,7 @@ class AgentLoop:
                 state.provider_error_code = ""
                 state.provider_http_status = None
         state.final_text = ""
+        state.final_text_is_model_output = False
         res.recorder.emit(
             "run.failed",
             data={
@@ -1962,6 +1976,11 @@ class AgentLoop:
             provider_error_code=cp.provider_error_code,
             provider_http_status=cp.provider_http_status,
             final_text=cp.final_text,
+            # Fail closed. Provenance is not in the checkpoint, so a restored non-empty final_text is
+            # assumed to be the model's: over-digesting a resumed kernel message costs a sentence in
+            # the transcript, while the other default would publish model output on the very stream
+            # the run had already moved it off.
+            final_text_is_model_output=bool(cp.final_text),
             previous_turn_handle=cp.previous_turn_handle,
             pending_user_input=(
                 tuple(content_part_from_json(part) for part in cp.pending_user_input)
@@ -2758,6 +2777,7 @@ class AgentLoop:
             if log_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the conversation size limit."
+                state.final_text_is_model_output = False
                 state.error_code = log_limit_code
                 state.pending_observations = ()
                 return Suspension(
@@ -2773,6 +2793,7 @@ class AgentLoop:
             if token_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the token budget."
+                state.final_text_is_model_output = False
                 state.error_code = token_limit_code
                 state.pending_observations = ()
                 return Suspension(
@@ -2785,6 +2806,7 @@ class AgentLoop:
             if delta_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the workspace change size limit."
+                state.final_text_is_model_output = False
                 state.error_code = delta_limit_code
                 state.pending_observations = ()
                 return Suspension(
@@ -2826,6 +2848,7 @@ class AgentLoop:
                 if wire_limit_code is not None:
                     state.status = "limited"
                     state.final_text = "Stopped after reaching the model request size limit."
+                    state.final_text_is_model_output = False
                     state.error_code = wire_limit_code
                     state.pending_observations = ()
                     return Suspension(
@@ -2962,6 +2985,10 @@ class AgentLoop:
                 # "neither text nor tool calls" error below.
                 if turn.final_text or turn.stop_reason in ("refusal", "length"):
                     state.final_text = turn.final_text or ""
+                    # The model wrote this (or refused/was truncated, which is still its turn
+                    # speaking). Flagged even when the text is empty: provenance describes who
+                    # produced the value, not whether the value has anything in it.
+                    state.final_text_is_model_output = True
                     # The model has consumed the pending observations and settled;
                     # the next submit must not resend them alongside a new message.
                     state.pending_observations = ()
@@ -2979,6 +3006,10 @@ class AgentLoop:
                 if state.total_tool_calls > self.spec.limits.max_tool_calls:
                     state.status = "limited"
                     state.final_text = "Stopped after reaching max tool calls."
+                    # Overwrites whatever a prior settle in this run left here, so the flag has to
+                    # come down with it — otherwise a limit message inherits an earlier turn's
+                    # model provenance and gets digested off the stream.
+                    state.final_text_is_model_output = False
                     state.error_code = "max_tool_calls_exceeded"
                     break
                 # Each call completes before the next starts. Native async handlers stay on
@@ -3007,7 +3038,11 @@ class AgentLoop:
             state.pending_observations = tuple(observations)
 
             if context.pending_finish is not None:
+                # ``summary`` is an argument the model passed to the ``run.finish`` tool, so this is
+                # model-authored prose even though the kernel is the one storing it. Classifying it
+                # as ours would publish model output on the fan-out stream.
                 state.final_text = context.pending_finish.summary
+                state.final_text_is_model_output = True
                 decision = await self._decide_settle(state, res, context, turn, runtime_config)
                 settled = self._apply_settle(decision, state, res, context, from_finish=True)
                 if settled is None:
@@ -3022,6 +3057,7 @@ class AgentLoop:
                 )
         state.status = "limited"
         state.final_text = "Stopped after reaching max steps."
+        state.final_text_is_model_output = False
         state.error_code = "max_steps_exceeded"
         return Suspension(
             reason="limited",
