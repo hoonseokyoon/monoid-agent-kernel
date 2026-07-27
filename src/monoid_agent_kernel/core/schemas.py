@@ -1011,35 +1011,44 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     return issues
 
 
-def _validate_json_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
-    if not path.exists():
-        return
-    # The THIRD sibling of ``_validate_jsonl_file`` / ``_validate_event_file``, and it must be as
-    # hard as both. It guards ten artifacts (manifest, workspace index/base, metrics, proposal,
-    # status, package, approval, apply-result, job) and nine of those calls run BEFORE either
-    # JSONL validator — so leaving it soft made hardening the other two unreachable on a run dir
-    # corrupted in a JSON artifact first. Decoding is done here rather than in ``read_text``
-    # because a torn multi-byte sequence raises out of the read, not out of ``json.loads``.
+def _read_json_artifact(path: Path) -> tuple[Any, ValidationIssue | None]:
+    """Decode and parse one JSON artifact, returning the problem instead of raising it.
+
+    The single loader for every JSON artifact read in this module — schema validation *and* the
+    relationship/hash checks that re-read the same files afterwards. Hardening one reader and
+    leaving its siblings is precisely how this file kept crashing ``monoid validate`` on the
+    corruption it exists to report: the schema pass recorded the issue and returned, and a
+    downstream check then re-read the same bytes with a bare ``read_text()``.
+
+    Decoding is explicit rather than left to ``read_text`` because a torn multi-byte sequence
+    raises out of the *read*, not out of ``json.loads`` — and ``RecursionError`` is not a
+    ``ValueError``, so a deeply nested document escapes a ``ValueError``-only handler.
+    """
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        issues.append(ValidationIssue(path.name, f"unreadable: {exc}"))
-        return
+        return None, ValidationIssue(path.name, f"unreadable: {exc}")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        issues.append(ValidationIssue(path.name, "invalid UTF-8"))
-        return
+        return None, ValidationIssue(path.name, "invalid UTF-8")
     try:
-        payload = json.loads(text)
+        return json.loads(text), None
     except json.JSONDecodeError as exc:
-        issues.append(ValidationIssue(path.name, f"invalid JSON: {exc.msg}"))
-        return
+        return None, ValidationIssue(path.name, f"invalid JSON: {exc.msg}")
     except (ValueError, RecursionError):
         # Same catch-set and label as both JSONL halves: a deeply nested document exceeds the C
         # scanner's stack, and ``json.loads`` raises other ValueErrors (the digit-conversion cap)
         # that are decoder limits too.
-        issues.append(ValidationIssue(path.name, "invalid JSON: decoder limit exceeded"))
+        return None, ValidationIssue(path.name, "invalid JSON: decoder limit exceeded")
+
+
+def _validate_json_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
+    if not path.exists():
+        return
+    payload, issue = _read_json_artifact(path)
+    if issue is not None:
+        issues.append(issue)
         return
     _validate_object(payload, schema, issues, path.name)
 
@@ -1133,10 +1142,9 @@ def _validate_manifest_relative_file(
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.exists():
         return
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return
+    manifest, issue = _read_json_artifact(manifest_path)
+    if issue is not None:
+        return  # already recorded by the schema pass; do not double-report
     if not isinstance(manifest, dict):
         return
     rel = manifest.get(key)
@@ -1158,9 +1166,8 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
     proposal_path = run_dir / "proposal.json"
     if not proposal_path.exists():
         return
-    try:
-        proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    proposal, issue = _read_json_artifact(proposal_path)
+    if issue is not None:
         return
     if not isinstance(proposal, dict):
         return
@@ -1194,9 +1201,8 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
 
 def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> None:
     package_path = run_dir / "proposal.package.json"
-    try:
-        package = json.loads(package_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    package, issue = _read_json_artifact(package_path)
+    if issue is not None:
         return
     if not isinstance(package, dict):
         return
@@ -1222,9 +1228,8 @@ def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> No
 
 
 def _validate_canonical_hash(path: Path, hash_key: str, issues: list[ValidationIssue]) -> None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    payload, issue = _read_json_artifact(path)
+    if issue is not None:
         return
     if not isinstance(payload, dict):
         return

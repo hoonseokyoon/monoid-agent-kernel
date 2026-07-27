@@ -482,6 +482,19 @@ def test_a_transcript_with_undecodable_bytes_is_reported(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
+    "artifact",
+    [
+        # Has a downstream relationship/hash check that RE-READS the file after the schema pass.
+        # Hardening only the schema loader left those re-reads on the old bare `read_text()`, so
+        # `monoid validate` still crashed — the seventh instance of one-half-of-a-pair on this
+        # branch, and the reason all JSON reads now share one loader.
+        pytest.param("manifest.json", id="with-downstream-reader"),
+        pytest.param("proposal.json", id="with-hash-check"),
+        # No downstream reader: the schema pass is the only reader.
+        pytest.param("metrics.json", id="schema-pass-only"),
+    ],
+)
+@pytest.mark.parametrize(
     ("corruption", "expected"),
     [
         pytest.param(b'{"a": "b\xffc"}', "invalid UTF-8", id="undecodable-bytes"),
@@ -489,7 +502,7 @@ def test_a_transcript_with_undecodable_bytes_is_reported(tmp_path: Path) -> None
     ],
 )
 def test_a_corrupt_json_artifact_is_reported_not_raised(
-    tmp_path: Path, corruption: bytes, expected: str
+    tmp_path: Path, artifact: str, corruption: bytes, expected: str
 ) -> None:
     """The THIRD validator sibling, which guards ten artifacts and runs before both JSONL halves.
 
@@ -504,12 +517,14 @@ def test_a_corrupt_json_artifact_is_reported_not_raised(
     adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="valid run")])
     run_dir = _run(_spec(tmp_path), adapter)
 
-    (run_dir / "metrics.json").write_bytes(corruption)
+    (run_dir / artifact).write_bytes(corruption)
 
     issues = validate_run_dir(run_dir)  # must not raise
-    assert any(
-        issue.path == "metrics.json" and expected in issue.message for issue in issues
-    ), issues
+    matching = [issue for issue in issues if issue.path == artifact]
+    assert any(expected in issue.message for issue in matching), issues
+    # Exactly one: the downstream re-read must skip silently rather than report the same
+    # corruption a second time.
+    assert len(matching) == 1, matching
 
 
 @pytest.mark.parametrize("artifact", ["metrics.json", "events.jsonl", "transcript.jsonl"])
