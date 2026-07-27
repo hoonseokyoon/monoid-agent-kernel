@@ -481,56 +481,63 @@ def test_a_transcript_with_undecodable_bytes_is_reported(tmp_path: Path) -> None
     ), issues
 
 
-@pytest.mark.parametrize("artifact", ["events.jsonl", "transcript.jsonl"])
-def test_a_deeply_nested_line_is_reported_not_raised(tmp_path: Path, artifact: str) -> None:
-    """Both validator halves, because hardening one of them is how this keeps going wrong.
-
-    `RecursionError` is not a `ValueError`, so a deeply nested line escaped the catch entirely and
-    crashed `monoid validate` on the corruption it exists to report. The transcript half was
-    hardened first and the event half left — and since `events.jsonl` is validated *first*, that
-    left the newly-hardened branch unreachable on a run dir corrupted in both.
-    """
-    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="valid run")])
-    run_dir = _run(_spec(tmp_path), adapter)
-
-    depth = sys.getrecursionlimit() * 3
-    nested = ("[" * depth) + ("]" * depth)
-    with (run_dir / artifact).open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(nested + "\n")
-
-    issues = validate_run_dir(run_dir)  # must not raise
-    assert any(issue.path.startswith(f"{artifact}:") for issue in issues), issues
-
-
 @pytest.mark.parametrize(
     ("corruption", "expected"),
     [
         pytest.param(b'{"a": "b\xffc"}', "invalid UTF-8", id="undecodable-bytes"),
-        pytest.param(None, "decoder limit exceeded", id="deeply-nested"),
         pytest.param(b"1" * 5000, "decoder limit exceeded", id="oversized-int"),
     ],
 )
 def test_a_corrupt_json_artifact_is_reported_not_raised(
-    tmp_path: Path, corruption: bytes | None, expected: str
+    tmp_path: Path, corruption: bytes, expected: str
 ) -> None:
     """The THIRD validator sibling, which guards ten artifacts and runs before both JSONL halves.
 
     Hardening `_validate_jsonl_file` and `_validate_event_file` while leaving this one made both
     of those unreachable on a run dir whose corruption is in a JSON artifact — the same
     ordering argument that justified hardening the event half in the first place.
+
+    Both cases are deterministic across interpreters: undecodable bytes raise out of the decode,
+    and the 4300-digit integer cap is a fixed `ValueError` neither of which is a
+    `json.JSONDecodeError`. Deep nesting is NOT deterministic — see the test below.
     """
     adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="valid run")])
     run_dir = _run(_spec(tmp_path), adapter)
 
-    if corruption is None:
-        depth = sys.getrecursionlimit() * 3
-        corruption = (b"[" * depth) + (b"]" * depth)
     (run_dir / "metrics.json").write_bytes(corruption)
 
     issues = validate_run_dir(run_dir)  # must not raise
     assert any(
         issue.path == "metrics.json" and expected in issue.message for issue in issues
     ), issues
+
+
+@pytest.mark.parametrize("artifact", ["metrics.json", "events.jsonl", "transcript.jsonl"])
+def test_a_deeply_nested_artifact_never_crashes_the_validator(tmp_path: Path, artifact: str) -> None:
+    """All three validator siblings survive deep nesting, whichever way the decoder reacts.
+
+    Deliberately does NOT pin the message. Python 3.12 decoupled the C-level recursion limit from
+    `sys.getrecursionlimit()`, so the same document that trips `RecursionError` on 3.11 parses on
+    3.12 and is rejected by the schema instead. An earlier version of this asserted
+    "decoder limit exceeded" and passed locally on 3.11 while failing CI on 3.12 — the depth that
+    makes it deterministic is an interpreter detail, not a property of the validator.
+
+    What IS the validator's property, and what this pins on every interpreter: it reports rather
+    than raises. Before the fix this crashed `monoid validate` with an uncaught traceback.
+    """
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="valid run")])
+    run_dir = _run(_spec(tmp_path), adapter)
+
+    depth = sys.getrecursionlimit() * 3
+    nested = ("[" * depth) + ("]" * depth)
+    if artifact.endswith(".jsonl"):
+        with (run_dir / artifact).open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(nested + "\n")
+    else:
+        (run_dir / artifact).write_text(nested, encoding="utf-8")
+
+    issues = validate_run_dir(run_dir)  # must not raise
+    assert any(issue.path.startswith(artifact) for issue in issues), issues
 
 
 def test_the_approval_preview_leaves_an_absent_notes_alone() -> None:
