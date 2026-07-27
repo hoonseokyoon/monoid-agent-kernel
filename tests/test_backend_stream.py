@@ -129,6 +129,41 @@ def test_backend_stream_rejects_non_admin(tmp_path: Path, backend_factory: Any) 
 # --- In-process programmatic seam (no HTTP) --------------------------------------------
 
 
+def test_astream_run_hydrates_event_frames_and_not_delta_frames(
+    tmp_path: Path, backend_factory: Any, monkeypatch: Any
+) -> None:
+    """The live stream is a read path of its own, and it degrades asymmetrically without this.
+
+    ``kind:event`` frames carry the settle events whose model text moves to the run-dir record;
+    ``kind:delta`` frames carry live token text that no turn-end record can supply, and
+    ``kind:result`` reads off ``AgentRunResult`` rather than the event stream. Hydrating the wrong
+    set is invisible while the events still carry their text, so the wiring is asserted directly
+    rather than through an observable outcome.
+    """
+    from monoid_agent_kernel.reference.backend import run_execution
+
+    hydrated_kinds: list[Any] = []
+    original = run_execution.hydrate_settled_text
+
+    def spy(events: Any, run_dir: Any) -> Any:
+        hydrated_kinds.extend(event.get("kind") for event in events)
+        return original(events, run_dir)
+
+    monkeypatch.setattr(run_execution, "hydrate_settled_text", spy)
+
+    workspace = _workspace(tmp_path)
+    backend = _streaming_backend(
+        backend_factory, workspace, [TextDelta("done"), TurnComplete(response_id="prov")]
+    )
+    frames = asyncio.run(_collect(backend, _request(workspace)))
+
+    # The run really did stream both shapes, so "only events were hydrated" is a choice rather
+    # than an artefact of nothing else being there.
+    assert any(frame["kind"] == "delta" for frame in frames)
+    assert any(frame["kind"] == "event" for frame in frames)
+    assert hydrated_kinds and set(hydrated_kinds) == {"event"}
+
+
 def test_astream_run_programmatic_seam(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
     backend = _streaming_backend(

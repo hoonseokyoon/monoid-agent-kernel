@@ -10,6 +10,7 @@ from monoid_agent_kernel.core.content import ContentPart
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 from monoid_agent_kernel.reference.backend.ports import (
     DriveOpenSessionPort,
     LoopBuildPort,
@@ -133,8 +134,18 @@ class RunExecutionService:
             suspension: Suspension | None = None
             first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
             async with loop.astream(first_input) as stream:
+                stream_run_dir = loop.spec.run_root / loop.spec.run_id
                 async for item in stream:
-                    yield stream_item_frame(item)
+                    frame = stream_item_frame(item)
+                    # ``kind:event`` frames carry the settle events, and the settled-text record is
+                    # written *before* its emit, so it is already on disk by the time the frame is
+                    # built. Without this the live stream degrades asymmetrically — orchestration
+                    # frames lose the text while ``kind:delta`` and ``kind:result`` keep it, which
+                    # no consumer expects. Delta frames are deliberately untouched: they carry live
+                    # token text that no turn-end record can supply.
+                    if frame.get("kind") == "event":
+                        hydrate_settled_text([frame], stream_run_dir)
+                    yield frame
                 suspension = stream.suspension
             result = await loop.aclose()
             closed = True
