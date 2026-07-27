@@ -57,7 +57,8 @@ def _records(run_dir: Path, kind: str) -> list[dict[str, Any]]:
         try:
             record = json.loads(line)
         except ValueError:
-            # A torn line is a legitimate transcript state (no append-tail repair), and the
+            # A torn line is a legitimate transcript state (the repair confines a tear, it does
+            # not recover the torn record), and the
             # reader under test skips them — so this helper must too, or it fails on the very
             # input the torn-tail case exists to exercise.
             continue

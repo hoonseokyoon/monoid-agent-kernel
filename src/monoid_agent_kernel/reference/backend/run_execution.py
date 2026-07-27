@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -153,7 +154,16 @@ class RunExecutionService:
                         data = frame.get("data")
                         if isinstance(data, dict):
                             frame["data"] = dict(data)
-                        hydrate_settled_text([frame], stream_run_dir)
+                        # Off-thread: resolving a digest scans the transcript, which has no
+                        # positional bound (any window drops text a reader legitimately asked
+                        # for). Run synchronously here it blocked the shared run loop for the
+                        # whole read — measured at ~0.15s on a 21MB transcript — and runs share
+                        # that loop behind ``acquire_run_slot``, so one large session's hydration
+                        # would delay every other streaming run. The disk paths off this loop
+                        # (``projection.events``) are already called from sync contexts.
+                        await asyncio.to_thread(
+                            hydrate_settled_text, [frame], stream_run_dir
+                        )
                     yield frame
                 suspension = stream.suspension
             result = await loop.aclose()

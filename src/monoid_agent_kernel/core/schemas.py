@@ -1052,6 +1052,12 @@ def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[Valida
         except json.JSONDecodeError as exc:
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {exc.msg}"))
             continue
+        except (ValueError, RecursionError) as exc:
+            # Wider than JSONDecodeError, matching the twin: a deeply nested line exceeds the C
+            # scanner's stack, and `json.loads` raises other ValueErrors too. A validator whose
+            # job is to report corruption must not be stopped by it.
+            issues.append(ValidationIssue(f"{path.name}:{index}", f"undecodable record: {exc}"))
+            continue
         _validate_object(payload, schema, issues, f"{path.name}:{index}")
 
 

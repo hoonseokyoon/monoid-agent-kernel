@@ -92,7 +92,8 @@ def test_present_text_is_never_overwritten_on_a_mixed_page(tmp_path: Path) -> No
 
 
 def test_a_missing_transcript_never_fails_the_read(tmp_path: Path) -> None:
-    # Durability is best-effort: no fsync, no append-tail repair. A committed event whose digest
+    # Durability is best-effort: no fsync, and the only repair confines a torn line rather than
+    # recovering it. A committed event whose digest
     # resolves to nothing must degrade to an absent field, not a dead endpoint.
     events = [_event(status="completed", final_text_digest="a" * 64)]
 

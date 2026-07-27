@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -144,6 +145,7 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
 
     hydrated_kinds: list[Any] = []
     hydrated_dirs: list[Any] = []
+    hydrated_threads: list[int] = []
     aliased: list[bool] = []
     streamed_items: list[Any] = []
     original = run_execution.hydrate_settled_text
@@ -154,6 +156,7 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
         return original_frame(item)
 
     def spy(events: Any, run_dir: Any) -> Any:
+        hydrated_threads.append(threading.get_ident())
         hydrated_dirs.append(run_dir)
         for event in events:
             hydrated_kinds.append(event.get("kind"))
@@ -183,6 +186,10 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
     run_id = frames[0]["run_id"]
     assert hydrated_dirs and all(directory.name == run_id for directory in hydrated_dirs)
     assert aliased and not any(aliased)
+    # Resolved OFF the event loop. The scan has no positional bound — any window drops text a
+    # reader legitimately asked for — so inline it blocked the shared run loop for a whole
+    # transcript read, delaying every other concurrently streaming run.
+    assert hydrated_threads and threading.get_ident() not in hydrated_threads
 
 
 def test_astream_run_programmatic_seam(tmp_path: Path, backend_factory: Any) -> None:

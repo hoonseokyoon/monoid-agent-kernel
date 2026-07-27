@@ -49,10 +49,16 @@ TEXT_FIELD = "final_text"
 # about events outside it, and hydration silently returning less than it holds is worse than being
 # slow: every consumer normalises an absent field to "" and hides it, so the loss is invisible.
 #
-# What is bounded is what actually needs to be: memory is O(len(wanted)), the file is read
-# streaming a line at a time, and the scan stops as soon as every wanted digest is resolved. The
-# cost is one pass over the transcript in the worst case, paid only once the emit change makes
-# events carry digests at all — and only for pages that are missing text.
+# What is bounded is the working set, not the file position: the transcript is read streaming a
+# line at a time, and only the wanted digests are retained — so peak memory is the combined size
+# of the answers actually being resolved, not the transcript.
+#
+# The cost is honestly one full pass in the common case, not just the worst one. The early exit
+# fires only when every wanted digest has been found, so a page whose record was appended last
+# still reads to EOF, and a digest whose record was lost (a tolerated outcome, see above) never
+# terminates early at all. Callers on an event loop must therefore not call this inline —
+# ``run_execution`` hands it to a thread. Paid only once the emit change makes events carry
+# digests, and only for pages actually missing text.
 
 
 def hydrate_settled_text(events: Any, run_dir: Path) -> Any:
@@ -147,7 +153,8 @@ def _settled_text_entry(line: str) -> tuple[str | None, str | None]:
         # than the writer did. This module promises never to fail a read, and a corrupted or
         # foreign run dir is exactly the case that promise exists for.
         # A torn tail, or a line another writer is mid-way through. The transcript has no
-        # append-tail repair, so a malformed line is expected rather than exceptional.
+        # repair that RECOVERS a torn line — the recorder's only one confines a tear to the record
+        # it tore — so a malformed line is expected rather than exceptional.
         return None, None
     if not isinstance(record, dict) or record.get("kind") != SETTLED_TEXT_KIND:
         return None, None
