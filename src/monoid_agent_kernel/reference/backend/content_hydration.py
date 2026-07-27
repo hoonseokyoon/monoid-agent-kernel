@@ -28,6 +28,8 @@ from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
+from monoid_agent_kernel.core.model_io import content_digest
+
 TRANSCRIPT_FILE_NAME = "transcript.jsonl"
 SETTLED_TEXT_KIND = "settled_text"
 DIGEST_FIELD = "final_text_digest"
@@ -95,12 +97,24 @@ def _wanted_digests(events: Any) -> set[str]:
 def _resolve(transcript_path: Path, wanted: set[str]) -> dict[str, str]:
     found: dict[str, str] = {}
     try:
-        with transcript_path.open("r", encoding="utf-8") as handle:
+        # ``errors="replace"`` because a crash can tear a multi-byte sequence mid-write, and
+        # decoding is lazy: strict mode raises ``UnicodeDecodeError`` from the iterator itself,
+        # which is a ``ValueError`` and so slips past the ``OSError`` handler below. That turned
+        # every REST/SSE/Studio read needing a digest into a failed request rather than the
+        # promised absent field. A replaced line then fails to parse as JSON, or fails the digest
+        # check, and is skipped like any other malformed record.
+        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
             for index, line in enumerate(handle):
                 if index >= MAX_SCANNED_LINES:
                     break
                 digest, text = _settled_text_entry(line)
                 if digest is None or text is None or digest not in wanted:
+                    continue
+                if content_digest(text) != digest:
+                    # The join's whole premise is that the digest names the content, so verify
+                    # rather than trust. A torn or character-replaced line can still decode to a
+                    # well-formed record whose text is no longer what its digest names, and
+                    # handing that back would be worse than handing back nothing.
                     continue
                 found[digest] = text
                 if len(found) == len(wanted):

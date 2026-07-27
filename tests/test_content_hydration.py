@@ -116,6 +116,48 @@ def test_a_malformed_line_does_not_hide_a_later_record(tmp_path: Path) -> None:
     assert events[0]["data"]["final_text"] == "found anyway"
 
 
+def test_a_torn_utf8_sequence_does_not_fail_the_read(tmp_path: Path) -> None:
+    """A crash can tear a multi-byte sequence mid-write.
+
+    Decoding is lazy, so strict UTF-8 raises ``UnicodeDecodeError`` from the iterator — a
+    ``ValueError``, which slips past the ``OSError`` handler and turns every read needing a
+    digest into a failed request. The tear has to come *before* the wanted record: the scan exits
+    as soon as every digest is found, so a tear in the trailing bytes is never decoded at all and
+    proves nothing.
+    """
+    digest = content_digest("survived the tear")
+    record = json.dumps(
+        {
+            "kind": "settled_text",
+            "final_text": "survived the tear",
+            "final_text_digest": digest,
+            "final_text_len": len("survived the tear"),
+        }
+    )
+    torn = "한".encode("utf-8")[:2] + b"\n"
+    (tmp_path / "transcript.jsonl").write_bytes(torn + record.encode("utf-8") + b"\n")
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert events[0]["data"]["final_text"] == "survived the tear"
+
+
+def test_a_record_whose_text_does_not_match_its_digest_is_refused(tmp_path: Path) -> None:
+    """The digest names the content, so the join verifies rather than trusts.
+
+    A torn or character-replaced line can still decode to a well-formed record whose text is no
+    longer what its digest names. Handing that back would be worse than handing back nothing.
+    """
+    digest = content_digest("the real answer")
+    _write_record(tmp_path, "the real answer", final_text="tampered text")
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert "final_text" not in events[0]["data"]
+
+
 def test_malformed_event_shapes_are_skipped(tmp_path: Path) -> None:
     _write_record(tmp_path, "unused")
     events: list[Any] = ["not a dict", {"data": "not a mapping"}, {"no": "data"}]

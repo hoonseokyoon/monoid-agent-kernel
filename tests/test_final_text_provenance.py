@@ -32,7 +32,12 @@ from monoid_agent_kernel.providers.fake import (
     fake_tool_call,
 )
 
-_LOOP_SOURCE = Path(__file__).resolve().parents[1] / "src" / "monoid_agent_kernel" / "loop.py"
+# Every module under src/, not just loop.py. Scoping the guard to the file the rule was written
+# in is what let two assignments in loop_phases.py ship unpaired: proving a rule on one of two
+# parallel halves and never binding the twin is the defect shape this repo keeps re-earning.
+_SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "monoid_agent_kernel"
+_ASSIGNMENT = re.compile(r"\s*state\.final_text = ")
+_PROVENANCE = "state.final_text_is_model_output = "
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
 
 
@@ -391,6 +396,99 @@ def test_a_fresh_submit_resets_provenance(tmp_path: Path) -> None:
     assert observed == [False]
 
 
+# --- the settle coordinator: kernel text installed after a model settle ---------------------
+
+
+def _settle_coordinator() -> tuple[Any, Any, Any]:
+    """The real ``LoopSettleCoordinator`` over stubs, so the assertions run the shipped branch.
+
+    Transcribing the branch into the test instead would pass even with the fix reverted, which is
+    the failure mode this whole file exists to avoid.
+    """
+    from types import SimpleNamespace
+
+    from monoid_agent_kernel.loop_phases import LoopSettleCoordinator
+
+    emitted: list[tuple[str, Any]] = []
+    recorder = SimpleNamespace(emit=lambda event_type, **kw: emitted.append((event_type, kw)))
+    res = SimpleNamespace(recorder=recorder)
+    loop = SimpleNamespace(
+        _clear_finish_metadata=lambda context: None,
+        _log_finish_observations=lambda state: None,
+    )
+    return LoopSettleCoordinator(loop), res, emitted
+
+
+def test_output_contract_fallback_is_not_flagged_as_model_output() -> None:
+    """`loop_phases.py` installs kernel text of its own, after the finish path raised the flag.
+
+    A `run.finish` whose summary no validator accepts settles on "Stopped: the final response did
+    not satisfy the output contract." — the kernel's sentence, reached with provenance already
+    True. Left True, the emit flip would digest the one line explaining why the run stopped.
+
+    This site lives in a different module from the other nine, which is exactly why it shipped
+    unpaired: the structural guard used to read only `loop.py`.
+    """
+    from monoid_agent_kernel.loop import RunState
+    from monoid_agent_kernel.loop_phases import _OUTPUT_CONTRACT_STOPPED, SettleDecision
+
+    coordinator, res, _emitted = _settle_coordinator()
+    state = RunState()
+    state.final_text_is_model_output = True  # as the run.finish path leaves it
+
+    coordinator.apply(
+        SettleDecision(kind="exhausted", status="limited", error_code="output_contract_unsatisfied"),
+        state,
+        res,
+        None,
+        from_finish=False,
+    )
+
+    assert state.final_text == _OUTPUT_CONTRACT_STOPPED
+    assert state.final_text_is_model_output is False
+
+
+def test_an_accepted_model_answer_keeps_its_provenance_through_the_fallback_branch() -> None:
+    # The counterweight: the branch installs the kernel sentence only when there is nothing to
+    # keep. A model answer that survives validation must stay flagged, or the fix would have
+    # traded a leak for text that never leaves the event.
+    from monoid_agent_kernel.loop import RunState
+    from monoid_agent_kernel.loop_phases import SettleDecision
+
+    coordinator, res, _emitted = _settle_coordinator()
+    state = RunState()
+    state.final_text = "a real answer"
+    state.final_text_is_model_output = True
+
+    coordinator.apply(
+        SettleDecision(kind="exhausted", status="limited", error_code="output_contract_unsatisfied"),
+        state,
+        res,
+        None,
+        from_finish=False,
+    )
+
+    assert state.final_text == "a real answer"
+    assert state.final_text_is_model_output is True
+
+
+def test_a_rejected_finish_summary_drops_its_provenance_with_the_text() -> None:
+    # loop_phases.py's second site: the re-prompt path clears the rejected summary, so there is
+    # no settled text again until the next turn produces one.
+    from monoid_agent_kernel.loop import RunState
+    from monoid_agent_kernel.loop_phases import SettleDecision
+
+    coordinator, res, _emitted = _settle_coordinator()
+    state = RunState()
+    state.final_text = "a rejected summary"
+    state.final_text_is_model_output = True
+
+    coordinator.apply(SettleDecision(kind="reprompt"), state, res, None, from_finish=True)
+
+    assert state.final_text == ""
+    assert state.final_text_is_model_output is False
+
+
 # --- restore: provenance is not checkpointed, so it fails closed ---------------------------
 
 
@@ -427,37 +525,46 @@ def test_restore_leaves_an_empty_text_unflagged(tmp_path: Path) -> None:
 # --- structural guards: what protects the sites this file cannot enumerate forever ----------
 
 
-def _final_text_assignments(source: str) -> list[tuple[int, str]]:
-    lines = source.splitlines()
-    return [
-        (index, line)
-        for index, line in enumerate(lines)
-        if re.match(r"\s*state\.final_text = ", line)
-    ]
-
-
-def test_every_final_text_assignment_sets_provenance_in_the_same_breath() -> None:
-    """A future write to ``state.final_text`` that forgets the flag is a silent leak.
-
-    No behavioural test can cover a site that does not exist yet, so the pairing is enforced on
-    the source itself: each assignment must set provenance before the next assignment begins.
-    """
-    source = _LOOP_SOURCE.read_text(encoding="utf-8")
-    lines = source.splitlines()
-    assignments = _final_text_assignments(source)
-    assert assignments, "found no state.final_text assignments — the guard is looking in the wrong file"
-
-    starts = [index for index, _line in assignments]
+def _unpaired_assignments(path: Path) -> list[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    starts = [index for index, line in enumerate(lines) if _ASSIGNMENT.match(line)]
     unpaired: list[str] = []
-    for position, (index, line) in enumerate(assignments):
+    for position, index in enumerate(starts):
         # Bound the search by the next assignment so one site cannot be credited with another's
         # flag; a parenthesised multi-line value (the cancel/timeout site) needs the slack.
         stop = starts[position + 1] if position + 1 < len(starts) else len(lines)
-        window = lines[index + 1 : stop]
-        if not any("state.final_text_is_model_output = " in candidate for candidate in window):
-            unpaired.append(f"loop.py:{index + 1}: {line.strip()}")
+        if not any(_PROVENANCE in candidate for candidate in lines[index + 1 : stop]):
+            unpaired.append(f"{path.name}:{index + 1}: {lines[index].strip()}")
+    return unpaired
 
+
+def test_every_final_text_assignment_sets_provenance_in_the_same_breath() -> None:
+    """A write to ``state.final_text`` that forgets the flag is a silent leak.
+
+    No behavioural test can cover a site that does not exist yet, so the pairing is enforced on
+    the source itself: each assignment must set provenance before the next assignment begins.
+
+    Scanned across **all** of ``src/``. The first version of this guard looked only at
+    ``loop.py``, and two assignments in ``loop_phases.py`` shipped unpaired underneath it — a
+    guard is only as wide as the files it reads.
+    """
+    modules = sorted(_SRC_ROOT.rglob("*.py"))
+    unpaired = [entry for path in modules for entry in _unpaired_assignments(path)]
     assert not unpaired, "final_text assigned without declaring provenance:\n" + "\n".join(unpaired)
+
+
+def test_the_pairing_guard_actually_reaches_more_than_one_module() -> None:
+    """The guard above passes vacuously if its file sweep finds nothing.
+
+    Pinned separately because the failure mode is silent: a wrong root, a changed layout, or a
+    stricter pattern all turn the guard into a test that asserts an empty list is empty.
+    """
+    with_assignments = {
+        path.name
+        for path in _SRC_ROOT.rglob("*.py")
+        if any(_ASSIGNMENT.match(line) for line in path.read_text(encoding="utf-8").splitlines())
+    }
+    assert {"loop.py", "loop_phases.py"} <= with_assignments, with_assignments
 
 
 def test_only_the_two_model_authored_sites_set_the_flag_true() -> None:
@@ -467,19 +574,19 @@ def test_only_the_two_model_authored_sites_set_the_flag_true() -> None:
     settles on is a kernel string. Flipping any site trips this, including sites whose behavioural
     path is expensive to reach.
     """
-    source = _LOOP_SOURCE.read_text(encoding="utf-8")
-    lines = source.splitlines()
     true_sites: list[str] = []
-    for index, line in enumerate(lines):
-        if re.match(r"\s*state\.final_text_is_model_output = True\b", line):
-            # Attribute the flag to the assignment it follows.
-            preceding = [
-                candidate
-                for candidate in lines[max(0, index - 8) : index]
-                if re.match(r"\s*state\.final_text = ", candidate)
-            ]
-            assert preceding, f"loop.py:{index + 1} sets provenance with no assignment above it"
-            true_sites.append(preceding[-1].strip())
+    for path in sorted(_SRC_ROOT.rglob("*.py")):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if re.match(r"\s*state\.final_text_is_model_output = True\b", line):
+                # Attribute the flag to the assignment it follows.
+                preceding = [
+                    candidate
+                    for candidate in lines[max(0, index - 8) : index]
+                    if _ASSIGNMENT.match(candidate)
+                ]
+                assert preceding, f"{path.name}:{index + 1} sets provenance with no assignment above"
+                true_sites.append(preceding[-1].strip())
 
     assert sorted(true_sites) == sorted(
         [

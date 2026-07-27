@@ -380,7 +380,14 @@ class LoopSettleCoordinator:
             recorder.emit("output.validation.failed", data={"reason": decision.terminal_reason}, level="warning")
         elif decision.kind == "exhausted":
             state.status = decision.status
-            state.final_text = state.final_text or _OUTPUT_CONTRACT_STOPPED
+            if not state.final_text:
+                # The kernel's own explanation, installed because nothing the model produced
+                # satisfied the contract. Written as an explicit branch rather than an ``or`` so
+                # provenance can come down with it: reached from the ``run.finish`` path the flag
+                # is already True, and once the emit flip lands a stale True would digest this
+                # sentence off the event — taking the operator's only explanation with it.
+                state.final_text = _OUTPUT_CONTRACT_STOPPED
+                state.final_text_is_model_output = False
             state.error_code = decision.error_code
             recorder.emit(
                 "output.validator.exhausted",
@@ -398,7 +405,10 @@ class LoopSettleCoordinator:
             if decision.kind in ("reprompt", "exhausted"):
                 self._loop._clear_finish_metadata(context)
                 if decision.kind == "reprompt":
+                    # Dropping the rejected finish summary: there is no settled text again until
+                    # the re-prompted turn produces one, so its provenance goes with it.
                     state.final_text = ""
+                    state.final_text_is_model_output = False
             self._loop._log_finish_observations(state)
 
         if decision.kind == "reprompt":
