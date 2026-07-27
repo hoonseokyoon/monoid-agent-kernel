@@ -1053,10 +1053,12 @@ def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[Valida
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {exc.msg}"))
             continue
         except (ValueError, RecursionError) as exc:
-            # Wider than JSONDecodeError, matching the twin: a deeply nested line exceeds the C
-            # scanner's stack, and `json.loads` raises other ValueErrors too. A validator whose
-            # job is to report corruption must not be stopped by it.
-            issues.append(ValidationIssue(f"{path.name}:{index}", f"undecodable record: {exc}"))
+            # Wider than JSONDecodeError: a deeply nested line exceeds the C scanner's stack, and
+            # `json.loads` raises other ValueErrors too. A validator whose job is to report
+            # corruption must not be stopped by it. Same catch-set and same message shape as
+            # ``_validate_event_file`` — identical corruption should not be labelled two ways.
+            message = exc.msg if isinstance(exc, json.JSONDecodeError) else "decoder limit exceeded"
+            issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {message}"))
             continue
         _validate_object(payload, schema, issues, f"{path.name}:{index}")
 
@@ -1070,7 +1072,11 @@ def _validate_event_file(path: Path, issues: list[ValidationIssue]) -> None:
         except UnicodeDecodeError:
             issues.append(ValidationIssue(f"{path.name}:{index}", "invalid UTF-8"))
             continue
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # ``RecursionError`` is NOT a ``ValueError``: a deeply nested line exceeds the C
+            # scanner's stack and escaped this clause entirely, crashing ``monoid validate`` on the
+            # very corruption it exists to report. ``events.jsonl`` is validated before
+            # ``transcript.jsonl``, so hardening only the transcript half left this reachable first.
             message = exc.msg if isinstance(exc, json.JSONDecodeError) else "decoder limit exceeded"
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {message}"))
             continue

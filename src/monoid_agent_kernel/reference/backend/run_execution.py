@@ -11,7 +11,10 @@ from monoid_agent_kernel.core.content import ContentPart
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.errors import NativeAgentError
-from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
+from monoid_agent_kernel.reference.backend.content_hydration import (
+    hydrate_settled_text,
+    needs_settled_text,
+)
 from monoid_agent_kernel.reference.backend.ports import (
     DriveOpenSessionPort,
     LoopBuildPort,
@@ -154,16 +157,23 @@ class RunExecutionService:
                         data = frame.get("data")
                         if isinstance(data, dict):
                             frame["data"] = dict(data)
-                        # Off-thread: resolving a digest scans the transcript, which has no
-                        # positional bound (any window drops text a reader legitimately asked
-                        # for). Run synchronously here it blocked the shared run loop for the
-                        # whole read — measured at ~0.15s on a 21MB transcript — and runs share
-                        # that loop behind ``acquire_run_slot``, so one large session's hydration
-                        # would delay every other streaming run. The disk paths off this loop
-                        # (``projection.events``) are already called from sync contexts.
-                        await asyncio.to_thread(
-                            hydrate_settled_text, [frame], stream_run_dir
-                        )
+                        # Off-thread ONLY when there is a digest to resolve. Resolving one scans
+                        # the transcript, which has no positional bound (any window drops text a
+                        # reader legitimately asked for); inline that blocked the shared run loop
+                        # for the whole read — ~0.15s on a 21MB transcript — and runs share that
+                        # loop behind ``acquire_run_slot``.
+                        #
+                        # But the hop is not free either: the default executor is shared and
+                        # bounded (32 workers), and parked runs hold workers for up to
+                        # ``task_wait_poll_s`` each, so an unconditional hop would queue every
+                        # frame's delivery behind them. Until the emit change lands, no event
+                        # carries a digest and the resolver opens no file at all — so the
+                        # emptiness check stays on the loop and only real work crosses the
+                        # boundary.
+                        if needs_settled_text(frame):
+                            await asyncio.to_thread(
+                                hydrate_settled_text, [frame], stream_run_dir
+                            )
                     yield frame
                 suspension = stream.suspension
             result = await loop.aclose()

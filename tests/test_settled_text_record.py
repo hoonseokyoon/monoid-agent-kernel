@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -478,6 +479,27 @@ def test_a_transcript_with_undecodable_bytes_is_reported(tmp_path: Path) -> None
     assert any(
         issue.path.startswith("transcript.jsonl:") and "UTF-8" in issue.message for issue in issues
     ), issues
+
+
+@pytest.mark.parametrize("artifact", ["events.jsonl", "transcript.jsonl"])
+def test_a_deeply_nested_line_is_reported_not_raised(tmp_path: Path, artifact: str) -> None:
+    """Both validator halves, because hardening one of them is how this keeps going wrong.
+
+    `RecursionError` is not a `ValueError`, so a deeply nested line escaped the catch entirely and
+    crashed `monoid validate` on the corruption it exists to report. The transcript half was
+    hardened first and the event half left — and since `events.jsonl` is validated *first*, that
+    left the newly-hardened branch unreachable on a run dir corrupted in both.
+    """
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="valid run")])
+    run_dir = _run(_spec(tmp_path), adapter)
+
+    depth = sys.getrecursionlimit() * 3
+    nested = ("[" * depth) + ("]" * depth)
+    with (run_dir / artifact).open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(nested + "\n")
+
+    issues = validate_run_dir(run_dir)  # must not raise
+    assert any(issue.path.startswith(f"{artifact}:") for issue in issues), issues
 
 
 def test_the_approval_preview_leaves_an_absent_notes_alone() -> None:

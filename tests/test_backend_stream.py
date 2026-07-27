@@ -169,6 +169,12 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
 
     monkeypatch.setattr(run_execution, "stream_item_frame", frame_spy)
     monkeypatch.setattr(run_execution, "hydrate_settled_text", spy)
+    # Force the resolving path. No event carries a digest until the emit change lands, so without
+    # this the stream correctly skips hydration entirely and every assertion below would pass
+    # vacuously on a run that never resolved anything.
+    monkeypatch.setattr(
+        run_execution, "needs_settled_text", lambda frame: frame.get("kind") == "event"
+    )
 
     workspace = _workspace(tmp_path)
     backend = _streaming_backend(
@@ -190,6 +196,32 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
     # reader legitimately asked for — so inline it blocked the shared run loop for a whole
     # transcript read, delaying every other concurrently streaming run.
     assert hydrated_threads and threading.get_ident() not in hydrated_threads
+
+
+def test_astream_run_does_not_hop_threads_when_no_frame_needs_text(
+    tmp_path: Path, backend_factory: Any, monkeypatch: Any
+) -> None:
+    """No digest on the wire means no thread hop — the case that is 100% of frames today.
+
+    The executor the hop targets is process-wide and bounded (32 workers), and runs parked
+    awaiting hosted tasks hold a worker each for up to `task_wait_poll_s`. An unconditional hop
+    would therefore queue every event frame's delivery behind them, to do no work at all.
+    """
+    from monoid_agent_kernel.reference.backend import run_execution
+
+    hydrated: list[Any] = []
+    monkeypatch.setattr(
+        run_execution, "hydrate_settled_text", lambda events, run_dir: hydrated.append(run_dir)
+    )
+
+    workspace = _workspace(tmp_path)
+    backend = _streaming_backend(
+        backend_factory, workspace, [TextDelta("done"), TurnComplete(response_id="prov")]
+    )
+    frames = asyncio.run(_collect(backend, _request(workspace)))
+
+    assert any(frame["kind"] == "event" for frame in frames)  # frames really did stream
+    assert hydrated == []
 
 
 def test_astream_run_programmatic_seam(tmp_path: Path, backend_factory: Any) -> None:
