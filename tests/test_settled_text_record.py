@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.model_io import content_digest
@@ -219,6 +221,55 @@ def test_a_malformed_record_is_reported(tmp_path: Path) -> None:
     # ``path`` carries the offending line ("transcript.jsonl:7"), not just the file name.
     issues = validate_run_dir(run_dir)
     assert any(issue.path.startswith("transcript.jsonl:") for issue in issues), issues
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        pytest.param("SENTINEL-a short final answer", id="short"),
+        # Long values took a different route: the generic preview truncates to a 160-character
+        # prefix rather than dropping the field, so it leaked a readable excerpt instead of the
+        # whole answer. Both shapes have to be covered.
+        pytest.param("SENTINEL-" + "x" * 400, id="long-enough-to-be-truncated"),
+    ],
+)
+def test_the_run_finish_summary_never_reaches_the_tool_call_event(
+    tmp_path: Path, summary: str
+) -> None:
+    """Settling through `run.finish` is the default flow, so its `summary` IS the final answer.
+
+    It reached `events.jsonl` through `tool.call.started.data.args_preview` as well as the settle
+    events — a second door that removing text from `turn.settled` alone would have left open.
+    """
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(
+                    fake_tool_call(
+                        "run_finish", {"summary": summary, "outputs": ["notes.md"]}, "c1"
+                    ),
+                ),
+            )
+        ]
+    )
+
+    run_dir = _run(_spec(tmp_path), adapter)
+
+    # ``tool`` carries the wire call name (``run_finish``), not the spec id (``run.finish``).
+    started = [
+        event for event in _events(run_dir, "tool.call.started") if event["data"]["tool"] == "run_finish"
+    ]
+    assert started, "the run.finish tool call never started"
+    preview = started[-1]["data"]["args_preview"]
+    assert preview["summary"] == {"redacted": True, "type": "str", "bytes": len(summary)}
+    # Not the whole file: `outputs` is a path list, not prose, and must survive. A preview that
+    # redacted everything would satisfy the assertion above and tell an operator nothing.
+    assert preview["outputs"] == ["notes.md"]
+    # And the sentinel is nowhere in the raw event line, not merely absent from the field checked.
+    raw = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+    started_lines = [line for line in raw.splitlines() if '"tool.call.started"' in line]
+    assert started_lines and not any(summary[:30] in line for line in started_lines)
 
 
 def test_this_commit_does_not_change_the_settle_events(tmp_path: Path) -> None:

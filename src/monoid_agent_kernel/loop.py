@@ -167,6 +167,7 @@ from monoid_agent_kernel.providers.base import (
 )
 from monoid_agent_kernel.public_view import (
     args_preview,
+    finish_args_preview,
     public_error_message,
     public_path,
     public_proposal_payload,
@@ -4554,6 +4555,8 @@ def _tool_start_data(
         preview = shell_args_preview(arguments, permission_policy)
     elif preview_kind == "web":
         preview = web_args_preview(arguments, permission_policy)
+    elif preview_kind == "finish":
+        preview = finish_args_preview(arguments, permission_policy)
     else:
         preview = args_preview(arguments, permission_policy)
     return {

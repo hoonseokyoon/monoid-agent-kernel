@@ -10,7 +10,7 @@ from monoid_agent_kernel.core.content import ContentPart
 from monoid_agent_kernel.errors import ToolExecutionError
 
 ToolSideEffect = Literal["read", "write", "artifact", "run", "shell"]
-ToolPreviewKind = Literal["args", "shell", "web"]
+ToolPreviewKind = Literal["args", "shell", "web", "finish"]
 ToolChangedPathsSource = Literal["path_args", "result_content"]
 ToolResultPayloadKind = Literal["paths", "shell_exec"]
 

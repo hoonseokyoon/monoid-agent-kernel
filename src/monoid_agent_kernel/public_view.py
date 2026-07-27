@@ -96,6 +96,33 @@ def args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[st
     return {key: preview_value(key, value, policy) for key, value in arguments.items()}
 
 
+# ``run.finish`` arguments that are the model's own prose rather than metadata about the run.
+# ``outputs`` is a path list and stays previewed normally.
+_FINISH_CONTENT_KEYS = frozenset({"summary", "notes"})
+
+
+def finish_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
+    """Preview for ``run.finish``, whose ``summary`` is the run's final answer.
+
+    Settling through ``run.finish`` is the default flow, so this argument *is* the model-authored
+    final text — the same value that reaches ``turn.settled``. Left to the generic preview it was
+    copied verbatim into ``tool.call.started.data.args_preview`` (and truncated to a 160-character
+    prefix when long), putting model output on `events.jsonl` and every event sink through a
+    second door. Removing it from the settle events alone would not have closed the channel.
+
+    Kept out of ``_is_content_field``: that predicate is documented as *file*-content fields, and
+    these are model content. Same destination, different reason.
+    """
+    return {
+        key: (
+            redacted_value(value)
+            if str(key).lower() in _FINISH_CONTENT_KEYS
+            else preview_value(str(key), value, policy)
+        )
+        for key, value in arguments.items()
+    }
+
+
 def shell_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
     env = arguments.get("env") if isinstance(arguments.get("env"), dict) else {}
     return {
