@@ -26,6 +26,7 @@ from monoid_agent_kernel.core._util import (
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
 from monoid_agent_kernel.core.lifecycle import SessionState, session_state_from_run_status, session_state_value
 from monoid_agent_kernel.core.manifest import RunManifest
+from monoid_agent_kernel.core.model_io import content_digest, content_length
 from monoid_agent_kernel.core.result import AgentArtifact
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -225,6 +226,10 @@ class AgentRecorder:
     _transcript_file: TextIO = field(init=False, repr=False)
     started_at: float = field(default_factory=time.time)
     artifacts: list[AgentArtifact] = field(default_factory=list)
+    # Digests already written by ``settled_text``. Per-recorder, so a resumed run may re-append a
+    # record whose digest is already in the file; that duplicates identical content, which the
+    # content-addressed join resolves the same either way.
+    _settled_text_digests: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.run_dir = self.run_root / self.run_id
@@ -263,6 +268,47 @@ class AgentRecorder:
 
     def transcript(self, item: dict[str, Any]) -> None:
         _write_jsonl(self._transcript_file, item)
+
+    def settled_text(self, text: str) -> str:
+        """Record model-authored settled text and return its content digest.
+
+        The digest is the join key: a settle event carries ``final_text_digest`` and a reader
+        resolves the text by matching it here. Keying on *content* rather than on the emitting
+        event's identity is what lets this be written **before** the emit — the event's id and seq
+        do not exist until ``emit`` returns, and writing afterwards would open a window in which a
+        committed event names text that is not yet on disk.
+
+        Identical text yields one record. ``turn.settled`` and ``run.finished`` normally carry the
+        same value, so a content-addressed key makes the second write redundant by construction
+        rather than by a caller remembering not to repeat itself.
+
+        This lives on the recorder rather than beside the emit sites because it owns the transcript
+        handle. ``transcript.jsonl`` is the private debug/replay artifact
+        (``docs/OBSERVABILITY.md``) and already holds model text per turn, so settled text belongs
+        with it rather than in a new run-dir file — which is also why no compatibility-ledger entry
+        is involved.
+
+        Durability is best-effort and deliberately so: ``_write_jsonl`` flushes but does not fsync,
+        and the transcript has no append-tail repair. A crash can leave a committed event whose
+        digest resolves to nothing, so **content-missing is a tolerated read outcome** — hydration
+        fills absent fields and never fails a read.
+        """
+        # ``content_digest``, never a bare sha256 of the text: it hashes canonical JSON under a
+        # shape key so a text field cannot collide with a structured value's serialization. Once a
+        # record persists one it is frozen (see the function's own docstring).
+        digest = content_digest(text)
+        if digest not in self._settled_text_digests:
+            self._settled_text_digests.add(digest)
+            _write_jsonl(
+                self._transcript_file,
+                {
+                    "kind": "settled_text",
+                    "final_text": text,
+                    "final_text_digest": digest,
+                    "final_text_len": content_length(text),
+                },
+            )
+        return digest
 
     def emit_artifact_bytes(
         self,

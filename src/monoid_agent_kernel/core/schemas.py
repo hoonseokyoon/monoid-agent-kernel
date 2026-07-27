@@ -711,6 +711,24 @@ TRANSCRIPT_RECORD_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": True,
         },
+        {
+            # Model-authored text a run settled on, keyed by its content digest so a settle event
+            # carrying ``final_text_digest`` can resolve back to it. Distinct from ``model_turn``
+            # above: that records one model response per step, while ``state.final_text`` is
+            # frequently not the last of those (a ``run.finish`` summary, a validator repair), and
+            # is what the settle events actually publish.
+            "type": "object",
+            "required": ["kind", "final_text", "final_text_digest", "final_text_len"],
+            "properties": {
+                "kind": {"const": "settled_text"},
+                "final_text": {"type": "string"},
+                # ``core.model_io.content_digest`` — canonical JSON under a shape key, NOT a bare
+                # sha256 of the text. Recompute with that function or the join silently misses.
+                "final_text_digest": {"type": "string"},
+                "final_text_len": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": True,
+        },
     ]
 }
 

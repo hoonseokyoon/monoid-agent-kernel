@@ -514,6 +514,13 @@ class LoopFinalizer:
                 ],
             },
         )
+        # Written *before* the emit so a committed event can never name text that is not yet on
+        # disk. Only model-authored text goes to the record: a kernel string ("Stopped after
+        # reaching max steps.") stays inline on the event, where an operator can read it without a
+        # join. The returned digest is unused until the emit change lands — this commit still
+        # publishes ``final_text``, so the record is written but nothing reads it yet.
+        if state.final_text_is_model_output:
+            recorder.settled_text(state.final_text)
         recorder.emit(
             "run.finished",
             data={
@@ -564,6 +571,11 @@ class LoopFinalizer:
             public_path(str(path), loop.permission_policy)
             for path in proposal_payload.get("changed_paths", [])
         ]
+        # Same discipline as ``run.finished`` above: record first, emit second. Both settle events
+        # normally carry the same text, and ``settled_text`` is content-keyed, so the second call
+        # is a no-op rather than a duplicate record.
+        if state.final_text_is_model_output:
+            recorder.settled_text(state.final_text)
         recorder.emit(
             "turn.settled",
             data={
