@@ -32,10 +32,8 @@ from support.backend_harness import (
 )
 
 from monoid_agent_kernel.core.model_io import content_digest
-from monoid_agent_kernel.reference.backend.content_hydration import (
-    MAX_SCANNED_LINES,
-    hydrate_settled_text,
-)
+from monoid_agent_kernel.reference.backend import content_hydration
+from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
 
 # Tier and the serial marker come from ``support/test_tiers.py`` (this module is registered in
@@ -183,12 +181,49 @@ def test_the_transcript_is_not_opened_when_nothing_wants_text(tmp_path: Path, mo
     assert calls == []
 
 
-def test_the_scan_is_bounded(tmp_path: Path) -> None:
-    # An unbounded lookup would regress the resource bounds this repo applies to its other readers.
-    with (tmp_path / "transcript.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
-        for index in range(MAX_SCANNED_LINES + 5):
-            handle.write(json.dumps({"kind": "model_turn", "step": index}) + "\n")
-    digest = _write_record(tmp_path, "beyond the cap")
+def _pad(run_dir: Path, byte_target: int) -> None:
+    with (run_dir / "transcript.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
+        written = 0
+        index = 0
+        while written < byte_target:
+            line = json.dumps({"kind": "model_turn", "step": index, "pad": "x" * 200}) + "\n"
+            handle.write(line)
+            written += len(line)
+            index += 1
+
+
+def test_the_newest_record_resolves_even_in_a_transcript_larger_than_the_budget(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The bound is anchored at the END of the file, and this is why.
+
+    ``settled_text`` records are appended and the transcript accumulates across every step and
+    every restore, so a bound counted from the *start* truncated exactly the region holding the
+    current run's text: old settled text resolved and the newest silently did not. Padding here
+    exceeds the budget on purpose — under the old front-anchored cap this test fails.
+    """
+    monkeypatch.setattr(content_hydration, "MAX_SCAN_BYTES", 4_000)
+    _pad(tmp_path, 12_000)
+    digest = _write_record(tmp_path, "the newest answer")
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert events[0]["data"]["final_text"] == "the newest answer"
+
+
+def test_a_record_older_than_the_budget_is_not_scanned(tmp_path: Path, monkeypatch: Any) -> None:
+    # The other side: the bound still bounds. An unbounded lookup would regress the resource
+    # limits this repo applies to its other readers.
+    #
+    # The leading pad matters. The reader discards the partial line its seek lands inside, so with
+    # the record written as line 1 this passed even when the seek was moved to byte 0 — the record
+    # was skipped as "the partial line" rather than excluded by the bound. Verified: that version
+    # survived the seek(0) mutant.
+    monkeypatch.setattr(content_hydration, "MAX_SCAN_BYTES", 4_000)
+    _pad(tmp_path, 500)
+    digest = _write_record(tmp_path, "an ancient answer")
+    _pad(tmp_path, 12_000)
     events = [_event(status="completed", final_text_digest=digest)]
 
     hydrate_settled_text(events, tmp_path)

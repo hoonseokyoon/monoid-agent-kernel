@@ -49,12 +49,21 @@ def _run(spec: AgentRunSpec, adapter: Any, *tool_ids: str) -> Path:
 
 
 def _records(run_dir: Path, kind: str) -> list[dict[str, Any]]:
-    text = (run_dir / "transcript.jsonl").read_text(encoding="utf-8")
-    return [
-        record
-        for record in (json.loads(line) for line in text.splitlines() if line.strip())
-        if record.get("kind") == kind
-    ]
+    text = (run_dir / "transcript.jsonl").read_text(encoding="utf-8", errors="replace")
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            # A torn line is a legitimate transcript state (no append-tail repair), and the
+            # reader under test skips them — so this helper must too, or it fails on the very
+            # input the torn-tail case exists to exercise.
+            continue
+        if isinstance(record, dict) and record.get("kind") == kind:
+            records.append(record)
+    return records
 
 
 def _events(run_dir: Path, event_type: str) -> list[dict[str, Any]]:
@@ -270,6 +279,122 @@ def test_the_run_finish_summary_never_reaches_the_tool_call_event(
     raw = (run_dir / "events.jsonl").read_text(encoding="utf-8")
     started_lines = [line for line in raw.splitlines() if '"tool.call.started"' in line]
     assert started_lines and not any(summary[:30] in line for line in started_lines)
+
+
+def _finish_spec() -> Any:
+    """A spec carrying the real `run.finish` preview kind.
+
+    Synthetic rather than the builtin, which needs a live workspace to construct. That the actual
+    `run.finish` binding carries `preview_kind="finish"` is covered by
+    `test_the_run_finish_summary_never_reaches_the_tool_call_event`, which drives a real run and
+    only passes if the wiring is in place.
+    """
+    from monoid_agent_kernel.tools.base import ToolSpec
+
+    return ToolSpec(
+        id="run.finish",
+        description="Finish the run.",
+        input_schema={"type": "object"},
+        capability="run.control",
+        side_effect="run",
+        handler=lambda *_args, **_kwargs: None,
+        preview_kind="finish",
+    )
+
+
+def test_the_approval_request_redacts_the_summary_too() -> None:
+    """The approval path is a second public route for the same argument.
+
+    `build_tool_approval_task_request` stores `arguments_preview`, and the hosted task republishes
+    it on `task.started`. Redacting only in `_tool_start_data` left this half unbound, so binding
+    `run.finish` to `authorization="ask"` put the final answer straight back on `events.jsonl`.
+    """
+    from monoid_agent_kernel.core.tool_approval import build_tool_approval_task_request
+
+    request = build_tool_approval_task_request(
+        spec=_finish_spec(),
+        binding_id="run.finish",
+        model_name="run_finish",
+        call_name="run_finish",
+        call_id="c1",
+        arguments={"summary": "SENTINEL-the-answer", "notes": "SENTINEL-notes", "outputs": ["n.md"]},
+        reason="ask",
+        turn_id="turn_0001",
+        tool_event_id=None,
+    )
+
+    preview = request["arguments_preview"]
+    assert "SENTINEL-the-answer" not in json.dumps(preview)
+    assert "SENTINEL-notes" not in json.dumps(preview)
+    # Counterweight: non-prose arguments must survive, or an approver sees nothing to judge.
+    assert preview["outputs"] == ["n.md"]
+    # And the private `arguments` still carry the real values — the approval decision is not
+    # deprived of them; only the public preview is.
+    assert request["arguments"]["summary"] == "SENTINEL-the-answer"
+
+
+def test_a_tool_without_the_finish_preview_kind_is_unaffected() -> None:
+    # The redaction is keyed on preview kind, not on argument names, so an ordinary tool whose
+    # arguments happen to include `summary` is not silently gutted.
+    from monoid_agent_kernel.core.tool_approval import redact_tool_arguments
+
+    assert redact_tool_arguments({"summary": "plain"})["summary"] == "plain"
+
+
+def test_finish_preview_leaves_an_absent_notes_alone() -> None:
+    # `notes` is declared ["string", "null"]. A redaction marker on a value that was never there
+    # tells an operator something was withheld when nothing was.
+    from monoid_agent_kernel.permissions import PermissionPolicy
+    from monoid_agent_kernel.public_view import finish_args_preview
+
+    preview = finish_args_preview({"summary": "s", "notes": None}, PermissionPolicy())
+    assert preview["notes"] is None
+
+
+def test_a_refusal_writes_no_settled_text_record(tmp_path: Path) -> None:
+    """Empty model-authored text is skipped.
+
+    A digest of "" on the event, with no way to distinguish a lost record from a genuinely empty
+    answer, is worse than leaving the field alone.
+    """
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(response_id="r1", final_text=None, stop_reason="refusal")]
+    )
+
+    run_dir = _run(_spec(tmp_path), adapter)
+
+    assert _records(run_dir, "settled_text") == []
+
+
+def test_a_torn_transcript_tail_does_not_consume_the_next_record(tmp_path: Path) -> None:
+    """A remnant without its trailing newline would glue the next record onto it, losing BOTH.
+
+    On the recovery path the first write of the reopened recorder can be the settled-text record
+    itself, which a committed `run.finished` then names — the exact "event names text that is not
+    on disk" failure the write-before-emit ordering exists to prevent, with no crash in the
+    recovered run.
+    """
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    run_root = tmp_path / "runs"
+    run_dir = run_root / "run-torn"
+    run_dir.mkdir(parents=True)
+    with (run_dir / "transcript.jsonl").open("wb") as handle:
+        handle.write(b'{"kind":"model_turn","step":1,"final_text":"complete"}\n')
+        handle.write(b'{"kind":"model_turn","step":2,"final_te')  # torn mid-write, no newline
+
+    recorder = AgentRecorder(run_root=run_root, run_id="run-torn", reopen=True, status_file=False)
+    try:
+        digest = recorder.settled_text("survives the tear")
+    finally:
+        recorder.close()
+
+    records = _records(run_dir, "settled_text")
+    assert [record["final_text_digest"] for record in records] == [digest]
+    # The torn remnant is still one broken line — confined to the record it tore, not spread.
+    lines = (run_dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+    broken = [line for line in lines if line.strip() and not line.strip().endswith("}")]
+    assert len(broken) == 1
 
 
 def test_this_commit_does_not_change_the_settle_events(tmp_path: Path) -> None:

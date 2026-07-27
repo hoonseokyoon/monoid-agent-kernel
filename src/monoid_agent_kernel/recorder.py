@@ -243,6 +243,7 @@ class AgentRecorder:
         )
         initial_seq = _verified_event_sequence_seed(events_path, tail)
         self._transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
+        self._terminate_torn_transcript_tail()
         sinks: list[EventSink] = [JsonlEventSink(events_path)]
         if self.status_file:
             sinks.append(StatusJsonSink(self.run_dir / "status.json"))
@@ -265,6 +266,34 @@ class AgentRecorder:
             turn_id=turn_id,
             parent_id=parent_id,
         )
+
+    def _terminate_torn_transcript_tail(self) -> None:
+        """Close off a torn last line so the next append is not glued onto it.
+
+        ``transcript.jsonl`` gets no ``repair_event_log_tail_for_append`` the way ``events.jsonl``
+        does. Appending after a line that lacks its trailing newline concatenates the remnant and
+        the new record into one unparseable line, losing **both** — so a crash costs the next run's
+        first record as well as its own. On the recovery path that first record can be the
+        settled-text one, which a committed ``run.finished`` then names: exactly the
+        "event names text that is not on disk" failure the write-before-emit ordering exists to
+        prevent, with no crash during the recovered run.
+
+        Writing the missing newline costs one byte and confines a torn write to the record it tore.
+        Best-effort by design: if the file cannot be inspected, appending as before is no worse.
+        """
+        path = self.run_dir / "transcript.jsonl"
+        try:
+            size = path.stat().st_size
+            if size == 0:
+                return
+            with path.open("rb") as handle:
+                handle.seek(size - 1)
+                if handle.read(1) == b"\n":
+                    return
+            self._transcript_file.write("\n")
+            self._transcript_file.flush()
+        except OSError:
+            return
 
     def transcript(self, item: dict[str, Any]) -> None:
         _write_jsonl(self._transcript_file, item)
@@ -298,7 +327,6 @@ class AgentRecorder:
         # record persists one it is frozen (see the function's own docstring).
         digest = content_digest(text)
         if digest not in self._settled_text_digests:
-            self._settled_text_digests.add(digest)
             _write_jsonl(
                 self._transcript_file,
                 {
@@ -308,6 +336,10 @@ class AgentRecorder:
                     "final_text_len": content_length(text),
                 },
             )
+            # Marked written only once it is. Adding before the write meant a raising write (a
+            # full disk mid-flush) recorded the digest as present with nothing on disk, so a later
+            # call for the same text short-circuited and returned a digest resolving to nothing.
+            self._settled_text_digests.add(digest)
         return digest
 
     def emit_artifact_bytes(

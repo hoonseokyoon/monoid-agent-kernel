@@ -526,10 +526,15 @@ class LoopFinalizer:
         )
         # Written *before* the emit so a committed event can never name text that is not yet on
         # disk. Only model-authored text goes to the record: a kernel string ("Stopped after
-        # reaching max steps.") stays inline on the event, where an operator can read it without a
-        # join. The returned digest is unused until the emit change lands — this commit still
-        # publishes ``final_text``, so the record is written but nothing reads it yet.
-        if state.final_text_is_model_output:
+        # reaching max steps.") normally stays inline on the event, where an operator can read it
+        # without a join. The exception is a restored run — provenance is not checkpointed, so
+        # ``_rehydrate`` fails closed and a resumed kernel message is recorded too. Over-recording
+        # is the safe direction; see the field on ``RunState``.
+        #
+        # Empty text is skipped: a digest of "" on the event with no way to tell a lost record from
+        # a genuinely empty answer is worse than leaving the field alone. The returned digest is
+        # unused until the emit change lands.
+        if state.final_text and state.final_text_is_model_output:
             recorder.settled_text(state.final_text)
         recorder.emit(
             "run.finished",
@@ -581,10 +586,10 @@ class LoopFinalizer:
             public_path(str(path), loop.permission_policy)
             for path in proposal_payload.get("changed_paths", [])
         ]
-        # Same discipline as ``run.finished`` above: record first, emit second. Both settle events
-        # normally carry the same text, and ``settled_text`` is content-keyed, so the second call
-        # is a no-op rather than a duplicate record.
-        if state.final_text_is_model_output:
+        # Same discipline as ``run.finished`` above: record first, emit second, skip empty text.
+        # Both settle events normally carry the same value, and ``settled_text`` is content-keyed,
+        # so the second call is a no-op rather than a duplicate record.
+        if state.final_text and state.final_text_is_model_output:
             recorder.settled_text(state.final_text)
         recorder.emit(
             "turn.settled",

@@ -41,7 +41,10 @@ def build_tool_approval_task_request(
         "call_name": call_name,
         "call_id": call_id,
         "arguments": sanitized_arguments,
-        "arguments_preview": redact_tool_arguments(sanitized_arguments),
+        "arguments_preview": redact_tool_arguments(
+            sanitized_arguments,
+            prose_keys=_PROSE_KEYS_BY_PREVIEW_KIND.get(spec.preview_kind, frozenset()),
+        ),
         "reason": reason,
         "side_effect": spec.side_effect,
         "turn_id": turn_id,
@@ -63,9 +66,25 @@ def tool_approval_key(request: Mapping[str, Any]) -> str:
     )
 
 
-def redact_tool_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
+# Tool arguments that are the model's own prose, keyed by the tool's preview kind. Mirrors
+# ``public_view._FINISH_CONTENT_KEYS``: an approval request republishes ``arguments_preview`` on
+# ``task.started``, so it is a SECOND public route for the same values. Redacting only in
+# ``_tool_start_data`` left that half unbound, and binding a tool to ``authorization="ask"`` put
+# the text straight back on ``events.jsonl``.
+_PROSE_KEYS_BY_PREVIEW_KIND: dict[str, frozenset[str]] = {
+    "finish": frozenset({"summary", "notes"}),
+}
+
+
+def redact_tool_arguments(
+    arguments: Mapping[str, Any], *, prose_keys: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     return {
-        str(key): (_REDACTED if _is_secret_key(str(key)) else _redact_value(value))
+        str(key): (
+            _REDACTED
+            if _is_secret_key(str(key)) or str(key).lower() in prose_keys
+            else _redact_value(value)
+        )
         for key, value in arguments.items()
     }
 

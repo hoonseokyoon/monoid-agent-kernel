@@ -112,11 +112,22 @@ def finish_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> 
 
     Kept out of ``_is_content_field``: that predicate is documented as *file*-content fields, and
     these are model content. Same destination, different reason.
+
+    ``summary`` and ``notes`` are treated alike here but recover differently, which is deliberate.
+    ``summary`` becomes ``state.final_text``, so it is written to the run-dir settled-text record
+    and hydrated back for entitled readers. ``notes`` has no such route — it is redacted at the one
+    public seam that carried it and survives only in ``transcript.jsonl``'s private ``model_turn``
+    record. That is the intended destination for model prose; it is not a join-back path, and
+    nothing should be built expecting one.
+
+    ``None`` is left alone rather than redacted: ``notes`` is declared ``["string", "null"]``, and
+    a redaction marker on an absent value tells an operator something was withheld when nothing
+    was there.
     """
     return {
         key: (
             redacted_value(value)
-            if str(key).lower() in _FINISH_CONTENT_KEYS
+            if value is not None and str(key).lower() in _FINISH_CONTENT_KEYS
             else preview_value(str(key), value, policy)
         )
         for key, value in arguments.items()

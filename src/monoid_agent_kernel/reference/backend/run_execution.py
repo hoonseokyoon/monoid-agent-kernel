@@ -144,6 +144,15 @@ class RunExecutionService:
                     # no consumer expects. Delta frames are deliberately untouched: they carry live
                     # token text that no turn-end record can supply.
                     if frame.get("kind") == "event":
+                        # ``AgentEvent.to_json()`` hands back the live ``data`` dict *by
+                        # reference*, so hydrating the frame in place would write the text into
+                        # the event the bus still owns and every registered sink shares —
+                        # including embedder-supplied ones. A sink that buffers events and
+                        # serializes them later would then export exactly the content this change
+                        # moves off that stream. Copy before filling.
+                        data = frame.get("data")
+                        if isinstance(data, dict):
+                            frame["data"] = dict(data)
                         hydrate_settled_text([frame], stream_run_dir)
                     yield frame
                 suspension = stream.suspension

@@ -38,9 +38,15 @@ TEXT_FIELD = "final_text"
 # The record is keyed by content digest, while every reader pages by ``seq``, so resolving a page
 # means a lookup rather than an offset. Bound it: this repo bounds its other readers (watch
 # batches, event-index slots) and an unbounded scan of an attacker-influenced file would regress
-# that. The scan also stops as soon as every wanted digest is found, so the cap only bites on a
-# transcript whose text genuinely is not there.
-MAX_SCANNED_LINES = 100_000
+# that.
+#
+# The bound is applied from the END of the file, which is the correction to a cap that used to
+# count lines from the start. ``settled_text`` records are *appended*, and the transcript
+# accumulates across every step and every restore of a run, so a front-anchored cap truncated
+# exactly the region holding the newest settled text: old text resolved and the current run's did
+# not. Scanning the tail also means the early-exit on "every wanted digest found" is a latency
+# optimisation rather than the thing keeping the cap honest.
+MAX_SCAN_BYTES = 8_000_000
 
 
 def hydrate_settled_text(events: Any, run_dir: Path) -> Any:
@@ -97,17 +103,20 @@ def _wanted_digests(events: Any) -> set[str]:
 def _resolve(transcript_path: Path, wanted: set[str]) -> dict[str, str]:
     found: dict[str, str] = {}
     try:
-        # ``errors="replace"`` because a crash can tear a multi-byte sequence mid-write, and
-        # decoding is lazy: strict mode raises ``UnicodeDecodeError`` from the iterator itself,
-        # which is a ``ValueError`` and so slips past the ``OSError`` handler below. That turned
-        # every REST/SSE/Studio read needing a digest into a failed request rather than the
-        # promised absent field. A replaced line then fails to parse as JSON, or fails the digest
-        # check, and is skipped like any other malformed record.
-        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for index, line in enumerate(handle):
-                if index >= MAX_SCANNED_LINES:
-                    break
-                digest, text = _settled_text_entry(line)
+        # Read bytes and decode per line rather than opening in text mode. Two reasons: seeking to
+        # a byte offset is only well-defined on a binary handle, and a crash can tear a multi-byte
+        # sequence mid-write — decoding is lazy, so strict text mode raises ``UnicodeDecodeError``
+        # from the iterator itself, which is a ``ValueError`` and slips past the ``OSError``
+        # handler below. That turned every read needing a digest into a failed request rather than
+        # the promised absent field. A replaced line then fails to parse as JSON, or fails the
+        # digest check, and is skipped like any other malformed record.
+        size = transcript_path.stat().st_size
+        with transcript_path.open("rb") as handle:
+            if size > MAX_SCAN_BYTES:
+                handle.seek(size - MAX_SCAN_BYTES)
+                handle.readline()  # discard the partial line the seek landed inside
+            for raw_line in handle:
+                digest, text = _settled_text_entry(raw_line.decode("utf-8", errors="replace"))
                 if digest is None or text is None or digest not in wanted:
                     continue
                 if content_digest(text) != digest:

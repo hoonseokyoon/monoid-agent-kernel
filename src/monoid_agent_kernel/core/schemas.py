@@ -1031,7 +1031,12 @@ def _validate_object(payload: Any, schema: dict[str, Any], issues: list[Validati
 
 
 def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
-    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    # ``errors="replace"``: a crash can tear a multi-byte sequence mid-write, and strict decoding
+    # raises ``UnicodeDecodeError`` — uncaught here, since the ``try`` below covers only
+    # ``json.loads`` — turning ``monoid validate`` into a traceback instead of a reported issue.
+    # The twin ``_validate_event_file`` already handles this; a replaced line simply fails to parse
+    # and is reported as invalid JSON, which is what a torn line is.
+    for index, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
         if not line.strip():
             continue
         try:
