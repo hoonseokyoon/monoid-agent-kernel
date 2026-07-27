@@ -502,6 +502,37 @@ def test_a_deeply_nested_line_is_reported_not_raised(tmp_path: Path, artifact: s
     assert any(issue.path.startswith(f"{artifact}:") for issue in issues), issues
 
 
+@pytest.mark.parametrize(
+    ("corruption", "expected"),
+    [
+        pytest.param(b'{"a": "b\xffc"}', "invalid UTF-8", id="undecodable-bytes"),
+        pytest.param(None, "decoder limit exceeded", id="deeply-nested"),
+        pytest.param(b"1" * 5000, "decoder limit exceeded", id="oversized-int"),
+    ],
+)
+def test_a_corrupt_json_artifact_is_reported_not_raised(
+    tmp_path: Path, corruption: bytes | None, expected: str
+) -> None:
+    """The THIRD validator sibling, which guards ten artifacts and runs before both JSONL halves.
+
+    Hardening `_validate_jsonl_file` and `_validate_event_file` while leaving this one made both
+    of those unreachable on a run dir whose corruption is in a JSON artifact — the same
+    ordering argument that justified hardening the event half in the first place.
+    """
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="valid run")])
+    run_dir = _run(_spec(tmp_path), adapter)
+
+    if corruption is None:
+        depth = sys.getrecursionlimit() * 3
+        corruption = (b"[" * depth) + (b"]" * depth)
+    (run_dir / "metrics.json").write_bytes(corruption)
+
+    issues = validate_run_dir(run_dir)  # must not raise
+    assert any(
+        issue.path == "metrics.json" and expected in issue.message for issue in issues
+    ), issues
+
+
 def test_the_approval_preview_leaves_an_absent_notes_alone() -> None:
     # The other half of the `notes: None` rule. Fixing it in `finish_args_preview` alone moved the
     # two halves in opposite directions inside one commit — the approval preview then badged an

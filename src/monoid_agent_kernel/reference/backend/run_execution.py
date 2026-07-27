@@ -170,7 +170,7 @@ class RunExecutionService:
                         # carries a digest and the resolver opens no file at all — so the
                         # emptiness check stays on the loop and only real work crosses the
                         # boundary.
-                        if needs_settled_text(frame):
+                        if needs_settled_text([frame]):
                             await asyncio.to_thread(
                                 hydrate_settled_text, [frame], stream_run_dir
                             )

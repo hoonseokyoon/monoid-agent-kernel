@@ -1014,10 +1014,32 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
 def _validate_json_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
     if not path.exists():
         return
+    # The THIRD sibling of ``_validate_jsonl_file`` / ``_validate_event_file``, and it must be as
+    # hard as both. It guards ten artifacts (manifest, workspace index/base, metrics, proposal,
+    # status, package, approval, apply-result, job) and nine of those calls run BEFORE either
+    # JSONL validator — so leaving it soft made hardening the other two unreachable on a run dir
+    # corrupted in a JSON artifact first. Decoding is done here rather than in ``read_text``
+    # because a torn multi-byte sequence raises out of the read, not out of ``json.loads``.
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+    except OSError as exc:
+        issues.append(ValidationIssue(path.name, f"unreadable: {exc}"))
+        return
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        issues.append(ValidationIssue(path.name, "invalid UTF-8"))
+        return
+    try:
+        payload = json.loads(text)
     except json.JSONDecodeError as exc:
         issues.append(ValidationIssue(path.name, f"invalid JSON: {exc.msg}"))
+        return
+    except (ValueError, RecursionError):
+        # Same catch-set and label as both JSONL halves: a deeply nested document exceeds the C
+        # scanner's stack, and ``json.loads`` raises other ValueErrors (the digit-conversion cap)
+        # that are decoder limits too.
+        issues.append(ValidationIssue(path.name, "invalid JSON: decoder limit exceeded"))
         return
     _validate_object(payload, schema, issues, path.name)
 

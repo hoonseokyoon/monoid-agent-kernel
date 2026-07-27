@@ -83,15 +83,20 @@ def hydrate_settled_text(events: Any, run_dir: Path) -> Any:
     return events
 
 
-def needs_settled_text(*events: Any) -> bool:
-    """Whether any of ``events`` would cause ``hydrate_settled_text`` to touch the filesystem.
+def needs_settled_text(events: Any) -> bool:
+    """Whether ``events`` would cause ``hydrate_settled_text`` to touch the filesystem.
 
     Exists so a caller on an event loop can keep the cheap check on the loop and offload only the
     scan. Until the emit change lands nothing carries a digest, so this is ``False`` for every
     frame and an unconditional thread hop would queue delivery behind a shared, bounded executor
     for no work at all.
+
+    Takes the same shape as ``hydrate_settled_text`` — a list — deliberately. As a variadic it
+    accepted ``needs_settled_text(page)`` and silently answered ``False``, because the list nested
+    inside a list and every entry was skipped as malformed. A gate that fails closed by returning
+    "no work" is the exact one-more-caller trap this module has been bitten by repeatedly.
     """
-    return bool(_wanted_digests(list(events)))
+    return bool(_wanted_digests(events))
 
 
 def _event_data(events: Any) -> list[MutableMapping[str, Any]]:

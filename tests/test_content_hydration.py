@@ -294,6 +294,28 @@ def test_an_unresolvable_event_is_not_filled_with_another_events_text(tmp_path: 
     assert "final_text" not in events[1]["data"]
 
 
+def test_the_hydration_gate_takes_the_same_shape_as_hydration(tmp_path: Path) -> None:
+    """`needs_settled_text` must answer for a LIST, exactly as `hydrate_settled_text` consumes one.
+
+    As a variadic it accepted a list and silently answered `False` — the list nested inside a list
+    and every entry was skipped as malformed — so a caller gating a whole page on it would skip
+    hydration entirely and lose every assistant message. A gate that fails closed to "no work" is
+    the one-more-caller trap this module has been bitten by repeatedly.
+    """
+    from monoid_agent_kernel.reference.backend.content_hydration import needs_settled_text
+
+    digest = _write_record(tmp_path, "an answer")
+    page = [_event(status="completed", final_text_digest=digest)]
+
+    assert needs_settled_text(page) is True
+    # And it agrees with what hydration actually does, which is the only reason a gate is safe.
+    hydrate_settled_text(page, tmp_path)
+    assert page[0]["data"]["final_text"] == "an answer"
+
+    inline = [_event(status="completed", final_text="already here")]
+    assert needs_settled_text(inline) is False
+
+
 def test_a_digest_with_no_record_anywhere_stays_absent(tmp_path: Path) -> None:
     # The counterweight to "position never excludes": absence must still read as absence, or the
     # test above would pass against a resolver that invented text.

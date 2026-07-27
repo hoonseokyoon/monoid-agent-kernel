@@ -173,7 +173,9 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
     # this the stream correctly skips hydration entirely and every assertion below would pass
     # vacuously on a run that never resolved anything.
     monkeypatch.setattr(
-        run_execution, "needs_settled_text", lambda frame: frame.get("kind") == "event"
+        run_execution,
+        "needs_settled_text",
+        lambda events: any(event.get("kind") == "event" for event in events),
     )
 
     workspace = _workspace(tmp_path)

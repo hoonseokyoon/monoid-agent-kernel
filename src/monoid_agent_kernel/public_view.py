@@ -115,8 +115,9 @@ def finish_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> 
 
     ``summary`` and ``notes`` are treated alike here but recover differently, which is deliberate.
     ``summary`` becomes ``state.final_text``, so it is written to the run-dir settled-text record
-    and hydrated back for entitled readers. ``notes`` has no such route — it is redacted at the one
-    public seam that carried it and survives only in ``transcript.jsonl``'s private ``model_turn``
+    and hydrated back for entitled readers. ``notes`` has no such route — it is redacted at both
+    public seams that carry it (here, and ``arguments_preview`` on the approval request; see
+    ``core.tool_approval``) and survives only in ``transcript.jsonl``'s private ``model_turn``
     record. That is the intended destination for model prose; it is not a join-back path, and
     nothing should be built expecting one.
 
