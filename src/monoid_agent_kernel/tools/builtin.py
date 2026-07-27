@@ -1112,5 +1112,10 @@ def _run_finish() -> ToolSpec:
         ),
         capability="run.control",
         side_effect="run",
+        # ``summary``/``notes`` are the model's own prose — settling through run.finish is the
+        # default flow, so ``summary`` *is* the run's final answer. Under the generic preview it
+        # was copied into tool.call.started and reached every event sink, which would have left
+        # the content channel open even after the settle events stop carrying text.
+        preview_kind="finish",
         handler=handler,
     )

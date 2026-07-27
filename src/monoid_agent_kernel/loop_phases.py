@@ -380,7 +380,14 @@ class LoopSettleCoordinator:
             recorder.emit("output.validation.failed", data={"reason": decision.terminal_reason}, level="warning")
         elif decision.kind == "exhausted":
             state.status = decision.status
-            state.final_text = state.final_text or _OUTPUT_CONTRACT_STOPPED
+            if not state.final_text:
+                # The kernel's own explanation, installed because nothing the model produced
+                # satisfied the contract. Written as an explicit branch rather than an ``or`` so
+                # provenance can come down with it: reached from the ``run.finish`` path the flag
+                # is already True, and once the emit flip lands a stale True would digest this
+                # sentence off the event — taking the operator's only explanation with it.
+                state.final_text = _OUTPUT_CONTRACT_STOPPED
+                state.final_text_is_model_output = False
             state.error_code = decision.error_code
             recorder.emit(
                 "output.validator.exhausted",
@@ -398,7 +405,10 @@ class LoopSettleCoordinator:
             if decision.kind in ("reprompt", "exhausted"):
                 self._loop._clear_finish_metadata(context)
                 if decision.kind == "reprompt":
+                    # Dropping the rejected finish summary: there is no settled text again until
+                    # the re-prompted turn produces one, so its provenance goes with it.
                     state.final_text = ""
+                    state.final_text_is_model_output = False
             self._loop._log_finish_observations(state)
 
         if decision.kind == "reprompt":
@@ -514,6 +524,18 @@ class LoopFinalizer:
                 ],
             },
         )
+        # Written *before* the emit so a committed event can never name text that is not yet on
+        # disk. Only model-authored text goes to the record: a kernel string ("Stopped after
+        # reaching max steps.") normally stays inline on the event, where an operator can read it
+        # without a join. The exception is a restored run — provenance is not checkpointed, so
+        # ``_rehydrate`` fails closed and a resumed kernel message is recorded too. Over-recording
+        # is the safe direction; see the field on ``RunState``.
+        #
+        # Empty text is skipped: a digest of "" on the event with no way to tell a lost record from
+        # a genuinely empty answer is worse than leaving the field alone. The returned digest is
+        # unused until the emit change lands.
+        if state.final_text and state.final_text_is_model_output:
+            recorder.settled_text(state.final_text)
         recorder.emit(
             "run.finished",
             data={
@@ -564,6 +586,11 @@ class LoopFinalizer:
             public_path(str(path), loop.permission_policy)
             for path in proposal_payload.get("changed_paths", [])
         ]
+        # Same discipline as ``run.finished`` above: record first, emit second, skip empty text.
+        # Both settle events normally carry the same value, and ``settled_text`` is content-keyed,
+        # so the second call is a no-op rather than a duplicate record.
+        if state.final_text and state.final_text_is_model_output:
+            recorder.settled_text(state.final_text)
         recorder.emit(
             "turn.settled",
             data={

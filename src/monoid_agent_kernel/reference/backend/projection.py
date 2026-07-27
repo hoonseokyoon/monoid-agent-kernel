@@ -23,6 +23,7 @@ from monoid_agent_kernel.core.subagent_runtime import (
 )
 from monoid_agent_kernel.core.trace_context import trace_id_of
 from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 from monoid_agent_kernel.reference.backend.ports import RunRecordPort
 from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
 from monoid_agent_kernel.reference.backend.run_state import (
@@ -177,8 +178,13 @@ class RunProjectionService:
     def events(
         self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
     ) -> dict[str, Any]:
-        events_path = self._context.authorized_run_dir(run_id, token) / "events.jsonl"
-        page = self._context.read_event_page(events_path, from_seq=from_seq, limit=limit)
+        run_dir = self._context.authorized_run_dir(run_id, token)
+        page = self._context.read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=limit)
+        # One seam for every consumer that reads events through the backend: the REST and SSE
+        # twins on reference/backend/http.py, the Studio BFF's read_page, and `monoid studio
+        # accept`. Hydrating at those call sites instead would leave each new transport to
+        # remember.
+        hydrate_settled_text(page.get("events"), run_dir)
         return {"run_id": run_id, **page}
 
     def descendant_events(
@@ -195,8 +201,12 @@ class RunProjectionService:
             validate_descendant_run_id(run_id, descendant_run_id)
         except ValueError as exc:
             raise PermissionDenied(str(exc)) from exc
-        events_path = self._context.run_root_provider() / descendant_run_id / "events.jsonl"
-        page = self._context.read_event_page(events_path, from_seq=from_seq, limit=limit)
+        run_dir = self._context.run_root_provider() / descendant_run_id
+        page = self._context.read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=limit)
+        # The descendant feed hydrates from the *child's* run dir, and it has to happen here:
+        # Studio cannot reach a child run dir at all (`_token_for` raises for an id it never
+        # issued a token for), which is why this endpoint exists in the first place.
+        hydrate_settled_text(page.get("events"), run_dir)
         return {"run_id": descendant_run_id, **page}
 
     def descendant_status(

@@ -89,7 +89,16 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "status": _STR,
             "error": _STR,
             "error_code": _STR,
+            # ``final_text`` stays accepted after v0.20 stops emitting model-authored text here.
+            # ``validate_run_dir`` replays committed logs against these schemas, so removing the
+            # property would fail every run directory written before the change — and kernel
+            # strings ("Stopped after reaching max steps.") keep travelling inline regardless.
             "final_text": _STR,
+            # Set instead of ``final_text`` when the text is the model's. The digest is
+            # ``core.model_io.content_digest`` — canonical JSON, NOT a bare sha256 of the text —
+            # and the text itself is resolved from the run-dir settled-text record.
+            "final_text_digest": _STR,
+            "final_text_len": _INT,
             "duration_s": _NUM,
             "diff_path": _STR,
             "proposal_path": _STR,
@@ -124,7 +133,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     "turn.settled": _data_schema(
         {
             "status": _STR,
+            # Retained for the same reasons as on ``run.finished`` above.
             "final_text": _STR,
+            "final_text_digest": _STR,
+            "final_text_len": _INT,
             "error_code": _STR,
             "changed_paths": _STR_ARRAY,
             "output_validators": _INT,
@@ -699,6 +711,24 @@ TRANSCRIPT_RECORD_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": True,
         },
+        {
+            # Model-authored text a run settled on, keyed by its content digest so a settle event
+            # carrying ``final_text_digest`` can resolve back to it. Distinct from ``model_turn``
+            # above: that records one model response per step, while ``state.final_text`` is
+            # frequently not the last of those (a ``run.finish`` summary, a validator repair), and
+            # is what the settle events actually publish.
+            "type": "object",
+            "required": ["kind", "final_text", "final_text_digest", "final_text_len"],
+            "properties": {
+                "kind": {"const": "settled_text"},
+                "final_text": {"type": "string"},
+                # ``core.model_io.content_digest`` — canonical JSON under a shape key, NOT a bare
+                # sha256 of the text. Recompute with that function or the join silently misses.
+                "final_text_digest": {"type": "string"},
+                "final_text_len": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": True,
+        },
     ]
 }
 
@@ -974,6 +1004,7 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     transcript_path = run_dir / "transcript.jsonl"
     if transcript_path.exists():
         _validate_jsonl_file(transcript_path, TRANSCRIPT_RECORD_SCHEMA, issues)
+        _validate_settled_text_digests(transcript_path, issues)
     jobs_dir = run_dir / "artifacts" / "jobs"
     if jobs_dir.exists():
         for job_path in sorted(jobs_dir.glob("*/job.json")):
@@ -981,13 +1012,92 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     return issues
 
 
+def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) -> None:
+    """Recompute each ``settled_text`` record's digest and length.
+
+    The schema can only say ``final_text_digest`` is *a string*, but the reader
+    (``reference.backend.content_hydration``) rejects any record whose text does not hash to the
+    digest it claims. Without this check the two disagree in the worst direction: a record whose
+    text was altered while its digest was left alone stays schema-valid, so ``monoid validate``
+    reports the run clean while an entitled reader silently resolves nothing and the final answer
+    is gone. Validation must not certify a record the reader will refuse.
+
+    Uses ``content_digest``/``content_length`` — the same functions the writer and the reader use —
+    rather than reimplementing the hash, so the three cannot drift apart.
+    """
+    from monoid_agent_kernel.core.model_io import content_digest, content_length
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return  # already reported by the schema pass
+    for index, raw_line in enumerate(raw.split(b"\n"), start=1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue  # already reported by the schema pass
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, RecursionError):
+            continue  # already reported by the schema pass
+        if not isinstance(record, dict) or record.get("kind") != "settled_text":
+            continue
+        text = record.get("final_text")
+        if not isinstance(text, str):
+            continue  # shape is the schema's job
+        label = f"{path.name}:{index}"
+        claimed = record.get("final_text_digest")
+        if claimed != content_digest(text):
+            issues.append(
+                ValidationIssue(label, "settled_text digest does not match final_text")
+            )
+        claimed_len = record.get("final_text_len")
+        if claimed_len != content_length(text):
+            issues.append(
+                ValidationIssue(label, "settled_text length does not match final_text")
+            )
+
+
+def _read_json_artifact(path: Path) -> tuple[Any, ValidationIssue | None]:
+    """Decode and parse one JSON artifact, returning the problem instead of raising it.
+
+    The single loader for every JSON artifact read in this module — schema validation *and* the
+    relationship/hash checks that re-read the same files afterwards. Hardening one reader and
+    leaving its siblings is precisely how this file kept crashing ``monoid validate`` on the
+    corruption it exists to report: the schema pass recorded the issue and returned, and a
+    downstream check then re-read the same bytes with a bare ``read_text()``.
+
+    Decoding is explicit rather than left to ``read_text`` because a torn multi-byte sequence
+    raises out of the *read*, not out of ``json.loads`` — and ``RecursionError`` is not a
+    ``ValueError``, so a deeply nested document escapes a ``ValueError``-only handler.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return None, ValidationIssue(path.name, f"unreadable: {exc}")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, ValidationIssue(path.name, "invalid UTF-8")
+    try:
+        return json.loads(text), None
+    except json.JSONDecodeError as exc:
+        return None, ValidationIssue(path.name, f"invalid JSON: {exc.msg}")
+    except (ValueError, RecursionError):
+        # Same catch-set and label as both JSONL halves: a deeply nested document exceeds the C
+        # scanner's stack, and ``json.loads`` raises other ValueErrors (the digit-conversion cap)
+        # that are decoder limits too.
+        return None, ValidationIssue(path.name, "invalid JSON: decoder limit exceeded")
+
+
 def _validate_json_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
     if not path.exists():
         return
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        issues.append(ValidationIssue(path.name, f"invalid JSON: {exc.msg}"))
+    payload, issue = _read_json_artifact(path)
+    if issue is not None:
+        issues.append(issue)
         return
     _validate_object(payload, schema, issues, path.name)
 
@@ -1001,13 +1111,34 @@ def _validate_object(payload: Any, schema: dict[str, Any], issues: list[Validati
 
 
 def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
-    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    # Decode per line and REPORT undecodable bytes, matching the twin ``_validate_event_file``.
+    #
+    # Strict whole-file decoding raised ``UnicodeDecodeError`` out of ``monoid validate`` — the
+    # ``try`` below covers only ``json.loads`` — so a torn transcript crashed the validator. But
+    # ``errors="replace"`` is the wrong repair: a *complete* record whose string value holds an
+    # undecodable byte then parses, validates, and the file is reported clean. A validator that
+    # turns detected corruption into silence is worse than one that crashes, because the crash at
+    # least stops the caller. The twin detects and reports; do the same.
+    for index, raw_line in enumerate(path.read_bytes().split(b"\n"), start=1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            issues.append(ValidationIssue(f"{path.name}:{index}", "invalid UTF-8"))
+            continue
         if not line.strip():
             continue
         try:
             payload = json.loads(line)
         except json.JSONDecodeError as exc:
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {exc.msg}"))
+            continue
+        except (ValueError, RecursionError) as exc:
+            # Wider than JSONDecodeError: a deeply nested line exceeds the C scanner's stack, and
+            # `json.loads` raises other ValueErrors too. A validator whose job is to report
+            # corruption must not be stopped by it. Same catch-set and same message shape as
+            # ``_validate_event_file`` — identical corruption should not be labelled two ways.
+            message = exc.msg if isinstance(exc, json.JSONDecodeError) else "decoder limit exceeded"
+            issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {message}"))
             continue
         _validate_object(payload, schema, issues, f"{path.name}:{index}")
 
@@ -1021,7 +1152,11 @@ def _validate_event_file(path: Path, issues: list[ValidationIssue]) -> None:
         except UnicodeDecodeError:
             issues.append(ValidationIssue(f"{path.name}:{index}", "invalid UTF-8"))
             continue
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # ``RecursionError`` is NOT a ``ValueError``: a deeply nested line exceeds the C
+            # scanner's stack and escaped this clause entirely, crashing ``monoid validate`` on the
+            # very corruption it exists to report. ``events.jsonl`` is validated before
+            # ``transcript.jsonl``, so hardening only the transcript half left this reachable first.
             message = exc.msg if isinstance(exc, json.JSONDecodeError) else "decoder limit exceeded"
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {message}"))
             continue
@@ -1056,10 +1191,9 @@ def _validate_manifest_relative_file(
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.exists():
         return
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return
+    manifest, issue = _read_json_artifact(manifest_path)
+    if issue is not None:
+        return  # already recorded by the schema pass; do not double-report
     if not isinstance(manifest, dict):
         return
     rel = manifest.get(key)
@@ -1081,9 +1215,8 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
     proposal_path = run_dir / "proposal.json"
     if not proposal_path.exists():
         return
-    try:
-        proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    proposal, issue = _read_json_artifact(proposal_path)
+    if issue is not None:
         return
     if not isinstance(proposal, dict):
         return
@@ -1117,9 +1250,8 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
 
 def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> None:
     package_path = run_dir / "proposal.package.json"
-    try:
-        package = json.loads(package_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    package, issue = _read_json_artifact(package_path)
+    if issue is not None:
         return
     if not isinstance(package, dict):
         return
@@ -1145,9 +1277,8 @@ def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> No
 
 
 def _validate_canonical_hash(path: Path, hash_key: str, issues: list[ValidationIssue]) -> None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    payload, issue = _read_json_artifact(path)
+    if issue is not None:
         return
     if not isinstance(payload, dict):
         return

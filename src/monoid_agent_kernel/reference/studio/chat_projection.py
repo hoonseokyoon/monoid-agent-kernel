@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from monoid_agent_kernel.core._event_log import iter_committed_event_records
+from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 
 CHAT_SCHEMA_VERSION = "studio.chat.v1"
 CHAT_MESSAGE_SCHEMA_VERSION = "studio.chat.message.v1"
@@ -42,7 +43,14 @@ def _write_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _read_committed_events(path: Path) -> list[dict[str, Any]]:
-    return [record.payload for record in iter_committed_event_records(path)]
+    # Studio's catch-up reads events.jsonl straight off disk rather than through the backend
+    # projection, so it needs hydration of its own. Without it a restored session renders empty
+    # assistant bubbles while the live SSE page — which does go through the projection — shows the
+    # text, and `_record_from_event` drops a message whose content is empty rather than showing
+    # anything is missing.
+    return hydrate_settled_text(
+        [record.payload for record in iter_committed_event_records(path)], path.parent
+    )
 
 
 def _sorted_chat_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
