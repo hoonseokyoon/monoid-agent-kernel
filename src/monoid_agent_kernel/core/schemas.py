@@ -89,7 +89,16 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "status": _STR,
             "error": _STR,
             "error_code": _STR,
+            # ``final_text`` stays accepted after v0.20 stops emitting model-authored text here.
+            # ``validate_run_dir`` replays committed logs against these schemas, so removing the
+            # property would fail every run directory written before the change — and kernel
+            # strings ("Stopped after reaching max steps.") keep travelling inline regardless.
             "final_text": _STR,
+            # Set instead of ``final_text`` when the text is the model's. The digest is
+            # ``core.model_io.content_digest`` — canonical JSON, NOT a bare sha256 of the text —
+            # and the text itself is resolved from the run-dir settled-text record.
+            "final_text_digest": _STR,
+            "final_text_len": _INT,
             "duration_s": _NUM,
             "diff_path": _STR,
             "proposal_path": _STR,
@@ -124,7 +133,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     "turn.settled": _data_schema(
         {
             "status": _STR,
+            # Retained for the same reasons as on ``run.finished`` above.
             "final_text": _STR,
+            "final_text_digest": _STR,
+            "final_text_len": _INT,
             "error_code": _STR,
             "changed_paths": _STR_ARRAY,
             "output_validators": _INT,
