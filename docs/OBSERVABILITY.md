@@ -52,11 +52,13 @@ Not carried:
   — **on the trace surface**. The approval surface deliberately shows them, bounded; see "Carried,
   deliberately" below. This list said "file contents" unqualified while the entry 45 lines down said
   the opposite, and the preamble calls this list the contract.
-- **Whole values of any length**, for every model-authored *value* and every mapping *key*: previews
-  are capped by a **byte** budget, so the cap does not depend on the script the text is written in.
-  Three exceptions, all listed under "Carried, deliberately": a hosted-task prompt, an error
-  message, and the model-chosen `call_id`, which is a correlation key joined across `events.jsonl`,
-  `task.json` and `approval_key` and so cannot be shortened.
+- **Whole values of any length**, for every model-authored *value* and every mapping *key* that
+  reaches a preview builder: those are capped by a **byte** budget, so the cap does not depend on
+  the script the text is written in. Several routes bypass the builders entirely and are listed
+  under "Carried, deliberately" below — read that list rather than counting exceptions here. An
+  earlier revision of this line said "three exceptions" and was wrong twice over: it omitted
+  `model.output.delta`, which the very next section describes as carrying raw model text, and
+  `task.started.data.choices`.
 
 Carried, deliberately:
 
@@ -111,7 +113,12 @@ Carried, deliberately:
   It is not the only such route on this list: `model.output.delta` carries raw model text by
   construction, and an error message passes through `public_error_message`, which substitutes only
   when the text contains `PRIVATE KEY` and otherwise returns it whole.
-- **The model-chosen `call_id`**, uncapped for the reason given above — it is a join key, not prose.
+- **The model-chosen `call_id`**, uncapped because it is a join key, not prose: `events.jsonl`,
+  `task.json` and `approval_key` are matched on it, so a shortened copy would fail to correlate.
+- **Hosted-task `choices`** (`task.started.data.choices`) — the options a HITL card offers, uncapped
+  for the same reason as the prompt beside it: a person reads them to choose one, and a truncated
+  option is one they cannot evaluate. Model-authored via `hitl.request`, whose schema bounds neither
+  the number of choices nor their length.
 
 Studio adds `studio.chat.jsonl` inside each Studio run directory as the browser-facing chat
 projection. The Studio UI restores user, assistant, and error messages from

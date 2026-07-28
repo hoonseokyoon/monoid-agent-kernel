@@ -559,9 +559,16 @@ def test_an_ordinary_argument_name_is_untouched_by_the_key_bound() -> None:
     assert args_preview(arguments, PermissionPolicy()) == arguments
 
 
-def test_a_model_chosen_tool_name_is_bounded_on_the_events_that_carry_it() -> None:
+def test_a_model_chosen_tool_name_is_bounded() -> None:
     """`_aexecute_tool_call` handles a `call_name` the catalog cannot resolve and still emits it,
-    so the name is model-authored text, not a kernel enum."""
+    so the name is model-authored text, not a kernel enum.
+
+    Named for the function, not for the events: this exercises `public_tool_name` directly and
+    builds no event. It was called `..._on_the_events_that_carry_it` while asserting nothing about
+    an event, and on one of those events the whole name was still going out through `error` at the
+    time — a name promising end-to-end coverage over a unit test is how that survived.
+    `tests/test_event_stream_bounds.py` owns the end-to-end half.
+    """
     assert public_tool_name("fs.write") == "fs.write"
 
     published = public_tool_name("도구" * 6_000)

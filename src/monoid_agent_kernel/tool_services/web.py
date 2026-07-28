@@ -239,10 +239,15 @@ class WebService:
             max_value=1_000_000,
         )
         allowed_domains, blocked_domains = self._domain_filters(args, call)
-        # Bounded like the `tool.call.started` preview of the same call. The domain lists and
-        # `format` are model-authored and unconstrained by their schemas, so leaving them raw here
-        # published on `.started`/`.finished`/`.failed` exactly what `web_args_preview` was changed
-        # to withhold -- in the same event whose `url_preview` is a digest.
+        # Bounded like the `tool.call.started` preview of the same call -- defensively here, not
+        # because a leak was measured on this one. Unlike `web.search`, none of `web.fetch`'s
+        # descriptors is an unbounded model-authored string: `format` is an enum the dispatch-path
+        # validator enforces, and the domain lists are not in its schema at all
+        # (`additionalProperties: false`), so they can only arrive from the operator-signed
+        # `call.scope`. Previewing them costs nothing and keeps the three web builders identical,
+        # which is the property worth having. The first version of this comment was copy-pasted from
+        # `web.search` and named `locale`/`query_preview`; its replacement named `format` and the
+        # domain lists as model-authored. Both described a different tool than the one they sat on.
         event_data = public_event_payload(
             {
                 "url_preview": public_url_preview(url),

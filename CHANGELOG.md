@@ -68,11 +68,13 @@ out in commit messages and here.
   an approver is entitled to see past.
 - A container reachable from *itself* is elided with a `circular` marker rather than re-expanded,
   tracked over ancestors on the current path so a value legitimately shared twice still renders
-  twice. Measured before the guard, at fanout 8: 45 s and 1.1 GB from an input that fits on a line.
+  twice. Measured before the guard, at fanout 7: 23 s and 377 MB of serialized JSON, from an input that fits on a line.
 - **Path redaction fails closed for every path-naming field**, including `*_path`. A value that
-  cannot be normalized to a workspace path counts as redacted. This over-redacts: a task result's
-  absolute `report_path` renders `{"redacted": true}` for an operator whose patterns could not have
-  matched it. The narrower rule — fail closed only for `path`/`root`/`cwd` — was tried and taken
+  cannot be normalized to a workspace path counts as redacted. This over-redacts, though not for
+  anything a builtin publishes — every `stdout_path`/`stderr_path` goes out relative and normalizes
+  cleanly. The reachable case is a custom or MCP tool returning an absolute `*_path` in its result,
+  which renders `{"redacted": true}` for an operator whose patterns could not have matched it. The
+  narrower rule — fail closed only for `path`/`root`/`cwd` — was tried and taken
   back, because `normalize_workspace_path` raises on any `..` component *before* resolving it, so
   `x/../secrets/creds.txt` raises while naming a file the pattern does match, and was published
   verbatim next to `paths: ["[redacted-path]"]` on the same event. Both failure modes are real and
@@ -162,7 +164,8 @@ either means changing a surface this one does not touch:
   begin sharing mutable state with the live loop. Both belong to the durability surface.
 - **One preview's total size is bounded only by its input.** The depth, key and item caps bound a
   preview's *shape*, not its size: a value reachable by many paths is re-expanded once per path, so
-  nine levels of a mapping shared five ways — about 40 objects — produced 25 MB in 21.9 s. The cycle
+  nine levels of a mapping shared five ways — about 40 objects — produced 26 MB of JSON in 1.1 s,
+  and the cost grows with fanout: 110 MB at 6, 377 MB at 7. The cycle
   guard does not help, because sharing is not a cycle. Reachable only from a Python-object caller
   (a custom or MCP tool's `ToolResult.content`), since JSON cannot express sharing. A
   `PREVIEW_MAX_NODES` budget was implemented and reverted: spent per visited value it replaced

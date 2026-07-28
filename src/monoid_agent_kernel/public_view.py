@@ -64,7 +64,7 @@ def public_tool_name(name: str) -> str:
     A name looks like a kernel-controlled enum and is not one: `_aexecute_tool_call` explicitly
     handles a `call_name` the catalog cannot resolve and still emits `tool.call.started` with
     `spec=None` and the raw string, so an arbitrary model-chosen name reaches five event fields.
-    18 KB of it, measured, on `tool.call.started` and `tool.call.failed` together.
+    36 KB of it, measured, across `tool.call.started` and `tool.call.failed`.
 
     Narrower than the argument channel, which is why it survived this long -- but the model chooses
     it just as freely, and "that field is an identifier" was the same assumption that left dict keys
@@ -389,8 +389,10 @@ def public_mapping(
 ) -> dict[str, Any]:
     """Build a public mapping from ``values``, bounding the **key** as well as the value.
 
-    Every builder that assembles an outer mapping goes through here, so "the key is model-authored
-    text too" is stated once. ``preview`` receives the *whole* key, not the bounded one: a 5 KB key
+    Every builder whose outer mapping has *model-authored* keys goes through here, so "the key is
+    model-authored text too" is stated once. ``shell_args_preview`` and ``web_args_preview`` do not:
+    their outer keys are kernel literals (``command_preview``, ``env_keys``, ``url_preview``), and
+    only the values they wrap come from the model. ``preview`` receives the *whole* key, not the bounded one: a 5 KB key
     ending in ``_path`` is still a path, and judging it by its truncated form would let length
     defeat the redaction.
 
@@ -486,7 +488,7 @@ def preview_value(
     if isinstance(value, (dict, list)):
         # The depth cap terminates but does not bound *cost*: a container reachable from itself is
         # re-expanded once per edge per level, so a 21-object input with 20 self-referencing keys
-        # costs 20**8 nodes. Measured at fanout 8: 45 s and 1.1 GB, from an input that fits on a
+        # costs 20**8 nodes. Measured at fanout 7: 23 s and 377 MB of serialized JSON, from an input that fits on a
         # line. Not reachable from a `json.loads`-derived tool argument (JSON cannot express
         # sharing), but `public_result_content` previews a `ToolResult.content` built by a custom or
         # MCP tool handler in ordinary Python objects, which can.
