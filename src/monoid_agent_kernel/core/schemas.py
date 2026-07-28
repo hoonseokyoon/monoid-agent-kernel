@@ -444,7 +444,7 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         required=("artifact_id",),
     ),
     "plan.updated": _data_schema(
-        {"items": _OBJ_ARRAY},
+        {"items": _OBJ_ARRAY, "truncated_items": _INT},
         required=("items",),
     ),
     "output.validator.satisfied": _data_schema(

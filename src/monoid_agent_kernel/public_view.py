@@ -282,6 +282,7 @@ def preview_value(
     threshold: int = PREVIEW_BYTE_THRESHOLD,
     budget: int = PREVIEW_BYTE_BUDGET,
     redact_content: bool = True,
+    list_marker: bool = True,
     _depth: int = 0,
 ) -> Any:
     """Bound a value for publication, optionally masking keys the caller names first.
@@ -292,6 +293,12 @@ def preview_value(
     ``core.tool_approval.redact_tool_arguments`` had its own recursion carrying the masking rules but
     no caps, while this one had the caps but knew nothing about secrets. Which half of the policy
     applied to a value depended only on which surface it left through. One traversal, all the rules.
+
+    ``list_marker=False`` caps a list without appending the ``{"truncated_items": n}`` element.
+    Only the *caller* knows whether it is previewing a JSON blob (where a self-describing marker is
+    the signal, and the default) or a **typed array** a consumer iterates by element shape (where
+    the marker is a foreign object). Callers that pass ``False`` are expected to report the drop
+    out-of-band; ``len(original) - len(previewed)`` gives the count without restating the cap.
     """
     if mask is not None:
         replacement = mask(key, value)
@@ -314,6 +321,7 @@ def preview_value(
                 threshold=threshold,
                 budget=budget,
                 redact_content=redact_content,
+                list_marker=list_marker,
                 _depth=_depth + 1,
             )
             for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]
@@ -338,11 +346,18 @@ def preview_value(
                 threshold=threshold,
                 budget=budget,
                 redact_content=redact_content,
+                list_marker=list_marker,
                 _depth=_depth + 1,
             )
             for item in value[:PREVIEW_MAX_ITEMS]
         ]
-        if len(value) > PREVIEW_MAX_ITEMS:
+        # The marker is a *foreign shape* in the array it is appended to. In a JSON blob that is the
+        # point -- it is self-describing and the reader sees it. In a typed array it is a defect: the
+        # Studio plan renderer reads ``items[].step``, so this element drew a blank row AND inflated
+        # the ``n/len(plan)`` progress denominator. ``list_marker`` propagates so a caller declaring
+        # its structure typed gets that at every depth, not only the one the reviewer happened to
+        # look at.
+        if list_marker and len(value) > PREVIEW_MAX_ITEMS:
             items.append({"truncated_items": len(value) - PREVIEW_MAX_ITEMS})
         return items
     if isinstance(value, str):

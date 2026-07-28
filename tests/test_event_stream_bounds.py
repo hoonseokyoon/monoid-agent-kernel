@@ -65,13 +65,19 @@ def test_plan_updated_carries_the_same_capped_items_as_the_tool_call_event(tmp_p
 
     result = _run(_spec(tmp_path), [("run.update_plan", {"items": items})], "run.update_plan")
 
-    published = _events(result.run_dir, "plan.updated")[-1]["data"]["items"]
+    plan_data = _events(result.run_dir, "plan.updated")[-1]["data"]
+    published = plan_data["items"]
     on_the_call = _events(result.run_dir, "tool.call.started")[0]["data"]["args_preview"]["items"]
-    assert published == on_the_call, "the two routes for the same value disagree again"
+    # The two routes carry the same *values* under the same bounds; they differ only in where the
+    # truncation count is written. `plan.updated.items` is a typed array a renderer iterates, so its
+    # count is a sibling key; `args_preview` is a generic JSON blob, where the marker element is the
+    # signal and there is no typed consumer to confuse. Pinned as an exact identity rather than
+    # loosened to a prefix match, so neither route can quietly move its cap.
+    assert on_the_call == [*published, {"truncated_items": plan_data["truncated_items"]}]
 
     # And the bound really bound: capped in width, and each step capped in bytes.
-    assert len(published) == PREVIEW_MAX_ITEMS + 1
-    assert published[-1] == {"truncated_items": len(items) - PREVIEW_MAX_ITEMS}
+    assert len(published) == PREVIEW_MAX_ITEMS
+    assert plan_data["truncated_items"] == len(items) - PREVIEW_MAX_ITEMS
     # A *string*, not a preview dict. `WorkspaceInspector.svelte` renders `{item.step}` directly, so
     # a dict here renders `[object Object]` — and `svelte-check` cannot catch it, because
     # `run-state.ts` casts the items through `unknown` to `PlanItem[]`.
@@ -101,6 +107,36 @@ def test_plan_items_stay_renderable_objects_with_string_steps(tmp_path: Path) ->
     assert published[0]["status"] == "pending"
     assert isinstance(published[0]["step"], str)
     assert LONG_STEP[:20] in published[0]["step"], "the step is truncated, not replaced"
+
+
+def test_a_long_plan_is_capped_without_a_foreign_element_inside_the_typed_array(
+    tmp_path: Path,
+) -> None:
+    """The *other* half of the same renderer contract, and the half the first fix missed.
+
+    Capping the step keeps each item renderable; capping the list used to append a
+    ``{"truncated_items": n}`` element, which is an object (so ``_OBJ_ARRAY`` accepts it) but not a
+    *plan item*. ``run-state.ts:265`` casts the array to ``PlanItem[]`` wholesale, so that element
+    reached ``WorkspaceInspector.svelte`` as a row with no ``step`` — a blank line — and, because
+    line 49 divides by ``plan.length``, it also inflated the progress denominator: a 25-step plan
+    with every step done rendered ``20/21``, permanently one short of finished.
+
+    So the count moves to a sibling key and the array stays homogeneous. Asserted on the shape a
+    consumer actually relies on — *every* element carries the two fields the renderer reads — rather
+    than on the last element only, which is how the marker survived the first pass.
+    """
+    items = [{"step": f"step {index}", "status": "pending"} for index in range(25)]
+
+    result = _run(_spec(tmp_path), [("run.update_plan", {"items": items})], "run.update_plan")
+
+    assert validate_run_dir(result.run_dir) == []
+    data = _events(result.run_dir, "plan.updated")[-1]["data"]
+    published = data["items"]
+    assert len(published) == 20
+    assert all(isinstance(item, dict) for item in published)
+    assert all(isinstance(item.get("step"), str) for item in published), "no marker object smuggled in"
+    assert all(item.get("status") == "pending" for item in published)
+    assert data["truncated_items"] == 5, "the drop is reported, just not as a plan item"
 
 
 def test_status_json_gets_the_capped_plan_rather_than_a_second_uncapped_copy(tmp_path: Path) -> None:

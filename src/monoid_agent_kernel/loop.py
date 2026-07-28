@@ -446,10 +446,20 @@ class AgentToolContext(ToolContext):
         # This also bounds ``status.json["plan"]``, which ``StatusJsonSink`` copies straight out of
         # this event and ``RunProjectionService.status()`` serves wholesale. Capping here rather
         # than there keeps one copy of the rule instead of two that can drift apart.
+        #
+        # ``items`` is a *typed* array, not a JSON blob: the reducer casts it to ``PlanItem[]`` and
+        # the renderer reads ``.step``/``.status`` off every element. So the list cap reports its
+        # drop through a sibling key instead of appending a marker element -- as an element it drew
+        # a blank row and counted toward the ``completed/total`` denominator, making a capped plan
+        # look permanently one step short of done. The count comes from the previewed length rather
+        # than from ``PREVIEW_MAX_ITEMS`` so the cap stays stated in exactly one place.
         self.plan = items
-        self.recorder.emit(
-            "plan.updated", data={"items": preview_value("items", items, self.permission_policy)}
-        )
+        published = preview_value("items", items, self.permission_policy, list_marker=False)
+        data: dict[str, Any] = {"items": published}
+        dropped = len(items) - len(published)
+        if dropped > 0:
+            data["truncated_items"] = dropped
+        self.recorder.emit("plan.updated", data=data)
 
     def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
         self.pending_finish = FinishResult(summary, tuple(outputs), notes)

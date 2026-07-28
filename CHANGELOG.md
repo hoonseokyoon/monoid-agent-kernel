@@ -43,6 +43,11 @@ out in commit messages and here.
   the run of any operator who had configured `redact_patterns`.
 - **`plan.updated` and `artifact.emitted` cap their model-authored payloads**, matching what
   `tool.call.started` already did with the same values. This also bounds `status.json["plan"]`.
+  `plan.updated.items` stays a *typed* array through the cap: each `step` is truncated as a string
+  rather than replaced by a preview object, and a plan longer than the item cap reports the drop in
+  a new sibling `truncated_items` key instead of appending a marker element. As an element it was a
+  valid object (so schema validation passed) but not a plan item, so the Studio inspector drew a
+  blank row for it and counted it in the `completed/total` denominator.
 - Tool arguments nested deeper than 64 levels are now rejected with a `ValueError` the model can
   read and correct. They previously raised `RecursionError`, which — being a `RuntimeError` — fell
   through the tool-call handler entirely.
