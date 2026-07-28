@@ -115,6 +115,7 @@ from monoid_agent_kernel.core.side_effect_policy import (
     side_effect_policy_from_config,
     verify_outbox_side_effect,
 )
+from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.errors import (
     ModelAdapterError,
     ModelCallAborted,
@@ -775,7 +776,10 @@ class AgentLoop:
     # Opt-in token streaming for the autonomous (non-RunStream) drive: when set and the model
     # adapter supports ``astream_turn``, each text fragment is emitted as a ``model.output.delta``
     # event so an event-stream consumer (e.g. the studio app over SSE) can render tokens live.
-    # Falls back to a one-shot ``next_turn`` for adapters that can't stream. Off by default.
+    # Falls back to a one-shot ``next_turn`` for adapters that can't stream. Off by default here,
+    # but the shipped Studio turns it on whenever ``httpx`` is importable — so for the product most
+    # people run, this is on. ``MONOID_OUTPUT_DELTAS=0`` forces it off for a whole deployment;
+    # see ``__post_init__``.
     emit_output_deltas: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
@@ -860,6 +864,17 @@ class AgentLoop:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
         # can pass any of the three forms without hand-wrapping a StaticRuntimeConfigProvider.
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
+        # Operator kill switch for the delta channel. Resolved here, into the field itself, rather
+        # than at the emit site: gating the emit would leave `emit_output_deltas` reporting True
+        # while nothing streamed, which is the "one half bound, its twin reporting otherwise" shape
+        # this release exists to remove. It can only turn the channel OFF -- an operator disabling
+        # content egress must not be able to enable it by accident, and a deployment that never
+        # opted in has nothing to switch on.
+        #
+        # Subagents are deliberately NOT special-cased: each child re-runs this on its own
+        # construction, so one variable covers a run and every run it spawns.
+        if self.emit_output_deltas and not getenv_bool(OUTPUT_DELTAS_ENV, default=True):
+            self.emit_output_deltas = False
         self._bootstrapper = LoopBootstrapper(self)
         self._settle_coordinator = LoopSettleCoordinator(self)
         self._finalizer = LoopFinalizer(self)

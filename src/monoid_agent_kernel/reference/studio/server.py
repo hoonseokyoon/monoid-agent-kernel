@@ -438,6 +438,12 @@ class StudioConfig:
     memory_directory: Path | None = None
     # Optional env file loaded at server start without overriding process env.
     env_file: Path | None = None
+    # Publish `model.output.delta` / `model.reasoning.delta` to the run's event log. On by default
+    # because live token rendering is what the UI is for, but it is the widest content route out of
+    # a run: the events are durable, and `EventBus` fans them to every sink with no level filter, so
+    # the assembled answer sits in `events.jsonl`. Turning this off costs live rendering and nothing
+    # else — the run result, `transcript.jsonl` and the settle events are untouched.
+    stream_output_deltas: bool = True
 
 
 class StudioServer:
@@ -1037,8 +1043,20 @@ class StudioServer:
         # validation through the same provider seam as Skills/MCP.
         provider_instances = self._tool_providers_for_runtime()
 
-        stream_gateway_output = _gateway_streaming_available()
-        if not stream_gateway_output:
+        # Two independent conditions: whether live streaming is *possible* (the optional transport)
+        # and whether the operator *wants* the durable delta events it produces. They were one
+        # value, so the only way to stop publishing model text to `events.jsonl` was to uninstall
+        # httpx. `AgentLoop.__post_init__` still applies `MONOID_OUTPUT_DELTAS` on top of this.
+        stream_gateway_output = _gateway_streaming_available() and self.config.stream_output_deltas
+        if not self.config.stream_output_deltas:
+            # Said separately from the httpx case: reporting "httpx is unavailable" to an operator
+            # who just passed --no-output-deltas sends them to install a package that would not
+            # change anything.
+            _LOGGER.info(
+                "output deltas are disabled; model text will not be published to events.jsonl "
+                "(the run result and transcript.jsonl are unaffected)"
+            )
+        elif not stream_gateway_output:
             _LOGGER.info(
                 "httpx is unavailable; Studio will use one-shot gateway turns "
                 "(install monoid-agent-kernel[http-async] for live token deltas)"

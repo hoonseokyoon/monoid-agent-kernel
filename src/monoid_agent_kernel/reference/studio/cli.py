@@ -182,6 +182,16 @@ def _workspace_option(fn):
 
 
 def _common_server_options(fn):
+    fn = click.option(
+        "--no-output-deltas",
+        is_flag=True,
+        default=False,
+        help=(
+            "Stop publishing model.output.delta / model.reasoning.delta to events.jsonl. "
+            "Costs live token rendering; the run result and transcript.jsonl are unaffected. "
+            "MONOID_OUTPUT_DELTAS=0 does the same for every run in a deployment."
+        ),
+    )(fn)
     fn = click.option("--host", type=str, default="127.0.0.1", show_default=True)(fn)
     fn = click.option("--port", type=int, default=8799, show_default=True)(fn)
     fn = click.option(
@@ -238,6 +248,7 @@ def _studio_config(
     mcp: bool,
     env_file: Path,
     no_env_file: bool,
+    no_output_deltas: bool = False,
 ) -> StudioConfig:
     return StudioConfig(
         workspace=workspace,
@@ -248,6 +259,7 @@ def _studio_config(
         skills_directory=None if no_skills else skills_directory,
         mcp=mcp,
         env_file=None if no_env_file else env_file,
+        stream_output_deltas=not no_output_deltas,
     )
 
 
@@ -271,6 +283,7 @@ def studio_serve(
     mcp: bool,
     env_file: Path,
     no_env_file: bool,
+    no_output_deltas: bool,
     open_window: bool,
 ) -> None:
     """Start the Studio server and keep it running (window is detachable)."""
@@ -278,7 +291,7 @@ def studio_serve(
         _studio_config(
             workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
             skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
-            env_file=env_file, no_env_file=no_env_file,
+            env_file=env_file, no_env_file=no_env_file, no_output_deltas=no_output_deltas,
         )
     )
     url = server.start()
@@ -310,13 +323,14 @@ def studio_app(
     mcp: bool,
     env_file: Path,
     no_env_file: bool,
+    no_output_deltas: bool,
 ) -> None:
     """Start the server and a desktop window; closing the window stops the server."""
     server = StudioServer(
         _studio_config(
             workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
             skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
-            env_file=env_file, no_env_file=no_env_file,
+            env_file=env_file, no_env_file=no_env_file, no_output_deltas=no_output_deltas,
         )
     )
     url = server.start()
@@ -454,6 +468,7 @@ def studio_doctor(
     mcp: bool,
     env_file: Path,
     no_env_file: bool,
+    no_output_deltas: bool,
 ) -> None:
     """Preflight the common setup failures and print pass/fail with exact remediation.
 
