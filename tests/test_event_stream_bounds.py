@@ -399,3 +399,93 @@ def test_a_declared_path_argument_is_redacted_in_the_preview_and_not_only_in_pat
     assert started["paths"][0] == REDACTED_PATH
     assert started["args_preview"]["source_path"] == redacted_value("secrets/creds.txt")
     assert "secrets/creds.txt" not in json.dumps(started)
+
+
+# The three files a run publishes. Asserting over the set, not over `events.jsonl` alone, is the
+# point: `metrics.json` was the one nobody checked, and it was the one that did not redact.
+PUBLIC_FILES = ("events.jsonl", "status.json", "metrics.json")
+
+
+def _public_text(run_dir: Path) -> dict[str, str]:
+    return {name: (run_dir / name).read_text(encoding="utf-8") for name in PUBLIC_FILES if (run_dir / name).exists()}
+
+
+def test_every_public_file_redacts_a_matched_path_not_just_the_two_that_were_checked(
+    tmp_path: Path,
+) -> None:
+    """`metrics.json` published `changed_paths` raw while its two siblings redacted.
+
+    Both callers of `build_metrics` apply `public_path` to the same list a few lines later for the
+    events they emit, so an operator who configured `redact_patterns`, looked at `events.jsonl` and
+    `status.json`, and saw `[redacted-path]` had every reason to conclude it had worked — with the
+    whole path sitting in the third file.
+
+    Found by driving a run and grepping its output rather than by reading the emit sites, which is
+    why several passes over the surrounding code walked past it.
+    """
+    spec = _redacting_spec(tmp_path)
+    (spec.workspace_root / "secrets").mkdir()
+
+    result = _run(spec, [("fs.write", {"path": "secrets/creds.txt", "content": "x"})], "fs.write")
+
+    metrics = json.loads((result.run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["changed_paths"] == [REDACTED_PATH], "metrics.json published the path raw"
+    for name, text in _public_text(result.run_dir).items():
+        assert "secrets/creds.txt" not in text, f"{name} carries the redacted path"
+
+
+def test_a_free_text_argument_that_looks_like_an_enum_is_still_bounded(tmp_path: Path) -> None:
+    """`artifact.emit`'s `kind` is `{"type": "string"}` with no enum — free model text.
+
+    It sat unbounded between three bounded neighbours (`label` truncates, `metadata` is previewed,
+    `path` is a run-dir pointer), because it reads like an enum. So do `timeout_s`,
+    `max_output_bytes` and `startup_wait_s` on `shell.exec`, which are declared
+    `["integer", "null"]` and were copied verbatim — `tool.call.started` is emitted *before*
+    `validate_args` rejects the call, so the schema does not protect this surface.
+    """
+    spec = _spec(tmp_path)
+    (spec.workspace_root / "note.md").write_text("hi", encoding="utf-8")
+    sentinel = "기밀" * 400
+
+    result = _run(spec, [("artifact.emit", {"path": "note.md", "kind": sentinel})], "artifact.emit")
+
+    for name, text in _public_text(result.run_dir).items():
+        assert sentinel not in text, f"{name} carries the whole `kind`"
+
+
+def test_an_unknown_job_id_fails_the_call_instead_of_the_run(tmp_path: Path) -> None:
+    """`TaskManager` raises `KeyError`, which tool dispatch does not catch.
+
+    A model asking about a job that already finished — or inventing an id — terminated the run and
+    republished its own argument into `run.failed`, `status.json` and `metrics.json`. Same shape as
+    the `WorkspaceError` that ended runs for operators with `redact_patterns` configured, on four
+    twins (`job.status` / `logs` / `cancel` / `wait`) that guard never reached.
+    """
+    sentinel = "기밀" * 300
+
+    result = _run(_spec(tmp_path), [("job.status", {"job_id": sentinel})], "job.status")
+
+    assert result.status == "completed", "one bad argument ended the run"
+    assert result.final_text == "done"
+    for name, text in _public_text(result.run_dir).items():
+        assert sentinel not in text, f"{name} republished the argument"
+
+
+def test_a_provider_supplied_response_id_is_bounded(tmp_path: Path) -> None:
+    """`response_id` and `previous_turn_handle` arrive from the gateway — outside the trust boundary.
+
+    Real ids are short, so this needs a hostile or buggy proxy rather than a hostile model. It is
+    here because no amount of reviewing *tool arguments* would ever reach it: the value never passes
+    through a tool, a preview builder, or the permission policy.
+    """
+    spec = _spec(tmp_path)
+    sentinel = "기밀" * 3_000
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id=sentinel, final_text="done")]),
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+    result = loop.run_once("go")
+
+    for name, text in _public_text(result.run_dir).items():
+        assert sentinel not in text, f"{name} carries the whole response_id"

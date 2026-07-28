@@ -162,6 +162,26 @@ either means changing a surface this one does not touch:
   does not close it: by then the turn is already in history. The fixes are to reject the turn at
   ingestion or to stop using `asdict`, and the latter also drops its deep copy, so a checkpoint would
   begin sharing mutable state with the live loop. Both belong to the durability surface.
+- **`metrics.json` redacts `redact_patterns` paths.** It is one of the three public run artifacts
+  and was the only one that never did, so an operator who configured a pattern, checked
+  `events.jsonl` and `status.json`, and saw `[redacted-path]` had every reason to think it had
+  worked while the whole path sat in the third file. Both callers of `build_metrics` already applied
+  `public_path` to the same list for the events they emit.
+- **Identifier fields are bounded**, via one `public_identifier`: a model-chosen tool name (the
+  catalog is allowed not to resolve it), a `job_id`, and the `response_id` / `previous_turn_handle`
+  the gateway echoes back — the last two arriving from outside the kernel's trust boundary. "That
+  field is an identifier" is the assumption that left dict keys, env keys and the tool name
+  unbounded, three separate times in this release.
+- **Arguments that look like enums or integers are previewed, not copied.** `artifact.emit`'s `kind`
+  is declared `{"type": "string"}` with no enum; `shell.exec`'s `timeout_s`, `max_output_bytes` and
+  `startup_wait_s` are declared `["integer", "null"]`. The schema does not protect this surface:
+  `tool.call.started` is emitted *before* `validate_args` rejects the call, so a model that sends a
+  2 KB string in `timeout_s` publishes it and is only then told the call was invalid.
+- **An unknown `job_id` fails the call instead of the run.** `TaskManager` raises `KeyError`, which
+  is not in the set tool dispatch catches, so a model asking about a finished job terminated the run
+  and republished its own argument into `run.failed`, `status.json` and `metrics.json`. Same shape
+  as the `WorkspaceError` that ended runs for operators with `redact_patterns` set, on the four
+  `job.*` twins that guard never reached.
 - **One preview's total size is bounded only by its input.** The depth, key and item caps bound a
   preview's *shape*, not its size: a value reachable by many paths is re-expanded once per path, so
   nine levels of a mapping shared five ways — about 40 objects — produced 26 MB of JSON in 1.1 s,

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from monoid_agent_kernel.errors import ToolExecutionError
+from monoid_agent_kernel.public_view import public_identifier
 from monoid_agent_kernel.tasks import TaskManager
 
 
@@ -12,25 +14,42 @@ class JobsService:
 
     job_manager: TaskManager
 
+    def _job_id(self, args: dict[str, Any]) -> str:
+        """The requested job id, or a tool error naming it.
+
+        `TaskManager` raises `KeyError` for an id it does not know, and `KeyError` is not in the
+        `(NativeAgentError, ValueError, TypeError)` set the tool-call handler catches -- so a model
+        asking about a job that has finished, or inventing an id, terminated the whole run and
+        republished its argument into `run.failed`, `status.json` and `metrics.json`. That is the
+        defect `public_path`'s fail-closed guard was written to stop, on four twins nobody bound.
+        Bounded in the message for the same reason the tool name is.
+        """
+        job_id = str(args["job_id"])
+        if job_id not in self.job_manager.jobs:
+            raise ToolExecutionError(
+                f"unknown job_id: {public_identifier(job_id)}", error_code="job_unknown"
+            )
+        return job_id
+
     def list_jobs(self) -> list[dict[str, Any]]:
         return self.job_manager.list_jobs()
 
     def status(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.status(str(args["job_id"]))
+        return self.job_manager.status(self._job_id(args))
 
     def logs(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.job_manager.logs(
-            str(args["job_id"]),
+            self._job_id(args),
             stream=str(args.get("stream") or "stdout"),  # type: ignore[arg-type]
             tail_bytes=args.get("tail_bytes"),
             offset=args.get("offset"),
         )
 
     def cancel(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.cancel(str(args["job_id"]))
+        return self.job_manager.cancel(self._job_id(args))
 
     def wait(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.wait(str(args["job_id"]), timeout_s=args.get("timeout_s"))
+        return self.job_manager.wait(self._job_id(args), timeout_s=args.get("timeout_s"))
 
     def background_metrics(self) -> dict[str, Any]:
         jobs = self.job_manager.list_jobs()

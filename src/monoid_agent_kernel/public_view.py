@@ -58,19 +58,19 @@ def public_inline_path(path: str, policy: PermissionPolicy) -> str:
     )
 
 
-def public_tool_name(name: str) -> str:
-    """A tool name for publication, bounded.
+def public_identifier(value: str) -> str:
+    """An identifier for publication, bounded.
 
-    A name looks like a kernel-controlled enum and is not one: `_aexecute_tool_call` explicitly
-    handles a `call_name` the catalog cannot resolve and still emits `tool.call.started` with
-    `spec=None` and the raw string, so an arbitrary model-chosen name reaches five event fields.
-    36 KB of it, measured, across `tool.call.started` and `tool.call.failed`.
+    Named for what it is rather than for the first field that needed it. An identifier field looks
+    kernel-controlled and generally is not: `_aexecute_tool_call` handles a `call_name` the catalog
+    cannot resolve and still emits it (36 KB, measured, across `tool.call.started` and
+    `tool.call.failed`); `response_id` and `previous_turn_handle` are echoed from the gateway, i.e.
+    from outside the trust boundary; and a `job_id` is whatever the model asked about.
 
-    Narrower than the argument channel, which is why it survived this long -- but the model chooses
-    it just as freely, and "that field is an identifier" was the same assumption that left dict keys
-    unbounded two commits ago.
+    "That field is an identifier" is the same assumption that left dict keys, env keys and the tool
+    name unbounded, three separate times in this release.
     """
-    return truncate_inline_text(name, threshold=PREVIEW_BYTE_THRESHOLD, budget=PREVIEW_BYTE_BUDGET)
+    return truncate_inline_text(value, threshold=PREVIEW_BYTE_THRESHOLD, budget=PREVIEW_BYTE_BUDGET)
 
 
 def public_error_message(error: str) -> str:
@@ -219,9 +219,14 @@ def shell_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> d
     return {
         "command_preview": preview_value("command_preview", str(arguments.get("command") or ""), policy),
         "cwd": preview_value("cwd", arguments.get("cwd", "."), policy),
-        "timeout_s": arguments.get("timeout_s"),
-        "max_output_bytes": arguments.get("max_output_bytes"),
-        "startup_wait_s": arguments.get("startup_wait_s"),
+        # Previewed, not copied, even though all three are declared `["integer", "null"]`. The
+        # schema does not protect this surface: `tool.call.started` is emitted *before*
+        # `validate_args` rejects the call, so a model that sends a 2 KB string in `timeout_s`
+        # publishes it and is then told the call was invalid. "It is an int" is the same assumption
+        # that left `env_keys` and the tool name unbounded.
+        "timeout_s": preview_value("timeout_s", arguments.get("timeout_s"), policy),
+        "max_output_bytes": preview_value("max_output_bytes", arguments.get("max_output_bytes"), policy),
+        "startup_wait_s": preview_value("startup_wait_s", arguments.get("startup_wait_s"), policy),
         "background": bool(arguments.get("background", False)),
         "resume_on_exit": bool(arguments.get("resume_on_exit", True)),
         # Previewed, not copied. Env *keys* are model-controlled strings of unbounded length and

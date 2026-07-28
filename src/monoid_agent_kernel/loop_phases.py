@@ -506,7 +506,16 @@ class LoopFinalizer:
             "duration_s": time.time() - res.started,
             "steps_limit": loop.spec.limits.max_steps,
             "tool_calls": state.total_tool_calls,
-            "changed_paths": res.workspace.changed_paths(),
+            # `metrics.json` is a public run artifact, like `events.jsonl` and `status.json`, and was
+            # the only one of the three that never redacted. Both callers of this builder apply
+            # `public_path` to the very same list a few lines later for the events they emit, so an
+            # operator who configured `redact_patterns`, checked those two surfaces and found
+            # `[redacted-path]` had every reason to believe it had worked -- while the whole path sat
+            # in the third file. Found by driving runs and grepping the output rather than by reading
+            # this function, which is how it survived several passes over the surrounding code.
+            "changed_paths": [
+                public_path(str(path), loop.permission_policy) for path in res.workspace.changed_paths()
+            ],
             "workspace_backend": loop.spec.workspace_backend,
             "requested_reasoning_effort": model.reasoning.effort,
             "effective_reasoning_effort": model.reasoning.effort,

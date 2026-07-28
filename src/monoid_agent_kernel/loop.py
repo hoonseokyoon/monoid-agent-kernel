@@ -172,7 +172,7 @@ from monoid_agent_kernel.public_view import (
     preview_value,
     public_error_message,
     public_inline_path,
-    public_tool_name,
+    public_identifier,
     public_path,
     public_proposal_payload,
     public_result_content,
@@ -400,7 +400,10 @@ class AgentToolContext(ToolContext):
                 # break the readers that resolve it, for no egress -- the same reason
                 # `snapshot_path` keeps bare `public_path`.
                 "path": artifact.path,
-                "kind": kind,
+                # `kind` is declared `{"type": "string"}` with no enum, so it is free model text
+                # sitting between three bounded neighbours -- `label` truncates, `metadata` is
+                # previewed, `path` is a run-dir pointer. It reads like an enum and is not one.
+                "kind": preview_value("kind", kind, self.permission_policy),
                 # Model-authored and republished on the fan-out stream. The same mapping is already
                 # capped when it reaches ``tool.call.started`` through ``args_preview``, so leaving
                 # it raw here made the second emit the wider door -- the twin-miss shape again. The
@@ -2642,7 +2645,15 @@ class AgentLoop:
             turn_started = recorder.emit(
                 "model.turn.started",
                 turn_id=turn_id,
-                data={"step": step, "previous_turn_handle": state.previous_turn_handle},
+                data={
+                    "step": step,
+                    # Same provenance as `response_id`: this *is* a previous one, echoed back.
+                    "previous_turn_handle": (
+                        public_identifier(state.previous_turn_handle)
+                        if state.previous_turn_handle
+                        else state.previous_turn_handle
+                    ),
+                },
             )
             turn_context = self._turn_context(state, res, step, max(0, max_steps - local_step))
             turn_registry = self._registry_for_turn(context, turn_context, res)
@@ -2981,7 +2992,11 @@ class AgentLoop:
                 {
                     "kind": "model_turn",
                     "step": step,
-                    "response_id": turn.response_id,
+                    # Bounded: this arrives from the gateway, i.e. from outside the kernel's
+                    # trust boundary, and real ids are short. A compromised or buggy proxy
+                    # echoing an unbounded string onto the public stream is a channel no
+                    # review of *tool* arguments would ever look at.
+                    "response_id": public_identifier(turn.response_id) if turn.response_id else turn.response_id,
                     "final_text": turn.final_text,
                     "tool_calls": [call.__dict__ for call in turn.tool_calls],
                     "usage": turn.usage,
@@ -2993,7 +3008,11 @@ class AgentLoop:
                 parent_id=turn_started.event_id,
                 data={
                     "step": step,
-                    "response_id": turn.response_id,
+                    # Bounded: this arrives from the gateway, i.e. from outside the kernel's
+                    # trust boundary, and real ids are short. A compromised or buggy proxy
+                    # echoing an unbounded string onto the public stream is a channel no
+                    # review of *tool* arguments would ever look at.
+                    "response_id": public_identifier(turn.response_id) if turn.response_id else turn.response_id,
                     "tool_calls": len(turn.tool_calls),
                     "has_final": bool(turn.final_text),
                     "usage": turn.usage,
@@ -3811,7 +3830,7 @@ class AgentLoop:
                 "kind": "tool_observation",
                 "step": step,
                 "call_id": call_id,
-                "tool": public_tool_name(call_name),
+                "tool": public_identifier(call_name),
                 "tool_id": spec.id if spec is not None else None,
                 "output": observation.output,
             }
@@ -3823,7 +3842,7 @@ class AgentLoop:
             parent_id=started_event.event_id if started_event else parent_id,
             data={
                 "call_id": call_id,
-                "tool": public_tool_name(call_name),
+                "tool": public_identifier(call_name),
                 "ok": result.ok,
                 "error": public_error_message(result.error),
                 "error_code": result.error_code,
@@ -3987,7 +4006,7 @@ class AgentLoop:
                         # raw name republished the whole 36 KB of it through `error` on the
                         # very event whose `tool` field had just been capped -- two of three
                         # fields bound and the third a laundering channel for the same string.
-                        f"unknown tool: {public_tool_name(call_name)}",
+                        f"unknown tool: {public_identifier(call_name)}",
                         error_code="tool_unknown",
                     )
                 spec = bound_tool.model_spec
@@ -4113,8 +4132,8 @@ class AgentLoop:
                 parent_id=started_event.event_id if started_event else parent_id,
                 data={
                     "call_id": call_id,
-                    "tool": spec.id if spec is not None else public_tool_name(call_name),
-                    "requested_tool": public_tool_name(call_name),
+                    "tool": spec.id if spec is not None else public_identifier(call_name),
+                    "requested_tool": public_identifier(call_name),
                     "error": public_error_message(str(exc)),
                     "error_code": result.error_code,
                     "surface_decision": surface_decision or None,
@@ -4648,7 +4667,7 @@ def _tool_start_data(
         preview = args_preview(arguments, permission_policy)
     return {
         "call_id": call_id,
-        "tool": public_tool_name(call_name),
+        "tool": public_identifier(call_name),
         "capability": spec.capability if spec is not None else None,
         "side_effect": spec.side_effect if spec is not None else None,
         "paths": _public_paths_from_args(spec, arguments, permission_policy) if spec is not None else [],

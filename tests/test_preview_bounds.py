@@ -39,7 +39,7 @@ from monoid_agent_kernel.public_view import (
     finish_args_preview,
     preview_value,
     public_event_payload,
-    public_tool_name,
+    public_identifier,
     public_inline_path,
     public_proposal_payload,
     public_result_content,
@@ -563,15 +563,15 @@ def test_a_model_chosen_tool_name_is_bounded() -> None:
     """`_aexecute_tool_call` handles a `call_name` the catalog cannot resolve and still emits it,
     so the name is model-authored text, not a kernel enum.
 
-    Named for the function, not for the events: this exercises `public_tool_name` directly and
+    Named for the function, not for the events: this exercises `public_identifier` directly and
     builds no event. It was called `..._on_the_events_that_carry_it` while asserting nothing about
     an event, and on one of those events the whole name was still going out through `error` at the
     time — a name promising end-to-end coverage over a unit test is how that survived.
     `tests/test_event_stream_bounds.py` owns the end-to-end half.
     """
-    assert public_tool_name("fs.write") == "fs.write"
+    assert public_identifier("fs.write") == "fs.write"
 
-    published = public_tool_name("도구" * 6_000)
+    published = public_identifier("도구" * 6_000)
 
     assert len(published.encode()) <= PREVIEW_BYTE_BUDGET + len(TRUNCATION_SUFFIX.encode())
     assert published.endswith(TRUNCATION_SUFFIX)
