@@ -41,7 +41,11 @@ from monoid_agent_kernel.public_view import (
 from monoid_agent_kernel.tasks import HostedTask
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
-FILE_BODY = "SENTINEL-file-body " * 40  # 760 bytes of "file content" an approver must not publish
+# Deliberately over `APPROVAL_BYTE_THRESHOLD` (4096). At 760 bytes this cleared the threshold
+# untouched, so the "bounded" half of the test below was satisfied by the `isinstance(..., str)`
+# short-circuit and passed identically against the unbounded base code. A fixture that never
+# reaches the cap cannot test the cap.
+FILE_BODY = "SENTINEL-file-body " * 300  # 5700 bytes
 SUMMARY = "SENTINEL-the-final-answer"
 
 
@@ -101,8 +105,11 @@ def test_an_ask_gated_write_is_bounded_but_still_readable_by_the_approver(tmp_pa
     """
     preview = _published(tmp_path, {"path": "notes/a.md", "content": FILE_BODY})
 
-    assert isinstance(preview["content"], str) or preview["content"]["truncated"] is True
-    assert "SENTINEL-file-body" in str(preview["content"]), "the approver can read what is written"
+    assert preview["content"]["truncated"] is True, "the body is over the budget and must be cut"
+    assert preview["content"]["bytes"] == len(FILE_BODY.encode())
+    published = preview["content"]["preview"]
+    assert len(published.encode()) <= APPROVAL_BYTE_BUDGET, "bounded"
+    assert published.startswith("SENTINEL-file-body"), "and still readable by the approver"
     assert preview["path"] == "notes/a.md"
 
 
@@ -319,8 +326,11 @@ def test_no_second_content_addressed_copy_of_the_arguments_is_retained(tmp_path)
         ).read_text(encoding="utf-8")
     )
     assert "arguments_digest" not in task["request"]
-    blobs = tmp_path / "runs" / loop.spec.run_id / "blobs"
-    assert not blobs.exists() or not any(blobs.iterdir())
+    # `LocalFsCheckpointStore._dir()` is `run_root/<run_id>/checkpoints`, so blobs land in
+    # `checkpoints/blobs`. Asserting on `runs/<id>/blobs` watched a path the store never writes to,
+    # and passed with a blob on disk. Anchored to the store's own layout instead of a guess.
+    blobs = store._dir(loop.spec.run_id) / "blobs"
+    assert not blobs.exists() or not any(blobs.iterdir()), f"a blob was retained at {blobs}"
 
 
 def test_raw_arguments_stay_intact_for_replay(tmp_path) -> None:

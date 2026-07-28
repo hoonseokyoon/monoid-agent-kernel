@@ -197,6 +197,11 @@ def test_plan_items_stay_renderable_objects_with_string_steps(tmp_path: Path) ->
     assert isinstance(published[0], dict)
     assert published[0]["status"] == "pending"
     assert isinstance(published[0]["step"], str)
+    # A prefix check alone passes on an uncapped step -- it is true of the whole value too, so this
+    # test held with the cap removed entirely. The bound is what makes it a *truncation*.
+    assert published[0]["step"] != LONG_STEP, "the step was published whole"
+    assert published[0]["step"].endswith(TRUNCATION_SUFFIX)
+    assert len(published[0]["step"].encode()) <= PREVIEW_BYTE_BUDGET + len(TRUNCATION_SUFFIX.encode())
     assert LONG_STEP[:20] in published[0]["step"], "the step is truncated, not replaced"
 
 
@@ -285,6 +290,12 @@ def test_a_later_shorter_plan_clears_the_stale_truncation_count(tmp_path: Path) 
         "run.update_plan",
     )
 
+    # The first plan has to have *set* a count, or "it is absent at the end" is true for the wrong
+    # reason: with the cap regressed no count is ever written and this test passes having observed
+    # nothing. Asserting the intermediate state is what makes the clearing observable.
+    first = _events(result.run_dir, "plan.updated")[0]["data"]
+    assert first["truncated_items"] == 25 - PREVIEW_MAX_ITEMS, "no count was ever set to clear"
+
     status = json.loads((result.run_dir / "status.json").read_text(encoding="utf-8"))
     assert len(status["plan"]) == 1
     assert "plan_truncated_items" not in status
@@ -322,6 +333,13 @@ def test_artifact_metadata_is_capped_on_the_event_but_not_in_the_model_s_own_res
 
     on_the_call = _events(result.run_dir, "tool.call.started")[0]["data"]["args_preview"]["metadata"]
     assert published == on_the_call
+
+    # "...but not in the model's own result" -- the half the name promises, and the half that makes
+    # the cap a *publication* boundary rather than data loss. `tool.call.finished` deliberately
+    # carries no result, so the model's copy is observable only where it actually goes: the private
+    # transcript. Capping the tool's return value would have left this test green.
+    transcript = (result.run_dir / "transcript.jsonl").read_text(encoding="utf-8")
+    assert LONG_STEP in transcript, "the model wrote this and must get it back whole"
 
 
 def test_ordinary_plans_and_metadata_are_published_unchanged(tmp_path: Path) -> None:

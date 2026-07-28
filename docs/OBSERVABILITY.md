@@ -63,8 +63,14 @@ Carried, deliberately:
   `data.text` across the run's `model.output.delta` records instead. Disable with
   `MONOID_OUTPUT_DELTAS=0` (whole deployment, subagents included),
   `monoid studio serve --no-output-deltas` (the flag sits on the `serve` / `app` / `doctor`
-  subcommands, not on the `studio` group), or `StudioConfig(stream_output_deltas=False)`. The cost is
-  live token rendering **and nothing else** — in particular the completed answer still arrives. The
+  subcommands, not on the `studio` group), or `StudioConfig(stream_output_deltas=False)`. The
+  completed answer still arrives. Two things do change, and the second is easy to be surprised by:
+  live token rendering stops, and **mid-turn interruption becomes step-boundary interruption** —
+  Stop waits for the in-flight model call to finish rather than aborting within a token. That
+  coupling is not new and is not the switch's doing: the kernel only takes the streaming path when
+  something is consuming deltas, and `emit_output_deltas` is `False` by default, so turning this off
+  returns you to the kernel's own default rather than degrading past it. Studio turns it on, which
+  is why the difference is visible there. The
   reason is not obvious from the emit site, so: `turn.settled` carries only `final_text_digest` on
   the durable stream either way, and `RunProjectionService.events` refills `final_text` from
   `transcript.jsonl` (`backend/content_hydration.py`) before the event reaches a reader. The Studio
@@ -80,7 +86,10 @@ Carried, deliberately:
   an `api_key` argument is masked on an `ask`-gated call and published verbatim on an `allow` call.
   If you want it masked on both, attach the example sink, or do not pass credentials as tool
   arguments. `PermissionPolicy.redact_patterns` will not help: it is a *workspace path* glob list,
-  consulted only for `path` / `root` / `cwd`.
+  consulted only for fields that name a path — `path`, `root`, `cwd`, and any `*_path` argument
+  such as `fs.move`'s `source_path` / `destination_path`. It was previously consulted for the first
+  three only, which meant one `fs.move` published `paths: ["[redacted-path]"]` alongside
+  `args_preview.source_path: "secrets/creds.txt"` on the same event.
 - The **approval** preview (`arguments_preview`) is bounded far more loosely than the trace preview,
   and it does **not** blank file-content fields. A person reads it to decide whether a call may run:
   a command cut mid-string hides the part that matters (with the model choosing where that part

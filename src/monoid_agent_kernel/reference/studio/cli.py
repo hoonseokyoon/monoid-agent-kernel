@@ -190,7 +190,8 @@ def _common_server_options(fn):
         default=False,
         help=(
             "Stop publishing model.output.delta / model.reasoning.delta to events.jsonl. "
-            "Costs live token rendering; the run result and transcript.jsonl are unaffected. "
+            "The run result and transcript.jsonl are unaffected. Costs live token rendering, and "
+            "makes Stop wait for the in-flight model call instead of aborting mid-token. "
             "MONOID_OUTPUT_DELTAS=0 does the same for every run in a deployment."
         ),
     )(fn)

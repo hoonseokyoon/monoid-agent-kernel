@@ -13,6 +13,10 @@ existing test, so it could have regressed silently.
 
 from __future__ import annotations
 
+import itertools
+
+from monoid_agent_kernel.reference.studio import server as server_module
+
 import json
 import os
 from pathlib import Path
@@ -202,7 +206,9 @@ def test_an_unparseable_switch_value_is_an_error_rather_than_a_silent_default() 
             os.environ[OUTPUT_DELTAS_ENV] = previous
 
 
-def test_studio_wires_the_switch_from_the_flag_through_to_the_backend(tmp_path: Path) -> None:
+def test_studio_wires_the_switch_from_the_flag_through_to_the_backend(
+    tmp_path: Path, monkeypatch
+) -> None:
     """The Studio half, bound at the two places that actually decide it.
 
     An earlier version of this test only read `StudioConfig(...).stream_output_deltas` back. That is
@@ -232,14 +238,18 @@ def test_studio_wires_the_switch_from_the_flag_through_to_the_backend(tmp_path: 
     assert _studio_config(**common).stream_output_deltas is True
 
     # 2. The config reaches the backend the runs are built from.
+    # Distinct dirs per *call*, not per value: this helper is now invoked more than once with the
+    # same `stream`, and keying the workspace on the value alone collided on the second.
+    calls = itertools.count()
+
     def backend_deltas(*, stream: bool) -> bool:
-        workspace = tmp_path / f"ws-{stream}"
+        workspace = tmp_path / f"ws-{stream}-{next(calls)}"
         workspace.mkdir()
         server = StudioServer(
             StudioConfig(
                 workspace=workspace,
                 port=0,
-                run_root=tmp_path / f"runs-{stream}",
+                run_root=tmp_path / f"runs-{workspace.name}",
                 stream_output_deltas=stream,
             )
         )
@@ -250,10 +260,16 @@ def test_studio_wires_the_switch_from_the_flag_through_to_the_backend(tmp_path: 
             server.shutdown()
 
     assert backend_deltas(stream=False) is False, "the flag never reached the backend"
-    # With the flag on, the transport decides — which is the pre-existing behaviour, not this switch.
-    from monoid_agent_kernel.reference.studio.server import _gateway_streaming_available
+    # With the flag on, the transport decides. Pinned by *forcing* the transport answer rather than
+    # comparing against the same function the source ANDs in -- `x is _gateway_streaming_available()`
+    # holds whether or not the config participates at all, and on a minimal install (no httpx) both
+    # sides are False, so the whole test went quiet exactly where it mattered.
+    monkeypatch.setattr(server_module, "_gateway_streaming_available", lambda: True)
+    assert backend_deltas(stream=True) is True
+    assert backend_deltas(stream=False) is False, "the config must still be able to veto"
 
-    assert backend_deltas(stream=True) is _gateway_streaming_available()
+    monkeypatch.setattr(server_module, "_gateway_streaming_available", lambda: False)
+    assert backend_deltas(stream=True) is False, "no transport, no deltas"
 
 
 def test_kernel_authored_limit_text_stays_inline(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from monoid_agent_kernel.env import _FALSE_VALUES, _TRUE_VALUES
 from monoid_agent_kernel.reference.studio.cli import studio
 
 
@@ -53,7 +54,11 @@ def test_doctor_fails_on_a_typo_in_the_delta_kill_switch(
     assert result.exit_code == 1, result.output
     assert "MONOID_OUTPUT_DELTAS" in result.output
     assert "[FAIL]" in result.output
-    assert "off" in result.output, "the remedy has to name the accepted values"
+    # Driven off the constants, not a substring: `"off" in output` was satisfied by the doctor's
+    # own earlier `[PASS] provider 'offline'` line, so this assertion held even when the remedy
+    # named nothing at all.
+    for accepted in sorted(_TRUE_VALUES | _FALSE_VALUES):
+        assert repr(accepted) in result.output, f"the remedy never names {accepted!r}"
 
 
 @pytest.mark.parametrize(

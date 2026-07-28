@@ -441,8 +441,12 @@ class StudioConfig:
     # Publish `model.output.delta` / `model.reasoning.delta` to the run's event log. On by default
     # because live token rendering is what the UI is for, but it is the widest content route out of
     # a run: the events are durable, and `EventBus` fans them to every sink with no level filter, so
-    # the assembled answer sits in `events.jsonl`. Turning this off costs live rendering and nothing
-    # else — the run result, `transcript.jsonl` and the settle events are untouched.
+    # the assembled answer sits in `events.jsonl`. Turning this off leaves the run result,
+    # `transcript.jsonl` and the settle events untouched, but it costs two things: live rendering,
+    # and mid-turn interruption. The kernel only streams when something consumes deltas, so with
+    # none consumed, Stop lands on the next step boundary instead of aborting inside the call.
+    # Pre-existing coupling -- `emit_output_deltas` is `False` by default in the kernel and this is
+    # what turns it on -- but it is invisible from here, hence the note.
     stream_output_deltas: bool = True
 
 

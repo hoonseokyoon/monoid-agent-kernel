@@ -21,6 +21,7 @@ from monoid_agent_kernel.core.model_io import (
     ModelIOSubscription,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.model_call import ShouldAbort
 from monoid_agent_kernel.core.streaming import QueueEventSink
 from monoid_agent_kernel.errors import (
     ModelAdapterError,
@@ -2540,3 +2541,41 @@ def test_one_turns_tokens_cannot_arrive_in_the_next_turns_stream() -> None:
     assert not foreign, (
         f"the abandoned turn's tokens were delivered into the next turn's stream: {foreign[:5]}"
     )
+
+
+def test_interruption_is_mid_turn_only_while_something_consumes_deltas() -> None:
+    """Pins the documented cost of `--no-output-deltas` / `MONOID_OUTPUT_DELTAS=0`.
+
+    `_adrive` takes the streaming path only when `delta_consumer is not None`, and the loop wires
+    `should_abort` only in the same branch that wires the consumer. So switching delta publication
+    off also moves Stop from "aborts within a token" to "waits for the in-flight call" -- which the
+    release notes, the `--help` text, the `StudioConfig` comment and `docs/OBSERVABILITY.md` all
+    claimed cost "live token rendering and nothing else".
+
+    The coupling itself is deliberate and predates the switch: `emit_output_deltas` is `False` by
+    default in the kernel, so this is its default behaviour, not a degradation past it. What was
+    wrong was four documents saying otherwise. This test is here so that if the coupling is ever
+    broken deliberately, the docs are what fails first.
+    """
+    stop_now: ShouldAbort = lambda: True  # noqa: E731
+
+    async def with_consumer() -> ModelTurn:
+        seen: list[Any] = []
+        return (
+            await ModelCallRunner(adapter=StreamingAdapter(chunks=[TextDelta(f"t{i}") for i in range(20)])).acall(
+                REQUEST, delta_consumer=seen.append, should_abort=stop_now
+            )
+        )[0]
+
+    async def without_consumer() -> ModelTurn:
+        return (
+            await ModelCallRunner(adapter=StreamingAdapter()).acall(REQUEST, should_abort=stop_now)
+        )[0]
+
+    with pytest.raises(ModelCallAborted):
+        asyncio.run(with_consumer())
+
+    # No consumer: dispatch leaves the streaming branch entirely -- `one-shot fallback` is
+    # `StreamingAdapter.next_turn`, so the generator that would have been polled between chunks was
+    # never entered -- the abort predicate is never consulted, and the call runs to completion.
+    assert asyncio.run(without_consumer()).final_text == "one-shot fallback"

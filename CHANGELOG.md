@@ -77,9 +77,14 @@ out in commit messages and here.
   `MONOID_OUTPUT_DELTAS=0` (applies to a run and every subagent it spawns), pass
   `monoid studio serve --no-output-deltas` (the flag is on the `serve` / `app` / `doctor`
   subcommands, not on the `studio` group), or construct `StudioConfig(stream_output_deltas=False)`.
-  The cost is live token rendering in the UI; `AgentLoop.astream` takes a different path and is
-  unaffected, as are the run result and `transcript.jsonl`. The completed answer still reaches the
-  Studio UI, because its event feed hydrates `final_text` from `transcript.jsonl`.
+  The cost is live token rendering in the UI **and mid-turn interruption**: the kernel only takes
+  the streaming path when something consumes deltas, so Stop lands on the next step boundary rather
+  than aborting inside the in-flight model call. That coupling predates this release —
+  `emit_output_deltas` is `False` by default in the kernel, so the switch returns you to the kernel
+  default rather than degrading past it — but Studio turns deltas on, so it is visible there.
+  `AgentLoop.astream` takes a different path and is unaffected, as are the run result and
+  `transcript.jsonl`. The completed answer still reaches the Studio UI, because its event feed
+  hydrates `final_text` from `transcript.jsonl`.
 - `transcript.jsonl` is now registered in the compatibility ledger. It became the authoritative
   source of displayed model text, so it is no longer merely a debug artifact.
 - `monoid studio doctor` validates `MONOID_OUTPUT_DELTAS` and reports the effective delta state.
