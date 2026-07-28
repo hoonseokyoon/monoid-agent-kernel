@@ -168,6 +168,7 @@ from monoid_agent_kernel.providers.base import (
 from monoid_agent_kernel.public_view import (
     args_preview,
     finish_args_preview,
+    preview_value,
     public_error_message,
     public_path,
     public_proposal_payload,
@@ -391,7 +392,11 @@ class AgentToolContext(ToolContext):
                 "artifact_id": artifact.artifact_id,
                 "path": artifact.path,
                 "kind": kind,
-                "metadata": dict(artifact.metadata),
+                # Model-authored and republished on the fan-out stream. The same mapping is already
+                # capped when it reaches ``tool.call.started`` through ``args_preview``, so leaving
+                # it raw here made the second emit the wider door -- the twin-miss shape again. The
+                # tool's *return* value below stays raw: that goes back to the model, which wrote it.
+                "metadata": preview_value("metadata", dict(artifact.metadata), self.permission_policy),
             },
         )
         return {
@@ -429,8 +434,19 @@ class AgentToolContext(ToolContext):
             return False
 
     def update_plan(self, items: list[dict[str, Any]]) -> None:
+        # ``self.plan`` keeps the model's own steps verbatim; only the published copy is capped.
+        # Each step is truncated as a *string* inside its item: ``plan.updated.items`` is declared
+        # ``_OBJ_ARRAY``, so an item that stops being an object fails ``validate_run_dir``, and
+        # ``WorkspaceInspector`` renders ``items[].step`` directly -- a preview dict there would
+        # show up as a blank row rather than a truncated one.
+        #
+        # This also bounds ``status.json["plan"]``, which ``StatusJsonSink`` copies straight out of
+        # this event and ``RunProjectionService.status()`` serves wholesale. Capping here rather
+        # than there keeps one copy of the rule instead of two that can drift apart.
         self.plan = items
-        self.recorder.emit("plan.updated", data={"items": items})
+        self.recorder.emit(
+            "plan.updated", data={"items": preview_value("items", items, self.permission_policy)}
+        )
 
     def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
         self.pending_finish = FinishResult(summary, tuple(outputs), notes)
