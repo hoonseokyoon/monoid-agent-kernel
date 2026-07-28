@@ -55,7 +55,9 @@ out in commit messages and here.
   valid object (so schema validation passed) but not a plan item, so the Studio inspector drew a
   blank row for it and counted it in the `completed/total` denominator. `status.json` mirrors this
   with `plan_truncated_items`, so the cap is visible on that surface too rather than silently
-  shortening the plan.
+  shortening the plan. Suppressing the in-band marker is scoped to that one typed array: a list
+  nested inside a plan item is an ordinary JSON blob and keeps its own `truncated_items` marker,
+  since the sibling count measures the root only and would not have reported its loss.
 - Tool arguments nested deeper than 64 levels are now rejected with a `ValueError` the model can
   read and correct. They previously raised `RecursionError`, which — being a `RuntimeError` — fell
   through the tool-call handler entirely.
@@ -77,7 +79,10 @@ out in commit messages and here.
 - `monoid studio doctor` validates `MONOID_OUTPUT_DELTAS` and reports the effective delta state.
   A malformed value is a startup error by design, so without this the preflight passed and the next
   `serve` died in `AgentLoop.__post_init__` — and an operator who *thought* they had disabled a
-  channel carrying raw model text learned nothing from a bare `[PASS]`.
+  channel carrying raw model text learned nothing from a bare `[PASS]`. The report names the actual
+  cause, including the case where deltas are off because the `[http-async]` extra is absent — which
+  is the base package's default, and where a report covering only the two switches said raw model
+  text was about to be published when none was.
 
 **What this release does not close**, stated as an exceptions list rather than an absolute claim:
 
