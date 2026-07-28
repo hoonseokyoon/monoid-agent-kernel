@@ -651,7 +651,23 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
     ``{"source_path": ["secrets/creds.txt"]}``.
     """
 
+    seen: set[tuple[int, str]] = set()
+
     def walk(value: Any, key: str, depth: int) -> bool:
+        # The same ancestor guard `preview_value` uses. Without it this re-expanded a
+        # self-referencing container, and it runs *before* `preview_value` -- so the guard three
+        # functions away never got a chance to fire. A set rather than a frozenset chain because
+        # this only answers yes/no: nothing is rendered, so eliding a legitimately shared value
+        # costs nothing here, unlike in the preview.
+        if isinstance(value, (Mapping, list)):
+            # Keyed on (identity, inherited key), not identity alone. A *list* takes its key from
+            # the parent, so the same list reached under `other` and under `source_path` answers
+            # differently -- an identity-only set would let the first, negative visit suppress the
+            # second. Not reachable from JSON-derived arguments, which cannot share, but the guard
+            # should not be the thing that introduces a miss.
+            if (id(value), key) in seen:
+                return False
+            seen.add((id(value), key))
         # ``depth`` counts the same way ``preview_value``'s ``_depth`` does: the outer mapping is
         # not a level, so a top-level value is 0. Counting the mapping itself made this stop one
         # level *earlier* than the traversal it has to agree with, and `preview_value`'s depth cap

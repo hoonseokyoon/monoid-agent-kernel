@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_value,
 )
 from monoid_agent_kernel.core.result import AgentRunResult
+from monoid_agent_kernel.public_view import public_error_message
 from monoid_agent_kernel.reference.backend.ports import LoopPort, MutableRunRecordPort, RunRecordPort
 
 
@@ -214,7 +215,12 @@ class RunStateMutationService:
                 session_state_from_run_status(result.status, error_code=result.error_code, terminal=True),
                 terminal=True,
             )
-            record.error = result.error
+            # Through the kernel's own error filter before it becomes an HTTP projection.
+            # `AgentRunResult.error` is deliberately raw -- the embedding application is inside
+            # the trust boundary and needs the whole message to debug -- but `record.error` is
+            # served by `status`, `result` and `diagnostics`, and a gateway 400 embeds the entire
+            # provider response body in it, which is not the run's own data to hand back.
+            record.error = public_error_message(result.error)
             record.error_code = result.error_code
             record.finished_at = self._context.now()
             self._usage.setdefault(record.tenant_id, TenantUsage(record.tenant_id)).add_metrics(
@@ -236,7 +242,7 @@ class RunStateMutationService:
         def _mutate() -> None:
             record = self._context.record(run_id)
             set_record_state(record, SessionState.FAILED, terminal=True)
-            record.error = str(exc)
+            record.error = public_error_message(str(exc))
             record.error_code = getattr(exc, "error_code", "internal_error")
             record.finished_at = self._context.now()
 

@@ -125,6 +125,22 @@ projection. The Studio UI restores user, assistant, and error messages from
 `/api/chat-transcript`, then replays `events.jsonl` for trace and activity panels.
 `transcript.jsonl` remains the private model-call log.
 
+**`studio.chat.jsonl` carries whole model answers and whole user prompts**, and is the one
+run-directory artifact that is both content-bearing and served over HTTP. It has to be: a chat UI
+that cannot re-render the conversation is not a chat UI, and the text is joined back out of
+`transcript.jsonl` by the same hydration seam the projection uses. Three consequences worth stating
+rather than leaving to be discovered:
+
+- It is **not** covered by `MONOID_OUTPUT_DELTAS=0`. That switch stops model text reaching
+  `events.jsonl`; with it engaged, the assembled answer still lands here. The switch bounds the
+  *durable event stream*, not the run directory.
+- The read path **writes**. Deleting the file and requesting `/api/chat-transcript` regenerates it
+  from `transcript.jsonl`, so removing it does not remove the content.
+- Treat it as **private by location**, like `artifacts/tasks/<id>/task.json` — with the difference
+  that Studio serves it, so "do not expose the run directory" is not by itself sufficient. Studio is
+  reference code and binds `127.0.0.1` by default; a deployment that fronts it needs to gate this
+  route the way it gates the run directory.
+
 ## Event Sinks
 
 Programmatic callers can pass sinks to

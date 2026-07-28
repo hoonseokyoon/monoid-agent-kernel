@@ -182,6 +182,17 @@ either means changing a surface this one does not touch:
   and republished its own argument into `run.failed`, `status.json` and `metrics.json`. Same shape
   as the `WorkspaceError` that ended runs for operators with `redact_patterns` set, on the four
   `job.*` twins that guard never reached.
+- **The run's terminal error is filtered on every public artifact.** `public_error_message` was
+  bound on `events.jsonl`, `status.json` and `failure.json` and missed on `metrics.json` — and
+  `_error_from_status_body` embeds the *entire* LLM gateway HTTP response body in the message, so a
+  400 from a misconfigured gateway wrote whatever that body held into a public run artifact. The
+  reference backend filters it again before serving it on `status` / `result` / `diagnostics`;
+  `AgentRunResult.error` stays raw, because the embedding application is inside the trust boundary.
+- **No `KeyError` escapes the job tools.** `job.status` / `logs` / `cancel` / `wait` raised through
+  tool dispatch, which catches `(NativeAgentError, ValueError, TypeError)` and not `KeyError`, so a
+  model asking about a job terminated the run. Two distinct sources: an unregistered id, and a
+  registered `HostedTask` with no log file — the second reachable by calling `job.logs` on an id the
+  kernel itself handed the model through `job.list` after `agent.spawn`.
 - **One preview's total size is bounded only by its input.** The depth, key and item caps bound a
   preview's *shape*, not its size: a value reachable by many paths is re-expanded once per path, so
   nine levels of a mapping shared five ways — about 40 objects — produced 26 MB of JSON in 1.1 s,

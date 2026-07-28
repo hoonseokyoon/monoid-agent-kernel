@@ -403,7 +403,12 @@ class AgentToolContext(ToolContext):
                 # `kind` is declared `{"type": "string"}` with no enum, so it is free model text
                 # sitting between three bounded neighbours -- `label` truncates, `metadata` is
                 # previewed, `path` is a run-dir pointer. It reads like an enum and is not one.
-                "kind": preview_value("kind", kind, self.permission_policy),
+                #
+                # Bounded as a *string*, not previewed: `artifact.emitted`'s own data schema declares
+                # `{"kind": _STR}` with `additionalProperties: false`, so returning the preview
+                # envelope made every run carrying a long `kind` fail `validate_run_dir` -- the fix
+                # broke the contract it was protecting. Same reason `_INLINE_TEXT_KEYS` exists.
+                "kind": public_identifier(kind),
                 # Model-authored and republished on the fan-out stream. The same mapping is already
                 # capped when it reaches ``tool.call.started`` through ``args_preview``, so leaving
                 # it raw here made the second emit the wider door -- the twin-miss shape again. The
@@ -2992,11 +2997,12 @@ class AgentLoop:
                 {
                     "kind": "model_turn",
                     "step": step,
-                    # Bounded: this arrives from the gateway, i.e. from outside the kernel's
-                    # trust boundary, and real ids are short. A compromised or buggy proxy
-                    # echoing an unbounded string onto the public stream is a channel no
-                    # review of *tool* arguments would ever look at.
-                    "response_id": public_identifier(turn.response_id) if turn.response_id else turn.response_id,
+                    # Raw. This is `transcript.jsonl`, the private full-payload replay artifact --
+                    # its neighbour `final_text` on the next line is the whole model answer. The
+                    # bound belongs on the *event* copy below, and putting it here also left
+                    # `model_request`'s `previous_turn_handle` unbounded sixty lines up, so the
+                    # private artifact was half-bounded and inconsistent with itself.
+                    "response_id": turn.response_id,
                     "final_text": turn.final_text,
                     "tool_calls": [call.__dict__ for call in turn.tool_calls],
                     "usage": turn.usage,

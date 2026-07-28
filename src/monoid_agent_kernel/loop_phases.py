@@ -541,7 +541,16 @@ class LoopFinalizer:
         if state.provider_http_status is not None:
             metrics["provider_http_status"] = state.provider_http_status
         if state.error:
-            metrics["error"] = state.error
+            # Through the same filter `events.jsonl`, `status.json` and `failure.json` use. This was
+            # the one surface carrying it raw, and `_error_from_status_body` embeds the *entire* LLM
+            # gateway HTTP response body in the message -- so a 400 from a misconfigured gateway put
+            # whatever that body held into a public run artifact.
+            #
+            # Twenty-six lines above, `changed_paths` was routed through `public_path` one commit ago
+            # for precisely this reason, in this function, with a comment calling `metrics.json` "the
+            # only one of the three that never redacted". The list got bound and the error string on
+            # the next screen did not.
+            metrics["error"] = public_error_message(state.error)
         return metrics
 
     def finalize(self, state: Any, res: _RunResources) -> AgentRunResult:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,25 +32,47 @@ class JobsService:
             )
         return job_id
 
+    def _guarded(self, args: dict[str, Any], call: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
+        """Run one job lookup with **every** `KeyError` converted, not just the id-not-found one.
+
+        Checking membership in `job_manager.jobs` bound one of two sources and left the other:
+        `read_job_log_text` raises a second `KeyError` for an id that *is* registered but has no log
+        file on disk -- which is every `HostedTask` (subagent, hitl, capability, tool approval). The
+        model is handed those ids by `job.list`, so `agent.spawn` followed by `job.logs` on the id it
+        just read terminated the run. Three of the four twins were bound and the fourth was bound
+        halfway, which is worse than not bound: it looks covered.
+        """
+        job_id = self._job_id(args)
+        try:
+            return call(job_id)
+        except KeyError as exc:
+            detail = str(exc.args[0]) if exc.args else job_id
+            raise ToolExecutionError(
+                f"job data unavailable: {public_identifier(detail)}", error_code="job_unavailable"
+            ) from None
+
     def list_jobs(self) -> list[dict[str, Any]]:
         return self.job_manager.list_jobs()
 
     def status(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.status(self._job_id(args))
+        return self._guarded(args, self.job_manager.status)
 
     def logs(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.logs(
-            self._job_id(args),
-            stream=str(args.get("stream") or "stdout"),  # type: ignore[arg-type]
-            tail_bytes=args.get("tail_bytes"),
-            offset=args.get("offset"),
+        return self._guarded(
+            args,
+            lambda job_id: self.job_manager.logs(
+                job_id,
+                stream=str(args.get("stream") or "stdout"),  # type: ignore[arg-type]
+                tail_bytes=args.get("tail_bytes"),
+                offset=args.get("offset"),
+            ),
         )
 
     def cancel(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.cancel(self._job_id(args))
+        return self._guarded(args, self.job_manager.cancel)
 
     def wait(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.job_manager.wait(self._job_id(args), timeout_s=args.get("timeout_s"))
+        return self._guarded(args, lambda job_id: self.job_manager.wait(job_id, timeout_s=args.get("timeout_s")))
 
     def background_metrics(self) -> dict[str, Any]:
         jobs = self.job_manager.list_jobs()

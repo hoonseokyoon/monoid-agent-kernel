@@ -21,6 +21,7 @@ from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -430,6 +431,7 @@ def test_every_public_file_redacts_a_matched_path_not_just_the_two_that_were_che
 
     metrics = json.loads((result.run_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["changed_paths"] == [REDACTED_PATH], "metrics.json published the path raw"
+    assert validate_run_dir(result.run_dir) == []
     for name, text in _public_text(result.run_dir).items():
         assert "secrets/creds.txt" not in text, f"{name} carries the redacted path"
 
@@ -449,6 +451,11 @@ def test_a_free_text_argument_that_looks_like_an_enum_is_still_bounded(tmp_path:
 
     result = _run(spec, [("artifact.emit", {"path": "note.md", "kind": sentinel})], "artifact.emit")
 
+    # The assertion the six older tests in this file all carry, and that the four added with
+    # these fixes all omitted -- which is exactly why the suite stayed green while `kind`
+    # published a preview envelope into a field its schema declares as a string.
+    assert validate_run_dir(result.run_dir) == []
+
     for name, text in _public_text(result.run_dir).items():
         assert sentinel not in text, f"{name} carries the whole `kind`"
 
@@ -464,6 +471,8 @@ def test_an_unknown_job_id_fails_the_call_instead_of_the_run(tmp_path: Path) -> 
     sentinel = "기밀" * 300
 
     result = _run(_spec(tmp_path), [("job.status", {"job_id": sentinel})], "job.status")
+
+    assert validate_run_dir(result.run_dir) == []
 
     assert result.status == "completed", "one bad argument ended the run"
     assert result.final_text == "done"
@@ -487,5 +496,46 @@ def test_a_provider_supplied_response_id_is_bounded(tmp_path: Path) -> None:
     )
     result = loop.run_once("go")
 
+    assert validate_run_dir(result.run_dir) == []
     for name, text in _public_text(result.run_dir).items():
         assert sentinel not in text, f"{name} carries the whole response_id"
+
+
+def test_the_terminal_error_is_filtered_on_every_public_artifact_not_three_of_four(
+    tmp_path: Path,
+) -> None:
+    """`public_error_message` was bound on three surfaces and missed on the fourth.
+
+    `events.jsonl`, `status.json` and `failure.json` rendered `[redacted-sensitive-error]` while
+    `metrics.json` carried the message whole — and `_error_from_status_body` embeds the *entire* LLM
+    gateway HTTP response body in it, so a 400 from a misconfigured gateway put whatever that body
+    held into a public run artifact.
+
+    The `changed_paths` list in the same function had been routed through `public_path` one commit
+    earlier, under a comment calling `metrics.json` "the only one of the three that never redacted".
+    The list got bound; the error string twenty-six lines below it did not.
+
+    `AgentRunResult.error` stays raw on purpose: the embedding application is inside the trust
+    boundary and needs the whole message. The reference backend filters it again before serving it
+    over HTTP, because a provider's response body is not the run's own data to hand back.
+    """
+    secret = "-----BEGIN PRIVATE KEY-----" + "기밀" * 200
+
+    class FailingAdapter:
+        def next_turn(self, request: Any) -> Any:
+            raise ModelAdapterError(f"LLM gateway returned HTTP 400: {secret}", retryable=False)
+
+    spec = _spec(tmp_path)
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FailingAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+    result = loop.run_once("go")
+
+    for name in (*PUBLIC_FILES, "failure.json"):
+        path = result.run_dir / name
+        if path.exists():
+            assert secret not in path.read_text(encoding="utf-8"), f"{name} carries the raw error"
+
+    assert secret in str(result.error), "the in-process caller must still get the whole message"
