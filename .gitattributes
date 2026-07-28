@@ -1,3 +1,13 @@
 *.py text eol=lf
 .nvmrc text eol=lf
+# `vite build` copies studio-ui/index.html verbatim and injects the hashed asset tags with LF.
+# With core.autocrlf=true the template checks out CRLF on Windows, so the generated file comes out
+# mixed (CRLF from the template, LF from the injection) and can never match the LF file CI's Linux
+# runner builds -- which ci.yml gates with `git diff --exit-code`. Pinning both ends makes the
+# packaged bundle reproducible on every platform instead of only where the checkout happens to be
+# LF. The hashed assets are left alone deliberately: vite regenerates them wholesale rather than
+# copying a template, and minified JS can carry a literal CR inside a string literal that eol=lf
+# would rewrite.
+studio-ui/index.html text eol=lf
+src/monoid_agent_kernel/reference/studio/web/dist/index.html text eol=lf
 src/monoid_agent_kernel/reference/studio/web/dist/assets/*.js whitespace=-trailing-space
