@@ -11,6 +11,7 @@ from monoid_agent_kernel.public_view import (
     APPROVAL_BYTE_THRESHOLD,
     UNMASKED,
     preview_value,
+    touches_redacted_path,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
@@ -106,7 +107,7 @@ def redact_tool_arguments(
     about secrets.
 
     What it takes from that traversal is the **bounds**, not the trace surface's *policy*. The
-    budget here is far larger, and ``redact_content=False`` keeps file-content fields visible,
+    budget here is far larger, and ``decision_surface=True`` keeps file-content fields visible,
     because someone reads this to decide whether a call may run: a command cut mid-string hides the
     part that matters (with the model choosing where that part sits), and a card rendering
     ``{"redacted": true}`` where the body should be asks a human to authorize a write they cannot
@@ -126,6 +127,16 @@ def redact_tool_arguments(
     stop doing.
     """
     resolved = policy if policy is not None else PermissionPolicy()
+    # The operator's explicit policy outranks the decision surface's exemption -- and it has to
+    # outrank it for the *whole* call, not field by field. Blanking only the path produced a card
+    # showing a private key's contents above `{"redacted": true}` where the destination should be:
+    # it broke the approver's judgement and protected nothing, since the body was right there.
+    # Blanking only the content is the same trade in the other direction. So: if `redact_patterns`
+    # matches any path this call touches, this is not a decision surface, and the approver decides
+    # from the tool name and the withheld-value markers. That is the operator asking for exactly
+    # this, which is different from the kernel's own `_is_content_field` default -- a blanket rule
+    # the approver is entitled to see past.
+    withheld = touches_redacted_path(arguments, resolved)
 
     def mask(key: str, value: Any) -> Any:
         if _is_secret_key(key) or (value is not None and key.lower() in prose_keys):
@@ -140,13 +151,15 @@ def redact_tool_arguments(
             mask=mask,
             threshold=APPROVAL_BYTE_THRESHOLD,
             budget=APPROVAL_BYTE_BUDGET,
-            # `content`/`old`/`new` are blanked on the trace surface and *shown* here, bounded by
-            # the budget above. An approval card that renders `{"redacted": true}` where the file
-            # body should be asks a human to authorize a write they cannot see -- which trains
-            # people to approve blindly and is a worse outcome than the logging it buys. The bound
-            # still applies, so this publishes at most `APPROVAL_BYTE_BUDGET` rather than the
-            # unbounded body that reached here before this release.
-            redact_content=False,
+            # This is the decision surface: `content`/`old`/`new` are blanked on the trace surface
+            # and *shown* here, bounded by the budget above. An approval card that renders
+            # `{"redacted": true}` where the file body should be asks a human to authorize a write
+            # they cannot see -- which trains people to approve blindly and is a worse outcome than
+            # the logging it buys. The bound still applies, so this publishes at most
+            # `APPROVAL_BYTE_BUDGET` rather than the unbounded body that reached here before.
+            #
+            # ...unless the operator redacted a path this call touches; see `withheld` above.
+            decision_surface=not withheld,
         )
         for key, value in arguments.items()
     }

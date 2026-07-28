@@ -327,7 +327,7 @@ def preview_value(
     mask: Callable[[str, Any], Any] | None = None,
     threshold: int = PREVIEW_BYTE_THRESHOLD,
     budget: int = PREVIEW_BYTE_BUDGET,
-    redact_content: bool = True,
+    decision_surface: bool = False,
     list_marker: bool = True,
     _depth: int = 0,
 ) -> Any:
@@ -339,6 +339,11 @@ def preview_value(
     ``core.tool_approval.redact_tool_arguments`` had its own recursion carrying the masking rules but
     no caps, while this one had the caps but knew nothing about secrets. Which half of the policy
     applied to a value depended only on which surface it left through. One traversal, all the rules.
+
+    ``decision_surface=True`` marks a surface a *person* reads to authorize a call, and stops this
+    function withholding from them: file bodies and ``redact_patterns`` paths are shown, bounded by
+    the caller's budget rather than blanked. Every other surface is a log, and the default withholds
+    both. It is deliberately one switch — see ``core.tool_approval.redact_tool_arguments``.
 
     ``list_marker=False`` caps the list **passed in** without appending the
     ``{"truncated_items": n}`` element. Only the *caller* knows whether it is previewing a JSON blob
@@ -360,26 +365,50 @@ def preview_value(
         if replacement is not UNMASKED:
             return replacement
     lowered = key.lower()
-    if redact_content and _is_content_field(lowered):
-        return redacted_value(value)
-    if lowered in {"path", "root", "cwd"} and isinstance(value, str) and _is_path_redacted(value, policy):
-        return redacted_value(value)
+    if not decision_surface:
+        # One branch, both withholdings. They were two independent flags for one commit, and that
+        # was long enough to ship the inversion: the approval card turned content redaction *off*
+        # so an approver could read the body, and left path redaction *on*, so it showed a private
+        # key's contents while hiding which file it was being written to. Whatever an operator
+        # means by ``redact_patterns``, it is not that. A surface either withholds from its reader
+        # or it does not; a caller cannot pick one half any more.
+        if _is_content_field(lowered):
+            return redacted_value(value)
+        if _is_path_field(lowered) and isinstance(value, str) and _is_path_redacted(value, policy):
+            return redacted_value(value)
     if isinstance(value, (dict, list)) and _depth >= PREVIEW_MAX_DEPTH:
         return {"truncated": True, "type": type(value).__name__, "depth_exceeded": PREVIEW_MAX_DEPTH}
     if isinstance(value, dict):
-        preview = {
-            str(child_key): preview_value(
+        preview: dict[str, Any] = {}
+        for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]:
+            # The key is model-authored text too, and it was the one string this function published
+            # at any length: the same 30 KB file body arrived ``{"redacted": true}`` in the value
+            # position and verbatim in the key position, past both the byte cap and
+            # ``_is_content_field`` (which reads the key to judge the *value*, so a body moved into
+            # the key has no name left to incriminate it). ``env_keys`` was routed through here for
+            # exactly this reason one commit earlier -- but that bound keys arriving as list
+            # *items*, and left the twin where they arrive as keys.
+            name = truncate_inline_text(str(child_key), threshold=threshold, budget=budget)
+            # Bounding keys makes distinct keys collide, and a dict comprehension resolves a
+            # collision by dropping one of them silently -- a cap that does not say it capped, the
+            # exact failure this release exists to close. Disambiguate rather than lose an entry.
+            if name in preview:
+                suffix = 2
+                while f"{name}#{suffix}" in preview:
+                    suffix += 1
+                name = f"{name}#{suffix}"
+            # Rules still match on the *whole* key: a 5 KB key ending in ``_path`` is a path, and
+            # judging it by its truncated form would let length defeat the redaction.
+            preview[name] = preview_value(
                 str(child_key),
                 child_value,
                 policy,
                 mask=mask,
                 threshold=threshold,
                 budget=budget,
-                redact_content=redact_content,
+                decision_surface=decision_surface,
                 _depth=_depth + 1,
             )
-            for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]
-        }
         # A source key literally named ``truncated_keys`` loses to the marker. Acceptable: the
         # preview is lossy by construction, and no consumer reads nested preview dicts by key --
         # ``narration`` and the Studio activity feed both read only top-level ``args_preview`` keys,
@@ -399,7 +428,7 @@ def preview_value(
                 mask=mask,
                 threshold=threshold,
                 budget=budget,
-                redact_content=redact_content,
+                decision_surface=decision_surface,
                 _depth=_depth + 1,
             )
             for item in value[:PREVIEW_MAX_ITEMS]
@@ -407,9 +436,9 @@ def preview_value(
         # The marker is a *foreign shape* in the array it is appended to. In a JSON blob that is the
         # point -- it is self-describing and the reader sees it. In a typed array it is a defect: the
         # Studio plan renderer reads ``items[].step``, so this element drew a blank row AND inflated
-        # the ``n/len(plan)`` progress denominator. ``list_marker`` propagates so a caller declaring
-        # its structure typed gets that at every depth, not only the one the reviewer happened to
-        # look at.
+        # the ``n/len(plan)`` progress denominator. ``list_marker`` applies to the list passed in
+        # and does *not* propagate -- see the docstring for why nested lists are not that twin.
+        # (This comment used to claim the opposite, and outlived the fix that made it false.)
         if list_marker and len(value) > PREVIEW_MAX_ITEMS:
             items.append({"truncated_items": len(value) - PREVIEW_MAX_ITEMS})
         return items
@@ -451,6 +480,36 @@ def redacted_value(value: Any) -> dict[str, Any]:
     if isinstance(value, bytes):
         return {"redacted": True, "type": "bytes", "bytes": len(value)}
     return {"redacted": True, "type": type(value).__name__}
+
+
+def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -> bool:
+    """True if any argument in ``values`` is a path the operator's ``redact_patterns`` matches.
+
+    Exists so the decision surface can drop its exemption *as a whole*. ``preview_value`` sees one
+    key at a time and cannot know that the ``content`` it is about to show belongs to a call whose
+    ``path`` the operator marked secret; this sees the whole argument map, which is the only level
+    where that question can be answered.
+    """
+    return any(
+        _is_path_field(str(key).lower()) and isinstance(value, str) and _is_path_redacted(value, policy)
+        for key, value in values.items()
+    )
+
+
+def _is_path_field(lowered_key: str) -> bool:
+    # Which arguments carry a workspace path is declared per tool by ``ToolSpec.path_args``, not by
+    # this module -- and ``fs.move``/``fs.copy`` declare ``("source_path", "destination_path")``.
+    # Matching a hardcoded ``{"path", "root", "cwd"}`` meant one ``fs.move`` published
+    # ``paths: ["[redacted-path]"]`` next to ``args_preview.source_path: "secrets/creds.txt"`` on
+    # the *same event*: the operator's redaction defeated by the field beside it.
+    #
+    # Matched by name rather than by consulting the registry because this function also previews
+    # values that never were a tool argument (result payloads, artifact metadata, capability
+    # descriptors), where there is no ``ToolSpec`` to ask -- and because a custom or MCP tool that
+    # names an argument ``*_path`` is then covered without registering anything here. Over-matching
+    # is the safe direction: the cost is a redaction marker on a field that did not need one, and
+    # only ever for a value ``redact_patterns`` already matched.
+    return lowered_key in {"path", "root", "cwd"} or lowered_key.endswith("_path")
 
 
 def _is_content_field(lowered_key: str) -> bool:

@@ -28,6 +28,7 @@ from monoid_agent_kernel.public_view import (
     PREVIEW_MAX_ITEMS,
     PREVIEW_MAX_KEYS,
     REDACTED_PATH,
+    TRUNCATION_SUFFIX,
     args_preview,
     preview_value,
     public_path,
@@ -305,3 +306,91 @@ def test_list_marker_applies_to_the_value_passed_in_and_not_to_nested_containers
 
     # And the default still marks in both positions.
     assert preview_value("items", long_list, policy)[-1] == {"truncated_items": 7}
+
+
+def test_a_body_smuggled_into_the_key_position_is_bounded_like_any_other_string() -> None:
+    """The one string this traversal published at any length.
+
+    `preview_value` capped every *value* and emitted `str(child_key)` untouched, so the identical
+    payload came out `{"redacted": true}` in the value position and verbatim in the key position.
+    `_is_content_field` cannot help: it reads the key to judge the value, so a body moved *into*
+    the key has no name left to incriminate it. Measured in bytes and with multibyte text, because
+    a character-slice cap is no cap at all for Hangul -- the defect this whole file exists for.
+    """
+    policy = PermissionPolicy()
+    body = "비밀-" + "가" * 10_000
+
+    as_value = preview_value("metadata", {"content": body}, policy)
+    assert as_value["content"]["redacted"] is True
+
+    published_key = next(iter(preview_value("metadata", {body: "x"}, policy)))
+    assert published_key != body, "the key rode out verbatim"
+    assert len(published_key.encode("utf-8")) <= PREVIEW_BYTE_BUDGET + len(TRUNCATION_SUFFIX.encode())
+    assert published_key.endswith(TRUNCATION_SUFFIX), "a cut key must say it was cut"
+
+
+def test_bounding_a_key_never_silently_merges_two_distinct_entries() -> None:
+    """Truncation makes distinct keys collide, and a dict drops the loser without a word.
+
+    That would trade one silent cap for another -- the failure this release exists to close -- so
+    the collision is disambiguated instead. Both source entries have to survive with their own
+    values, or the bound is buying egress at the price of correctness.
+    """
+    policy = PermissionPolicy()
+    shared = "x" * (PREVIEW_BYTE_THRESHOLD + 50)
+
+    preview = preview_value("metadata", {shared + "-alpha": 1, shared + "-beta": 2}, policy)
+
+    assert len(preview) == 2, f"an entry was dropped: {preview}"
+    assert sorted(preview.values()) == [1, 2]
+
+
+def test_every_path_argument_the_registry_declares_is_redacted_not_just_the_three_hardcoded(
+    tmp_path,
+) -> None:
+    """The redaction was keyed on `{path, root, cwd}`; the registry declares the real list.
+
+    `fs.move`/`fs.copy` declare `("source_path", "destination_path")`, so one `fs.move` published
+    `paths: ["[redacted-path]"]` and `args_preview.source_path: "secrets/creds.txt"` on the *same
+    event*: the operator's redaction defeated by the field beside it. Driven off `builtin_tools`
+    rather than a literal list so that declaring a new path argument cannot quietly reopen this.
+    """
+    from monoid_agent_kernel.tools.builtin import builtin_tools
+    from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
+
+    policy = PermissionPolicy(redact_patterns=("secrets/**", "secrets/*"))
+    secret = "secrets/creds.txt"
+
+    declared = {name for spec in builtin_tools(LocalWorkspaceBackend(tmp_path)) for name in spec.path_args}
+    assert {"source_path", "destination_path"} <= declared, "registry no longer exercises this"
+
+    for name in sorted(declared):
+        assert preview_value(name, secret, policy) == {
+            "redacted": True,
+            "type": "str",
+            "bytes": len(secret.encode()),
+        }, f"{name} is a declared path argument and published verbatim"
+
+
+def test_the_approval_card_never_shows_a_body_while_hiding_where_it_goes() -> None:
+    """The decision surface was inverted for exactly one release candidate.
+
+    `redact_tool_arguments` turns content redaction *off* so an approver can read what a write
+    contains. Path redaction stayed on, so under `redact_patterns` the card rendered a private
+    key's contents above `{"redacted": true}` where the destination should be -- it hid the field
+    the decision turns on and showed the field that made hiding it pointless.
+
+    Both fields now move together. The operator's explicit `redact_patterns` outranks the card's
+    exemption (unlike the kernel's own `_is_content_field` default, which an approver is entitled
+    to see past), so a redacted path withholds the whole call rather than half of it.
+    """
+    body = "-----BEGIN PRIVATE KEY-----"
+    arguments = {"path": "secrets/deploy.key", "content": body}
+
+    exposed = redact_tool_arguments(arguments, policy=PermissionPolicy())
+    assert exposed == {"path": "secrets/deploy.key", "content": body}, "the approver must see both"
+
+    withheld = redact_tool_arguments(arguments, policy=PermissionPolicy(redact_patterns=("secrets/*",)))
+    assert withheld["path"]["redacted"] is True
+    assert withheld["content"]["redacted"] is True, "a body shown beside a hidden path protects nothing"
+    assert body not in str(withheld)
