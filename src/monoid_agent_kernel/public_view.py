@@ -106,7 +106,7 @@ def finish_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> 
 
     Settling through ``run.finish`` is the default flow, so this argument *is* the model-authored
     final text — the same value that reaches ``turn.settled``. Left to the generic preview it was
-    copied verbatim into ``tool.call.started.data.args_preview`` (and truncated to a 160-character
+    copied verbatim into ``tool.call.started.data.args_preview`` (and truncated to a 160-*byte*
     prefix when long), putting model output on `events.jsonl` and every event sink through a
     second door. Removing it from the settle events alone would not have closed the channel.
 
@@ -176,23 +176,80 @@ def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dic
     return preview
 
 
-def preview_value(key: str, value: Any, policy: PermissionPolicy) -> Any:
+# A preview is capped so that a bounded amount of text reaches the event stream, and "bounded" is a
+# byte budget — that is what an event log costs and what an operator's redaction promise is about.
+# Slicing by *characters* against a *byte* threshold made the cap depend on the language: 100 Hangul
+# characters are 300 bytes, so they cleared the 240-byte threshold and were then "truncated" to a
+# 160-character prefix, i.e. to all 100 of them. Every multibyte string with at most 160 characters
+# and more than 240 bytes was published in full while the payload reported ``truncated: True``.
+PREVIEW_BYTE_THRESHOLD = 240
+PREVIEW_BYTE_BUDGET = 160
+# Bounds on the recursion itself. Nested containers arrive from model-controlled input --
+# ``artifact.emit.metadata`` and ``run.update_plan.items`` both declare ``additionalProperties:
+# True`` -- so without these a model can hand the writer a structure that costs more to preview than
+# the run is worth, or one deep enough to raise ``RecursionError`` inside tool dispatch. The read
+# side already learned the depth lesson (``core.schemas`` catches ``RecursionError``); this is the
+# write side learning it.
+PREVIEW_MAX_DEPTH = 8
+PREVIEW_MAX_KEYS = 20
+PREVIEW_MAX_ITEMS = 20
+
+
+def truncate_to_bytes(value: str, max_bytes: int) -> str:
+    """The longest prefix of ``value`` whose UTF-8 encoding fits in ``max_bytes``.
+
+    Backs off to a codepoint boundary. A bare ``value.encode()[:n].decode()`` raises
+    ``UnicodeDecodeError`` whenever the cut lands inside a multi-byte sequence, which for non-ASCII
+    text is the common case rather than the edge case. ``errors="ignore"`` drops exactly the
+    trailing partial sequence and nothing else: the bytes came from encoding a valid ``str``, so the
+    only ill-formed run possible is the one the slice created, and UTF-8 is self-synchronizing.
+
+    Shared with ``shell.preview_command`` rather than reimplemented there. The two truncators had
+    already drifted to different constants (240/160 here, 240/200 there) while carrying the same
+    defect, so a fix applied to one would have left the other publishing whole commands.
+    """
+    if max_bytes <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def preview_value(key: str, value: Any, policy: PermissionPolicy, *, _depth: int = 0) -> Any:
     lowered = key.lower()
     if _is_content_field(lowered):
         return redacted_value(value)
     if lowered in {"path", "root", "cwd"} and isinstance(value, str) and policy.is_path_redacted(value):
         return redacted_value(value)
+    if isinstance(value, (dict, list)) and _depth >= PREVIEW_MAX_DEPTH:
+        return {"truncated": True, "type": type(value).__name__, "depth_exceeded": PREVIEW_MAX_DEPTH}
     if isinstance(value, dict):
-        return {str(child_key): preview_value(str(child_key), child_value, policy) for child_key, child_value in value.items()}
-    if isinstance(value, list):
-        preview = [preview_value(key, item, policy) for item in value[:20]]
-        if len(value) > 20:
-            preview.append({"truncated_items": len(value) - 20})
+        preview = {
+            str(child_key): preview_value(str(child_key), child_value, policy, _depth=_depth + 1)
+            for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]
+        }
+        # A source key literally named ``truncated_keys`` loses to the marker. Acceptable: the
+        # preview is lossy by construction, and no consumer reads nested preview dicts by key --
+        # ``narration`` and the Studio activity feed both read only top-level ``args_preview`` keys,
+        # which the ``*_args_preview`` builders above assemble themselves and never width-cap.
+        if len(value) > PREVIEW_MAX_KEYS:
+            preview["truncated_keys"] = len(value) - PREVIEW_MAX_KEYS
         return preview
+    if isinstance(value, list):
+        items = [preview_value(key, item, policy, _depth=_depth + 1) for item in value[:PREVIEW_MAX_ITEMS]]
+        if len(value) > PREVIEW_MAX_ITEMS:
+            items.append({"truncated_items": len(value) - PREVIEW_MAX_ITEMS})
+        return items
     if isinstance(value, str):
         encoded_len = len(value.encode("utf-8"))
-        if encoded_len > 240:
-            return {"type": "str", "preview": value[:160], "bytes": encoded_len, "truncated": True}
+        if encoded_len > PREVIEW_BYTE_THRESHOLD:
+            return {
+                "type": "str",
+                "preview": truncate_to_bytes(value, PREVIEW_BYTE_BUDGET),
+                "bytes": encoded_len,
+                "truncated": True,
+            }
         return value
     return value
 

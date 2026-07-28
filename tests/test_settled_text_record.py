@@ -239,9 +239,9 @@ def test_a_malformed_record_is_reported(tmp_path: Path) -> None:
     "summary",
     [
         pytest.param("SENTINEL-a short final answer", id="short"),
-        # Long values took a different route: the generic preview truncates to a 160-character
-        # prefix rather than dropping the field, so it leaked a readable excerpt instead of the
-        # whole answer. Both shapes have to be covered.
+        # Long values took a different route: the generic preview truncates to a 160-byte prefix
+        # rather than dropping the field, so it leaked a readable excerpt instead of the whole
+        # answer. Both shapes have to be covered.
         pytest.param("SENTINEL-" + "x" * 400, id="long-enough-to-be-truncated"),
     ],
 )
