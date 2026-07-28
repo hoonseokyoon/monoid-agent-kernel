@@ -60,6 +60,56 @@ def _run(spec: AgentRunSpec, calls: list[tuple[str, dict[str, Any]]], *tool_ids:
     return loop.run_once("go")
 
 
+def test_a_truncated_path_says_so_instead_of_reading_as_an_exact_filename(tmp_path: Path) -> None:
+    """`paths` entries stay strings, so the cut has to be marked *in* the string.
+
+    `narration._target` prefers `args_preview[path]`, but skips it when it is a preview dict — which
+    is exactly what a long path becomes — and falls back to joining `data["paths"]`. So an unmarked
+    prefix is what the CLI and Studio present to an operator as the exact target of a write, with
+    nothing distinguishing it from a short path that was published whole.
+
+    Asserted on two paths that share the truncated prefix, because that is the case a bound alone
+    does not cover: both entries are identical after the cut, and the marker is the only thing left
+    telling a reader the name is incomplete rather than a real file called `.../nested/nested`.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    shared = "deeply/" + "nested/" * 60
+    calls = [
+        ("fs.write", {"path": f"{shared}alpha.txt", "content": "a"}),
+        ("fs.write", {"path": f"{shared}beta.txt", "content": "b"}),
+    ]
+
+    result = _run(_spec(tmp_path), calls, "fs.write")
+
+    assert validate_run_dir(result.run_dir) == []
+    published = [
+        event["data"]["paths"][0]
+        for event in _events(result.run_dir, "tool.call.started")
+        if event["data"].get("paths")
+    ]
+    assert len(published) == 2
+    for entry in published:
+        assert isinstance(entry, str)
+        assert entry.endswith(TRUNCATION_SUFFIX), f"{entry!r} reads as a complete filename"
+        assert len(entry.encode()) <= PREVIEW_BYTE_BUDGET + len(TRUNCATION_SUFFIX.encode())
+    assert published[0] == published[1], (
+        "the two paths do collide after the cut — which is why the marker, not the prefix, "
+        "is what tells a reader the name is partial"
+    )
+
+
+def test_a_short_path_is_published_whole_and_unmarked(tmp_path: Path) -> None:
+    """The other side of the bound. Without this, marking *every* path would pass the test above
+    while making every ordinary filename in the UI end in an ellipsis it did not earn."""
+    result = _run(
+        _spec(tmp_path), [("fs.write", {"path": "notes.md", "content": "x"})], "fs.write"
+    )
+
+    started = [e for e in _events(result.run_dir, "tool.call.started") if e["data"].get("paths")]
+    assert started[0]["data"]["paths"] == ["notes.md"]
+
+
 def test_plan_updated_carries_the_same_capped_items_as_the_tool_call_event(tmp_path: Path) -> None:
     items = [{"step": f"{LONG_STEP}-{index}", "status": "pending"} for index in range(30)]
 

@@ -263,6 +263,30 @@ def truncate_to_bytes(value: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def truncate_inline_text(value: str, *, threshold: int, budget: int) -> str:
+    """Bound a string that has to *stay* a string, marking it when it was cut.
+
+    The two callers publish values a renderer prints directly — a plan `step`, and the `paths` entry
+    `narration._target` falls back to when `args_preview.path` came through as a preview dict — so
+    neither can carry the `{"truncated": True}` envelope that says "there was more". The marker has
+    to be in the text or it does not exist.
+
+    This is one function because it was two. `paths` truncated at the budget with no threshold and
+    appended nothing, so a 5000-byte path and a different 5000-byte path sharing a prefix published
+    the *same* 160 bytes and each read as an exact, complete filename. The plan branch, three lines
+    away, had the threshold and the marker. Two sites implementing "truncate but stay a string" with
+    different answers is the shape that produced most of this release's defects, so they now cannot
+    disagree.
+
+    The result is at most ``budget`` bytes plus the marker, matching the bound already published for
+    plan steps; the marker is deliberately outside the budget rather than eating into it, so the
+    readable prefix is the same length whether or not anything was cut.
+    """
+    if len(value.encode("utf-8")) <= threshold:
+        return value
+    return truncate_to_bytes(value, budget) + TRUNCATION_SUFFIX
+
+
 class _Unmasked:
     """Sentinel: the mask looked at this value and declined to replace it."""
 
@@ -365,7 +389,7 @@ def preview_value(
         if encoded_len > threshold:
             if lowered in _INLINE_TEXT_KEYS:
                 # Stays a string: a renderer prints this one directly.
-                return truncate_to_bytes(value, budget) + TRUNCATION_SUFFIX
+                return truncate_inline_text(value, threshold=threshold, budget=budget)
             return {
                 "type": "str",
                 "preview": truncate_to_bytes(value, budget),

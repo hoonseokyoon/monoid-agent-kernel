@@ -23,6 +23,7 @@ from urllib import request as urlrequest
 import click
 
 from monoid_agent_kernel.core.model_io import content_digest
+from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.reference.studio import window
 from monoid_agent_kernel.reference.studio.server import (
     _SAMPLE_SKILLS_DIR,
@@ -515,6 +516,35 @@ def studio_doctor(
             )
     else:
         report(True, "provider 'offline' (no API key needed)")
+
+    # A hard check, not a warning: a malformed value here is a startup error by design, so leaving
+    # it out meant `doctor` could report every hard requirement passing and `serve` still die in
+    # `AgentLoop.__post_init__` on the next command. `doctor` loads the same `.env` this reads from,
+    # which is exactly where the typo lives.
+    #
+    # The effective state is reported even when the value parses, because this switch's failure mode
+    # is silent: an operator who believes they disabled a channel that publishes raw model text, and
+    # did not, learns nothing from "PASS". The env var can only turn deltas off — it is ANDed with
+    # the loop's own setting — so both inputs are named.
+    try:
+        deltas_env_permits = getenv_bool(OUTPUT_DELTAS_ENV, default=True)
+    except ValueError as exc:
+        hard_failures += 1
+        report(
+            False,
+            f"{OUTPUT_DELTAS_ENV} is set to a value that is not a boolean",
+            str(exc),
+        )
+    else:
+        if deltas_env_permits and not no_output_deltas:
+            report(
+                True,
+                "model.output.delta / model.reasoning.delta will be published to events.jsonl "
+                "(these carry raw model text)",
+            )
+        else:
+            source = f"{OUTPUT_DELTAS_ENV}" if not deltas_env_permits else "--no-output-deltas"
+            report(True, f"model-text deltas are disabled by {source}")
 
     # --- soft checks (warnings only) ---
     if window.find_chromium() is not None:

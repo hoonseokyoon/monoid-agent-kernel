@@ -35,6 +35,60 @@ def test_doctor_offline_all_good(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert "All hard checks passed" in result.output
 
 
+def test_doctor_fails_on_a_typo_in_the_delta_kill_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed switch value is a startup error by design, so preflight has to catch it.
+
+    Without this the doctor reported every hard check passing and `serve` then died in
+    `AgentLoop.__post_init__` on the next command — the exact class of late, cryptic failure this
+    command exists to convert into an upfront checklist. The doctor loads the same `.env` the loop
+    reads, which is where the typo lives.
+
+    The remedy line matters as much as the failure: `of` is a plausible spelling of `off`, so the
+    output has to say what *is* accepted rather than only that this is not.
+    """
+    monkeypatch.setenv("MONOID_OUTPUT_DELTAS", "of")
+    result = _invoke(tmp_path, "--no-env-file")
+    assert result.exit_code == 1, result.output
+    assert "MONOID_OUTPUT_DELTAS" in result.output
+    assert "[FAIL]" in result.output
+    assert "off" in result.output, "the remedy has to name the accepted values"
+
+
+@pytest.mark.parametrize(
+    ("env_value", "extra", "expected"),
+    [
+        (None, (), "will be published"),
+        ("0", (), "disabled by MONOID_OUTPUT_DELTAS"),
+        (None, ("--no-output-deltas",), "disabled by --no-output-deltas"),
+    ],
+)
+def test_doctor_reports_the_effective_delta_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str | None,
+    extra: tuple[str, ...],
+    expected: str,
+) -> None:
+    """Reporting the resolved state, not just the absence of an error.
+
+    This switch fails silently in the direction that matters: an operator who believes they turned
+    off a channel publishing raw model text, and did not, is told nothing by a bare `[PASS]`. All
+    three inputs are covered because the env var and the flag disable it independently, and a run
+    that says "disabled by" the wrong one sends someone to edit the wrong place.
+    """
+    if env_value is None:
+        monkeypatch.delenv("MONOID_OUTPUT_DELTAS", raising=False)
+    else:
+        monkeypatch.setenv("MONOID_OUTPUT_DELTAS", env_value)
+
+    result = _invoke(tmp_path, "--no-env-file", *extra)
+
+    assert result.exit_code == 0, result.output
+    assert expected in result.output
+
+
 def test_doctor_openai_without_key_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     result = _invoke(tmp_path, "--provider", "openai", "--no-env-file")

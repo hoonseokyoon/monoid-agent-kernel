@@ -43,6 +43,10 @@ out in commit messages and here.
 - A `path` argument that cannot be normalized (absolute, or containing `..`) is now redacted rather
   than raising. Normalization raises, the preview builders sit on the emit path, and the raise ended
   the run of any operator who had configured `redact_patterns`.
+- A truncated `paths` entry now ends in `…`. These stay plain strings because `narration._target`
+  falls back to them and joins them, so the cut has to be marked inside the text: an unmarked prefix
+  is presented to an operator as the exact target of a write, and two long paths sharing a prefix
+  become one indistinguishable name.
 - **`plan.updated` and `artifact.emitted` cap their model-authored payloads**, matching what
   `tool.call.started` already did with the same values. This also bounds `status.json["plan"]`.
   `plan.updated.items` stays a *typed* array through the cap: each `step` is truncated as a string
@@ -70,6 +74,10 @@ out in commit messages and here.
   Studio UI, because its event feed hydrates `final_text` from `transcript.jsonl`.
 - `transcript.jsonl` is now registered in the compatibility ledger. It became the authoritative
   source of displayed model text, so it is no longer merely a debug artifact.
+- `monoid studio doctor` validates `MONOID_OUTPUT_DELTAS` and reports the effective delta state.
+  A malformed value is a startup error by design, so without this the preflight passed and the next
+  `serve` died in `AgentLoop.__post_init__` — and an operator who *thought* they had disabled a
+  channel carrying raw model text learned nothing from a bare `[PASS]`.
 
 **What this release does not close**, stated as an exceptions list rather than an absolute claim:
 

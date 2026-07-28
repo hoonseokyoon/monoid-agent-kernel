@@ -186,6 +186,15 @@ def test_an_unparseable_switch_value_is_an_error_rather_than_a_silent_default() 
         for value, expected in (("0", False), ("off", False), ("no", False), ("1", True), ("on", True)):
             os.environ[OUTPUT_DELTAS_ENV] = value
             assert getenv_bool(OUTPUT_DELTAS_ENV, default=True) is expected
+        # An *empty* value is the one string that must not raise. `MONOID_FOO=` is how a dotenv file
+        # blanks a key, and `load_env_file` copies that empty value into `os.environ`, so treating it
+        # as unparseable would fail every run of anyone who commented out a line. Asserted because
+        # the rule lives in one `if not normalized` that reads like a redundant guard next to the
+        # `raw is None` check above it — the shape a later simplification deletes.
+        for blank in ("", "   "):
+            os.environ[OUTPUT_DELTAS_ENV] = blank
+            assert getenv_bool(OUTPUT_DELTAS_ENV, default=True) is True
+            assert getenv_bool(OUTPUT_DELTAS_ENV, default=False) is False
     finally:
         if previous is None:
             os.environ.pop(OUTPUT_DELTAS_ENV, None)

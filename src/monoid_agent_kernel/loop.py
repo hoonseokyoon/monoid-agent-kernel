@@ -168,6 +168,7 @@ from monoid_agent_kernel.providers.base import (
 )
 from monoid_agent_kernel.public_view import (
     PREVIEW_BYTE_BUDGET,
+    PREVIEW_BYTE_THRESHOLD,
     args_preview,
     finish_args_preview,
     preview_value,
@@ -176,7 +177,7 @@ from monoid_agent_kernel.public_view import (
     public_proposal_payload,
     public_result_content,
     shell_args_preview,
-    truncate_to_bytes,
+    truncate_inline_text,
     web_args_preview,
 )
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -4649,10 +4650,17 @@ def _public_paths_from_args(
     it. `public_path` redacts by pattern, which is a different question from length.
 
     Stays a list of plain strings — `narration._target` falls back to `paths` and joins them, and a
-    preview dict there would render as its repr.
+    preview dict there would render as its repr. That fallback is also why the cut has to be
+    *marked*: an unmarked prefix is presented to an operator as the exact target, and two different
+    long paths sharing a prefix become one indistinguishable string. `truncate_inline_text` is
+    shared with the plan-step branch so the two cannot answer that differently again.
     """
     return [
-        truncate_to_bytes(public_path(str(arguments[name]), permission_policy), PREVIEW_BYTE_BUDGET)
+        truncate_inline_text(
+            public_path(str(arguments[name]), permission_policy),
+            threshold=PREVIEW_BYTE_THRESHOLD,
+            budget=PREVIEW_BYTE_BUDGET,
+        )
         for name in spec.path_args
         if name in arguments and arguments[name] is not None
     ]
