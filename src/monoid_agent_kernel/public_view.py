@@ -318,11 +318,20 @@ def preview_value(
     no caps, while this one had the caps but knew nothing about secrets. Which half of the policy
     applied to a value depended only on which surface it left through. One traversal, all the rules.
 
-    ``list_marker=False`` caps a list without appending the ``{"truncated_items": n}`` element.
-    Only the *caller* knows whether it is previewing a JSON blob (where a self-describing marker is
-    the signal, and the default) or a **typed array** a consumer iterates by element shape (where
-    the marker is a foreign object). Callers that pass ``False`` are expected to report the drop
-    out-of-band; ``len(original) - len(previewed)`` gives the count without restating the cap.
+    ``list_marker=False`` caps the list **passed in** without appending the
+    ``{"truncated_items": n}`` element. Only the *caller* knows whether it is previewing a JSON blob
+    (where a self-describing marker is the signal, and the default) or a **typed array** a consumer
+    iterates by element shape (where the marker is a foreign object). Callers that pass ``False``
+    are expected to report the drop out-of-band; ``len(original) - len(previewed)`` gives the count
+    without restating the cap.
+
+    It deliberately does **not** propagate into nested containers, which is where a first attempt
+    got it wrong. Only the top-level array has the typed consumer; a list nested inside one of its
+    elements is an ordinary JSON blob, and suppressing *its* marker dropped elements that the
+    caller's ``len(original) - len(previewed)`` cannot see, because that only measures the root.
+    The result was a silent cap -- the failure this release exists to stop -- reached by binding a
+    rule to every depth on the reasoning that a rule bound at one site should be bound at its twins.
+    Nested lists are not that twin.
     """
     if mask is not None:
         replacement = mask(key, value)
@@ -345,7 +354,6 @@ def preview_value(
                 threshold=threshold,
                 budget=budget,
                 redact_content=redact_content,
-                list_marker=list_marker,
                 _depth=_depth + 1,
             )
             for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]
@@ -370,7 +378,6 @@ def preview_value(
                 threshold=threshold,
                 budget=budget,
                 redact_content=redact_content,
-                list_marker=list_marker,
                 _depth=_depth + 1,
             )
             for item in value[:PREVIEW_MAX_ITEMS]

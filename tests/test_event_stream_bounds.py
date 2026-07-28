@@ -196,6 +196,38 @@ def test_a_long_plan_is_capped_without_a_foreign_element_inside_the_typed_array(
     assert status["plan_truncated_items"] == 5
 
 
+def test_a_list_nested_inside_a_plan_item_keeps_its_own_truncation_marker(tmp_path: Path) -> None:
+    """Suppressing the marker is scoped to the array with the typed consumer, not to every depth.
+
+    The first version of this propagated `list_marker=False` all the way down, on the reasoning that
+    a rule bound at one site should be bound at its twins. Nested lists are not that twin: only the
+    root `items` array is cast to `PlanItem[]` and iterated by element shape. A list *inside* an item
+    is an ordinary JSON blob, and dropping its marker deleted elements that nothing reported — the
+    sibling `truncated_items` count measures the root only, so `len(items) - len(published)` was 0
+    while ten entries had disappeared. A silent cap, which is the failure this release exists to
+    stop, introduced by the fix for a different one.
+    """
+    items = [
+        {"step": f"step {index}", "status": "pending", "evidence": [f"ref-{n}" for n in range(30)]}
+        for index in range(25)
+    ]
+
+    result = _run(_spec(tmp_path), [("run.update_plan", {"items": items})], "run.update_plan")
+
+    assert validate_run_dir(result.run_dir) == []
+    data = _events(result.run_dir, "plan.updated")[-1]["data"]
+    published = data["items"]
+
+    # The root array is still typed and still reports its drop out-of-band.
+    assert all(isinstance(item.get("step"), str) for item in published)
+    assert data["truncated_items"] == 5
+
+    # The nested blob keeps the in-band marker, so its drop is reported too.
+    nested = published[0]["evidence"]
+    assert len(nested) == PREVIEW_MAX_ITEMS + 1
+    assert nested[-1] == {"truncated_items": 30 - PREVIEW_MAX_ITEMS}
+
+
 def test_a_later_shorter_plan_clears_the_stale_truncation_count(tmp_path: Path) -> None:
     """`status.json` is reassigned per event, not merged, and the count has to follow that.
 

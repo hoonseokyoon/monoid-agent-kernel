@@ -29,6 +29,7 @@ from monoid_agent_kernel.reference.studio.server import (
     _SAMPLE_SKILLS_DIR,
     StudioConfig,
     StudioServer,
+    _gateway_streaming_available,
     load_env_file,
 )
 from monoid_agent_kernel.reference.studio.window import open_app_window
@@ -536,15 +537,29 @@ def studio_doctor(
             str(exc),
         )
     else:
-        if deltas_env_permits and not no_output_deltas:
+        # Three inputs decide this, and `StudioServer.start` ANDs all three:
+        # `_gateway_streaming_available() and config.stream_output_deltas`, with the loop applying
+        # the env var on top. Reporting on two of them told a minimal install -- no `httpx`, which
+        # is the base package's own default -- that raw model text "will be published" when the
+        # server was about to use one-shot turns and publish none. A preflight that names the wrong
+        # cause is worse than one that stays quiet: it sends someone to disable a switch that was
+        # never the reason.
+        if not deltas_env_permits:
+            report(True, f"model-text deltas are disabled by {OUTPUT_DELTAS_ENV}")
+        elif no_output_deltas:
+            report(True, "model-text deltas are disabled by --no-output-deltas")
+        elif not _gateway_streaming_available():
+            report(
+                True,
+                "model-text deltas are off because the async transport is not installed "
+                "(Studio uses one-shot turns without the [http-async] extra)",
+            )
+        else:
             report(
                 True,
                 "model.output.delta / model.reasoning.delta will be published to events.jsonl "
                 "(these carry raw model text)",
             )
-        else:
-            source = f"{OUTPUT_DELTAS_ENV}" if not deltas_env_permits else "--no-output-deltas"
-            report(True, f"model-text deltas are disabled by {source}")
 
     # --- soft checks (warnings only) ---
     if window.find_chromium() is not None:

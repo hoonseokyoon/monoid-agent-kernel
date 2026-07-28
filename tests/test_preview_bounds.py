@@ -25,6 +25,7 @@ from monoid_agent_kernel.public_view import (
     PREVIEW_BYTE_BUDGET,
     PREVIEW_BYTE_THRESHOLD,
     PREVIEW_MAX_DEPTH,
+    PREVIEW_MAX_ITEMS,
     PREVIEW_MAX_KEYS,
     args_preview,
     preview_value,
@@ -252,3 +253,29 @@ def test_depth_and_width_caps_leave_ordinary_payloads_untouched() -> None:
     }
 
     assert args_preview(arguments, PermissionPolicy()) == arguments
+
+
+def test_list_marker_applies_to_the_value_passed_in_and_not_to_nested_containers() -> None:
+    """Pins the entry point the integration test cannot reach, because nothing calls it yet.
+
+    `plan.updated` hands `preview_value` the typed array directly, so only the list branch's
+    suppression is observable end to end. The *dict* branch has the same rule and no caller today —
+    exactly the shape that gets "tidied up" into propagating again, silently suppressing markers on
+    every list nested under a mapping the day someone does pass one.
+
+    The rule is scope, not depth: `list_marker=False` describes the value handed in. A list one
+    level down inside a mapping is a different value with a different consumer, and it keeps its
+    marker.
+    """
+    policy = PermissionPolicy()
+    long_list = [f"item-{index}" for index in range(PREVIEW_MAX_ITEMS + 7)]
+
+    # Entry point 1: the value itself is the list — suppression applies.
+    assert preview_value("items", long_list, policy, list_marker=False) == long_list[:PREVIEW_MAX_ITEMS]
+
+    # Entry point 2: the value is a mapping — the nested list is not what the caller described.
+    nested = preview_value("payload", {"refs": long_list}, policy, list_marker=False)
+    assert nested["refs"][-1] == {"truncated_items": 7}
+
+    # And the default still marks in both positions.
+    assert preview_value("items", long_list, policy)[-1] == {"truncated_items": 7}

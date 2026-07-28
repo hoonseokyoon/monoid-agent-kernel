@@ -57,11 +57,12 @@ def test_doctor_fails_on_a_typo_in_the_delta_kill_switch(
 
 
 @pytest.mark.parametrize(
-    ("env_value", "extra", "expected"),
+    ("env_value", "extra", "transport", "expected"),
     [
-        (None, (), "will be published"),
-        ("0", (), "disabled by MONOID_OUTPUT_DELTAS"),
-        (None, ("--no-output-deltas",), "disabled by --no-output-deltas"),
+        (None, (), True, "will be published"),
+        ("0", (), True, "disabled by MONOID_OUTPUT_DELTAS"),
+        (None, ("--no-output-deltas",), True, "disabled by --no-output-deltas"),
+        (None, (), False, "async transport is not installed"),
     ],
 )
 def test_doctor_reports_the_effective_delta_state(
@@ -69,15 +70,26 @@ def test_doctor_reports_the_effective_delta_state(
     monkeypatch: pytest.MonkeyPatch,
     env_value: str | None,
     extra: tuple[str, ...],
+    transport: bool,
     expected: str,
 ) -> None:
     """Reporting the resolved state, not just the absence of an error.
 
     This switch fails silently in the direction that matters: an operator who believes they turned
-    off a channel publishing raw model text, and did not, is told nothing by a bare `[PASS]`. All
-    three inputs are covered because the env var and the flag disable it independently, and a run
-    that says "disabled by" the wrong one sends someone to edit the wrong place.
+    off a channel publishing raw model text, and did not, is told nothing by a bare `[PASS]`.
+
+    Every input `StudioServer.start` ANDs together gets a case, and each asserts on the *named
+    cause* rather than on "off", because naming the wrong one sends someone to edit the wrong
+    place. The transport case is the one a first version missed: without `httpx` — the base
+    package's own default — the server uses one-shot turns and publishes no deltas at all, while
+    the doctor announced raw model text was about to be published.
+
+    `transport` is patched rather than inferred so the expected line does not depend on whether the
+    machine running the suite happens to have the optional extra installed.
     """
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.cli._gateway_streaming_available", lambda: transport
+    )
     if env_value is None:
         monkeypatch.delenv("MONOID_OUTPUT_DELTAS", raising=False)
     else:
