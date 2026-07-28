@@ -22,12 +22,24 @@ out in commit messages and here.
   sliced characters, so any string with at most 160 characters and more than 240 bytes was published
   in full while the payload reported `truncated: true` — in practice, no cap at all for non-ASCII
   text. `shell.preview_command` had the same defect independently, with different constants.
-- **The tool-approval preview is now bounded.** `arguments_preview` masked secret-named keys but
-  applied no length, depth or item cap, so an `ask`-gated `fs.write` published the entire file body
-  on `task.started`, in `task.json`, and back to the model through `job.list`. It keeps the masking
-  and gains the caps. For tool approvals the record now carries `arguments_digest`, addressing the
-  raw arguments in the run's blob store, fetchable through the existing run-token-authorized
-  `/api/artifact?run_id=&digest=` route.
+- **The tool-approval preview is now bounded**, and **secret-named keys are masked on the ordinary
+  `allow` path too.** `arguments_preview` masked secrets but applied no length, depth or item cap, so
+  an `ask`-gated `fs.write` published the entire file body on `task.started`, in `task.json`, and
+  back to the model through `job.list`. Its twin `args_preview` — which fires on nearly every call —
+  had the caps and no masking, so whether an `api_key` argument was published verbatim depended only
+  on the tool's authorization decision. Both now run one traversal carrying both rules.
+  The approval preview keeps a **much larger byte budget** than the trace preview: a person reads it
+  to decide whether a call may run, and a command cut mid-string hides the part that matters, with
+  the model choosing where that part sits. File contents stay withheld there by field name at any
+  length. Past that budget the record carries `arguments_digest`, addressing the raw arguments in the
+  run's blob store over the run-token-authorized `/api/artifact?run_id=&digest=` route — a durable
+  handle and an API affordance; **no shipped UI reads it yet**.
+- `web.search` / `web.fetch` and `shell.exec` previews no longer copy their descriptors raw. Both
+  branches exist to withhold something (the query and URL; env *values*), and an unbounded `locale`,
+  `blocked_domains` entry or env *key* let a model publish exactly what was being withheld.
+- A `path` argument that cannot be normalized (absolute, or containing `..`) is now redacted rather
+  than raising. Normalization raises, the preview builders sit on the emit path, and the raise ended
+  the run of any operator who had configured `redact_patterns`.
 - **`plan.updated` and `artifact.emitted` cap their model-authored payloads**, matching what
   `tool.call.started` already did with the same values. This also bounds `status.json["plan"]`.
 - Tool arguments nested deeper than 64 levels are now rejected with a `ValueError` the model can
@@ -48,9 +60,26 @@ out in commit messages and here.
   source of displayed model text, so it is no longer merely a debug artifact.
 
 **What this release does not close**, stated as an exceptions list rather than an absolute claim:
-per-tool prose in `args_preview`, validator and JSON-schema error text, a subagent's answer on
-`task.finished`, and `job.list`'s exposure of hosted tasks to the model. And the delta channel
-remains **on by default in Studio** unless switched off. See `docs/OBSERVABILITY.md`.
+
+- per-tool prose in `args_preview` (only `preview_kind="finish"` redacts it);
+- validator and JSON-schema error text;
+- a subagent's answer on `task.finished`;
+- `job.list` / `job.status` exposing hosted-task payloads to the model;
+- **`task.started.data.prompt`** — the model-authored delegation brief or HITL question, uncapped and
+  neither previewed nor digested;
+- **secret-named argument values on the ordinary tool-call path.** `args_preview` deliberately does
+  not guess at secrets from key names — that heuristic was removed on purpose and redaction beyond
+  content fields is the integrating backend's job via the `EventSink` seam
+  (`examples/redacting_event_sink.py`). The *approval* record does mask them, so an `api_key`
+  argument is masked on an `ask`-gated call and published verbatim on an `allow` call. Documented
+  rather than changed, because changing it would reverse a deliberate architectural decision;
+- and the delta channel remains **on by default in Studio** unless switched off.
+
+Also worth knowing: the approval `arguments_digest` blob is raw content at rest under the run's
+checkpoint store. It is deleted when a run *completes*; a failed, limited or abandoned-parked run
+keeps its checkpoints by design, so on that path the blob persists until the run root is cleaned up.
+
+See `docs/OBSERVABILITY.md` for the full public/private split.
 
 - Added `ModelCallRunner`, which executes one model call against any adapter shape — a blocking
   `next_turn`, a coroutine `next_turn`, `anext_turn`, or a streamed `astream_turn` — through a single

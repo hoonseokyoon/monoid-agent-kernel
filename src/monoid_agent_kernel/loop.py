@@ -168,6 +168,7 @@ from monoid_agent_kernel.providers.base import (
     format_async_result_text,
 )
 from monoid_agent_kernel.public_view import (
+    PREVIEW_BYTE_BUDGET,
     args_preview,
     finish_args_preview,
     preview_value,
@@ -176,6 +177,7 @@ from monoid_agent_kernel.public_view import (
     public_proposal_payload,
     public_result_content,
     shell_args_preview,
+    truncate_to_bytes,
     web_args_preview,
 )
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -873,7 +875,13 @@ class AgentLoop:
         #
         # Subagents are deliberately NOT special-cased: each child re-runs this on its own
         # construction, so one variable covers a run and every run it spawns.
-        if self.emit_output_deltas and not getenv_bool(OUTPUT_DELTAS_ENV, default=True):
+        # Read unconditionally, and only then combine. Guarding the read behind
+        # `self.emit_output_deltas and ...` short-circuited it away in exactly the configurations
+        # where the operator most needs the feedback -- the kernel default, and Studio without
+        # `httpx` -- so a typo'd value was never validated for them at all. `getenv_bool`'s promise
+        # that a malformed value is an error rather than a silent no-op has to hold for everyone.
+        deltas_permitted = getenv_bool(OUTPUT_DELTAS_ENV, default=True)
+        if self.emit_output_deltas and not deltas_permitted:
             self.emit_output_deltas = False
         self._bootstrapper = LoopBootstrapper(self)
         self._settle_coordinator = LoopSettleCoordinator(self)
@@ -3835,17 +3843,30 @@ class AgentLoop:
         # run-token-authorized `/api/artifact?run_id=&digest=` route -- entitlement rather than a
         # wider public field. Two properties worth stating rather than discovering in review:
         # the digest is an unkeyed confirmation oracle, so anyone holding it can verify a *guess* at
-        # low-entropy arguments (the same trade already taken for `final_text_digest`); and the
-        # store is dropped when a run completes, so the handle is live exactly while the run is --
-        # which is exactly when an approval is pending.
+        # low-entropy arguments (the same trade already taken for `final_text_digest`); and the blob
+        # is raw content at rest, deleted with the checkpoint store when a run *completes*. A
+        # failed, limited or abandoned-parked run keeps its checkpoints on purpose (so a last-good
+        # one stays restorable), so on exactly the lifecycle where an approval is never answered the
+        # raw arguments persist on disk until the run root is cleaned up. Not "live only while the
+        # run is" -- state it as the retention it actually is.
         try:
             task_request["arguments_digest"] = self._checkpoint_store().put_blob(
                 self.spec.run_id, approval_arguments_blob(task_request["arguments"])
             )
-        except (OSError, NotImplementedError):
-            # A store that cannot take the blob must not turn into a failed tool call. An absent
-            # key means "not retained", which is a state a reader can act on; a present key that
-            # resolves to nothing would not be.
+        except Exception:  # noqa: BLE001 - see below; the blob is an affordance, not a requirement
+            # A store that cannot take the blob must not affect the run at all. An absent key means
+            # "not retained", which a reader can act on; a present key resolving to nothing could
+            # not be.
+            #
+            # Deliberately broad, after measuring what a narrow clause actually caught.
+            # `(OSError, NotImplementedError)` covered only `LocalFsCheckpointStore`, whose
+            # `file_lock` raises `TimeoutError`/`PermissionError`. `CheckpointStore` is a `Protocol`
+            # and an integrator seam, so a conforming store predating `put_blob` raises
+            # `AttributeError`, and the store this repo *ships* -- `SqliteCheckpointStore`, whose
+            # `put_blob` opens `BEGIN IMMEDIATE` -- raises `sqlite3.OperationalError` on a locked
+            # database. Neither is an `OSError`, and neither is caught by the tool-call handler
+            # either, so both terminalized the whole run and created no approval task at all. A
+            # missing convenience handle is not worth a failed run.
             pass
         task_id = context.job_manager.create_task(TOOL_APPROVAL_TASK_KIND, task_request)
         recorder.emit(
@@ -4626,8 +4647,17 @@ def _public_paths_from_args(
     arguments: dict[str, Any],
     permission_policy: PermissionPolicy,
 ) -> list[str]:
+    """Public `paths` for an event, bounded like every other published copy of the same value.
+
+    `paths` and `args_preview.path` are the *same argument* on the *same event*, and only the second
+    was capped: a 5000-character path arrived truncated in one field and whole in the field beside
+    it. `public_path` redacts by pattern, which is a different question from length.
+
+    Stays a list of plain strings — `narration._target` falls back to `paths` and joins them, and a
+    preview dict there would render as its repr.
+    """
     return [
-        public_path(str(arguments[name]), permission_policy)
+        truncate_to_bytes(public_path(str(arguments[name]), permission_policy), PREVIEW_BYTE_BUDGET)
         for name in spec.path_args
         if name in arguments and arguments[name] is not None
     ]

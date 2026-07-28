@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import pytest
 
+from monoid_agent_kernel.core.tool_approval import redact_tool_arguments
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
     PREVIEW_BYTE_BUDGET,
@@ -27,7 +28,10 @@ from monoid_agent_kernel.public_view import (
     PREVIEW_MAX_KEYS,
     args_preview,
     preview_value,
+    redacted_value,
+    shell_args_preview,
     truncate_to_bytes,
+    web_args_preview,
 )
 from monoid_agent_kernel.shell import COMMAND_PREVIEW_BYTE_BUDGET, preview_command
 
@@ -146,6 +150,24 @@ def test_a_short_value_is_returned_unchanged_rather_than_copied_through_the_enco
     assert truncate_to_bytes("가나다", 240) == "가나다"
 
 
+def test_the_trace_and_approval_previews_disagree_on_secrets_on_purpose() -> None:
+    """An asymmetry that looks like this release's defect shape and is not one.
+
+    `redact_tool_arguments` masks secret-*named* keys; `args_preview` does not. Reading that as a
+    twin-miss and "fixing" it reverses `0109e06`, which removed unconfigurable key-name guessing from
+    `public_view` on purpose and made redaction beyond content fields the integrating backend's job
+    via the `EventSink` seam (`examples/redacting_event_sink.py`). The approval record is a different
+    artifact — a human acts on it — so it masks.
+
+    Pinned from both sides so that neither half can drift without a deliberate decision, and so a
+    future reader does not have to re-derive which behaviour is intended.
+    """
+    arguments = {"api_key": "sk-live-DEADBEEF"}
+
+    assert args_preview(arguments, PermissionPolicy())["api_key"] == "sk-live-DEADBEEF"
+    assert redact_tool_arguments(arguments)["api_key"] == "[redacted]"
+
+
 def test_deep_nesting_is_capped_instead_of_raising() -> None:
     """``metadata`` and plan items are ``additionalProperties: True``, so depth is model-controlled.
 
@@ -172,6 +194,38 @@ def test_a_wide_mapping_is_capped_and_says_how_much_it_dropped() -> None:
 
     assert len(result) == PREVIEW_MAX_KEYS + 1  # the kept keys plus the marker
     assert result["truncated_keys"] == 5
+
+
+def test_the_web_and_shell_previews_do_not_bypass_the_cap() -> None:
+    """Two of the four dispatch branches copied their descriptors straight through.
+
+    `web_args_preview` exists to withhold the query and the URL, and `shell_args_preview` to withhold
+    env *values* — so a `locale`, a `blocked_domains` entry or an env *key* carrying 20 KB made each
+    branch a way to publish exactly what it was withholding, in the same event.
+    """
+    smuggled = "Z" * 5000
+
+    web = web_args_preview(
+        {"query": "hidden", "locale": smuggled, "blocked_domains": ["EXFIL-" + smuggled]},
+        PermissionPolicy(),
+    )
+    shell = shell_args_preview({"command": "echo hi", "env": {"K_" + smuggled: "v"}}, PermissionPolicy())
+
+    assert smuggled not in str(web)
+    assert smuggled not in str(shell)
+    assert web["query_preview"] and "hidden" not in str(web["query_preview"])
+
+
+def test_an_unnormalizable_path_is_redacted_rather_than_raising() -> None:
+    """`is_path_redacted` normalizes before matching and *raises* on an absolute or `..` path — both
+    of which a model can put in a `path` argument. These builders sit on the emit path, so a raise
+    here ends the run of any operator who merely configured `redact_patterns`. Fail closed."""
+    policy = PermissionPolicy(redact_patterns=("secrets/**",))
+
+    for path in ("/etc/passwd", "../../etc/passwd"):
+        assert preview_value("path", path, policy) == redacted_value(path)
+    # A normal relative path outside the patterns is still published.
+    assert preview_value("path", "notes/a.md", policy) == "notes/a.md"
 
 
 def test_the_width_cap_does_not_reach_top_level_argument_keys() -> None:

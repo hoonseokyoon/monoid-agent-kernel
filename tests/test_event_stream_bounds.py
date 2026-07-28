@@ -24,7 +24,12 @@ from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
-from monoid_agent_kernel.public_view import PREVIEW_BYTE_BUDGET, PREVIEW_MAX_ITEMS, PREVIEW_MAX_KEYS
+from monoid_agent_kernel.public_view import (
+    PREVIEW_BYTE_BUDGET,
+    PREVIEW_MAX_ITEMS,
+    PREVIEW_MAX_KEYS,
+    TRUNCATION_SUFFIX,
+)
 
 LONG_STEP = "가" * 200  # 600 bytes: over the threshold, under the old 160-character slice.
 
@@ -67,14 +72,25 @@ def test_plan_updated_carries_the_same_capped_items_as_the_tool_call_event(tmp_p
     # And the bound really bound: capped in width, and each step capped in bytes.
     assert len(published) == PREVIEW_MAX_ITEMS + 1
     assert published[-1] == {"truncated_items": len(items) - PREVIEW_MAX_ITEMS}
-    assert len(published[0]["step"]["preview"].encode()) <= PREVIEW_BYTE_BUDGET
+    # A *string*, not a preview dict. `WorkspaceInspector.svelte` renders `{item.step}` directly, so
+    # a dict here renders `[object Object]` — and `svelte-check` cannot catch it, because
+    # `run-state.ts` casts the items through `unknown` to `PlanItem[]`.
+    assert isinstance(published[0]["step"], str)
+    assert published[0]["step"].endswith(TRUNCATION_SUFFIX)
+    assert len(published[0]["step"].encode()) <= PREVIEW_BYTE_BUDGET + len(TRUNCATION_SUFFIX.encode())
     assert LONG_STEP not in (result.run_dir / "events.jsonl").read_text(encoding="utf-8")
 
 
-def test_plan_items_stay_objects_so_the_run_dir_still_validates(tmp_path: Path) -> None:
-    """``plan.updated.items`` is ``_OBJ_ARRAY``; a step replaced by a preview dict is fine, an
-    *item* replaced by one is not. ``WorkspaceInspector`` reads ``items[].step`` directly, so this
-    also pins that the renderer still finds a row rather than a blank."""
+def test_plan_items_stay_renderable_objects_with_string_steps(tmp_path: Path) -> None:
+    """Two separate properties, and an earlier version of this test asserted the second one wrong.
+
+    ``plan.updated.items`` is ``_OBJ_ARRAY``, so each *item* must stay an object — that is the
+    schema half. The renderer half is that ``items[].step`` must stay a **string**: the previous
+    implementation replaced it with a ``{"preview": ...}`` dict, which `validate_run_dir` accepts
+    and `WorkspaceInspector.svelte:52` renders as ``[object Object]``. The test passed while
+    claiming the renderer "still finds a row rather than a blank"; it found a row reading
+    ``[object Object]``. Both halves are asserted here.
+    """
     items = [{"step": LONG_STEP, "status": "pending"}]
 
     result = _run(_spec(tmp_path), [("run.update_plan", {"items": items})], "run.update_plan")
@@ -83,7 +99,8 @@ def test_plan_items_stay_objects_so_the_run_dir_still_validates(tmp_path: Path) 
     published = _events(result.run_dir, "plan.updated")[-1]["data"]["items"]
     assert isinstance(published[0], dict)
     assert published[0]["status"] == "pending"
-    assert published[0]["step"]["truncated"] is True
+    assert isinstance(published[0]["step"], str)
+    assert LONG_STEP[:20] in published[0]["step"], "the step is truncated, not replaced"
 
 
 def test_status_json_gets_the_capped_plan_rather_than_a_second_uncapped_copy(tmp_path: Path) -> None:

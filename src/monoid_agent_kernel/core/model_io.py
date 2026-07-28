@@ -499,11 +499,29 @@ def content_length(value: Any) -> int | None:
     return len(value) if isinstance(value, str) else None
 
 
-def _jsonish(value: Any) -> Any:
+# Bound on the structural depth this will normalize. Reached from `content_digest`, which
+# `dispatch_model_call` computes over a turn's raw tool-call arguments -- model-controlled, and
+# `json.loads` will hand us up to ~994 levels. Unbounded, this raised `RecursionError` from ~495,
+# and `RecursionError` is a `RuntimeError`, not a `ValueError`, so it escapes the handlers that would
+# otherwise turn a bad payload into a failed call. `core.tool_approval` has the same-named function
+# with the same shape; bounding one and not the other is precisely the twin-miss this release keeps
+# finding, and this side fires *earlier* -- during the model-call publish, before tool dispatch.
+MAX_JSONISH_DEPTH = 64
+
+# What replaces a subtree past the bound. A marker rather than a raise: this runs inside digest and
+# observer publication, where the caller wants an identifier for the payload, not an exception.
+# Distinct and constant, so two payloads differing only below the bound still digest identically --
+# which is honest, because at that depth the digest genuinely cannot distinguish them.
+_DEPTH_ELIDED = "[depth-elided]"
+
+
+def _jsonish(value: Any, _depth: int = 0) -> Any:
+    if _depth > MAX_JSONISH_DEPTH:
+        return _DEPTH_ELIDED
     if isinstance(value, Mapping):
-        return {str(key): _jsonish(item) for key, item in value.items()}
+        return {str(key): _jsonish(item, _depth + 1) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_jsonish(item) for item in value]
+        return [_jsonish(item, _depth + 1) for item in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)

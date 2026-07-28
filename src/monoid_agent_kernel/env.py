@@ -43,9 +43,12 @@ def getenv_bool(name: str, *, default: bool) -> bool:
     did nothing.
     """
     raw = getenv(name)
-    if raw is None:
+    normalized = "" if raw is None else raw.strip().lower()
+    if not normalized:
+        # An empty value reads as unset, not as an error. `MONOID_FOO=` is the ordinary way to blank
+        # a key in a dotenv file, and `load_env_file` copies empty values into `os.environ` — so
+        # rejecting it would turn a routine edit into a hard failure of every run.
         return default
-    normalized = raw.strip().lower()
     if normalized in _TRUE_VALUES:
         return True
     if normalized in _FALSE_VALUES:

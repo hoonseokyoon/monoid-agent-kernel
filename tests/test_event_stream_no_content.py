@@ -193,14 +193,58 @@ def test_an_unparseable_switch_value_is_an_error_rather_than_a_silent_default() 
             os.environ[OUTPUT_DELTAS_ENV] = previous
 
 
-def test_studio_exposes_the_switch_independently_of_the_optional_transport() -> None:
-    """Studio derived `emit_output_deltas` from `find_spec("httpx")` alone, so the only way to stop
-    publishing model text to `events.jsonl` was to uninstall a package. Whether streaming is
-    *possible* and whether an operator *wants* the durable events are separate questions."""
-    from monoid_agent_kernel.reference.studio.server import StudioConfig
+def test_studio_wires_the_switch_from_the_flag_through_to_the_backend(tmp_path: Path) -> None:
+    """The Studio half, bound at the two places that actually decide it.
 
-    assert StudioConfig(workspace=Path(".")).stream_output_deltas is True
-    assert StudioConfig(workspace=Path("."), stream_output_deltas=False).stream_output_deltas is False
+    An earlier version of this test only read `StudioConfig(...).stream_output_deltas` back. That is
+    the builder, not the wiring: reverting *both* `server.py`'s
+    `stream_gateway_output = _gateway_streaming_available() and self.config.stream_output_deltas` and
+    `cli.py`'s `stream_output_deltas=not no_output_deltas` left the entire Studio suite green. The
+    half the commit calls the whole point — "for the shipped app the channel was ON, with no
+    supported way to close it" — was unbound. Same gap as the policy-threading one, one commit later.
+    """
+    from monoid_agent_kernel.reference.studio.cli import _studio_config
+    from monoid_agent_kernel.reference.studio.server import StudioConfig, StudioServer
+
+    # 1. The CLI flag reaches the config.
+    common = {
+        "workspace": tmp_path,
+        "host": "127.0.0.1",
+        "port": 0,
+        "provider": "offline",
+        "run_root": tmp_path / "runs",
+        "skills_directory": tmp_path,
+        "no_skills": True,
+        "mcp": False,
+        "env_file": tmp_path / ".env",
+        "no_env_file": True,
+    }
+    assert _studio_config(**common, no_output_deltas=True).stream_output_deltas is False
+    assert _studio_config(**common).stream_output_deltas is True
+
+    # 2. The config reaches the backend the runs are built from.
+    def backend_deltas(*, stream: bool) -> bool:
+        workspace = tmp_path / f"ws-{stream}"
+        workspace.mkdir()
+        server = StudioServer(
+            StudioConfig(
+                workspace=workspace,
+                port=0,
+                run_root=tmp_path / f"runs-{stream}",
+                stream_output_deltas=stream,
+            )
+        )
+        try:
+            server.start()
+            return bool(server._backend.emit_output_deltas)
+        finally:
+            server.shutdown()
+
+    assert backend_deltas(stream=False) is False, "the flag never reached the backend"
+    # With the flag on, the transport decides — which is the pre-existing behaviour, not this switch.
+    from monoid_agent_kernel.reference.studio.server import _gateway_streaming_available
+
+    assert backend_deltas(stream=True) is _gateway_streaming_available()
 
 
 def test_kernel_authored_limit_text_stays_inline(tmp_path: Path) -> None:

@@ -6,7 +6,12 @@ from typing import Any
 from monoid_agent_kernel.core._util import _canonical_bytes, canonical_sha256
 from monoid_agent_kernel.core.model_io import DEFAULT_SECRET_KEY_PARTS, REDACTION_PLACEHOLDER
 from monoid_agent_kernel.permissions import PermissionPolicy
-from monoid_agent_kernel.public_view import UNMASKED, preview_value
+from monoid_agent_kernel.public_view import (
+    APPROVAL_BYTE_BUDGET,
+    APPROVAL_BYTE_THRESHOLD,
+    UNMASKED,
+    preview_value,
+)
 from monoid_agent_kernel.tools.base import ToolSpec
 
 TOOL_APPROVAL_TASK_KIND = "tool_approval"
@@ -131,7 +136,14 @@ def redact_tool_arguments(
         return UNMASKED
 
     return {
-        str(key): preview_value(str(key), value, resolved, mask=mask)
+        str(key): preview_value(
+            str(key),
+            value,
+            resolved,
+            mask=mask,
+            threshold=APPROVAL_BYTE_THRESHOLD,
+            budget=APPROVAL_BYTE_BUDGET,
+        )
         for key, value in arguments.items()
     }
 

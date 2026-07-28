@@ -26,9 +26,11 @@ Each run writes:
 - `artifacts/jobs/<job_id>/`: background job status (`job.json`) and `stdout.log` / `stderr.log`
 - `artifacts/tasks/<task_id>/task.json`: hosted-task record (hitl, subagent, capability, tool
   approval). **Private by location, like `transcript.jsonl`** — it is not served over HTTP and is
-  not in the export allowlist, so it keeps values the event stream drops. It carries a bounded
-  `arguments_preview`, and for a tool approval an `arguments_digest` addressing the raw arguments in
-  the run's blob store; it does *not* carry the raw arguments inline.
+  not in the export allowlist, so it keeps values the event stream drops. A **tool-approval** record
+  carries a bounded `arguments_preview` plus an `arguments_digest` addressing the raw arguments in
+  the run's blob store, and not the raw arguments inline. The other kinds (hitl, subagent,
+  capability) have no `arguments_preview` at all, and their `result` is written **raw** — that is
+  what "private by location" buys, and it is why this file is not a public surface.
 
 Proposed file contents are exposed only through the run directory snapshot or
 run-token protected backend proposal APIs.
@@ -54,17 +56,37 @@ Carried, deliberately:
 
 - **`model.output.delta` and `model.reasoning.delta` carry raw model text**, and Studio enables them
   whenever the optional `httpx` extra is installed. These are durable events, not a live-only side
-  channel, so the assembled answer is reconstructible from the file — note that it arrives split
-  across fragments, so **grepping the event log for a known string will not find it and is not a
-  valid check**. Disable with `MONOID_OUTPUT_DELTAS=0` (whole deployment, subagents included),
+  channel, so the assembled answer is reconstructible from the file. **Do not use a grep for a known
+  string to decide whether the answer is present**: the text is split at whatever boundaries the
+  provider streamed, so a substring search finds it when the answer happened to arrive in one chunk
+  and misses it when it did not. Absence of a grep hit is not absence of the content — concatenate
+  `data.text` across the run's `model.output.delta` records instead. Disable with
+  `MONOID_OUTPUT_DELTAS=0` (whole deployment, subagents included),
   `monoid studio --no-output-deltas`, or `StudioConfig(stream_output_deltas=False)`. The cost is
   live token rendering; `AgentLoop.astream` is unaffected, since it takes a different path.
 - **Bounded previews of tool arguments** (`args_preview`, `arguments_preview`), including a preview
-  of paths, commands, plan steps and artifact metadata. Secret-*named* keys are masked; values that
-  are secret without a telling key name are the integrator's responsibility, via
-  `PermissionPolicy.redact_patterns`.
+  of paths, commands, plan steps and artifact metadata.
+- **Secret-named argument values, on the ordinary tool-call path.** The core does *not* guess at
+  secrets from key names here; that heuristic was deliberately removed, and redaction beyond
+  content fields is the integrating backend's job through the `EventSink` seam — see
+  `examples/redacting_event_sink.py`. The approval record (`arguments_preview` on a `tool_approval`
+  task) is the exception and *does* mask secret-named keys, because a human acts on it directly. So
+  an `api_key` argument is masked on an `ask`-gated call and published verbatim on an `allow` call.
+  If you want it masked on both, attach the example sink, or do not pass credentials as tool
+  arguments. `PermissionPolicy.redact_patterns` will not help: it is a *workspace path* glob list,
+  consulted only for `path` / `root` / `cwd`.
+- The **approval** preview (`arguments_preview`) is bounded far more loosely than the trace preview,
+  because a person reads it to decide whether a call may run: a command cut mid-string hides the part
+  that matters, and the model chooses where in the string that part sits. File contents are still
+  withheld there by field name regardless of length. When a value does exceed even that budget, the
+  approval record carries `arguments_digest` addressing the raw arguments in the run's blob store,
+  fetchable over the run-token-authorized `/api/artifact?run_id=&digest=` route. **No shipped UI
+  reads that digest yet** — it is a durable handle and an API affordance, not a finished workflow.
 - **Error messages and paths**, which can name workspace structure.
-- **A subagent's answer** on `task.finished`, and hosted-task prompts.
+- **A subagent's answer** on `task.finished`.
+- **Hosted-task prompts** (`task.started.data.prompt`) — the model-authored delegation brief or HITL
+  question, **uncapped**. Model-authored prose on a public surface, and the one route on this list
+  that is neither previewed nor digested.
 
 Studio adds `studio.chat.jsonl` inside each Studio run directory as the browser-facing chat
 projection. The Studio UI restores user, assistant, and error messages from
