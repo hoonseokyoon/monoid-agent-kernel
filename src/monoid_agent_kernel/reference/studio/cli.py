@@ -22,6 +22,7 @@ from urllib import request as urlrequest
 
 import click
 
+from monoid_agent_kernel.core.model_io import content_digest
 from monoid_agent_kernel.reference.studio import window
 from monoid_agent_kernel.reference.studio.server import (
     _SAMPLE_SKILLS_DIR,
@@ -102,17 +103,31 @@ def run_acceptance(
         check("chat-start", bool(run_id) and "run_token" not in chat)
         deadline = time.time() + timeout_s
         final_text = ""
+        settled_digest = ""
         state = ""
         while run_id and time.time() < deadline:
             events = server.poll_events(run_id, 0).get("events", [])
             settled = [event for event in events if event.get("type") == "turn.settled"]
             if settled:
-                final_text = str((settled[-1].get("data") or {}).get("final_text") or "")
+                settled_data = settled[-1].get("data") or {}
+                final_text = str(settled_data.get("final_text") or "")
+                settled_digest = str(settled_data.get("final_text_digest") or "")
                 state = str(server.run_status(run_id).get("state") or "")
                 if state != "running":
                     break
             time.sleep(0.1)
         check("deterministic-chat", bool(final_text), final_text[:120])
+        # Both halves of the settled-text join, from the one surface that sees them together.
+        # ``poll_events`` reads through the hydration seam, so a settle event arriving with *both* a
+        # digest and matching text proves the emit side published the digest AND the reader joined
+        # the transcript record back. Checking only ``deterministic-chat`` above cannot tell a
+        # working join from a flip that never happened; checking only the digest cannot tell a
+        # published digest from an unresolvable one.
+        check(
+            "settled-text-digest",
+            bool(settled_digest) and settled_digest == content_digest(final_text),
+            settled_digest[:16],
+        )
         transcript = _http_json(f"{base_url}/api/chat-transcript?run_id={quote(run_id)}") if run_id else {}
         transcript_messages = transcript.get("messages") if isinstance(transcript.get("messages"), list) else []
         transcript_roles = [str(message.get("role") or "") for message in transcript_messages]

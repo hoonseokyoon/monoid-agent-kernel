@@ -27,6 +27,8 @@ from monoid_agent_kernel.providers.fake import FakeModelAdapter, FakeStreamingMo
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 
+_SETTLE_TYPES = {"turn.settled", "run.finished"}
+
 
 def _workspace(tmp_path: Path) -> Path:
     workspace = tmp_path / "workspace"
@@ -169,14 +171,10 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
 
     monkeypatch.setattr(run_execution, "stream_item_frame", frame_spy)
     monkeypatch.setattr(run_execution, "hydrate_settled_text", spy)
-    # Force the resolving path. No event carries a digest until the emit change lands, so without
-    # this the stream correctly skips hydration entirely and every assertion below would pass
-    # vacuously on a run that never resolved anything.
-    monkeypatch.setattr(
-        run_execution,
-        "needs_settled_text",
-        lambda events: any(event.get("kind") == "event" for event in events),
-    )
+    # Driven by real emissions. This previously monkeypatched ``needs_settled_text`` to claim every
+    # ``kind: event`` frame needed text, because nothing carried a digest until the emit change
+    # landed. Now that settle events do, that patch would be a mask — it would mark frames the real
+    # gate skips, so the test would keep passing if the gate broke.
 
     workspace = _workspace(tmp_path)
     backend = _streaming_backend(
@@ -200,21 +198,30 @@ def test_astream_run_hydrates_event_frames_and_not_delta_frames(
     assert hydrated_threads and threading.get_ident() not in hydrated_threads
 
 
-def test_astream_run_does_not_hop_threads_when_no_frame_needs_text(
+def test_astream_run_hops_threads_only_for_the_frames_carrying_a_digest(
     tmp_path: Path, backend_factory: Any, monkeypatch: Any
 ) -> None:
-    """No digest on the wire means no thread hop — the case that is 100% of frames today.
+    """Only the two settle frames need resolving; the rest must not pay for a thread hop.
 
-    The executor the hop targets is process-wide and bounded (32 workers), and runs parked
-    awaiting hosted tasks hold a worker each for up to `task_wait_poll_s`. An unconditional hop
-    would therefore queue every event frame's delivery behind them, to do no work at all.
+    The executor the hop targets is process-wide and bounded (32 workers), and runs parked awaiting
+    hosted tasks hold a worker each for up to `task_wait_poll_s`. An unconditional hop would queue
+    every event frame's delivery behind them to do no work at all.
+
+    This asserted ``hydrated == []`` when nothing on the wire carried a digest. That premise died
+    with the emit change, and the assertion would have failed loudly — but the *property* it was
+    protecting is unchanged and still worth pinning, so it is now stated as a ratio against the
+    frames that really streamed rather than as an absolute zero.
     """
     from monoid_agent_kernel.reference.backend import run_execution
 
     hydrated: list[Any] = []
-    monkeypatch.setattr(
-        run_execution, "hydrate_settled_text", lambda events, run_dir: hydrated.append(run_dir)
-    )
+    original = run_execution.hydrate_settled_text
+
+    def spy(events: Any, run_dir: Any) -> Any:
+        hydrated.append(events)
+        return original(events, run_dir)
+
+    monkeypatch.setattr(run_execution, "hydrate_settled_text", spy)
 
     workspace = _workspace(tmp_path)
     backend = _streaming_backend(
@@ -222,8 +229,20 @@ def test_astream_run_does_not_hop_threads_when_no_frame_needs_text(
     )
     frames = asyncio.run(_collect(backend, _request(workspace)))
 
-    assert any(frame["kind"] == "event" for frame in frames)  # frames really did stream
-    assert hydrated == []
+    event_frames = [frame for frame in frames if frame["kind"] == "event"]
+    settled = [frame for frame in event_frames if frame.get("type") in _SETTLE_TYPES]
+    # Non-empty first, so the ratio below cannot hold vacuously at 0 == 0. Only ``turn.settled``
+    # reaches this stream — ``run.finished`` is emitted after it closes — so the count is derived
+    # from the frames rather than hardcoded.
+    assert settled, [frame.get("type") for frame in event_frames]
+    # The discrimination is the point: exactly one hop per frame carrying a digest, and strictly
+    # fewer than the event frames. Equality with `len(event_frames)` would mean the gate does
+    # nothing; zero would mean it never resolves.
+    assert len(hydrated) == len(settled)
+    assert len(hydrated) < len(event_frames)
+    # And the frame the reader receives really did get its text back.
+    assert settled[0]["data"]["final_text"] == "done"
+    assert settled[0]["data"]["final_text_digest"]
 
 
 def test_astream_run_programmatic_seam(tmp_path: Path, backend_factory: Any) -> None:
