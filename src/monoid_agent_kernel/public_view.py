@@ -281,6 +281,7 @@ def preview_value(
     mask: Callable[[str, Any], Any] | None = None,
     threshold: int = PREVIEW_BYTE_THRESHOLD,
     budget: int = PREVIEW_BYTE_BUDGET,
+    redact_content: bool = True,
     _depth: int = 0,
 ) -> Any:
     """Bound a value for publication, optionally masking keys the caller names first.
@@ -297,7 +298,7 @@ def preview_value(
         if replacement is not UNMASKED:
             return replacement
     lowered = key.lower()
-    if _is_content_field(lowered):
+    if redact_content and _is_content_field(lowered):
         return redacted_value(value)
     if lowered in {"path", "root", "cwd"} and isinstance(value, str) and _is_path_redacted(value, policy):
         return redacted_value(value)
@@ -312,6 +313,7 @@ def preview_value(
                 mask=mask,
                 threshold=threshold,
                 budget=budget,
+                redact_content=redact_content,
                 _depth=_depth + 1,
             )
             for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]
@@ -329,7 +331,14 @@ def preview_value(
         # mask *down* to dicts inside the list, so ``{"headers": [{"api_key": ...}]}`` still masks.
         items = [
             preview_value(
-                key, item, policy, mask=mask, threshold=threshold, budget=budget, _depth=_depth + 1
+                key,
+                item,
+                policy,
+                mask=mask,
+                threshold=threshold,
+                budget=budget,
+                redact_content=redact_content,
+                _depth=_depth + 1,
             )
             for item in value[:PREVIEW_MAX_ITEMS]
         ]

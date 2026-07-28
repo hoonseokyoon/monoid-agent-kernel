@@ -102,7 +102,6 @@ from monoid_agent_kernel.core.tool_surface import (
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
     TOOL_APPROVAL_TASK_KIND,
-    approval_arguments_blob,
     approval_replay_from_task,
     build_tool_approval_task_request,
     denied_tool_approval_observation,
@@ -3838,36 +3837,22 @@ class AgentLoop:
             # silently drops `redact_patterns`, which is the half an operator configured.
             policy=context.permission_policy,
         )
-        # The preview is bounded, so the full arguments need a way back for the person deciding.
-        # They go into the run's content-addressed blob namespace, reachable through the existing
-        # run-token-authorized `/api/artifact?run_id=&digest=` route -- entitlement rather than a
-        # wider public field. Two properties worth stating rather than discovering in review:
-        # the digest is an unkeyed confirmation oracle, so anyone holding it can verify a *guess* at
-        # low-entropy arguments (the same trade already taken for `final_text_digest`); and the blob
-        # is raw content at rest, deleted with the checkpoint store when a run *completes*. A
-        # failed, limited or abandoned-parked run keeps its checkpoints on purpose (so a last-good
-        # one stays restorable), so on exactly the lifecycle where an approval is never answered the
-        # raw arguments persist on disk until the run root is cleaned up. Not "live only while the
-        # run is" -- state it as the retention it actually is.
-        try:
-            task_request["arguments_digest"] = self._checkpoint_store().put_blob(
-                self.spec.run_id, approval_arguments_blob(task_request["arguments"])
-            )
-        except Exception:  # noqa: BLE001 - see below; the blob is an affordance, not a requirement
-            # A store that cannot take the blob must not affect the run at all. An absent key means
-            # "not retained", which a reader can act on; a present key resolving to nothing could
-            # not be.
-            #
-            # Deliberately broad, after measuring what a narrow clause actually caught.
-            # `(OSError, NotImplementedError)` covered only `LocalFsCheckpointStore`, whose
-            # `file_lock` raises `TimeoutError`/`PermissionError`. `CheckpointStore` is a `Protocol`
-            # and an integrator seam, so a conforming store predating `put_blob` raises
-            # `AttributeError`, and the store this repo *ships* -- `SqliteCheckpointStore`, whose
-            # `put_blob` opens `BEGIN IMMEDIATE` -- raises `sqlite3.OperationalError` on a locked
-            # database. Neither is an `OSError`, and neither is caught by the tool-call handler
-            # either, so both terminalized the whole run and created no approval task at all. A
-            # missing convenience handle is not worth a failed run.
-            pass
+        # No separate content-addressed copy of the raw arguments is written here, and an earlier
+        # revision of this branch did write one (`arguments_digest` + `put_blob`). Removed, because
+        # every reason for it turned out to be wrong:
+        #
+        #   * It had no reader. Nothing in `studio-ui/`, the backend, or the CLI consumed the
+        #     digest, so the "entitled fetch" it was supposed to buy did not exist; the approver
+        #     simply lost information.
+        #   * It was redundant. `HostedTask.checkpoint_json` already stores `request` verbatim,
+        #     raw `arguments` included, and the checkpoint *is* deleted when a run completes.
+        #   * On the store this repo ships it was permanent. `SqliteCheckpointStore.put_blob`
+        #     discards `run_id` (blobs are global and content-addressed) and `delete(run_id)`
+        #     deliberately leaves blobs behind, so raw secrets and file bodies stayed in the
+        #     database forever, contradicting the run-lifetime retention the code claimed.
+        #
+        # What the approver actually needed was to see the arguments on the card, which
+        # `redact_tool_arguments` now does directly. See `core.tool_approval`.
         task_id = context.job_manager.create_task(TOOL_APPROVAL_TASK_KIND, task_request)
         recorder.emit(
             "tool.approval.requested",

@@ -27,10 +27,10 @@ Each run writes:
 - `artifacts/tasks/<task_id>/task.json`: hosted-task record (hitl, subagent, capability, tool
   approval). **Private by location, like `transcript.jsonl`** — it is not served over HTTP and is
   not in the export allowlist, so it keeps values the event stream drops. A **tool-approval** record
-  carries a bounded `arguments_preview` plus an `arguments_digest` addressing the raw arguments in
-  the run's blob store, and not the raw arguments inline. The other kinds (hitl, subagent,
-  capability) have no `arguments_preview` at all, and their `result` is written **raw** — that is
-  what "private by location" buys, and it is why this file is not a public surface.
+  carries a bounded `arguments_preview` and not the raw arguments; the raw copy lives in the run's
+  checkpoint, which is deleted when the run completes. The other kinds (hitl, subagent, capability)
+  have no `arguments_preview` at all, and their `result` is written **raw** — that is what "private
+  by location" buys, and it is why this file is not a public surface.
 
 Proposed file contents are exposed only through the run directory snapshot or
 run-token protected backend proposal APIs.
@@ -76,12 +76,13 @@ Carried, deliberately:
   arguments. `PermissionPolicy.redact_patterns` will not help: it is a *workspace path* glob list,
   consulted only for `path` / `root` / `cwd`.
 - The **approval** preview (`arguments_preview`) is bounded far more loosely than the trace preview,
-  because a person reads it to decide whether a call may run: a command cut mid-string hides the part
-  that matters, and the model chooses where in the string that part sits. File contents are still
-  withheld there by field name regardless of length. When a value does exceed even that budget, the
-  approval record carries `arguments_digest` addressing the raw arguments in the run's blob store,
-  fetchable over the run-token-authorized `/api/artifact?run_id=&digest=` route. **No shipped UI
-  reads that digest yet** — it is a durable handle and an API affordance, not a finished workflow.
+  and it does **not** blank file-content fields. A person reads it to decide whether a call may run:
+  a command cut mid-string hides the part that matters (with the model choosing where that part
+  sits), and a card rendering `{"redacted": true}` where a file body should be asks someone to
+  authorize a write they cannot inspect. So an `ask`-gated call publishes more on `task.started`
+  than the same call would on `tool.call.started` — bounded, but readable. If that is not acceptable
+  for a deployment, do not bind the tool to `authorization="ask"`, or attach a redacting
+  `EventSink`.
 - **Error messages and paths**, which can name workspace structure.
 - **A subagent's answer** on `task.finished`.
 - **Hosted-task prompts** (`task.started.data.prompt`) — the model-authored delegation brief or HITL

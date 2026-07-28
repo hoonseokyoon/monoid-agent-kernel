@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from monoid_agent_kernel.core._util import _canonical_bytes, canonical_sha256
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.model_io import DEFAULT_SECRET_KEY_PARTS, REDACTION_PLACEHOLDER
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
@@ -68,17 +68,6 @@ def build_tool_approval_task_request(
     return request
 
 
-def approval_arguments_blob(arguments: Mapping[str, Any]) -> bytes:
-    """The exact bytes an approval's ``arguments_digest`` addresses.
-
-    Serialized through the same ``_canonical_bytes`` the digests use, so ``put_blob`` returning
-    ``sha256(these bytes)`` *is* ``canonical_sha256(arguments)`` rather than a second number that
-    happens to match today. The caller stores ``put_blob``'s return value rather than recomputing:
-    one serialization, one digest, no way for the record and the blob to disagree.
-    """
-    return _canonical_bytes(dict(arguments), ())
-
-
 def tool_approval_key(request: Mapping[str, Any]) -> str:
     return canonical_sha256(
         {
@@ -107,14 +96,22 @@ def redact_tool_arguments(
     prose_keys: frozenset[str] = frozenset(),
     policy: PermissionPolicy | None = None,
 ) -> dict[str, Any]:
-    """The approval projection of a tool call's arguments.
+    """The approval projection of a tool call's arguments — a *decision* surface, not a log.
 
     Runs on ``public_view.preview_value``'s traversal rather than its own. It used to have one of
     its own, and the two carried disjoint halves of the same policy: this one masked secret- and
-    prose-named keys but applied no length, depth or item cap and never consulted
-    ``_is_content_field``, so an ``ask``-gated ``fs.write`` published the entire file body on
-    ``task.started``, in ``task.json``, and back to the model through ``job.list``. Meanwhile
-    ``preview_value`` capped everything but knew nothing about secrets.
+    prose-named keys but applied no length, depth or item cap at all, so an ``ask``-gated
+    ``fs.write`` published an unbounded file body on ``task.started``, in ``task.json``, and back to
+    the model through ``job.list``. Meanwhile ``preview_value`` capped everything but knew nothing
+    about secrets.
+
+    What it takes from that traversal is the **bounds**, not the trace surface's *policy*. The
+    budget here is far larger, and ``redact_content=False`` keeps file-content fields visible,
+    because someone reads this to decide whether a call may run: a command cut mid-string hides the
+    part that matters (with the model choosing where that part sits), and a card rendering
+    ``{"redacted": true}`` where the body should be asks a human to authorize a write they cannot
+    see. Both were measured on this branch before being corrected. The result is still strictly
+    tighter than before the release — bounded rather than unbounded — just not blanked.
 
     Routing this *through* ``preview_value`` rather than *replacing* it with ``args_preview`` is the
     load-bearing detail. ``args_preview`` is the generic branch of a four-way dispatch on
@@ -143,6 +140,13 @@ def redact_tool_arguments(
             mask=mask,
             threshold=APPROVAL_BYTE_THRESHOLD,
             budget=APPROVAL_BYTE_BUDGET,
+            # `content`/`old`/`new` are blanked on the trace surface and *shown* here, bounded by
+            # the budget above. An approval card that renders `{"redacted": true}` where the file
+            # body should be asks a human to authorize a write they cannot see -- which trains
+            # people to approve blindly and is a worse outcome than the logging it buys. The bound
+            # still applies, so this publishes at most `APPROVAL_BYTE_BUDGET` rather than the
+            # unbounded body that reached here before this release.
+            redact_content=False,
         )
         for key, value in arguments.items()
     }

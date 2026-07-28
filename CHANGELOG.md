@@ -28,12 +28,13 @@ out in commit messages and here.
   back to the model through `job.list`. Its twin `args_preview` — which fires on nearly every call —
   had the caps and no masking, so whether an `api_key` argument was published verbatim depended only
   on the tool's authorization decision. Both now run one traversal carrying both rules.
-  The approval preview keeps a **much larger byte budget** than the trace preview: a person reads it
-  to decide whether a call may run, and a command cut mid-string hides the part that matters, with
-  the model choosing where that part sits. File contents stay withheld there by field name at any
-  length. Past that budget the record carries `arguments_digest`, addressing the raw arguments in the
-  run's blob store over the run-token-authorized `/api/artifact?run_id=&digest=` route — a durable
-  handle and an API affordance; **no shipped UI reads it yet**.
+  The approval preview keeps a **much larger byte budget** than the trace preview and does **not**
+  blank file-content fields, because a person reads it to decide whether a call may run: a command
+  cut mid-string hides the part that matters (with the model choosing where that part sits), and a
+  card rendering `{"redacted": true}` where a file body should be asks someone to authorize a write
+  they cannot inspect. An `ask`-gated call therefore publishes more on `task.started` than the same
+  call publishes on `tool.call.started` — bounded, but readable. Deployments that cannot accept that
+  should not bind the tool to `authorization="ask"`, or should attach a redacting `EventSink`.
 - `web.search` / `web.fetch` and `shell.exec` previews no longer copy their descriptors raw. Both
   branches exist to withhold something (the query and URL; env *values*), and an unbounded `locale`,
   `blocked_domains` entry or env *key* let a model publish exactly what was being withheld.
@@ -74,10 +75,6 @@ out in commit messages and here.
   argument is masked on an `ask`-gated call and published verbatim on an `allow` call. Documented
   rather than changed, because changing it would reverse a deliberate architectural decision;
 - and the delta channel remains **on by default in Studio** unless switched off.
-
-Also worth knowing: the approval `arguments_digest` blob is raw content at rest under the run's
-checkpoint store. It is deleted when a run *completes*; a failed, limited or abandoned-parked run
-keeps its checkpoints by design, so on that path the blob persists until the run root is cleaned up.
 
 See `docs/OBSERVABILITY.md` for the full public/private split.
 
