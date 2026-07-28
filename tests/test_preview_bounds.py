@@ -27,8 +27,10 @@ from monoid_agent_kernel.public_view import (
     PREVIEW_MAX_DEPTH,
     PREVIEW_MAX_ITEMS,
     PREVIEW_MAX_KEYS,
+    REDACTED_PATH,
     args_preview,
     preview_value,
+    public_path,
     redacted_value,
     shell_args_preview,
     truncate_to_bytes,
@@ -225,8 +227,14 @@ def test_an_unnormalizable_path_is_redacted_rather_than_raising() -> None:
 
     for path in ("/etc/passwd", "../../etc/passwd"):
         assert preview_value("path", path, policy) == redacted_value(path)
+        # ...and `public_path`, which is the *other* builder on the same emit path. Guarding only
+        # `preview_value` left this one raising, and it has twelve callers across `loop`,
+        # `loop_phases`, `tasks`, `tool_services.shell` and `core.projections` — so the rule lives
+        # in `public_path` itself rather than at any of them.
+        assert public_path(path, policy) == REDACTED_PATH
     # A normal relative path outside the patterns is still published.
     assert preview_value("path", "notes/a.md", policy) == "notes/a.md"
+    assert public_path("notes/a.md", policy) == "notes/a.md"
 
 
 def test_the_width_cap_does_not_reach_top_level_argument_keys() -> None:

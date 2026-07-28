@@ -11,7 +11,24 @@ REDACTED_PATH = "[redacted-path]"
 
 
 def public_path(path: str, policy: PermissionPolicy) -> str:
-    return REDACTED_PATH if policy.is_path_redacted(path) else path
+    """The publishable form of one path — redacted by pattern, and fail-closed on a bad one.
+
+    Goes through ``_is_path_redacted`` rather than ``policy.is_path_redacted`` directly. The raw
+    predicate normalizes before matching and *raises* on an absolute path or a ``..`` traversal,
+    both of which a model can put in a ``path`` argument, and every caller of this function sits on
+    an event-construction path. So the raise did not produce a failed tool observation the model
+    could correct — it escaped ``_emit_tool_started`` before validation, and the error handler
+    retried the same emission, ending the run of any operator who had configured
+    ``redact_patterns``.
+
+    Guarding here rather than at a call site is the point. Twelve call sites across ``loop``,
+    ``loop_phases``, ``tasks``, ``tool_services.shell`` and ``core.projections`` share this
+    function, and a review found one of them. Fixing that one would have left eleven and made a
+    third implementation of a rule that already existed in two places — which is how this defect
+    was reachable at all: the guard was added to ``preview_value``'s path branch and not to its
+    twin here.
+    """
+    return REDACTED_PATH if _is_path_redacted(path, policy) else path
 
 
 def public_error_message(error: str) -> str:

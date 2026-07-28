@@ -24,11 +24,14 @@ from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
     PREVIEW_BYTE_BUDGET,
     PREVIEW_MAX_ITEMS,
     PREVIEW_MAX_KEYS,
+    REDACTED_PATH,
     TRUNCATION_SUFFIX,
+    redacted_value,
 )
 
 LONG_STEP = "가" * 200  # 600 bytes: over the threshold, under the old 160-character slice.
@@ -58,6 +61,44 @@ def _run(spec: AgentRunSpec, calls: list[tuple[str, dict[str, Any]]], *tool_ids:
         runtime_config_provider=runtime_provider(runtime_config(*tool_ids, "run.finish")),
     )
     return loop.run_once("go")
+
+
+def test_a_bad_path_argument_fails_the_call_instead_of_the_run(tmp_path: Path) -> None:
+    """The consequence half of the fail-closed rule, which the unit test cannot reach.
+
+    `is_path_redacted` normalizes before matching and raises on an absolute or `..` path. Every
+    builder that calls it sits inside event construction, so the raise escaped `_emit_tool_started`
+    *before* validation and the error handler retried the same emission — turning one malformed,
+    model-authored argument into a terminated run, for any operator who had configured
+    `redact_patterns` and no one else.
+
+    So this asserts on the run surviving, not on the redaction. `test_preview_bounds` already pins
+    that `public_path` returns `[redacted-path]`; what could not be seen from there is that the
+    difference between "redacted" and "raises" is the difference between a tool error the model can
+    correct and no result at all.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    spec = AgentRunSpec(
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+        permission_policy=PermissionPolicy(redact_patterns=("secrets/**",)),
+    )
+
+    result = _run(spec, [("fs.write", {"path": "/etc/passwd", "content": "x"})], "fs.write")
+
+    assert result.final_text == "done", "the run ended early instead of continuing past a bad call"
+    assert validate_run_dir(result.run_dir) == []
+    # The model gets an observation it can correct, which is the whole difference being asserted.
+    assert _events(result.run_dir, "tool.call.failed"), "no failed-call observation was recorded"
+
+    # And the *projections* carry the marker rather than the argument. Scoped to these fields on
+    # purpose: `tool.call.failed.data.error` does name the rejected path, and that is deliberate —
+    # `docs/OBSERVABILITY.md` lists error messages among the surfaces that carry paths, because an
+    # operator debugging a denied write needs to know which write was denied.
+    started = _events(result.run_dir, "tool.call.started")[0]["data"]
+    assert started["paths"] == [REDACTED_PATH]
+    assert started["args_preview"]["path"] == redacted_value("/etc/passwd")
 
 
 def test_a_truncated_path_says_so_instead_of_reading_as_an_exact_filename(tmp_path: Path) -> None:

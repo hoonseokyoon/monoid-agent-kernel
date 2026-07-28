@@ -42,7 +42,11 @@ out in commit messages and here.
   `blocked_domains` entry or env *key* let a model publish exactly what was being withheld.
 - A `path` argument that cannot be normalized (absolute, or containing `..`) is now redacted rather
   than raising. Normalization raises, the preview builders sit on the emit path, and the raise ended
-  the run of any operator who had configured `redact_patterns`.
+  the run of any operator who had configured `redact_patterns` — it escaped `_emit_tool_started`
+  before validation, and the error handler retried the same emission, so one malformed
+  model-authored argument terminated the run instead of producing a tool error the model could
+  correct. The guard lives in `public_path` itself, which all twelve call sites across `loop`,
+  `loop_phases`, `tasks`, `tool_services.shell` and `core.projections` go through.
 - A truncated `paths` entry now ends in `…`. These stay plain strings because `narration._target`
   falls back to them and joins them, so the cut has to be marked inside the text: an unmarked prefix
   is presented to an operator as the exact target of a write, and two long paths sharing a prefix
