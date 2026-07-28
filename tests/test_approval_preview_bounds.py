@@ -17,17 +17,24 @@ that the previous stage had just removed from the settle events.
 
 from __future__ import annotations
 
-import pytest
+import json
 
+import pytest
+from support.runtime import runtime_config, runtime_provider, tool_binding
+
+from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_approval import (
     MAX_ARGUMENT_DEPTH,
     TOOL_APPROVAL_TASK_KIND,
     build_tool_approval_task_request,
 )
+from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.public_view import PREVIEW_BYTE_BUDGET
 from monoid_agent_kernel.tasks import HostedTask
-from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
+from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 FILE_BODY = "SENTINEL-file-body " * 40  # 760 bytes of "file content" an approver must not publish
 SUMMARY = "SENTINEL-the-final-answer"
@@ -143,13 +150,75 @@ def test_long_non_ascii_arguments_are_bounded_here_too(tmp_path) -> None:
     assert command not in str(preview)
 
 
-def test_the_run_s_own_policy_reaches_the_preview_not_a_default_one(tmp_path) -> None:
+def test_the_builder_honours_the_policy_it_is_given(tmp_path) -> None:
     """`redact_patterns` is operator configuration; a preview built with `PermissionPolicy()`
     keeps every cap and silently drops exactly the redaction someone asked for."""
     policy = PermissionPolicy(redact_patterns=("secret/**",))
 
     preview = _published(tmp_path, {"path": "secret/report.txt"}, policy=policy)
 
+    assert preview["path"] == {"redacted": True, "type": "str", "bytes": len("secret/report.txt")}
+
+
+def test_the_run_s_own_policy_actually_reaches_the_preview(tmp_path) -> None:
+    """Driven through a real loop, because the test above cannot see the wiring.
+
+    It hands the builder a policy directly, so it stays green even if `loop.py` passes none at all —
+    which a mutation run demonstrated. The parameter existing and the parameter being *supplied* are
+    two properties, and only this one covers the second. Same shape as the gap that let the whole
+    approval-preview leak survive: everything asserted where the value is built, nothing where it is
+    published.
+    """
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(_ctx: ToolContext, args: dict) -> ToolResult:
+                return ToolResult(ok=True, content={"path": args["path"]})
+
+            return [
+                ToolSpec(
+                    id="demo.gated",
+                    description="ask-gated write",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    loop = AgentLoop(
+        spec=AgentRunSpec(
+            workspace_root=workspace,
+            run_root=tmp_path / "runs",
+            permission_policy=PermissionPolicy(redact_patterns=("secret/**",)),
+        ),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_gated", {"path": "secret/report.txt"}, "c1"),)),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(bindings=(tool_binding("demo.gated", authorization="ask"),))
+        ),
+        tool_providers=(Provider(),),
+    )
+    loop.open()
+    parked = loop.run_until_suspended("go")
+    loop.report_task_result(parked.awaiting_task_ids[0], {"approved": False})
+    loop.run_until_suspended(None)
+    result = loop.close()
+
+    started = [
+        json.loads(line)
+        for line in (result.run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line)["type"] == "task.started"
+    ]
+    preview = started[-1]["data"]["request"]["arguments_preview"]
     assert preview["path"] == {"redacted": True, "type": "str", "bytes": len("secret/report.txt")}
 
 
