@@ -401,8 +401,10 @@ class AgentToolContext(ToolContext):
                 # `snapshot_path` keeps bare `public_path`.
                 "path": artifact.path,
                 # `kind` is declared `{"type": "string"}` with no enum, so it is free model text
-                # sitting between three bounded neighbours -- `label` truncates, `metadata` is
-                # previewed, `path` is a run-dir pointer. It reads like an enum and is not one.
+                # sitting beside two bounded neighbours -- `metadata` is previewed and `path` is a
+                # run-dir pointer. It reads like an enum and is not one. (An earlier version of this
+                # comment cited `label` as a third precedent; `label` is not on this event at all,
+                # and is not bounded anywhere.)
                 #
                 # Bounded as a *string*, not previewed: `artifact.emitted`'s own data schema declares
                 # `{"kind": _STR}` with `additionalProperties: false`, so returning the preview

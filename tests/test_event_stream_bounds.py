@@ -463,7 +463,7 @@ def test_a_free_text_argument_that_looks_like_an_enum_is_still_bounded(tmp_path:
 def test_an_unknown_job_id_fails_the_call_instead_of_the_run(tmp_path: Path) -> None:
     """`TaskManager` raises `KeyError`, which tool dispatch does not catch.
 
-    A model asking about a job that already finished — or inventing an id — terminated the run and
+    A model inventing an id — or reading one from `job.list` with no log file — terminated the run and
     republished its own argument into `run.failed`, `status.json` and `metrics.json`. Same shape as
     the `WorkspaceError` that ended runs for operators with `redact_patterns` configured, on four
     twins (`job.status` / `logs` / `cancel` / `wait`) that guard never reached.

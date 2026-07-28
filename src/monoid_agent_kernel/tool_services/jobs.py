@@ -19,8 +19,8 @@ class JobsService:
         """The requested job id, or a tool error naming it.
 
         `TaskManager` raises `KeyError` for an id it does not know, and `KeyError` is not in the
-        `(NativeAgentError, ValueError, TypeError)` set the tool-call handler catches -- so a model
-        asking about a job that has finished, or inventing an id, terminated the whole run and
+        `(NativeAgentError, ValueError, TypeError)` set the tool-call handler catches -- so a model that
+        invents an id, or reads one from `job.list` with no log file, terminated the whole run and
         republished its argument into `run.failed`, `status.json` and `metrics.json`. That is the
         defect `public_path`'s fail-closed guard was written to stop, on four twins nobody bound.
         Bounded in the message for the same reason the tool name is.

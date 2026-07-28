@@ -70,10 +70,13 @@ out in commit messages and here.
   tracked over ancestors on the current path so a value legitimately shared twice still renders
   twice. Measured before the guard, at fanout 7: 23 s and 377 MB of serialized JSON, from an input that fits on a line.
 - **Path redaction fails closed for every path-naming field**, including `*_path`. A value that
-  cannot be normalized to a workspace path counts as redacted. This over-redacts, though not for
-  anything a builtin publishes — every `stdout_path`/`stderr_path` goes out relative and normalizes
-  cleanly. The reachable case is a custom or MCP tool returning an absolute `*_path` in its result,
-  which renders `{"redacted": true}` for an operator whose patterns could not have matched it. The
+  cannot be normalized to a workspace path counts as redacted. **This over-redacts, and it reaches a
+  first-party tool on every call:** `memory.*` addresses a virtual `/memories` root, so `path`,
+  `old_path` and `new_path` are absolute by contract, never normalize as workspace paths, and render
+  `{"redacted": true}` for any operator with *any* pattern configured — including on the approval
+  card, since `memory` write bindings default to `authorization="ask"`. An earlier draft of this
+  entry claimed no builtin was affected, on the strength of checking `stdout_path`/`stderr_path`
+  (which do go out relative, and are fine). The
   narrower rule — fail closed only for `path`/`root`/`cwd` — was tried and taken
   back, because `normalize_workspace_path` raises on any `..` component *before* resolving it, so
   `x/../secrets/creds.txt` raises while naming a file the pattern does match, and was published
@@ -135,33 +138,6 @@ out in commit messages and here.
   is the base package's default, and where a report covering only the two switches said raw model
   text was about to be published when none was.
 
-**What this release does not close**, stated as an exceptions list rather than an absolute claim:
-
-- per-tool prose in `args_preview` (only `preview_kind="finish"` redacts it);
-- validator and JSON-schema error text;
-- a subagent's answer on `task.finished`;
-- `job.list` / `job.status` exposing hosted-task payloads to the model;
-- **`task.started.data.prompt`** — the model-authored delegation brief or HITL question, uncapped and
-  neither previewed nor digested;
-- **secret-named argument values on the ordinary tool-call path.** `args_preview` deliberately does
-  not guess at secrets from key names — that heuristic was removed on purpose and redaction beyond
-  content fields is the integrating backend's job via the `EventSink` seam
-  (`examples/redacting_event_sink.py`). The *approval* record does mask them, so an `api_key`
-  argument is masked on an `ask`-gated call and published verbatim on an `allow` call. Documented
-  rather than changed, because changing it would reverse a deliberate architectural decision;
-- and the delta channel remains **on by default in Studio** unless switched off.
-
-Two further gaps were found reviewing this release and are deliberately left open, because closing
-either means changing a surface this one does not touch:
-
-- **A deeply nested tool argument still ends the run on the `allow` path.** `MAX_ARGUMENT_DEPTH` is
-  reached only through the approval-request builder, so `ask`-gated calls reject and `allow`-gated
-  calls carry the argument into the message history and on to `RunCheckpoint.to_json`, whose
-  `dataclasses.asdict` raises `RecursionError` around depth 500 — while `json.loads`/`json.dumps`
-  handle 900 — surfacing as `_CheckpointPersistError` out of `run_once`. Guarding tool *dispatch*
-  does not close it: by then the turn is already in history. The fixes are to reject the turn at
-  ingestion or to stop using `asdict`, and the latter also drops its deep copy, so a checkpoint would
-  begin sharing mutable state with the live loop. Both belong to the durability surface.
 - **`metrics.json` redacts `redact_patterns` paths.** It is one of the three public run artifacts
   and was the only one that never did, so an operator who configured a pattern, checked
   `events.jsonl` and `status.json`, and saw `[redacted-path]` had every reason to think it had
@@ -178,7 +154,7 @@ either means changing a surface this one does not touch:
   `tool.call.started` is emitted *before* `validate_args` rejects the call, so a model that sends a
   2 KB string in `timeout_s` publishes it and is only then told the call was invalid.
 - **An unknown `job_id` fails the call instead of the run.** `TaskManager` raises `KeyError`, which
-  is not in the set tool dispatch catches, so a model asking about a finished job terminated the run
+  is not in the set tool dispatch catches, so a model asking about a job id the kernel never issued terminated the run — and separately `job.logs` on a `HostedTask` id that `job.list` had just handed it
   and republished its own argument into `run.failed`, `status.json` and `metrics.json`. Same shape
   as the `WorkspaceError` that ended runs for operators with `redact_patterns` set, on the four
   `job.*` twins that guard never reached.
@@ -193,9 +169,37 @@ either means changing a surface this one does not touch:
   model asking about a job terminated the run. Two distinct sources: an unregistered id, and a
   registered `HostedTask` with no log file — the second reachable by calling `job.logs` on an id the
   kernel itself handed the model through `job.list` after `agent.spawn`.
+
+**What this release does not close**, stated as an exceptions list rather than an absolute claim:
+
+- per-tool prose in `args_preview` (only `preview_kind="finish"` redacts it);
+- validator and JSON-schema error text;
+- a subagent's answer on `task.finished`;
+- `job.list` / `job.status` exposing hosted-task payloads to the model;
+- **`task.started.data.prompt`** — the model-authored delegation brief or HITL question, uncapped and
+  neither previewed nor digested;
+- **secret-named argument values on the ordinary tool-call path.** `args_preview` deliberately does
+  not guess at secrets from key names — that heuristic was removed on purpose and redaction beyond
+  content fields is the integrating backend's job via the `EventSink` seam
+  (`examples/redacting_event_sink.py`). The *approval* record does mask them, so an `api_key`
+  argument is masked on an `ask`-gated call and published verbatim on an `allow` call. Documented
+  rather than changed, because changing it would reverse a deliberate architectural decision;
+- and the delta channel remains **on by default in Studio** unless switched off.
+
+Four gaps were found reviewing this release and are deliberately left open, because closing any
+of them means changing a surface this one does not touch:
+
+- **A deeply nested tool argument still ends the run on the `allow` path.** `MAX_ARGUMENT_DEPTH` is
+  reached only through the approval-request builder, so `ask`-gated calls reject and `allow`-gated
+  calls carry the argument into the message history and on to `RunCheckpoint.to_json`, whose
+  `dataclasses.asdict` raises `RecursionError` around depth 500 — while `json.loads`/`json.dumps`
+  handle 900 — surfacing as `_CheckpointPersistError` out of `run_once`. Guarding tool *dispatch*
+  does not close it: by then the turn is already in history. The fixes are to reject the turn at
+  ingestion or to stop using `asdict`, and the latter also drops its deep copy, so a checkpoint would
+  begin sharing mutable state with the live loop. Both belong to the durability surface.
 - **One preview's total size is bounded only by its input.** The depth, key and item caps bound a
   preview's *shape*, not its size: a value reachable by many paths is re-expanded once per path, so
-  nine levels of a mapping shared five ways — about 40 objects — produced 26 MB of JSON in 1.1 s,
+  nine levels of a mapping shared five ways — ten objects, 46 key slots — produced 26 MB of JSON in 1.1 s,
   and the cost grows with fanout: 110 MB at 6, 377 MB at 7. The cycle
   guard does not help, because sharing is not a cycle. Reachable only from a Python-object caller
   (a custom or MCP tool's `ToolResult.content`), since JSON cannot express sharing. A
