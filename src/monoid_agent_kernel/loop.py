@@ -102,6 +102,7 @@ from monoid_agent_kernel.core.tool_surface import (
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
     TOOL_APPROVAL_TASK_KIND,
+    approval_arguments_blob,
     approval_replay_from_task,
     build_tool_approval_task_request,
     denied_tool_approval_observation,
@@ -3814,6 +3815,23 @@ class AgentLoop:
             # silently drops `redact_patterns`, which is the half an operator configured.
             policy=context.permission_policy,
         )
+        # The preview is bounded, so the full arguments need a way back for the person deciding.
+        # They go into the run's content-addressed blob namespace, reachable through the existing
+        # run-token-authorized `/api/artifact?run_id=&digest=` route -- entitlement rather than a
+        # wider public field. Two properties worth stating rather than discovering in review:
+        # the digest is an unkeyed confirmation oracle, so anyone holding it can verify a *guess* at
+        # low-entropy arguments (the same trade already taken for `final_text_digest`); and the
+        # store is dropped when a run completes, so the handle is live exactly while the run is --
+        # which is exactly when an approval is pending.
+        try:
+            task_request["arguments_digest"] = self._checkpoint_store().put_blob(
+                self.spec.run_id, approval_arguments_blob(task_request["arguments"])
+            )
+        except (OSError, NotImplementedError):
+            # A store that cannot take the blob must not turn into a failed tool call. An absent
+            # key means "not retained", which is a state a reader can act on; a present key that
+            # resolves to nothing would not be.
+            pass
         task_id = context.job_manager.create_task(TOOL_APPROVAL_TASK_KIND, task_request)
         recorder.emit(
             "tool.approval.requested",

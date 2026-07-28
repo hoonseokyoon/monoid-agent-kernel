@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core._util import _canonical_bytes, canonical_sha256
 from monoid_agent_kernel.core.model_io import DEFAULT_SECRET_KEY_PARTS, REDACTION_PLACEHOLDER
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import UNMASKED, preview_value
@@ -61,6 +61,17 @@ def build_tool_approval_task_request(
     }
     request["approval_key"] = tool_approval_key(request)
     return request
+
+
+def approval_arguments_blob(arguments: Mapping[str, Any]) -> bytes:
+    """The exact bytes an approval's ``arguments_digest`` addresses.
+
+    Serialized through the same ``_canonical_bytes`` the digests use, so ``put_blob`` returning
+    ``sha256(these bytes)`` *is* ``canonical_sha256(arguments)`` rather than a second number that
+    happens to match today. The caller stores ``put_blob``'s return value rather than recomputing:
+    one serialization, one digest, no way for the record and the blob to disagree.
+    """
+    return _canonical_bytes(dict(arguments), ())
 
 
 def tool_approval_key(request: Mapping[str, Any]) -> str:

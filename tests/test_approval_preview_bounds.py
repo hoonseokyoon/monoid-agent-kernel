@@ -22,6 +22,8 @@ import json
 import pytest
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
+from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_approval import (
     MAX_ARGUMENT_DEPTH,
@@ -220,6 +222,64 @@ def test_the_run_s_own_policy_actually_reaches_the_preview(tmp_path) -> None:
     ]
     preview = started[-1]["data"]["request"]["arguments_preview"]
     assert preview["path"] == {"redacted": True, "type": "str", "bytes": len("secret/report.txt")}
+
+
+def test_the_published_digest_resolves_to_the_raw_arguments(tmp_path) -> None:
+    """What makes the bounded preview acceptable: the approver can still get the full text.
+
+    The record carries `put_blob`'s own return value rather than a separately computed hash, so the
+    digest on the record and the key the blob is stored under cannot disagree — the failure mode
+    would be a handle that looks authoritative and resolves to nothing.
+    """
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(_ctx: ToolContext, args: dict) -> ToolResult:
+                return ToolResult(ok=True, content={})
+
+            return [
+                ToolSpec(
+                    id="demo.gated",
+                    description="ask-gated write",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = LocalFsCheckpointStore(tmp_path / "runs")
+    arguments = {"path": "notes/a.md", "content": FILE_BODY}
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_gated", arguments, "c1"),)),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(bindings=(tool_binding("demo.gated", authorization="ask"),))
+        ),
+        tool_providers=(Provider(),),
+        checkpoint_store=store,
+    )
+    loop.open()
+    parked = loop.run_until_suspended("go")
+
+    task = json.loads(
+        (loop.spec.run_root / loop.spec.run_id / "artifacts" / "tasks" / parked.awaiting_task_ids[0] / "task.json").read_text(encoding="utf-8")
+    )
+    digest = task["request"]["arguments_digest"]
+
+    assert json.loads(store.get_blob(loop.spec.run_id, digest)) == arguments
+    assert digest == canonical_sha256(arguments), "the handle must be the digest of what it addresses"
+    # And the body is still absent from the preview the same record publishes.
+    assert task["request"]["arguments_preview"]["content"]["redacted"] is True
 
 
 def test_raw_arguments_stay_intact_for_replay(tmp_path) -> None:
