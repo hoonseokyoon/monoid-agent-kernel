@@ -269,7 +269,7 @@ MAX_ARGUMENT_DEPTH = 64
 
 def _jsonish(value: Any, _depth: int = 0) -> Any:
     # Raises ``ValueError``, which the tool-call handler already turns into a tool error the model
-    # can read and correct. Left unbounded this raised ``RecursionError`` at ~600 -- and
+    # can read and correct. Left unbounded this raised ``RecursionError`` at ~496 -- and
     # ``RecursionError`` is a ``RuntimeError``, so it fell straight through the
     # ``(NativeAgentError, ValueError, TypeError)`` handler and out of tool dispatch entirely. The
     # read side learned this same lesson already (``core.schemas`` catches it explicitly); an

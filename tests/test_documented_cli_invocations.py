@@ -37,10 +37,12 @@ _CONTINUATION = re.compile(r"\\\s*$")
 
 
 def _living_docs() -> list[Path]:
-    # `rglob`, not `glob`: the non-recursive form silently excluded `docs/security/`,
-    # `docs/dx-notes/` and the Studio reference README, which between them document a dozen live
-    # invocations. Only CHANGELOG is excluded on purpose -- a changelog naming a since-renamed
-    # command is correct as written, because it describes the release it shipped in.
+    # The `reference/**/*.md` tree is what this actually adds: 8 invocations, all from the Studio
+    # reference README and DX notes, which document `serve|app|open|doctor|accept` and were checked
+    # by nothing. `docs` is globbed recursively for symmetry, not for coverage -- measured, it
+    # yields the same 31 either way, because no nested `docs/` file contains an invocation today.
+    # Only CHANGELOG is excluded on purpose: a changelog naming a since-renamed command is correct
+    # as written, because it describes the release it shipped in.
     return [
         REPO_ROOT / "README.md",
         *sorted((REPO_ROOT / "docs").rglob("*.md")),

@@ -21,9 +21,10 @@ def public_path(path: str, policy: PermissionPolicy) -> str:
     retried the same emission, ending the run of any operator who had configured
     ``redact_patterns``.
 
-    Guarding here rather than at a call site is the point. Twelve call sites across ``loop``,
-    ``loop_phases``, ``tasks``, ``tool_services.shell`` and ``core.projections`` share this
-    function, and a review found one of them. Fixing that one would have left eleven and made a
+    Guarding here rather than at a call site is the point. Thirteen call sites share this function
+    and its ``public_inline_path`` wrapper — nine across ``loop``, ``loop_phases``, ``tasks``,
+    ``tool_services.shell`` and ``core.projections``, plus four inside this module — and a review
+    found one of them. Fixing that one would have left eleven and made a
     third implementation of a rule that already existed in two places — which is how this defect
     was reachable at all: the guard was added to ``preview_value``'s path branch and not to its
     twin here.
@@ -38,8 +39,10 @@ def public_inline_path(path: str, policy: PermissionPolicy) -> str:
     for **contract** surfaces — ``proposal.json``'s ``changed_paths`` and ``snapshot_path`` are
     resolved back to real files by ``core.proposal_file``, ``core.packages`` and ``core.schemas``,
     so a truncated value there does not describe a shorter path, it breaks replay and packaging.
-    This one is for surfaces nobody resolves: ``tool.call.started.paths``,
-    ``artifact.emitted.path``, ``workspace.file.changed.result.path``.
+    This one is for surfaces nobody resolves: ``tool.call.started.paths`` and
+    ``workspace.file.changed``'s ``paths`` and ``result.path``. Not ``artifact.emitted.path``,
+    which looks like a member of this family and is not — ``emit_artifact_bytes`` rewrites it to
+    ``artifacts/<id>/<basename>``, so it is a run-dir pointer readers resolve, and it stays raw.
 
     It exists because those three were three different answers. ``paths`` got the cap and the
     marker; ``artifact.emitted.path`` got neither, four lines under a comment about closing "the
@@ -609,8 +612,9 @@ def public_event_payload(data: Mapping[str, Any], policy: PermissionPolicy) -> d
     """Bound every value in an event payload a service assembled by hand.
 
     The ``*_args_preview`` builders bound what reaches ``tool.call.started``, and services then
-    built their *own* payloads for the events they emit either side of it — ``to_public_json`` for
-    the four shell events, an inline ``event_data`` for the three web ones. Same model-authored
+    built their *own* payloads for the events they emit either side of it — ``to_public_json`` at
+    seven emit sites covering six shell event types, an inline ``event_data`` in each of the three
+    web builders. Same model-authored
     values, same run, one of them capped: a 20 KB ``env`` key or ``blocked_domains`` entry was
     published verbatim on ``tool.approval.requested`` while ``args_preview`` reduced it to a
     preview, and a ``cwd`` under ``redact_patterns`` came out ``{"redacted": true}`` on one event

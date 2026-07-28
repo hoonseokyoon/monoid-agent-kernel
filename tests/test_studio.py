@@ -392,7 +392,13 @@ def test_list_files_returns_workspace_tree(studio: StudioServer) -> None:
 def test_the_ui_still_gets_a_final_answer_with_the_delta_channel_switched_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The kill switch costs live token rendering and nothing else.
+    """The kill switch does not cost the answer.
+
+    Not "and nothing else" — that phrasing was corrected in four other places and survived here.
+    It also converts mid-turn interruption into step-boundary interruption, which
+    `tests/test_model_call_runner.py::test_interruption_is_mid_turn_only_while_something_consumes_deltas`
+    pins. What this test guards is narrower and is the thing an operator actually fears: that
+    switching the channel off leaves the completed answer reaching no surface at all.
 
     Both halves of the switch are engaged at once — the config flag and the environment variable —
     because they disable different things (Studio's gateway streaming, and the loop's delta emission

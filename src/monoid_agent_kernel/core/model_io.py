@@ -481,8 +481,12 @@ def content_digest(value: Any) -> str:
     hashed identically to that value, which is the collision the wrapper was supposed to prevent.
 
     Consequence for anything that records these: recompute with this function, not with a bare
-    `sha256sum` of the text. Nothing persists a `content_digest` yet, which is what makes changing it
-    free today; once the run-dir sidecar records one, it is frozen.
+    `sha256sum` of the text. **This is now frozen.** It was free to change while nothing persisted a
+    digest; `recorder.settled_text` writes one into every `settled_text` record in
+    `transcript.jsonl`, `_validate_settled_text_digests` verifies it, and `monoid.transcript.v1` is
+    registered in the compatibility ledger precisely because the digest became the durable join key
+    that a settle event's `final_text_digest` resolves against. Changing this function now
+    invalidates every transcript already on disk.
     """
     if isinstance(value, str):
         return canonical_sha256({"text": value})

@@ -41,8 +41,9 @@ out in commit messages and here.
   branches exist to withhold something (the query and URL; env *values*), and an unbounded `locale`,
   `blocked_domains` entry or env *key* let a model publish exactly what was being withheld.
   This now covers the events those services emit **either side** of `tool.call.started`. They build
-  their own payloads — `ShellApprovalRequest.to_public_json` for four shell events, an inline
-  `event_data` for three web ones — so the same 20 KB env key or `blocked_domains` entry rode out
+  their own payloads — `ShellApprovalRequest.to_public_json`, spread across seven emit sites covering
+  six shell event types, and an inline `event_data` in each of the three web builders — so the same
+  20 KB env key or `blocked_domains` entry rode out
   verbatim on `tool.approval.requested`, `tool.approval.denied` (a *rejected* call still shipped it)
   and `shell.exec.started`, while `args_preview` reduced it to a preview in the same run. A `cwd`
   under `redact_patterns` likewise came out `{"redacted": true}` on one event and as the path on the
@@ -86,10 +87,10 @@ out in commit messages and here.
   the run of any operator who had configured `redact_patterns` — it escaped `_emit_tool_started`
   before validation, and the error handler retried the same emission, so one malformed
   model-authored argument terminated the run instead of producing a tool error the model could
-  correct. The guard lives in `public_path` itself, which all twelve call sites across `loop`,
-  `loop_phases`, `tasks`, `tool_services.shell` and `core.projections` go through, and in
-  `public_proposal_file`, the one remaining direct caller of the raw predicate. No unguarded call
-  to `PermissionPolicy.is_path_redacted` is left outside the guard.
+  correct. The guard lives in `public_path` itself, which every call site goes through — thirteen of
+  them, nine across `loop`, `loop_phases`, `tasks`, `tool_services.shell` and `core.projections`,
+  and four inside `public_view` — and in `public_proposal_file`, the one remaining direct caller of
+  the raw predicate. No unguarded call to `PermissionPolicy.is_path_redacted` is left.
 - A truncated `paths` entry now ends in `…`. These stay plain strings because `narration._target`
   falls back to them and joins them, so the cut has to be marked inside the text: an unmarked prefix
   is presented to an operator as the exact target of a write, and two long paths sharing a prefix

@@ -48,9 +48,15 @@ Not carried:
   itself is unaffected. Kernel-authored text (for example `Stopped after reaching max steps.`) stays
   inline, because digesting it would cost an operator the line explaining why a run stopped and buy
   no privacy.
-- **File contents** in tool arguments and results (`content`, `old`, `new`, `old_text`, `new_text`).
-- **Whole values of any length.** Previews are capped by a **byte** budget, so the cap does not
-  depend on the script the text is written in.
+- **File contents** in tool arguments and results (`content`, `old`, `new`, `old_text`, `new_text`)
+  — **on the trace surface**. The approval surface deliberately shows them, bounded; see "Carried,
+  deliberately" below. This list said "file contents" unqualified while the entry 45 lines down said
+  the opposite, and the preamble calls this list the contract.
+- **Whole values of any length**, for every model-authored *value* and every mapping *key*: previews
+  are capped by a **byte** budget, so the cap does not depend on the script the text is written in.
+  Three exceptions, all listed under "Carried, deliberately": a hosted-task prompt, an error
+  message, and the model-chosen `call_id`, which is a correlation key joined across `events.jsonl`,
+  `task.json` and `approval_key` and so cannot be shortened.
 
 Carried, deliberately:
 
@@ -101,8 +107,11 @@ Carried, deliberately:
 - **Error messages and paths**, which can name workspace structure.
 - **A subagent's answer** on `task.finished`.
 - **Hosted-task prompts** (`task.started.data.prompt`) — the model-authored delegation brief or HITL
-  question, **uncapped**. Model-authored prose on a public surface, and the one route on this list
-  that is neither previewed nor digested.
+  question, **uncapped**. Model-authored prose on a public surface, neither previewed nor digested.
+  It is not the only such route on this list: `model.output.delta` carries raw model text by
+  construction, and an error message passes through `public_error_message`, which substitutes only
+  when the text contains `PRIVATE KEY` and otherwise returns it whole.
+- **The model-chosen `call_id`**, uncapped for the reason given above — it is a join key, not prose.
 
 Studio adds `studio.chat.jsonl` inside each Studio run directory as the browser-facing chat
 projection. The Studio UI restores user, assistant, and error messages from

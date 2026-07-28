@@ -338,8 +338,18 @@ def test_artifact_metadata_is_capped_on_the_event_but_not_in_the_model_s_own_res
     # the cap a *publication* boundary rather than data loss. `tool.call.finished` deliberately
     # carries no result, so the model's copy is observable only where it actually goes: the private
     # transcript. Capping the tool's return value would have left this test green.
-    transcript = (result.run_dir / "transcript.jsonl").read_text(encoding="utf-8")
-    assert LONG_STEP in transcript, "the model wrote this and must get it back whole"
+    # The `tool_observation` record specifically, not the file. `LONG_STEP` is also in the
+    # `model_turn` record -- the arguments the model *sent* -- so a whole-file search is satisfied
+    # by the model's own outbound copy and stays green with the return value capped, which is the
+    # one thing this half exists to catch.
+    observations = [
+        json.loads(line)
+        for line in (result.run_dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("kind") == "tool_observation"
+    ]
+    assert observations, "no tool observation was recorded"
+    returned = observations[0]["output"]["result"]["artifact"]["metadata"]
+    assert returned == metadata, "the model wrote this and must get it back whole"
 
 
 def test_ordinary_plans_and_metadata_are_published_unchanged(tmp_path: Path) -> None:
