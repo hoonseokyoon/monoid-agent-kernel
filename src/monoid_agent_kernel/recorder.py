@@ -110,12 +110,20 @@ class StatusJsonSink:
                 error_code=str(data.get("error_code") or ""),
                 terminal=True,
             )
+            # No ``final_text``. This sink is a *fan-out* sink — it fires as the event is emitted,
+            # before the log is on disk — so no hydration seam can reach it, and model-authored text
+            # now leaves ``run.finished`` as a digest. Carrying ``data.get("final_text", "")`` would
+            # therefore write ``""`` on every model-answered run: no schema failure (``STATUS_SCHEMA``
+            # never declares the field and allows additional properties), no error, just a silently
+            # empty answer. Removing it is the honest shape, and it is also a leak fix —
+            # ``RunProjectionService.status()`` returns this file wholesale to any run-token bearer.
+            # Verified to have no reader in ``src/``, ``tests/``, ``docs/``, ``studio-ui/`` or
+            # ``scripts/``, and subagent runs never had one (``status_file=False``).
             self.state.update(
                 {
                     "state": session_state_value(state),
                     "terminal": True,
                     "finished_at": event.timestamp,
-                    "final_text": data.get("final_text", ""),
                     "error": data.get("error", ""),
                     "error_code": data.get("error_code", ""),
                 }

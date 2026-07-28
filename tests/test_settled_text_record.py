@@ -1,8 +1,9 @@
 """The run-dir record that carries model-authored settled text.
 
-``transcript.jsonl`` gains a ``settled_text`` variant keyed by content digest. This commit writes
-it but nothing reads it — the settle events still publish ``final_text`` — so the assertions here
-are about the record's shape, its selectivity, and the fact that the events are *unchanged*.
+``transcript.jsonl`` has a ``settled_text`` variant keyed by content digest. The settle events now
+publish ``final_text_digest`` + ``final_text_len`` in place of model-authored text, so the
+assertions here are about the record's shape, its selectivity, and the fact that the record and the
+event agree on the join.
 
 Selectivity is the part worth testing from both sides. "Model-authored text is recorded" and
 "kernel-authored text is not" are separate claims, and an implementation that records everything
@@ -630,16 +631,22 @@ def test_the_approval_preview_leaves_an_absent_notes_alone() -> None:
     assert request["arguments_preview"]["notes"] is None
 
 
-def test_this_commit_does_not_change_the_settle_events(tmp_path: Path) -> None:
-    """The no-op property. Hydration and the emit change land later; until then the events are
-    byte-identical to what they were, so a Studio regression here cannot be blamed on the record.
+def test_the_record_and_the_event_agree_on_the_digest_and_length(tmp_path: Path) -> None:
+    """The join has to line up on both fields, from both ends.
+
+    This replaces the no-op guard that pinned the pre-flip shape. The record and the event are
+    written by one helper precisely so they cannot disagree, and that is the property worth
+    asserting now: a reader resolves the event's digest against the record's, and reports the
+    record's length. Recomputing either independently is how a writer and a reader end up with
+    different ideas of what a record says.
     """
-    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="unchanged")])
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="joined answer")])
 
     run_dir = _run(_spec(tmp_path), adapter)
 
+    record = _records(run_dir, "settled_text")[-1]
     for event_type in ("turn.settled", "run.finished"):
         data = _events(run_dir, event_type)[-1]["data"]
-        assert data["final_text"] == "unchanged", event_type
-        assert "final_text_digest" not in data, event_type
-        assert "final_text_len" not in data, event_type
+        assert data["final_text_digest"] == record["final_text_digest"], event_type
+        assert data["final_text_len"] == record["final_text_len"], event_type
+        assert data["final_text_digest"] == content_digest("joined answer"), event_type

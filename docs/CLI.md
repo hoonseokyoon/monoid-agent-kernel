@@ -185,6 +185,13 @@ monoid watch <run_id> --run-root ./runs --follow
 `--json` prints raw JSONL events. The default watch output is a compact human
 view.
 
+`watch` reads `events.jsonl` directly and does **not** join settled text back in. Since v0.20 a
+settle event carries `final_text_digest` instead of model-authored `final_text`, so `--json` shows
+the digest where the backend and Studio show the text — they read through a hydrating projection
+and `watch` deliberately does not, because "raw JSONL events" is what this flag is for. Kernel
+messages such as `Stopped after reaching max steps.` are still inline. To resolve a digest, match it
+against the `settled_text` records in the run's `transcript.jsonl`.
+
 Inspect the current proposed output snapshot:
 
 ```bash

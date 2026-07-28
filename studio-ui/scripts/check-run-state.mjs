@@ -56,10 +56,55 @@ state = reduceRunEvent(
 );
 assert.equal(state.status, "succeeded");
 
+// --- turn.settled text, after v0.20 moved model-authored output off the event stream ---
+//
+// The reducer arm reads `data.final_text ?? next.activeResponse ?? ""` and appends nothing when
+// that resolves empty. Nothing else in this repo asserts anything about event *content*, so a
+// dropped answer would have shipped as a blank transcript with no throw, no log and no
+// "undefined" — the frontend normalises absent to "" and hides on falsiness at every layer.
+// These four scenarios pin each branch of that expression.
+
+// 1. The shape a Studio consumer actually receives: hydration filled `final_text` back in
+//    alongside the digest the kernel published. The answer must render.
+state = reduceRunEvent(
+  initialRunState("hydrated-run"),
+  event("turn.settled", { status: "completed", final_text: "hydrated answer", final_text_digest: "abc123", final_text_len: 15 }, 1),
+);
+assert.equal(state.messages.length, 1, "a hydrated settle event must render its answer");
+assert.equal(state.messages[0].content, "hydrated answer");
+
+// 2. Kernel-authored text stays inline with no digest — the selectivity half. If the provenance
+//    flag were stuck on, this branch would silently lose the one line explaining why a run stopped.
+state = reduceRunEvent(
+  initialRunState("limit-run"),
+  event("turn.settled", { status: "limited", final_text: "Stopped after reaching max steps." }, 1),
+);
+assert.equal(state.messages.length, 1, "kernel-authored settle text must stay renderable");
+assert.equal(state.messages[0].content, "Stopped after reaching max steps.");
+
+// 3. Digest with no text and no preceding deltas — an unhydrated read. This appends NOTHING, and
+//    that is the current, deliberate behaviour rather than an accident: asserted so a future
+//    placeholder is a conscious change to this file, and so the silent-drop mode stays documented.
+state = reduceRunEvent(
+  initialRunState("unhydrated-run"),
+  event("turn.settled", { status: "completed", final_text_digest: "abc123", final_text_len: 15 }, 1),
+);
+assert.equal(state.messages.length, 0, "an unresolved digest must not fabricate an empty message");
+
+// 4. The `?? activeResponse` fallback, which only exists when token streaming is on. It is not a
+//    general safety net for a missed hydration path — it is empty whenever deltas are disabled.
+state = reduceRunEvent(
+  initialRunState("streamed-run"),
+  event("model.output.delta", { text: "streamed answer" }, 1),
+);
+state = reduceRunEvent(state, event("turn.settled", { status: "completed", final_text_digest: "abc123" }, 2));
+assert.equal(state.messages.length, 1, "streamed deltas must still render when the event carries no text");
+assert.equal(state.messages[0].content, "streamed answer");
+
 assert.equal(isRunBusy("running"), true);
 assert.equal(isRunBusy("queued"), true);
 assert.equal(isRunBusy("awaiting-approval"), true);
 assert.equal(isRunBusy("stopping"), true, "stop and pause requests must keep the composer busy");
 assert.equal(isRunBusy("stopped"), false);
 
-console.log("Run-state checks passed (9 scenarios).");
+console.log("Run-state checks passed (13 scenarios).");

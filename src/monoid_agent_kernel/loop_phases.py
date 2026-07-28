@@ -11,6 +11,7 @@ from monoid_agent_kernel.core.agents import (
 )
 from monoid_agent_kernel.core.context import TurnContext, render_workspace_index_segment
 from monoid_agent_kernel.core.manifest import build_run_manifest
+from monoid_agent_kernel.core.model_io import content_length
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
     OutputRetry,
@@ -452,6 +453,39 @@ class LoopSettleCoordinator:
         )
 
 
+def _settled_text_fields(recorder: AgentRecorder, state: Any) -> dict[str, Any]:
+    """The text fields for a settle event — recording model-authored text as a side effect.
+
+    ``events.jsonl`` is documented as the public/redacted stream (``docs/OBSERVABILITY.md``) and was
+    carrying raw model output. Model-authored text now travels as ``final_text_digest`` +
+    ``final_text_len``; the text itself lives in ``transcript.jsonl``, the private debug/replay
+    artifact, and readers that are entitled to it join the two back together at the projection seam
+    (``reference/backend/content_hydration.py``).
+
+    **Record and publish in one call, so the two can never disagree.** The digest on the event is
+    the value ``settled_text`` returned rather than a second computation of it, and the length comes
+    from the same ``content_length`` the record and ``validate_run_dir`` use. Deriving either
+    independently is how a writer and a reader end up with different ideas of what a record says —
+    the shape that already cost this release one round when the validator certified records the
+    reader refused. It also makes record-*before*-emit structural: these fields are evaluated as the
+    ``emit`` call's arguments, so a committed event cannot name text that was never written.
+
+    **Kernel-authored text stays inline.** "Stopped after reaching max steps." is not model output,
+    so digesting it buys no privacy and costs an operator the one line explaining why a run stopped
+    — exactly the case they most need to read. Empty text is inline for a different reason: a digest
+    of ``""`` on the event would be indistinguishable from a record that was lost.
+
+    Both settle events call this. Writing the branch once per site is the shape this release exists
+    to remove.
+    """
+    if state.final_text and state.final_text_is_model_output:
+        return {
+            "final_text_digest": recorder.settled_text(state.final_text),
+            "final_text_len": content_length(state.final_text),
+        }
+    return {"final_text": state.final_text}
+
+
 class LoopFinalizer:
     """Build settle checkpoints and terminal run results."""
 
@@ -524,25 +558,18 @@ class LoopFinalizer:
                 ],
             },
         )
-        # Written *before* the emit so a committed event can never name text that is not yet on
-        # disk. Only model-authored text goes to the record: a kernel string ("Stopped after
-        # reaching max steps.") normally stays inline on the event, where an operator can read it
-        # without a join. The exception is a restored run — provenance is not checkpointed, so
-        # ``_rehydrate`` fails closed and a resumed kernel message is recorded too. Over-recording
-        # is the safe direction; see the field on ``RunState``.
-        #
-        # Empty text is skipped: a digest of "" on the event with no way to tell a lost record from
-        # a genuinely empty answer is worse than leaving the field alone. The returned digest is
-        # unused until the emit change lands.
-        if state.final_text and state.final_text_is_model_output:
-            recorder.settled_text(state.final_text)
+        # The record is written as a side effect of building these fields, so it lands before the
+        # emit rather than by a caller remembering to call it first. A restored run is recorded too:
+        # provenance is not checkpointed, so ``_rehydrate`` fails closed and treats any restored
+        # non-empty text as model-authored. Over-recording is the safe direction; see the field on
+        # ``RunState``.
         recorder.emit(
             "run.finished",
             data={
                 "status": state.status,
                 "error": public_error_message(state.error),
                 "error_code": state.error_code,
-                "final_text": state.final_text,
+                **_settled_text_fields(recorder, state),
                 "duration_s": metrics["duration_s"],
                 "diff_path": str(diff_path.relative_to(recorder.run_dir)),
                 "proposal_path": "proposal.json",
@@ -586,16 +613,15 @@ class LoopFinalizer:
             public_path(str(path), loop.permission_policy)
             for path in proposal_payload.get("changed_paths", [])
         ]
-        # Same discipline as ``run.finished`` above: record first, emit second, skip empty text.
-        # Both settle events normally carry the same value, and ``settled_text`` is content-keyed,
-        # so the second call is a no-op rather than a duplicate record.
-        if state.final_text and state.final_text_is_model_output:
-            recorder.settled_text(state.final_text)
+        # Same helper as ``run.finished`` above — the two settle events must never disagree about
+        # what they publish. Both normally carry the same value, and ``settled_text`` is
+        # content-keyed, so the second record is a no-op by construction rather than by a caller
+        # remembering not to repeat itself.
         recorder.emit(
             "turn.settled",
             data={
                 "status": state.status,
-                "final_text": state.final_text,
+                **_settled_text_fields(recorder, state),
                 "error_code": state.error_code,
                 "changed_paths": public_changed,
                 "output_validators": len(loop._active_output_validators(state.previous_runtime_config)),

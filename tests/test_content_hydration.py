@@ -2,13 +2,14 @@
 
 The failure this guards against is silent. Every frontend read normalizes an absent field to `""`
 and hides on truthiness, so a transport that forgets to hydrate renders an empty transcript with
-no throw, no log, and nothing in the console. The only way to know a path is covered is to strip
-the text from its events and watch it come back.
+no throw, no log, and nothing in the console. The only way to know a path is covered is to watch
+the text come back on it.
 
-The events are rewritten into the shape the emit change will produce — ``final_text_digest`` and
-no ``final_text`` — because until that lands the events still carry the text and hydration is
-correctly a no-op. Testing the mechanism before it is load-bearing is the point: the alternative
-is discovering a missed transport after the text is already gone.
+The transport tests below now read an **unmodified** run: the emit change has landed, so a real
+run already commits settle events carrying ``final_text_digest`` and no ``final_text``. They
+previously rewrote the events into that shape, which was necessary while the mechanism was inert
+and is now the wrong thing to test — a fabricated fixture would keep passing if the emit side
+regressed. ``_assert_committed_events_carry_only_a_digest`` holds that premise explicitly.
 """
 
 from __future__ import annotations
@@ -331,32 +332,32 @@ def test_a_digest_with_no_record_anywhere_stays_absent(tmp_path: Path) -> None:
 # --- integration: every transport that reads events ------------------------------------------
 
 
-def _strip_text_from_settle_events(run_dir: Path, text: str) -> str:
-    """Rewrite committed settle events into the shape the emit change will produce.
+def _assert_committed_events_carry_only_a_digest(run_dir: Path, text: str) -> str:
+    """Assert the committed settle events already have the digest-only shape; return the digest.
 
-    Asserts that it actually stripped something. If the run's settled text ever stops matching
-    ``text`` this becomes a no-op, and every transport test below would then "pass" by finding
-    text that was never removed — the tests would be measuring nothing and still be green.
+    This replaces a helper that *rewrote* the events into that shape, which was necessary only
+    while the emit change had not landed. Now that it has, fabricating the shape would test the
+    fabrication — and a rewrite helper that silently stops matching becomes a no-op, leaving every
+    transport test below to "pass" by finding text that was never removed.
+
+    The anti-vacuity property is kept and strengthened rather than dropped: this asserts both settle
+    events were found *and* that neither carries inline text, so a regression that puts
+    ``final_text`` back on the fan-out stream fails here instead of quietly making the hydration
+    tests meaningless.
     """
     digest = content_digest(text)
-    path = run_dir / "events.jsonl"
-    rewritten: list[str] = []
-    stripped = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
+    seen = 0
+    for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         event = json.loads(line)
+        if event.get("type") not in SETTLE_TYPES:
+            continue
         data = event.get("data") or {}
-        if event.get("type") in SETTLE_TYPES and data.get("final_text") == text:
-            data.pop("final_text")
-            data["final_text_digest"] = digest
-            data["final_text_len"] = len(text)
-            event["data"] = data
-            stripped += 1
-        rewritten.append(json.dumps(event, ensure_ascii=False, sort_keys=True))
-    assert stripped == 2, f"expected to strip turn.settled and run.finished, stripped {stripped}"
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write("\n".join(rewritten) + "\n")
+        assert "final_text" not in data, f"{event['type']} still carries inline model text"
+        assert data.get("final_text_digest") == digest, event["type"]
+        seen += 1
+    assert seen == 2, f"expected turn.settled and run.finished, saw {seen}"
     return digest
 
 
@@ -396,7 +397,7 @@ def test_the_record_is_written_by_a_real_run(tmp_path: Path) -> None:
 
 def test_backend_projection_hydrates(tmp_path: Path) -> None:
     backend, submission = _completed_run(tmp_path)
-    _strip_text_from_settle_events(submission.run_dir, "done")
+    _assert_committed_events_carry_only_a_digest(submission.run_dir, "done")
 
     page = backend.events(submission.run_id, submission.run_token)
 
@@ -405,7 +406,7 @@ def test_backend_projection_hydrates(tmp_path: Path) -> None:
 
 def test_backend_http_json_twin_hydrates(tmp_path: Path) -> None:
     backend, submission = _completed_run(tmp_path)
-    _strip_text_from_settle_events(submission.run_dir, "done")
+    _assert_committed_events_carry_only_a_digest(submission.run_dir, "done")
     server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -429,7 +430,7 @@ def test_backend_http_sse_twin_hydrates(tmp_path: Path) -> None:
     branch. A test that only covered the JSON twin would have declared this transport safe.
     """
     backend, submission = _completed_run(tmp_path)
-    _strip_text_from_settle_events(submission.run_dir, "done")
+    _assert_committed_events_carry_only_a_digest(submission.run_dir, "done")
     server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -469,7 +470,7 @@ def test_studio_chat_projection_catch_up_hydrates(tmp_path: Path) -> None:
     bubble — it is a message that silently never appears.
     """
     _backend_obj, submission = _completed_run(tmp_path)
-    _strip_text_from_settle_events(submission.run_dir, "done")
+    _assert_committed_events_carry_only_a_digest(submission.run_dir, "done")
 
     body = ChatProjection(submission.run_dir).catch_up(submission.run_id)
 
