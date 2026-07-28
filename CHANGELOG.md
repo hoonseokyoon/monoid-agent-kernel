@@ -40,6 +40,35 @@ out in commit messages and here.
 - `web.search` / `web.fetch` and `shell.exec` previews no longer copy their descriptors raw. Both
   branches exist to withhold something (the query and URL; env *values*), and an unbounded `locale`,
   `blocked_domains` entry or env *key* let a model publish exactly what was being withheld.
+  This now covers the events those services emit **either side** of `tool.call.started`. They build
+  their own payloads — `ShellApprovalRequest.to_public_json` for four shell events, an inline
+  `event_data` for three web ones — so the same 20 KB env key or `blocked_domains` entry rode out
+  verbatim on `tool.approval.requested`, `tool.approval.denied` (a *rejected* call still shipped it)
+  and `shell.exec.started`, while `args_preview` reduced it to a preview in the same run. A `cwd`
+  under `redact_patterns` likewise came out `{"redacted": true}` on one event and as the path on the
+  next. Both now go through one `public_event_payload`.
+- **Dict keys are bounded.** `preview_value` capped every value and emitted `str(child_key)`
+  untouched, so the same 30 KB file body arrived `{"redacted": true}` in the value position and
+  verbatim in the key position — past the byte cap and past `_is_content_field`, which reads the key
+  to judge the value and so has nothing to match when a body *is* the key. Bounding keys makes
+  distinct keys collide, and a mapping resolves a collision by dropping one silently, so collisions
+  are disambiguated with a `#n` suffix rather than traded for a second silent cap.
+- **`redact_patterns` now covers every field that names a path**, not a hardcoded
+  `{path, root, cwd}`. The registry declares path arguments per tool, and `fs.move`/`fs.copy`
+  declare `source_path`/`destination_path` — so one `fs.move` published `paths: ["[redacted-path]"]`
+  next to `args_preview.source_path: "secrets/creds.txt"` on the *same event*, the redaction defeated
+  by the field beside it. Matched by name (`path`, `root`, `cwd`, `*_path`), which also covers custom
+  and MCP tools that never register with the builtin registry.
+- **The approval card no longer hides what it is asking about.** Content redaction was switched off
+  for the approver while path redaction stayed on, so under `redact_patterns` the card showed a
+  private key's *contents* above `{"redacted": true}` where the destination should be. The two are
+  now a single `decision_surface` switch a caller cannot half-set, and the operator's explicit
+  `redact_patterns` outranks it for the whole call — unlike the kernel's own content default, which
+  an approver is entitled to see past.
+- A container reachable from itself is elided rather than re-expanded. The depth cap terminated the
+  walk without bounding its cost: 20 self-referencing keys cost `20 ** PREVIEW_MAX_DEPTH` nodes, and
+  fanout 8 was measured at 45 s and 1.1 GB from an input that fits on one line. Ancestors on the
+  current path only, so a value legitimately shared twice still renders twice.
 - A `path` argument that cannot be normalized (absolute, or containing `..`) is now redacted rather
   than raising. Normalization raises, the preview builders sit on the emit path, and the raise ended
   the run of any operator who had configured `redact_patterns` — it escaped `_emit_tool_started`
@@ -110,6 +139,22 @@ out in commit messages and here.
   argument is masked on an `ask`-gated call and published verbatim on an `allow` call. Documented
   rather than changed, because changing it would reverse a deliberate architectural decision;
 - and the delta channel remains **on by default in Studio** unless switched off.
+
+Two further gaps were found reviewing this release and are deliberately left open, because closing
+either means changing a surface this one does not touch:
+
+- **A deeply nested tool argument still ends the run on the `allow` path.** `MAX_ARGUMENT_DEPTH` is
+  reached only through the approval-request builder, so `ask`-gated calls reject and `allow`-gated
+  calls carry the argument into the message history and on to `RunCheckpoint.to_json`, whose
+  `dataclasses.asdict` raises `RecursionError` around depth 500 — while `json.loads`/`json.dumps`
+  handle 900 — surfacing as `_CheckpointPersistError` out of `run_once`. Guarding tool *dispatch*
+  does not close it: by then the turn is already in history. The fixes are to reject the turn at
+  ingestion or to stop using `asdict`, and the latter also drops its deep copy, so a checkpoint would
+  begin sharing mutable state with the live loop. Both belong to the durability surface.
+- **Nothing renders `truncated_items`.** The count reaches `events.jsonl` and `status.json`, and the
+  shipped Studio bundle drops it: a 25-step plan reads `Plan · 20 steps` and `20/20`. The count
+  exists precisely so the cap is not silent, and on that surface it still is. Closing it means
+  changing `studio-ui/` and rebuilding `web/dist`, which this release deliberately leaves untouched.
 
 See `docs/OBSERVABILITY.md` for the full public/private split.
 

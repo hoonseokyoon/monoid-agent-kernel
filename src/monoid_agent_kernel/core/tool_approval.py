@@ -252,6 +252,16 @@ def _parse_approval_bool(value: Any) -> bool | None:
 # over, so it cannot be truncated the way the preview is. Rejecting is the only honest answer: a call
 # whose arguments cannot be recorded faithfully cannot be faithfully approved.
 MAX_ARGUMENT_DEPTH = 64
+# Known gap, deliberately not closed in this release. This bound is reached only through
+# `build_tool_approval_task_request`, i.e. the `ask` path. On `allow`, the arguments still enter
+# the message history and reach `RunCheckpoint.to_json`, whose `dataclasses.asdict` recurses in
+# pure Python and raises `RecursionError` around depth 500 -- while `json.loads`/`json.dumps`
+# handle 900 -- surfacing as `_CheckpointPersistError` out of `run_once`: the run lost, from one
+# model-authored argument. Guarding tool *dispatch* does not close it (the turn is already in
+# history by then); the fixes are either rejecting the turn at ingestion or dropping `asdict`,
+# and the latter also drops its deep copy, so a checkpoint would start sharing mutable state
+# with the live loop. Both are decisions for the durability surface, not for a content-egress
+# release, and neither file is in its diff.
 
 
 def _jsonish(value: Any, _depth: int = 0) -> Any:

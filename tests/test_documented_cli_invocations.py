@@ -37,12 +37,43 @@ _CONTINUATION = re.compile(r"\\\s*$")
 
 
 def _living_docs() -> list[Path]:
-    return [REPO_ROOT / "README.md", *sorted((REPO_ROOT / "docs").glob("*.md"))]
+    # `rglob`, not `glob`: the non-recursive form silently excluded `docs/security/`,
+    # `docs/dx-notes/` and the Studio reference README, which between them document a dozen live
+    # invocations. Only CHANGELOG is excluded on purpose -- a changelog naming a since-renamed
+    # command is correct as written, because it describes the release it shipped in.
+    return [
+        REPO_ROOT / "README.md",
+        *sorted((REPO_ROOT / "docs").rglob("*.md")),
+        *sorted((REPO_ROOT / "src" / "monoid_agent_kernel" / "reference").rglob("*.md")),
+    ]
+
+
+# A documented invocation is rarely bare. It sits behind a `$ ` prompt, after a `cd x &&`, or --
+# the shape that matters most here -- behind an env prefix, because `MONOID_OUTPUT_DELTAS=0 monoid
+# ...` is exactly how this release documents its own kill switch. Each of those made the extractor
+# skip the line silently, so a typo only had to wear one of them to be invisible.
+_ENV_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
+
+
+def _strip_shell_noise(line: str) -> str:
+    line = line.strip()
+    for prompt in ("$ ", "> "):
+        if line.startswith(prompt):
+            line = line[len(prompt):].strip()
+    if "&&" in line:
+        line = line.rsplit("&&", 1)[1].strip()
+    while (stripped := _ENV_PREFIX.sub("", line)) != line:
+        line = stripped
+    return line
 
 
 def _candidate_commands(text: str) -> list[str]:
     """Pull `monoid ...` invocations out of inline spans and fenced bash blocks."""
-    found: list[str] = [span.strip() for span in _INLINE_CODE.findall(text) if span.strip().startswith("monoid ")]
+    found: list[str] = [
+        normalized
+        for span in _INLINE_CODE.findall(text)
+        if (normalized := _strip_shell_noise(span.strip())).startswith("monoid ")
+    ]
 
     in_fence = False
     buffer = ""
@@ -55,6 +86,7 @@ def _candidate_commands(text: str) -> list[str]:
         if not in_fence:
             continue
         # Fenced examples wrap with a trailing backslash; join before parsing.
+        line = _strip_shell_noise(line)
         if buffer or line.startswith("monoid "):
             buffer = f"{buffer} {_CONTINUATION.sub('', line).strip()}".strip()
             if not _CONTINUATION.search(raw):
@@ -76,7 +108,14 @@ def _resolve(tokens: list[str]) -> tuple[click.Command, list[str]]:
     while index < len(tokens):
         token = tokens[index]
         if token.startswith("-"):
-            break
+            # Skip the flag (and a value that is not itself a subcommand) and keep walking: `_resolve`
+            # used to stop dead here, so `monoid run --workspace . studioo` resolved to `run` and the
+            # bogus subcommand was never checked.
+            index += 1
+            if index < len(tokens) and not tokens[index].startswith("-"):
+                if not isinstance(node, click.Group) or node.get_command(click.Context(node), tokens[index]) is None:
+                    index += 1
+            continue
         if not isinstance(node, click.Group):
             break
         child = node.get_command(click.Context(node), token)
@@ -84,7 +123,13 @@ def _resolve(tokens: list[str]) -> tuple[click.Command, list[str]]:
             raise AssertionError(f"no such command: {' '.join(tokens[: index + 1])}")
         node = child
         index += 1
-    return node, [token for token in tokens[index:] if token.startswith("--")]
+    # Both flag shapes. Filtering to `--` left every short flag unvalidated, so `monoid run -Z`
+    # passed. `-` alone and bare `--` are shell idioms, not flags.
+    return node, [
+        token
+        for token in tokens
+        if token.startswith("-") and token not in {"-", "--"} and not _ENV_PREFIX.match(token)
+    ]
 
 
 def _documented_invocations() -> list[tuple[str, str]]:

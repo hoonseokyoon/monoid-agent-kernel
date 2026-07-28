@@ -356,6 +356,7 @@ def preview_value(
     decision_surface: bool = False,
     list_marker: bool = True,
     _depth: int = 0,
+    _ancestors: frozenset[int] = frozenset(),
 ) -> Any:
     """Bound a value for publication, optionally masking keys the caller names first.
 
@@ -404,6 +405,20 @@ def preview_value(
             return redacted_value(value)
     if isinstance(value, (dict, list)) and _depth >= PREVIEW_MAX_DEPTH:
         return {"truncated": True, "type": type(value).__name__, "depth_exceeded": PREVIEW_MAX_DEPTH}
+    if isinstance(value, (dict, list)):
+        # The depth cap terminates but does not bound *cost*: a container reachable from itself is
+        # re-expanded once per edge per level, so a 21-object input with 20 self-referencing keys
+        # costs 20**8 nodes. Measured at fanout 8: 45 s and 1.1 GB, from an input that fits on a
+        # line. Not reachable from a `json.loads`-derived tool argument (JSON cannot express
+        # sharing), but `public_result_content` previews a `ToolResult.content` built by a custom or
+        # MCP tool handler in ordinary Python objects, which can.
+        #
+        # Ancestors on the current path, not everything seen: the same small dict appearing twice in
+        # a payload is ordinary and both copies should render. Only a container containing *itself*
+        # is elided, which is the case that has no faithful rendering anyway.
+        if id(value) in _ancestors:
+            return {"truncated": True, "type": type(value).__name__, "circular": True}
+        _ancestors = _ancestors | {id(value)}
     if isinstance(value, dict):
         preview: dict[str, Any] = {}
         for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]:
@@ -434,6 +449,7 @@ def preview_value(
                 budget=budget,
                 decision_surface=decision_surface,
                 _depth=_depth + 1,
+                _ancestors=_ancestors,
             )
         # A source key literally named ``truncated_keys`` loses to the marker. Acceptable: the
         # preview is lossy by construction, and no consumer reads nested preview dicts by key --
@@ -456,6 +472,7 @@ def preview_value(
                 budget=budget,
                 decision_surface=decision_surface,
                 _depth=_depth + 1,
+                _ancestors=_ancestors,
             )
             for item in value[:PREVIEW_MAX_ITEMS]
         ]

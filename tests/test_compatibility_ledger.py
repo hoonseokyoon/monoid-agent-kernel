@@ -206,10 +206,19 @@ def test_documented_ledger_rows_match_registry_in_order() -> None:
         if not line.startswith("| `"):
             continue
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        documented.append((cells[0].strip("`"), cells[2].strip("`")))
+        documented.append((cells[0].strip("`"), cells[2].strip("`"), cells[3].strip()))
 
+    # The reader-policy cell is checked too. Reading only the key and the writer left the column
+    # that actually drifted unchecked, in a table whose own preamble says CI checks it: the
+    # `transcript` row said `json-schema` while the registry set `accepts_missing_version=True`,
+    # and every other such row renders the suffix.
     assert documented == [
-        (artifact.key, artifact.current_writer) for artifact in PUBLIC_ARTIFACT_COMPATIBILITY
+        (
+            artifact.key,
+            artifact.current_writer,
+            artifact.reader_policy + ("; missing id accepted" if artifact.accepts_missing_version else ""),
+        )
+        for artifact in PUBLIC_ARTIFACT_COMPATIBILITY
     ]
     alias_table = text.split("<!-- compatibility-aliases:start -->", 1)[1].split(
         "<!-- compatibility-aliases:end -->", 1

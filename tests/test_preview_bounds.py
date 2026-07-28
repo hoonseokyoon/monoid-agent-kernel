@@ -17,6 +17,10 @@ its twin.
 
 from __future__ import annotations
 
+import json
+import time
+from typing import Any
+
 import pytest
 
 from monoid_agent_kernel.core.tool_approval import redact_tool_arguments
@@ -439,3 +443,41 @@ def test_a_contract_path_is_never_truncated_even_though_the_log_one_is() -> None
     assert payload["changed_paths"] == [long_path]
     assert payload["files"][0]["path"] == long_path
     assert payload["files"][0]["snapshot_path"] == long_path
+
+
+def test_a_self_referencing_container_is_elided_instead_of_re_expanded() -> None:
+    """The depth cap terminates the walk but does not bound its cost.
+
+    A container reachable from itself is re-expanded once per edge per level, so a 21-object input
+    with 20 self-referencing keys costs `20 ** PREVIEW_MAX_DEPTH` nodes. Measured before this guard:
+    fanout 8 took 45 s and produced 1.1 GB, from an input that fits on one line. JSON cannot express
+    sharing, so a tool *argument* cannot reach it -- but `public_result_content` previews a
+    `ToolResult.content` built by a custom or MCP handler out of ordinary Python objects, which can.
+    """
+    policy = PermissionPolicy()
+    cyclic: dict[str, Any] = {}
+    for index in range(8):
+        cyclic[f"k{index}"] = cyclic
+
+    start = time.monotonic()
+    published = json.dumps(preview_value("metadata", cyclic, policy))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, f"the traversal is still re-expanding: {elapsed:.2f}s"
+    assert len(published) < 10_000, f"output blew up to {len(published)} bytes"
+    assert '"circular": true' in published
+
+
+def test_a_value_shared_twice_without_a_cycle_still_renders_both_times() -> None:
+    """The guard tracks ancestors on the current path, not everything seen.
+
+    A global seen-set would be cheaper and wrong: the same small mapping appearing under two keys is
+    ordinary, and eliding the second would report a cycle where there is none — a preview that lies
+    about the shape of the data to save work it did not need to save.
+    """
+    shared = {"x": 1}
+
+    assert preview_value("metadata", {"p": shared, "q": shared}, PermissionPolicy()) == {
+        "p": {"x": 1},
+        "q": {"x": 1},
+    }
