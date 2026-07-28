@@ -250,7 +250,7 @@ are truncated to a byte budget. **One exception is on by default in Studio:** `m
 and `model.reasoning.delta` publish raw model text, and the bundled app enables them whenever the
 optional `httpx` extra is installed, because they are what renders tokens live. They are durable
 events, not a live-only side channel. Turn them off with `MONOID_OUTPUT_DELTAS=0` or
-`monoid studio --no-output-deltas`; see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full
+`monoid studio serve --no-output-deltas`; see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full
 public/private split.
 
 The run-directory artifact set, custom event sinks (including secret redaction), OTel tracing,

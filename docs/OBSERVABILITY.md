@@ -62,7 +62,8 @@ Carried, deliberately:
   and misses it when it did not. Absence of a grep hit is not absence of the content — concatenate
   `data.text` across the run's `model.output.delta` records instead. Disable with
   `MONOID_OUTPUT_DELTAS=0` (whole deployment, subagents included),
-  `monoid studio --no-output-deltas`, or `StudioConfig(stream_output_deltas=False)`. The cost is
+  `monoid studio serve --no-output-deltas` (the flag sits on the `serve` / `app` / `doctor`
+  subcommands, not on the `studio` group), or `StudioConfig(stream_output_deltas=False)`. The cost is
   live token rendering **and nothing else** — in particular the completed answer still arrives. The
   reason is not obvious from the emit site, so: `turn.settled` carries only `final_text_digest` on
   the durable stream either way, and `RunProjectionService.events` refills `final_text` from

@@ -112,7 +112,7 @@ _CONTENT_EVENT_FIELDS: dict[str, tuple[set[str], set[str]]] = {
     # ``find_spec("httpx") is not None``, so for anyone who had installed the async extra the
     # channel was on, durable, and unfiltered. v0.20 adds a real off switch
     # (``MONOID_OUTPUT_DELTAS=0``, ``StudioConfig.stream_output_deltas``,
-    # ``monoid studio --no-output-deltas``) instead of a default that only looked like one.
+    # ``monoid studio serve --no-output-deltas``) instead of a default that only looked like one.
     "model.output.delta": ({"text"}, {"text"}),
     "model.reasoning.delta": ({"text"}, {"text"}),
 }

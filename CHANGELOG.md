@@ -22,12 +22,14 @@ out in commit messages and here.
   sliced characters, so any string with at most 160 characters and more than 240 bytes was published
   in full while the payload reported `truncated: true` — in practice, no cap at all for non-ASCII
   text. `shell.preview_command` had the same defect independently, with different constants.
-- **The tool-approval preview is now bounded**, and **secret-named keys are masked on the ordinary
-  `allow` path too.** `arguments_preview` masked secrets but applied no length, depth or item cap, so
-  an `ask`-gated `fs.write` published the entire file body on `task.started`, in `task.json`, and
-  back to the model through `job.list`. Its twin `args_preview` — which fires on nearly every call —
-  had the caps and no masking, so whether an `api_key` argument was published verbatim depended only
-  on the tool's authorization decision. Both now run one traversal carrying both rules.
+- **The tool-approval preview is now bounded.** `arguments_preview` masked secrets but applied no
+  length, depth or item cap, so an `ask`-gated `fs.write` published the entire file body on
+  `task.started`, in `task.json`, and back to the model through `job.list`. It now runs on the same
+  traversal as its twin `args_preview`, which had the caps, so the bounds are stated once instead of
+  in two places that carried disjoint halves of the policy.
+  Sharing a traversal did **not** give the ordinary `allow` path secret masking: `args_preview`
+  calls it without a mask and still publishes an `api_key` argument verbatim, on purpose. See the
+  exceptions list below.
   The approval preview keeps a **much larger byte budget** than the trace preview and does **not**
   blank file-content fields, because a person reads it to decide whether a call may run: a command
   cut mid-string hides the part that matters (with the model choosing where that part sits), and a
@@ -59,9 +61,11 @@ out in commit messages and here.
   enables them whenever the optional `httpx` extra is installed — so for the shipped app they were on
   with no supported way to turn them off short of uninstalling a package. Set
   `MONOID_OUTPUT_DELTAS=0` (applies to a run and every subagent it spawns), pass
-  `monoid studio --no-output-deltas`, or construct `StudioConfig(stream_output_deltas=False)`. The
-  cost is live token rendering in the UI; `AgentLoop.astream` takes a different path and is
-  unaffected, as are the run result and `transcript.jsonl`.
+  `monoid studio serve --no-output-deltas` (the flag is on the `serve` / `app` / `doctor`
+  subcommands, not on the `studio` group), or construct `StudioConfig(stream_output_deltas=False)`.
+  The cost is live token rendering in the UI; `AgentLoop.astream` takes a different path and is
+  unaffected, as are the run result and `transcript.jsonl`. The completed answer still reaches the
+  Studio UI, because its event feed hydrates `final_text` from `transcript.jsonl`.
 - `transcript.jsonl` is now registered in the compatibility ledger. It became the authoritative
   source of displayed model text, so it is no longer merely a debug artifact.
 
