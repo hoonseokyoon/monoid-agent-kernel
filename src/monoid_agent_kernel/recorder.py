@@ -177,6 +177,16 @@ class StatusJsonSink:
             self.state.pop("current_tool_call_id", None)
         elif event.type == "plan.updated":
             self.state["plan"] = data.get("items", [])
+            # Carry the drop count across with the list it belongs to. The event moved it out of
+            # the array so a typed renderer would stop drawing a blank row for it, and copying only
+            # ``items`` here would have turned that into a *silent* cap on this surface: a reader
+            # would see 20 steps with nothing saying there had been 25. Reassigned rather than
+            # merged, because a later shorter plan has to clear a stale count.
+            truncated = data.get("truncated_items")
+            if isinstance(truncated, int) and truncated > 0:
+                self.state["plan_truncated_items"] = truncated
+            else:
+                self.state.pop("plan_truncated_items", None)
         elif event.type == "metrics.updated":
             self.state["metrics"] = data
         elif event.type == "workspace.proposal.updated":

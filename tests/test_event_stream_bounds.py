@@ -138,6 +138,34 @@ def test_a_long_plan_is_capped_without_a_foreign_element_inside_the_typed_array(
     assert all(item.get("status") == "pending" for item in published)
     assert data["truncated_items"] == 5, "the drop is reported, just not as a plan item"
 
+    # `status.json` is the twin surface: it copies `items` out of this same event, so moving the
+    # count out of the array silently shortened the plan there too unless the count travels with it.
+    # Capping is fine; capping without saying so reads as "that was the whole plan".
+    status = json.loads((result.run_dir / "status.json").read_text(encoding="utf-8"))
+    assert len(status["plan"]) == 20
+    assert status["plan_truncated_items"] == 5
+
+
+def test_a_later_shorter_plan_clears_the_stale_truncation_count(tmp_path: Path) -> None:
+    """`status.json` is reassigned per event, not merged, and the count has to follow that.
+
+    A run that publishes a long plan and then replaces it with a short one would otherwise leave
+    `plan_truncated_items` behind from the first, reporting a drop against a list that no longer has
+    one — a stale number being worse than an absent one, since a reader cannot tell it is stale.
+    """
+    long_plan = [{"step": f"step {index}", "status": "pending"} for index in range(25)]
+    short_plan = [{"step": "only step", "status": "pending"}]
+
+    result = _run(
+        _spec(tmp_path),
+        [("run.update_plan", {"items": long_plan}), ("run.update_plan", {"items": short_plan})],
+        "run.update_plan",
+    )
+
+    status = json.loads((result.run_dir / "status.json").read_text(encoding="utf-8"))
+    assert len(status["plan"]) == 1
+    assert "plan_truncated_items" not in status
+
 
 def test_status_json_gets_the_capped_plan_rather_than_a_second_uncapped_copy(tmp_path: Path) -> None:
     """``StatusJsonSink`` copies ``plan.updated.items`` verbatim and the projection service serves

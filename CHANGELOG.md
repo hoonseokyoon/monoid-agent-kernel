@@ -49,7 +49,9 @@ out in commit messages and here.
   rather than replaced by a preview object, and a plan longer than the item cap reports the drop in
   a new sibling `truncated_items` key instead of appending a marker element. As an element it was a
   valid object (so schema validation passed) but not a plan item, so the Studio inspector drew a
-  blank row for it and counted it in the `completed/total` denominator.
+  blank row for it and counted it in the `completed/total` denominator. `status.json` mirrors this
+  with `plan_truncated_items`, so the cap is visible on that surface too rather than silently
+  shortening the plan.
 - Tool arguments nested deeper than 64 levels are now rejected with a `ValueError` the model can
   read and correct. They previously raised `RecursionError`, which — being a `RuntimeError` — fell
   through the tool-call handler entirely.
