@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -216,7 +216,37 @@ def truncate_to_bytes(value: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
-def preview_value(key: str, value: Any, policy: PermissionPolicy, *, _depth: int = 0) -> Any:
+class _Unmasked:
+    """Sentinel: the mask looked at this value and declined to replace it."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "UNMASKED"
+
+
+UNMASKED = _Unmasked()
+
+
+def preview_value(
+    key: str,
+    value: Any,
+    policy: PermissionPolicy,
+    *,
+    mask: Callable[[str, Any], Any] | None = None,
+    _depth: int = 0,
+) -> Any:
+    """Bound a value for publication, optionally masking keys the caller names first.
+
+    ``mask`` is consulted at *every* level with that level's key, and returning anything other than
+    ``UNMASKED`` replaces the value outright. It exists so that the approval projection can add its
+    secret- and prose-key rules to this traversal instead of running a second one:
+    ``core.tool_approval.redact_tool_arguments`` had its own recursion carrying the masking rules but
+    no caps, while this one had the caps but knew nothing about secrets. Which half of the policy
+    applied to a value depended only on which surface it left through. One traversal, all the rules.
+    """
+    if mask is not None:
+        replacement = mask(key, value)
+        if replacement is not UNMASKED:
+            return replacement
     lowered = key.lower()
     if _is_content_field(lowered):
         return redacted_value(value)
@@ -226,7 +256,9 @@ def preview_value(key: str, value: Any, policy: PermissionPolicy, *, _depth: int
         return {"truncated": True, "type": type(value).__name__, "depth_exceeded": PREVIEW_MAX_DEPTH}
     if isinstance(value, dict):
         preview = {
-            str(child_key): preview_value(str(child_key), child_value, policy, _depth=_depth + 1)
+            str(child_key): preview_value(
+                str(child_key), child_value, policy, mask=mask, _depth=_depth + 1
+            )
             for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]
         }
         # A source key literally named ``truncated_keys`` loses to the marker. Acceptable: the
@@ -237,7 +269,13 @@ def preview_value(key: str, value: Any, policy: PermissionPolicy, *, _depth: int
             preview["truncated_keys"] = len(value) - PREVIEW_MAX_KEYS
         return preview
     if isinstance(value, list):
-        items = [preview_value(key, item, policy, _depth=_depth + 1) for item in value[:PREVIEW_MAX_ITEMS]]
+        # The parent key is reused for each item because list items have no key of their own. A
+        # secret-named list is already masked whole before reaching here; what this carries is the
+        # mask *down* to dicts inside the list, so ``{"headers": [{"api_key": ...}]}`` still masks.
+        items = [
+            preview_value(key, item, policy, mask=mask, _depth=_depth + 1)
+            for item in value[:PREVIEW_MAX_ITEMS]
+        ]
         if len(value) > PREVIEW_MAX_ITEMS:
             items.append({"truncated_items": len(value) - PREVIEW_MAX_ITEMS})
         return items

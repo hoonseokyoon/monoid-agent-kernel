@@ -5,6 +5,8 @@ from typing import Any
 
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.model_io import DEFAULT_SECRET_KEY_PARTS, REDACTION_PLACEHOLDER
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.public_view import UNMASKED, preview_value
 from monoid_agent_kernel.tools.base import ToolSpec
 
 TOOL_APPROVAL_TASK_KIND = "tool_approval"
@@ -30,8 +32,14 @@ def build_tool_approval_task_request(
     reason: str,
     turn_id: str,
     tool_event_id: str | None,
+    policy: PermissionPolicy | None = None,
 ) -> dict[str, Any]:
-    """Build the durable hosted-task request for one model-requested tool approval."""
+    """Build the durable hosted-task request for one model-requested tool approval.
+
+    ``arguments`` stays raw: it is what the approver replays and what ``approval_key`` is taken
+    over, so a truncated copy would key a different call than the one being approved. Only
+    ``arguments_preview`` — the projection every public surface reads — is bounded.
+    """
     sanitized_arguments = _jsonish(dict(arguments))
     request = {
         "prompt": f"Approve tool call {call_name}",
@@ -44,6 +52,7 @@ def build_tool_approval_task_request(
         "arguments_preview": redact_tool_arguments(
             sanitized_arguments,
             prose_keys=_PROSE_KEYS_BY_PREVIEW_KIND.get(spec.preview_kind, frozenset()),
+            policy=policy,
         ),
         "reason": reason,
         "side_effect": spec.side_effect,
@@ -77,20 +86,41 @@ _PROSE_KEYS_BY_PREVIEW_KIND: dict[str, frozenset[str]] = {
 
 
 def redact_tool_arguments(
-    arguments: Mapping[str, Any], *, prose_keys: frozenset[str] = frozenset()
+    arguments: Mapping[str, Any],
+    *,
+    prose_keys: frozenset[str] = frozenset(),
+    policy: PermissionPolicy | None = None,
 ) -> dict[str, Any]:
+    """The approval projection of a tool call's arguments.
+
+    Runs on ``public_view.preview_value``'s traversal rather than its own. It used to have one of
+    its own, and the two carried disjoint halves of the same policy: this one masked secret- and
+    prose-named keys but applied no length, depth or item cap and never consulted
+    ``_is_content_field``, so an ``ask``-gated ``fs.write`` published the entire file body on
+    ``task.started``, in ``task.json``, and back to the model through ``job.list``. Meanwhile
+    ``preview_value`` capped everything but knew nothing about secrets.
+
+    Routing this *through* ``preview_value`` rather than *replacing* it with ``args_preview`` is the
+    load-bearing detail. ``args_preview`` is the generic branch of a four-way dispatch on
+    ``spec.preview_kind``, and the request does not record which kind it came from — so swapping it
+    in would have dropped secret masking (``api_key`` published verbatim), dropped the ``run.finish``
+    prose redaction that closed the settle leak one stage ago, and dropped the shell/web shaping.
+    Measured, not assumed.
+
+    ``value is not None`` mirrors ``public_view.finish_args_preview``. Without it the two halves
+    moved in opposite directions on ``notes: null`` — a legal call shape — and the approval preview
+    badged an absent value as withheld, which is the exact behaviour the other half was changed to
+    stop doing.
+    """
+    resolved = policy if policy is not None else PermissionPolicy()
+
+    def mask(key: str, value: Any) -> Any:
+        if _is_secret_key(key) or (value is not None and key.lower() in prose_keys):
+            return _REDACTED
+        return UNMASKED
+
     return {
-        str(key): (
-            _REDACTED
-            if _is_secret_key(str(key))
-            # ``value is not None`` mirrors ``public_view.finish_args_preview``. Without it the two
-            # halves moved in opposite directions on ``notes: null`` — a legal call shape — and the
-            # approval preview badged an absent value as withheld, which is the exact behaviour the
-            # other half was changed to stop doing. Binding one half of a rule and not the other is
-            # what created the second door this ``prose_keys`` argument exists to close.
-            or (value is not None and str(key).lower() in prose_keys)
-            else _redact_value(value)
-        )
+        str(key): preview_value(str(key), value, resolved, mask=mask)
         for key, value in arguments.items()
     }
 
@@ -160,14 +190,6 @@ def denied_tool_approval_observation(
     }
 
 
-def _redact_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return redact_tool_arguments(value)
-    if isinstance(value, list | tuple):
-        return [_redact_value(item) for item in value]
-    return value
-
-
 def _is_secret_key(key: str) -> bool:
     lowered = key.lower().replace("-", "_")
     return any(part in lowered for part in _SECRET_KEY_PARTS)
@@ -185,11 +207,29 @@ def _parse_approval_bool(value: Any) -> bool | None:
     return None
 
 
-def _jsonish(value: Any) -> Any:
+# Tool arguments nest a handful of levels in practice. The bound exists because ``arguments`` is
+# model-controlled and is stored raw -- it is the replay copy and what ``approval_key`` is taken
+# over, so it cannot be truncated the way the preview is. Rejecting is the only honest answer: a call
+# whose arguments cannot be recorded faithfully cannot be faithfully approved.
+MAX_ARGUMENT_DEPTH = 64
+
+
+def _jsonish(value: Any, _depth: int = 0) -> Any:
+    # Raises ``ValueError``, which the tool-call handler already turns into a tool error the model
+    # can read and correct. Left unbounded this raised ``RecursionError`` at ~600 -- and
+    # ``RecursionError`` is a ``RuntimeError``, so it fell straight through the
+    # ``(NativeAgentError, ValueError, TypeError)`` handler and out of tool dispatch entirely. The
+    # read side learned this same lesson already (``core.schemas`` catches it explicitly); an
+    # uncaught crash reachable from one model-authored argument is worse than a rejected call.
+    if _depth > MAX_ARGUMENT_DEPTH:
+        raise ValueError(
+            f"tool arguments nest deeper than {MAX_ARGUMENT_DEPTH} levels; "
+            "flatten the payload or pass it as a workspace file"
+        )
     if isinstance(value, Mapping):
-        return {str(key): _jsonish(item) for key, item in value.items()}
+        return {str(key): _jsonish(item, _depth + 1) for key, item in value.items()}
     if isinstance(value, list | tuple):
-        return [_jsonish(item) for item in value]
+        return [_jsonish(item, _depth + 1) for item in value]
     if value is None or isinstance(value, str | int | float | bool):
         return value
     return str(value)

@@ -3810,6 +3810,9 @@ class AgentLoop:
             reason=authorization.reason,
             turn_id=turn_id,
             tool_event_id=started_event.event_id if started_event is not None else None,
+            # The run's real policy, not a default one: without it the preview keeps every cap and
+            # silently drops `redact_patterns`, which is the half an operator configured.
+            policy=context.permission_policy,
         )
         task_id = context.job_manager.create_task(TOOL_APPROVAL_TASK_KIND, task_request)
         recorder.emit(
