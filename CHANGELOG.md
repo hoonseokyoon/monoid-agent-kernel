@@ -7,7 +7,50 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed — content egress from the event stream (breaking for `events.jsonl` consumers)
+
+- **`turn.settled` and `run.finished` no longer carry `final_text` for model-authored answers.**
+  They carry `final_text_digest` (a domain-separated `content_digest`) and `final_text_len` instead.
+  The text moved to `transcript.jsonl`'s `settled_text` record, which entitled readers join back —
+  the Studio and backend read paths hydrate it automatically. **Kernel-authored text still arrives
+  inline** (for example `Stopped after reaching max steps.`), so the field is present on some settle
+  events and absent on others; branch on which key is there rather than assuming either. `monoid
+  watch --json` reads raw JSONL and does *not* hydrate. `status.json` no longer carries `final_text`
+  at all: it is written by a fan-out sink that no hydration seam can reach, and keeping the key would
+  have written `""` on every model-answered run.
+- **Public previews are now capped by bytes rather than characters.** The cap compared bytes and
+  sliced characters, so any string with at most 160 characters and more than 240 bytes was published
+  in full while the payload reported `truncated: true` — in practice, no cap at all for non-ASCII
+  text. `shell.preview_command` had the same defect independently, with different constants.
+- **The tool-approval preview is now bounded.** `arguments_preview` masked secret-named keys but
+  applied no length, depth or item cap, so an `ask`-gated `fs.write` published the entire file body
+  on `task.started`, in `task.json`, and back to the model through `job.list`. It keeps the masking
+  and gains the caps. For tool approvals the record now carries `arguments_digest`, addressing the
+  raw arguments in the run's blob store, fetchable through the existing run-token-authorized
+  `/api/artifact?run_id=&digest=` route.
+- **`plan.updated` and `artifact.emitted` cap their model-authored payloads**, matching what
+  `tool.call.started` already did with the same values. This also bounds `status.json["plan"]`.
+- Tool arguments nested deeper than 64 levels are now rejected with a `ValueError` the model can
+  read and correct. They previously raised `RecursionError`, which — being a `RuntimeError` — fell
+  through the tool-call handler entirely.
+
 ### Added
+
+- **An operator kill switch for the delta channel.** `model.output.delta` and
+  `model.reasoning.delta` publish raw model text, they are durable rather than live-only, and Studio
+  enables them whenever the optional `httpx` extra is installed — so for the shipped app they were on
+  with no supported way to turn them off short of uninstalling a package. Set
+  `MONOID_OUTPUT_DELTAS=0` (applies to a run and every subagent it spawns), pass
+  `monoid studio --no-output-deltas`, or construct `StudioConfig(stream_output_deltas=False)`. The
+  cost is live token rendering in the UI; `AgentLoop.astream` takes a different path and is
+  unaffected, as are the run result and `transcript.jsonl`.
+- `transcript.jsonl` is now registered in the compatibility ledger. It became the authoritative
+  source of displayed model text, so it is no longer merely a debug artifact.
+
+**What this release does not close**, stated as an exceptions list rather than an absolute claim:
+per-tool prose in `args_preview`, validator and JSON-schema error text, a subagent's answer on
+`task.finished`, and `job.list`'s exposure of hosted tasks to the model. And the delta channel
+remains **on by default in Studio** unless switched off. See `docs/OBSERVABILITY.md`.
 
 - Added `ModelCallRunner`, which executes one model call against any adapter shape — a blocking
   `next_turn`, a coroutine `next_turn`, `anext_turn`, or a streamed `astream_turn` — through a single

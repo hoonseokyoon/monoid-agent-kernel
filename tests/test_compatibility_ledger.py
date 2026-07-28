@@ -78,7 +78,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 34
+    assert len(artifacts) == 35
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)

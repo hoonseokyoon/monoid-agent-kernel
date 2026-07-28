@@ -322,8 +322,13 @@ class AgentRecorder:
         This lives on the recorder rather than beside the emit sites because it owns the transcript
         handle. ``transcript.jsonl`` is the private debug/replay artifact
         (``docs/OBSERVABILITY.md``) and already holds model text per turn, so settled text belongs
-        with it rather than in a new run-dir file — which is also why no compatibility-ledger entry
-        is involved.
+        with it rather than in a new run-dir file.
+
+        This docstring used to add "which is also why no compatibility-ledger entry is involved".
+        That was true when the transcript was only a debug aid, and adding this record is what made
+        it false: the settle events now publish a digest, so an entitled reader joins *here* for the
+        text a UI displays. It is registered as ``monoid.transcript.v1`` — a private artifact with a
+        public join contract, which is exactly the case a ledger exists to pin.
 
         Durability is best-effort and deliberately so: ``_write_jsonl`` flushes but does not fsync,
         and the transcript's only repair is ``_terminate_torn_transcript_tail``, which stops a torn

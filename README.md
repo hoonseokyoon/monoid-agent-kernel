@@ -241,9 +241,17 @@ for existing durable artifacts and gateway requests.
 ## Observability
 
 Every run emits a structured event stream (`events.jsonl`) and durable artifacts, and can
-mirror that stream to OpenTelemetry — all without the core capturing prompt/response content.
-`AgentLoop.astream(user_input)` exposes live token deltas, and each run writes `metrics.json`
-with counters, timing, and token usage.
+mirror that stream to OpenTelemetry. `AgentLoop.astream(user_input)` exposes live token deltas,
+and each run writes `metrics.json` with counters, timing, and token usage.
+
+`events.jsonl` carries metadata and bounded previews rather than content: model-authored settled
+text leaves as a digest that entitled readers join back from `transcript.jsonl`, and tool arguments
+are truncated to a byte budget. **One exception is on by default in Studio:** `model.output.delta`
+and `model.reasoning.delta` publish raw model text, and the bundled app enables them whenever the
+optional `httpx` extra is installed, because they are what renders tokens live. They are durable
+events, not a live-only side channel. Turn them off with `MONOID_OUTPUT_DELTAS=0` or
+`monoid studio --no-output-deltas`; see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full
+public/private split.
 
 The run-directory artifact set, custom event sinks (including secret redaction), OTel tracing,
 live streaming, and metrics are all documented in **[docs/OBSERVABILITY.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OBSERVABILITY.md)**.

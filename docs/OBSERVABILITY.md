@@ -1,9 +1,13 @@
 # Outputs, event sinks, and observability
 
 Every run emits a structured event stream and durable artifacts, and can mirror
-that stream to OpenTelemetry — all without the core capturing prompt/response
-content. This is the reference for the run-directory artifact set, custom event
-sinks, OTel tracing, live streaming, and metrics.
+that stream to OpenTelemetry. This is the reference for the run-directory artifact
+set, custom event sinks, OTel tracing, live streaming, and metrics.
+
+The event stream carries metadata and bounded previews rather than content — with a
+short list of deliberate exceptions, stated under [What `events.jsonl` does and does
+not carry](#what-eventsjsonl-does-and-does-not-carry) rather than left as an absolute
+claim that the shipped defaults contradict.
 
 ## Outputs
 
@@ -20,9 +24,47 @@ Each run writes:
 - `proposal.json`: proposed output snapshot metadata
 - `proposal/files/`: materialized changed-file snapshots
 - `artifacts/jobs/<job_id>/`: background job status (`job.json`) and `stdout.log` / `stderr.log`
+- `artifacts/tasks/<task_id>/task.json`: hosted-task record (hitl, subagent, capability, tool
+  approval). **Private by location, like `transcript.jsonl`** — it is not served over HTTP and is
+  not in the export allowlist, so it keeps values the event stream drops. It carries a bounded
+  `arguments_preview`, and for a tool approval an `arguments_digest` addressing the raw arguments in
+  the run's blob store; it does *not* carry the raw arguments inline.
 
-`events.jsonl` remains public/redacted. Proposed file contents are exposed only
-through the run directory snapshot or run-token protected backend proposal APIs.
+Proposed file contents are exposed only through the run directory snapshot or
+run-token protected backend proposal APIs.
+
+## What `events.jsonl` does and does not carry
+
+Treat this as the contract, not the summary above it. `EventBus.emit` fans every event out to every
+registered sink with **no level filtering**, so `level="debug"` gates nothing: whatever is listed
+here is what a redacting sink, an OTel exporter, and `monoid watch --json` all see.
+
+Not carried:
+
+- **Model-authored settled text.** `turn.settled` and `run.finished` carry `final_text_digest` and
+  `final_text_len`. Entitled readers join the text back from `transcript.jsonl`; the run result
+  itself is unaffected. Kernel-authored text (for example `Stopped after reaching max steps.`) stays
+  inline, because digesting it would cost an operator the line explaining why a run stopped and buy
+  no privacy.
+- **File contents** in tool arguments and results (`content`, `old`, `new`, `old_text`, `new_text`).
+- **Whole values of any length.** Previews are capped by a **byte** budget, so the cap does not
+  depend on the script the text is written in.
+
+Carried, deliberately:
+
+- **`model.output.delta` and `model.reasoning.delta` carry raw model text**, and Studio enables them
+  whenever the optional `httpx` extra is installed. These are durable events, not a live-only side
+  channel, so the assembled answer is reconstructible from the file — note that it arrives split
+  across fragments, so **grepping the event log for a known string will not find it and is not a
+  valid check**. Disable with `MONOID_OUTPUT_DELTAS=0` (whole deployment, subagents included),
+  `monoid studio --no-output-deltas`, or `StudioConfig(stream_output_deltas=False)`. The cost is
+  live token rendering; `AgentLoop.astream` is unaffected, since it takes a different path.
+- **Bounded previews of tool arguments** (`args_preview`, `arguments_preview`), including a preview
+  of paths, commands, plan steps and artifact metadata. Secret-*named* keys are masked; values that
+  are secret without a telling key name are the integrator's responsibility, via
+  `PermissionPolicy.redact_patterns`.
+- **Error messages and paths**, which can name workspace structure.
+- **A subagent's answer** on `task.finished`, and hosted-task prompts.
 
 Studio adds `studio.chat.jsonl` inside each Studio run directory as the browser-facing chat
 projection. The Studio UI restores user, assistant, and error messages from
