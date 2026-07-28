@@ -11,6 +11,7 @@ from monoid_agent_kernel.public_view import (
     APPROVAL_BYTE_THRESHOLD,
     UNMASKED,
     preview_value,
+    public_mapping,
     touches_redacted_path,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
@@ -143,9 +144,10 @@ def redact_tool_arguments(
             return _REDACTED
         return UNMASKED
 
-    return {
-        str(key): preview_value(
-            str(key),
+    return public_mapping(
+        arguments,
+        lambda key, value: preview_value(
+            key,
             value,
             resolved,
             mask=mask,
@@ -160,9 +162,10 @@ def redact_tool_arguments(
             #
             # ...unless the operator redacted a path this call touches; see `withheld` above.
             decision_surface=not withheld,
-        )
-        for key, value in arguments.items()
-    }
+        ),
+        threshold=APPROVAL_BYTE_THRESHOLD,
+        budget=APPROVAL_BYTE_BUDGET,
+    )
 
 
 def normalize_tool_approval_result(

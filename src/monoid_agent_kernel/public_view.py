@@ -55,6 +55,21 @@ def public_inline_path(path: str, policy: PermissionPolicy) -> str:
     )
 
 
+def public_tool_name(name: str) -> str:
+    """A tool name for publication, bounded.
+
+    A name looks like a kernel-controlled enum and is not one: `_aexecute_tool_call` explicitly
+    handles a `call_name` the catalog cannot resolve and still emits `tool.call.started` with
+    `spec=None` and the raw string, so an arbitrary model-chosen name reaches five event fields.
+    18 KB of it, measured, on `tool.call.started` and `tool.call.failed` together.
+
+    Narrower than the argument channel, which is why it survived this long -- but the model chooses
+    it just as freely, and "that field is an identifier" was the same assumption that left dict keys
+    unbounded two commits ago.
+    """
+    return truncate_inline_text(name, threshold=PREVIEW_BYTE_THRESHOLD, budget=PREVIEW_BYTE_BUDGET)
+
+
 def public_error_message(error: str) -> str:
     if not error:
         return ""
@@ -64,17 +79,16 @@ def public_error_message(error: str) -> str:
 
 
 def public_result_content(content: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
-    public: dict[str, Any] = {}
-    for key, value in content.items():
+    def one(key: str, value: Any) -> Any:
         if key == "content":
-            public[key] = redacted_value(value)
-        elif key == "path" and isinstance(value, str):
+            return redacted_value(value)
+        if key == "path" and isinstance(value, str):
             # Same bound as `paths` on the event that carries this. Diverting `path` to bare
             # `public_path` published the model's whole argument beside its own truncation.
-            public[key] = public_inline_path(value, policy)
-        else:
-            public[key] = preview_value(key, value, policy)
-    return public
+            return public_inline_path(value, policy)
+        return preview_value(key, value, policy)
+
+    return public_mapping(content, one)
 
 
 def public_capability_result(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -155,7 +169,7 @@ def args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[st
     is masked on an ``ask``-gated call and published verbatim on an ``allow`` call. Anyone who wants
     it masked on both adds the example sink, or does not pass credentials as tool arguments.
     """
-    return {key: preview_value(key, value, policy) for key, value in arguments.items()}
+    return public_mapping(arguments, lambda key, value: preview_value(key, value, policy))
 
 
 # ``run.finish`` arguments that are the model's own prose rather than metadata about the run.
@@ -187,14 +201,14 @@ def finish_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> 
     a redaction marker on an absent value tells an operator something was withheld when nothing
     was there.
     """
-    return {
-        key: (
+    return public_mapping(
+        arguments,
+        lambda key, value: (
             redacted_value(value)
-            if value is not None and str(key).lower() in _FINISH_CONTENT_KEYS
-            else preview_value(str(key), value, policy)
-        )
-        for key, value in arguments.items()
-    }
+            if value is not None and key.lower() in _FINISH_CONTENT_KEYS
+            else preview_value(key, value, policy)
+        ),
+    )
 
 
 def shell_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
@@ -268,6 +282,14 @@ PREVIEW_BYTE_BUDGET = 160
 # side already learned the depth lesson (``core.schemas`` catches ``RecursionError``); this is the
 # write side learning it.
 PREVIEW_MAX_DEPTH = 8
+# A ceiling on the whole traversal, not on any one leaf. Depth, key and item caps bound the *shape*
+# of a preview and say nothing about its total size: a value reachable by many paths is re-expanded
+# once per path, so 9 levels of a mapping shared 5 ways -- about 40 objects, an input that fits on a
+# line -- produced 25 MB in 21.9 s. A cycle guard does not help, because sharing is not a cycle. A
+# node budget is the only thing that makes "the preview is bounded" true for every input shape
+# rather than for the ones that were tried. Generous enough that no realistic payload reaches it,
+# and reaching it is announced rather than silent.
+PREVIEW_MAX_NODES = 2000
 PREVIEW_MAX_KEYS = 20
 PREVIEW_MAX_ITEMS = 20
 
@@ -335,6 +357,54 @@ def truncate_inline_text(value: str, *, threshold: int, budget: int) -> str:
     return truncate_to_bytes(value, budget) + TRUNCATION_SUFFIX
 
 
+def _bounded_key(raw: str, *, threshold: int, budget: int, taken: Mapping[str, Any]) -> str:
+    """The published form of one mapping key: bounded, marked, and never silently merged.
+
+    One function because it was two, and the second one did not exist. Bounding keys inside
+    ``preview_value``'s dict branch fixed every key at depth >= 1 and left depth 0 — which is the
+    *only* depth a model names directly, since the outer mapping of a tool call is built by
+    ``args_preview`` and its four siblings rather than by the traversal. A 90 KB body arrived
+    ``{"redacted": true}`` as a value, 162 bytes as a nested key, and verbatim as a top-level key.
+
+    Collisions are disambiguated rather than dropped: truncation makes distinct keys equal, and a
+    mapping resolves that by discarding one of them without a word — a cap that does not say it
+    capped, which is the failure this release exists to close.
+    """
+    name = truncate_inline_text(raw, threshold=threshold, budget=budget)
+    if name not in taken:
+        return name
+    suffix = 2
+    while f"{name}#{suffix}" in taken:
+        suffix += 1
+    return f"{name}#{suffix}"
+
+
+def public_mapping(
+    values: Mapping[str, Any],
+    preview: Callable[[str, Any], Any],
+    *,
+    threshold: int = PREVIEW_BYTE_THRESHOLD,
+    budget: int = PREVIEW_BYTE_BUDGET,
+) -> dict[str, Any]:
+    """Build a public mapping from ``values``, bounding the **key** as well as the value.
+
+    Every builder that assembles an outer mapping goes through here, so "the key is model-authored
+    text too" is stated once. ``preview`` receives the *whole* key, not the bounded one: a 5 KB key
+    ending in ``_path`` is still a path, and judging it by its truncated form would let length
+    defeat the redaction.
+
+    Deliberately not ``preview_value(key, mapping, policy)``, which would also apply
+    ``PREVIEW_MAX_KEYS``. The top-level *count* cap is absent on purpose — ``narration`` and the
+    activity feed read specific argument names, and dropping the 21st argument would blank them —
+    and that reasoning is about count, not length.
+    """
+    published: dict[str, Any] = {}
+    for key, value in values.items():
+        name = _bounded_key(str(key), threshold=threshold, budget=budget, taken=published)
+        published[name] = preview(str(key), value)
+    return published
+
+
 class _Unmasked:
     """Sentinel: the mask looked at this value and declined to replace it."""
 
@@ -357,6 +427,7 @@ def preview_value(
     list_marker: bool = True,
     _depth: int = 0,
     _ancestors: frozenset[int] = frozenset(),
+    _nodes: list[int] | None = None,
 ) -> Any:
     """Bound a value for publication, optionally masking keys the caller names first.
 
@@ -387,6 +458,14 @@ def preview_value(
     rule to every depth on the reasoning that a rule bound at one site should be bound at its twins.
     Nested lists are not that twin.
     """
+    # Spent per invocation, not per container: counting only containers bounded the recursion but
+    # not the output, because each over-budget child still emitted its own marker -- 912 KB of
+    # markers, measured. One counter shared by the whole traversal, so the total is what is bounded.
+    if _nodes is None:
+        _nodes = [PREVIEW_MAX_NODES]
+    _nodes[0] -= 1
+    if _nodes[0] < 0:
+        return {"truncated": True, "budget_exhausted": True}
     if mask is not None:
         replacement = mask(key, value)
         if replacement is not UNMASKED:
@@ -401,7 +480,11 @@ def preview_value(
         # or it does not; a caller cannot pick one half any more.
         if _is_content_field(lowered):
             return redacted_value(value)
-        if _is_path_field(lowered) and isinstance(value, str) and _is_path_redacted(value, policy):
+        if (
+            _is_path_field(lowered)
+            and isinstance(value, str)
+            and _is_path_redacted(value, policy, fail_closed=lowered in _WORKSPACE_PATH_KEYS)
+        ):
             return redacted_value(value)
     if isinstance(value, (dict, list)) and _depth >= PREVIEW_MAX_DEPTH:
         return {"truncated": True, "type": type(value).__name__, "depth_exceeded": PREVIEW_MAX_DEPTH}
@@ -429,15 +512,7 @@ def preview_value(
             # the key has no name left to incriminate it). ``env_keys`` was routed through here for
             # exactly this reason one commit earlier -- but that bound keys arriving as list
             # *items*, and left the twin where they arrive as keys.
-            name = truncate_inline_text(str(child_key), threshold=threshold, budget=budget)
-            # Bounding keys makes distinct keys collide, and a dict comprehension resolves a
-            # collision by dropping one of them silently -- a cap that does not say it capped, the
-            # exact failure this release exists to close. Disambiguate rather than lose an entry.
-            if name in preview:
-                suffix = 2
-                while f"{name}#{suffix}" in preview:
-                    suffix += 1
-                name = f"{name}#{suffix}"
+            name = _bounded_key(str(child_key), threshold=threshold, budget=budget, taken=preview)
             # Rules still match on the *whole* key: a 5 KB key ending in ``_path`` is a path, and
             # judging it by its truncated form would let length defeat the redaction.
             preview[name] = preview_value(
@@ -450,6 +525,7 @@ def preview_value(
                 decision_surface=decision_surface,
                 _depth=_depth + 1,
                 _ancestors=_ancestors,
+                _nodes=_nodes,
             )
         # A source key literally named ``truncated_keys`` loses to the marker. Acceptable: the
         # preview is lossy by construction, and no consumer reads nested preview dicts by key --
@@ -473,6 +549,7 @@ def preview_value(
                 decision_surface=decision_surface,
                 _depth=_depth + 1,
                 _ancestors=_ancestors,
+                _nodes=_nodes,
             )
             for item in value[:PREVIEW_MAX_ITEMS]
         ]
@@ -501,7 +578,7 @@ def preview_value(
     return value
 
 
-def _is_path_redacted(value: str, policy: PermissionPolicy) -> bool:
+def _is_path_redacted(value: str, policy: PermissionPolicy, *, fail_closed: bool = True) -> bool:
     """``policy.is_path_redacted``, but a path that cannot be normalized counts as redacted.
 
     ``is_path_redacted`` normalizes before matching, and normalization *raises* on an absolute path
@@ -514,7 +591,10 @@ def _is_path_redacted(value: str, policy: PermissionPolicy) -> bool:
     try:
         return policy.is_path_redacted(value)
     except WorkspaceError:
-        return True
+        # ``fail_closed=False`` for a ``*_path`` field outside the workspace-path trio: those hold
+        # absolute, non-workspace paths legitimately (a task result's ``report_path``), and a
+        # workspace-relative glob could not have matched one anyway. See ``_WORKSPACE_PATH_KEYS``.
+        return fail_closed
 
 
 def redacted_value(value: Any) -> dict[str, Any]:
@@ -541,7 +621,7 @@ def public_event_payload(data: Mapping[str, Any], policy: PermissionPolicy) -> d
     argument that kept it out of ``plan.updated.items`` was about a consumer reading
     ``items[].step``, and nothing reads these by element shape.
     """
-    return {str(key): preview_value(str(key), value, policy) for key, value in data.items()}
+    return public_mapping(data, lambda key, value: preview_value(key, value, policy))
 
 
 def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -> bool:
@@ -551,11 +631,34 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
     key at a time and cannot know that the ``content`` it is about to show belongs to a call whose
     ``path`` the operator marked secret; this sees the whole argument map, which is the only level
     where that question can be answered.
+
+    **Recurses, because ``preview_value`` does.** Checking only ``values.items()`` made this the
+    shallower half of a pair that has to agree: a redacted path one level down — inside
+    ``artifact.emit``'s ``metadata``, which is declared ``additionalProperties: true`` and so
+    survives argument validation — neither triggered the escape hatch nor got redacted by the
+    traversal, because ``decision_surface`` had switched that off. It was published verbatim where
+    the release before this one had rendered ``{"redacted": true}``: a fix that made one field more
+    exposed than it found it. Lists are walked for the same reason; a ``str``-only check missed
+    ``{"source_path": ["secrets/creds.txt"]}``.
     """
-    return any(
-        _is_path_field(str(key).lower()) and isinstance(value, str) and _is_path_redacted(value, policy)
-        for key, value in values.items()
-    )
+
+    def walk(value: Any, key: str, depth: int) -> bool:
+        if depth > PREVIEW_MAX_DEPTH:
+            return False
+        if isinstance(value, Mapping):
+            return any(walk(item, str(child), depth + 1) for child, item in value.items())
+        if isinstance(value, list):
+            # The parent key carries down: list items have no key of their own, which is the same
+            # reason ``preview_value`` reuses it.
+            return any(walk(item, key, depth + 1) for item in value)
+        lowered = key.lower()
+        return (
+            _is_path_field(lowered)
+            and isinstance(value, str)
+            and _is_path_redacted(value, policy, fail_closed=lowered in _WORKSPACE_PATH_KEYS)
+        )
+
+    return walk(dict(values), "", 0)
 
 
 def _is_path_field(lowered_key: str) -> bool:
@@ -568,10 +671,22 @@ def _is_path_field(lowered_key: str) -> bool:
     # Matched by name rather than by consulting the registry because this function also previews
     # values that never were a tool argument (result payloads, artifact metadata, capability
     # descriptors), where there is no ``ToolSpec`` to ask -- and because a custom or MCP tool that
-    # names an argument ``*_path`` is then covered without registering anything here. Over-matching
-    # is the safe direction: the cost is a redaction marker on a field that did not need one, and
-    # only ever for a value ``redact_patterns`` already matched.
-    return lowered_key in {"path", "root", "cwd"} or lowered_key.endswith("_path")
+    # names an argument ``*_path`` is then covered without registering anything here.
+    return lowered_key in _WORKSPACE_PATH_KEYS or lowered_key.endswith("_path")
+
+
+# The three keys a tool argument uses for a path that is a *workspace* path by contract. They alone
+# fail closed when normalization raises, and that distinction is load-bearing rather than tidy.
+#
+# ``redact_patterns`` are workspace-relative globs, so a value that cannot be normalized to a
+# workspace path cannot match one: redacting it is a guess, not the operator's instruction. While
+# ``_is_path_field`` was the hardcoded triple that guess was cheap, because those fields hold
+# workspace paths and a malformed one is a real anomaly. Widening to ``*_path`` extended it to
+# fields that legitimately hold absolute, non-workspace paths -- a task result's ``report_path``,
+# a job's ``stdout_path`` -- and blanked them on ``workspace.file.changed.result`` and
+# ``task.finished.result`` the moment an operator configured *any* unrelated pattern. So: a
+# ``*_path`` that will not normalize is not a workspace path, and is published.
+_WORKSPACE_PATH_KEYS = frozenset({"path", "root", "cwd"})
 
 
 def _is_content_field(lowered_key: str) -> bool:

@@ -172,6 +172,7 @@ from monoid_agent_kernel.public_view import (
     preview_value,
     public_error_message,
     public_inline_path,
+    public_tool_name,
     public_path,
     public_proposal_payload,
     public_result_content,
@@ -3534,8 +3535,14 @@ class AgentLoop:
         context: AgentToolContext,
         recorder: AgentRecorder,
     ) -> None:
+        # `public_inline_path`, matching the foreground branch. Despite the local name these are
+        # emitted as `data["paths"]` below -- the same field `_public_paths_from_args` bounds for a
+        # foreground `shell.exec` and the same `narration._target` reads. `shell.exec` declares
+        # `skip_emit_if_background=True`, so which branch runs is decided by `background=True` in a
+        # model-authored argument: the twin was one flag away, and a scripted edit that matched on
+        # indentation converted the foreground copy and silently missed this one.
         changed_paths = [
-            public_path(str(path), self.permission_policy)
+            public_inline_path(str(path), self.permission_policy)
             for path in payload.get("changed_paths", [])
         ]
         if not changed_paths:
@@ -3804,7 +3811,7 @@ class AgentLoop:
                 "kind": "tool_observation",
                 "step": step,
                 "call_id": call_id,
-                "tool": call_name,
+                "tool": public_tool_name(call_name),
                 "tool_id": spec.id if spec is not None else None,
                 "output": observation.output,
             }
@@ -3816,7 +3823,7 @@ class AgentLoop:
             parent_id=started_event.event_id if started_event else parent_id,
             data={
                 "call_id": call_id,
-                "tool": call_name,
+                "tool": public_tool_name(call_name),
                 "ok": result.ok,
                 "error": public_error_message(result.error),
                 "error_code": result.error_code,
@@ -4099,8 +4106,8 @@ class AgentLoop:
                 parent_id=started_event.event_id if started_event else parent_id,
                 data={
                     "call_id": call_id,
-                    "tool": spec.id if spec is not None else call_name,
-                    "requested_tool": call_name,
+                    "tool": spec.id if spec is not None else public_tool_name(call_name),
+                    "requested_tool": public_tool_name(call_name),
                     "error": public_error_message(str(exc)),
                     "error_code": result.error_code,
                     "surface_decision": surface_decision or None,
@@ -4634,7 +4641,7 @@ def _tool_start_data(
         preview = args_preview(arguments, permission_policy)
     return {
         "call_id": call_id,
-        "tool": call_name,
+        "tool": public_tool_name(call_name),
         "capability": spec.capability if spec is not None else None,
         "side_effect": spec.side_effect if spec is not None else None,
         "paths": _public_paths_from_args(spec, arguments, permission_policy) if spec is not None else [],

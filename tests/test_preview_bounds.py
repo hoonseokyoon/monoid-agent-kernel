@@ -26,6 +26,7 @@ import pytest
 from monoid_agent_kernel.core.tool_approval import redact_tool_arguments
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
+    APPROVAL_BYTE_BUDGET,
     PREVIEW_BYTE_BUDGET,
     PREVIEW_BYTE_THRESHOLD,
     PREVIEW_MAX_DEPTH,
@@ -34,7 +35,10 @@ from monoid_agent_kernel.public_view import (
     REDACTED_PATH,
     TRUNCATION_SUFFIX,
     args_preview,
+    finish_args_preview,
     preview_value,
+    public_event_payload,
+    public_tool_name,
     public_inline_path,
     public_proposal_payload,
     public_result_content,
@@ -481,3 +485,137 @@ def test_a_value_shared_twice_without_a_cycle_still_renders_both_times() -> None
         "p": {"x": 1},
         "q": {"x": 1},
     }
+
+
+# Every builder that assembles an outer mapping from model-authored input. Parametrized rather than
+# written out, because the previous fix bound keys inside `preview_value`'s traversal and left all
+# five of these -- and depth 0 is the *only* depth a model names directly, since the outer mapping
+# of a tool call is built here rather than by the traversal.
+TOP_LEVEL_BUILDERS = [
+    pytest.param(lambda args, policy: args_preview(args, policy), PREVIEW_BYTE_BUDGET, id="args_preview"),
+    pytest.param(lambda args, policy: finish_args_preview(args, policy), PREVIEW_BYTE_BUDGET, id="finish_args_preview"),
+    pytest.param(lambda args, policy: public_result_content(args, policy), PREVIEW_BYTE_BUDGET, id="public_result_content"),
+    pytest.param(lambda args, policy: public_event_payload(args, policy), PREVIEW_BYTE_BUDGET, id="public_event_payload"),
+    pytest.param(
+        lambda args, policy: redact_tool_arguments(args, policy=policy),
+        APPROVAL_BYTE_BUDGET,
+        id="redact_tool_arguments",
+    ),
+]
+
+
+@pytest.mark.parametrize(("build", "budget"), TOP_LEVEL_BUILDERS)
+def test_a_top_level_key_is_bounded_by_every_builder(build, budget: int) -> None:
+    """A 90 KB body was `{"redacted": true}` as a value, 162 bytes as a nested key, and verbatim
+    as a top-level key -- through all five of these, onto `events.jsonl`, `task.json` and
+    `status.json`."""
+    body = "비밀" * 15_000
+    assert len(body.encode()) > budget
+
+    published = next(iter(build({body: 1}, PermissionPolicy())))
+
+    assert published != body, "the key rode out verbatim"
+    assert len(published.encode()) <= budget + len(TRUNCATION_SUFFIX.encode())
+    assert published.endswith(TRUNCATION_SUFFIX)
+
+
+@pytest.mark.parametrize(("build", "budget"), TOP_LEVEL_BUILDERS)
+def test_no_builder_silently_merges_two_top_level_keys(build, budget: int) -> None:
+    """The collision hazard follows the cap wherever it goes."""
+    shared = "x" * (budget + 50)
+
+    published = build({shared + "-alpha": 1, shared + "-beta": 2}, PermissionPolicy())
+
+    assert len(published) == 2, f"an argument was dropped: {list(published)}"
+
+
+def test_an_ordinary_argument_name_is_untouched_by_the_key_bound() -> None:
+    """The cap is a ceiling on hostile input, not a reshaping of every tool call.
+
+    Without this, "bound the keys" would satisfy every assertion above while renaming every
+    argument an operator reads -- and `narration` and the Studio activity feed look arguments up by
+    name, so a reshaped key blanks them.
+    """
+    arguments = {"path": "notes/a.md", "recursive": True, "max_bytes": 10}
+
+    assert args_preview(arguments, PermissionPolicy()) == arguments
+
+
+def test_a_model_chosen_tool_name_is_bounded_on_the_events_that_carry_it() -> None:
+    """`_aexecute_tool_call` handles a `call_name` the catalog cannot resolve and still emits it,
+    so the name is model-authored text, not a kernel enum."""
+    assert public_tool_name("fs.write") == "fs.write"
+
+    published = public_tool_name("도구" * 6_000)
+
+    assert len(published.encode()) <= PREVIEW_BYTE_BUDGET + len(TRUNCATION_SUFFIX.encode())
+    assert published.endswith(TRUNCATION_SUFFIX)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "label"),
+    [
+        ({"metadata": {"path": "secrets/id_rsa"}}, "one level down"),
+        ({"metadata": {"deeper": {"source_path": "secrets/id_rsa"}}}, "two levels down"),
+        ({"source_path": ["secrets/id_rsa"]}, "inside a list"),
+    ],
+)
+def test_the_approval_escape_hatch_reaches_as_deep_as_the_traversal(arguments, label: str) -> None:
+    """A regression this branch introduced and had to take back.
+
+    `decision_surface` switched path redaction off for the approver, and `touches_redacted_path` --
+    the escape hatch that switches it back on when the operator marked something secret -- looked
+    only at `values.items()`. `preview_value` recurses, so a redacted path one level down got
+    neither treatment and was published where the previous release rendered `{"redacted": true}`.
+    Reachable from a builtin: `artifact.emit`'s `metadata` is `additionalProperties: true`, so it
+    survives argument validation intact.
+
+    The two halves of a pair have to walk the same shape or the shallower one is a hole.
+    """
+    policy = PermissionPolicy(redact_patterns=("secrets/**",))
+
+    published = json.dumps(redact_tool_arguments(arguments, policy=policy))
+
+    assert "secrets/id_rsa" not in published, f"published verbatim ({label}): {published}"
+
+
+def test_a_path_that_is_not_a_workspace_path_is_not_blanked_by_an_unrelated_pattern() -> None:
+    """The cost of widening the path predicate, which the widening comment got wrong.
+
+    `_is_path_redacted` treats a normalization failure as redacted, because a malformed *workspace*
+    path is an anomaly worth withholding. Extending that to every `*_path` blanked fields that hold
+    absolute non-workspace paths legitimately — a task result's `report_path`, a job's
+    `stdout_path` — on `workspace.file.changed.result` and `task.finished.result`, for any operator
+    who had configured a pattern that could not possibly match them: `redact_patterns` are
+    workspace-relative globs, so a path outside the workspace never matches one.
+    """
+    policy = PermissionPolicy(redact_patterns=("secrets/**",))
+
+    assert public_result_content({"report_path": "/srv/out/report.pdf"}, policy) == {
+        "report_path": "/srv/out/report.pdf"
+    }
+    # The trio still fails closed: those hold workspace paths by contract.
+    assert preview_value("path", "/etc/passwd", policy) == redacted_value("/etc/passwd")
+    # And an actual pattern match is still redacted wherever the key shape allows it.
+    assert preview_value("source_path", "secrets/creds.txt", policy) == redacted_value("secrets/creds.txt")
+
+
+def test_the_total_size_of_one_preview_is_bounded_for_a_shared_graph_too() -> None:
+    """The cycle guard bounded self-reference and left sharing, which is the cheaper attack.
+
+    Re-expansion "once per edge per level" needs sharing, not a cycle: nine levels of a mapping
+    shared five ways is about 40 objects and produced 25 MB in 21.9 s. Depth, key and item caps
+    bound a preview's *shape* and say nothing about its total size, so the node budget is what makes
+    "bounded" true for input shapes nobody thought to try.
+    """
+    node: Any = {"leaf": 1}
+    for _ in range(9):
+        node = {f"c{index}": node for index in range(5)}
+
+    start = time.monotonic()
+    published = json.dumps(public_result_content({"payload": node}, PermissionPolicy()))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0, f"still re-expanding: {elapsed:.2f}s"
+    assert len(published) < 250_000, f"output was {len(published)} bytes"
+    assert '"budget_exhausted": true' in published, "the cap has to say it capped"

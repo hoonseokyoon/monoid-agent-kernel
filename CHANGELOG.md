@@ -65,10 +65,22 @@ out in commit messages and here.
   now a single `decision_surface` switch a caller cannot half-set, and the operator's explicit
   `redact_patterns` outranks it for the whole call — unlike the kernel's own content default, which
   an approver is entitled to see past.
-- A container reachable from itself is elided rather than re-expanded. The depth cap terminated the
-  walk without bounding its cost: 20 self-referencing keys cost `20 ** PREVIEW_MAX_DEPTH` nodes, and
-  fanout 8 was measured at 45 s and 1.1 GB from an input that fits on one line. Ancestors on the
-  current path only, so a value legitimately shared twice still renders twice.
+- **The total size of one preview is bounded**, not just each leaf. The depth, key and item caps
+  bound a preview's *shape* and say nothing about its size: a value reachable by many paths is
+  re-expanded once per path. Self-reference was the loud version (fanout 8: 45 s, 1.1 GB) and is now
+  elided with a `circular` marker, tracked over ancestors on the current path so a value
+  legitimately shared twice still renders twice. But sharing without a cycle is the cheaper attack
+  and the cycle guard does nothing for it — nine levels shared five ways, about 40 objects,
+  produced 25 MB in 21.9 s. A `PREVIEW_MAX_NODES` budget spent per visited value bounds every input
+  shape, including the ones nobody tried; exhausting it is announced with `budget_exhausted`.
+  Reachable only from a Python-object caller (a custom or MCP tool's `ToolResult.content`), since
+  JSON cannot express sharing.
+- `redact_patterns` covers `*_path` fields, but a `*_path` that cannot be normalized to a workspace
+  path is **published, not blanked**. The `path`/`root`/`cwd` trio still fails closed on a malformed
+  value — those hold workspace paths by contract, and that guard is what stopped a model-authored
+  `..` from ending the run. Extending it to every `*_path` blanked fields that legitimately hold
+  absolute paths (a task result's `report_path`, a job's `stdout_path`) for any operator with an
+  unrelated pattern configured, and a workspace-relative glob could never have matched them anyway.
 - A `path` argument that cannot be normalized (absolute, or containing `..`) is now redacted rather
   than raising. Normalization raises, the preview builders sit on the emit path, and the raise ended
   the run of any operator who had configured `redact_patterns` — it escaped `_emit_tool_started`

@@ -60,10 +60,15 @@ def _strip_shell_noise(line: str) -> str:
     for prompt in ("$ ", "> "):
         if line.startswith(prompt):
             line = line[len(prompt):].strip()
-    if "&&" in line:
-        line = line.rsplit("&&", 1)[1].strip()
-    while (stripped := _ENV_PREFIX.sub("", line)) != line:
-        line = stripped
+    # Every segment, not the last one. `rsplit(...)[1]` handled `cd repo && monoid run ...` and
+    # discarded the reverse -- so a typo'd invocation only had to be *followed* by `&& something` to
+    # vanish, which is the same silent skip this function exists to close.
+    for segment in line.split("&&"):
+        candidate = segment.strip()
+        while (stripped := _ENV_PREFIX.sub("", candidate)) != candidate:
+            candidate = stripped
+        if candidate.startswith("monoid "):
+            return candidate
     return line
 
 
@@ -108,9 +113,11 @@ def _resolve(tokens: list[str]) -> tuple[click.Command, list[str]]:
     while index < len(tokens):
         token = tokens[index]
         if token.startswith("-"):
-            # Skip the flag (and a value that is not itself a subcommand) and keep walking: `_resolve`
-            # used to stop dead here, so `monoid run --workspace . studioo` resolved to `run` and the
-            # bogus subcommand was never checked.
+            # Skip the flag (and a value that is not itself a subcommand) and keep walking, so a
+            # group's subcommand is still resolved when a flag precedes it. Note this does *not*
+            # make `monoid run --workspace . studioo` an error, and should not: `run` is a command
+            # rather than a group, so `studioo` there is its prompt argument, not a mistyped
+            # subcommand.
             index += 1
             if index < len(tokens) and not tokens[index].startswith("-"):
                 if not isinstance(node, click.Group) or node.get_command(click.Context(node), tokens[index]) is None:
