@@ -46,7 +46,9 @@ out in commit messages and here.
   before validation, and the error handler retried the same emission, so one malformed
   model-authored argument terminated the run instead of producing a tool error the model could
   correct. The guard lives in `public_path` itself, which all twelve call sites across `loop`,
-  `loop_phases`, `tasks`, `tool_services.shell` and `core.projections` go through.
+  `loop_phases`, `tasks`, `tool_services.shell` and `core.projections` go through, and in
+  `public_proposal_file`, the one remaining direct caller of the raw predicate. No unguarded call
+  to `PermissionPolicy.is_path_redacted` is left outside the guard.
 - A truncated `paths` entry now ends in `…`. These stay plain strings because `narration._target`
   falls back to them and joins them, so the cut has to be marked inside the text: an unmarked prefix
   is presented to an operator as the exact target of a write, and two long paths sharing a prefix

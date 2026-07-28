@@ -31,6 +31,7 @@ from monoid_agent_kernel.public_view import (
     args_preview,
     preview_value,
     public_path,
+    public_proposal_file,
     redacted_value,
     shell_args_preview,
     truncate_to_bytes,
@@ -232,9 +233,26 @@ def test_an_unnormalizable_path_is_redacted_rather_than_raising() -> None:
         # `loop_phases`, `tasks`, `tool_services.shell` and `core.projections` — so the rule lives
         # in `public_path` itself rather than at any of them.
         assert public_path(path, policy) == REDACTED_PATH
+        # ...and the third caller in this module, which after `public_path` was guarded was calling
+        # both: `public_proposal_file` failed closed on its `path` and still raised on the identical
+        # string one line earlier. Found by sweeping for the shape rather than by review.
+        entry = public_proposal_file({"path": path, "snapshot_path": "snap/x"}, policy)
+        assert entry["path"] == REDACTED_PATH
+        assert entry["snapshot_path"] == REDACTED_PATH
     # A normal relative path outside the patterns is still published.
     assert preview_value("path", "notes/a.md", policy) == "notes/a.md"
     assert public_path("notes/a.md", policy) == "notes/a.md"
+    assert public_proposal_file({"path": "notes/a.md", "snapshot_path": "snap/x"}, policy) == {
+        "path": "notes/a.md",
+        "kind": None,
+        "size": None,
+        "sha256": None,
+        "base_sha256": None,
+        "proposed_sha256": None,
+        "snapshot_sha256": None,
+        "change_kind": None,
+        "snapshot_path": "snap/x",
+    }
 
 
 def test_the_width_cap_does_not_reach_top_level_argument_keys() -> None:

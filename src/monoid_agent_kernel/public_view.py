@@ -96,7 +96,12 @@ def public_proposal_payload(payload: dict[str, Any], policy: PermissionPolicy) -
 
 def public_proposal_file(file: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
     path = str(file.get("path", ""))
-    redacted = policy.is_path_redacted(path)
+    # The guarded predicate, for the same reason `public_path` uses it — and because after that
+    # change this function was calling both: line 101 failed closed while this line still raised on
+    # the identical string. Proposal paths come from the workspace diff rather than from a model
+    # argument, so this is harder to reach than the tool-call sites, but "that input is always
+    # well-formed" is exactly the assumption that made the other two reachable.
+    redacted = _is_path_redacted(path, policy)
     return {
         "path": public_path(path, policy),
         "kind": file.get("kind"),
