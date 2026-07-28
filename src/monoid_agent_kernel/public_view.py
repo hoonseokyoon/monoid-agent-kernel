@@ -31,6 +31,30 @@ def public_path(path: str, policy: PermissionPolicy) -> str:
     return REDACTED_PATH if _is_path_redacted(path, policy) else path
 
 
+def public_inline_path(path: str, policy: PermissionPolicy) -> str:
+    """A path for a *log* field a renderer prints inline: redacted, bounded, and marked when cut.
+
+    The distinction this draws is the one the release keeps rediscovering. ``public_path`` alone is
+    for **contract** surfaces — ``proposal.json``'s ``changed_paths`` and ``snapshot_path`` are
+    resolved back to real files by ``core.proposal_file``, ``core.packages`` and ``core.schemas``,
+    so a truncated value there does not describe a shorter path, it breaks replay and packaging.
+    This one is for surfaces nobody resolves: ``tool.call.started.paths``,
+    ``artifact.emitted.path``, ``workspace.file.changed.result.path``.
+
+    It exists because those three were three different answers. ``paths`` got the cap and the
+    marker; ``artifact.emitted.path`` got neither, four lines under a comment about closing "the
+    second emit the wider door"; and ``public_result_content`` diverted ``path`` to bare
+    ``public_path``, so one ``workspace.file.changed`` carried the same argument cut-and-marked in
+    ``paths`` and whole in ``result.path`` — the cap defeated by the field beside it, which is also
+    how the ``source_path`` redaction gap worked.
+    """
+    return truncate_inline_text(
+        public_path(path, policy),
+        threshold=PREVIEW_BYTE_THRESHOLD,
+        budget=PREVIEW_BYTE_BUDGET,
+    )
+
+
 def public_error_message(error: str) -> str:
     if not error:
         return ""
@@ -45,7 +69,9 @@ def public_result_content(content: dict[str, Any], policy: PermissionPolicy) -> 
         if key == "content":
             public[key] = redacted_value(value)
         elif key == "path" and isinstance(value, str):
-            public[key] = public_path(value, policy)
+            # Same bound as `paths` on the event that carries this. Diverting `path` to bare
+            # `public_path` published the model's whole argument beside its own truncation.
+            public[key] = public_inline_path(value, policy)
         else:
             public[key] = preview_value(key, value, policy)
     return public
@@ -480,6 +506,25 @@ def redacted_value(value: Any) -> dict[str, Any]:
     if isinstance(value, bytes):
         return {"redacted": True, "type": "bytes", "bytes": len(value)}
     return {"redacted": True, "type": type(value).__name__}
+
+
+def public_event_payload(data: Mapping[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
+    """Bound every value in an event payload a service assembled by hand.
+
+    The ``*_args_preview`` builders bound what reaches ``tool.call.started``, and services then
+    built their *own* payloads for the events they emit either side of it — ``to_public_json`` for
+    the four shell events, an inline ``event_data`` for the three web ones. Same model-authored
+    values, same run, one of them capped: a 20 KB ``env`` key or ``blocked_domains`` entry was
+    published verbatim on ``tool.approval.requested`` while ``args_preview`` reduced it to a
+    preview, and a ``cwd`` under ``redact_patterns`` came out ``{"redacted": true}`` on one event
+    and as the path on the next.
+
+    These payloads are declared ``additionalProperties: true`` JSON blobs with no typed renderer,
+    so the self-describing ``{"truncated_items": n}`` marker is the right default here — the
+    argument that kept it out of ``plan.updated.items`` was about a consumer reading
+    ``items[].step``, and nothing reads these by element shape.
+    """
+    return {str(key): preview_value(str(key), value, policy) for key, value in data.items()}
 
 
 def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -> bool:

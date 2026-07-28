@@ -31,6 +31,9 @@ from monoid_agent_kernel.public_view import (
     TRUNCATION_SUFFIX,
     args_preview,
     preview_value,
+    public_inline_path,
+    public_proposal_payload,
+    public_result_content,
     public_path,
     public_proposal_file,
     redacted_value,
@@ -394,3 +397,45 @@ def test_the_approval_card_never_shows_a_body_while_hiding_where_it_goes() -> No
     assert withheld["path"]["redacted"] is True
     assert withheld["content"]["redacted"] is True, "a body shown beside a hidden path protects nothing"
     assert body not in str(withheld)
+
+
+def test_the_same_path_is_bounded_identically_in_paths_and_in_the_result_beside_it() -> None:
+    """One `workspace.file.changed` carried the same argument cut in one field and whole in another.
+
+    `_public_paths_from_args` capped and marked `paths`; `public_result_content` diverted `path` to
+    bare `public_path`, which redacts but never truncates. A cap the neighbouring field publishes
+    around is not a cap -- the same way the `source_path` redaction was defeated.
+
+    Not an end-to-end test because Windows cannot create the 300-byte path it would need; the
+    coupling is the thing worth pinning, and it lives here.
+    """
+    policy = PermissionPolicy()
+    long_path = "d" * 300 + "/note.md"
+
+    on_the_call = public_inline_path(long_path, policy)
+    in_the_result = public_result_content({"path": long_path}, policy)["path"]
+
+    assert in_the_result == on_the_call
+    assert on_the_call.endswith(TRUNCATION_SUFFIX)
+    assert len(on_the_call.encode()) <= PREVIEW_BYTE_BUDGET + len(TRUNCATION_SUFFIX.encode())
+
+
+def test_a_contract_path_is_never_truncated_even_though_the_log_one_is() -> None:
+    """The other half, and the reason `public_inline_path` is a separate function.
+
+    `proposal.json`'s `changed_paths` and `snapshot_path` are resolved back to real files by
+    `core.proposal_file`, `core.packages` and `core.schemas`. Truncating them there would not
+    publish a shorter path, it would break replay and packaging -- so "bind the rule at every
+    caller of `public_path`" is the wrong generalisation here, and this pins that it stays wrong.
+    """
+    policy = PermissionPolicy()
+    long_path = "d" * 300 + "/note.md"
+
+    payload = public_proposal_payload(
+        {"changed_paths": [long_path], "files": [{"path": long_path, "snapshot_path": long_path}]},
+        policy,
+    )
+
+    assert payload["changed_paths"] == [long_path]
+    assert payload["files"][0]["path"] == long_path
+    assert payload["files"][0]["snapshot_path"] == long_path

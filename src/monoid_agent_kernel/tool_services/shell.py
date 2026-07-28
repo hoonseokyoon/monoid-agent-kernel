@@ -89,7 +89,7 @@ class ShellService:
             "tool.approval.requested",
             turn_id=call.turn_id,
             parent_id=approval_parent,
-            data=request.to_public_json(),
+            data=request.to_public_json(self.permission_policy),
         )
         provider = self.approval_provider or _approval_provider_for_options(shell_options)
         if provider is None:
@@ -105,7 +105,7 @@ class ShellService:
             approval_event_type,
             turn_id=call.turn_id,
             parent_id=approval_parent,
-            data={**request.to_public_json(), **decision.to_public_json()},
+            data={**request.to_public_json(self.permission_policy), **decision.to_public_json()},
             level="info" if decision.approved else "warning",
         )
         if not decision.approved:
@@ -115,7 +115,7 @@ class ShellService:
             "shell.exec.started",
             turn_id=call.turn_id,
             parent_id=approval_parent,
-            data=request.to_public_json(),
+            data=request.to_public_json(self.permission_policy),
         )
         if background:
             try:
@@ -140,7 +140,7 @@ class ShellService:
                     turn_id=call.turn_id,
                     parent_id=shell_started.event_id,
                     data={
-                        **request.to_public_json(),
+                        **request.to_public_json(self.permission_policy),
                         "error": public_error_message(str(exc)),
                         "error_code": error_code_for_exception(exc),
                     },
@@ -154,7 +154,7 @@ class ShellService:
                 turn_id=call.turn_id,
                 parent_id=shell_started.event_id,
                 data={
-                    **request.to_public_json(),
+                    **request.to_public_json(self.permission_policy),
                     "job_id": job.job_id,
                     "status": job.status,
                     "stdout_path": content["stdout_path"],
@@ -184,7 +184,7 @@ class ShellService:
                 turn_id=call.turn_id,
                 parent_id=shell_started.event_id,
                 data={
-                    **request.to_public_json(),
+                    **request.to_public_json(self.permission_policy),
                     "error": public_error_message(str(exc)),
                     "error_code": error_code_for_exception(exc),
                 },
@@ -200,7 +200,7 @@ class ShellService:
             turn_id=call.turn_id,
             parent_id=shell_started.event_id,
             data={
-                **request.to_public_json(),
+                **request.to_public_json(self.permission_policy),
                 "exit_code": result.exit_code,
                 "timed_out": result.timed_out,
                 "output_truncated": result.output_truncated,

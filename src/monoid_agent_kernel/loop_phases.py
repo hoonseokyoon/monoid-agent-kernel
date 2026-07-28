@@ -153,6 +153,7 @@ class LoopBootstrapper:
         web_service = WebService(
             recorder=recorder,
             web_gateway_client=loop.web_gateway_client,
+            permission_policy=loop.permission_policy,
         )
         jobs_service = JobsService(job_manager=job_manager)
         from monoid_agent_kernel.loop import AgentToolContext

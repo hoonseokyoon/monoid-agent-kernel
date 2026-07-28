@@ -335,3 +335,39 @@ def test_ordinary_plans_and_metadata_are_published_unchanged(tmp_path: Path) -> 
     result = _run(_spec(tmp_path), [("run.update_plan", {"items": items})], "run.update_plan")
 
     assert _events(result.run_dir, "plan.updated")[-1]["data"]["items"] == items
+
+
+def _redacting_spec(tmp_path: Path) -> AgentRunSpec:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    return AgentRunSpec(
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+        permission_policy=PermissionPolicy(redact_patterns=("secrets/**", "secrets/*")),
+    )
+
+
+def test_a_declared_path_argument_is_redacted_in_the_preview_and_not_only_in_paths(
+    tmp_path: Path,
+) -> None:
+    """The redaction was defeated by the field beside it, on the same event.
+
+    `preview_value` matched a hardcoded `{path, root, cwd}` while the registry declares path
+    arguments per tool, so `fs.move` published `paths: ["[redacted-path]"]` next to
+    `args_preview.source_path: "secrets/creds.txt"`. An operator reading either field alone would
+    draw opposite conclusions about whether their `redact_patterns` worked.
+    """
+    spec = _redacting_spec(tmp_path)
+    (spec.workspace_root / "secrets").mkdir()
+    (spec.workspace_root / "secrets" / "creds.txt").write_text("k", encoding="utf-8")
+
+    result = _run(
+        spec,
+        [("fs.move", {"source_path": "secrets/creds.txt", "destination_path": "public/out.txt"})],
+        "fs.move",
+    )
+
+    started = _events(result.run_dir, "tool.call.started")[0]["data"]
+    assert started["paths"][0] == REDACTED_PATH
+    assert started["args_preview"]["source_path"] == redacted_value("secrets/creds.txt")
+    assert "secrets/creds.txt" not in json.dumps(started)

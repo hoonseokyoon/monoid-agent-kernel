@@ -167,17 +167,15 @@ from monoid_agent_kernel.providers.base import (
     format_async_result_text,
 )
 from monoid_agent_kernel.public_view import (
-    PREVIEW_BYTE_BUDGET,
-    PREVIEW_BYTE_THRESHOLD,
     args_preview,
     finish_args_preview,
     preview_value,
     public_error_message,
+    public_inline_path,
     public_path,
     public_proposal_payload,
     public_result_content,
     shell_args_preview,
-    truncate_inline_text,
     web_args_preview,
 )
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -394,6 +392,12 @@ class AgentToolContext(ToolContext):
             "artifact.emitted",
             data={
                 "artifact_id": artifact.artifact_id,
+                # Deliberately raw, and not the twin it looks like. `emit_artifact_bytes` rewrites
+                # this to `artifacts/<artifact_id>/<basename>` (recorder.py), so it is a run-dir
+                # pointer to a real file, never the model's own argument: `redact_patterns` cannot
+                # match it and the filesystem already bounds the basename. Bounding it here would
+                # break the readers that resolve it, for no egress -- the same reason
+                # `snapshot_path` keeps bare `public_path`.
                 "path": artifact.path,
                 "kind": kind,
                 # Model-authored and republished on the fan-out stream. The same mapping is already
@@ -4445,7 +4449,7 @@ class AgentLoop:
                 return
             if spec.changed_paths_source == "result_content":
                 paths = [
-                    public_path(str(path), self.permission_policy)
+                    public_inline_path(str(path), self.permission_policy)
                     for path in result.content.get("changed_paths", [])
                 ]
             else:
@@ -4656,11 +4660,7 @@ def _public_paths_from_args(
     shared with the plan-step branch so the two cannot answer that differently again.
     """
     return [
-        truncate_inline_text(
-            public_path(str(arguments[name]), permission_policy),
-            threshold=PREVIEW_BYTE_THRESHOLD,
-            budget=PREVIEW_BYTE_BUDGET,
-        )
+        public_inline_path(str(arguments[name]), permission_policy)
         for name in spec.path_args
         if name in arguments and arguments[name] is not None
     ]
