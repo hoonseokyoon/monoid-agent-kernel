@@ -27,6 +27,7 @@ from monoid_agent_kernel.core.tool_approval import redact_tool_arguments
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
     APPROVAL_BYTE_BUDGET,
+    APPROVAL_BYTE_THRESHOLD,
     PREVIEW_BYTE_BUDGET,
     PREVIEW_BYTE_THRESHOLD,
     PREVIEW_MAX_DEPTH,
@@ -492,20 +493,31 @@ def test_a_value_shared_twice_without_a_cycle_still_renders_both_times() -> None
 # five of these -- and depth 0 is the *only* depth a model names directly, since the outer mapping
 # of a tool call is built here rather than by the traversal.
 TOP_LEVEL_BUILDERS = [
-    pytest.param(lambda args, policy: args_preview(args, policy), PREVIEW_BYTE_BUDGET, id="args_preview"),
-    pytest.param(lambda args, policy: finish_args_preview(args, policy), PREVIEW_BYTE_BUDGET, id="finish_args_preview"),
-    pytest.param(lambda args, policy: public_result_content(args, policy), PREVIEW_BYTE_BUDGET, id="public_result_content"),
-    pytest.param(lambda args, policy: public_event_payload(args, policy), PREVIEW_BYTE_BUDGET, id="public_event_payload"),
+    pytest.param(
+        lambda args, policy: args_preview(args, policy),
+        PREVIEW_BYTE_BUDGET, PREVIEW_BYTE_THRESHOLD, id="args_preview",
+    ),
+    pytest.param(
+        lambda args, policy: finish_args_preview(args, policy),
+        PREVIEW_BYTE_BUDGET, PREVIEW_BYTE_THRESHOLD, id="finish_args_preview",
+    ),
+    pytest.param(
+        lambda args, policy: public_result_content(args, policy),
+        PREVIEW_BYTE_BUDGET, PREVIEW_BYTE_THRESHOLD, id="public_result_content",
+    ),
+    pytest.param(
+        lambda args, policy: public_event_payload(args, policy),
+        PREVIEW_BYTE_BUDGET, PREVIEW_BYTE_THRESHOLD, id="public_event_payload",
+    ),
     pytest.param(
         lambda args, policy: redact_tool_arguments(args, policy=policy),
-        APPROVAL_BYTE_BUDGET,
-        id="redact_tool_arguments",
+        APPROVAL_BYTE_BUDGET, APPROVAL_BYTE_THRESHOLD, id="redact_tool_arguments",
     ),
 ]
 
 
-@pytest.mark.parametrize(("build", "budget"), TOP_LEVEL_BUILDERS)
-def test_a_top_level_key_is_bounded_by_every_builder(build, budget: int) -> None:
+@pytest.mark.parametrize(("build", "budget", "threshold"), TOP_LEVEL_BUILDERS)
+def test_a_top_level_key_is_bounded_by_every_builder(build, budget: int, threshold: int) -> None:
     """A 90 KB body was `{"redacted": true}` as a value, 162 bytes as a nested key, and verbatim
     as a top-level key -- through all five of these, onto `events.jsonl`, `task.json` and
     `status.json`."""
@@ -519,10 +531,16 @@ def test_a_top_level_key_is_bounded_by_every_builder(build, budget: int) -> None
     assert published.endswith(TRUNCATION_SUFFIX)
 
 
-@pytest.mark.parametrize(("build", "budget"), TOP_LEVEL_BUILDERS)
-def test_no_builder_silently_merges_two_top_level_keys(build, budget: int) -> None:
-    """The collision hazard follows the cap wherever it goes."""
-    shared = "x" * (budget + 50)
+@pytest.mark.parametrize(("build", "budget", "threshold"), TOP_LEVEL_BUILDERS)
+def test_no_builder_silently_merges_two_top_level_keys(build, budget: int, threshold: int) -> None:
+    """The collision hazard follows the cap wherever it goes.
+
+    Sized off the **threshold**, not the budget: at `budget + 50` four of these five builders got a
+    216-byte key, under the 240-byte threshold, so nothing truncated, nothing collided, and the
+    assertion passed without ever reaching the code it names. The nested-key twin in this same file
+    already used the threshold — the two halves drifted apart.
+    """
+    shared = "x" * (max(threshold, budget) + 50)
 
     published = build({shared + "-alpha": 1, shared + "-beta": 2}, PermissionPolicy())
 
@@ -579,43 +597,31 @@ def test_the_approval_escape_hatch_reaches_as_deep_as_the_traversal(arguments, l
     assert "secrets/id_rsa" not in published, f"published verbatim ({label}): {published}"
 
 
-def test_a_path_that_is_not_a_workspace_path_is_not_blanked_by_an_unrelated_pattern() -> None:
-    """The cost of widening the path predicate, which the widening comment got wrong.
+def test_a_path_naming_a_redacted_file_through_a_dotdot_is_still_redacted() -> None:
+    """Fail closed for every path-naming field, and the reason the narrower rule was taken back.
 
-    `_is_path_redacted` treats a normalization failure as redacted, because a malformed *workspace*
-    path is an anomaly worth withholding. Extending that to every `*_path` blanked fields that hold
-    absolute non-workspace paths legitimately — a task result's `report_path`, a job's
-    `stdout_path` — on `workspace.file.changed.result` and `task.finished.result`, for any operator
-    who had configured a pattern that could not possibly match them: `redact_patterns` are
-    workspace-relative globs, so a path outside the workspace never matches one.
+    Scoping fail-closed to `path`/`root`/`cwd` — so a task result's absolute `report_path` would not
+    be blanked by an unrelated pattern — re-opened the leak the widening had closed.
+    `normalize_workspace_path` raises on any `..` component *before* resolving it, so
+    `x/../secrets/creds.txt` raises while naming a file the operator's pattern matches, and was then
+    published verbatim beside `paths: ["[redacted-path]"]` on the same event, with the approval
+    card's content redaction going with it.
+
+    Both failure modes are real. Only one is silent: an over-redacted field renders
+    `{"redacted": true}` and an operator can see it and widen the glob, while an under-redacted one
+    is indistinguishable from a field that was checked and cleared.
     """
     policy = PermissionPolicy(redact_patterns=("secrets/**",))
 
-    assert public_result_content({"report_path": "/srv/out/report.pdf"}, policy) == {
-        "report_path": "/srv/out/report.pdf"
-    }
-    # The trio still fails closed: those hold workspace paths by contract.
-    assert preview_value("path", "/etc/passwd", policy) == redacted_value("/etc/passwd")
-    # And an actual pattern match is still redacted wherever the key shape allows it.
-    assert preview_value("source_path", "secrets/creds.txt", policy) == redacted_value("secrets/creds.txt")
+    for spelling in ("secrets/creds.txt", "x/../secrets/creds.txt", "./secrets/creds.txt"):
+        assert args_preview({"source_path": spelling}, policy) == {
+            "source_path": redacted_value(spelling)
+        }, f"published verbatim: {spelling}"
 
-
-def test_the_total_size_of_one_preview_is_bounded_for_a_shared_graph_too() -> None:
-    """The cycle guard bounded self-reference and left sharing, which is the cheaper attack.
-
-    Re-expansion "once per edge per level" needs sharing, not a cycle: nine levels of a mapping
-    shared five ways is about 40 objects and produced 25 MB in 21.9 s. Depth, key and item caps
-    bound a preview's *shape* and say nothing about its total size, so the node budget is what makes
-    "bounded" true for input shapes nobody thought to try.
-    """
-    node: Any = {"leaf": 1}
-    for _ in range(9):
-        node = {f"c{index}": node for index in range(5)}
-
-    start = time.monotonic()
-    published = json.dumps(public_result_content({"payload": node}, PermissionPolicy()))
-    elapsed = time.monotonic() - start
-
-    assert elapsed < 2.0, f"still re-expanding: {elapsed:.2f}s"
-    assert len(published) < 250_000, f"output was {len(published)} bytes"
-    assert '"budget_exhausted": true' in published, "the cap has to say it capped"
+    # And the approval card withholds the body alongside it, rather than showing one and not the other.
+    card = redact_tool_arguments(
+        {"source_path": "x/../secrets/creds.txt", "content": "-----BEGIN PRIVATE KEY-----"},
+        policy=policy,
+    )
+    assert card["source_path"]["redacted"] is True
+    assert card["content"]["redacted"] is True

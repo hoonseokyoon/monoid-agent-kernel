@@ -3982,7 +3982,14 @@ class AgentLoop:
             else:
                 bound_tool = bound_catalog.resolve_model_call(call_name)
                 if bound_tool is None:
-                    raise ToolExecutionError(f"unknown tool: {call_name}", error_code="tool_unknown")
+                    raise ToolExecutionError(
+                        # Bounded, like the `tool` field on the same event. Interpolating the
+                        # raw name republished the whole 36 KB of it through `error` on the
+                        # very event whose `tool` field had just been capped -- two of three
+                        # fields bound and the third a laundering channel for the same string.
+                        f"unknown tool: {public_tool_name(call_name)}",
+                        error_code="tool_unknown",
+                    )
                 spec = bound_tool.model_spec
                 started_event = self._emit_tool_started(
                     recorder,

@@ -66,22 +66,18 @@ out in commit messages and here.
   now a single `decision_surface` switch a caller cannot half-set, and the operator's explicit
   `redact_patterns` outranks it for the whole call — unlike the kernel's own content default, which
   an approver is entitled to see past.
-- **The total size of one preview is bounded**, not just each leaf. The depth, key and item caps
-  bound a preview's *shape* and say nothing about its size: a value reachable by many paths is
-  re-expanded once per path. Self-reference was the loud version (fanout 8: 45 s, 1.1 GB) and is now
-  elided with a `circular` marker, tracked over ancestors on the current path so a value
-  legitimately shared twice still renders twice. But sharing without a cycle is the cheaper attack
-  and the cycle guard does nothing for it — nine levels shared five ways, about 40 objects,
-  produced 25 MB in 21.9 s. A `PREVIEW_MAX_NODES` budget spent per visited value bounds every input
-  shape, including the ones nobody tried; exhausting it is announced with `budget_exhausted`.
-  Reachable only from a Python-object caller (a custom or MCP tool's `ToolResult.content`), since
-  JSON cannot express sharing.
-- `redact_patterns` covers `*_path` fields, but a `*_path` that cannot be normalized to a workspace
-  path is **published, not blanked**. The `path`/`root`/`cwd` trio still fails closed on a malformed
-  value — those hold workspace paths by contract, and that guard is what stopped a model-authored
-  `..` from ending the run. Extending it to every `*_path` blanked fields that legitimately hold
-  absolute paths (a task result's `report_path`, a job's `stdout_path`) for any operator with an
-  unrelated pattern configured, and a workspace-relative glob could never have matched them anyway.
+- A container reachable from *itself* is elided with a `circular` marker rather than re-expanded,
+  tracked over ancestors on the current path so a value legitimately shared twice still renders
+  twice. Measured before the guard, at fanout 8: 45 s and 1.1 GB from an input that fits on a line.
+- **Path redaction fails closed for every path-naming field**, including `*_path`. A value that
+  cannot be normalized to a workspace path counts as redacted. This over-redacts: a task result's
+  absolute `report_path` renders `{"redacted": true}` for an operator whose patterns could not have
+  matched it. The narrower rule — fail closed only for `path`/`root`/`cwd` — was tried and taken
+  back, because `normalize_workspace_path` raises on any `..` component *before* resolving it, so
+  `x/../secrets/creds.txt` raises while naming a file the pattern does match, and was published
+  verbatim next to `paths: ["[redacted-path]"]` on the same event. Both failure modes are real and
+  only one is silent: an over-redacted field is visible and an operator can widen the glob, while an
+  under-redacted one looks exactly like a field that was checked.
 - A `path` argument that cannot be normalized (absolute, or containing `..`) is now redacted rather
   than raising. Normalization raises, the preview builders sit on the emit path, and the raise ended
   the run of any operator who had configured `redact_patterns` — it escaped `_emit_tool_started`
@@ -164,6 +160,16 @@ either means changing a surface this one does not touch:
   does not close it: by then the turn is already in history. The fixes are to reject the turn at
   ingestion or to stop using `asdict`, and the latter also drops its deep copy, so a checkpoint would
   begin sharing mutable state with the live loop. Both belong to the durability surface.
+- **One preview's total size is bounded only by its input.** The depth, key and item caps bound a
+  preview's *shape*, not its size: a value reachable by many paths is re-expanded once per path, so
+  nine levels of a mapping shared five ways — about 40 objects — produced 25 MB in 21.9 s. The cycle
+  guard does not help, because sharing is not a cycle. Reachable only from a Python-object caller
+  (a custom or MCP tool's `ToolResult.content`), since JSON cannot express sharing. A
+  `PREVIEW_MAX_NODES` budget was implemented and reverted: spent per visited value it replaced
+  whole `run.update_plan` items with `{"budget_exhausted": true}` markers on a plain-JSON payload,
+  turning a rare adversarial cost into a *silent* cap on an ordinary one — `truncated_items` stayed
+  0, so the plan looked complete and one step short of done. The right fix bounds the budget without
+  crossing the `_INLINE_TEXT_KEYS` and plan-count invariants; that is a redesign, not a patch.
 - **Nothing renders `truncated_items`.** The count reaches `events.jsonl` and `status.json`, and the
   shipped Studio bundle drops it: a 25-step plan reads `Plan · 20 steps` and `20/20`. The count
   exists precisely so the cap is not silent, and on that surface it still is. Closing it means

@@ -285,14 +285,6 @@ PREVIEW_BYTE_BUDGET = 160
 # side already learned the depth lesson (``core.schemas`` catches ``RecursionError``); this is the
 # write side learning it.
 PREVIEW_MAX_DEPTH = 8
-# A ceiling on the whole traversal, not on any one leaf. Depth, key and item caps bound the *shape*
-# of a preview and say nothing about its total size: a value reachable by many paths is re-expanded
-# once per path, so 9 levels of a mapping shared 5 ways -- about 40 objects, an input that fits on a
-# line -- produced 25 MB in 21.9 s. A cycle guard does not help, because sharing is not a cycle. A
-# node budget is the only thing that makes "the preview is bounded" true for every input shape
-# rather than for the ones that were tried. Generous enough that no realistic payload reaches it,
-# and reaching it is announced rather than silent.
-PREVIEW_MAX_NODES = 2000
 PREVIEW_MAX_KEYS = 20
 PREVIEW_MAX_ITEMS = 20
 
@@ -360,7 +352,9 @@ def truncate_inline_text(value: str, *, threshold: int, budget: int) -> str:
     return truncate_to_bytes(value, budget) + TRUNCATION_SUFFIX
 
 
-def _bounded_key(raw: str, *, threshold: int, budget: int, taken: Mapping[str, Any]) -> str:
+def _bounded_key(
+    raw: str, *, threshold: int, budget: int, taken: Mapping[str, Any], _collisions: dict[str, int]
+) -> str:
     """The published form of one mapping key: bounded, marked, and never silently merged.
 
     One function because it was two, and the second one did not exist. Bounding keys inside
@@ -376,9 +370,13 @@ def _bounded_key(raw: str, *, threshold: int, budget: int, taken: Mapping[str, A
     name = truncate_inline_text(raw, threshold=threshold, budget=budget)
     if name not in taken:
         return name
-    suffix = 2
+    # Probe upward from the count already recorded rather than from 2. The linear rescan was
+    # quadratic at the one caller with no key-count cap -- 8000 colliding argument names took 15 s
+    # inside event construction, which is a denial of service wearing a correctness fix's clothes.
+    suffix = _collisions.get(name, 1) + 1
     while f"{name}#{suffix}" in taken:
         suffix += 1
+    _collisions[name] = suffix
     return f"{name}#{suffix}"
 
 
@@ -402,8 +400,11 @@ def public_mapping(
     and that reasoning is about count, not length.
     """
     published: dict[str, Any] = {}
+    collisions: dict[str, int] = {}
     for key, value in values.items():
-        name = _bounded_key(str(key), threshold=threshold, budget=budget, taken=published)
+        name = _bounded_key(
+            str(key), threshold=threshold, budget=budget, taken=published, _collisions=collisions
+        )
         published[name] = preview(str(key), value)
     return published
 
@@ -430,7 +431,6 @@ def preview_value(
     list_marker: bool = True,
     _depth: int = 0,
     _ancestors: frozenset[int] = frozenset(),
-    _nodes: list[int] | None = None,
 ) -> Any:
     """Bound a value for publication, optionally masking keys the caller names first.
 
@@ -461,14 +461,6 @@ def preview_value(
     rule to every depth on the reasoning that a rule bound at one site should be bound at its twins.
     Nested lists are not that twin.
     """
-    # Spent per invocation, not per container: counting only containers bounded the recursion but
-    # not the output, because each over-budget child still emitted its own marker -- 912 KB of
-    # markers, measured. One counter shared by the whole traversal, so the total is what is bounded.
-    if _nodes is None:
-        _nodes = [PREVIEW_MAX_NODES]
-    _nodes[0] -= 1
-    if _nodes[0] < 0:
-        return {"truncated": True, "budget_exhausted": True}
     if mask is not None:
         replacement = mask(key, value)
         if replacement is not UNMASKED:
@@ -486,7 +478,7 @@ def preview_value(
         if (
             _is_path_field(lowered)
             and isinstance(value, str)
-            and _is_path_redacted(value, policy, fail_closed=lowered in _WORKSPACE_PATH_KEYS)
+            and _is_path_redacted(value, policy)
         ):
             return redacted_value(value)
     if isinstance(value, (dict, list)) and _depth >= PREVIEW_MAX_DEPTH:
@@ -507,6 +499,7 @@ def preview_value(
         _ancestors = _ancestors | {id(value)}
     if isinstance(value, dict):
         preview: dict[str, Any] = {}
+        collisions: dict[str, int] = {}
         for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]:
             # The key is model-authored text too, and it was the one string this function published
             # at any length: the same 30 KB file body arrived ``{"redacted": true}`` in the value
@@ -515,7 +508,9 @@ def preview_value(
             # the key has no name left to incriminate it). ``env_keys`` was routed through here for
             # exactly this reason one commit earlier -- but that bound keys arriving as list
             # *items*, and left the twin where they arrive as keys.
-            name = _bounded_key(str(child_key), threshold=threshold, budget=budget, taken=preview)
+            name = _bounded_key(
+                str(child_key), threshold=threshold, budget=budget, taken=preview, _collisions=collisions
+            )
             # Rules still match on the *whole* key: a 5 KB key ending in ``_path`` is a path, and
             # judging it by its truncated form would let length defeat the redaction.
             preview[name] = preview_value(
@@ -528,7 +523,6 @@ def preview_value(
                 decision_surface=decision_surface,
                 _depth=_depth + 1,
                 _ancestors=_ancestors,
-                _nodes=_nodes,
             )
         # A source key literally named ``truncated_keys`` loses to the marker. Acceptable: the
         # preview is lossy by construction, and no consumer reads nested preview dicts by key --
@@ -552,7 +546,6 @@ def preview_value(
                 decision_surface=decision_surface,
                 _depth=_depth + 1,
                 _ancestors=_ancestors,
-                _nodes=_nodes,
             )
             for item in value[:PREVIEW_MAX_ITEMS]
         ]
@@ -581,7 +574,7 @@ def preview_value(
     return value
 
 
-def _is_path_redacted(value: str, policy: PermissionPolicy, *, fail_closed: bool = True) -> bool:
+def _is_path_redacted(value: str, policy: PermissionPolicy) -> bool:
     """``policy.is_path_redacted``, but a path that cannot be normalized counts as redacted.
 
     ``is_path_redacted`` normalizes before matching, and normalization *raises* on an absolute path
@@ -594,10 +587,15 @@ def _is_path_redacted(value: str, policy: PermissionPolicy, *, fail_closed: bool
     try:
         return policy.is_path_redacted(value)
     except WorkspaceError:
-        # ``fail_closed=False`` for a ``*_path`` field outside the workspace-path trio: those hold
-        # absolute, non-workspace paths legitimately (a task result's ``report_path``), and a
-        # workspace-relative glob could not have matched one anyway. See ``_WORKSPACE_PATH_KEYS``.
-        return fail_closed
+        # Fail closed, for every path-naming field. Scoping this to ``path``/``root``/``cwd`` --
+        # to stop a task result's absolute ``report_path`` being blanked by an unrelated pattern --
+        # re-opened the leak it was meant to leave closed: ``normalize_workspace_path`` raises on any
+        # ``..`` component *before* resolving it, so ``x/../secrets/creds.txt`` raises while naming a
+        # path the operator's pattern matches, and was then published verbatim next to
+        # ``paths: ["[redacted-path]"]`` on the same event. Both failure modes are real; only one is
+        # silent. An over-redacted field says ``{"redacted": true}`` and an operator can see it and
+        # widen the glob, while an under-redacted one looks exactly like a field that was checked.
+        return True
 
 
 def redacted_value(value: Any) -> dict[str, Any]:
@@ -647,6 +645,11 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
     """
 
     def walk(value: Any, key: str, depth: int) -> bool:
+        # ``depth`` counts the same way ``preview_value``'s ``_depth`` does: the outer mapping is
+        # not a level, so a top-level value is 0. Counting the mapping itself made this stop one
+        # level *earlier* than the traversal it has to agree with, and `preview_value`'s depth cap
+        # only blocks containers -- so a string at the boundary was still previewed and published
+        # while this had already given up on it. A matched path and a file body both rode out.
         if depth > PREVIEW_MAX_DEPTH:
             return False
         if isinstance(value, Mapping):
@@ -659,10 +662,10 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
         return (
             _is_path_field(lowered)
             and isinstance(value, str)
-            and _is_path_redacted(value, policy, fail_closed=lowered in _WORKSPACE_PATH_KEYS)
+            and _is_path_redacted(value, policy)
         )
 
-    return walk(dict(values), "", 0)
+    return any(walk(value, str(key), 0) for key, value in values.items())
 
 
 def _is_path_field(lowered_key: str) -> bool:
@@ -676,21 +679,8 @@ def _is_path_field(lowered_key: str) -> bool:
     # values that never were a tool argument (result payloads, artifact metadata, capability
     # descriptors), where there is no ``ToolSpec`` to ask -- and because a custom or MCP tool that
     # names an argument ``*_path`` is then covered without registering anything here.
-    return lowered_key in _WORKSPACE_PATH_KEYS or lowered_key.endswith("_path")
+    return lowered_key in {"path", "root", "cwd"} or lowered_key.endswith("_path")
 
-
-# The three keys a tool argument uses for a path that is a *workspace* path by contract. They alone
-# fail closed when normalization raises, and that distinction is load-bearing rather than tidy.
-#
-# ``redact_patterns`` are workspace-relative globs, so a value that cannot be normalized to a
-# workspace path cannot match one: redacting it is a guess, not the operator's instruction. While
-# ``_is_path_field`` was the hardcoded triple that guess was cheap, because those fields hold
-# workspace paths and a malformed one is a real anomaly. Widening to ``*_path`` extended it to
-# fields that legitimately hold absolute, non-workspace paths -- a task result's ``report_path``,
-# a job's ``stdout_path`` -- and blanked them on ``workspace.file.changed.result`` and
-# ``task.finished.result`` the moment an operator configured *any* unrelated pattern. So: a
-# ``*_path`` that will not normalize is not a workspace path, and is published.
-_WORKSPACE_PATH_KEYS = frozenset({"path", "root", "cwd"})
 
 
 def _is_content_field(lowered_key: str) -> bool:
