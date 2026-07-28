@@ -389,6 +389,55 @@ def test_list_files_returns_workspace_tree(studio: StudioServer) -> None:
     assert "sub/inner.txt" in paths
 
 
+def test_the_ui_still_gets_a_final_answer_with_the_delta_channel_switched_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kill switch costs live token rendering and nothing else.
+
+    Both halves of the switch are engaged at once — the config flag and the environment variable —
+    because they disable different things (Studio's gateway streaming, and the loop's delta emission
+    for a run and every subagent it spawns), and the failure being guarded against is the one where
+    the answer reaches no surface at all.
+
+    The assertion order is what makes this load-bearing rather than tautological: `events.jsonl` is
+    checked *first* to confirm the settled event on disk carries only a digest, so the text that then
+    arrives through `poll_events` can only have come from the projection's hydration seam
+    (`backend/projection.py` -> `hydrate_settled_text`), which is the step a reader looking at the
+    emit site alone would miss. Without the disk assertion this test would still pass if the event
+    simply carried the text inline, i.e. if this release's core change had been reverted.
+    """
+    monkeypatch.setenv("MONOID_OUTPUT_DELTAS", "0")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    answer = "Here is the complete answer the operator needs to see."
+    fake = FakeModelAdapter(turns=[ModelTurn(final_text=answer)])
+    server = StudioServer(
+        StudioConfig(
+            workspace=workspace,
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+            stream_output_deltas=False,
+        ),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("say something")["run_id"]
+        _wait_settled(server, run_id, 1)
+
+        raw = (server._run_dir_for(run_id) / "events.jsonl").read_text(encoding="utf-8")
+        assert answer not in raw, "the durable stream is supposed to carry a digest, not the text"
+        assert "model.output.delta" not in raw, "the switch did not switch anything off"
+
+        events = server.poll_events(run_id, 0).get("events", [])
+        settled = [event for event in events if event.get("type") == "turn.settled"]
+        assert settled, "no settled event reached the reducer"
+        assert settled[0]["data"]["final_text"] == answer
+    finally:
+        server.shutdown()
+
+
 def test_agent_reads_a_file_and_emits_activity(tmp_path: Path) -> None:
     # End-to-end with a tool-calling fake model injected via the provider seam: the agent calls
     # fs.read, the read flows through as events, and describe_event renders an activity line.

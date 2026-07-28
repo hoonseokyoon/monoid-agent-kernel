@@ -63,7 +63,12 @@ Carried, deliberately:
   `data.text` across the run's `model.output.delta` records instead. Disable with
   `MONOID_OUTPUT_DELTAS=0` (whole deployment, subagents included),
   `monoid studio --no-output-deltas`, or `StudioConfig(stream_output_deltas=False)`. The cost is
-  live token rendering; `AgentLoop.astream` is unaffected, since it takes a different path.
+  live token rendering **and nothing else** — in particular the completed answer still arrives. The
+  reason is not obvious from the emit site, so: `turn.settled` carries only `final_text_digest` on
+  the durable stream either way, and `RunProjectionService.events` refills `final_text` from
+  `transcript.jsonl` (`backend/content_hydration.py`) before the event reaches a reader. The Studio
+  UI polls that projection, not `events.jsonl`, so its reducer still gets the text. `AgentLoop.astream`
+  is unaffected, since it takes a different path.
 - **Bounded previews of tool arguments** (`args_preview`, `arguments_preview`), including a preview
   of paths, commands, plan steps and artifact metadata.
 - **Secret-named argument values, on the ordinary tool-call path.** The core does *not* guess at
