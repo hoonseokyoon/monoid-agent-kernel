@@ -193,6 +193,14 @@ either means changing a surface this one does not touch:
   turning a rare adversarial cost into a *silent* cap on an ordinary one — `truncated_items` stayed
   0, so the plan looked complete and one step short of done. The right fix bounds the budget without
   crossing the `_INLINE_TEXT_KEYS` and plan-count invariants; that is a redesign, not a patch.
+- **There is no aggregate budget, so the caps can be walked around by chunking.** Every cap is
+  per-value (240 bytes) or per-container (20 keys, 20 items), and nothing bounds the total, so a
+  model that splits its payload into sub-threshold pieces publishes all of it while obeying every
+  rule: one `run.update_plan` with 20 items × 20 extra keys × 234 bytes puts **267 KB** across the
+  three public files, and one `artifact.emit` puts 187 KB. Unlike the shared-graph case above this
+  needs nothing but plain JSON. "Content stays off the public stream" and "100 KB per tool call" are
+  both true today, which is the honest way to state where this release got to: it closed the routes
+  that leaked a value *whole*, and did not make the stream a bounded channel.
 - **Nothing renders `truncated_items`.** The count reaches `events.jsonl` and `status.json`, and the
   shipped Studio bundle drops it: a 25-step plan reads `Plan · 20 steps` and `20/20`. The count
   exists precisely so the cap is not silent, and on that surface it still is. Closing it means
