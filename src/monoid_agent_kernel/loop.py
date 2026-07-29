@@ -114,6 +114,7 @@ from monoid_agent_kernel.core.side_effect_policy import (
     side_effect_policy_from_config,
     verify_outbox_side_effect,
 )
+from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.errors import (
     ModelAdapterError,
     ModelCallAborted,
@@ -168,7 +169,10 @@ from monoid_agent_kernel.providers.base import (
 from monoid_agent_kernel.public_view import (
     args_preview,
     finish_args_preview,
+    preview_value,
     public_error_message,
+    public_inline_path,
+    public_identifier,
     public_path,
     public_proposal_payload,
     public_result_content,
@@ -389,9 +393,29 @@ class AgentToolContext(ToolContext):
             "artifact.emitted",
             data={
                 "artifact_id": artifact.artifact_id,
+                # Deliberately raw, and not the twin it looks like. `emit_artifact_bytes` rewrites
+                # this to `artifacts/<artifact_id>/<basename>` (recorder.py), so it is a run-dir
+                # pointer to a real file, never the model's own argument: `redact_patterns` cannot
+                # match it and the filesystem already bounds the basename. Bounding it here would
+                # break the readers that resolve it, for no egress -- the same reason
+                # `snapshot_path` keeps bare `public_path`.
                 "path": artifact.path,
-                "kind": kind,
-                "metadata": dict(artifact.metadata),
+                # `kind` is declared `{"type": "string"}` with no enum, so it is free model text
+                # sitting beside two bounded neighbours -- `metadata` is previewed and `path` is a
+                # run-dir pointer. It reads like an enum and is not one. (An earlier version of this
+                # comment cited `label` as a third precedent; `label` is not on this event at all,
+                # and is not bounded anywhere.)
+                #
+                # Bounded as a *string*, not previewed: `artifact.emitted`'s own data schema declares
+                # `{"kind": _STR}` with `additionalProperties: false`, so returning the preview
+                # envelope made every run carrying a long `kind` fail `validate_run_dir` -- the fix
+                # broke the contract it was protecting. Same reason `_INLINE_TEXT_KEYS` exists.
+                "kind": public_identifier(kind),
+                # Model-authored and republished on the fan-out stream. The same mapping is already
+                # capped when it reaches ``tool.call.started`` through ``args_preview``, so leaving
+                # it raw here made the second emit the wider door -- the twin-miss shape again. The
+                # tool's *return* value below stays raw: that goes back to the model, which wrote it.
+                "metadata": preview_value("metadata", dict(artifact.metadata), self.permission_policy),
             },
         )
         return {
@@ -429,8 +453,29 @@ class AgentToolContext(ToolContext):
             return False
 
     def update_plan(self, items: list[dict[str, Any]]) -> None:
+        # ``self.plan`` keeps the model's own steps verbatim; only the published copy is capped.
+        # Each step is truncated as a *string* inside its item: ``plan.updated.items`` is declared
+        # ``_OBJ_ARRAY``, so an item that stops being an object fails ``validate_run_dir``, and
+        # ``WorkspaceInspector`` renders ``items[].step`` directly -- a preview dict there would
+        # show up as a blank row rather than a truncated one.
+        #
+        # This also bounds ``status.json["plan"]``, which ``StatusJsonSink`` copies straight out of
+        # this event and ``RunProjectionService.status()`` serves wholesale. Capping here rather
+        # than there keeps one copy of the rule instead of two that can drift apart.
+        #
+        # ``items`` is a *typed* array, not a JSON blob: the reducer casts it to ``PlanItem[]`` and
+        # the renderer reads ``.step``/``.status`` off every element. So the list cap reports its
+        # drop through a sibling key instead of appending a marker element -- as an element it drew
+        # a blank row and counted toward the ``completed/total`` denominator, making a capped plan
+        # look permanently one step short of done. The count comes from the previewed length rather
+        # than from ``PREVIEW_MAX_ITEMS`` so the cap stays stated in exactly one place.
         self.plan = items
-        self.recorder.emit("plan.updated", data={"items": items})
+        published = preview_value("items", items, self.permission_policy, list_marker=False)
+        data: dict[str, Any] = {"items": published}
+        dropped = len(items) - len(published)
+        if dropped > 0:
+            data["truncated_items"] = dropped
+        self.recorder.emit("plan.updated", data=data)
 
     def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
         self.pending_finish = FinishResult(summary, tuple(outputs), notes)
@@ -758,7 +803,10 @@ class AgentLoop:
     # Opt-in token streaming for the autonomous (non-RunStream) drive: when set and the model
     # adapter supports ``astream_turn``, each text fragment is emitted as a ``model.output.delta``
     # event so an event-stream consumer (e.g. the studio app over SSE) can render tokens live.
-    # Falls back to a one-shot ``next_turn`` for adapters that can't stream. Off by default.
+    # Falls back to a one-shot ``next_turn`` for adapters that can't stream. Off by default here,
+    # but the shipped Studio turns it on whenever ``httpx`` is importable — so for the product most
+    # people run, this is on. ``MONOID_OUTPUT_DELTAS=0`` forces it off for a whole deployment;
+    # see ``__post_init__``.
     emit_output_deltas: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
@@ -843,6 +891,23 @@ class AgentLoop:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
         # can pass any of the three forms without hand-wrapping a StaticRuntimeConfigProvider.
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
+        # Operator kill switch for the delta channel. Resolved here, into the field itself, rather
+        # than at the emit site: gating the emit would leave `emit_output_deltas` reporting True
+        # while nothing streamed, which is the "one half bound, its twin reporting otherwise" shape
+        # this release exists to remove. It can only turn the channel OFF -- an operator disabling
+        # content egress must not be able to enable it by accident, and a deployment that never
+        # opted in has nothing to switch on.
+        #
+        # Subagents are deliberately NOT special-cased: each child re-runs this on its own
+        # construction, so one variable covers a run and every run it spawns.
+        # Read unconditionally, and only then combine. Guarding the read behind
+        # `self.emit_output_deltas and ...` short-circuited it away in exactly the configurations
+        # where the operator most needs the feedback -- the kernel default, and Studio without
+        # `httpx` -- so a typo'd value was never validated for them at all. `getenv_bool`'s promise
+        # that a malformed value is an error rather than a silent no-op has to hold for everyone.
+        deltas_permitted = getenv_bool(OUTPUT_DELTAS_ENV, default=True)
+        if self.emit_output_deltas and not deltas_permitted:
+            self.emit_output_deltas = False
         self._bootstrapper = LoopBootstrapper(self)
         self._settle_coordinator = LoopSettleCoordinator(self)
         self._finalizer = LoopFinalizer(self)
@@ -2587,7 +2652,15 @@ class AgentLoop:
             turn_started = recorder.emit(
                 "model.turn.started",
                 turn_id=turn_id,
-                data={"step": step, "previous_turn_handle": state.previous_turn_handle},
+                data={
+                    "step": step,
+                    # Same provenance as `response_id`: this *is* a previous one, echoed back.
+                    "previous_turn_handle": (
+                        public_identifier(state.previous_turn_handle)
+                        if state.previous_turn_handle
+                        else state.previous_turn_handle
+                    ),
+                },
             )
             turn_context = self._turn_context(state, res, step, max(0, max_steps - local_step))
             turn_registry = self._registry_for_turn(context, turn_context, res)
@@ -2926,6 +2999,11 @@ class AgentLoop:
                 {
                     "kind": "model_turn",
                     "step": step,
+                    # Raw. This is `transcript.jsonl`, the private full-payload replay artifact --
+                    # its neighbour `final_text` on the next line is the whole model answer. The
+                    # bound belongs on the *event* copy below, and putting it here also left
+                    # `model_request`'s `previous_turn_handle` unbounded sixty lines up, so the
+                    # private artifact was half-bounded and inconsistent with itself.
                     "response_id": turn.response_id,
                     "final_text": turn.final_text,
                     "tool_calls": [call.__dict__ for call in turn.tool_calls],
@@ -2938,7 +3016,11 @@ class AgentLoop:
                 parent_id=turn_started.event_id,
                 data={
                     "step": step,
-                    "response_id": turn.response_id,
+                    # Bounded: this arrives from the gateway, i.e. from outside the kernel's
+                    # trust boundary, and real ids are short. A compromised or buggy proxy
+                    # echoing an unbounded string onto the public stream is a channel no
+                    # review of *tool* arguments would ever look at.
+                    "response_id": public_identifier(turn.response_id) if turn.response_id else turn.response_id,
                     "tool_calls": len(turn.tool_calls),
                     "has_final": bool(turn.final_text),
                     "usage": turn.usage,
@@ -3480,8 +3562,14 @@ class AgentLoop:
         context: AgentToolContext,
         recorder: AgentRecorder,
     ) -> None:
+        # `public_inline_path`, matching the foreground branch. Despite the local name these are
+        # emitted as `data["paths"]` below -- the same field `_public_paths_from_args` bounds for a
+        # foreground `shell.exec` and the same `narration._target` reads. `shell.exec` declares
+        # `skip_emit_if_background=True`, so which branch runs is decided by `background=True` in a
+        # model-authored argument: the twin was one flag away, and a scripted edit that matched on
+        # indentation converted the foreground copy and silently missed this one.
         changed_paths = [
-            public_path(str(path), self.permission_policy)
+            public_inline_path(str(path), self.permission_policy)
             for path in payload.get("changed_paths", [])
         ]
         if not changed_paths:
@@ -3750,6 +3838,12 @@ class AgentLoop:
                 "kind": "tool_observation",
                 "step": step,
                 "call_id": call_id,
+                # Raw, like every other value in `transcript.jsonl`. Bounding it here made the
+                # observation record disagree with the `model_turn.tool_calls` entry above it and
+                # with `ToolObservation.tool_name`, so a replay reader could not reconstruct the
+                # call that actually ran. The `response_id` bound was reverted out of the transcript
+                # for exactly this reason one commit earlier -- and this twin, in the same file,
+                # was missed. The event copy below keeps the bound.
                 "tool": call_name,
                 "tool_id": spec.id if spec is not None else None,
                 "output": observation.output,
@@ -3762,7 +3856,7 @@ class AgentLoop:
             parent_id=started_event.event_id if started_event else parent_id,
             data={
                 "call_id": call_id,
-                "tool": call_name,
+                "tool": public_identifier(call_name),
                 "ok": result.ok,
                 "error": public_error_message(result.error),
                 "error_code": result.error_code,
@@ -3794,7 +3888,26 @@ class AgentLoop:
             reason=authorization.reason,
             turn_id=turn_id,
             tool_event_id=started_event.event_id if started_event is not None else None,
+            # The run's real policy, not a default one: without it the preview keeps every cap and
+            # silently drops `redact_patterns`, which is the half an operator configured.
+            policy=context.permission_policy,
         )
+        # No separate content-addressed copy of the raw arguments is written here, and an earlier
+        # revision of this branch did write one (`arguments_digest` + `put_blob`). Removed, because
+        # every reason for it turned out to be wrong:
+        #
+        #   * It had no reader. Nothing in `studio-ui/`, the backend, or the CLI consumed the
+        #     digest, so the "entitled fetch" it was supposed to buy did not exist; the approver
+        #     simply lost information.
+        #   * It was redundant. `HostedTask.checkpoint_json` already stores `request` verbatim,
+        #     raw `arguments` included, and the checkpoint *is* deleted when a run completes.
+        #   * On the store this repo ships it was permanent. `SqliteCheckpointStore.put_blob`
+        #     discards `run_id` (blobs are global and content-addressed) and `delete(run_id)`
+        #     deliberately leaves blobs behind, so raw secrets and file bodies stayed in the
+        #     database forever, contradicting the run-lifetime retention the code claimed.
+        #
+        # What the approver actually needed was to see the arguments on the card, which
+        # `redact_tool_arguments` now does directly. See `core.tool_approval`.
         task_id = context.job_manager.create_task(TOOL_APPROVAL_TASK_KIND, task_request)
         recorder.emit(
             "tool.approval.requested",
@@ -3902,7 +4015,14 @@ class AgentLoop:
             else:
                 bound_tool = bound_catalog.resolve_model_call(call_name)
                 if bound_tool is None:
-                    raise ToolExecutionError(f"unknown tool: {call_name}", error_code="tool_unknown")
+                    raise ToolExecutionError(
+                        # Bounded, like the `tool` field on the same event. Interpolating the
+                        # raw name republished the whole 36 KB of it through `error` on the
+                        # very event whose `tool` field had just been capped -- two of three
+                        # fields bound and the third a laundering channel for the same string.
+                        f"unknown tool: {public_identifier(call_name)}",
+                        error_code="tool_unknown",
+                    )
                 spec = bound_tool.model_spec
                 started_event = self._emit_tool_started(
                     recorder,
@@ -4026,8 +4146,8 @@ class AgentLoop:
                 parent_id=started_event.event_id if started_event else parent_id,
                 data={
                     "call_id": call_id,
-                    "tool": spec.id if spec is not None else call_name,
-                    "requested_tool": call_name,
+                    "tool": spec.id if spec is not None else public_identifier(call_name),
+                    "requested_tool": public_identifier(call_name),
                     "error": public_error_message(str(exc)),
                     "error_code": result.error_code,
                     "surface_decision": surface_decision or None,
@@ -4376,7 +4496,7 @@ class AgentLoop:
                 return
             if spec.changed_paths_source == "result_content":
                 paths = [
-                    public_path(str(path), self.permission_policy)
+                    public_inline_path(str(path), self.permission_policy)
                     for path in result.content.get("changed_paths", [])
                 ]
             else:
@@ -4561,7 +4681,7 @@ def _tool_start_data(
         preview = args_preview(arguments, permission_policy)
     return {
         "call_id": call_id,
-        "tool": call_name,
+        "tool": public_identifier(call_name),
         "capability": spec.capability if spec is not None else None,
         "side_effect": spec.side_effect if spec is not None else None,
         "paths": _public_paths_from_args(spec, arguments, permission_policy) if spec is not None else [],
@@ -4574,8 +4694,20 @@ def _public_paths_from_args(
     arguments: dict[str, Any],
     permission_policy: PermissionPolicy,
 ) -> list[str]:
+    """Public `paths` for an event, bounded like every other published copy of the same value.
+
+    `paths` and `args_preview.path` are the *same argument* on the *same event*, and only the second
+    was capped: a 5000-character path arrived truncated in one field and whole in the field beside
+    it. `public_path` redacts by pattern, which is a different question from length.
+
+    Stays a list of plain strings — `narration._target` falls back to `paths` and joins them, and a
+    preview dict there would render as its repr. That fallback is also why the cut has to be
+    *marked*: an unmarked prefix is presented to an operator as the exact target, and two different
+    long paths sharing a prefix become one indistinguishable string. `truncate_inline_text` is
+    shared with the plan-step branch so the two cannot answer that differently again.
+    """
     return [
-        public_path(str(arguments[name]), permission_policy)
+        public_inline_path(str(arguments[name]), permission_policy)
         for name in spec.path_args
         if name in arguments and arguments[name] is not None
     ]

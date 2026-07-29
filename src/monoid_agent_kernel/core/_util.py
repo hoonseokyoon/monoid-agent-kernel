@@ -74,7 +74,15 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     """Write ``payload`` as pretty JSON, replacing ``path`` atomically via a temp file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone surrogate survives `json.loads` and cannot be UTF-8 encoded; see
+        # `recorder._write_jsonl` for the full note. On this path it also left a torn `.tmp` in the
+        # run root forever, because the failure happened between the temp write and the replace.
+        text = json.dumps(payload, ensure_ascii=True, indent=2)
+    tmp_path.write_text(text, encoding="utf-8")
     _atomic_replace(tmp_path, path)
 
 

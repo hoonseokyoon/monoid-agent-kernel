@@ -1,9 +1,13 @@
 # Outputs, event sinks, and observability
 
 Every run emits a structured event stream and durable artifacts, and can mirror
-that stream to OpenTelemetry — all without the core capturing prompt/response
-content. This is the reference for the run-directory artifact set, custom event
-sinks, OTel tracing, live streaming, and metrics.
+that stream to OpenTelemetry. This is the reference for the run-directory artifact
+set, custom event sinks, OTel tracing, live streaming, and metrics.
+
+The event stream carries metadata and bounded previews rather than content — with a
+short list of deliberate exceptions, stated under [What `events.jsonl` does and does
+not carry](#what-eventsjsonl-does-and-does-not-carry) rather than left as an absolute
+claim that the shipped defaults contradict.
 
 ## Outputs
 
@@ -20,14 +24,124 @@ Each run writes:
 - `proposal.json`: proposed output snapshot metadata
 - `proposal/files/`: materialized changed-file snapshots
 - `artifacts/jobs/<job_id>/`: background job status (`job.json`) and `stdout.log` / `stderr.log`
+- `artifacts/tasks/<task_id>/task.json`: hosted-task record (hitl, subagent, capability, tool
+  approval). **Private by location, like `transcript.jsonl`** — it is not served over HTTP and is
+  not in the export allowlist, so it keeps values the event stream drops. A **tool-approval** record
+  carries a bounded `arguments_preview` and not the raw arguments; the raw copy lives in the run's
+  checkpoint, which is deleted when the run completes. The other kinds (hitl, subagent, capability)
+  have no `arguments_preview` at all, and their `result` is written **raw** — that is what "private
+  by location" buys, and it is why this file is not a public surface.
 
-`events.jsonl` remains public/redacted. Proposed file contents are exposed only
-through the run directory snapshot or run-token protected backend proposal APIs.
+Proposed file contents are exposed only through the run directory snapshot or
+run-token protected backend proposal APIs.
+
+## What `events.jsonl` does and does not carry
+
+Treat this as the contract, not the summary above it. `EventBus.emit` fans every event out to every
+registered sink with **no level filtering**, so `level="debug"` gates nothing: whatever is listed
+here is what a redacting sink, an OTel exporter, and `monoid watch --json` all see.
+
+Not carried:
+
+- **Model-authored settled text.** `turn.settled` and `run.finished` carry `final_text_digest` and
+  `final_text_len`. Entitled readers join the text back from `transcript.jsonl`; the run result
+  itself is unaffected. Kernel-authored text (for example `Stopped after reaching max steps.`) stays
+  inline, because digesting it would cost an operator the line explaining why a run stopped and buy
+  no privacy.
+- **File contents** in tool arguments and results (`content`, `old`, `new`, `old_text`, `new_text`)
+  — **on the trace surface**. The approval surface deliberately shows them, bounded; see "Carried,
+  deliberately" below. This list said "file contents" unqualified while the entry 45 lines down said
+  the opposite, and the preamble calls this list the contract.
+- **Whole values of any length**, for every model-authored *value* and every mapping *key* that
+  reaches a preview builder: those are capped by a **byte** budget, so the cap does not depend on
+  the script the text is written in. Several routes bypass the builders entirely and are listed
+  under "Carried, deliberately" below — read that list rather than counting exceptions here. An
+  earlier revision of this line said "three exceptions" and was wrong twice over: it omitted
+  `model.output.delta`, which the very next section describes as carrying raw model text, and
+  `task.started.data.choices`.
+
+Carried, deliberately:
+
+- **`model.output.delta` and `model.reasoning.delta` carry raw model text**, and Studio enables them
+  whenever the optional `httpx` extra is installed. These are durable events, not a live-only side
+  channel, so the assembled answer is reconstructible from the file. **Do not use a grep for a known
+  string to decide whether the answer is present**: the text is split at whatever boundaries the
+  provider streamed, so a substring search finds it when the answer happened to arrive in one chunk
+  and misses it when it did not. Absence of a grep hit is not absence of the content — concatenate
+  `data.text` across the run's `model.output.delta` records instead. Disable with
+  `MONOID_OUTPUT_DELTAS=0` (whole deployment, subagents included),
+  `monoid studio serve --no-output-deltas` (the flag sits on the `serve` / `app` / `doctor`
+  subcommands, not on the `studio` group), or `StudioConfig(stream_output_deltas=False)`. The
+  completed answer still arrives. Two things do change, and the second is easy to be surprised by:
+  live token rendering stops, and **mid-turn interruption becomes step-boundary interruption** —
+  Stop waits for the in-flight model call to finish rather than aborting within a token. That
+  coupling is not new and is not the switch's doing: the kernel only takes the streaming path when
+  something is consuming deltas, and `emit_output_deltas` is `False` by default, so turning this off
+  returns you to the kernel's own default rather than degrading past it. Studio turns it on, which
+  is why the difference is visible there. The
+  reason is not obvious from the emit site, so: `turn.settled` carries only `final_text_digest` on
+  the durable stream either way, and `RunProjectionService.events` refills `final_text` from
+  `transcript.jsonl` (`backend/content_hydration.py`) before the event reaches a reader. The Studio
+  UI polls that projection, not `events.jsonl`, so its reducer still gets the text. `AgentLoop.astream`
+  is unaffected, since it takes a different path.
+- **Bounded previews of tool arguments** (`args_preview`, `arguments_preview`), including a preview
+  of paths, commands, plan steps and artifact metadata.
+- **Secret-named argument values, on the ordinary tool-call path.** The core does *not* guess at
+  secrets from key names here; that heuristic was deliberately removed, and redaction beyond
+  content fields is the integrating backend's job through the `EventSink` seam — see
+  `examples/redacting_event_sink.py`. The approval record (`arguments_preview` on a `tool_approval`
+  task) is the exception and *does* mask secret-named keys, because a human acts on it directly. So
+  an `api_key` argument is masked on an `ask`-gated call and published verbatim on an `allow` call.
+  If you want it masked on both, attach the example sink, or do not pass credentials as tool
+  arguments. `PermissionPolicy.redact_patterns` will not help: it is a *workspace path* glob list,
+  consulted only for fields that name a path — `path`, `root`, `cwd`, and any `*_path` argument
+  such as `fs.move`'s `source_path` / `destination_path`. It was previously consulted for the first
+  three only, which meant one `fs.move` published `paths: ["[redacted-path]"]` alongside
+  `args_preview.source_path: "secrets/creds.txt"` on the same event.
+- The **approval** preview (`arguments_preview`) is bounded far more loosely than the trace preview,
+  and it does **not** blank file-content fields. A person reads it to decide whether a call may run:
+  a command cut mid-string hides the part that matters (with the model choosing where that part
+  sits), and a card rendering `{"redacted": true}` where a file body should be asks someone to
+  authorize a write they cannot inspect. So an `ask`-gated call publishes more on `task.started`
+  than the same call would on `tool.call.started` — bounded, but readable. If that is not acceptable
+  for a deployment, do not bind the tool to `authorization="ask"`, or attach a redacting
+  `EventSink`.
+- **Error messages and paths**, which can name workspace structure.
+- **A subagent's answer** on `task.finished`.
+- **Hosted-task prompts** (`task.started.data.prompt`) — the model-authored delegation brief or HITL
+  question, **uncapped**. Model-authored prose on a public surface, neither previewed nor digested.
+  It is not the only such route on this list: `model.output.delta` carries raw model text by
+  construction, and an error message passes through `public_error_message`, which substitutes only
+  when the text contains `PRIVATE KEY` and otherwise returns it whole.
+- **The model-chosen `call_id`**, uncapped because it is a join key, not prose: `events.jsonl`,
+  `task.json` and `approval_key` are matched on it, so a shortened copy would fail to correlate.
+- **Hosted-task `choices`** (`task.started.data.choices`) — the options a HITL card offers, uncapped
+  for the same reason as the prompt beside it: a person reads them to choose one, and a truncated
+  option is one they cannot evaluate. Model-authored via `hitl.request`, whose schema bounds neither
+  the number of choices nor their length.
 
 Studio adds `studio.chat.jsonl` inside each Studio run directory as the browser-facing chat
 projection. The Studio UI restores user, assistant, and error messages from
 `/api/chat-transcript`, then replays `events.jsonl` for trace and activity panels.
 `transcript.jsonl` remains the private model-call log.
+
+**`studio.chat.jsonl` carries whole model answers and whole user prompts**, and is content-bearing
+and served over HTTP. It is not the only one: `RunProjectionService.events` hydrates `final_text`
+out of `transcript.jsonl` before returning an events page, and `diagnostics()` returns the whole
+`failure.json` — both behind a run token, which `studio.chat.jsonl`'s route is not. It has to be: a chat UI
+that cannot re-render the conversation is not a chat UI, and the text is joined back out of
+`transcript.jsonl` by the same hydration seam the projection uses. Three consequences worth stating
+rather than leaving to be discovered:
+
+- It is **not** covered by `MONOID_OUTPUT_DELTAS=0`. That switch stops model text reaching
+  `events.jsonl`; with it engaged, the assembled answer still lands here. The switch bounds the
+  *durable event stream*, not the run directory.
+- The read path **writes**. Deleting the file and requesting `/api/chat-transcript` regenerates it
+  from `transcript.jsonl`, so removing it does not remove the content.
+- Treat it as **private by location**, like `artifacts/tasks/<id>/task.json` — with the difference
+  that Studio serves it, so "do not expose the run directory" is not by itself sufficient. Studio is
+  reference code and binds `127.0.0.1` by default; a deployment that fronts it needs to gate this
+  route the way it gates the run directory.
 
 ## Event Sinks
 

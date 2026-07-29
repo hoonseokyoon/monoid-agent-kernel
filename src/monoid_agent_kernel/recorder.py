@@ -177,6 +177,16 @@ class StatusJsonSink:
             self.state.pop("current_tool_call_id", None)
         elif event.type == "plan.updated":
             self.state["plan"] = data.get("items", [])
+            # Carry the drop count across with the list it belongs to. The event moved it out of
+            # the array so a typed renderer would stop drawing a blank row for it, and copying only
+            # ``items`` here would have turned that into a *silent* cap on this surface: a reader
+            # would see 20 steps with nothing saying there had been 25. Reassigned rather than
+            # merged, because a later shorter plan has to clear a stale count.
+            truncated = data.get("truncated_items")
+            if isinstance(truncated, int) and truncated > 0:
+                self.state["plan_truncated_items"] = truncated
+            else:
+                self.state.pop("plan_truncated_items", None)
         elif event.type == "metrics.updated":
             self.state["metrics"] = data
         elif event.type == "workspace.proposal.updated":
@@ -322,8 +332,13 @@ class AgentRecorder:
         This lives on the recorder rather than beside the emit sites because it owns the transcript
         handle. ``transcript.jsonl`` is the private debug/replay artifact
         (``docs/OBSERVABILITY.md``) and already holds model text per turn, so settled text belongs
-        with it rather than in a new run-dir file — which is also why no compatibility-ledger entry
-        is involved.
+        with it rather than in a new run-dir file.
+
+        This docstring used to add "which is also why no compatibility-ledger entry is involved".
+        That was true when the transcript was only a debug aid, and adding this record is what made
+        it false: the settle events now publish a digest, so an entitled reader joins *here* for the
+        text a UI displays. It is registered as ``monoid.transcript.v1`` — a private artifact with a
+        public join contract, which is exactly the case a ledger exists to pin.
 
         Durability is best-effort and deliberately so: ``_write_jsonl`` flushes but does not fsync,
         and the transcript's only repair is ``_terminate_torn_transcript_tail``, which stops a torn
@@ -474,7 +489,28 @@ class AgentRecorder:
 
 
 def _write_jsonl(handle: TextIO, payload: dict[str, Any]) -> None:
-    handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    try:
+        line.encode("utf-8")
+    except UnicodeEncodeError:
+        # JSON permits a lone surrogate (``\ud800``); UTF-8 cannot encode one. ``json.loads`` hands
+        # them back happily -- from a tool-call argument, an HTTP body, or the user's own
+        # instruction -- and this write then raised ``UnicodeEncodeError``, which surfaced as
+        # ``_CheckpointPersistError`` out of ``run_once``. One character in a prompt ended the run,
+        # with no model involved.
+        #
+        # Retrying with ``ensure_ascii=True`` escapes it to a ``\udXXX`` sequence and writes valid,
+        # ASCII-safe JSON. Only the offending record pays for it: ordinary Hangul and emoji stay raw
+        # and compact on the common path, which is why the flag is not simply flipped.
+        #
+        # **This does not make a run survive a lone surrogate.** ``preview_value``'s byte
+        # measurement and ``canonical_sha256`` both call ``.encode("utf-8")`` and raise first; the
+        # only complete fix is to sanitize on the way in, which is a wider change than this hardening
+        # and is recorded as an open gap in the changelog. What this *does* close is the write itself
+        # -- notably ``write_json_atomic``, which failed between the temp write and the replace and
+        # left an orphan ``.tmp`` in the run root forever.
+        line = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    handle.write(line + "\n")
     handle.flush()
 
 

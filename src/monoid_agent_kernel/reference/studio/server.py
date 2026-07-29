@@ -438,6 +438,16 @@ class StudioConfig:
     memory_directory: Path | None = None
     # Optional env file loaded at server start without overriding process env.
     env_file: Path | None = None
+    # Publish `model.output.delta` / `model.reasoning.delta` to the run's event log. On by default
+    # because live token rendering is what the UI is for, but it is the widest content route out of
+    # a run: the events are durable, and `EventBus` fans them to every sink with no level filter, so
+    # the assembled answer sits in `events.jsonl`. Turning this off leaves the run result,
+    # `transcript.jsonl` and the settle events untouched, but it costs two things: live rendering,
+    # and mid-turn interruption. The kernel only streams when something consumes deltas, so with
+    # none consumed, Stop lands on the next step boundary instead of aborting inside the call.
+    # Pre-existing coupling -- `emit_output_deltas` is `False` by default in the kernel and this is
+    # what turns it on -- but it is invisible from here, hence the note.
+    stream_output_deltas: bool = True
 
 
 class StudioServer:
@@ -1037,8 +1047,20 @@ class StudioServer:
         # validation through the same provider seam as Skills/MCP.
         provider_instances = self._tool_providers_for_runtime()
 
-        stream_gateway_output = _gateway_streaming_available()
-        if not stream_gateway_output:
+        # Two independent conditions: whether live streaming is *possible* (the optional transport)
+        # and whether the operator *wants* the durable delta events it produces. They were one
+        # value, so the only way to stop publishing model text to `events.jsonl` was to uninstall
+        # httpx. `AgentLoop.__post_init__` still applies `MONOID_OUTPUT_DELTAS` on top of this.
+        stream_gateway_output = _gateway_streaming_available() and self.config.stream_output_deltas
+        if not self.config.stream_output_deltas:
+            # Said separately from the httpx case: reporting "httpx is unavailable" to an operator
+            # who just passed --no-output-deltas sends them to install a package that would not
+            # change anything.
+            _LOGGER.info(
+                "output deltas are disabled; model text will not be published to events.jsonl "
+                "(the run result and transcript.jsonl are unaffected)"
+            )
+        elif not stream_gateway_output:
             _LOGGER.info(
                 "httpx is unavailable; Studio will use one-shot gateway turns "
                 "(install monoid-agent-kernel[http-async] for live token deltas)"

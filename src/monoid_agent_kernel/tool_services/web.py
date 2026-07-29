@@ -10,6 +10,8 @@ from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.public_view import public_error_message
 from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.tool_services.base import CallContext
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.public_view import public_event_payload
 from monoid_agent_kernel.web import (
     WebGatewayClient,
     domain_from_url,
@@ -24,6 +26,10 @@ class WebService:
 
     recorder: AgentRecorder
     web_gateway_client: WebGatewayClient | None = None
+    # Supplied so the hand-built event payloads bound through the same policy the rest of the
+    # run publishes under. No web descriptor is a path today, so this changes nothing yet --
+    # it is here so that the day one is, this surface is not the one that missed it.
+    permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     web_search_calls: int = 0
     web_fetch_calls: int = 0
     web_context_calls: int = 0
@@ -161,16 +167,23 @@ class WebService:
             max_value=10,
         )
         allowed_domains, blocked_domains = self._domain_filters(args, call)
-        event_data = {
-            "query_preview": public_query_preview(query),
-            "requested_max_results": requested_max_results,
-            "effective_max_results": effective_max_results,
-            "allowed_domains": allowed_domains,
-            "blocked_domains": blocked_domains,
-            "recency_days": args.get("recency_days"),
-            "locale": args.get("locale"),
-            "binding_id": call.binding_id,
-        }
+        # Bounded like the `tool.call.started` preview of the same call. `locale` and the
+        # domain lists are model-authored and unconstrained by their schemas, so leaving them
+        # raw here published on `.started`/`.finished`/`.failed` exactly what `web_args_preview`
+        # was changed to withhold -- in the same event whose `query_preview` is a digest.
+        event_data = public_event_payload(
+            {
+                "query_preview": public_query_preview(query),
+                "requested_max_results": requested_max_results,
+                "effective_max_results": effective_max_results,
+                "allowed_domains": allowed_domains,
+                "blocked_domains": blocked_domains,
+                "recency_days": args.get("recency_days"),
+                "locale": args.get("locale"),
+                "binding_id": call.binding_id,
+            },
+            self.permission_policy,
+        )
         payload = {
             "protocol": namespaced_id("web-search.v1"),
             "binding_id": call.binding_id,
@@ -226,18 +239,30 @@ class WebService:
             max_value=1_000_000,
         )
         allowed_domains, blocked_domains = self._domain_filters(args, call)
-        event_data = {
-            "url_preview": public_url_preview(url),
-            "domain": domain_from_url(url),
-            "format": args.get("format") or "text",
-            "requested_timeout_s": requested_timeout_s,
-            "effective_timeout_s": effective_timeout_s,
-            "requested_max_bytes": requested_max_bytes,
-            "effective_max_bytes": effective_max_bytes,
-            "allowed_domains": allowed_domains,
-            "blocked_domains": blocked_domains,
-            "binding_id": call.binding_id,
-        }
+        # Bounded like the `tool.call.started` preview of the same call -- defensively here, not
+        # because a leak was measured on this one. Unlike `web.search`, none of `web.fetch`'s
+        # descriptors is an unbounded model-authored string: `format` is an enum the dispatch-path
+        # validator enforces, and the domain lists are not in its schema at all
+        # (`additionalProperties: false`), so they can only arrive from the operator-signed
+        # `call.scope`. Previewing them costs nothing and keeps the three web builders identical,
+        # which is the property worth having. The first version of this comment was copy-pasted from
+        # `web.search` and named `locale`/`query_preview`; its replacement named `format` and the
+        # domain lists as model-authored. Both described a different tool than the one they sat on.
+        event_data = public_event_payload(
+            {
+                "url_preview": public_url_preview(url),
+                "domain": domain_from_url(url),
+                "format": args.get("format") or "text",
+                "requested_timeout_s": requested_timeout_s,
+                "effective_timeout_s": effective_timeout_s,
+                "requested_max_bytes": requested_max_bytes,
+                "effective_max_bytes": effective_max_bytes,
+                "allowed_domains": allowed_domains,
+                "blocked_domains": blocked_domains,
+                "binding_id": call.binding_id,
+            },
+            self.permission_policy,
+        )
         payload = {
             "protocol": namespaced_id("web-fetch.v1"),
             "binding_id": call.binding_id,
@@ -306,20 +331,27 @@ class WebService:
             max_value=256,
         )
         allowed_domains, blocked_domains = self._domain_filters(args, call)
-        event_data = {
-            "query_preview": public_query_preview(query),
-            "requested_max_tokens": requested_max_tokens,
-            "effective_max_tokens": effective_max_tokens,
-            "requested_max_urls": requested_max_urls,
-            "effective_max_urls": effective_max_urls,
-            "requested_max_snippets": requested_max_snippets,
-            "effective_max_snippets": effective_max_snippets,
-            "allowed_domains": allowed_domains,
-            "blocked_domains": blocked_domains,
-            "recency_days": args.get("recency_days"),
-            "locale": args.get("locale"),
-            "binding_id": call.binding_id,
-        }
+        # Bounded like the `tool.call.started` preview of the same call. `locale` and the
+        # domain lists are model-authored and unconstrained by their schemas, so leaving them
+        # raw here published on `.started`/`.finished`/`.failed` exactly what `web_args_preview`
+        # was changed to withhold -- in the same event whose `query_preview` is a digest.
+        event_data = public_event_payload(
+            {
+                "query_preview": public_query_preview(query),
+                "requested_max_tokens": requested_max_tokens,
+                "effective_max_tokens": effective_max_tokens,
+                "requested_max_urls": requested_max_urls,
+                "effective_max_urls": effective_max_urls,
+                "requested_max_snippets": requested_max_snippets,
+                "effective_max_snippets": effective_max_snippets,
+                "allowed_domains": allowed_domains,
+                "blocked_domains": blocked_domains,
+                "recency_days": args.get("recency_days"),
+                "locale": args.get("locale"),
+                "binding_id": call.binding_id,
+            },
+            self.permission_policy,
+        )
         payload = {
             "protocol": namespaced_id("web-context.v1"),
             "binding_id": call.binding_id,

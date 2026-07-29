@@ -481,8 +481,12 @@ def content_digest(value: Any) -> str:
     hashed identically to that value, which is the collision the wrapper was supposed to prevent.
 
     Consequence for anything that records these: recompute with this function, not with a bare
-    `sha256sum` of the text. Nothing persists a `content_digest` yet, which is what makes changing it
-    free today; once the run-dir sidecar records one, it is frozen.
+    `sha256sum` of the text. **This is now frozen.** It was free to change while nothing persisted a
+    digest; `recorder.settled_text` writes one into every `settled_text` record in
+    `transcript.jsonl`, `_validate_settled_text_digests` verifies it, and `monoid.transcript.v1` is
+    registered in the compatibility ledger precisely because the digest became the durable join key
+    that a settle event's `final_text_digest` resolves against. Changing this function now
+    invalidates every transcript already on disk.
     """
     if isinstance(value, str):
         return canonical_sha256({"text": value})
@@ -499,11 +503,54 @@ def content_length(value: Any) -> int | None:
     return len(value) if isinstance(value, str) else None
 
 
-def _jsonish(value: Any) -> Any:
+# Bound on the structural depth this will normalize. Reached from `content_digest`, which
+# `dispatch_model_call` computes over a turn's raw tool-call arguments -- model-controlled, and
+# `json.loads` will hand us up to ~994 levels. Unbounded, this raised `RecursionError` from ~495,
+# and `RecursionError` is a `RuntimeError`, not a `ValueError`, so it escapes the handlers that would
+# otherwise turn a bad payload into a failed call. `core.tool_approval` has the same-named function
+# with the same shape; bounding one and not the other is precisely the twin-miss this release keeps
+# finding, and this side fires *earlier* -- during the model-call publish, before tool dispatch.
+MAX_JSONISH_DEPTH = 64
+
+# What replaces a subtree past the bound. A marker rather than a raise: this runs inside digest and
+# observer publication, where the caller wants an identifier for the payload, not an exception.
+# Distinct and constant, so two payloads differing only below the bound still digest identically --
+# which is honest, because at that depth the digest genuinely cannot distinguish them.
+_DEPTH_ELIDED = "[depth-elided]"
+
+# What replaces a container reachable from itself. Distinct from ``_DEPTH_ELIDED`` so a digest can
+# tell "too deep to distinguish" from "cyclic", and so the marker says which bound was hit.
+_CIRCULAR_ELIDED = "[circular-elided]"
+
+
+def _jsonish(value: Any, _depth: int = 0, _ancestors: frozenset[int] = frozenset()) -> Any:
+    if _depth > MAX_JSONISH_DEPTH:
+        return _DEPTH_ELIDED
+    if isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes, bytearray)):
+        # The depth bound alone made this *worse*, not better. A cyclic mapping with two
+        # self-referencing keys is re-expanded once per edge per level, so the bound turned a fast
+        # ``RecursionError`` into ~2**64 nodes -- a hang, before the completed provider turn is
+        # returned. Reachable from a third-party adapter handing back a cyclic tool-call argument,
+        # which is the same reachability class as ``public_view.preview_value``'s guard.
+        #
+        # Third traversal in this tree to need this. ``preview_value`` and
+        # ``public_view.touches_redacted_path`` were both guarded during review; this one was not,
+        # which is the release's own defect shape one more time.
+        #
+        # Its two siblings are clean, and the reason is worth knowing before touching either.
+        # ``core.tool_approval._jsonish`` *raises* past its bound and ``conformance.contracts``
+        # has no bound at all, so both abort the whole traversal on the first over-deep path —
+        # measured at 0.002 s for the same cyclic input that hung this one. **The elision is what
+        # makes a depth cap dangerous**: returning a marker lets every sibling branch keep
+        # expanding. Converting either of those to return a marker instead of raising reintroduces
+        # this defect there, and would need this guard first.
+        if id(value) in _ancestors:
+            return _CIRCULAR_ELIDED
+        _ancestors = _ancestors | {id(value)}
     if isinstance(value, Mapping):
-        return {str(key): _jsonish(item) for key, item in value.items()}
+        return {str(key): _jsonish(item, _depth + 1, _ancestors) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_jsonish(item) for item in value]
+        return [_jsonish(item, _depth + 1, _ancestors) for item in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)

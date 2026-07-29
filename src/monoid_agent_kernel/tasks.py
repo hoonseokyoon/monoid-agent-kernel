@@ -33,6 +33,7 @@ from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ToolObservation
 from monoid_agent_kernel.public_view import (
+    preview_value,
     public_capability_result,
     public_path,
     public_result_content,
@@ -219,6 +220,12 @@ class BackgroundJob:
         payload = self.to_json(run_dir)
         payload["changed_paths"] = self.public_paths(permission_policy)
         payload.pop("command", None)
+        # The same `cwd` from the same `shell.exec` call came out `{"redacted": true}` on
+        # `tool.approval.requested` / `shell.exec.started` and as the path on `job.started` /
+        # `job.finished`, then into `status.json["jobs"]` -- so backgrounding a command was enough
+        # to route around `redact_patterns`. `changed_paths` above stays exact: it is the
+        # declared-contract family, and only this hand-copied field was ever unbounded.
+        payload["cwd"] = preview_value("cwd", payload.get("cwd"), permission_policy)
         return payload
 
     def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:

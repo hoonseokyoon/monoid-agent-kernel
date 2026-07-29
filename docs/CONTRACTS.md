@@ -1329,8 +1329,12 @@ durable storage — a mounted volume needs no code change.
 **Limitations (v2):** a mid-run `commit_checkpoint` re-baseline combined with delta-
 restore is a documented follow-up (the common no-re-baseline case is covered).
 Multimodal message parts (image/document) round-trip through the checkpoint, so a
-resumed run re-forwards the media. `transcript.jsonl` is a debug artifact (the
-by-value `messages` in the checkpoint are the load-bearing conversation record).
+resumed run re-forwards the media. The by-value `messages` in the checkpoint remain
+the load-bearing record for *resuming* a run — but `transcript.jsonl` is no longer
+only a debug artifact: since v0.20 the settle events carry a digest instead of the
+model's text, and `transcript.jsonl`'s `settled_text` record is what an entitled
+reader joins back to display it. Deleting it now costs displayed answers, not just
+debuggability.
 
 ## Legacy Reference Production Hardening
 

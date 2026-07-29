@@ -7,7 +7,246 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed — content egress from the event stream (breaking for `events.jsonl` consumers)
+
+- **`turn.settled` and `run.finished` no longer carry `final_text` for model-authored answers.**
+  They carry `final_text_digest` (a domain-separated `content_digest`) and `final_text_len` instead.
+  The text moved to `transcript.jsonl`'s `settled_text` record, which entitled readers join back —
+  the Studio and backend read paths hydrate it automatically. **Kernel-authored text still arrives
+  inline** (for example `Stopped after reaching max steps.`), so the field is present on some settle
+  events and absent on others; branch on which key is there rather than assuming either. `monoid
+  watch --json` reads raw JSONL and does *not* hydrate. `status.json` no longer carries `final_text`
+  at all: it is written by a fan-out sink that no hydration seam can reach, and keeping the key would
+  have written `""` on every model-answered run.
+- **Public previews are now capped by bytes rather than characters.** The cap compared bytes and
+  sliced characters, so any string with at most 160 characters and more than 240 bytes was published
+  in full while the payload reported `truncated: true` — in practice, no cap at all for non-ASCII
+  text. `shell.preview_command` had the same defect independently, with different constants.
+- **The tool-approval preview is now bounded.** `arguments_preview` masked secrets but applied no
+  length, depth or item cap, so an `ask`-gated `fs.write` published the entire file body on
+  `task.started`, in `task.json`, and back to the model through `job.list`. It now runs on the same
+  traversal as its twin `args_preview`, which had the caps, so the bounds are stated once instead of
+  in two places that carried disjoint halves of the policy.
+  Sharing a traversal did **not** give the ordinary `allow` path secret masking: `args_preview`
+  calls it without a mask and still publishes an `api_key` argument verbatim, on purpose. See the
+  exceptions list below.
+  The approval preview keeps a **much larger byte budget** than the trace preview and does **not**
+  blank file-content fields, because a person reads it to decide whether a call may run: a command
+  cut mid-string hides the part that matters (with the model choosing where that part sits), and a
+  card rendering `{"redacted": true}` where a file body should be asks someone to authorize a write
+  they cannot inspect. An `ask`-gated call therefore publishes more on `task.started` than the same
+  call publishes on `tool.call.started` — bounded, but readable. Deployments that cannot accept that
+  should not bind the tool to `authorization="ask"`, or should attach a redacting `EventSink`.
+- `web.search` / `web.fetch` and `shell.exec` previews no longer copy their descriptors raw. Both
+  branches exist to withhold something (the query and URL; env *values*), and an unbounded `locale`,
+  `blocked_domains` entry or env *key* let a model publish exactly what was being withheld.
+  This now covers the events those services emit **either side** of `tool.call.started`. They build
+  their own payloads — `ShellApprovalRequest.to_public_json`, spread across seven emit sites covering
+  six shell event types, and an inline `event_data` in each of the three web builders — so the same
+  20 KB env key or `blocked_domains` entry rode out
+  verbatim on `tool.approval.requested`, `tool.approval.denied` (a *rejected* call still shipped it)
+  and `shell.exec.started`, while `args_preview` reduced it to a preview in the same run. A `cwd`
+  under `redact_patterns` likewise came out `{"redacted": true}` on one event and as the path on the
+  next. Both now go through one `public_event_payload`.
+- **Dict keys are bounded.** `preview_value` capped every value and emitted `str(child_key)`
+  untouched, so the same 30 KB file body arrived `{"redacted": true}` in the value position and
+  verbatim in the key position — past the byte cap and past `_is_content_field`, which reads the key
+  to judge the value and so has nothing to match when a body *is* the key. Bounding keys makes
+  distinct keys collide, and a mapping resolves a collision by dropping one silently, so collisions
+  are disambiguated with a `#n` suffix rather than traded for a second silent cap.
+- **`redact_patterns` now covers every field that names a path**, not a hardcoded
+  `{path, root, cwd}`. The registry declares path arguments per tool, and `fs.move`/`fs.copy`
+  declare `source_path`/`destination_path` — so one `fs.move` published `paths: ["[redacted-path]"]`
+  next to `args_preview.source_path: "secrets/creds.txt"` on the *same event*, the redaction defeated
+  by the field beside it. Matched by name (`path`, `root`, `cwd`, `*_path`), which also covers custom
+  and MCP tools that never register with the builtin registry.
+- **The approval card no longer hides what it is asking about.** Content redaction was switched off
+  for the approver while path redaction stayed on, so under `redact_patterns` the card showed a
+  private key's *contents* above `{"redacted": true}` where the destination should be. The two are
+  now a single `decision_surface` switch a caller cannot half-set, and the operator's explicit
+  `redact_patterns` outranks it for the whole call — unlike the kernel's own content default, which
+  an approver is entitled to see past.
+- A container reachable from *itself* is elided with a `circular` marker rather than re-expanded,
+  tracked over ancestors on the current path so a value legitimately shared twice still renders
+  twice. Measured before the guard, at fanout 7: 23 s and 377 MB of serialized JSON, from an input that fits on a line.
+- **Path redaction fails closed for every path-naming field**, including `*_path`. A value that
+  cannot be normalized to a workspace path counts as redacted. **This over-redacts, and it reaches a
+  first-party tool on every call:** `memory.*` addresses a virtual `/memories` root, so `path`,
+  `old_path` and `new_path` are absolute by contract, never normalize as workspace paths, and render
+  `{"redacted": true}` for any operator with *any* pattern configured — including on the approval
+  card, since `memory` write bindings default to `authorization="ask"`. An earlier draft of this
+  entry claimed no builtin was affected, on the strength of checking `stdout_path`/`stderr_path`
+  (which do go out relative, and are fine). The
+  narrower rule — fail closed only for `path`/`root`/`cwd` — was tried and taken
+  back, because `normalize_workspace_path` raises on any `..` component *before* resolving it, so
+  `x/../secrets/creds.txt` raises while naming a file the pattern does match, and was published
+  verbatim next to `paths: ["[redacted-path]"]` on the same event. Both failure modes are real and
+  only one is silent: an over-redacted field is visible and an operator can widen the glob, while an
+  under-redacted one looks exactly like a field that was checked.
+- A `path` argument that cannot be normalized (absolute, or containing `..`) is now redacted rather
+  than raising. Normalization raises, the preview builders sit on the emit path, and the raise ended
+  the run of any operator who had configured `redact_patterns` — it escaped `_emit_tool_started`
+  before validation, and the error handler retried the same emission, so one malformed
+  model-authored argument terminated the run instead of producing a tool error the model could
+  correct. The guard lives in `public_path` itself, which every call site goes through — fourteen of
+  them, ten across `loop`, `loop_phases`, `tasks`, `tool_services.shell` and `core.projections`,
+  and four inside `public_view` — and in `public_proposal_file`, the one remaining direct caller of
+  the raw predicate. No unguarded call to `PermissionPolicy.is_path_redacted` is left.
+- A truncated `paths` entry now ends in `…`. These stay plain strings because `narration._target`
+  falls back to them and joins them, so the cut has to be marked inside the text: an unmarked prefix
+  is presented to an operator as the exact target of a write, and two long paths sharing a prefix
+  become one indistinguishable name.
+- **`plan.updated` and `artifact.emitted` cap their model-authored payloads**, matching what
+  `tool.call.started` already did with the same values. This also bounds `status.json["plan"]`.
+  `plan.updated.items` stays a *typed* array through the cap: each `step` is truncated as a string
+  rather than replaced by a preview object, and a plan longer than the item cap reports the drop in
+  a new sibling `truncated_items` key instead of appending a marker element. As an element it was a
+  valid object (so schema validation passed) but not a plan item, so the Studio inspector drew a
+  blank row for it and counted it in the `completed/total` denominator. `status.json` mirrors this
+  with `plan_truncated_items`, so the cap is visible on that surface too rather than silently
+  shortening the plan. Suppressing the in-band marker is scoped to that one typed array: a list
+  nested inside a plan item is an ordinary JSON blob and keeps its own `truncated_items` marker,
+  since the sibling count measures the root only and would not have reported its loss.
+- Tool arguments nested deeper than 64 levels are now rejected with a `ValueError` the model can
+  read and correct. They previously raised `RecursionError`, which — being a `RuntimeError` — fell
+  through the tool-call handler entirely.
+
 ### Added
+
+- **An operator kill switch for the delta channel.** `model.output.delta` and
+  `model.reasoning.delta` publish raw model text, they are durable rather than live-only, and Studio
+  enables them whenever the optional `httpx` extra is installed — so for the shipped app they were on
+  with no supported way to turn them off short of uninstalling a package. Set
+  `MONOID_OUTPUT_DELTAS=0` (applies to a run and every subagent it spawns), pass
+  `monoid studio serve --no-output-deltas` (the flag is on the `serve` / `app` / `doctor`
+  subcommands, not on the `studio` group), or construct `StudioConfig(stream_output_deltas=False)`.
+  The cost is live token rendering in the UI **and mid-turn interruption**: the kernel only takes
+  the streaming path when something consumes deltas, so Stop lands on the next step boundary rather
+  than aborting inside the in-flight model call. That coupling predates this release —
+  `emit_output_deltas` is `False` by default in the kernel, so the switch returns you to the kernel
+  default rather than degrading past it — but Studio turns deltas on, so it is visible there.
+  `AgentLoop.astream` takes a different path and is unaffected, as are the run result and
+  `transcript.jsonl`. The completed answer still reaches the Studio UI, because its event feed
+  hydrates `final_text` from `transcript.jsonl`.
+- `transcript.jsonl` is now registered in the compatibility ledger. It became the authoritative
+  source of displayed model text, so it is no longer merely a debug artifact.
+- `monoid studio doctor` validates `MONOID_OUTPUT_DELTAS` and reports the effective delta state.
+  A malformed value is a startup error by design, so without this the preflight passed and the next
+  `serve` died in `AgentLoop.__post_init__` — and an operator who *thought* they had disabled a
+  channel carrying raw model text learned nothing from a bare `[PASS]`. The report names the actual
+  cause, including the case where deltas are off because the `[http-async]` extra is absent — which
+  is the base package's default, and where a report covering only the two switches said raw model
+  text was about to be published when none was.
+
+- **`metrics.json` redacts `redact_patterns` paths.** It is one of the three public run artifacts
+  and was the only one that never did, so an operator who configured a pattern, checked
+  `events.jsonl` and `status.json`, and saw `[redacted-path]` had every reason to think it had
+  worked while the whole path sat in the third file. Both callers of `build_metrics` already applied
+  `public_path` to the same list for the events they emit.
+- **Identifier fields are bounded**, via one `public_identifier`: a model-chosen tool name (the
+  catalog is allowed not to resolve it), a `job_id`, and the `response_id` / `previous_turn_handle`
+  the gateway echoes back — the last two arriving from outside the kernel's trust boundary. "That
+  field is an identifier" is the assumption that left dict keys, env keys and the tool name
+  unbounded, three separate times in this release.
+- **Arguments that look like enums or integers are previewed, not copied.** `artifact.emit`'s `kind`
+  is declared `{"type": "string"}` with no enum; `shell.exec`'s `timeout_s`, `max_output_bytes` and
+  `startup_wait_s` are declared `["integer", "null"]`. The schema does not protect this surface:
+  `tool.call.started` is emitted *before* `validate_args` rejects the call, so a model that sends a
+  2 KB string in `timeout_s` publishes it and is only then told the call was invalid.
+- **The run's terminal error goes through the same filter on every public artifact.**
+  `public_error_message` was bound on `events.jsonl`, `status.json` and `failure.json` and missed on
+  `metrics.json`. Note what that filter *is*: it substitutes only when the message contains
+  `PRIVATE KEY`, and applies no length bound — so this closes an inconsistency, not the underlying
+  exposure. `_error_from_status_body` embeds the entire LLM gateway HTTP response body in the
+  message, and that body still reaches all four artifacts unless it happens to name a private key.
+  Error text is listed under "Carried, deliberately" in `docs/OBSERVABILITY.md` for exactly this
+  reason. The reference backend applies the same filter before serving `status` / `result` /
+  `diagnostics`, and to the `failure.json` it writes; `AgentRunResult.error` stays raw, because the
+  embedding application is inside the trust boundary.
+- **No `KeyError` escapes the job tools.** `job.status` / `logs` / `cancel` / `wait` raised through
+  tool dispatch, which catches `(NativeAgentError, ValueError, TypeError)` and not `KeyError`, so a
+  model asking about a job terminated the run. Two distinct sources: an unregistered id, and a
+  registered `HostedTask` with no log file — the second reachable by calling `job.logs` on an id the
+  kernel itself handed the model through `job.list` after `agent.spawn`.
+
+**What this release does not close**, stated as an exceptions list rather than an absolute claim:
+
+- per-tool prose in `args_preview` (only `preview_kind="finish"` redacts it);
+- validator and JSON-schema error text;
+- a subagent's answer on `task.finished`;
+- `job.list` / `job.status` exposing hosted-task payloads to the model;
+- **`task.started.data.prompt`** — the model-authored delegation brief or HITL question, uncapped and
+  neither previewed nor digested;
+- **secret-named argument values on the ordinary tool-call path.** `args_preview` deliberately does
+  not guess at secrets from key names — that heuristic was removed on purpose and redaction beyond
+  content fields is the integrating backend's job via the `EventSink` seam
+  (`examples/redacting_event_sink.py`). The *approval* record does mask them, so an `api_key`
+  argument is masked on an `ask`-gated call and published verbatim on an `allow` call. Documented
+  rather than changed, because changing it would reverse a deliberate architectural decision;
+- and the delta channel remains **on by default in Studio** unless switched off.
+
+Nine gaps were found reviewing this release and are deliberately left open, because closing any
+of them means changing a surface this one does not touch:
+
+- **A lone surrogate anywhere in a string ends the run.** JSON permits one; UTF-8 cannot encode one,
+  and `json.loads` hands them back — from a tool argument, an HTTP body, or **the user's own
+  instruction**, so no model is needed. Every `.encode("utf-8")` then raises: `preview_value`'s byte
+  measurement, `canonical_sha256`, and the JSONL/atomic writers. The writers are hardened here (they
+  retry with `ensure_ascii=True`, which also stops `write_json_atomic` leaving an orphan `.tmp` in
+  the run root), but the run still dies earlier. The complete fix is to sanitize where a string
+  enters the kernel; patching each `.encode` site in turn is the twin-miss shape this release spent
+  most of its review budget on. Writing *this bullet* crashed the tooling that wrote it.
+- **`BackgroundJob.public_payload` has one caller.** It exists to project `job.json` for publication
+  — dropping `command`, previewing `cwd`, redacting `changed_paths` — and only the event sink uses
+  it. `monoid jobs --json`, `monoid job status --json`, the backend's `/v1/runs/<id>/jobs` and
+  Studio's unauthenticated `/api/jobs` all re-read `job.json` off disk and publish a 1766-byte
+  `command` plus `redact_patterns`-matched `cwd` and `changed_paths` verbatim. Four readers, four
+  answers; the projection is the right one and nothing routes through it.
+- **Non-string scalars bypass the byte cap entirely.** `preview_value` bounds `str` and returns
+  everything else unchanged, so a 4300-digit integer — model-authored, arbitrary content in base ten
+  — reaches `events.jsonl` whole: one `artifact.emit` measured 96 KB with twenty verbatim copies.
+  Bounding them means returning a different *type*, which is exactly how the `artifact.emitted.kind`
+  fix broke that event's schema mid-review, so this needs a design rather than a patch.
+- **`events.jsonl` can contain `NaN` / `Infinity`.** `json.dumps` defaults to `allow_nan=True` on
+  every write path and `json.loads` accepts those tokens from a model, so the documented JSONL
+  contract is not strictly JSON. The Studio feed silently drops such a frame. `conformance/` already
+  writes with `allow_nan=False`; the run path does not.
+- **`project_run_status` has no `EventLogCorruption` guard.** `monoid watch` catches it and prints a
+  clean error; `monoid status --json` and Studio's chat projection emit a 4.8 KB traceback on the
+  same interior-corrupt `events.jsonl`.
+- **A deeply nested tool argument still ends the run on the `allow` path.** `MAX_ARGUMENT_DEPTH` is
+  reached only through the approval-request builder, so `ask`-gated calls reject and `allow`-gated
+  calls carry the argument into the message history and on to `RunCheckpoint.to_json`, whose
+  `dataclasses.asdict` raises `RecursionError` around depth 500 — while `json.loads`/`json.dumps`
+  handle 900 — surfacing as `_CheckpointPersistError` out of `run_once`. Guarding tool *dispatch*
+  does not close it: by then the turn is already in history. The fixes are to reject the turn at
+  ingestion or to stop using `asdict`, and the latter also drops its deep copy, so a checkpoint would
+  begin sharing mutable state with the live loop. Both belong to the durability surface.
+- **One preview's total size is bounded only by its input.** The depth, key and item caps bound a
+  preview's *shape*, not its size: a value reachable by many paths is re-expanded once per path, so
+  nine levels of a mapping shared five ways — ten objects, 46 key slots — produced 26 MB of JSON in 1.1 s,
+  and the cost grows with fanout: 110 MB at 6, 377 MB at 7. The cycle
+  guard does not help, because sharing is not a cycle. Reachable only from a Python-object caller
+  (a custom or MCP tool's `ToolResult.content`), since JSON cannot express sharing. A
+  `PREVIEW_MAX_NODES` budget was implemented and reverted: spent per visited value it replaced
+  whole `run.update_plan` items with `{"budget_exhausted": true}` markers on a plain-JSON payload,
+  turning a rare adversarial cost into a *silent* cap on an ordinary one — `truncated_items` stayed
+  0, so the plan looked complete and one step short of done. The right fix bounds the budget without
+  crossing the `_INLINE_TEXT_KEYS` and plan-count invariants; that is a redesign, not a patch.
+- **There is no aggregate budget, so the caps can be walked around by chunking.** Every cap is
+  per-value (240 bytes) or per-container (20 keys, 20 items), and nothing bounds the total, so a
+  model that splits its payload into sub-threshold pieces publishes all of it while obeying every
+  rule: one `run.update_plan` with 20 items × 20 extra keys × 234 bytes puts **267 KB** across the
+  three public files, and one `artifact.emit` puts 187 KB. Unlike the shared-graph case above this
+  needs nothing but plain JSON. "Content stays off the public stream" and "100 KB per tool call" are
+  both true today, which is the honest way to state where this release got to: it closed the routes
+  that leaked a value *whole*, and did not make the stream a bounded channel.
+- **Nothing renders `truncated_items`.** The count reaches `events.jsonl` and `status.json`, and the
+  shipped Studio bundle drops it: a 25-step plan reads `Plan · 20 steps` and `20/20`. The count
+  exists precisely so the cap is not silent, and on that surface it still is. Closing it means
+  changing `studio-ui/` and rebuilding `web/dist`, which this release deliberately leaves untouched.
+
+See `docs/OBSERVABILITY.md` for the full public/private split.
 
 - Added `ModelCallRunner`, which executes one model call against any adapter shape — a blocking
   `next_turn`, a coroutine `next_turn`, `anext_turn`, or a streamed `astream_turn` — through a single

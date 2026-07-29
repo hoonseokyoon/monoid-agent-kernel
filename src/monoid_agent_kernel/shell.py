@@ -13,6 +13,11 @@ from monoid_agent_kernel._policy_util import dedupe, str_tuple
 from monoid_agent_kernel._proc import file_size, spawn_process, terminate_process
 from monoid_agent_kernel.errors import PermissionDenied, ToolExecutionError, WorkspaceError
 from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.public_view import (
+    PREVIEW_BYTE_THRESHOLD,
+    public_event_payload,
+    truncate_to_bytes,
+)
 from monoid_agent_kernel.workspace.paths import is_within, normalize_workspace_path
 
 if TYPE_CHECKING:
@@ -260,25 +265,33 @@ class ShellApprovalRequest:
     def max_output_bytes(self) -> int:
         return self.effective_max_output_bytes
 
-    def to_public_json(self) -> dict[str, Any]:
-        return {
-            "tool": "shell.exec",
-            "tool_call_id": self.tool_call_id,
-            "command_preview": self.command_preview,
-            "cwd": self.cwd,
-            "requested_timeout_s": self.requested_timeout_s,
-            "effective_timeout_s": self.effective_timeout_s,
-            "requested_startup_wait_s": self.requested_startup_wait_s,
-            "effective_startup_wait_s": self.effective_startup_wait_s,
-            "requested_max_output_bytes": self.requested_max_output_bytes,
-            "effective_max_output_bytes": self.effective_max_output_bytes,
-            "timeout_s": self.effective_timeout_s,
-            "max_output_bytes": self.effective_max_output_bytes,
-            "execution_workspace": self.execution_workspace,
-            "background": self.background,
-            "resume_on_exit": self.resume_on_exit,
-            "env_keys": list(self.env_keys),
-        }
+    def to_public_json(self, policy: PermissionPolicy) -> dict[str, Any]:
+        # Bounded here rather than at the seven emit sites that spread it. `env_keys` and
+        # `cwd` are model-authored and were published raw on every one of them while
+        # `shell_args_preview` capped and redacted the same two values for
+        # `tool.call.started` -- including on `tool.approval.denied`, so a rejected call
+        # still shipped its 20 KB key.
+        return public_event_payload(
+            {
+                "tool": "shell.exec",
+                "tool_call_id": self.tool_call_id,
+                "command_preview": self.command_preview,
+                "cwd": self.cwd,
+                "requested_timeout_s": self.requested_timeout_s,
+                "effective_timeout_s": self.effective_timeout_s,
+                "requested_startup_wait_s": self.requested_startup_wait_s,
+                "effective_startup_wait_s": self.effective_startup_wait_s,
+                "requested_max_output_bytes": self.requested_max_output_bytes,
+                "effective_max_output_bytes": self.effective_max_output_bytes,
+                "timeout_s": self.effective_timeout_s,
+                "max_output_bytes": self.effective_max_output_bytes,
+                "execution_workspace": self.execution_workspace,
+                "background": self.background,
+                "resume_on_exit": self.resume_on_exit,
+                "env_keys": list(self.env_keys),
+            },
+            policy,
+        )
 
 
 @dataclass(frozen=True)
@@ -748,8 +761,25 @@ def _read_output(path: Path, max_bytes: int) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+# Wider than ``public_view.PREVIEW_BYTE_BUDGET`` because a command is the operator's primary
+# identifying detail in the job list, and it keeps the pre-existing ASCII behaviour byte-identical.
+COMMAND_PREVIEW_BYTE_BUDGET = 200
+
+
 def preview_command(command: str) -> str:
+    """A single-line, byte-bounded rendering of a command for public payloads.
+
+    Stays a ``str`` on purpose: ``command_preview`` is declared ``{"type": "string"}`` and is
+    *required* by ``JOB_SCHEMA``, so this cannot return the ``{"preview": ...}`` dict that
+    ``preview_value`` returns for over-long text.
+
+    The byte budget is shared with ``public_view`` rather than re-spelled here. Before that, this
+    function compared bytes and sliced characters exactly as ``preview_value`` did, so a 150-
+    character Hangul command measured 450 bytes, cleared the threshold, and was "truncated" to its
+    first 200 characters -- all 150 of them -- and then had ``...`` appended, publishing the entire
+    command plus a claim that it had been cut.
+    """
     single_line = " ".join(command.split())
-    if len(single_line.encode("utf-8")) <= 240:
+    if len(single_line.encode("utf-8")) <= PREVIEW_BYTE_THRESHOLD:
         return single_line
-    return single_line[:200] + "..."
+    return truncate_to_bytes(single_line, COMMAND_PREVIEW_BYTE_BUDGET) + "..."

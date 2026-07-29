@@ -153,6 +153,7 @@ class LoopBootstrapper:
         web_service = WebService(
             recorder=recorder,
             web_gateway_client=loop.web_gateway_client,
+            permission_policy=loop.permission_policy,
         )
         jobs_service = JobsService(job_manager=job_manager)
         from monoid_agent_kernel.loop import AgentToolContext
@@ -505,7 +506,16 @@ class LoopFinalizer:
             "duration_s": time.time() - res.started,
             "steps_limit": loop.spec.limits.max_steps,
             "tool_calls": state.total_tool_calls,
-            "changed_paths": res.workspace.changed_paths(),
+            # `metrics.json` is a public run artifact, like `events.jsonl` and `status.json`, and was
+            # the only one of the three that never redacted. Both callers of this builder apply
+            # `public_path` to the very same list a few lines later for the events they emit, so an
+            # operator who configured `redact_patterns`, checked those two surfaces and found
+            # `[redacted-path]` had every reason to believe it had worked -- while the whole path sat
+            # in the third file. Found by driving runs and grepping the output rather than by reading
+            # this function, which is how it survived several passes over the surrounding code.
+            "changed_paths": [
+                public_path(str(path), loop.permission_policy) for path in res.workspace.changed_paths()
+            ],
             "workspace_backend": loop.spec.workspace_backend,
             "requested_reasoning_effort": model.reasoning.effort,
             "effective_reasoning_effort": model.reasoning.effort,
@@ -531,7 +541,16 @@ class LoopFinalizer:
         if state.provider_http_status is not None:
             metrics["provider_http_status"] = state.provider_http_status
         if state.error:
-            metrics["error"] = state.error
+            # Through the same filter `events.jsonl`, `status.json` and `failure.json` use. This was
+            # the one surface carrying it raw, and `_error_from_status_body` embeds the *entire* LLM
+            # gateway HTTP response body in the message -- so a 400 from a misconfigured gateway put
+            # whatever that body held into a public run artifact.
+            #
+            # Twenty-six lines above, `changed_paths` was routed through `public_path` one commit ago
+            # for precisely this reason, in this function, with a comment calling `metrics.json` "the
+            # only one of the three that never redacted". The list got bound and the error string on
+            # the next screen did not.
+            metrics["error"] = public_error_message(state.error)
         return metrics
 
     def finalize(self, state: Any, res: _RunResources) -> AgentRunResult:

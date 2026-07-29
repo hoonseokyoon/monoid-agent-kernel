@@ -23,11 +23,13 @@ from urllib import request as urlrequest
 import click
 
 from monoid_agent_kernel.core.model_io import content_digest
+from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.reference.studio import window
 from monoid_agent_kernel.reference.studio.server import (
     _SAMPLE_SKILLS_DIR,
     StudioConfig,
     StudioServer,
+    _gateway_streaming_available,
     load_env_file,
 )
 from monoid_agent_kernel.reference.studio.window import open_app_window
@@ -182,6 +184,17 @@ def _workspace_option(fn):
 
 
 def _common_server_options(fn):
+    fn = click.option(
+        "--no-output-deltas",
+        is_flag=True,
+        default=False,
+        help=(
+            "Stop publishing model.output.delta / model.reasoning.delta to events.jsonl. "
+            "The run result and transcript.jsonl are unaffected. Costs live token rendering, and "
+            "makes Stop wait for the in-flight model call instead of aborting mid-token. "
+            "MONOID_OUTPUT_DELTAS=0 does the same for every run in a deployment."
+        ),
+    )(fn)
     fn = click.option("--host", type=str, default="127.0.0.1", show_default=True)(fn)
     fn = click.option("--port", type=int, default=8799, show_default=True)(fn)
     fn = click.option(
@@ -238,6 +251,7 @@ def _studio_config(
     mcp: bool,
     env_file: Path,
     no_env_file: bool,
+    no_output_deltas: bool = False,
 ) -> StudioConfig:
     return StudioConfig(
         workspace=workspace,
@@ -248,6 +262,7 @@ def _studio_config(
         skills_directory=None if no_skills else skills_directory,
         mcp=mcp,
         env_file=None if no_env_file else env_file,
+        stream_output_deltas=not no_output_deltas,
     )
 
 
@@ -271,6 +286,7 @@ def studio_serve(
     mcp: bool,
     env_file: Path,
     no_env_file: bool,
+    no_output_deltas: bool,
     open_window: bool,
 ) -> None:
     """Start the Studio server and keep it running (window is detachable)."""
@@ -278,7 +294,7 @@ def studio_serve(
         _studio_config(
             workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
             skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
-            env_file=env_file, no_env_file=no_env_file,
+            env_file=env_file, no_env_file=no_env_file, no_output_deltas=no_output_deltas,
         )
     )
     url = server.start()
@@ -310,13 +326,14 @@ def studio_app(
     mcp: bool,
     env_file: Path,
     no_env_file: bool,
+    no_output_deltas: bool,
 ) -> None:
     """Start the server and a desktop window; closing the window stops the server."""
     server = StudioServer(
         _studio_config(
             workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
             skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
-            env_file=env_file, no_env_file=no_env_file,
+            env_file=env_file, no_env_file=no_env_file, no_output_deltas=no_output_deltas,
         )
     )
     url = server.start()
@@ -454,6 +471,7 @@ def studio_doctor(
     mcp: bool,
     env_file: Path,
     no_env_file: bool,
+    no_output_deltas: bool,
 ) -> None:
     """Preflight the common setup failures and print pass/fail with exact remediation.
 
@@ -500,6 +518,49 @@ def studio_doctor(
             )
     else:
         report(True, "provider 'offline' (no API key needed)")
+
+    # A hard check, not a warning: a malformed value here is a startup error by design, so leaving
+    # it out meant `doctor` could report every hard requirement passing and `serve` still die in
+    # `AgentLoop.__post_init__` on the next command. `doctor` loads the same `.env` this reads from,
+    # which is exactly where the typo lives.
+    #
+    # The effective state is reported even when the value parses, because this switch's failure mode
+    # is silent: an operator who believes they disabled a channel that publishes raw model text, and
+    # did not, learns nothing from "PASS". The env var can only turn deltas off — it is ANDed with
+    # the loop's own setting — so both inputs are named.
+    try:
+        deltas_env_permits = getenv_bool(OUTPUT_DELTAS_ENV, default=True)
+    except ValueError as exc:
+        hard_failures += 1
+        report(
+            False,
+            f"{OUTPUT_DELTAS_ENV} is set to a value that is not a boolean",
+            str(exc),
+        )
+    else:
+        # Three inputs decide this, and `StudioServer.start` ANDs all three:
+        # `_gateway_streaming_available() and config.stream_output_deltas`, with the loop applying
+        # the env var on top. Reporting on two of them told a minimal install -- no `httpx`, which
+        # is the base package's own default -- that raw model text "will be published" when the
+        # server was about to use one-shot turns and publish none. A preflight that names the wrong
+        # cause is worse than one that stays quiet: it sends someone to disable a switch that was
+        # never the reason.
+        if not deltas_env_permits:
+            report(True, f"model-text deltas are disabled by {OUTPUT_DELTAS_ENV}")
+        elif no_output_deltas:
+            report(True, "model-text deltas are disabled by --no-output-deltas")
+        elif not _gateway_streaming_available():
+            report(
+                True,
+                "model-text deltas are off because the async transport is not installed "
+                "(Studio uses one-shot turns without the [http-async] extra)",
+            )
+        else:
+            report(
+                True,
+                "model.output.delta / model.reasoning.delta will be published to events.jsonl "
+                "(these carry raw model text)",
+            )
 
     # --- soft checks (warnings only) ---
     if window.find_chromium() is not None:

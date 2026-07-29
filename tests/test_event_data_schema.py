@@ -103,9 +103,16 @@ _CONTENT_EVENT_FIELDS: dict[str, tuple[set[str], set[str]]] = {
         {"status"},
     ),
     # Both delta types stream raw model text to every sink, and ``text`` is required. v0.20 keeps
-    # them that way deliberately: they are the only live-streaming mechanism, so they are gated by
-    # ``emit_output_deltas`` (default False) and documented rather than removed. Pinned here so
-    # that decision has to be revisited on purpose rather than drifted past.
+    # them that way deliberately: they are the only live-streaming mechanism, so they are switchable
+    # and documented rather than removed. Pinned here so that decision has to be revisited on
+    # purpose rather than drifted past — and this note is that revisit.
+    #
+    # The previous wording said "gated by ``emit_output_deltas`` (default False)", which was true of
+    # this dataclass and false of the shipped product: Studio set the flag from
+    # ``find_spec("httpx") is not None``, so for anyone who had installed the async extra the
+    # channel was on, durable, and unfiltered. v0.20 adds a real off switch
+    # (``MONOID_OUTPUT_DELTAS=0``, ``StudioConfig.stream_output_deltas``,
+    # ``monoid studio serve --no-output-deltas``) instead of a default that only looked like one.
     "model.output.delta": ({"text"}, {"text"}),
     "model.reasoning.delta": ({"text"}, {"text"}),
 }

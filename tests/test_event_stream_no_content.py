@@ -13,17 +13,29 @@ existing test, so it could have regressed silently.
 
 from __future__ import annotations
 
+import itertools
+
+from monoid_agent_kernel.reference.studio import server as server_module
+
 import json
+import os
 from pathlib import Path
 from typing import Any
 
+import pytest
 from support.runtime import runtime_config, runtime_provider
+
+from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 
 from monoid_agent_kernel.core.model_io import content_digest
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
-from monoid_agent_kernel.providers.base import ModelTurn
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.providers.base import ModelTurn, TextDelta, TurnComplete
+from monoid_agent_kernel.providers.fake import (
+    FakeModelAdapter,
+    FakeStreamingModelAdapter,
+    fake_tool_call,
+)
 
 SETTLE_TYPES = ("turn.settled", "run.finished")
 MODEL_PROSE = "The answer is 42, and here is the reasoning behind it."
@@ -107,6 +119,157 @@ def test_status_json_no_longer_carries_the_answer(tmp_path: Path) -> None:
     assert status["terminal"] is True  # the run.finished branch really did fire
     assert "final_text" not in status
     assert MODEL_PROSE not in (result.run_dir / "status.json").read_text(encoding="utf-8")
+
+
+def test_the_delta_channel_republishes_the_answer_unless_it_is_switched_off(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The configuration every other test in this file avoids.
+
+    Everything above runs with `emit_output_deltas` off, which is this dataclass's default and *not*
+    the shipped product: Studio sets it from `find_spec("httpx") is not None`. So the file whose
+    docstring says the leak survived because the delta channel went unchecked was itself asserting
+    only in the one configuration where the channel does not exist. With deltas on, the answer
+    reassembles byte-exactly out of `events.jsonl` even though it never appears verbatim in any
+    single record — which is also why a grep-based audit finds nothing.
+
+    `MONOID_OUTPUT_DELTAS=0` is the supported way to close it.
+    """
+    # Split across fragments none of which contains the whole sentence -- that is why grepping the
+    # event log for the answer finds nothing while the answer is nonetheless present.
+    fragments = ["The answer is 42, ", "and here is ", "the reasoning behind it."]
+    assert "".join(fragments) == MODEL_PROSE
+
+    def _streaming() -> FakeStreamingModelAdapter:
+        return FakeStreamingModelAdapter(
+            chunk_turns=[[*(TextDelta(part) for part in fragments), TurnComplete(response_id="r1")]]
+        )
+
+    def _loop(root: Path) -> AgentLoop:
+        return AgentLoop(
+            spec=_spec(root),
+            model_adapter=_streaming(),
+            runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+            emit_output_deltas=True,
+        )
+
+    on = _loop(tmp_path)
+    assert on.emit_output_deltas is True
+    on_result = on.run_once("go")
+
+    published = (on_result.run_dir / "events.jsonl").read_text(encoding="utf-8")
+    assert MODEL_PROSE not in published, "no single record holds it; that is the point"
+    deltas = _events(on_result.run_dir, "model.output.delta")
+    assert "".join(record["data"]["text"] for record in deltas) == MODEL_PROSE
+
+    # Now the switch, same configuration otherwise.
+    monkeypatch.setenv("MONOID_OUTPUT_DELTAS", "0")
+    (tmp_path / "off").mkdir()
+    off = _loop(tmp_path / "off")
+    # Resolved into the field, not at the emit site: a loop reporting `True` while streaming nothing
+    # is the same half-bound shape the switch exists to remove.
+    assert off.emit_output_deltas is False
+    off_result = off.run_once("go")
+
+    assert _events(off_result.run_dir, "model.output.delta") == []
+    assert off_result.final_text == MODEL_PROSE  # the caller's answer is untouched
+
+
+def test_an_unparseable_switch_value_is_an_error_rather_than_a_silent_default() -> None:
+    """A kill switch that reads a typo as "leave it on" is worse than no switch.
+
+    The one existing env-boolean precedent is `getenv(...) != "1"`, which is fail-closed — correct
+    for a permission, wrong here, because every value except exactly `"1"` means off. An operator
+    who set the variable at all meant to change something.
+    """
+    previous = os.environ.get(OUTPUT_DELTAS_ENV)
+    os.environ[OUTPUT_DELTAS_ENV] = "of"  # a plausible typo for "off"
+    try:
+        with pytest.raises(ValueError, match="not a boolean"):
+            getenv_bool(OUTPUT_DELTAS_ENV, default=True)
+        for value, expected in (("0", False), ("off", False), ("no", False), ("1", True), ("on", True)):
+            os.environ[OUTPUT_DELTAS_ENV] = value
+            assert getenv_bool(OUTPUT_DELTAS_ENV, default=True) is expected
+        # An *empty* value is the one string that must not raise. `MONOID_FOO=` is how a dotenv file
+        # blanks a key, and `load_env_file` copies that empty value into `os.environ`, so treating it
+        # as unparseable would fail every run of anyone who commented out a line. Asserted because
+        # the rule lives in one `if not normalized` that reads like a redundant guard next to the
+        # `raw is None` check above it — the shape a later simplification deletes.
+        for blank in ("", "   "):
+            os.environ[OUTPUT_DELTAS_ENV] = blank
+            assert getenv_bool(OUTPUT_DELTAS_ENV, default=True) is True
+            assert getenv_bool(OUTPUT_DELTAS_ENV, default=False) is False
+    finally:
+        if previous is None:
+            os.environ.pop(OUTPUT_DELTAS_ENV, None)
+        else:
+            os.environ[OUTPUT_DELTAS_ENV] = previous
+
+
+def test_studio_wires_the_switch_from_the_flag_through_to_the_backend(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The Studio half, bound at the two places that actually decide it.
+
+    An earlier version of this test only read `StudioConfig(...).stream_output_deltas` back. That is
+    the builder, not the wiring: reverting *both* `server.py`'s
+    `stream_gateway_output = _gateway_streaming_available() and self.config.stream_output_deltas` and
+    `cli.py`'s `stream_output_deltas=not no_output_deltas` left the entire Studio suite green. The
+    half the commit calls the whole point — "for the shipped app the channel was ON, with no
+    supported way to close it" — was unbound. Same gap as the policy-threading one, one commit later.
+    """
+    from monoid_agent_kernel.reference.studio.cli import _studio_config
+    from monoid_agent_kernel.reference.studio.server import StudioConfig, StudioServer
+
+    # 1. The CLI flag reaches the config.
+    common = {
+        "workspace": tmp_path,
+        "host": "127.0.0.1",
+        "port": 0,
+        "provider": "offline",
+        "run_root": tmp_path / "runs",
+        "skills_directory": tmp_path,
+        "no_skills": True,
+        "mcp": False,
+        "env_file": tmp_path / ".env",
+        "no_env_file": True,
+    }
+    assert _studio_config(**common, no_output_deltas=True).stream_output_deltas is False
+    assert _studio_config(**common).stream_output_deltas is True
+
+    # 2. The config reaches the backend the runs are built from.
+    # Distinct dirs per *call*, not per value: this helper is now invoked more than once with the
+    # same `stream`, and keying the workspace on the value alone collided on the second.
+    calls = itertools.count()
+
+    def backend_deltas(*, stream: bool) -> bool:
+        workspace = tmp_path / f"ws-{stream}-{next(calls)}"
+        workspace.mkdir()
+        server = StudioServer(
+            StudioConfig(
+                workspace=workspace,
+                port=0,
+                run_root=tmp_path / f"runs-{workspace.name}",
+                stream_output_deltas=stream,
+            )
+        )
+        try:
+            server.start()
+            return bool(server._backend.emit_output_deltas)
+        finally:
+            server.shutdown()
+
+    assert backend_deltas(stream=False) is False, "the flag never reached the backend"
+    # With the flag on, the transport decides. Pinned by *forcing* the transport answer rather than
+    # comparing against the same function the source ANDs in -- `x is _gateway_streaming_available()`
+    # holds whether or not the config participates at all, and on a minimal install (no httpx) both
+    # sides are False, so the whole test went quiet exactly where it mattered.
+    monkeypatch.setattr(server_module, "_gateway_streaming_available", lambda: True)
+    assert backend_deltas(stream=True) is True
+    assert backend_deltas(stream=False) is False, "the config must still be able to veto"
+
+    monkeypatch.setattr(server_module, "_gateway_streaming_available", lambda: False)
+    assert backend_deltas(stream=True) is False, "no transport, no deltas"
 
 
 def test_kernel_authored_limit_text_stays_inline(tmp_path: Path) -> None:

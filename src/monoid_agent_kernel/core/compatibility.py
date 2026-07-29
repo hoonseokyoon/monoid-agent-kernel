@@ -222,6 +222,19 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         legacy_reader=True,
     ),
     _monoid_artifact(
+        "transcript.v1",
+        kind="durable",
+        reader_policy="json-schema",
+        source=("core/schemas.py:TRANSCRIPT_RECORD_SCHEMA",),
+        legacy_reader=False,
+        accepts_missing_version=True,
+        notes=(
+            "Private run-dir artifact, listed next to event.v1 because the two are now a pair: a "
+            "settle event carries final_text_digest and resolves here. Records are typed by 'kind' "
+            "rather than a schema_version field, hence accepts_missing_version."
+        ),
+    ),
+    _monoid_artifact(
         "manifest.v1",
         kind="durable",
         reader_policy="json-schema",

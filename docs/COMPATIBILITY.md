@@ -53,6 +53,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `checkpoint` | durable | `monoid.checkpoint.v1` | checked | `monoid.checkpoint.v1`<br>`native-agent-runner.checkpoint.v1` |
 | `backend-run` | durable | `monoid.backend-run.v1` | checked | `monoid.backend-run.v1`<br>`native-agent-runner.backend-run.v1` |
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
+| `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
 | `workspace-index` | durable | `monoid.workspace-index.v1` | json-schema | `monoid.workspace-index.v1`<br>`native-agent-runner.workspace-index.v1` |
