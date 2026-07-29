@@ -474,3 +474,30 @@ def test_agent_reads_a_file_and_emits_activity(tmp_path: Path) -> None:
         assert settled and "notes.md" in settled[0]["data"]["final_text"]
     finally:
         server.shutdown()
+
+
+def test_get_routes_answer_with_json_instead_of_dropping_the_connection(studio: StudioServer) -> None:
+    """`do_GET` had no exception handler while `do_POST` had one all along.
+
+    Anything a route did not anticipate reached `BaseHTTPRequestHandler`, which logs the traceback
+    and closes the socket with no status line -- the browser sees a network error rather than a
+    server error. `/api/job-logs` catches `NativeAgentError` only, and `read_job_log_text` raises
+    `KeyError` for a job that has no log file, so an unknown job id was enough to reach it.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    run_id = studio.start_chat("summarize the workspace")["run_id"]
+    _wait_settled(studio, run_id, 1)
+
+    url = f"{studio.base_url}/api/job-logs?run_id={run_id}&job_id=does-not-exist"
+    try:
+        urllib.request.urlopen(url)
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 500
+        assert json.loads(exc.read().decode("utf-8")) == {"error": "internal error"}
+    except urllib.error.URLError as exc:  # pragma: no cover - the pre-fix behaviour
+        raise AssertionError(f"connection dropped instead of answering: {exc}") from exc
+    else:
+        raise AssertionError("an unknown job id should not read as success")

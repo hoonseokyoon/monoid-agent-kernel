@@ -202,8 +202,8 @@ REMOVED_PUBLIC_SURFACE_NAMES = [
     "McpToolProvider",
     "McpError",
     "TaskManager",
-    "get_job_artifact",
-    "list_job_artifacts",
+    "public_job_artifact_for",
+    "public_job_artifacts",
     "read_job_log_text",
     "request_job_cancel",
     "JsonlEventSink",
@@ -426,8 +426,8 @@ def test_removed_names_remain_available_from_explicit_modules() -> None:
     from monoid_agent_kernel.subagent_loader import load_subagent_definitions
     from monoid_agent_kernel.tasks import (
         TaskManager,
-        get_job_artifact,
-        list_job_artifacts,
+        public_job_artifact_for,
+        public_job_artifacts,
         read_job_log_text,
         request_job_cancel,
     )
@@ -482,8 +482,8 @@ def test_removed_names_remain_available_from_explicit_modules() -> None:
         McpToolProvider,
         McpError,
         TaskManager,
-        get_job_artifact,
-        list_job_artifacts,
+        public_job_artifact_for,
+        public_job_artifacts,
         read_job_log_text,
         request_job_cancel,
         JsonlEventSink,

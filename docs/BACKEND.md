@@ -141,6 +141,13 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
   http://127.0.0.1:8765/v1/runs/$RUN_ID/jobs/$JOB_ID/logs?stream=stdout
 ```
 
+`/jobs` and `/jobs/<job_id>` return the **public projection** of `artifacts/jobs/<id>/job.json`,
+not the artifact: `command` is dropped (`command_preview` carries the bounded rendering), and
+`cwd` and `changed_paths` are redacted against the run's `permission_policy.redact_patterns`. The
+same projection backs `monoid jobs --json`, `monoid job status --json` and Studio's `/api/jobs`,
+so a job reads the same on every surface. See
+[OBSERVABILITY.md](OBSERVABILITY.md#outputs).
+
 `/status` returns lifecycle state, for example `{"state":"running","terminal":false}`.
 `/result` returns `ready=false` with lifecycle state while a run is open; when `ready=true`,
 its `status` field is the terminal result status (`completed`, `failed`, or `limited`).

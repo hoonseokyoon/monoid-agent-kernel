@@ -100,6 +100,45 @@ def iter_committed_event_records(
         yield _decode_committed_event_record(path, record)
 
 
+@dataclass(frozen=True)
+class CommittedEventRead:
+    """Everything readable from an event log, plus why the read stopped early."""
+
+    payloads: list[dict[str, Any]]
+    corruption: str
+    """Empty when the whole file was read. Otherwise the reason, ready to show a person."""
+
+
+def read_committed_event_payloads(path: Path) -> CommittedEventRead:
+    """Read a whole event log, stopping cleanly at corruption instead of raising through.
+
+    For the *projection* readers only. ``iter_committed_event_records`` is right to raise -- a
+    corrupt log is real and a reader that pretends otherwise is worse than one that fails -- but
+    ``project_run_status`` and Studio's chat catch-up are called by surfaces that must still
+    answer: ``monoid status --json`` printed a 4.8 KB traceback where ``monoid watch`` printed one
+    clean line, and Studio's ``do_GET`` had no handler at all, so the request died mid-response.
+
+    It returns the reason rather than swallowing it, and callers publish that reason on the
+    projection they build. A degraded projection that does not say it is degraded is worse than the
+    traceback it replaces: corruption before ``run.finished`` leaves a finished run reading
+    ``running``, and a poller would wait on it forever.
+
+    ``iter_committed_event_records`` is a generator, so records before the bad one have already been
+    yielded and are kept. ``EventLogChanged`` is a subclass of ``EventLogCorruption`` and means
+    something transient rather than corrupt -- it cannot arise here, because every raise of it
+    requires ``end_offset`` and this is an unbounded snapshot read.
+    """
+    payloads: list[dict[str, Any]] = []
+    try:
+        for record in iter_committed_event_records(path):
+            payloads.append(record.payload)
+    except EventLogCorruption as exc:
+        return CommittedEventRead(payloads=payloads, corruption=str(exc))
+    except OSError as exc:
+        return CommittedEventRead(payloads=payloads, corruption=f"event log could not be read: {exc}")
+    return CommittedEventRead(payloads=payloads, corruption="")
+
+
 def iter_open_committed_event_records(
     path: Path,
     handle: BinaryIO,

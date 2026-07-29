@@ -46,8 +46,8 @@ from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from monoid_agent_kernel.event_loader import load_event_sinks
 from monoid_agent_kernel.tasks import (
-    get_job_artifact,
-    list_job_artifacts,
+    public_job_artifact_for,
+    public_job_artifacts,
     read_job_log_text,
     request_job_cancel,
 )
@@ -470,8 +470,15 @@ def status_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> Non
     """Project a run directory into compact status state."""
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
     payload = project_run_status(run_dir)
+    # The projection degrades rather than raising, so this surface decides what that means. It
+    # prints the partial answer first -- a caller asked for it and the fields before the damage are
+    # the only ones there are -- and then fails, because `state` may name a run that has since
+    # finished and a script polling this must not read that as still running.
+    event_log_error = str(payload.get("event_log_error") or "")
     if json_output:
         click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        if event_log_error:
+            raise click.ClickException(event_log_error)
         return
     click.echo(f"run_id: {payload.get('run_id', '')}")
     click.echo(f"state: {payload.get('state', '')}")
@@ -490,6 +497,8 @@ def status_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> Non
         click.echo(f"proposal_hash: {payload['proposal_hash']}")
     if payload.get("changed_paths"):
         click.echo(f"changed_paths: {', '.join(map(str, payload['changed_paths']))}")
+    if event_log_error:
+        raise click.ClickException(event_log_error)
 
 
 @main.command("jobs")
@@ -499,7 +508,7 @@ def status_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> Non
 def jobs_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
     """List background shell jobs for a run."""
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
-    payload = {"run_dir": str(run_dir), "jobs": list_job_artifacts(run_dir)}
+    payload = {"run_dir": str(run_dir), "jobs": public_job_artifacts(run_dir)}
     if json_output:
         click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return
@@ -523,7 +532,7 @@ def job_group() -> None:
 def job_status_command(job_id: str, run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
     """Show one background job status."""
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
-    payload = get_job_artifact(run_dir, job_id)
+    payload = public_job_artifact_for(run_dir, job_id)
     if json_output:
         click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return

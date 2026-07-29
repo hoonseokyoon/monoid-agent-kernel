@@ -86,6 +86,57 @@ out in commit messages and here.
   calls to find files, where matching too much returns files it could already list. This function
   decides access, so the two want opposite defaults.
 
+### Fixed — `job.json` had five readers and three answers (breaking for `monoid_agent_kernel.tasks`)
+
+- **Every reader of `artifacts/jobs/<id>/job.json` now publishes the same projection.** The right
+  one existed — drop `command`, preview `cwd`, redact `changed_paths` — and reached only the event
+  sink. `monoid jobs --json`, `monoid job status --json`, the reference backend's
+  `/v1/runs/<id>/jobs` and (through it) Studio's `/api/jobs` re-read the artifact off disk and
+  published all three verbatim, and `core.projections` had a *fourth* answer that dropped `command`
+  and redacted `changed_paths` but left `cwd` exact. So the same `cwd` came out `{"redacted": true}`
+  on `shell.exec.started` and as the path on `monoid jobs --json`: **backgrounding a command was
+  enough to route around an operator's `redact_patterns`.** The rules now live in one function,
+  `public_view.public_job_artifact`, and `BackgroundJob.public_payload` calls it like everyone else.
+  The artifact on disk is unchanged — it is the run's own record, `JOB_SCHEMA` requires those
+  fields, and `monoid validate` reads the file rather than a reader.
+- **Breaking: `monoid_agent_kernel.tasks.list_job_artifacts` and `get_job_artifact` are gone**,
+  replaced by `public_job_artifacts` and `public_job_artifact_for`, which project rather than
+  return the raw artifact and read the run's policy from its own `manifest.json`. Renamed rather
+  than changed in place so the break is an `ImportError` and not a field that quietly stops
+  arriving; `command_preview` is the replacement for `command`. **No raw accessor ships**: keeping
+  one would leave the unprojected form a single default argument away, which is how this defect
+  existed at all. An embedder inside the trust boundary can read `artifacts/jobs/*/job.json`
+  directly. Neither name was in `contracts.__all__`.
+- `monoid jobs` / `monoid job status` change only under `--json`; their human-readable output was
+  already limited to ids, status, exit code and byte counts.
+- **`monoid validate` no longer reports a false issue on every run that started a background job.**
+  `BackgroundJob.to_json` has written `kind` since the tool bundle was widened and `JOB_SCHEMA` is
+  `additionalProperties: false` without it, so any run directory containing a `job.json` failed
+  validation with `Additional properties are not allowed ('kind' was unexpected)`. Declared
+  optional, so a `background-job.v1` artifact written before `kind` existed still reads. No test
+  had validated a run directory that had a job in it.
+
+### Fixed — a corrupt `events.jsonl` no longer kills the surfaces that read it
+
+- **`project_run_status` and Studio's chat catch-up degrade instead of raising.** `monoid watch`
+  caught `EventLogCorruption` and printed one clean line; `monoid status --json` printed a 4.8 KB
+  traceback, and Studio's catch-up raised inside a `do_GET` that had no exception handler, so the
+  request died mid-response and the session rendered as if it had no history. Both now read through
+  `read_committed_event_payloads`, which keeps every record before the damage and returns the
+  reason.
+- **The reason is published, not swallowed.** `project_run_status` carries `event_log_error` (empty
+  on a clean read) and the Studio chat response carries the same field. This is the half that
+  matters: corruption before `run.finished` leaves a finished run projecting as `running`, and a
+  degraded projection that does not say it is degraded reads as a complete, shorter run. `monoid
+  status` prints what it could project and then **exits non-zero**, on both the `--json` and the
+  human branch.
+- `read_event_page` and `reference/event_reader.py` deliberately still raise. The backend already
+  answers with a clean 500, and silently shortening a *paged* reader would read as end-of-stream.
+- **Studio's `do_GET` now has the exception handler `do_POST` has always had**, so an unanticipated
+  error answers `500 {"error": "internal error"}` instead of dropping the connection with no status
+  line. Reachable today: `/api/job-logs` catches `NativeAgentError` only, and `read_job_log_text`
+  raises `KeyError` for an unknown job id.
+
 ### Changed — content egress from the event stream (breaking for `events.jsonl` consumers)
 
 - **`turn.settled` and `run.finished` no longer carry `final_text` for model-authored answers.**
@@ -264,8 +315,9 @@ out in commit messages and here.
   rather than changed, because changing it would reverse a deliberate architectural decision;
 - and the delta channel remains **on by default in Studio** unless switched off.
 
-Nine gaps were found reviewing this release and are deliberately left open, because closing any
-of them means changing a surface this one does not touch:
+Seven gaps were found reviewing this release and are deliberately left open, because closing any
+of them means changing a surface this one does not touch. (Two more were found alongside them and
+are closed above: `job.json`'s readers, and the missing corrupt-event-log guard.)
 
 - **A lone surrogate anywhere in a string ends the run.** JSON permits one; UTF-8 cannot encode one,
   and `json.loads` hands them back — from a tool argument, an HTTP body, or **the user's own
@@ -275,12 +327,6 @@ of them means changing a surface this one does not touch:
   the run root), but the run still dies earlier. The complete fix is to sanitize where a string
   enters the kernel; patching each `.encode` site in turn is the twin-miss shape this release spent
   most of its review budget on. Writing *this bullet* crashed the tooling that wrote it.
-- **`BackgroundJob.public_payload` has one caller.** It exists to project `job.json` for publication
-  — dropping `command`, previewing `cwd`, redacting `changed_paths` — and only the event sink uses
-  it. `monoid jobs --json`, `monoid job status --json`, the backend's `/v1/runs/<id>/jobs` and
-  Studio's unauthenticated `/api/jobs` all re-read `job.json` off disk and publish a 1766-byte
-  `command` plus `redact_patterns`-matched `cwd` and `changed_paths` verbatim. Four readers, four
-  answers; the projection is the right one and nothing routes through it.
 - **Non-string scalars bypass the byte cap entirely.** `preview_value` bounds `str` and returns
   everything else unchanged, so a 4300-digit integer — model-authored, arbitrary content in base ten
   — reaches `events.jsonl` whole: one `artifact.emit` measured 96 KB with twenty verbatim copies.
@@ -290,9 +336,6 @@ of them means changing a surface this one does not touch:
   every write path and `json.loads` accepts those tokens from a model, so the documented JSONL
   contract is not strictly JSON. The Studio feed silently drops such a frame. `conformance/` already
   writes with `allow_nan=False`; the run path does not.
-- **`project_run_status` has no `EventLogCorruption` guard.** `monoid watch` catches it and prints a
-  clean error; `monoid status --json` and Studio's chat projection emit a 4.8 KB traceback on the
-  same interior-corrupt `events.jsonl`.
 - **A deeply nested tool argument still ends the run on the `allow` path.** `MAX_ARGUMENT_DEPTH` is
   reached only through the approval-request builder, so `ask`-gated calls reject and `allow`-gated
   calls carry the argument into the message history and on to `RunCheckpoint.to_json`, whose

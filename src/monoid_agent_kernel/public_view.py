@@ -167,6 +167,57 @@ def public_proposal_file(file: dict[str, Any], policy: PermissionPolicy) -> dict
     }
 
 
+def public_job_artifact(job: Mapping[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
+    """The publishable form of one ``artifacts/jobs/<id>/job.json``. One function, every reader.
+
+    It was three, across six call sites, and only one of them was right. ``BackgroundJob.to_json``
+    is written to disk raw and then re-read by ``monoid jobs --json``, ``monoid job status --json``,
+    the reference backend's ``/v1/runs/<id>/jobs`` and Studio's ``/api/jobs``, each of which
+    published ``command``, ``cwd`` and ``changed_paths`` verbatim; ``core.projections`` had a fourth
+    answer that dropped ``command`` and redacted ``changed_paths`` but left ``cwd`` exact. The one
+    correct projection reached only the event sink -- so **backgrounding a command was enough to
+    route around** ``redact_patterns``, which is the same sentence a comment in ``tasks`` already
+    used about the event path when that half was fixed and this half was not.
+
+    ``job.json`` does not get ``task.json``'s "private by location" exemption: it is served over
+    HTTP by two surfaces. See ``docs/OBSERVABILITY.md``.
+
+    Three treatments, for three reasons:
+
+    - ``command`` is dropped outright. ``command_preview`` is already in the artifact and is built
+      by ``shell.preview_command``, so a reader loses no field, only the unbounded copy of it.
+    - ``cwd`` is previewed, because it is a workspace path a model chose and ``_is_path_field``
+      knows it.
+    - ``changed_paths`` is redacted but **not** truncated: it is the declared-contract family that
+      ``proposal.json`` publishes and ``core.packages`` resolves back to real files, and a shortened
+      path there does not name a shorter file, it breaks replay.
+
+    Everything else is copied through. That is a deliberate denylist rather than an allowlist,
+    because an allowlist drops a newly added field from every public reader without saying so, and
+    a silent omission is the failure this release exists to close. What stops a new field from
+    leaking is ``test_job_projection_contract``, which pins the exact key set of
+    ``BackgroundJob.to_json`` and fails until whoever added a key classifies it here.
+    """
+    public = {key: value for key, value in job.items() if key not in _JOB_PRIVATE_KEYS}
+    if "cwd" in public:
+        public["cwd"] = preview_value("cwd", public["cwd"], policy)
+    if "changed_paths" in public:
+        # Fail closed on a shape that is not a list: a corrupt artifact is `monoid validate`'s
+        # problem, and publishing an unrecognized shape unredacted is not the way to report it.
+        raw_paths = public["changed_paths"]
+        public["changed_paths"] = (
+            [public_path(str(path), policy) for path in raw_paths]
+            if isinstance(raw_paths, list)
+            else []
+        )
+    return public
+
+
+# Dropped from every public projection of `job.json`. `command_preview` carries the bounded,
+# redacted rendering that replaces it.
+_JOB_PRIVATE_KEYS = frozenset({"command"})
+
+
 def args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
     """The generic trace preview: caps and content-field redaction, and **no secret-name guessing**.
 

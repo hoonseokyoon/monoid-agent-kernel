@@ -252,5 +252,15 @@ monoid job logs <job_id> --run <run_id> --stream stdout --tail-bytes 4096
 monoid job cancel <job_id> --run <run_id>
 ```
 
+`jobs` and `job status` print the **public projection** of `artifacts/jobs/<id>/job.json` rather
+than the artifact: `command` is dropped and `command_preview` carries the bounded rendering, and
+`cwd` and `changed_paths` are redacted against the run's `permission_policy.redact_patterns`. Read
+the artifact off disk if you are inside the trust boundary and need the exact command.
+
+`monoid status` exits non-zero when the run's `events.jsonl` is corrupt, after printing what it
+could project. The projection carries the reason in `event_log_error`, and every field beside it
+reflects only the records *before* the damage — including `state`, which reads `running` for a run
+that finished past the bad byte. Do not poll `state` without checking that field.
+
 For the full run-directory artifact set (`events.jsonl`, `transcript.jsonl`,
 `diff.patch`, `proposal.json`, …), see [OBSERVABILITY.md](OBSERVABILITY.md#outputs).

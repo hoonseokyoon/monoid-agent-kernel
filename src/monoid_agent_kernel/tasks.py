@@ -33,9 +33,8 @@ from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ToolObservation
 from monoid_agent_kernel.public_view import (
-    preview_value,
     public_capability_result,
-    public_path,
+    public_job_artifact,
     public_result_content,
 )
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -147,9 +146,6 @@ class BackgroundJob:
     def duration_s(self) -> float:
         return (self.finished_at or time.time()) - self.started_at
 
-    def public_paths(self, permission_policy: PermissionPolicy) -> list[str]:
-        return [public_path(path, permission_policy) for path in self.changed_paths]
-
     def stdout_relpath(self, run_dir: Path) -> str:
         return self.stdout_path.relative_to(run_dir).as_posix()
 
@@ -217,16 +213,10 @@ class BackgroundJob:
         return event_type, level
 
     def public_payload(self, run_dir: Path, permission_policy: PermissionPolicy) -> dict[str, Any]:
-        payload = self.to_json(run_dir)
-        payload["changed_paths"] = self.public_paths(permission_policy)
-        payload.pop("command", None)
-        # The same `cwd` from the same `shell.exec` call came out `{"redacted": true}` on
-        # `tool.approval.requested` / `shell.exec.started` and as the path on `job.started` /
-        # `job.finished`, then into `status.json["jobs"]` -- so backgrounding a command was enough
-        # to route around `redact_patterns`. `changed_paths` above stays exact: it is the
-        # declared-contract family, and only this hand-copied field was ever unbounded.
-        payload["cwd"] = preview_value("cwd", payload.get("cwd"), permission_policy)
-        return payload
+        # The whole projection lives in `public_view.public_job_artifact`, because the same
+        # `job.json` is re-read off disk by four other readers and each of them had its own answer.
+        # This method is the *event* path; keeping the rules here is what let the disk path diverge.
+        return public_job_artifact(self.to_json(run_dir), permission_policy)
 
     def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:
         stdout = read_job_log_text(run_dir, self.job_id, stream="stdout", tail_bytes=tail_bytes)
@@ -1356,29 +1346,63 @@ def _changed_entry_delta(
     return sorted(path for path in paths if before.get(path) != after.get(path))
 
 
-def list_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:
+def run_permission_policy(run_dir: Path) -> PermissionPolicy:
+    """The policy a run was started with, read back from its own ``manifest.json``.
+
+    Any reader that projects a run's artifacts needs this, and until now only ``core.projections``
+    had it -- which is most of why the other four readers of ``job.json`` published raw values.
+
+    **No manifest means the default policy; an unreadable one is an error.** The distinction is the
+    whole point and the first draft of this function got it wrong by collapsing both to the
+    default. A run directory with no manifest declared no patterns, so honouring none of them is
+    exact. A manifest that exists and cannot be parsed might declare any patterns at all, and
+    answering "then there are none" is a redaction control failing *open* -- silently, on the one
+    input where the operator most needs it not to. Raising costs a caller a traceback on a corrupt
+    run directory; guessing costs them the redaction they configured.
+    """
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        return PermissionPolicy()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"manifest.json is not an object: {manifest_path}")
+    return PermissionPolicy.from_durable_json(payload.get("permission_policy"))
+
+
+def public_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:
+    """Every background job of a run, projected for publication.
+
+    Named ``public_`` and taking no policy argument on purpose. It replaces ``list_job_artifacts``,
+    which returned the raw artifact and was reached by ``monoid jobs --json``, the reference
+    backend's ``/v1/runs/<id>/jobs`` and (through it) Studio's ``/api/jobs``. An optional
+    ``permission_policy=None`` parameter would have been a smaller change and would have left the
+    raw form one default argument away, which is how this got here.
+    """
     jobs_dir = run_dir / "artifacts" / "jobs"
     if not jobs_dir.exists():
         return []
+    # One manifest read for the whole listing, not one per job file.
+    policy = run_permission_policy(run_dir)
     jobs: list[dict[str, Any]] = []
     for path in sorted(jobs_dir.glob("*/job.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):
             continue
         if isinstance(payload, dict):
-            jobs.append(payload)
+            jobs.append(public_job_artifact(payload, policy))
     return jobs
 
 
-def get_job_artifact(run_dir: Path, job_id: str) -> dict[str, Any]:
+def public_job_artifact_for(run_dir: Path, job_id: str) -> dict[str, Any]:
+    """One background job, projected for publication. See ``public_job_artifacts``."""
     path = _job_dir(run_dir, job_id) / "job.json"
     if not path.exists():
         raise KeyError(f"unknown job: {job_id}")
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("job artifact is invalid")
-    return payload
+    return public_job_artifact(payload, run_permission_policy(run_dir))
 
 
 def read_job_log_text(
@@ -1429,5 +1453,4 @@ def _job_dir(run_dir: Path, job_id: str) -> Path:
     if not is_within(run_dir.resolve(), path):
         raise ValueError("job path escapes run directory")
     return path
-
 

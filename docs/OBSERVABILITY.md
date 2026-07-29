@@ -23,7 +23,17 @@ Each run writes:
 - `diff.patch`: proposed or applied workspace diff
 - `proposal.json`: proposed output snapshot metadata
 - `proposal/files/`: materialized changed-file snapshots
-- `artifacts/jobs/<job_id>/`: background job status (`job.json`) and `stdout.log` / `stderr.log`
+- `artifacts/jobs/<job_id>/`: background job status (`job.json`) and `stdout.log` / `stderr.log`.
+  **Written raw, published projected.** The file keeps the exact `command`, `cwd` and
+  `changed_paths` — it is the run's own record and `JOB_SCHEMA` requires them — but it does *not*
+  get `task.json`'s "private by location" exemption below, because two surfaces serve it over HTTP
+  (`/v1/runs/<id>/jobs` and Studio's `/api/jobs`). Every reader goes through one projection
+  (`public_view.public_job_artifact`): `command` is dropped, `command_preview` stays, `cwd` is
+  previewed and `changed_paths` redacted against `redact_patterns`. That is five readers with one
+  answer; it was five with three, and the raw ones meant **backgrounding a command was enough to
+  route around `redact_patterns`** — the same `cwd` came out `{"redacted": true}` on
+  `shell.exec.started` and as the path on `monoid jobs --json`. The log files themselves are not
+  projected: they are process output, served by `/jobs/<id>/logs` to a run-token holder.
 - `artifacts/tasks/<task_id>/task.json`: hosted-task record (hitl, subagent, capability, tool
   approval). **Private by location, like `transcript.jsonl`** — it is not served over HTTP and is
   not in the export allowlist, so it keeps values the event stream drops. A **tool-approval** record

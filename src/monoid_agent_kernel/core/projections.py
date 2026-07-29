@@ -4,15 +4,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-from monoid_agent_kernel.core._event_log import iter_committed_event_records
+from monoid_agent_kernel.core._event_log import read_committed_event_payloads
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     session_state_from_run_status,
     session_state_value,
 )
-from monoid_agent_kernel.tasks import list_job_artifacts
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import public_path
+from monoid_agent_kernel.tasks import public_job_artifacts, run_permission_policy
 
 
 def project_run_status(run_dir: Path) -> dict[str, Any]:
@@ -24,8 +24,11 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
     package = _read_json_if_exists(run_dir / "proposal.package.json")
     approval = _read_json_if_exists(run_dir / "approval.json")
     apply_result = _read_json_if_exists(run_dir / "apply-result.json")
-    permission_policy = PermissionPolicy.from_durable_json(manifest.get("permission_policy"))
-    jobs = _public_jobs(list_job_artifacts(run_dir), permission_policy)
+    permission_policy = run_permission_policy(run_dir)
+    # Already projected by the reader. There used to be a `_public_jobs` here that applied its own
+    # partial version of the same rules -- it dropped `command` and redacted `changed_paths` but
+    # left `cwd` exact -- and a second pass now would double-truncate what the reader already cut.
+    jobs = public_job_artifacts(run_dir)
     state = _payload_state(status_payload, metrics)
     terminal = _payload_terminal(status_payload, state)
 
@@ -63,6 +66,10 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         "apply_hash": apply_result.get("apply_hash"),
         "last_event_seq": int(status_payload.get("last_event_seq") or 0),
         "last_event_type": status_payload.get("last_event_type") or "",
+        # Empty on a clean read. When it is not, every field above it was projected from the
+        # records *before* the damage and none of them can be trusted to be current -- in
+        # particular `state`, which stays `running` for a run that finished past the bad byte.
+        "event_log_error": "",
     }
     _apply_event_projection(run_dir / "events.jsonl", projection, permission_policy)
     return projection
@@ -75,7 +82,9 @@ def _apply_event_projection(
 ) -> None:
     if not events_path.exists():
         return
-    for event in _iter_events(events_path):
+    read = read_committed_event_payloads(events_path)
+    projection["event_log_error"] = read.corruption
+    for event in read.payloads:
         event_type = str(event.get("type") or "")
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         seq = int(event.get("seq") or 0)
@@ -141,10 +150,6 @@ def _apply_event_projection(
             )
 
 
-def _iter_events(path: Path) -> list[dict[str, Any]]:
-    return [record.payload for record in iter_committed_event_records(path)]
-
-
 def _read_json_if_exists(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -182,19 +187,6 @@ def _public_paths(paths: object, permission_policy: PermissionPolicy) -> list[st
     if not isinstance(paths, list):
         return []
     return [public_path(str(path), permission_policy) for path in paths]
-
-
-def _public_jobs(jobs: list[dict[str, Any]], permission_policy: PermissionPolicy) -> list[dict[str, Any]]:
-    public: list[dict[str, Any]] = []
-    for job in jobs:
-        payload = {
-            key: value
-            for key, value in job.items()
-            if key not in {"command"}
-        }
-        payload["changed_paths"] = _public_paths(payload.get("changed_paths") or [], permission_policy)
-        public.append(payload)
-    return public
 
 
 def _first_string(*values: object) -> str:

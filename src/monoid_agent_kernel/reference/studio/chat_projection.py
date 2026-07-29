@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from monoid_agent_kernel.core._event_log import iter_committed_event_records
+from monoid_agent_kernel.core._event_log import read_committed_event_payloads
 from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 
 CHAT_SCHEMA_VERSION = "studio.chat.v1"
@@ -42,15 +42,20 @@ def _write_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
         handle.write(json.dumps(dict(payload), sort_keys=True, ensure_ascii=False) + "\n")
 
 
-def _read_committed_events(path: Path) -> list[dict[str, Any]]:
+def _read_committed_events(path: Path) -> tuple[list[dict[str, Any]], str]:
     # Studio's catch-up reads events.jsonl straight off disk rather than through the backend
     # projection, so it needs hydration of its own. Without it a restored session renders empty
     # assistant bubbles while the live SSE page — which does go through the projection — shows the
     # text, and `_record_from_event` drops a message whose content is empty rather than showing
     # anything is missing.
-    return hydrate_settled_text(
-        [record.payload for record in iter_committed_event_records(path)], path.parent
-    )
+    #
+    # Through the lenient reader for the same reason `core.projections` uses it: this ran under a
+    # `do_GET` with no exception handler, so one corrupt byte killed the request mid-response and
+    # the session rendered as if it had no history. The reason is carried out to the caller and
+    # published, because a transcript that silently stops at the damage looks like a short
+    # conversation rather than a truncated one.
+    read = read_committed_event_payloads(path)
+    return hydrate_settled_text(read.payloads, path.parent), read.corruption
 
 
 def _sorted_chat_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -120,12 +125,15 @@ class ChatProjection:
                 continue
         return cursor
 
-    def response(self, run_id: str) -> dict[str, Any]:
+    def response(self, run_id: str, *, event_log_error: str = "") -> dict[str, Any]:
         return {
             "schema_version": CHAT_SCHEMA_VERSION,
             "run_id": run_id,
             "messages": self.read(),
             "event_cursor": self.event_cursor(),
+            # Always present, empty when the log read cleanly, so a client tests one field rather
+            # than inferring truncation from a transcript that looks complete.
+            "event_log_error": event_log_error,
         }
 
     def append_user(
@@ -192,8 +200,9 @@ class ChatProjection:
 
     def catch_up(self, run_id: str) -> dict[str, Any]:
         self.ensure_legacy_user_from_run_meta()
-        self.project_events(_read_committed_events(self.run_dir / "events.jsonl"))
-        return self.response(run_id)
+        events, event_log_error = _read_committed_events(self.run_dir / "events.jsonl")
+        self.project_events(events)
+        return self.response(run_id, event_log_error=event_log_error)
 
     def _record_from_event(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
         event_type = str(event.get("type") or "")

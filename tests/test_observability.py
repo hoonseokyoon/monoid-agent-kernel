@@ -767,3 +767,160 @@ def test_cli_proposal_command_reads_snapshot_file(tmp_path: Path) -> None:
     payload = json.loads(summary.stdout)
     assert payload["encoding"] == "utf-8"
     assert payload["content"] == "Clean summary\n"
+
+
+# --- corrupt event log ---------------------------------------------------------------------
+#
+# `monoid watch` catches `EventLogCorruption` and prints one line. The two *projection* readers
+# did not, so `monoid status --json` printed a 4.8 KB traceback and Studio's chat catch-up died
+# inside `do_GET`, which has no handler, taking the connection with it. Both now read leniently
+# and publish the reason; these pin that the reason is published rather than swallowed, which is
+# the half that matters -- a projection that stops at the damage without saying so reads as a
+# complete, shorter run.
+
+
+def _corrupt_event_log(run_dir: Path) -> Path:
+    """A log whose *interior* is damaged: valid, garbage, valid.
+
+    Interior rather than trailing on purpose. A truncated tail is the ordinary case -- a crash
+    mid-append -- and the reader already withholds an uncommitted final record. What escaped was a
+    committed record that does not decode, with good records after it.
+    """
+    events_path = run_dir / "events.jsonl"
+    events_path.write_text(
+        json.dumps({"seq": 1, "type": "run.started", "data": {}})
+        + "\n"
+        + "{not json at all\n"
+        + json.dumps({"seq": 3, "type": "run.finished", "data": {"status": "completed"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    return events_path
+
+
+def test_status_projection_degrades_on_a_corrupt_event_log(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_corrupt"
+    run_dir.mkdir()
+    _corrupt_event_log(run_dir)
+
+    projection = project_run_status(run_dir)
+
+    assert "not valid JSON" in projection["event_log_error"]
+    # Everything before the damage survives...
+    assert projection["last_event_seq"] == 1
+    # ...and nothing after it does. This is exactly why the flag has to be published: the file
+    # says the run completed and the projection cannot see it, so a poller reading `state` alone
+    # waits forever on a run that already finished.
+    assert projection["state"] == "running"
+    assert projection["terminal"] is False
+
+
+def test_status_projection_reports_no_error_on_a_clean_log(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_clean"
+    run_dir.mkdir()
+    run_dir.joinpath("events.jsonl").write_text(
+        json.dumps({"seq": 1, "type": "run.started", "data": {}}) + "\n",
+        encoding="utf-8",
+    )
+
+    projection = project_run_status(run_dir)
+
+    assert projection["event_log_error"] == ""
+    assert projection["state"] == "running"
+
+
+def test_status_projection_reports_no_error_when_there_is_no_log(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_empty"
+    run_dir.mkdir()
+
+    assert project_run_status(run_dir)["event_log_error"] == ""
+
+
+def test_cli_status_json_prints_the_projection_then_fails(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_cli_corrupt"
+    run_dir.mkdir()
+    _corrupt_event_log(run_dir)
+
+    runner, split_stderr = _isolated_cli_runner()
+    result = runner.invoke(main, ["status", str(run_dir), "--json"])
+
+    # Non-zero, because `state` is not trustworthy and a script must not read it as current.
+    assert result.exit_code != 0
+    # The partial answer is still printed: the caller asked for it and it is all there is.
+    payload = json.loads(result.stdout.splitlines()[0])
+    assert payload["state"] == "running"
+    assert "not valid JSON" in payload["event_log_error"]
+    # One clean line, not a traceback.
+    stderr = result.stderr if split_stderr else result.output
+    assert "Traceback" not in stderr
+    assert "not valid JSON" in stderr
+
+
+def test_cli_status_human_output_also_fails_on_a_corrupt_log(tmp_path: Path) -> None:
+    """The `--json` branch returns early, so the human branch is a separate exit path -- the
+    shape that shipped a rule bound to one of two siblings all through this release."""
+    run_dir = tmp_path / "run_cli_corrupt_human"
+    run_dir.mkdir()
+    _corrupt_event_log(run_dir)
+
+    runner, split_stderr = _isolated_cli_runner()
+    result = runner.invoke(main, ["status", str(run_dir)])
+
+    assert result.exit_code != 0
+    assert "run_id:" in result.stdout
+    stderr = result.stderr if split_stderr else result.output
+    assert "Traceback" not in stderr
+    assert "not valid JSON" in stderr
+
+
+def test_cli_status_succeeds_on_a_clean_log(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_cli_clean"
+    run_dir.mkdir()
+    run_dir.joinpath("events.jsonl").write_text(
+        json.dumps({"seq": 1, "type": "run.started", "data": {}}) + "\n",
+        encoding="utf-8",
+    )
+
+    runner, _ = _isolated_cli_runner()
+    result = runner.invoke(main, ["status", str(run_dir), "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["event_log_error"] == ""
+
+
+def test_studio_chat_catch_up_degrades_on_a_corrupt_event_log(tmp_path: Path) -> None:
+    from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
+
+    run_dir = tmp_path / "run_studio_corrupt"
+    run_dir.mkdir()
+    run_dir.joinpath("events.jsonl").write_text(
+        json.dumps({"seq": 1, "type": "run.failed", "data": {"error": "before the damage"}})
+        + "\n"
+        + "{not json at all\n"
+        + json.dumps({"seq": 3, "type": "run.failed", "data": {"error": "after the damage"}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    body = ChatProjection(run_dir).catch_up("run-corrupt")
+
+    contents = [message["content"] for message in body["messages"]]
+    assert "before the damage" in contents
+    assert "after the damage" not in contents
+    assert "not valid JSON" in body["event_log_error"]
+
+
+def test_studio_chat_catch_up_reports_no_error_on_a_clean_log(tmp_path: Path) -> None:
+    from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
+
+    run_dir = tmp_path / "run_studio_clean"
+    run_dir.mkdir()
+    run_dir.joinpath("events.jsonl").write_text(
+        json.dumps({"seq": 1, "type": "run.failed", "data": {"error": "only message"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    body = ChatProjection(run_dir).catch_up("run-clean")
+
+    assert [message["content"] for message in body["messages"]] == ["only message"]
+    assert body["event_log_error"] == ""

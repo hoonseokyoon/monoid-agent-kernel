@@ -832,6 +832,13 @@ JOB_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": schema_version_property("background-job.v1"),
         "job_id": {"type": "string", "minLength": 1},
+        # `BackgroundJob.to_json` has written `kind` since the tool bundle was widened, and this
+        # schema is `additionalProperties: false` -- so `monoid validate` reported
+        # "Additional properties are not allowed ('kind' was unexpected)" on every run that started
+        # a background job, and no test noticed because none validated a run directory that had
+        # one. Declared optional rather than required: a `background-job.v1` artifact written
+        # before that change has no `kind`, and this schema still has to read it.
+        "kind": {"type": "string"},
         "command": {"type": "string"},
         "command_preview": {"type": "string"},
         "cwd": {"type": "string"},
