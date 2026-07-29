@@ -3838,7 +3838,13 @@ class AgentLoop:
                 "kind": "tool_observation",
                 "step": step,
                 "call_id": call_id,
-                "tool": public_identifier(call_name),
+                # Raw, like every other value in `transcript.jsonl`. Bounding it here made the
+                # observation record disagree with the `model_turn.tool_calls` entry above it and
+                # with `ToolObservation.tool_name`, so a replay reader could not reconstruct the
+                # call that actually ran. The `response_id` bound was reverted out of the transcript
+                # for exactly this reason one commit earlier -- and this twin, in the same file,
+                # was missed. The event copy below keeps the bound.
+                "tool": call_name,
                 "tool_id": spec.id if spec is not None else None,
                 "output": observation.output,
             }

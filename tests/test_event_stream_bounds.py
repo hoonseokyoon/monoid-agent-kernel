@@ -544,3 +544,31 @@ def test_the_terminal_error_is_filtered_on_every_public_artifact_not_three_of_fo
     # The only test here that drives a *failing* run, so the only one covering `failure.json` and
     # `run.failed` against their schemas.
     assert validate_run_dir(result.run_dir) == []
+
+
+def test_the_private_transcript_keeps_the_raw_tool_name_while_the_event_bounds_it(
+    tmp_path: Path,
+) -> None:
+    """`transcript.jsonl` is the full-fidelity replay artifact; the event stream is not.
+
+    `public_identifier` was applied to the `tool_observation` transcript record, which made it
+    disagree with the `model_turn.tool_calls` entry above it and with `ToolObservation.tool_name`,
+    so a replay reader could not reconstruct the call that actually ran. The same bound had been
+    reverted out of the transcript's `response_id` one commit earlier for exactly this reason — and
+    this twin, in the same file, was missed.
+    """
+    name = "도구" * 200
+
+    result = _run(_spec(tmp_path), [(name, {})])
+
+    transcript = [
+        json.loads(line)
+        for line in (result.run_dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    observations = [record for record in transcript if record.get("kind") == "tool_observation"]
+    assert observations, "no tool observation recorded"
+    assert observations[0]["tool"] == name, "the private replay copy was truncated"
+
+    for _name, text in _public_text(result.run_dir).items():
+        assert name not in text, f"{_name} carries the whole tool name"

@@ -673,3 +673,36 @@ def test_a_shared_observer_is_closed_once() -> None:
 def test_the_protocols_split_the_required_member_from_the_optional_one() -> None:
     assert isinstance(Recorder(), ModelIOObserver)
     assert not isinstance(Recorder(), ClosableModelIOObserver)
+
+
+def test_a_cyclic_digest_payload_is_elided_rather_than_expanded() -> None:
+    """The depth bound alone made this strictly worse than no bound.
+
+    `_jsonish` caps at `MAX_JSONISH_DEPTH`, and a container reachable from itself is re-expanded
+    once per edge per level — so a mapping with two self-referencing keys becomes ~2**64 nodes. The
+    cap converted a fast `RecursionError` into a hang, in the digest path that runs *before* a
+    completed provider turn is returned. Reachable from a third-party adapter handing back a cyclic
+    tool-call argument.
+
+    Third traversal in this tree to need an ancestor guard: `public_view.preview_value` and
+    `public_view.touches_redacted_path` were both given one during review and this one was not.
+    """
+    import time
+
+    from monoid_agent_kernel.core.model_io import _jsonish
+
+    cyclic: dict[str, object] = {}
+    for index in range(20):
+        cyclic[f"k{index}"] = cyclic
+
+    start = time.monotonic()
+    published = _jsonish(cyclic)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, f"still re-expanding: {elapsed:.2f}s"
+    assert set(published.values()) == {"[circular-elided]"}
+    # Ancestors on the current path only: a value shared twice without a cycle still renders twice.
+    shared = {"x": 1}
+    assert _jsonish({"a": shared, "b": shared}) == {"a": {"x": 1}, "b": {"x": 1}}
+    # And an ordinary payload is untouched.
+    assert _jsonish({"n": 1, "s": "hi", "l": [1, 2]}) == {"n": 1, "s": "hi", "l": [1, 2]}

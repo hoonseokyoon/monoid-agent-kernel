@@ -518,14 +518,31 @@ MAX_JSONISH_DEPTH = 64
 # which is honest, because at that depth the digest genuinely cannot distinguish them.
 _DEPTH_ELIDED = "[depth-elided]"
 
+# What replaces a container reachable from itself. Distinct from ``_DEPTH_ELIDED`` so a digest can
+# tell "too deep to distinguish" from "cyclic", and so the marker says which bound was hit.
+_CIRCULAR_ELIDED = "[circular-elided]"
 
-def _jsonish(value: Any, _depth: int = 0) -> Any:
+
+def _jsonish(value: Any, _depth: int = 0, _ancestors: frozenset[int] = frozenset()) -> Any:
     if _depth > MAX_JSONISH_DEPTH:
         return _DEPTH_ELIDED
+    if isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes, bytearray)):
+        # The depth bound alone made this *worse*, not better. A cyclic mapping with two
+        # self-referencing keys is re-expanded once per edge per level, so the bound turned a fast
+        # ``RecursionError`` into ~2**64 nodes -- a hang, before the completed provider turn is
+        # returned. Reachable from a third-party adapter handing back a cyclic tool-call argument,
+        # which is the same reachability class as ``public_view.preview_value``'s guard.
+        #
+        # Third traversal in this tree to need this. ``preview_value`` and
+        # ``public_view.touches_redacted_path`` were both guarded during review; this one was not,
+        # which is the release's own defect shape one more time.
+        if id(value) in _ancestors:
+            return _CIRCULAR_ELIDED
+        _ancestors = _ancestors | {id(value)}
     if isinstance(value, Mapping):
-        return {str(key): _jsonish(item, _depth + 1) for key, item in value.items()}
+        return {str(key): _jsonish(item, _depth + 1, _ancestors) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_jsonish(item, _depth + 1) for item in value]
+        return [_jsonish(item, _depth + 1, _ancestors) for item in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
