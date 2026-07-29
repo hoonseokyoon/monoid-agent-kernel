@@ -536,6 +536,14 @@ def _jsonish(value: Any, _depth: int = 0, _ancestors: frozenset[int] = frozenset
         # Third traversal in this tree to need this. ``preview_value`` and
         # ``public_view.touches_redacted_path`` were both guarded during review; this one was not,
         # which is the release's own defect shape one more time.
+        #
+        # Its two siblings are clean, and the reason is worth knowing before touching either.
+        # ``core.tool_approval._jsonish`` *raises* past its bound and ``conformance.contracts``
+        # has no bound at all, so both abort the whole traversal on the first over-deep path —
+        # measured at 0.002 s for the same cyclic input that hung this one. **The elision is what
+        # makes a depth cap dangerous**: returning a marker lets every sibling branch keep
+        # expanding. Converting either of those to return a marker instead of raising reintroduces
+        # this defect there, and would need this guard first.
         if id(value) in _ancestors:
             return _CIRCULAR_ELIDED
         _ancestors = _ancestors | {id(value)}
