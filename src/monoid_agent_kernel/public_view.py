@@ -167,6 +167,11 @@ def public_proposal_file(file: dict[str, Any], policy: PermissionPolicy) -> dict
     }
 
 
+# Dropped from every public projection of `job.json`. `command_preview` carries the bounded,
+# redacted rendering that replaces it.
+_JOB_PRIVATE_KEYS = frozenset({"command"})
+
+
 def public_job_artifact(job: Mapping[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
     """The publishable form of one ``artifacts/jobs/<id>/job.json``. One function, every reader.
 
@@ -211,11 +216,6 @@ def public_job_artifact(job: Mapping[str, Any], policy: PermissionPolicy) -> dic
             else []
         )
     return public
-
-
-# Dropped from every public projection of `job.json`. `command_preview` carries the bounded,
-# redacted rendering that replaces it.
-_JOB_PRIVATE_KEYS = frozenset({"command"})
 
 
 def args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:

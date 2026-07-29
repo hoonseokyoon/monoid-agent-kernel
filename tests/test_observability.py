@@ -924,3 +924,36 @@ def test_studio_chat_catch_up_reports_no_error_on_a_clean_log(tmp_path: Path) ->
 
     assert [message["content"] for message in body["messages"]] == ["only message"]
     assert body["event_log_error"] == ""
+
+
+def test_an_uncommitted_tail_is_not_reported_as_corruption(tmp_path: Path) -> None:
+    """The distinction the flag lives or dies on.
+
+    A run that crashed mid-append leaves a final record with no newline. That is the *ordinary*
+    case, the reader already withholds it, and reporting it as damage would put a scary field on
+    a large fraction of interrupted runs -- which is how a warning stops being read.
+    """
+    from monoid_agent_kernel.core._event_log import read_committed_event_payloads
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        json.dumps({"seq": 1, "type": "run.started", "data": {}}) + "\n" + '{"seq": 2, "type": "ru',
+        encoding="utf-8",
+    )
+
+    read = read_committed_event_payloads(events_path)
+
+    assert [payload["seq"] for payload in read.payloads] == [1]
+    assert read.corruption == ""
+
+
+def test_a_missing_or_empty_event_log_is_not_corruption(tmp_path: Path) -> None:
+    from monoid_agent_kernel.core._event_log import read_committed_event_payloads
+
+    absent = read_committed_event_payloads(tmp_path / "nope.jsonl")
+    assert absent.payloads == [] and absent.corruption == ""
+
+    empty_path = tmp_path / "empty.jsonl"
+    empty_path.write_text("", encoding="utf-8")
+    empty = read_committed_event_payloads(empty_path)
+    assert empty.payloads == [] and empty.corruption == ""
