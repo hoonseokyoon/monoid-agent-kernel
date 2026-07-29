@@ -125,8 +125,10 @@ projection. The Studio UI restores user, assistant, and error messages from
 `/api/chat-transcript`, then replays `events.jsonl` for trace and activity panels.
 `transcript.jsonl` remains the private model-call log.
 
-**`studio.chat.jsonl` carries whole model answers and whole user prompts**, and is the one
-run-directory artifact that is both content-bearing and served over HTTP. It has to be: a chat UI
+**`studio.chat.jsonl` carries whole model answers and whole user prompts**, and is content-bearing
+and served over HTTP. It is not the only one: `RunProjectionService.events` hydrates `final_text`
+out of `transcript.jsonl` before returning an events page, and `diagnostics()` returns the whole
+`failure.json` — both behind a run token, which `studio.chat.jsonl`'s route is not. It has to be: a chat UI
 that cannot re-render the conversation is not a chat UI, and the text is joined back out of
 `transcript.jsonl` by the same hydration seam the projection uses. Three consequences worth stating
 rather than leaving to be discovered:

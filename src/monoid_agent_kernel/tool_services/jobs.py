@@ -46,10 +46,15 @@ class JobsService:
         try:
             return call(job_id)
         except KeyError as exc:
-            detail = str(exc.args[0]) if exc.args else job_id
+            # Chained, not `from None`. `call` reaches `TaskExecutor`, `EventSink` and the recorder --
+            # all pluggable seams -- so a `KeyError` here is not necessarily about job data, and
+            # discarding the traceback turned a third-party bug into a silent "job unavailable" with
+            # nothing recording what actually failed. The message names the *job*, not
+            # `exc.args[0]`: that is an internal dict key, and putting it on `tool.call.failed`
+            # published kernel-internal naming to the model.
             raise ToolExecutionError(
-                f"job data unavailable: {public_identifier(detail)}", error_code="job_unavailable"
-            ) from None
+                f"job data unavailable: {public_identifier(job_id)}", error_code="job_unavailable"
+            ) from exc
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self.job_manager.list_jobs()

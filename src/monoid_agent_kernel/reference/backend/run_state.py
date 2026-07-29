@@ -233,7 +233,10 @@ class RunStateMutationService:
         self._context.write_failure_bundle(
             run_id,
             self._context.run_root_provider() / run_id,
-            error=str(exc),
+            # Filtered, like `record.error` below. `diagnostics()` returns the whole `failure.json`,
+            # so writing it raw put the message back on the same response the filter two lines
+            # down was added to clean. The kernel's own writer (`loop.py`) already filters here.
+            error=public_error_message(str(exc)),
             error_code=getattr(exc, "error_code", "internal_error"),
             exc_type=type(exc).__name__,
             overwrite=False,

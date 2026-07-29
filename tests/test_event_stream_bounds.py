@@ -439,11 +439,13 @@ def test_every_public_file_redacts_a_matched_path_not_just_the_two_that_were_che
 def test_a_free_text_argument_that_looks_like_an_enum_is_still_bounded(tmp_path: Path) -> None:
     """`artifact.emit`'s `kind` is `{"type": "string"}` with no enum — free model text.
 
-    It sat unbounded between three bounded neighbours (`label` truncates, `metadata` is previewed,
-    `path` is a run-dir pointer), because it reads like an enum. So do `timeout_s`,
-    `max_output_bytes` and `startup_wait_s` on `shell.exec`, which are declared
-    `["integer", "null"]` and were copied verbatim — `tool.call.started` is emitted *before*
-    `validate_args` rejects the call, so the schema does not protect this surface.
+    It sat unbounded beside two bounded neighbours (`metadata` is previewed, `path` is a run-dir
+    pointer), because it reads like an enum. An earlier version of this docstring also cited `label`,
+    which is not on this event at all, and named `shell.exec`'s `timeout_s` / `max_output_bytes` /
+    `startup_wait_s` — which have the same defect for the same reason (`tool.call.started` is
+    emitted *before* `validate_args` rejects the call, so the schema does not protect this surface)
+    but are exercised by `tests/test_preview_bounds.py`, not here. A docstring naming what a test
+    does not drive is how three of this release's defects stayed invisible.
     """
     spec = _spec(tmp_path)
     (spec.workspace_root / "note.md").write_text("hi", encoding="utf-8")
@@ -539,3 +541,6 @@ def test_the_terminal_error_is_filtered_on_every_public_artifact_not_three_of_fo
             assert secret not in path.read_text(encoding="utf-8"), f"{name} carries the raw error"
 
     assert secret in str(result.error), "the in-process caller must still get the whole message"
+    # The only test here that drives a *failing* run, so the only one covering `failure.json` and
+    # `run.failed` against their schemas.
+    assert validate_run_dir(result.run_dir) == []

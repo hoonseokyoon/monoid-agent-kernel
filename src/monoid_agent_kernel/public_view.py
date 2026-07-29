@@ -21,13 +21,14 @@ def public_path(path: str, policy: PermissionPolicy) -> str:
     retried the same emission, ending the run of any operator who had configured
     ``redact_patterns``.
 
-    Guarding here rather than at a call site is the point. Thirteen call sites share this function
-    and its ``public_inline_path`` wrapper — nine across ``loop``, ``loop_phases``, ``tasks``,
-    ``tool_services.shell`` and ``core.projections``, plus four inside this module — and a review
-    found one of them. Fixing that one would have left eleven and made a
-    third implementation of a rule that already existed in two places — which is how this defect
-    was reachable at all: the guard was added to ``preview_value``'s path branch and not to its
-    twin here.
+    Guarding here rather than at a call site is the point. Fourteen call sites share this function
+    and its ``public_inline_path`` wrapper — ten across ``loop``, ``loop_phases``, ``tasks``,
+    ``tool_services.shell`` and ``core.projections``, and four inside this module (one of which is
+    ``public_inline_path`` itself) — and a review found one of them. Fixing that one would have left
+    thirteen and made a third implementation of a rule that already existed in two places, which is
+    how the defect was reachable at all: the guard was added to ``preview_value``'s path branch and
+    not to its twin here. Two commits were spent correcting this count and both were wrong; it is
+    now what ``ast`` reports, not what was counted by eye.
     """
     return REDACTED_PATH if _is_path_redacted(path, policy) else path
 
@@ -39,10 +40,18 @@ def public_inline_path(path: str, policy: PermissionPolicy) -> str:
     for **contract** surfaces — ``proposal.json``'s ``changed_paths`` and ``snapshot_path`` are
     resolved back to real files by ``core.proposal_file``, ``core.packages`` and ``core.schemas``,
     so a truncated value there does not describe a shorter path, it breaks replay and packaging.
-    This one is for surfaces nobody resolves: ``tool.call.started.paths`` and
+    This one is used by exactly three fields: ``tool.call.started.paths`` and
     ``workspace.file.changed``'s ``paths`` and ``result.path``. Not ``artifact.emitted.path``,
     which looks like a member of this family and is not — ``emit_artifact_bytes`` rewrites it to
     ``artifacts/<id>/<basename>``, so it is a run-dir pointer readers resolve, and it stays raw.
+
+    **The partition above is a rationale, not a description of every call site.** ``changed_paths``
+    on ``turn.settled``, ``proposal.ready``, ``workspace.diff.updated`` and ``metrics.json`` are log
+    surfaces by that reasoning and use bare ``public_path``, so the same 243-byte path goes out cut
+    in ``paths`` and whole beside it. They are left exact deliberately: they are the same list
+    ``proposal.json`` publishes, redaction is the property that matters for them, and paths are
+    listed as carried in ``docs/OBSERVABILITY.md`` — a length cap there buys little and splitting one
+    list across two treatments has already produced defects twice in this release.
 
     It exists because those three were three different answers. ``paths`` got the cap and the
     marker; ``artifact.emitted.path`` got neither, four lines under a comment about closing "the
@@ -659,6 +668,18 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
         # functions away never got a chance to fire. A set rather than a frozenset chain because
         # this only answers yes/no: nothing is rendered, so eliding a legitimately shared value
         # costs nothing here, unlike in the preview.
+        # ``depth`` counts the same way ``preview_value``'s ``_depth`` does: the outer mapping is
+        # not a level, so a top-level value is 0. Counting the mapping itself made this stop one
+        # level *earlier* than the traversal it has to agree with, and `preview_value`'s depth cap
+        # only blocks containers -- so a string at the boundary was still previewed and published
+        # while this had already given up on it. A matched path and a file body both rode out.
+        #
+        # Checked *before* the ancestor bookkeeping below, not after. Recording a container that was
+        # rejected for depth marks it answered-no permanently, so the same container reached later
+        # at a shallower depth -- where it would have been walked -- short-circuits to False. The
+        # guard against re-expansion became a guard against detection.
+        if depth > PREVIEW_MAX_DEPTH:
+            return False
         if isinstance(value, (Mapping, list)):
             # Keyed on (identity, inherited key), not identity alone. A *list* takes its key from
             # the parent, so the same list reached under `other` and under `source_path` answers
@@ -668,13 +689,6 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
             if (id(value), key) in seen:
                 return False
             seen.add((id(value), key))
-        # ``depth`` counts the same way ``preview_value``'s ``_depth`` does: the outer mapping is
-        # not a level, so a top-level value is 0. Counting the mapping itself made this stop one
-        # level *earlier* than the traversal it has to agree with, and `preview_value`'s depth cap
-        # only blocks containers -- so a string at the boundary was still previewed and published
-        # while this had already given up on it. A matched path and a file body both rode out.
-        if depth > PREVIEW_MAX_DEPTH:
-            return False
         if isinstance(value, Mapping):
             return any(walk(item, str(child), depth + 1) for child, item in value.items())
         if isinstance(value, list):

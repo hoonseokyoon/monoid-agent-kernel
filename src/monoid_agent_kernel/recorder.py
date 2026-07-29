@@ -489,7 +489,28 @@ class AgentRecorder:
 
 
 def _write_jsonl(handle: TextIO, payload: dict[str, Any]) -> None:
-    handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    try:
+        line.encode("utf-8")
+    except UnicodeEncodeError:
+        # JSON permits a lone surrogate (``\ud800``); UTF-8 cannot encode one. ``json.loads`` hands
+        # them back happily -- from a tool-call argument, an HTTP body, or the user's own
+        # instruction -- and this write then raised ``UnicodeEncodeError``, which surfaced as
+        # ``_CheckpointPersistError`` out of ``run_once``. One character in a prompt ended the run,
+        # with no model involved.
+        #
+        # Retrying with ``ensure_ascii=True`` escapes it to a ``\udXXX`` sequence and writes valid,
+        # ASCII-safe JSON. Only the offending record pays for it: ordinary Hangul and emoji stay raw
+        # and compact on the common path, which is why the flag is not simply flipped.
+        #
+        # **This does not make a run survive a lone surrogate.** ``preview_value``'s byte
+        # measurement and ``canonical_sha256`` both call ``.encode("utf-8")`` and raise first; the
+        # only complete fix is to sanitize on the way in, which is a wider change than this hardening
+        # and is recorded as an open gap in the changelog. What this *does* close is the write itself
+        # -- notably ``write_json_atomic``, which failed between the temp write and the replace and
+        # left an orphan ``.tmp`` in the run root forever.
+        line = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    handle.write(line + "\n")
     handle.flush()
 
 

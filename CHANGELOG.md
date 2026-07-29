@@ -88,8 +88,8 @@ out in commit messages and here.
   the run of any operator who had configured `redact_patterns` — it escaped `_emit_tool_started`
   before validation, and the error handler retried the same emission, so one malformed
   model-authored argument terminated the run instead of producing a tool error the model could
-  correct. The guard lives in `public_path` itself, which every call site goes through — thirteen of
-  them, nine across `loop`, `loop_phases`, `tasks`, `tool_services.shell` and `core.projections`,
+  correct. The guard lives in `public_path` itself, which every call site goes through — fourteen of
+  them, ten across `loop`, `loop_phases`, `tasks`, `tool_services.shell` and `core.projections`,
   and four inside `public_view` — and in `public_proposal_file`, the one remaining direct caller of
   the raw predicate. No unguarded call to `PermissionPolicy.is_path_redacted` is left.
 - A truncated `paths` entry now ends in `…`. These stay plain strings because `narration._target`
@@ -153,17 +153,16 @@ out in commit messages and here.
   `startup_wait_s` are declared `["integer", "null"]`. The schema does not protect this surface:
   `tool.call.started` is emitted *before* `validate_args` rejects the call, so a model that sends a
   2 KB string in `timeout_s` publishes it and is only then told the call was invalid.
-- **An unknown `job_id` fails the call instead of the run.** `TaskManager` raises `KeyError`, which
-  is not in the set tool dispatch catches, so a model asking about a job id the kernel never issued terminated the run — and separately `job.logs` on a `HostedTask` id that `job.list` had just handed it
-  and republished its own argument into `run.failed`, `status.json` and `metrics.json`. Same shape
-  as the `WorkspaceError` that ended runs for operators with `redact_patterns` set, on the four
-  `job.*` twins that guard never reached.
-- **The run's terminal error is filtered on every public artifact.** `public_error_message` was
-  bound on `events.jsonl`, `status.json` and `failure.json` and missed on `metrics.json` — and
-  `_error_from_status_body` embeds the *entire* LLM gateway HTTP response body in the message, so a
-  400 from a misconfigured gateway wrote whatever that body held into a public run artifact. The
-  reference backend filters it again before serving it on `status` / `result` / `diagnostics`;
-  `AgentRunResult.error` stays raw, because the embedding application is inside the trust boundary.
+- **The run's terminal error goes through the same filter on every public artifact.**
+  `public_error_message` was bound on `events.jsonl`, `status.json` and `failure.json` and missed on
+  `metrics.json`. Note what that filter *is*: it substitutes only when the message contains
+  `PRIVATE KEY`, and applies no length bound — so this closes an inconsistency, not the underlying
+  exposure. `_error_from_status_body` embeds the entire LLM gateway HTTP response body in the
+  message, and that body still reaches all four artifacts unless it happens to name a private key.
+  Error text is listed under "Carried, deliberately" in `docs/OBSERVABILITY.md` for exactly this
+  reason. The reference backend applies the same filter before serving `status` / `result` /
+  `diagnostics`, and to the `failure.json` it writes; `AgentRunResult.error` stays raw, because the
+  embedding application is inside the trust boundary.
 - **No `KeyError` escapes the job tools.** `job.status` / `logs` / `cancel` / `wait` raised through
   tool dispatch, which catches `(NativeAgentError, ValueError, TypeError)` and not `KeyError`, so a
   model asking about a job terminated the run. Two distinct sources: an unregistered id, and a
@@ -186,9 +185,35 @@ out in commit messages and here.
   rather than changed, because changing it would reverse a deliberate architectural decision;
 - and the delta channel remains **on by default in Studio** unless switched off.
 
-Four gaps were found reviewing this release and are deliberately left open, because closing any
+Nine gaps were found reviewing this release and are deliberately left open, because closing any
 of them means changing a surface this one does not touch:
 
+- **A lone surrogate anywhere in a string ends the run.** JSON permits one; UTF-8 cannot encode one,
+  and `json.loads` hands them back — from a tool argument, an HTTP body, or **the user's own
+  instruction**, so no model is needed. Every `.encode("utf-8")` then raises: `preview_value`'s byte
+  measurement, `canonical_sha256`, and the JSONL/atomic writers. The writers are hardened here (they
+  retry with `ensure_ascii=True`, which also stops `write_json_atomic` leaving an orphan `.tmp` in
+  the run root), but the run still dies earlier. The complete fix is to sanitize where a string
+  enters the kernel; patching each `.encode` site in turn is the twin-miss shape this release spent
+  most of its review budget on. Writing *this bullet* crashed the tooling that wrote it.
+- **`BackgroundJob.public_payload` has one caller.** It exists to project `job.json` for publication
+  — dropping `command`, previewing `cwd`, redacting `changed_paths` — and only the event sink uses
+  it. `monoid jobs --json`, `monoid job status --json`, the backend's `/v1/runs/<id>/jobs` and
+  Studio's unauthenticated `/api/jobs` all re-read `job.json` off disk and publish a 1766-byte
+  `command` plus `redact_patterns`-matched `cwd` and `changed_paths` verbatim. Four readers, four
+  answers; the projection is the right one and nothing routes through it.
+- **Non-string scalars bypass the byte cap entirely.** `preview_value` bounds `str` and returns
+  everything else unchanged, so a 4300-digit integer — model-authored, arbitrary content in base ten
+  — reaches `events.jsonl` whole: one `artifact.emit` measured 96 KB with twenty verbatim copies.
+  Bounding them means returning a different *type*, which is exactly how the `artifact.emitted.kind`
+  fix broke that event's schema mid-review, so this needs a design rather than a patch.
+- **`events.jsonl` can contain `NaN` / `Infinity`.** `json.dumps` defaults to `allow_nan=True` on
+  every write path and `json.loads` accepts those tokens from a model, so the documented JSONL
+  contract is not strictly JSON. The Studio feed silently drops such a frame. `conformance/` already
+  writes with `allow_nan=False`; the run path does not.
+- **`project_run_status` has no `EventLogCorruption` guard.** `monoid watch` catches it and prints a
+  clean error; `monoid status --json` and Studio's chat projection emit a 4.8 KB traceback on the
+  same interior-corrupt `events.jsonl`.
 - **A deeply nested tool argument still ends the run on the `allow` path.** `MAX_ARGUMENT_DEPTH` is
   reached only through the approval-request builder, so `ask`-gated calls reject and `allow`-gated
   calls carry the argument into the message history and on to `RunCheckpoint.to_json`, whose

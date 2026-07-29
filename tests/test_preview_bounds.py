@@ -242,7 +242,7 @@ def test_an_unnormalizable_path_is_redacted_rather_than_raising() -> None:
     for path in ("/etc/passwd", "../../etc/passwd"):
         assert preview_value("path", path, policy) == redacted_value(path)
         # ...and `public_path`, which is the *other* builder on the same emit path. Guarding only
-        # `preview_value` left this one raising, and it has twelve callers across `loop`,
+        # `preview_value` left this one raising, and it has fourteen call sites across `loop`,
         # `loop_phases`, `tasks`, `tool_services.shell` and `core.projections` — so the rule lives
         # in `public_path` itself rather than at any of them.
         assert public_path(path, policy) == REDACTED_PATH
@@ -632,3 +632,75 @@ def test_a_path_naming_a_redacted_file_through_a_dotdot_is_still_redacted() -> N
     )
     assert card["source_path"]["redacted"] is True
     assert card["content"]["redacted"] is True
+
+
+def _shell_request(**overrides: Any) -> Any:
+    from monoid_agent_kernel.shell import ShellApprovalRequest
+
+    base = dict(
+        run_id="run_1",
+        tool_call_id="c1",
+        command="echo hi",
+        cwd=".",
+        requested_timeout_s=30,
+        effective_timeout_s=30,
+        requested_max_output_bytes=1000,
+        effective_max_output_bytes=1000,
+        execution_workspace="workspace",
+    )
+    base.update(overrides)
+    return ShellApprovalRequest(**base)
+
+
+def test_the_shell_approval_payload_is_bounded_for_every_event_that_spreads_it() -> None:
+    """The largest claim in the release notes, and until now the least tested.
+
+    `ShellApprovalRequest.to_public_json` is `data=` for seven emit sites covering six event types —
+    `tool.approval.requested` / `.approved` / `.denied` and `shell.exec.started` / `.finished` /
+    `.failed`. The only tests in the area called `shell_args_preview` directly, which is the
+    `tool.call.started` route: the half that already worked before this release. So the fix for the
+    half that did *not* work was asserted by nothing.
+
+    Testing the builder rather than the seven emit sites is deliberate — it is the single function
+    they all go through, which is the whole reason the fix was made there.
+    """
+    policy = PermissionPolicy(redact_patterns=("secrets/**", "secrets"))
+    big_key = "SECRET_" + "가" * 10_000
+
+    published = _shell_request(cwd="secrets", env_keys=(big_key, "PATH")).to_public_json(policy)
+
+    assert published["cwd"] == redacted_value("secrets"), "cwd bypassed redact_patterns"
+    keys = published["env_keys"]
+    assert big_key not in keys, "a 30 KB env key rode out verbatim"
+    assert len(json.dumps(keys, ensure_ascii=False).encode()) < 1_000
+    # A rejected call still spreads this payload, which is why the bound has to live here.
+    assert "가" * 100 not in json.dumps(published, ensure_ascii=False)
+
+
+def test_an_ordinary_shell_approval_payload_is_unchanged() -> None:
+    """The bound is a ceiling on hostile input, not a reshaping of every approval card."""
+    published = _shell_request(env_keys=("PATH", "HOME")).to_public_json(PermissionPolicy())
+
+    assert published["cwd"] == "."
+    assert published["env_keys"] == ["PATH", "HOME"]
+    assert published["command_preview"] == "echo hi"
+    assert published["effective_timeout_s"] == 30
+
+
+def test_the_web_event_payload_is_bounded_on_the_events_either_side_of_the_call() -> None:
+    """`WebService` builds its own `event_data` for `.started` / `.finished` / `.failed`.
+
+    Same shape as the shell half: `web_args_preview` covers `tool.call.started`, and the three
+    inline payloads either side of it were the ones publishing `locale` and the domain lists raw.
+    """
+    policy = PermissionPolicy()
+    big_locale = "ko-" + "가" * 10_000
+
+    published = public_event_payload(
+        {"query_preview": {"redacted": True}, "locale": big_locale, "blocked_domains": ["evil.test"]},
+        policy,
+    )
+
+    assert big_locale not in json.dumps(published, ensure_ascii=False)
+    assert published["locale"]["truncated"] is True
+    assert published["blocked_domains"] == ["evil.test"], "ordinary descriptors pass through"
