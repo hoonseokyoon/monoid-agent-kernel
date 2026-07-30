@@ -5,9 +5,14 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core.json_ingress import (
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.permissions import (
     PATH_PATTERN_ENCODING_FIELD,
     PATH_PATTERN_ENCODING_LITERAL_BANG,
+    is_validated_internal_path_pattern,
     parse_durable_path_patterns,
     parse_serialized_path_patterns,
     path_pattern_encoding,
@@ -91,10 +96,9 @@ class ToolQuota:
         raw = payload.get("max_calls_per_run", payload.get("max_calls"))
         if raw is None:
             return cls()
-        value = int(raw)
-        if value < 0:
+        if type(raw) is not int or raw < 0:
             raise ValueError("tool quota max_calls_per_run must be non-negative")
-        return cls(max_calls_per_run=value)
+        return cls(max_calls_per_run=raw)
 
     def to_json(self) -> dict[str, Any]:
         return {"max_calls_per_run": self.max_calls_per_run}
@@ -111,12 +115,39 @@ class ToolScope:
     env_allowlist: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        for field_name in (
+            "allowed_paths",
+            "denied_paths",
+            "allowed_domains",
+            "blocked_domains",
+            "command_allow_prefixes",
+            "command_deny_prefixes",
+            "env_allowlist",
+        ):
+            value = getattr(self, field_name)
+            valid_items = type(value) is tuple and (
+                all(is_validated_internal_path_pattern(item) for item in value)
+                if field_name in {"allowed_paths", "denied_paths"}
+                else all(type(item) is str for item in value)
+            )
+            if not valid_items:
+                raise ValueError(f"tool scope {field_name} must be a tuple of strings")
         object.__setattr__(
             self, "allowed_paths", validate_internal_path_patterns(self.allowed_paths)
         )
-        object.__setattr__(
-            self, "denied_paths", validate_internal_path_patterns(self.denied_paths)
-        )
+        object.__setattr__(self, "denied_paths", validate_internal_path_patterns(self.denied_paths))
+        for field_name in (
+            "allowed_domains",
+            "blocked_domains",
+            "command_allow_prefixes",
+            "command_deny_prefixes",
+            "env_allowlist",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                tuple(normalize_unicode_scalars(item) for item in getattr(self, field_name)),
+            )
 
     @classmethod
     def from_json(cls, payload: Any) -> ToolScope:
@@ -193,6 +224,20 @@ class ToolAuthorization:
     surface_scope: ToolScope = field(default_factory=ToolScope)
     runtime: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        validate_tool_authorization(self)
+        for field_name in ("tool_id", "binding_id", "model_name", "reason"):
+            object.__setattr__(
+                self,
+                field_name,
+                normalize_unicode_scalars(getattr(self, field_name)),
+            )
+        runtime = normalize_json_ingress(self.runtime)
+        if not isinstance(runtime, dict):
+            raise ValueError("tool authorization runtime must be an object")
+        object.__setattr__(self, "runtime", runtime)
+        validate_tool_authorization(self)
+
     def to_json(self) -> dict[str, Any]:
         return {
             "tool_id": self.tool_id,
@@ -206,6 +251,73 @@ class ToolAuthorization:
             "surface_scope": self.surface_scope.to_json(),
             "runtime": dict(self.runtime),
         }
+
+
+def validate_tool_authorization(value: Any) -> ToolAuthorization:
+    """Validate a resolver authorization before it controls tool execution."""
+
+    if not isinstance(value, ToolAuthorization):
+        raise ValueError("tool surface resolver must return ToolAuthorization values")
+    if (
+        not hasattr(value, "decision")
+        or type(value.decision) is not str
+        or value.decision not in {"allow", "ask", "deny"}
+    ):
+        raise ValueError("tool authorization decision must be allow, ask, or deny")
+    for field_name in ("tool_id", "binding_id", "model_name"):
+        if not hasattr(value, field_name):
+            raise ValueError(f"tool authorization {field_name} must be a non-empty string")
+        field_value = getattr(value, field_name)
+        if type(field_value) is not str or not field_value:
+            raise ValueError(f"tool authorization {field_name} must be a non-empty string")
+    if not hasattr(value, "reason") or type(value.reason) is not str:
+        raise ValueError("tool authorization reason must be a string")
+    if (
+        not hasattr(value, "exposure")
+        or type(value.exposure) is not str
+        or value.exposure not in {"immediate", "searchable", "hidden"}
+    ):
+        raise ValueError("tool authorization exposure must be immediate, searchable, or hidden")
+    if not hasattr(value, "quota") or not isinstance(value.quota, ToolQuota):
+        raise ValueError("tool authorization quota must be ToolQuota")
+    max_calls = value.quota.max_calls_per_run
+    if max_calls is not None and (type(max_calls) is not int or max_calls < 0):
+        raise ValueError("tool authorization quota must be a non-negative integer or null")
+    if (
+        not hasattr(value, "scope")
+        or not hasattr(value, "surface_scope")
+        or not isinstance(value.scope, ToolScope)
+        or not isinstance(value.surface_scope, ToolScope)
+    ):
+        raise ValueError("tool authorization scopes must be ToolScope values")
+    scope_fields = (
+        "allowed_paths",
+        "denied_paths",
+        "allowed_domains",
+        "blocked_domains",
+        "command_allow_prefixes",
+        "command_deny_prefixes",
+        "env_allowlist",
+    )
+    for scope_name in ("scope", "surface_scope"):
+        scope = getattr(value, scope_name)
+        for field_name in scope_fields:
+            field_value = getattr(scope, field_name, None)
+            if field_name in {"allowed_paths", "denied_paths"}:
+                valid_items = type(field_value) is tuple and all(
+                    is_validated_internal_path_pattern(item) for item in field_value
+                )
+            else:
+                valid_items = type(field_value) is tuple and all(
+                    type(item) is str for item in field_value
+                )
+            if not valid_items:
+                raise ValueError(
+                    f"tool authorization {scope_name}.{field_name} must be a tuple of strings"
+                )
+    if not hasattr(value, "runtime") or not isinstance(value.runtime, dict):
+        raise ValueError("tool authorization runtime must be an object")
+    return value
 
 
 @dataclass(frozen=True)
@@ -318,6 +430,22 @@ class ToolSurfaceSnapshot:
         }
 
 
+def validate_tool_surface_snapshot(value: Any) -> ToolSurfaceSnapshot:
+    """Validate resolver-owned authorization values before exposure or execution."""
+
+    if not isinstance(value, ToolSurfaceSnapshot):
+        raise ValueError("tool surface resolver must return ToolSurfaceSnapshot")
+    if not isinstance(value.authorizations, dict):
+        raise ValueError("tool surface authorizations must be an object")
+    for binding_id, authorization in value.authorizations.items():
+        if type(binding_id) is not str or not binding_id:
+            raise ValueError("tool surface authorization keys must be non-empty strings")
+        validate_tool_authorization(authorization)
+        if authorization.binding_id != binding_id:
+            raise ValueError("tool surface authorization key must match binding_id")
+    return value
+
+
 def visible_registry_tool_ids(
     snapshot: ToolSurfaceSnapshot,
     bound_catalog: Any,
@@ -372,8 +500,7 @@ class ToolSurfaceResolver(Protocol):
         pending_binding_loads: tuple[str, ...] = (),
         previous_snapshot: ToolSurfaceSnapshot | None = None,
         call_counts: Mapping[str, int] | None = None,
-    ) -> ToolSurfaceSnapshot:
-        ...
+    ) -> ToolSurfaceSnapshot: ...
 
 
 @dataclass(frozen=True)
@@ -425,14 +552,20 @@ class DefaultToolSurfaceResolver:
             if bound.binding_id in pending and exposure == "searchable":
                 exposure = "immediate"
                 auth = replace(auth, exposure=exposure, reason="loaded_from_tool_search")
-            authorizations[bound.binding_id] = auth if auth.exposure == exposure else replace(auth, exposure=exposure)
+            authorizations[bound.binding_id] = (
+                auth if auth.exposure == exposure else replace(auth, exposure=exposure)
+            )
             if exposure == "searchable":
                 searchable.append(bound.model_spec)
                 search_entries.append(_search_entry(bound, auth))
                 continue
             immediate.append(bound.model_spec)
 
-        if bound_catalog.tool_search.enabled and searchable and bound_catalog.search_tool is not None:
+        if (
+            bound_catalog.tool_search.enabled
+            and searchable
+            and bound_catalog.search_tool is not None
+        ):
             search_spec = _search_tool_spec(bound_catalog.search_tool, bound_catalog.tool_search)
             search_auth = ToolAuthorization(
                 tool_id="tool.search",
@@ -601,7 +734,9 @@ def _str_tuple(value: Any) -> tuple[str, ...]:
         return ()
     if not isinstance(value, list | tuple):
         raise ValueError("expected an array of strings")
-    return tuple(str(item) for item in value)
+    if not all(type(item) is str for item in value):
+        raise ValueError("expected an array of strings")
+    return tuple(value)
 
 
 def _tool_search_metadata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:

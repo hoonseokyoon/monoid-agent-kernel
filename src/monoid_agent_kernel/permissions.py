@@ -11,6 +11,7 @@ from typing import Any, Literal
 import pathspec
 
 from monoid_agent_kernel._policy_util import dedupe, str_tuple
+from monoid_agent_kernel.core.json_ingress import normalize_unicode_scalars
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
@@ -33,6 +34,12 @@ _PATTERN_STYLE = "gitignore"
 
 class _LegacyPathPattern(str):
     """A retained pre-v0.20 pattern that requires the historical PurePath matcher."""
+
+
+def is_validated_internal_path_pattern(value: Any) -> bool:
+    """Return whether ``value`` is an exact pattern or the private compatibility marker."""
+
+    return type(value) is str or isinstance(value, _LegacyPathPattern)
 
 
 def _canonical_pattern(pattern: str) -> str | None:
@@ -127,9 +134,7 @@ def _pathspec_pattern(pattern: str) -> str | None:
 @lru_cache(maxsize=512)
 def _compiled(patterns: tuple[str, ...]) -> pathspec.PathSpec:
     compiled_patterns = [
-        compiled
-        for pattern in patterns
-        if (compiled := _pathspec_pattern(pattern)) is not None
+        compiled for pattern in patterns if (compiled := _pathspec_pattern(pattern)) is not None
     ]
     # pathspec 1.1 emits Python's possible-set-operation FutureWarnings for valid glob classes such
     # as ``[[]`` (a literal ``[``) and ``[a&&b]``, even though the generated regex preserves today's
@@ -162,6 +167,7 @@ def validate_internal_path_patterns(raw: Any) -> tuple[str, ...]:
     validated: list[str] = []
     current: list[str] = []
     for index, source in enumerate(patterns):
+        source = normalize_unicode_scalars(source)
         if index < len(original) and isinstance(original[index], _LegacyPathPattern):
             legacy = _LegacyPathPattern(source)
             validated.append(legacy)
@@ -252,9 +258,7 @@ def parse_serialized_path_patterns(raw: Any, *, encoding: str | None) -> tuple[s
     return parse_path_patterns(tuple(marked))
 
 
-def parse_durable_path_patterns(
-    raw: Any, *, encoding: str | None = None
-) -> tuple[str, ...]:
+def parse_durable_path_patterns(raw: Any, *, encoding: str | None = None) -> tuple[str, ...]:
     """Decode path patterns written before and after the v0.20 grammar change.
 
     Pre-v0.20 writers serialized a literal leading ``!`` unchanged. Current JSON keeps that
@@ -322,9 +326,7 @@ def path_patterns_need_encoding_marker(*groups: tuple[str, ...]) -> bool:
         for source in patterns:
             if isinstance(source, _LegacyPathPattern):
                 marker = _first_pattern_segment_offset(str(source))
-                if str(source)[:marker] in {"", "./"} and str(source).startswith(
-                    "\\!", marker
-                ):
+                if str(source)[:marker] in {"", "./"} and str(source).startswith("\\!", marker):
                     return True
                 continue
             canonical = _canonical_pattern(str(source))
@@ -370,11 +372,7 @@ def matches_path_patterns(
     )
     if invalid_relative_root is not None:
         raise ValueError(f"path pattern must name a workspace path: {invalid_relative_root!r}")
-    if any(
-        ord(char) < 32 or ord(char) == 127
-        for pattern in current_patterns
-        for char in pattern
-    ):
+    if any(ord(char) < 32 or ord(char) == 127 for pattern in current_patterns for char in pattern):
         raise ValueError("control characters are not allowed in path patterns")
     normalized = normalize_workspace_path(rel)
     # ``.`` is the synthetic workspace root, not a workspace entry. PurePath matched none of the
@@ -387,9 +385,7 @@ def matches_path_patterns(
         return True
     pure = PurePosixPath(normalized)
     return any(
-        pure.match(str(pattern))
-        for pattern in patterns
-        if isinstance(pattern, _LegacyPathPattern)
+        pure.match(str(pattern)) for pattern in patterns if isinstance(pattern, _LegacyPathPattern)
     )
 
 

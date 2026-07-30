@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import tempfile
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from monoid_agent_kernel._policy_util import dedupe, str_tuple
 from monoid_agent_kernel._proc import file_size, spawn_process, terminate_process
+from monoid_agent_kernel.core.json_ingress import normalize_unicode_scalars
 from monoid_agent_kernel.errors import PermissionDenied, ToolExecutionError, WorkspaceError
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
@@ -54,23 +56,37 @@ _SENSITIVE_ENV_FRAGMENTS = (
     "PRIVATE_KEY",
 )
 
+
 @dataclass(frozen=True)
 class ShellCommandRule:
     action: ShellRuleAction
     prefix: str
 
+    def __post_init__(self) -> None:
+        if type(self.action) is not str or self.action not in {"allow", "deny"}:
+            raise ValueError("shell command rule action must be allow or deny")
+        if type(self.prefix) is not str or not self.prefix.strip():
+            raise ValueError("shell command rule prefix is required")
+        object.__setattr__(self, "prefix", normalize_unicode_scalars(self.prefix))
+
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ShellCommandRule:
-        action = str(payload.get("action") or "")
-        prefix = str(payload.get("prefix") or "")
+        if not isinstance(payload, dict):
+            raise ValueError("shell command rule must be an object")
+        action = payload.get("action")
+        prefix = payload.get("prefix")
+        if type(action) is not str:
+            raise ValueError("shell command rule action must be allow or deny")
         if action not in {"allow", "deny"}:
             raise ValueError("shell command rule action must be allow or deny")
-        if not prefix.strip():
+        if type(prefix) is not str or not prefix.strip():
             raise ValueError("shell command rule prefix is required")
         return cls(action=action, prefix=prefix)
 
     def matches(self, command: str) -> bool:
-        return command.strip().startswith(self.prefix)
+        if type(command) is not str:
+            return False
+        return normalize_unicode_scalars(command).strip().startswith(self.prefix)
 
     def to_json(self) -> dict[str, str]:
         return {"action": self.action, "prefix": self.prefix}
@@ -93,42 +109,76 @@ class ShellExecutionOptions:
     inherit_env_allowlist: tuple[str, ...] = _DEFAULT_INHERIT_ENV
     command_rules: tuple[ShellCommandRule, ...] = ()
 
+    def __post_init__(self) -> None:
+        self._validate_fields()
+        for field_name in ("approval_mode", "shell", "cwd_root", "execution_workspace"):
+            object.__setattr__(
+                self,
+                field_name,
+                normalize_unicode_scalars(getattr(self, field_name)),
+            )
+        for field_name in ("env_allowlist", "inherit_env_allowlist"):
+            object.__setattr__(
+                self,
+                field_name,
+                tuple(normalize_unicode_scalars(item) for item in getattr(self, field_name)),
+            )
+        self._validate_fields()
+
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ShellExecutionOptions:
         if payload is None:
             return cls()
         if not isinstance(payload, dict):
             raise ValueError("shell execution options must be an object")
-        rules = tuple(
-            ShellCommandRule.from_json(item)
-            for item in payload.get("command_rules") or ()
-        )
+        raw_rules = payload.get("command_rules", ())
+        if not isinstance(raw_rules, (list, tuple)):
+            raise ValueError("shell command_rules must be an array")
+        rules = tuple(ShellCommandRule.from_json(item) for item in raw_rules)
         return cls(
-            enabled=bool(payload.get("enabled", False)),
-            approval_mode=_approval_mode(str(payload.get("approval_mode") or "backend")),
-            shell=_shell_kind(str(payload.get("shell") or "auto")),
-            default_timeout_s=int(payload.get("default_timeout_s", 120)),
-            max_timeout_s=int(payload.get("max_timeout_s", 900)),
-            default_startup_wait_s=int(payload.get("default_startup_wait_s", 0)),
-            max_startup_wait_s=int(payload.get("max_startup_wait_s", 30)),
-            default_max_output_bytes=int(payload.get("default_max_output_bytes", 100_000)),
-            max_output_bytes=int(payload.get("max_output_bytes", 1_000_000)),
-            cwd_root=str(payload.get("cwd_root") or "workspace"),
+            enabled=_shell_bool(payload.get("enabled", False), "enabled"),
+            approval_mode=_approval_mode(
+                _shell_text(payload.get("approval_mode", "backend"), "approval_mode")
+            ),
+            shell=_shell_kind(_shell_text(payload.get("shell", "auto"), "shell")),
+            default_timeout_s=_shell_int(
+                payload.get("default_timeout_s", 120), "default_timeout_s", minimum=1
+            ),
+            max_timeout_s=_shell_int(payload.get("max_timeout_s", 900), "max_timeout_s", minimum=1),
+            default_startup_wait_s=_shell_int(
+                payload.get("default_startup_wait_s", 0),
+                "default_startup_wait_s",
+                minimum=0,
+            ),
+            max_startup_wait_s=_shell_int(
+                payload.get("max_startup_wait_s", 30), "max_startup_wait_s", minimum=0
+            ),
+            default_max_output_bytes=_shell_int(
+                payload.get("default_max_output_bytes", 100_000),
+                "default_max_output_bytes",
+                minimum=1,
+            ),
+            max_output_bytes=_shell_int(
+                payload.get("max_output_bytes", 1_000_000),
+                "max_output_bytes",
+                minimum=1,
+            ),
+            cwd_root=_shell_text(payload.get("cwd_root", "workspace"), "cwd_root"),
             execution_workspace=_execution_workspace(
-                str(payload.get("execution_workspace") or "auto")
+                _shell_text(payload.get("execution_workspace", "auto"), "execution_workspace")
             ),
             env_allowlist=str_tuple(
-                payload.get("env_allowlist") or (),
+                payload.get("env_allowlist", ()),
                 type_error="expected an array of strings",
                 empty_error="empty string is not allowed",
             ),
             inherit_env_allowlist=str_tuple(
-                payload.get("inherit_env_allowlist") or _DEFAULT_INHERIT_ENV,
+                payload.get("inherit_env_allowlist", _DEFAULT_INHERIT_ENV),
                 type_error="expected an array of strings",
                 empty_error="empty string is not allowed",
             ),
             command_rules=rules,
-        ).validated()
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -160,7 +210,9 @@ class ShellExecutionOptions:
     ) -> ShellExecutionOptions:
         return ShellExecutionOptions(
             enabled=self.enabled if enabled is None else enabled,
-            approval_mode=self.approval_mode if approval_mode is None else _approval_mode(approval_mode),
+            approval_mode=self.approval_mode
+            if approval_mode is None
+            else _approval_mode(approval_mode),
             shell=self.shell,
             default_timeout_s=self.default_timeout_s if timeout_s is None else timeout_s,
             max_timeout_s=self.max_timeout_s,
@@ -180,6 +232,34 @@ class ShellExecutionOptions:
         ).validated()
 
     def validated(self) -> ShellExecutionOptions:
+        self._validate_fields()
+        return self
+
+    def _validate_fields(self) -> None:
+        _shell_bool(self.enabled, "enabled")
+        _shell_text(self.approval_mode, "approval_mode")
+        _shell_text(self.shell, "shell")
+        _shell_int(self.default_timeout_s, "default_timeout_s", minimum=1)
+        _shell_int(self.max_timeout_s, "max_timeout_s", minimum=1)
+        _shell_int(self.default_startup_wait_s, "default_startup_wait_s", minimum=0)
+        _shell_int(self.max_startup_wait_s, "max_startup_wait_s", minimum=0)
+        _shell_int(self.default_max_output_bytes, "default_max_output_bytes", minimum=1)
+        _shell_int(self.max_output_bytes, "max_output_bytes", minimum=1)
+        _shell_text(self.cwd_root, "cwd_root")
+        _shell_text(self.execution_workspace, "execution_workspace")
+        for field_name in ("env_allowlist", "inherit_env_allowlist"):
+            value = getattr(self, field_name)
+            if type(value) is not tuple or not all(type(item) is str for item in value):
+                raise ValueError(f"shell {field_name} must be a tuple of strings")
+            str_tuple(
+                value,
+                type_error="expected an array of strings",
+                empty_error="empty string is not allowed",
+            )
+        if not isinstance(self.command_rules, tuple) or not all(
+            isinstance(rule, ShellCommandRule) for rule in self.command_rules
+        ):
+            raise ValueError("shell command_rules must contain ShellCommandRule values")
         if self.approval_mode not in {"backend", "auto-approve", "deny"}:
             raise ValueError(f"unsupported shell approval mode: {self.approval_mode}")
         if self.shell not in {"auto", "bash", "powershell"}:
@@ -200,18 +280,29 @@ class ShellExecutionOptions:
             raise ValueError("shell output byte limits must be positive")
         if self.default_max_output_bytes > self.max_output_bytes:
             raise ValueError("default_max_output_bytes cannot exceed max_output_bytes")
-        return self
 
     def effective_timeout(self, requested: Any) -> int:
-        value = self.default_timeout_s if requested is None else int(requested)
+        value = (
+            self.default_timeout_s
+            if requested is None
+            else _shell_int(requested, "requested timeout_s", minimum=1)
+        )
         return max(1, min(value, self.max_timeout_s))
 
     def effective_output_limit(self, requested: Any) -> int:
-        value = self.default_max_output_bytes if requested is None else int(requested)
+        value = (
+            self.default_max_output_bytes
+            if requested is None
+            else _shell_int(requested, "requested max_output_bytes", minimum=1)
+        )
         return max(1, min(value, self.max_output_bytes))
 
     def effective_startup_wait(self, requested: Any) -> int:
-        value = self.default_startup_wait_s if requested is None else int(requested)
+        value = (
+            self.default_startup_wait_s
+            if requested is None
+            else _shell_int(requested, "requested startup_wait_s", minimum=0)
+        )
         return max(0, min(value, self.max_startup_wait_s))
 
     def effective_shell(self) -> Literal["bash", "powershell"]:
@@ -219,18 +310,27 @@ class ShellExecutionOptions:
             return "powershell" if os.name == "nt" else "bash"
         return self.shell
 
-    def effective_execution_workspace(self, workspace_backend: str) -> ResolvedShellExecutionWorkspace:
+    def effective_execution_workspace(
+        self, workspace_backend: str
+    ) -> ResolvedShellExecutionWorkspace:
         if self.execution_workspace == "auto":
             return "direct" if workspace_backend == "staging" else "isolated-copy"
         return self.execution_workspace
 
     def check_command(self, command: str) -> None:
-        deny_matches = [rule for rule in self.command_rules if rule.action == "deny" and rule.matches(command)]
+        deny_matches = [
+            rule for rule in self.command_rules if rule.action == "deny" and rule.matches(command)
+        ]
         if deny_matches:
-            raise ToolExecutionError("shell command denied by binding constraints", error_code="shell_binding_denied")
+            raise ToolExecutionError(
+                "shell command denied by binding constraints", error_code="shell_binding_denied"
+            )
         allow_rules = [rule for rule in self.command_rules if rule.action == "allow"]
         if allow_rules and not any(rule.matches(command) for rule in allow_rules):
-            raise ToolExecutionError("shell command not allowed by binding constraints", error_code="shell_binding_denied")
+            raise ToolExecutionError(
+                "shell command not allowed by binding constraints",
+                error_code="shell_binding_denied",
+            )
 
     def to_manifest(self) -> dict[str, Any]:
         return {**self.to_json(), "effective_shell": self.effective_shell()}
@@ -300,6 +400,15 @@ class ShellApprovalDecision:
     reason: str = ""
     approver_id: str = ""
 
+    def __post_init__(self) -> None:
+        validate_shell_approval_decision(self)
+        object.__setattr__(self, "reason", normalize_unicode_scalars(self.reason))
+        object.__setattr__(
+            self,
+            "approver_id",
+            normalize_unicode_scalars(self.approver_id),
+        )
+
     def to_public_json(self) -> dict[str, Any]:
         return {
             "approved": self.approved,
@@ -309,8 +418,21 @@ class ShellApprovalDecision:
 
 
 class ShellApprovalProvider(Protocol):
-    def approve_shell(self, request: ShellApprovalRequest) -> ShellApprovalDecision:
-        ...
+    def approve_shell(self, request: ShellApprovalRequest) -> ShellApprovalDecision: ...
+
+
+def validate_shell_approval_decision(value: Any) -> ShellApprovalDecision:
+    """Validate an approval-provider result without truthiness or text coercion."""
+
+    if not isinstance(value, ShellApprovalDecision):
+        raise ValueError("shell approval provider must return ShellApprovalDecision")
+    if type(value.approved) is not bool:
+        raise ValueError("shell approval decision approved must be a boolean")
+    if type(value.reason) is not str:
+        raise ValueError("shell approval decision reason must be a string")
+    if type(value.approver_id) is not str:
+        raise ValueError("shell approval decision approver_id must be a string")
+    return value
 
 
 @dataclass(frozen=True)
@@ -319,7 +441,9 @@ class AutoApproveShellApprovalProvider:
 
     def approve_shell(self, request: ShellApprovalRequest) -> ShellApprovalDecision:
         del request
-        return ShellApprovalDecision(approved=True, reason="auto-approved", approver_id=self.approver_id)
+        return ShellApprovalDecision(
+            approved=True, reason="auto-approved", approver_id=self.approver_id
+        )
 
 
 @dataclass(frozen=True)
@@ -348,6 +472,20 @@ class ShellExecutionResult:
     effective_max_output_bytes: int = 0
     execution_workspace: ResolvedShellExecutionWorkspace = "isolated-copy"
 
+    def __post_init__(self) -> None:
+        validate_shell_execution_result(self)
+        for field_name in ("stdout", "stderr"):
+            object.__setattr__(
+                self,
+                field_name,
+                normalize_unicode_scalars(getattr(self, field_name)),
+            )
+        object.__setattr__(
+            self,
+            "changed_paths",
+            tuple(normalize_unicode_scalars(path) for path in self.changed_paths),
+        )
+
     def to_tool_content(self) -> dict[str, Any]:
         return {
             "exit_code": self.exit_code,
@@ -365,6 +503,53 @@ class ShellExecutionResult:
             "effective_max_output_bytes": self.effective_max_output_bytes,
             "execution_workspace": self.execution_workspace,
         }
+
+
+def validate_shell_execution_result(value: Any) -> ShellExecutionResult:
+    """Validate shell-runner output before it affects counters or public payloads."""
+
+    if not isinstance(value, ShellExecutionResult):
+        raise ValueError("shell executor must return ShellExecutionResult")
+    for field_name in (
+        "exit_code",
+        "stdout_bytes",
+        "stderr_bytes",
+        "effective_timeout_s",
+        "effective_max_output_bytes",
+    ):
+        field_value = getattr(value, field_name)
+        minimum = 0 if field_name != "exit_code" else None
+        if type(field_value) is not int or (minimum is not None and field_value < minimum):
+            raise ValueError(f"shell execution result {field_name} must be an integer")
+    for field_name in ("requested_timeout_s", "requested_max_output_bytes"):
+        field_value = getattr(value, field_name)
+        if field_value is not None and (type(field_value) is not int or field_value < 1):
+            raise ValueError(
+                f"shell execution result {field_name} must be a positive integer or null"
+            )
+    for field_name in ("stdout", "stderr"):
+        if type(getattr(value, field_name)) is not str:
+            raise ValueError(f"shell execution result {field_name} must be a string")
+    for field_name in ("timed_out", "output_truncated"):
+        if type(getattr(value, field_name)) is not bool:
+            raise ValueError(f"shell execution result {field_name} must be a boolean")
+    if type(value.duration_s) not in {int, float}:
+        raise ValueError("shell execution result duration_s must be finite")
+    try:
+        duration_is_finite = math.isfinite(float(value.duration_s))
+    except (OverflowError, ValueError):
+        duration_is_finite = False
+    if not duration_is_finite:
+        raise ValueError("shell execution result duration_s must be finite")
+    if value.duration_s < 0:
+        raise ValueError("shell execution result duration_s must be non-negative")
+    if type(value.changed_paths) is not tuple or not all(
+        type(path) is str for path in value.changed_paths
+    ):
+        raise ValueError("shell execution result changed_paths must be a tuple of strings")
+    if value.execution_workspace not in {"isolated-copy", "direct"}:
+        raise ValueError("shell execution result execution_workspace is invalid")
+    return value
 
 
 @dataclass(frozen=True)
@@ -390,6 +575,15 @@ def execute_shell(
 ) -> ShellExecutionResult:
     if not policy.enabled:
         raise ToolExecutionError("shell is disabled", error_code="shell_disabled")
+    if type(command) is not str:
+        raise ToolExecutionError(
+            "shell command must be a string",
+            error_code="shell_exec_error",
+        )
+    command = normalize_unicode_scalars(command)
+    if type(cwd) is not str:
+        raise ToolExecutionError("shell cwd must be a string", error_code="shell_exec_error")
+    cwd = normalize_unicode_scalars(cwd)
     if not command.strip():
         raise ToolExecutionError("shell command is required", error_code="shell_exec_error")
     policy.check_command(command)
@@ -398,8 +592,14 @@ def execute_shell(
     # ``argv_override`` runs a pre-built argv directly (no shell interpretation), so
     # model-supplied arguments can never be re-parsed by bash/powershell. ``command`` is
     # then only the human-readable label used for the scope check, approval, and preview.
-    argv = list(argv_override) if argv_override is not None else shell_argv(policy.effective_shell(), command)
-    resolved_execution_workspace = execution_workspace or policy.effective_execution_workspace(workspace.backend_kind)
+    argv = (
+        list(argv_override)
+        if argv_override is not None
+        else shell_argv(policy.effective_shell(), command)
+    )
+    resolved_execution_workspace = execution_workspace or policy.effective_execution_workspace(
+        workspace.backend_kind
+    )
 
     if resolved_execution_workspace == "direct":
         cwd_abs = (workspace.root / cwd_rel).resolve()
@@ -636,9 +836,7 @@ def _run_subprocess(
     stdout_file.close()
     stderr_file.close()
     with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
-        process = spawn_process(
-            argv, cwd=cwd, env=env, stdout=stdout_handle, stderr=stderr_handle
-        )
+        process = spawn_process(argv, cwd=cwd, env=env, stdout=stdout_handle, stderr=stderr_handle)
         timed_out = False
         output_truncated = False
         while process.poll() is None:
@@ -691,6 +889,11 @@ def _safe_unlink(path: Path) -> None:
 
 
 def build_env(policy: ShellExecutionOptions, requested: Mapping[str, Any]) -> dict[str, str]:
+    if not isinstance(requested, Mapping):
+        raise ToolExecutionError(
+            "shell env must be an object",
+            error_code="shell_exec_error",
+        )
     env: dict[str, str] = {}
     inherited = set(policy.inherit_env_allowlist)
     for key in inherited:
@@ -698,9 +901,14 @@ def build_env(policy: ShellExecutionOptions, requested: Mapping[str, Any]) -> di
             env[key] = os.environ[key]
     allowed = set(policy.env_allowlist)
     for key, value in requested.items():
-        key_text = str(key)
+        if type(key) is not str or type(value) is not str:
+            raise ToolExecutionError(
+                "shell env keys and values must be strings",
+                error_code="shell_exec_error",
+            )
+        key_text = normalize_unicode_scalars(key)
         if key_text in allowed and not _sensitive_env_key(key_text):
-            env[key_text] = str(value)
+            env[key_text] = normalize_unicode_scalars(value)
     return env
 
 
@@ -720,7 +928,9 @@ def shell_argv(shell: Literal["bash", "powershell"], command: str) -> list[str]:
 
 def _check_shell_path_allowed(rel: str, permission_policy: PermissionPolicy) -> None:
     if _shell_path_denied(rel, permission_policy):
-        raise PermissionDenied(f"shell denied by path boundary: {rel}", error_code="shell_path_denied")
+        raise PermissionDenied(
+            f"shell denied by path boundary: {rel}", error_code="shell_path_denied"
+        )
 
 
 def _shell_path_denied(rel: str, permission_policy: PermissionPolicy) -> bool:
@@ -736,6 +946,25 @@ def _ancestor_paths(rel: str) -> list[str]:
 def _sensitive_env_key(key: str) -> bool:
     upper = key.upper()
     return any(fragment in upper for fragment in _SENSITIVE_ENV_FRAGMENTS)
+
+
+def _shell_bool(value: Any, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"shell {field_name} must be a boolean")
+    return value
+
+
+def _shell_text(value: Any, field_name: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"shell {field_name} must be a string")
+    return value
+
+
+def _shell_int(value: Any, field_name: str, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        qualifier = "non-negative" if minimum == 0 else "positive"
+        raise ValueError(f"shell {field_name} must be a {qualifier} integer")
+    return value
 
 
 def _approval_mode(value: str) -> ShellApprovalMode:

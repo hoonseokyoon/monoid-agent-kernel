@@ -11,6 +11,14 @@ from typing import Any, ClassVar
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from monoid_agent_kernel.core.json_ingress import (
+    loads_json_ingress,
+    loads_model_envelope_json_ingress,
+    loads_model_json_ingress,
+    loads_model_stream_envelope_json_ingress,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.env import env_name_for_error, getenv
@@ -81,7 +89,7 @@ class GatewayModelAdapter:
         config = request.model or self.config
         url = self._resolve_gateway_url(config)
         payload = self._payload(request)
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
         retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
@@ -118,8 +126,8 @@ class GatewayModelAdapter:
                     with urlopen(http_request, timeout=config.timeout_s) as response:
                         response_body = response.read()
                     try:
-                        data = json.loads(response_body.decode("utf-8"))
-                    except json.JSONDecodeError as exc:
+                        data = loads_model_envelope_json_ingress(response_body.decode("utf-8"))
+                    except ValueError as exc:
                         raise ModelAdapterError(
                             "LLM gateway returned invalid JSON",
                             provider_error_code=GATEWAY_BAD_RESPONSE,
@@ -175,7 +183,9 @@ class GatewayModelAdapter:
                         raise last_error from exc
             if last_error is not None:
                 raise last_error
-            raise ModelAdapterError("LLM gateway request failed", provider_error_code=GATEWAY_NETWORK_ERROR)
+            raise ModelAdapterError(
+                "LLM gateway request failed", provider_error_code=GATEWAY_NETWORK_ERROR
+            )
         # Marked in one place rather than at each ``raise`` inside the loop: there are five
         # of those plus the exhausted-budget one, and a scheme needing every site updated is
         # one that eventually misses a site. ``attempt`` holds whichever attempt was in flight.
@@ -205,7 +215,9 @@ class GatewayModelAdapter:
 
         config = request.model or self.config
         url = self._resolve_gateway_url(config).rstrip("/") + "/stream"
-        body = json.dumps(self._payload(request), ensure_ascii=False).encode("utf-8")
+        body = json.dumps(self._payload(request), ensure_ascii=False, allow_nan=False).encode(
+            "utf-8"
+        )
         retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
@@ -269,7 +281,9 @@ class GatewayModelAdapter:
                     # change between attempts; a credential can.
                     headers = self._headers()
                     try:
-                        async with client.stream("POST", url, headers=headers, content=body) as response:
+                        async with client.stream(
+                            "POST", url, headers=headers, content=body
+                        ) as response:
                             if response.status_code != 200:
                                 detail = (await response.aread()).decode("utf-8", errors="replace")
                                 error = _error_from_status_body(response.status_code, detail)
@@ -305,7 +319,9 @@ class GatewayModelAdapter:
                         last_error = error
             if last_error is not None:
                 raise last_error
-            raise ModelAdapterError("LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR)
+            raise ModelAdapterError(
+                "LLM gateway stream failed", provider_error_code=GATEWAY_NETWORK_ERROR
+            )
         except httpx.HTTPError as exc:
             # The client's own lifecycle -- construction, `__aenter__`, and the `__aexit__` that
             # tears the pool down -- sits *outside* the per-attempt handler now that the client is
@@ -350,7 +366,12 @@ class GatewayModelAdapter:
         return self._resolve_gateway_url(config)
 
     def _resolve_gateway_url(self, config: ModelConfig) -> str:
-        url = self.gateway_url or config.gateway_url or self.config.gateway_url or getenv(DEFAULT_GATEWAY_URL_ENV)
+        url = (
+            self.gateway_url
+            or config.gateway_url
+            or self.config.gateway_url
+            or getenv(DEFAULT_GATEWAY_URL_ENV)
+        )
         if not url:
             raise ModelAdapterError(
                 f"LLM gateway URL is required via --llm-gateway-url or {env_name_for_error(DEFAULT_GATEWAY_URL_ENV)}"
@@ -429,61 +450,337 @@ def _gateway_tool_schema(tool: ToolSpec) -> dict[str, Any]:
     }
 
 
-def _parse_gateway_response(data: dict[str, Any]) -> ModelTurn:
-    if "error" in data:
+def _exact_gateway_bool(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    default: bool,
+    context: str,
+    http_status: int | None = None,
+    known_provider_retried: bool = False,
+) -> bool:
+    """Read a gateway control boolean without truthiness coercion.
+
+    Gateway payloads are wire data, so a present control has one portable meaning only when it is
+    an exact JSON boolean.  In particular, ``"false"`` must not become true and authorize a retry
+    or fabricate evidence that the upstream provider already retried.
+    """
+
+    if key not in payload:
+        return default
+    value = payload[key]
+    if type(value) is bool:
+        return value
+    raise ModelAdapterError(
+        f"LLM gateway returned an invalid {context}: {key} must be a boolean",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        http_status=http_status,
+        provider_retried=known_provider_retried,
+    )
+
+
+def _exact_gateway_int(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    default: int | None,
+    context: str,
+    minimum: int,
+    maximum: int | None = None,
+    allow_none: bool = False,
+    known_provider_retried: bool = False,
+) -> int | None:
+    if key not in payload:
+        return default
+    value = payload[key]
+    if value is None and allow_none:
+        return None
+    valid = type(value) is int and value >= minimum
+    if maximum is not None:
+        valid = valid and value <= maximum
+    if valid:
+        return value
+    requirement = f"an integer >= {minimum}"
+    if maximum is not None:
+        requirement = f"an integer from {minimum} through {maximum}"
+    raise ModelAdapterError(
+        f"LLM gateway returned an invalid {context}: {key} must be {requirement}",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        provider_retried=known_provider_retried,
+    )
+
+
+def _gateway_http_status_hint(payload: dict[str, Any]) -> int | None:
+    """Return an already trustworthy status for enriching a later validation error."""
+
+    value = payload.get("http_status")
+    if type(value) is int and 100 <= value <= 599:
+        return value
+    return None
+
+
+def _gateway_string(
+    payload: dict[str, Any],
+    *keys: str,
+    context: str,
+    required: bool = False,
+    known_provider_retried: bool = False,
+    http_status: int | None = None,
+) -> str | None:
+    """Read the first present gateway string field without identity coercion."""
+
+    for key in keys:
+        if key not in payload or payload[key] is None:
+            continue
+        value = payload[key]
+        if type(value) is not str:
+            raise ModelAdapterError(
+                f"LLM gateway returned an invalid {context}: {key} must be a string",
+                provider_error_code=GATEWAY_BAD_RESPONSE,
+                retryable=False,
+                http_status=http_status,
+                provider_retried=known_provider_retried,
+            )
+        if value:
+            return normalize_unicode_scalars(value)
+    if required:
+        names = " or ".join(keys)
         raise ModelAdapterError(
-            str(data["error"]),
-            provider_error_code=str(data.get("error_code") or GATEWAY_BAD_RESPONSE),
-            retryable=bool(data.get("retryable", False)),
-            http_status=int(data["http_status"]) if data.get("http_status") is not None else None,
-            provider_retried=bool(data.get("provider_retried", False)),
+            f"LLM gateway returned an invalid {context}: {names} is required",
+            provider_error_code=GATEWAY_BAD_RESPONSE,
+            retryable=False,
+            http_status=http_status,
+            provider_retried=known_provider_retried,
         )
-    raw_calls = data.get("tool_calls") or ()
+    return None
+
+
+def _gateway_fragment_string(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    context: str,
+    known_provider_retried: bool,
+) -> str | None:
+    """Validate a model content fragment while deferring cross-frame Unicode repair."""
+
+    if key not in payload or payload[key] is None:
+        return None
+    value = payload[key]
+    if type(value) is str:
+        return value
+    raise ModelAdapterError(
+        f"LLM gateway returned an invalid {context}: {key} must be a string",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        provider_retried=known_provider_retried,
+    )
+
+
+def _gateway_usage(
+    value: Any,
+    *,
+    context: str,
+    known_provider_retried: bool = False,
+) -> dict[str, int]:
+    try:
+        return normalize_usage(value)
+    except (TypeError, ValueError) as exc:
+        raise ModelAdapterError(
+            f"LLM gateway returned an invalid {context}: usage must contain token counts",
+            provider_error_code=GATEWAY_BAD_RESPONSE,
+            retryable=False,
+            provider_retried=known_provider_retried,
+        ) from exc
+
+
+def _portable_gateway_payload(
+    value: Any,
+    *,
+    context: str,
+    known_provider_retried: bool = False,
+) -> Any:
+    try:
+        return normalize_json_ingress(value)
+    except ValueError as exc:
+        raise ModelAdapterError(
+            f"LLM gateway returned an invalid {context}",
+            provider_error_code=GATEWAY_BAD_RESPONSE,
+            retryable=False,
+            provider_retried=known_provider_retried,
+        ) from exc
+
+
+def _parse_gateway_response(data: Any) -> ModelTurn:
+    if not isinstance(data, dict):
+        raise ModelAdapterError(
+            "LLM gateway returned a non-object JSON response",
+            provider_error_code=GATEWAY_BAD_RESPONSE,
+            retryable=False,
+        )
+    provider_retried = _exact_gateway_bool(
+        data,
+        "provider_retried",
+        default=False,
+        context="response",
+        http_status=_gateway_http_status_hint(data) if "error" in data else None,
+    )
+    if "error" in data:
+        error_http_status = _exact_gateway_int(
+            data,
+            "http_status",
+            default=None,
+            context="error response",
+            minimum=100,
+            maximum=599,
+            allow_none=True,
+            known_provider_retried=provider_retried,
+        )
+        retryable = _exact_gateway_bool(
+            data,
+            "retryable",
+            default=False,
+            context="error response",
+            http_status=error_http_status,
+            known_provider_retried=provider_retried,
+        )
+        raise ModelAdapterError(
+            _gateway_string(
+                data,
+                "error",
+                context="error response",
+                required=True,
+                known_provider_retried=provider_retried,
+                http_status=error_http_status,
+            )
+            or "",
+            provider_error_code=(
+                _gateway_string(
+                    data,
+                    "error_code",
+                    context="error response",
+                    known_provider_retried=provider_retried,
+                    http_status=error_http_status,
+                )
+                or GATEWAY_BAD_RESPONSE
+            ),
+            retryable=retryable,
+            http_status=error_http_status,
+            provider_retried=provider_retried,
+        )
+    _exact_gateway_bool(
+        data,
+        "retryable",
+        default=False,
+        context="response",
+        known_provider_retried=provider_retried,
+    )
+    raw_calls = data.get("tool_calls", ())
+    if raw_calls is None:
+        raw_calls = ()
+    if not isinstance(raw_calls, (list, tuple)):
+        raise ModelAdapterError(
+            "LLM gateway returned invalid tool_calls: expected an array",
+            provider_error_code=GATEWAY_BAD_RESPONSE,
+            provider_retried=provider_retried,
+        )
     tool_calls: list[ToolCall] = []
     for raw in raw_calls:
         if not isinstance(raw, dict):
             raise ModelAdapterError(
                 "LLM gateway returned an invalid tool call",
                 provider_error_code=GATEWAY_BAD_RESPONSE,
+                provider_retried=provider_retried,
             )
-        args = raw.get("arguments") or {}
+        args = raw.get("arguments")
+        if args is None:
+            args = {}
         if isinstance(args, str):
             try:
-                args = json.loads(args)
-            except json.JSONDecodeError as exc:
+                args = loads_model_json_ingress(args)
+            except ValueError as exc:
                 raise ModelAdapterError(
                     f"invalid gateway tool call arguments for {raw.get('name')}",
                     provider_error_code=GATEWAY_BAD_RESPONSE,
+                    provider_retried=provider_retried,
                 ) from exc
+        else:
+            args = _portable_gateway_payload(
+                args,
+                context="tool call arguments",
+                known_provider_retried=provider_retried,
+            )
         if not isinstance(args, dict):
             raise ModelAdapterError(
                 f"invalid gateway tool call arguments for {raw.get('name')}",
                 provider_error_code=GATEWAY_BAD_RESPONSE,
+                provider_retried=provider_retried,
             )
         tool_calls.append(
             ToolCall(
-                id=str(raw.get("id") or raw.get("call_id") or ""),
-                name=str(raw.get("name") or ""),
+                id=_gateway_string(
+                    raw,
+                    "id",
+                    "call_id",
+                    context="tool call",
+                    required=True,
+                    known_provider_retried=provider_retried,
+                )
+                or "",
+                name=_gateway_string(
+                    raw,
+                    "name",
+                    context="tool call",
+                    required=True,
+                    known_provider_retried=provider_retried,
+                )
+                or "",
                 arguments=args,
             )
         )
 
     # stop_reason rides the gateway wire (added by the gateway server). Older gateways omit it;
     # infer the common cases so the loop's branch still works.
-    stop_reason = data.get("stop_reason")
+    stop_reason = _gateway_string(
+        data,
+        "stop_reason",
+        context="response",
+        known_provider_retried=provider_retried,
+    )
     if stop_reason is None:
         stop_reason = "tool_calls" if tool_calls else "stop"
     return ModelTurn(
-        response_id=data.get("response_id") or data.get("turn_handle"),
-        final_text=data.get("final_text"),
+        response_id=_gateway_string(
+            data,
+            "response_id",
+            "turn_handle",
+            context="response",
+            known_provider_retried=provider_retried,
+        ),
+        final_text=_gateway_string(
+            data,
+            "final_text",
+            context="response",
+            known_provider_retried=provider_retried,
+        ),
         tool_calls=tuple(tool_calls),
-        usage=normalize_usage(data.get("usage")),
-        raw=data,
+        usage=_gateway_usage(
+            data.get("usage"),
+            context="response",
+            known_provider_retried=provider_retried,
+        ),
+        raw=_portable_gateway_payload(
+            data,
+            context="response",
+            known_provider_retried=provider_retried,
+        ),
         stop_reason=stop_reason,
         # A retry the gateway's own backend made. Absent from an older gateway, which reads as
         # "did not retry" -- the same default an adapter with no retry loop carries, and the only
         # thing a wire that never mentions it can honestly mean.
-        provider_retried=bool(data.get("provider_retried", False)),
+        provider_retried=provider_retried,
     )
 
 
@@ -505,7 +802,7 @@ async def _aiter_sse_chunks(response: Any) -> AsyncIterator[ModelStreamChunk]:
     async for line in response.aiter_lines():
         if line == "":
             if data_lines:
-                chunk = _chunk_from_event(json.loads("\n".join(data_lines)))
+                chunk = _decode_sse_chunk(data_lines)
                 data_lines = []
                 if chunk is not None:
                     yield chunk
@@ -515,44 +812,169 @@ async def _aiter_sse_chunks(response: Any) -> AsyncIterator[ModelStreamChunk]:
         if line.startswith("data:"):
             data_lines.append(line[5:].lstrip(" "))
     if data_lines:
-        chunk = _chunk_from_event(json.loads("\n".join(data_lines)))
+        chunk = _decode_sse_chunk(data_lines)
         if chunk is not None:
             yield chunk
 
 
+def _decode_sse_chunk(data_lines: list[str]) -> ModelStreamChunk | None:
+    try:
+        event = loads_model_stream_envelope_json_ingress("\n".join(data_lines))
+    except ValueError as exc:
+        raise ModelAdapterError(
+            "LLM gateway stream returned invalid JSON",
+            provider_error_code=GATEWAY_BAD_RESPONSE,
+        ) from exc
+    if not isinstance(event, dict):
+        raise ModelAdapterError(
+            "LLM gateway stream returned a non-object frame",
+            provider_error_code=GATEWAY_BAD_RESPONSE,
+        )
+    return _chunk_from_event(event)
+
+
 def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
-    event_type = event.get("type")
     # A retry the gateway's own backend made, as opposed to one this client's loop made. Read off
     # every frame that carries it, because a stream cancelled mid-flight never delivers the
     # terminal one. Absent reads as "did not retry", which is what a wire that never mentions it
     # can honestly mean; the client's own ``attempt > 1`` is combined with this, never over it.
-    retried = bool(event.get("provider_retried", False))
+    raw_event_type = event.get("type")
+    status_hint = (
+        _gateway_http_status_hint(event)
+        if type(raw_event_type) is str and raw_event_type == "error"
+        else None
+    )
+    retried = _exact_gateway_bool(
+        event,
+        "provider_retried",
+        default=False,
+        context="stream frame",
+        http_status=status_hint,
+    )
+    event_type = _gateway_string(
+        event,
+        "type",
+        context="stream frame",
+        known_provider_retried=retried,
+    )
     if event_type == "text_delta":
-        return TextDelta(text=str(event.get("text") or ""), provider_retried=retried)
+        return TextDelta(
+            text=_gateway_fragment_string(
+                event,
+                "text",
+                context="text delta",
+                known_provider_retried=retried,
+            )
+            or "",
+            provider_retried=retried,
+        )
     if event_type == "reasoning_delta":
-        return ReasoningDelta(text=str(event.get("text") or ""), provider_retried=retried)
+        return ReasoningDelta(
+            text=_gateway_fragment_string(
+                event,
+                "text",
+                context="reasoning delta",
+                known_provider_retried=retried,
+            )
+            or "",
+            provider_retried=retried,
+        )
     if event_type == "tool_call_delta":
         return ToolCallDelta(
-            index=int(event.get("index") or 0),
-            arguments_fragment=str(event.get("arguments_fragment") or ""),
-            id=event.get("id"),
-            name=event.get("name"),
+            index=_exact_gateway_int(
+                event,
+                "index",
+                default=0,
+                context="tool-call delta",
+                minimum=0,
+                known_provider_retried=retried,
+            ),
+            arguments_fragment=(
+                _gateway_fragment_string(
+                    event,
+                    "arguments_fragment",
+                    context="tool-call delta",
+                    known_provider_retried=retried,
+                )
+                or ""
+            ),
+            id=_gateway_string(
+                event,
+                "id",
+                context="tool-call delta",
+                known_provider_retried=retried,
+            ),
+            name=_gateway_string(
+                event,
+                "name",
+                context="tool-call delta",
+                known_provider_retried=retried,
+            ),
             provider_retried=retried,
         )
     if event_type == "turn_complete":
         # The gateway's opaque turn_handle is the continuation handle the core stores.
         return TurnComplete(
-            response_id=event.get("turn_handle") or event.get("response_id"),
-            usage=normalize_usage(event.get("usage")),
-            stop_reason=event.get("stop_reason"),
+            response_id=_gateway_string(
+                event,
+                "turn_handle",
+                "response_id",
+                context="turn-complete frame",
+                known_provider_retried=retried,
+            ),
+            usage=_gateway_usage(
+                event.get("usage"),
+                context="turn-complete frame",
+                known_provider_retried=retried,
+            ),
+            stop_reason=_gateway_string(
+                event,
+                "stop_reason",
+                context="turn-complete frame",
+                known_provider_retried=retried,
+            ),
             provider_retried=retried,
         )
     if event_type == "error":
+        error_http_status = _exact_gateway_int(
+            event,
+            "http_status",
+            default=None,
+            context="stream error",
+            minimum=100,
+            maximum=599,
+            allow_none=True,
+            known_provider_retried=retried,
+        )
+        retryable = _exact_gateway_bool(
+            event,
+            "retryable",
+            default=False,
+            context="stream error",
+            http_status=error_http_status,
+            known_provider_retried=retried,
+        )
         raise ModelAdapterError(
-            str(event.get("error") or "LLM gateway stream error"),
-            provider_error_code=str(event.get("error_code") or GATEWAY_BAD_RESPONSE),
-            retryable=bool(event.get("retryable", False)),
-            http_status=int(event["http_status"]) if event.get("http_status") is not None else None,
+            _gateway_string(
+                event,
+                "error",
+                context="stream error",
+                known_provider_retried=retried,
+                http_status=error_http_status,
+            )
+            or "LLM gateway stream error",
+            provider_error_code=(
+                _gateway_string(
+                    event,
+                    "error_code",
+                    context="stream error",
+                    known_provider_retried=retried,
+                    http_status=error_http_status,
+                )
+                or GATEWAY_BAD_RESPONSE
+            ),
+            retryable=retryable,
+            http_status=error_http_status,
             provider_retried=retried,
         )
     return None  # unknown frame type: forward-compatible, ignore
@@ -568,14 +990,59 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
 
     error_payload: dict[str, Any] = {}
     try:
-        parsed = json.loads(detail)
+        parsed = loads_json_ingress(detail)
         if isinstance(parsed, dict):
             error_payload = parsed
+        elif detail.lstrip().startswith(("{", "[")):
+            return ModelAdapterError(
+                f"LLM gateway returned HTTP {status}: invalid JSON error response",
+                provider_error_code=GATEWAY_BAD_RESPONSE,
+                retryable=False,
+                http_status=status,
+                provider_retried=False,
+            )
     except json.JSONDecodeError:
-        pass
-    provider_error_code = str(error_payload.get("error_code") or _error_code_for_http_status(status))
-    retryable = bool(error_payload.get("retryable", _retryable_for_http_status(status)))
-    message = str(error_payload.get("error") or detail or f"HTTP {status}")
+        if detail.lstrip().startswith(("{", "[")):
+            return ModelAdapterError(
+                f"LLM gateway returned HTTP {status}: invalid JSON error response",
+                provider_error_code=GATEWAY_BAD_RESPONSE,
+                retryable=False,
+                http_status=status,
+                provider_retried=False,
+            )
+    provider_retried = _exact_gateway_bool(
+        error_payload,
+        "provider_retried",
+        default=False,
+        context="HTTP error response",
+        http_status=status,
+    )
+    provider_error_code = _gateway_string(
+        error_payload,
+        "error_code",
+        context="HTTP error response",
+        known_provider_retried=provider_retried,
+        http_status=status,
+    ) or _error_code_for_http_status(status)
+    retryable = _exact_gateway_bool(
+        error_payload,
+        "retryable",
+        default=_retryable_for_http_status(status),
+        context="HTTP error response",
+        http_status=status,
+        known_provider_retried=provider_retried,
+    )
+    message = (
+        _gateway_string(
+            error_payload,
+            "error",
+            context="HTTP error response",
+            known_provider_retried=provider_retried,
+            http_status=status,
+        )
+        or detail
+        or f"HTTP {status}"
+    )
     return ModelAdapterError(
         f"LLM gateway returned HTTP {status}: {message}",
         provider_error_code=provider_error_code,
@@ -584,7 +1051,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         # Read for the same reason as ``retryable``: it is a fact about the call the gateway is
         # reporting, and a failure is where it matters most. ``retryable`` forecasts a *future*
         # attempt; this records ones already made, upstream, by a retry loop this client cannot see.
-        provider_retried=bool(error_payload.get("provider_retried", False)),
+        provider_retried=provider_retried,
     )
 
 

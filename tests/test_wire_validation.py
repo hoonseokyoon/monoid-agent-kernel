@@ -63,6 +63,9 @@ def test_parse_int_and_float_reject_bool_and_strings() -> None:
         parse_int({"count": True}, "count")
     with pytest.raises(WireValidationError):
         parse_float({"limit": "3"}, "limit")
+    for nonfinite in (float("nan"), float("inf"), float("-inf"), 10**400):
+        with pytest.raises(WireValidationError, match="finite number"):
+            parse_float({"limit": nonfinite}, "limit")
 
 
 def test_parse_literal_rejects_unknown_values() -> None:

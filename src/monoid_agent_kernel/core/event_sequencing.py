@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 from monoid_agent_kernel.core._event_log import iter_committed_event_records
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.lifecycle import (
     TERMINAL_STATES,
     SessionState,
@@ -88,7 +88,7 @@ def diagnostic_event_summary(
 
 def _read_optional_json(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = loads_json_ingress(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -98,7 +98,9 @@ def _read_optional_json(path: Path) -> dict[str, Any] | None:
 class RunEventSequencer:
     """Decision helper for event sequence ownership around backend control events."""
 
-    direct_append_statuses: frozenset[str] = field(default_factory=lambda: DIRECT_AUDIT_APPEND_STATUSES)
+    direct_append_statuses: frozenset[str] = field(
+        default_factory=lambda: DIRECT_AUDIT_APPEND_STATUSES
+    )
 
     def is_queued_before_recorder(self, state: str | SessionState) -> bool:
         """Queued runs may seed the event log before the recorder opens."""
@@ -121,7 +123,9 @@ class RunEventSequencer:
         terminal: bool = False,
     ) -> bool:
         """Live non-terminal records should write through the live recorder."""
-        return not self.is_queued_before_recorder(state) and not self.is_terminal_direct_append_status(
+        return not self.is_queued_before_recorder(
+            state
+        ) and not self.is_terminal_direct_append_status(
             state,
             terminal=terminal,
         )
@@ -133,7 +137,9 @@ class RunEventSequencer:
         state, terminal = lifecycle_from_status_artifact(payload)
         return self.is_terminal_direct_append_status(state, terminal=terminal)
 
-    def newest_sequence(self, status: Mapping[str, Any], status_file: Mapping[str, Any] | None = None) -> int:
+    def newest_sequence(
+        self, status: Mapping[str, Any], status_file: Mapping[str, Any] | None = None
+    ) -> int:
         """Return the newest event sequence visible across live and durable projections."""
         status_file = status_file or {}
         return max(
@@ -154,7 +160,9 @@ class RunEventSequencer:
         last_event_seq = self.newest_sequence(status, status_file)
         return max(0, last_event_seq - event_limit + 1) if last_event_seq else 0
 
-    def read_event_page(self, events_path: Path, *, from_seq: int, limit: int | None) -> dict[str, Any]:
+    def read_event_page(
+        self, events_path: Path, *, from_seq: int, limit: int | None
+    ) -> dict[str, Any]:
         return read_event_page(events_path, from_seq=from_seq, limit=limit)
 
     def diagnostic_event_summary(self, event: Mapping[str, Any]) -> dict[str, Any]:

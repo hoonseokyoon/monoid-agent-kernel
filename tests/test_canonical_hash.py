@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 
+import pytest
+
 from monoid_agent_kernel.core._util import canonical_sha256
 
 
@@ -50,3 +52,9 @@ def test_canonical_sha256_no_drop_keeps_all_keys() -> None:
     payload = {"value": 1, "package_hash": "abc"}
     assert canonical_sha256(payload) == _reference(payload)
     assert canonical_sha256(payload, drop=("package_hash",)) != canonical_sha256(payload)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_canonical_sha256_rejects_non_finite_numbers(value: float) -> None:
+    with pytest.raises(ValueError, match="Out of range float values"):
+        canonical_sha256({"value": value})

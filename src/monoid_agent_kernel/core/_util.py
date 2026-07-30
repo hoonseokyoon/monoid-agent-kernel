@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
+
 
 def utc_timestamp() -> str:
     """Current UTC time as ISO-8601 with a ``Z`` suffix (e.g. ``...T12:00:00Z``)."""
@@ -40,6 +42,7 @@ def _canonical_bytes(payload: dict[str, Any], drop: tuple[str, ...]) -> bytes:
     return json.dumps(
         canonical,
         ensure_ascii=False,
+        allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -60,7 +63,9 @@ def canonical_sha256(payload: dict[str, Any], *, drop: tuple[str, ...] = ()) -> 
     return hashlib.sha256(_canonical_bytes(payload, drop)).hexdigest()
 
 
-def canonical_hmac_sha256(payload: dict[str, Any], key: bytes, *, drop: tuple[str, ...] = ()) -> str:
+def canonical_hmac_sha256(
+    payload: dict[str, Any], key: bytes, *, drop: tuple[str, ...] = ()
+) -> str:
     """Keyed digest of ``payload`` as canonical JSON, for payloads that contain secrets.
 
     Same serialization as ``canonical_sha256``, so equal payloads still produce equal digests for a
@@ -74,14 +79,14 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     """Write ``payload`` as pretty JSON, replacing ``path`` atomically via a temp file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
     try:
         text.encode("utf-8")
     except UnicodeEncodeError:
-        # A lone surrogate survives `json.loads` and cannot be UTF-8 encoded; see
-        # `recorder._write_jsonl` for the full note. On this path it also left a torn `.tmp` in the
-        # run root forever, because the failure happened between the temp write and the replace.
-        text = json.dumps(payload, ensure_ascii=True, indent=2)
+        # A manually constructed payload can bypass semantic ingress. Repair it to valid Unicode
+        # rather than persisting escaped surrogate code units that fail again at the next wire.
+        normalized = normalize_json_ingress(payload)
+        text = json.dumps(normalized, ensure_ascii=False, indent=2, allow_nan=False)
     tmp_path.write_text(text, encoding="utf-8")
     _atomic_replace(tmp_path, path)
 

@@ -44,7 +44,9 @@ def _manager(tmp_path: Path) -> tuple[TaskManager, AgentRecorder, _CaptureSink]:
     workspace_root.mkdir()
     workspace = LocalWorkspaceBackend(workspace_root, mode="propose", backend_kind="staging")
     sink = _CaptureSink()
-    recorder = AgentRecorder(tmp_path / "runs", "run_jobs", extra_event_sinks=(sink,), status_file=False)
+    recorder = AgentRecorder(
+        tmp_path / "runs", "run_jobs", extra_event_sinks=(sink,), status_file=False
+    )
     manager = TaskManager(
         run_id="run_jobs",
         workspace=workspace,
@@ -258,7 +260,10 @@ def test_hosted_task_cancel_marks_ready_for_reentry(tmp_path: Path) -> None:
     observations = manager.pop_reentry_observations()
     assert observations
     assert observations[0].output["status"] == "cancelled"
-    assert any(event.type == "task.cancelled" and event.data["task_id"] == task.job_id for event in sink.events)
+    assert any(
+        event.type == "task.cancelled" and event.data["task_id"] == task.job_id
+        for event in sink.events
+    )
 
 
 def test_mark_ready_is_idempotent_for_cancelled_task(tmp_path: Path) -> None:
@@ -320,9 +325,25 @@ def test_subagent_cancel_waits_for_child_coroutine_to_stop_before_reentry(tmp_pa
         observations = manager.pop_reentry_observations()
         assert observations
         assert observations[0].output["status"] == "cancelled"
-        assert any(event.type == "task.cancelled" and event.data["task_id"] == task.job_id for event in sink.events)
+        assert any(
+            event.type == "task.cancelled" and event.data["task_id"] == task.job_id
+            for event in sink.events
+        )
     finally:
         manager._shutdown_task_loop()
+
+
+@pytest.mark.parametrize("invalid", ["false", 0, None, float("nan")])
+def test_hosted_task_rejects_coercible_resume_control(
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    manager, _recorder, _sink = _manager(tmp_path)
+
+    with pytest.raises(ValueError, match="resume_on_exit must be a boolean"):
+        manager.start_task("hitl", {"prompt": "Approve?", "resume_on_exit": invalid})
+
+    assert manager.jobs == {}
 
 
 def test_non_resume_job_is_not_offered_for_reentry(tmp_path: Path) -> None:

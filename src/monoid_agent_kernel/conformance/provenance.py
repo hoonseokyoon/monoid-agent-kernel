@@ -14,12 +14,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from monoid_agent_kernel.core.json_ingress import (
+    normalize_json_ingress,
+    parse_finite_json_float,
+    reject_nonfinite_json_constant,
+)
 from monoid_agent_kernel.identifiers import namespaced_id
 
 CONFORMANCE_EVIDENCE_VERSION = namespaced_id("conformance-evidence.v1")
-CONFORMANCE_EVIDENCE_MEDIA_TYPE = (
-    "application/vnd.monoid.conformance-evidence.v1+json"
-)
+CONFORMANCE_EVIDENCE_MEDIA_TYPE = "application/vnd.monoid.conformance-evidence.v1+json"
 CONFORMANCE_EVIDENCE_KIND = "minimal-agent-lifecycle"
 MAX_CONFORMANCE_EVIDENCE_BYTES = 8 * 1024 * 1024
 
@@ -168,9 +171,7 @@ class ConformanceTarget:
                 "target adapter_version",
             ),
             source=(
-                ConformanceResource.from_json(
-                    _closed_mapping(source_payload, "target source")
-                )
+                ConformanceResource.from_json(_closed_mapping(source_payload, "target source"))
                 if source_payload is not None
                 else None
             ),
@@ -305,20 +306,14 @@ class ConformanceEvidenceBundle:
             target=ConformanceTarget.from_json(
                 _closed_mapping(parsed["target"], "evidence target")
             ),
-            case_id_sha256=_required_string(
-                case["case_id_sha256"], "evidence case_id_sha256"
-            ),
+            case_id_sha256=_required_string(case["case_id_sha256"], "evidence case_id_sha256"),
             run_id_present=case["run_id_present"],
             submitted=case["submitted"],
-            states=tuple(
-                _optional_string(state, "evidence lifecycle state") for state in states
-            ),
+            states=tuple(_optional_string(state, "evidence lifecycle state") for state in states),
             result_run_id_matches=result["run_id_matches"],
             result_status=_optional_string(result["status"], "evidence result status"),
             events=tuple(
-                ConformanceEvent.from_json(
-                    _closed_mapping(event, "conformance event")
-                )
+                ConformanceEvent.from_json(_closed_mapping(event, "conformance event"))
                 for event in events
             ),
             events_complete=case["events_complete"],
@@ -347,8 +342,7 @@ class ConformanceEvidenceReference:
         if self.resource.media_type != CONFORMANCE_EVIDENCE_MEDIA_TYPE:
             raise ValueError("unsupported conformance evidence media type")
         if any(
-            digest.algorithm not in _KNOWN_DIGEST_HEX_LENGTHS
-            for digest in self.resource.digests
+            digest.algorithm not in _KNOWN_DIGEST_HEX_LENGTHS for digest in self.resource.digests
         ):
             raise ValueError("unsupported conformance evidence digest algorithm")
         if self.resource.size_bytes is None:
@@ -403,9 +397,7 @@ def case_id_sha256(run_id: str) -> str:
 
     if not isinstance(run_id, str):
         raise ValueError("run id must be a string")
-    return hashlib.sha256(
-        b"monoid.conformance.case.v1\0" + run_id.encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(b"monoid.conformance.case.v1\0" + run_id.encode("utf-8")).hexdigest()
 
 
 def serialize_conformance_evidence(
@@ -509,7 +501,14 @@ def verify_conformance_evidence(
 def _load_evidence_json(data: bytes) -> Mapping[str, Any]:
     try:
         text = data.decode("utf-8")
-        payload = json.loads(text, object_pairs_hook=_unique_object)
+        payload = normalize_json_ingress(
+            json.loads(
+                text,
+                object_pairs_hook=_unique_object,
+                parse_constant=reject_nonfinite_json_constant,
+                parse_float=parse_finite_json_float,
+            )
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise ValueError("invalid conformance evidence JSON") from exc
     return _closed_mapping(payload, "conformance evidence")

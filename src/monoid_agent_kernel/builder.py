@@ -7,12 +7,14 @@ from typing import Any
 
 import click
 
+from monoid_agent_kernel._runtime_config_ingress import preflight_runtime_config
 from monoid_agent_kernel.core.agents import (
     AgentDefinition,
     AgentRuntimeConfig,
     ToolBinding,
     collect_runtime_config_issues,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
 from monoid_agent_kernel.subagent_loader import load_subagent_definitions
 from monoid_agent_kernel.tool_loader import load_tool_provider
@@ -30,7 +32,9 @@ def builder_group() -> None:
 @builder_group.command("init")
 @click.option("--target", type=click.Path(path_type=Path), required=True)
 @click.option("--force", is_flag=True, help="Overwrite existing scaffold files.")
-@click.option("--custom-tool-template", is_flag=True, help="Also write a tools.py provider template.")
+@click.option(
+    "--custom-tool-template", is_flag=True, help="Also write a tools.py provider template."
+)
 def builder_init(target: Path, force: bool, custom_tool_template: bool) -> None:
     """Create minimal files for a local monoid run."""
     target.mkdir(parents=True, exist_ok=True)
@@ -102,7 +106,11 @@ def builder_config_validate(
         effective_config = (
             replace(config, tools=config.tools + skill_bindings) if skill_bindings else config
         )
-        issues = registration_issues + collect_runtime_config_issues(effective_config, registry)
+        normalized_config, ingress_issues = preflight_runtime_config(effective_config)
+        issues = registration_issues + ingress_issues
+        if normalized_config is not None:
+            effective_config = normalized_config
+            issues.extend(collect_runtime_config_issues(effective_config, registry))
     except click.ClickException:
         raise
     except Exception as exc:
@@ -117,7 +125,7 @@ def builder_config_validate(
         "issues": issues,
     }
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     elif issues:
         click.echo("invalid")
         for issue in issues:
@@ -183,7 +191,7 @@ def builder_tools_list(
     ]
     payload = {"tools": tools}
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         return
 
     for tool in tools:
@@ -196,7 +204,9 @@ def _load_agent_runtime_config(
     agent_definition_file: Path | None,
 ) -> AgentRuntimeConfig:
     if runtime_config_file is not None and agent_definition_file is not None:
-        raise click.ClickException("--runtime-config-file and --agent-definition-file are mutually exclusive")
+        raise click.ClickException(
+            "--runtime-config-file and --agent-definition-file are mutually exclusive"
+        )
     if runtime_config_file is None and agent_definition_file is None:
         raise click.ClickException("--runtime-config-file or --agent-definition-file is required")
     if runtime_config_file is not None:
@@ -204,7 +214,7 @@ def _load_agent_runtime_config(
 
     assert agent_definition_file is not None
     try:
-        payload = json.loads(agent_definition_file.read_text(encoding="utf-8"))
+        payload = loads_json_ingress(agent_definition_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise click.ClickException(f"invalid agent config JSON: {exc.msg}") from exc
     try:
@@ -215,7 +225,7 @@ def _load_agent_runtime_config(
 
 def _load_runtime_config_file(path: Path) -> AgentRuntimeConfig:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = loads_json_ingress(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise click.ClickException(f"invalid agent config JSON: {exc.msg}") from exc
     try:
@@ -255,7 +265,11 @@ def _build_tool_registry(
     if subagents:
         _register_many(
             registry,
-            [agent_spawn_tool({name: definition.description for name, definition in subagents.items()})],
+            [
+                agent_spawn_tool(
+                    {name: definition.description for name, definition in subagents.items()}
+                )
+            ],
             issues,
         )
 
@@ -328,7 +342,7 @@ def _default_run_spec() -> dict[str, Any]:
 
 
 def _pretty_json(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    return json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
 
 
 _CUSTOM_TOOLS_TEMPLATE = '''from __future__ import annotations

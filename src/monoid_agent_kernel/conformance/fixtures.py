@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from importlib.resources import files
 from typing import Any
+
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 
 
 @dataclass(frozen=True)
@@ -20,7 +21,7 @@ def load_compatibility_fixtures() -> tuple[CompatibilityFixture, ...]:
     resource = files("monoid_agent_kernel.conformance").joinpath(
         "fixtures", "compatibility-v1.json"
     )
-    payload = json.loads(resource.read_text(encoding="utf-8"))
+    payload = loads_json_ingress(resource.read_text(encoding="utf-8"))
     if payload.get("schema_version") != "monoid.conformance-fixtures.v1":
         raise ValueError("unsupported conformance fixture schema")
     return tuple(

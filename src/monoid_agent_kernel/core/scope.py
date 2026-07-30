@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
@@ -68,7 +69,9 @@ def domain_patterns_within(requested: Iterable[str], signed: Iterable[str]) -> b
     if "*" in signed_patterns:
         return True
     for pattern in _domain_tuple(requested):
-        if not any(_domain_pattern_within(pattern, signed_pattern) for signed_pattern in signed_patterns):
+        if not any(
+            _domain_pattern_within(pattern, signed_pattern) for signed_pattern in signed_patterns
+        ):
             return False
     return True
 
@@ -138,8 +141,11 @@ def _apply_numeric_cap(scope: Mapping[str, Any], payload: dict[str, Any], key: s
 def _positive_number(value: Any, *, key: str, reason: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ScopePolicyError(key, reason, f"{key} must be positive")
-    number = float(value)
-    if number <= 0:
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ScopePolicyError(key, reason, f"{key} must be positive") from exc
+    if not math.isfinite(number) or number <= 0:
         raise ScopePolicyError(key, reason, f"{key} must be positive")
     return number
 
@@ -153,7 +159,14 @@ def _numeric_cap_within(inner_val: Any, outer_val: Any) -> bool:
         return False
     if not isinstance(inner_val, int | float) or not isinstance(outer_val, int | float):
         return False
-    return float(inner_val) <= float(outer_val)
+    try:
+        inner_number = float(inner_val)
+        outer_number = float(outer_val)
+    except (OverflowError, ValueError):
+        return False
+    return (
+        math.isfinite(inner_number) and math.isfinite(outer_number) and inner_number <= outer_number
+    )
 
 
 def _domain_pattern_within(pattern: str, signed_pattern: str) -> bool:
@@ -167,7 +180,11 @@ def _domain_pattern_within(pattern: str, signed_pattern: str) -> bool:
         return True
     if pattern.startswith("*."):
         suffix = pattern[2:].strip(".")
-        return bool(suffix) and signed_pattern.startswith("*.") and domain_matches(suffix, signed_pattern)
+        return (
+            bool(suffix)
+            and signed_pattern.startswith("*.")
+            and domain_matches(suffix, signed_pattern)
+        )
     return domain_matches(pattern, signed_pattern)
 
 

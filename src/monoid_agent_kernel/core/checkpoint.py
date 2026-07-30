@@ -16,8 +16,6 @@ observations, content parts, runtime config and hosted tasks live in the loop's
 
 from __future__ import annotations
 
-import json
-import math
 import shutil
 import time
 from collections.abc import Callable, Mapping
@@ -27,12 +25,22 @@ from typing import Any, Protocol
 
 from monoid_agent_kernel.core._util import file_lock, sha256_bytes, write_json_atomic
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
+from monoid_agent_kernel.core.json_ingress import is_finite_json_number, loads_json_ingress
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 SCHEMA_VERSION = namespaced_id("checkpoint.v1")
 ACCEPTED_SCHEMA_VERSIONS = accepted_namespaced_ids("checkpoint.v1")
 
 CHECKPOINT_FILENAME = "checkpoint.json"
+
+
+def _checkpoint_pointer_seq(pointer: Any) -> int:
+    if not isinstance(pointer, dict) or "seq" not in pointer:
+        raise ValueError("checkpoint latest pointer must contain seq")
+    sequence = pointer["seq"]
+    if type(sequence) is not int or sequence < 0:
+        raise ValueError("checkpoint latest pointer seq must be a non-negative integer")
+    return sequence
 
 
 @dataclass
@@ -200,12 +208,7 @@ def _require_nonnegative_int(value: object, field_name: str) -> None:
 
 
 def _require_finite_nonnegative_number(value: object, field_name: str) -> None:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        or value < 0
-    ):
+    if not is_finite_json_number(value) or value < 0:
         raise ValueError(f"checkpoint {field_name} must be a finite non-negative number")
 
 
@@ -359,7 +362,7 @@ def read_checkpoint_checked(run_dir: Path) -> DurableLoadResult[RunCheckpoint]:
     except OSError:
         return CHECKPOINT_CODEC.corrupt("checkpoint file could not be read")
     try:
-        payload = json.loads(raw)
+        payload = loads_json_ingress(raw)
     except ValueError:
         return CHECKPOINT_CODEC.corrupt("checkpoint file is not valid JSON")
     return decode_checkpoint(payload)
@@ -502,6 +505,7 @@ def load_latest_checked(store: CheckpointStore, run_id: str) -> DurableLoadResul
         run_id,
     )
 
+
 @dataclass
 class LocalFsCheckpointStore:
     """Default local-filesystem store. Layout under ``run_root/<run_id>/checkpoints/``:
@@ -525,7 +529,9 @@ class LocalFsCheckpointStore:
         # Serialize puts for this run across processes: without it, two writers could interleave
         # blob writes and LATEST flips and tear a checkpoint.
         cdir.mkdir(parents=True, exist_ok=True)
-        with file_lock(cdir / ".put.lock", timeout_s=self.lock_timeout_s, stale_s=self.lock_stale_s):
+        with file_lock(
+            cdir / ".put.lock", timeout_s=self.lock_timeout_s, stale_s=self.lock_stale_s
+        ):
             # 0) GC orphaned blob temp files left by a crashed prior write (no LATEST was
             #    flipped for them, so they are pure dead weight).
             self._gc_blob_tmp(cdir)
@@ -558,7 +564,9 @@ class LocalFsCheckpointStore:
         cdir = self._dir(run_id)
         blobs_dir = cdir / "blobs"
         blobs_dir.mkdir(parents=True, exist_ok=True)
-        with file_lock(cdir / ".put.lock", timeout_s=self.lock_timeout_s, stale_s=self.lock_stale_s):
+        with file_lock(
+            cdir / ".put.lock", timeout_s=self.lock_timeout_s, stale_s=self.lock_stale_s
+        ):
             target = blobs_dir / sha
             if not target.exists():
                 tmp = target.with_suffix(".tmp")
@@ -579,7 +587,9 @@ class LocalFsCheckpointStore:
 
     def run_metadata(self, run_id: str) -> dict[str, Any] | None:
         try:
-            payload = json.loads((self._dir(run_id) / "run_meta.json").read_text(encoding="utf-8"))
+            payload = loads_json_ingress(
+                (self._dir(run_id) / "run_meta.json").read_text(encoding="utf-8")
+            )
         except (FileNotFoundError, ValueError, OSError):
             return None
         if not isinstance(payload, dict) or payload.get("run_id") != run_id:
@@ -601,14 +611,16 @@ class LocalFsCheckpointStore:
         except OSError:
             return RUN_METADATA_CODEC.corrupt("backend-run metadata could not be read")
         try:
-            payload = json.loads(raw)
+            payload = loads_json_ingress(raw)
         except ValueError:
             return RUN_METADATA_CODEC.corrupt("backend-run metadata is not valid JSON")
         return bind_run_metadata_result(decode_run_metadata(payload), run_id)
 
     def _read_latest_seq(self, cdir: Path) -> int:
         try:
-            return int(json.loads((cdir / "LATEST").read_text(encoding="utf-8"))["seq"])
+            return _checkpoint_pointer_seq(
+                loads_json_ingress((cdir / "LATEST").read_text(encoding="utf-8"))
+            )
         except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
             return -1
 
@@ -639,9 +651,11 @@ class LocalFsCheckpointStore:
         manifest: dict[str, Any] | None = None
         for attempt in range(4):
             try:
-                pointer = json.loads((cdir / "LATEST").read_text(encoding="utf-8"))
-                seq = int(pointer["seq"])
-                manifest = json.loads((cdir / str(seq) / "manifest.json").read_text(encoding="utf-8"))
+                pointer = loads_json_ingress((cdir / "LATEST").read_text(encoding="utf-8"))
+                seq = _checkpoint_pointer_seq(pointer)
+                manifest = loads_json_ingress(
+                    (cdir / str(seq) / "manifest.json").read_text(encoding="utf-8")
+                )
                 break
             except (ValueError, OSError, KeyError, TypeError):
                 manifest = None

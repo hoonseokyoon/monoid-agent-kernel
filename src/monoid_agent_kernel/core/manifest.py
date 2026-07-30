@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from monoid_agent_kernel.core._util import utc_timestamp
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -33,7 +34,7 @@ class RunManifest:
     workspace_index_path: str = "workspace.index.json"
 
     def to_json(self) -> dict[str, Any]:
-        return asdict(self)
+        return normalize_json_ingress(asdict(self))
 
 
 def build_run_manifest(

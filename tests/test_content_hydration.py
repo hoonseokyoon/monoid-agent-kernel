@@ -82,7 +82,9 @@ def test_present_text_is_never_overwritten_on_a_mixed_page(tmp_path: Path) -> No
     mutant that deleted the fill loop's guard.
     """
     digest = _write_record(tmp_path, "the model wrote this")
-    kernel = _event(status="limited", final_text="Stopped after reaching max steps.", final_text_digest=digest)
+    kernel = _event(
+        status="limited", final_text="Stopped after reaching max steps.", final_text_digest=digest
+    )
     needs_fill = _event(status="completed", final_text_digest=digest)
     events = [kernel, needs_fill]
 
@@ -192,6 +194,35 @@ def test_a_torn_utf8_sequence_does_not_fail_the_read(tmp_path: Path) -> None:
     assert events[0]["data"]["final_text"] == "survived the tear"
 
 
+def test_legacy_surrogate_text_is_repaired_and_nonfinite_lines_are_skipped(
+    tmp_path: Path,
+) -> None:
+    repaired = "legacy\ufffdtext"
+    digest = content_digest(repaired)
+    records = [
+        {
+            "kind": "settled_text",
+            "final_text": "ignored",
+            "final_text_digest": digest,
+            "score": float("nan"),
+        },
+        {
+            "kind": "settled_text",
+            "final_text": "legacy\ud800text",
+            "final_text_digest": digest,
+        },
+    ]
+    (tmp_path / "transcript.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert events[0]["data"]["final_text"] == repaired
+
+
 def test_a_record_whose_text_does_not_match_its_digest_is_refused(tmp_path: Path) -> None:
     """The digest names the content, so the join verifies rather than trusts.
 
@@ -216,7 +247,9 @@ def test_malformed_event_shapes_are_skipped(tmp_path: Path) -> None:
     hydrate_settled_text({"events": []}, tmp_path)
 
 
-def test_the_transcript_is_not_opened_when_nothing_wants_text(tmp_path: Path, monkeypatch: Any) -> None:
+def test_the_transcript_is_not_opened_when_nothing_wants_text(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
     """Today every event still carries its text, so this is the only path taken in production.
 
     Asserted rather than assumed: a resolver that ran unconditionally would read the transcript on
@@ -379,9 +412,7 @@ def _completed_run(tmp_path: Path) -> tuple[RunnerBackend, Any]:
 
 def _settled_texts(events: list[dict[str, Any]]) -> list[str | None]:
     return [
-        event["data"].get("final_text")
-        for event in events
-        if event.get("type") in SETTLE_TYPES
+        event["data"].get("final_text") for event in events if event.get("type") in SETTLE_TYPES
     ]
 
 

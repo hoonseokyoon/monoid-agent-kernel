@@ -19,6 +19,11 @@ from monoid_agent_kernel.conformance.provenance import (
     ConformanceTarget,
 )
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
+from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
+    normalize_json_ingress,
+    parse_finite_json_float,
+)
 from monoid_agent_kernel.identifiers import namespaced_id
 
 CONFORMANCE_REPORT_V1 = namespaced_id("conformance-report.v1")
@@ -461,10 +466,13 @@ def read_conformance_report(
                 data.extend(chunk)
         if len(data) > max_bytes:
             return _CONFORMANCE_REPORT_CODEC.corrupt("conformance report exceeds the byte limit")
-        payload = json.loads(
-            data.decode("utf-8"),
-            object_pairs_hook=_unique_json_object,
-            parse_constant=_reject_json_constant,
+        payload = normalize_json_ingress(
+            json.loads(
+                data.decode("utf-8"),
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+                parse_float=parse_finite_json_float,
+            )
         )
     except FileNotFoundError:
         return _CONFORMANCE_REPORT_CODEC.missing()
@@ -694,7 +702,7 @@ def _nonnegative_int(value: Any, label: str) -> int:
 
 
 def _nonnegative_number(value: Any, label: str) -> float:
-    if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+    if not is_finite_json_number(value) or value < 0:
         raise ValueError(f"{label} must be a finite non-negative number")
     return float(value)
 

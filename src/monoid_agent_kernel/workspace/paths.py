@@ -4,6 +4,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
+from monoid_agent_kernel.core.json_ingress import normalize_unicode_scalars
 from monoid_agent_kernel.errors import WorkspaceError
 
 _WINDOWS_INVALID_CHARS = frozenset('<>:"|?*')
@@ -48,7 +49,7 @@ def _validate_workspace_segment(part: str, raw: str | None) -> None:
 
 
 def normalize_workspace_path(raw: str | None) -> str:
-    value = "." if raw is None or raw == "" else raw.replace("\\", "/")
+    value = "." if raw is None or raw == "" else normalize_unicode_scalars(raw).replace("\\", "/")
     if value.startswith("/") or (len(value) >= 2 and value[1] == ":"):
         raise WorkspaceError(f"absolute paths are not allowed: {raw!r}")
     pure = PurePosixPath(value)
@@ -69,4 +70,3 @@ def is_within(root: Path, candidate: Path) -> bool:
     except ValueError:
         return False
     return os.path.commonpath([str(root), str(candidate)]) == str(root)
-

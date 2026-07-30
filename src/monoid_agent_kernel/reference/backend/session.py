@@ -10,10 +10,15 @@ from typing import Any
 from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.content import content_part_to_json
 from monoid_agent_kernel.core.inbox import InboxMessage
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.core.media import normalize_inline_media_dicts
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.reference._shared.tokens import TokenError
-from monoid_agent_kernel.reference.backend.ports import LoopPort, MutableRunRecordPort, TokenClaimsPort
+from monoid_agent_kernel.reference.backend.ports import (
+    LoopPort,
+    MutableRunRecordPort,
+    TokenClaimsPort,
+)
 from monoid_agent_kernel.reference.backend.run_state import (
     record_lifecycle_payload as _record_lifecycle_payload,
 )
@@ -21,13 +26,16 @@ from monoid_agent_kernel.reference.backend.run_state import (
 
 def _normalize_inbound_message(content: str | Sequence[Any]) -> str | list[dict[str, Any]]:
     if isinstance(content, str):
-        return content
+        return normalize_unicode_scalars(content)
     parts: list[dict[str, Any]] = []
     for item in content:
         parts.append(item if isinstance(item, dict) else content_part_to_json(item))
     if not parts:
         raise ValueError("message has no content")
-    return parts
+    normalized = normalize_json_ingress(parts)
+    if not isinstance(normalized, list):  # pragma: no cover - list topology is retained
+        raise ValueError("message content must be an array")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -156,33 +164,38 @@ class BackendSessionService:
     ) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
+        message_id = normalize_unicode_scalars(message_id)
         if message_id and message_id in record.seen_inbox_ids:
             return {"run_id": run_id, "status": "duplicate", "message_id": message_id}
         message = _normalize_inbound_message(content)
         checkpoint_store = self._context.checkpoint_store_provider()
+        pending: dict[str, bytes] = {}
         if isinstance(message, list) and checkpoint_store is not None:
-            pending: dict[str, bytes] = {}
             message = normalize_inline_media_dicts(message, pending)
-            for data in pending.values():
-                checkpoint_store.put_blob(run_id, data)
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise ValueError("message metadata must be an object or null")
         envelope = InboxMessage(
             content=message,
             id=message_id or f"inbox_{uuid.uuid4().hex[:12]}",
-            source=source,
-            type=message_type,
+            source=normalize_unicode_scalars(source),
+            type=normalize_unicode_scalars(message_type),
             run_id=run_id,
-            correlation_id=correlation_id,
-            causation_id=causation_id,
-            traceparent=traceparent,
-            tracestate=tracestate,
-            metadata=dict(metadata or {}),
+            correlation_id=normalize_unicode_scalars(correlation_id),
+            causation_id=normalize_unicode_scalars(causation_id),
+            traceparent=normalize_unicode_scalars(traceparent),
+            tracestate=normalize_unicode_scalars(tracestate),
+            metadata=normalize_json_ingress(dict(metadata or {})),
         )
-        wire_bytes = len(json.dumps(envelope.to_json()).encode("utf-8"))
+        envelope_payload = normalize_json_ingress(envelope.to_json())
+        wire_bytes = len(json.dumps(envelope_payload, allow_nan=False).encode("utf-8"))
         max_message_bytes = self._context.max_message_bytes_provider()
         if wire_bytes > max_message_bytes:
             raise ValueError(f"message exceeds the {max_message_bytes}-byte limit")
         self._context.ensure_message_enqueue_allowed(record)
-        self._context.enqueue_message_and_checkpoint(record, envelope.to_json())
+        if checkpoint_store is not None:
+            for data in pending.values():
+                checkpoint_store.put_blob(run_id, data)
+        self._context.enqueue_message_and_checkpoint(record, envelope_payload)
         return {"run_id": run_id, "status": "queued", "message_id": envelope.id}
 
     def report_task_result(
@@ -237,7 +250,9 @@ class BackendSessionService:
         meta = self._context.read_recovery_meta(run_dir, run_id)
         if meta is None:
             raise KeyError(f"unknown run: {run_id}")
-        if claims.tenant_id != (meta.get("tenant_id") or "") or claims.user_id != (meta.get("user_id") or ""):
+        if claims.tenant_id != (meta.get("tenant_id") or "") or claims.user_id != (
+            meta.get("user_id") or ""
+        ):
             raise PermissionDenied("token subject mismatch")
         if (run_dir / "failure.json").exists():
             raise ValueError("run is marked unrecoverable; inspect failure.json")
@@ -273,7 +288,9 @@ class BackendSessionService:
 
     def authorize_claim_subject(self, run_id: str, claims: TokenClaimsPort) -> None:
         record = self._context.active_record(run_id)
-        if record is not None and (claims.tenant_id != record.tenant_id or claims.user_id != record.user_id):
+        if record is not None and (
+            claims.tenant_id != record.tenant_id or claims.user_id != record.user_id
+        ):
             raise PermissionDenied("token subject mismatch")
 
     def verify_task_callback_token(self, run_id: str, token: str, task_id: str) -> None:

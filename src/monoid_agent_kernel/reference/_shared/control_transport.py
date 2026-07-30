@@ -12,6 +12,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from monoid_agent_kernel.core.json_ingress import (
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -161,11 +165,34 @@ def command_identity_sha256(
 ) -> str:
     """Canonical semantic identity used to reject conflicting command-ID reuse."""
 
+    if not isinstance(command_type, str):
+        raise ValueError("command type must be a string")
+    if not isinstance(args, dict):
+        raise ValueError("command args must be an object")
+    if not isinstance(principal, CommandPrincipal):
+        raise ValueError("command principal must be a CommandPrincipal")
+    if not all(
+        isinstance(value, str)
+        for value in (principal.tenant_id, principal.user_id, principal.issuer, reason)
+    ):
+        raise ValueError("command principal and reason fields must be strings")
+    normalized_args = normalize_json_ingress(sanitize_command_args(command_type, args))
+    assert isinstance(normalized_args, dict)
     payload = {
-        "type": command_type,
-        "args": sanitize_command_args(command_type, args),
-        "principal": principal.to_json(),
-        "reason": reason,
+        "type": normalize_unicode_scalars(command_type),
+        "args": normalized_args,
+        "principal": {
+            "tenant_id": normalize_unicode_scalars(principal.tenant_id),
+            "user_id": normalize_unicode_scalars(principal.user_id),
+            "issuer": normalize_unicode_scalars(principal.issuer),
+        },
+        "reason": normalize_unicode_scalars(reason),
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

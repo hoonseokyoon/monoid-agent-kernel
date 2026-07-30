@@ -13,6 +13,11 @@ from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
     diagnostic_event_summary,
 )
+from monoid_agent_kernel.core.json_ingress import (
+    loads_json_ingress,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.core.lifecycle import (
     lifecycle_from_status_artifact,
     session_state_value,
@@ -45,7 +50,7 @@ class EventPageReader(Protocol):
 
 def _read_optional_json(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = loads_json_ingress(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -68,9 +73,18 @@ def _trace_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
 def _json_safe(value: Any) -> Any:
     """Render a value safe for JSON wire projection at any nesting depth."""
     try:
-        return json.loads(json.dumps(value, default=repr))
+        return loads_json_ingress(
+            json.dumps(
+                normalize_json_ingress(value),
+                default=repr,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+    except RecursionError:
+        return "<value exceeds JSON nesting limit>"
     except (TypeError, ValueError):
-        return repr(value)
+        return normalize_unicode_scalars(repr(value))
 
 
 def _status_payload_lifecycle(
@@ -110,7 +124,7 @@ class RunProjectionService:
         status_payload: dict[str, Any] | None = None
         if status_file.exists():
             # Resilient read: the run may be concurrently flipping status.json via atomic replace.
-            status_payload = json.loads(read_text_resilient(status_file))
+            status_payload = loads_json_ingress(read_text_resilient(status_file))
         record = self._context.active_record(run_id)
         if record is None:
             return {
@@ -153,7 +167,9 @@ class RunProjectionService:
                 "error_code": record.error_code,
             }
         result = record.result
-        diff_text = result.diff_path.read_text(encoding="utf-8") if result.diff_path.exists() else ""
+        diff_text = (
+            result.diff_path.read_text(encoding="utf-8") if result.diff_path.exists() else ""
+        )
         proposal_payload = read_proposal_snapshot(record)
         return {
             "run_id": record.run_id,
@@ -179,7 +195,9 @@ class RunProjectionService:
         self, run_id: str, token: str, *, from_seq: int = 0, limit: int | None = None
     ) -> dict[str, Any]:
         run_dir = self._context.authorized_run_dir(run_id, token)
-        page = self._context.read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=limit)
+        page = self._context.read_event_page(
+            run_dir / "events.jsonl", from_seq=from_seq, limit=limit
+        )
         # One seam for every consumer that reads events through the backend: the REST and SSE
         # twins on reference/backend/http.py, the Studio BFF's read_page, and `monoid studio
         # accept`. Hydrating at those call sites instead would leave each new transport to
@@ -202,16 +220,16 @@ class RunProjectionService:
         except ValueError as exc:
             raise PermissionDenied(str(exc)) from exc
         run_dir = self._context.run_root_provider() / descendant_run_id
-        page = self._context.read_event_page(run_dir / "events.jsonl", from_seq=from_seq, limit=limit)
+        page = self._context.read_event_page(
+            run_dir / "events.jsonl", from_seq=from_seq, limit=limit
+        )
         # The descendant feed hydrates from the *child's* run dir, and it has to happen here:
         # Studio cannot reach a child run dir at all (`_token_for` raises for an id it never
         # issued a token for), which is why this endpoint exists in the first place.
         hydrate_settled_text(page.get("events"), run_dir)
         return {"run_id": descendant_run_id, **page}
 
-    def descendant_status(
-        self, run_id: str, token: str, descendant_run_id: str
-    ) -> dict[str, Any]:
+    def descendant_status(self, run_id: str, token: str, descendant_run_id: str) -> dict[str, Any]:
         """Read descendant lifecycle after authorizing its root ancestor."""
 
         self._context.authorize_run(run_id, token)
@@ -241,7 +259,9 @@ class RunProjectionService:
             raise ValueError("event_limit must be positive")
         run_dir = self._context.authorized_run_dir(run_id, token)
         status = self.status(run_id, token)
-        status_file = status.get("status_file") if isinstance(status.get("status_file"), dict) else {}
+        status_file = (
+            status.get("status_file") if isinstance(status.get("status_file"), dict) else {}
+        )
         from_seq = _RUN_EVENT_SEQUENCER.diagnostics_from_seq(
             status,
             status_file,
@@ -254,7 +274,9 @@ class RunProjectionService:
         )
         event_summaries = [_diagnostic_event_summary(event) for event in event_page["events"]]
         control_events = [
-            event for event in event_summaries if str(event.get("type") or "").startswith("control.command.")
+            event
+            for event in event_summaries
+            if str(event.get("type") or "").startswith("control.command.")
         ]
         failure = _read_optional_json(run_dir / "failure.json")
         recover_attempts = self._context.read_recover_attempts(run_dir)
@@ -308,13 +330,17 @@ class RunProjectionService:
                 status_path = run_dir / "status.json"
                 if status_path.exists():
                     try:
-                        payload = json.loads(read_text_resilient(status_path))
+                        payload = loads_json_ingress(read_text_resilient(status_path))
                         status_payload = payload if isinstance(payload, dict) else None
                     except (ValueError, OSError):
                         status_payload = None
                 lifecycle = _status_payload_lifecycle(status_payload, run_dir)
             recoverable = False
-            if record is None and not (run_dir / "failure.json").exists() and checkpoint_store is not None:
+            if (
+                record is None
+                and not (run_dir / "failure.json").exists()
+                and checkpoint_store is not None
+            ):
                 stored = checkpoint_store.latest(run_id)
                 recoverable = stored is not None and not stored.checkpoint.terminal
             runs.append(

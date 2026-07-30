@@ -22,6 +22,8 @@ from urllib import request as urlrequest
 
 import click
 
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+
 from monoid_agent_kernel.core.model_io import content_digest
 from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.reference.studio import window
@@ -39,14 +41,21 @@ from monoid_agent_kernel.reference.studio.server import (
 from monoid_agent_kernel.reference.studio.window import open_app_window
 
 
-def _http_json(url: str, *, method: str = "GET", payload: dict | None = None, timeout: float = 5.0) -> dict:
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
+def _http_json(
+    url: str, *, method: str = "GET", payload: dict | None = None, timeout: float = 5.0
+) -> dict:
+    data = None if payload is None else json.dumps(payload, allow_nan=False).encode("utf-8")
     req = urlrequest.Request(url, data=data, method=method)
     if payload is not None:
         req.add_header("Content-Type", "application/json")
     with urlrequest.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
-    return json.loads(raw) if raw else {}
+    if not raw:
+        return {}
+    payload = loads_json_ingress(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("Studio response must be a JSON object")
+    return payload
 
 
 def _http_text(url: str, *, timeout: float = 5.0) -> str:
@@ -92,12 +101,18 @@ def run_acceptance(
         cfg = _http_json(f"{base_url}/api/config")
         check("config-route", cfg.get("offline") is True and cfg.get("provider") == "offline")
         settings = _http_json(f"{base_url}/api/settings")
-        check("settings-route", bool(settings.get("available")) and "read" in settings.get("capabilities", []))
+        check(
+            "settings-route",
+            bool(settings.get("available")) and "read" in settings.get("capabilities", []),
+        )
         catalog = _http_json(f"{base_url}/api/capabilities-catalog")
         check("capabilities-catalog-route", "skills" in catalog and "mcp_tools" in catalog)
         profiles = _http_json(f"{base_url}/api/profiles")
         default_profile = str(profiles.get("default_profile_id") or "default")
-        check("profiles-route", any(p.get("id") == default_profile for p in profiles.get("profiles", [])))
+        check(
+            "profiles-route",
+            any(p.get("id") == default_profile for p in profiles.get("profiles", [])),
+        )
         before_sessions = _http_json(f"{base_url}/api/sessions?profile_id={default_profile}")
         check("profile-sessions-route", before_sessions.get("profile_id") == default_profile)
         chat = _http_json(
@@ -134,8 +149,12 @@ def run_acceptance(
             bool(settled_digest) and settled_digest == content_digest(final_text),
             settled_digest[:16],
         )
-        transcript = _http_json(f"{base_url}/api/chat-transcript?run_id={quote(run_id)}") if run_id else {}
-        transcript_messages = transcript.get("messages") if isinstance(transcript.get("messages"), list) else []
+        transcript = (
+            _http_json(f"{base_url}/api/chat-transcript?run_id={quote(run_id)}") if run_id else {}
+        )
+        transcript_messages = (
+            transcript.get("messages") if isinstance(transcript.get("messages"), list) else []
+        )
         transcript_roles = [str(message.get("role") or "") for message in transcript_messages]
         check(
             "chat-transcript",
@@ -148,7 +167,10 @@ def run_acceptance(
         scoped_sessions = _http_json(f"{base_url}/api/sessions?profile_id={default_profile}")
         check(
             "profile-history",
-            any(s.get("run_id") == run_id and s.get("profile_id") == default_profile for s in scoped_sessions.get("sessions", [])),
+            any(
+                s.get("run_id") == run_id and s.get("profile_id") == default_profile
+                for s in scoped_sessions.get("sessions", [])
+            ),
         )
         ok = all(item["ok"] for item in checks)
         return {
@@ -297,9 +319,17 @@ def studio_serve(
     """Start the Studio server and keep it running (window is detachable)."""
     server = StudioServer(
         _studio_config(
-            workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
-            skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
-            env_file=env_file, no_env_file=no_env_file, no_output_deltas=no_output_deltas,
+            workspace=workspace,
+            host=host,
+            port=port,
+            provider=provider,
+            run_root=run_root,
+            skills_directory=skills_directory,
+            no_skills=no_skills,
+            mcp=mcp,
+            env_file=env_file,
+            no_env_file=no_env_file,
+            no_output_deltas=no_output_deltas,
         )
     )
     url = server.start()
@@ -336,9 +366,17 @@ def studio_app(
     """Start the server and a desktop window; closing the window stops the server."""
     server = StudioServer(
         _studio_config(
-            workspace=workspace, host=host, port=port, provider=provider, run_root=run_root,
-            skills_directory=skills_directory, no_skills=no_skills, mcp=mcp,
-            env_file=env_file, no_env_file=no_env_file, no_output_deltas=no_output_deltas,
+            workspace=workspace,
+            host=host,
+            port=port,
+            provider=provider,
+            run_root=run_root,
+            skills_directory=skills_directory,
+            no_skills=no_skills,
+            mcp=mcp,
+            env_file=env_file,
+            no_env_file=no_env_file,
+            no_output_deltas=no_output_deltas,
         )
     )
     url = server.start()
@@ -402,7 +440,7 @@ def studio_accept(
         host=host,
         timeout_s=timeout_s,
     )
-    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    click.echo(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
     if not result.get("ok"):
         raise SystemExit(1)
 
@@ -496,7 +534,11 @@ def studio_doctor(
         report(True, f"port {host}:{port} is free")
     else:
         hard_failures += 1
-        report(False, f"port {host}:{port} is in use", "stop the process using it or pass --port <other>")
+        report(
+            False,
+            f"port {host}:{port} is in use",
+            "stop the process using it or pass --port <other>",
+        )
 
     for label, directory in (("workspace", workspace), ("run root", run_root)):
         if _dir_writable(directory):
@@ -511,7 +553,11 @@ def studio_doctor(
             report(True, f"OPENAI_API_KEY is set{source}")
         else:
             hard_failures += 1
-            report(False, "OPENAI_API_KEY is not set", "export OPENAI_API_KEY=... or use --provider offline")
+            report(
+                False,
+                "OPENAI_API_KEY is not set",
+                "export OPENAI_API_KEY=... or use --provider offline",
+            )
         if _openai_sdk_importable():
             report(True, "the openai SDK is installed")
         else:
@@ -571,12 +617,20 @@ def studio_doctor(
     if window.find_chromium() is not None:
         report(True, "a Chromium-family browser is available")
     else:
-        report(None, "no Chromium browser found", "install Chrome/Edge, or use 'studio serve' and open the URL manually")
+        report(
+            None,
+            "no Chromium browser found",
+            "install Chrome/Edge, or use 'studio serve' and open the URL manually",
+        )
 
     if _otel_export_importable():
         report(True, "OpenTelemetry SDK + OTLP exporter are importable")
     else:
-        report(None, "OTel export deps not installed", "pip install 'monoid-agent-kernel[otel-export]' (only needed for the OTel toggle)")
+        report(
+            None,
+            "OTel export deps not installed",
+            "pip install 'monoid-agent-kernel[otel-export]' (only needed for the OTel toggle)",
+        )
 
     click.echo("")
     if hard_failures:

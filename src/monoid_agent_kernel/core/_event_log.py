@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO
+
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 
 _REVERSE_READ_SIZE = 64 * 1024
 
@@ -142,7 +143,9 @@ def read_committed_event_payloads(path: Path) -> CommittedEventRead:
     except EventLogCorruption as exc:
         return CommittedEventRead(payloads=payloads, corruption=str(exc))
     except OSError as exc:
-        return CommittedEventRead(payloads=payloads, corruption=f"event log could not be read: {exc}")
+        return CommittedEventRead(
+            payloads=payloads, corruption=f"event log could not be read: {exc}"
+        )
     return CommittedEventRead(payloads=payloads, corruption="")
 
 
@@ -242,22 +245,18 @@ def iter_open_committed_jsonl_records(
         if end_offset is not None and byte_offset >= end_offset:
             return
         raw_record = (
-            handle.readline()
-            if end_offset is None
-            else handle.readline(end_offset - byte_offset)
+            handle.readline() if end_offset is None else handle.readline(end_offset - byte_offset)
         )
         if not raw_record:
             if end_offset is not None and byte_offset < end_offset:
                 raise EventLogChanged(
-                    f"event log ended before the committed boundary: {path} "
-                    f"at byte {byte_offset}"
+                    f"event log ended before the committed boundary: {path} at byte {byte_offset}"
                 )
             return
         if not raw_record.endswith(b"\n"):
             if end_offset is not None:
                 raise EventLogChanged(
-                    f"event log changed within the committed boundary: {path} "
-                    f"at byte {byte_offset}"
+                    f"event log changed within the committed boundary: {path} at byte {byte_offset}"
                 )
             return
         next_byte_offset = handle.tell()
@@ -437,9 +436,7 @@ def _inspect_open_committed_jsonl_tail(
         committed_end,
     )
     inspected_bytes += record_bytes
-    record_sha256 = (
-        "" if raw_record is None else hashlib.sha256(raw_record + b"\n").hexdigest()
-    )
+    record_sha256 = "" if raw_record is None else hashlib.sha256(raw_record + b"\n").hexdigest()
     return (
         CommittedJsonlTail(
             device=stat.st_dev,
@@ -528,7 +525,7 @@ def _decode_event_record(path: Path, byte_offset: int, raw_record: bytes) -> dic
             f"committed event log record is not valid UTF-8: {path} at byte {byte_offset}"
         ) from exc
     try:
-        payload = json.loads(text)
+        payload = loads_json_ingress(text)
     except (ValueError, RecursionError) as exc:
         raise EventLogCorruption(
             f"committed event log record is not valid JSON: {path} at byte {byte_offset}"

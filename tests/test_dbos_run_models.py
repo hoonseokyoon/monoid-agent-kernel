@@ -57,6 +57,17 @@ def test_dbos_resume_command_identity_is_retry_stable_and_round_trips() -> None:
     assert first.checkpoint_marker == retry.checkpoint_marker
 
 
+@pytest.mark.parametrize("invalid", [True, "1", float("nan"), float("inf"), 10**400])
+def test_dbos_resume_command_rejects_invalid_created_at(invalid: object) -> None:
+    with pytest.raises(ValueError, match="created_at must be a finite number"):
+        DbosResumeCommand("run_1", "resume_1", 7, created_at=invalid)  # type: ignore[arg-type]
+
+    payload = DbosResumeCommand("run_1", "resume_1", 7, created_at=1.0).to_json()
+    payload["created_at"] = invalid
+    with pytest.raises(ValueError, match="created_at must be a finite number"):
+        DbosResumeCommand.from_json(payload)
+
+
 def test_dbos_run_receipt_reconstructs_exact_durable_boundary() -> None:
     command = DbosResumeCommand("run_1", "resume_1", 4)
     suspension = Suspension(
@@ -107,14 +118,14 @@ def test_old_dbos_resume_reconstructs_its_own_boundary_after_newer_input() -> No
             old_command.checkpoint_marker: {
                 "checkpoint_seq": 5,
                 "checkpoint_sha256": "a" * 64,
-                    "state": "awaiting_input",
+                "state": "awaiting_input",
                 "terminal": False,
                 "suspension": suspension_checkpoint_payload(old_suspension),
             },
             new_command.checkpoint_marker: {
                 "checkpoint_seq": 6,
                 "checkpoint_sha256": "b" * 64,
-                    "state": "awaiting_input",
+                "state": "awaiting_input",
                 "terminal": False,
                 "suspension": suspension_checkpoint_payload(new_suspension),
             },

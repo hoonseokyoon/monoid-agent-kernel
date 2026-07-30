@@ -7,6 +7,30 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — kernel ingress and artifacts now stay inside portable JSON
+
+- **Strings and numbers are normalized once at semantic ingress.** Valid UTF-16 surrogate pairs
+  retain their Unicode scalar, lone surrogates become `U+FFFD`, and Python/model/tool non-finite
+  floats become JSON `null`. The rule covers user input, seed history, standalone and AgentLoop
+  model calls, streamed chunks, native tool results, hosted-task requests and results, and emitted
+  event data. The iterative traversal preserves shared and cyclic container topology and rejects a
+  mapping when normalized keys would collide.
+- **External JSON remains strict.** Backend, LLM gateway, MCP gateway, web gateway, and Studio HTTP
+  requests reject non-standard `NaN`/`Infinity` tokens, finite-range overflow such as `1e9999`,
+  excessive nesting, and duplicate object keys. Escaped lone surrogates are repaired by the same
+  ingress rule. Direct Python entry points apply the substitution policy before adapters or durable
+  writers see a value.
+- **Every run-path JSON writer now asserts the contract with `allow_nan=False`.** Canonical digests,
+  atomic artifacts, event and transcript JSONL, metrics, SQLite checkpoints and metadata, HTTP/SSE
+  responses, and Studio chat projection fail fast if a semantic ingress is ever missed. Event-log
+  and validation readers report retained non-finite artifacts as corrupt JSON instead of accepting
+  a value that standards-compliant consumers reject.
+- **Retained and direct-Python controls fail closed before coercion.** Run/model configuration,
+  lifecycle state, capability and tool-surface structures, shell/web execution options,
+  output-validator outcomes, and recognized provider usage counters require their exact types and
+  finite ranges. Operator deny/redaction rules share the same Unicode scalar domain as the content
+  they govern, so normalization cannot turn a configured denial into an allow.
+
 ### Security — `**` in a path pattern covered one directory level, not a subtree
 
 - **`deny_patterns` and `redact_patterns` now use gitignore-style wildcard syntax.**
@@ -341,27 +365,15 @@ out in commit messages and here.
   rather than changed, because changing it would reverse a deliberate architectural decision;
 - and the delta channel remains **on by default in Studio** unless switched off.
 
-Seven gaps were found reviewing this release and are deliberately left open, because closing any
-of them means changing a surface this one does not touch. (Two more were found alongside them and
-are closed above: `job.json`'s readers, and the missing corrupt-event-log guard.)
+Five gaps remain open after this review. Four related gaps are closed above or in the portable-JSON
+batch: `job.json`'s readers, the corrupt-event-log guard, lone-surrogate ingress, and non-finite
+number ingress and serialization.
 
-- **A lone surrogate anywhere in a string ends the run.** JSON permits one; UTF-8 cannot encode one,
-  and `json.loads` hands them back — from a tool argument, an HTTP body, or **the user's own
-  instruction**, so no model is needed. Every `.encode("utf-8")` then raises: `preview_value`'s byte
-  measurement, `canonical_sha256`, and the JSONL/atomic writers. The writers are hardened here (they
-  retry with `ensure_ascii=True`, which also stops `write_json_atomic` leaving an orphan `.tmp` in
-  the run root), but the run still dies earlier. The complete fix is to sanitize where a string
-  enters the kernel; patching each `.encode` site in turn is the twin-miss shape this release spent
-  most of its review budget on. Writing *this bullet* crashed the tooling that wrote it.
 - **Non-string scalars bypass the byte cap entirely.** `preview_value` bounds `str` and returns
   everything else unchanged, so a 4300-digit integer — model-authored, arbitrary content in base ten
   — reaches `events.jsonl` whole: one `artifact.emit` measured 96 KB with twenty verbatim copies.
   Bounding them means returning a different *type*, which is exactly how the `artifact.emitted.kind`
   fix broke that event's schema mid-review, so this needs a design rather than a patch.
-- **`events.jsonl` can contain `NaN` / `Infinity`.** `json.dumps` defaults to `allow_nan=True` on
-  every write path and `json.loads` accepts those tokens from a model, so the documented JSONL
-  contract is not strictly JSON. The Studio feed silently drops such a frame. `conformance/` already
-  writes with `allow_nan=False`; the run path does not.
 - **A deeply nested tool argument still ends the run on the `allow` path.** `MAX_ARGUMENT_DEPTH` is
   reached only through the approval-request builder, so `ask`-gated calls reject and `allow`-gated
   calls carry the argument into the message history and on to `RunCheckpoint.to_json`, whose

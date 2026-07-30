@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.core.scope import ScopePolicyError, effective_signed_scope
 from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenError, TokenManager
 from monoid_agent_kernel.errors import PermissionDenied
@@ -16,8 +18,7 @@ from monoid_agent_kernel.web import (
 
 
 class WebProvider(Protocol):
-    def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
-        ...
+    def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]: ...
 
     def fetch(
         self,
@@ -28,8 +29,7 @@ class WebProvider(Protocol):
         blocked_domains: tuple[str, ...] = (),
         timeout_s: int | None = None,
         max_bytes: int | None = None,
-    ) -> dict[str, Any]:
-        ...
+    ) -> dict[str, Any]: ...
 
     def context(
         self,
@@ -42,18 +42,17 @@ class WebProvider(Protocol):
         freshness: str | None,
         allowed_domains: tuple[str, ...],
         blocked_domains: tuple[str, ...],
-    ) -> dict[str, Any]:
-        ...
+    ) -> dict[str, Any]: ...
 
 
 DEFAULT_FAKE_CORPUS: tuple[dict[str, str], ...] = (
     {
         "url": "https://docs.example.test/monoid-agent-kernel/web",
         "title": "Monoid Agent Kernel Web Tools",
-            "content": (
-                "Monoid Agent Kernel exposes web.search and web.fetch through a WebGateway. "
-                "The kernel never receives provider API keys."
-            ),
+        "content": (
+            "Monoid Agent Kernel exposes web.search and web.fetch through a WebGateway. "
+            "The kernel never receives provider API keys."
+        ),
     },
     {
         "url": "https://docs.example.test/monoid-agent-kernel/policy",
@@ -235,7 +234,9 @@ class WebGatewayBackend:
 
     def handle_search(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = _normalize_request_payload(payload, capability="web.search")
         payload = _apply_signed_scope(claims, payload, expected_capability="web.search")
+        payload = _normalize_request_payload(payload, capability="web.search")
         self._check_binding_limit(claims, payload, error_code="web_search_limit_exceeded")
         query = str(payload.get("query") or "")
         if not query.strip():
@@ -243,11 +244,21 @@ class WebGatewayBackend:
         effective_max_results = max(1, int(payload.get("max_results") or 5))
         request_allowed = _domain_tuple(payload.get("allowed_domains") or ())
         request_blocked = _domain_tuple(payload.get("blocked_domains") or ())
-        raw_results = self.provider.search(query, max_results=effective_max_results)
+        raw_results = normalize_json_ingress(
+            self.provider.search(query, max_results=effective_max_results)
+        )
+        if not isinstance(raw_results, list):
+            raise WebGatewayError(
+                "web search provider response must be an array",
+                error_code="web_search_bad_response",
+            )
         results = [
             result
             for result in raw_results
-            if _result_allowed(result, request_allowed=request_allowed, request_blocked=request_blocked)
+            if isinstance(result, dict)
+            and _result_allowed(
+                result, request_allowed=request_allowed, request_blocked=request_blocked
+            )
         ][:effective_max_results]
         with self._lock:
             self._counts(claims.run_id).search_calls += 1
@@ -266,7 +277,9 @@ class WebGatewayBackend:
 
     def handle_fetch(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = _normalize_request_payload(payload, capability="web.fetch")
         payload = _apply_signed_scope(claims, payload, expected_capability="web.fetch")
+        payload = _normalize_request_payload(payload, capability="web.fetch")
         self._check_binding_limit(claims, payload, error_code="web_fetch_limit_exceeded")
         url = str(payload.get("url") or "")
         if not url.strip():
@@ -274,7 +287,9 @@ class WebGatewayBackend:
         domain = domain_from_url(url)
         request_allowed = _domain_tuple(payload.get("allowed_domains") or ())
         request_blocked = _domain_tuple(payload.get("blocked_domains") or ())
-        if not domain_allowed(domain, allowed_domains=request_allowed, blocked_domains=request_blocked):
+        if not domain_allowed(
+            domain, allowed_domains=request_allowed, blocked_domains=request_blocked
+        ):
             raise WebGatewayError(
                 f"domain is not allowed by binding constraints: {domain}",
                 error_code="web_binding_denied",
@@ -282,17 +297,26 @@ class WebGatewayBackend:
         output_format = str(payload.get("format") or "text")
         effective_timeout_s = max(1, int(payload.get("timeout_s") or 30))
         effective_max_bytes = max(1, int(payload.get("max_bytes") or 100_000))
-        fetched = self.provider.fetch(
-            url,
-            format=output_format,
-            allowed_domains=request_allowed,
-            blocked_domains=request_blocked,
-            timeout_s=effective_timeout_s,
-            max_bytes=effective_max_bytes,
+        fetched = normalize_json_ingress(
+            self.provider.fetch(
+                url,
+                format=output_format,
+                allowed_domains=request_allowed,
+                blocked_domains=request_blocked,
+                timeout_s=effective_timeout_s,
+                max_bytes=effective_max_bytes,
+            )
         )
+        if not isinstance(fetched, dict):
+            raise WebGatewayError(
+                "web fetch provider response must be an object",
+                error_code="web_fetch_bad_response",
+            )
         final_url = str(fetched.get("final_url") or url)
         final_domain = domain_from_url(final_url)
-        if not domain_allowed(final_domain, allowed_domains=request_allowed, blocked_domains=request_blocked):
+        if not domain_allowed(
+            final_domain, allowed_domains=request_allowed, blocked_domains=request_blocked
+        ):
             raise WebGatewayError(
                 f"final domain is not allowed by binding constraints: {final_domain}",
                 error_code="web_binding_denied",
@@ -331,7 +355,9 @@ class WebGatewayBackend:
 
     def handle_context(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = _normalize_request_payload(payload, capability="web.context")
         payload = _apply_signed_scope(claims, payload, expected_capability="web.context")
+        payload = _normalize_request_payload(payload, capability="web.context")
         self._check_binding_limit(claims, payload, error_code="web_context_limit_exceeded")
         query = str(payload.get("query") or "")
         if not query.strip():
@@ -341,16 +367,23 @@ class WebGatewayBackend:
         effective_max_tokens = max(1, int(payload.get("max_tokens") or 8_192))
         effective_max_urls = max(1, int(payload.get("max_urls") or 8))
         effective_max_snippets = max(1, int(payload.get("max_snippets") or 50))
-        provider_result = self.provider.context(
-            query,
-            max_tokens=effective_max_tokens,
-            max_urls=effective_max_urls,
-            max_snippets=effective_max_snippets,
-            locale=_optional_string(payload.get("locale")),
-            freshness=_freshness_from_payload(payload),
-            allowed_domains=request_allowed,
-            blocked_domains=request_blocked,
+        provider_result = normalize_json_ingress(
+            self.provider.context(
+                query,
+                max_tokens=effective_max_tokens,
+                max_urls=effective_max_urls,
+                max_snippets=effective_max_snippets,
+                locale=_optional_string(payload.get("locale")),
+                freshness=_freshness_from_payload(payload),
+                allowed_domains=request_allowed,
+                blocked_domains=request_blocked,
+            )
         )
+        if not isinstance(provider_result, dict):
+            raise WebGatewayError(
+                "web context provider response must be an object",
+                error_code="web_context_bad_response",
+            )
         filtered = _filter_context_result(provider_result, request_allowed, request_blocked)
         context = str(filtered.get("context") or "")
         encoded = context.encode("utf-8")
@@ -393,7 +426,9 @@ class WebGatewayBackend:
         except TokenError as exc:
             raise PermissionDenied(str(exc)) from exc
 
-    def _check_binding_limit(self, claims: TokenClaims, payload: dict[str, Any], *, error_code: str) -> None:
+    def _check_binding_limit(
+        self, claims: TokenClaims, payload: dict[str, Any], *, error_code: str
+    ) -> None:
         binding_id = str(payload.get("binding_id") or "").strip()
         max_calls = int(payload.get("max_calls") or 0)
         if not binding_id or max_calls <= 0:
@@ -436,7 +471,45 @@ def _domain_tuple(value: Any) -> tuple[str, ...]:
     return tuple(str(item).strip().lower() for item in value if str(item).strip())
 
 
-def _apply_signed_scope(claims: TokenClaims, payload: dict[str, Any], *, expected_capability: str) -> dict[str, Any]:
+_WEB_INTEGER_REQUEST_KEYS_BY_CAPABILITY = {
+    "web.search": ("max_results", "recency_days"),
+    "web.fetch": ("timeout_s", "max_bytes"),
+    "web.context": ("max_tokens", "max_urls", "max_snippets", "recency_days"),
+}
+
+
+def _normalize_request_payload(
+    payload: Any,
+    *,
+    capability: str,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("web request payload must be an object")
+    for key in _WEB_INTEGER_REQUEST_KEYS_BY_CAPABILITY[capability]:
+        _validate_integer_control(payload, key, minimum=1)
+    _validate_integer_control(payload, "max_calls", minimum=0)
+    normalized = normalize_json_ingress(payload)
+    if not isinstance(normalized, dict):  # pragma: no cover - guarded above
+        raise ValueError("web request payload must be an object")
+    return normalized
+
+
+def _validate_integer_control(payload: dict[str, Any], key: str, *, minimum: int) -> None:
+    if key not in payload or payload[key] is None:
+        return
+    value = payload[key]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{key} must be finite")
+    if type(value) is not int:
+        raise ValueError(f"{key} must be an integer")
+    if value < minimum:
+        requirement = "positive" if minimum == 1 else "non-negative"
+        raise ValueError(f"{key} must be {requirement}")
+
+
+def _apply_signed_scope(
+    claims: TokenClaims, payload: dict[str, Any], *, expected_capability: str
+) -> dict[str, Any]:
     metadata = claims.metadata or {}
     scope = metadata.get("scope")
     capability = str(metadata.get("capability") or "").strip()
@@ -453,7 +526,9 @@ def _apply_signed_scope(claims: TokenClaims, payload: dict[str, Any], *, expecte
             )
         return payload
     if not isinstance(scope, dict):
-        raise WebGatewayError("web gateway token signed scope is invalid", error_code="web_scope_invalid")
+        raise WebGatewayError(
+            "web gateway token signed scope is invalid", error_code="web_scope_invalid"
+        )
     if capability != expected_capability:
         raise WebGatewayError(
             "web gateway scoped token capability does not match endpoint",
@@ -481,7 +556,11 @@ def _scope_error_message(exc: ScopePolicyError) -> str:
 
 
 def _scope_error_code(exc: ScopePolicyError) -> str:
-    return "web_scope_invalid" if exc.reason in {"invalid", "signed_not_positive"} else "web_scope_denied"
+    return (
+        "web_scope_invalid"
+        if exc.reason in {"invalid", "signed_not_positive"}
+        else "web_scope_denied"
+    )
 
 
 def _filter_context_result(
@@ -512,7 +591,8 @@ def _filter_context_result(
         if isinstance(chunk, dict)
         and (
             not str(chunk.get("domain") or domain_from_url(str(chunk.get("url") or "")))
-            or str(chunk.get("domain") or domain_from_url(str(chunk.get("url") or ""))) in allowed_domains
+            or str(chunk.get("domain") or domain_from_url(str(chunk.get("url") or "")))
+            in allowed_domains
             or domain_allowed(
                 str(chunk.get("domain") or domain_from_url(str(chunk.get("url") or ""))),
                 allowed_domains=request_allowed,
@@ -522,8 +602,12 @@ def _filter_context_result(
     ]
     context = str(result.get("context") or "")
     filters_active = bool(request_allowed or request_blocked)
-    if filters_active and (len(allowed_sources) != len(sources) or len(allowed_chunks) != len(chunks)):
-        context = "\n\n".join(str(chunk.get("text") or "") for chunk in allowed_chunks if isinstance(chunk, dict))
+    if filters_active and (
+        len(allowed_sources) != len(sources) or len(allowed_chunks) != len(chunks)
+    ):
+        context = "\n\n".join(
+            str(chunk.get("text") or "") for chunk in allowed_chunks if isinstance(chunk, dict)
+        )
     if filters_active:
         sources = allowed_sources
         chunks = allowed_chunks
