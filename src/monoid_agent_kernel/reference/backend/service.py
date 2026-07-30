@@ -71,7 +71,7 @@ from monoid_agent_kernel.reference.command_inbox import (
     InMemoryCommandStore,
     StoredCommand,
     redact_command_credential,
-    sanitize_command_data,
+    sanitize_command_args,
 )
 from monoid_agent_kernel.reference.backend.commands import BackendCommandContext, BackendCommandService
 from monoid_agent_kernel.reference.backend.jobs import JobService, JobServiceContext
@@ -726,7 +726,7 @@ class RunnerBackend:
             max_tool_calls=int(limits.get("max_tool_calls", 100)),
             max_bytes_read=int(limits.get("max_bytes_read", 1_000_000)),
             max_duration_s=limits.get("max_duration_s", 900),
-            permission_policy=PermissionPolicy.from_json(meta.get("permission_policy")),
+            permission_policy=PermissionPolicy.from_durable_json(meta.get("permission_policy")),
             runtime_config=runtime_config,
             multi_turn=bool(meta.get("multi_turn", False)),
         )
@@ -1059,6 +1059,11 @@ class RunnerBackend:
         args = dict(command.args)
         token = str(args.pop("token", "") or "")
         principal = self._authorize_command_principal(command, args=args, token=token)
+        if command.type == "replace_runtime_config":
+            # This is the fresh operator boundary. Stored v1 commands have a separate compatibility
+            # decoder when claimed, so a new ambiguous bare ``!`` never acquires legacy meaning.
+            parsed_config = AgentRuntimeConfig.from_json(args.get("config"))
+            args["config"] = parsed_config.to_json()
         with self._lock:
             locally_owned = command.run_id in self._records
         if command.type == "create_task" and not locally_owned:
@@ -1089,7 +1094,9 @@ class RunnerBackend:
         # storage gets a second bearer pass after JSON coercion because bytes/custom objects become
         # repr strings and can reintroduce the authenticated credential.
         stored_args = dict(
-            redact_command_credential(sanitize_command_data(execution_args), token)
+            redact_command_credential(
+                sanitize_command_args(command.type, execution_args), token
+            )
         )
         stored_command = StoredCommand(
             run_id=command.run_id,

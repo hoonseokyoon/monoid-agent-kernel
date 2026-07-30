@@ -125,7 +125,9 @@ jobs:
       - name: Run platform-sensitive smoke
         run: >
           python -m pytest -q
+          tests/test_path_patterns.py
           tests/test_workspace_paths_properties.py
+          tests/test_workspace_permissions.py
           tests/test_workspace_contract.py
           tests/test_file_lock.py
           tests/test_spec_serialization.py

@@ -195,6 +195,19 @@ Recovery compares the local and shared copies, selects and repairs from the high
 and reports equal-generation divergence as `corrupt`. When both historical copies omit the field,
 the local descriptor retains authority. Older readers ignore this additive field.
 
+The v0.20 path-pattern writer keeps a literal leading `!` unchanged and adds
+`"path_pattern_encoding": "monoid.literal-bang.v1"` to the containing policy or tool scope.
+Pre-v0.20 writers stored the literal without that marker in the same v1 artifact identifiers.
+Durable readers therefore migrate the unmarked bare spelling in `manifest.v1`, `backend-run.v1`,
+`checkpoint.v1`, and retained `command-inbox.v1` runtime-config payloads. Fresh operator
+configuration rejects a bare `!`; `\!` remains its explicit literal spelling. An unmarked legacy
+`\!` retains its old literal-backslash/PurePath meaning and is never widened to `!`.
+The same durable readers keep pre-v0.20 `PurePath` matching for stored patterns that the current
+grammar rejects, while fresh inputs remain strict. Runtime-config hashes omit only the
+`path_pattern_encoding` representation marker at `tools[*].scope`; raw path arrays and every other
+scope field remain hash-authoritative. A pre-v0.20 reader can ignore the additive marker and
+recompute the same semantic hash, while retained legacy spellings keep distinct hashes.
+
 The v0.18 writer adds four optional recovery fields to `monoid.checkpoint.v1`:
 
 - `last_suspension` records the exact observable boundary represented by the checkpoint;

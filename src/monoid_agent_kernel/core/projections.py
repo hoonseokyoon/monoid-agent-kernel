@@ -24,7 +24,7 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
     package = _read_json_if_exists(run_dir / "proposal.package.json")
     approval = _read_json_if_exists(run_dir / "approval.json")
     apply_result = _read_json_if_exists(run_dir / "apply-result.json")
-    permission_policy = PermissionPolicy.from_json(manifest.get("permission_policy"))
+    permission_policy = PermissionPolicy.from_durable_json(manifest.get("permission_policy"))
     jobs = _public_jobs(list_job_artifacts(run_dir), permission_policy)
     state = _payload_state(status_payload, metrics)
     terminal = _payload_terminal(status_payload, state)

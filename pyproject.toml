@@ -25,6 +25,19 @@ classifiers = [
 dependencies = [
     "click>=8.1",
     "jsonschema>=4.21",
+    # Gitignore-style wildcard matching for PermissionPolicy and ToolScope path patterns. Not
+    # stdlib-able on this floor: `PurePath.full_match` and `glob.translate` are 3.13+ while
+    # `requires-python` is >=3.11,
+    # `fnmatch` lets `*` cross `/`, and `PurePath.match` is the one that was wrong. See
+    # `permissions.matches_path_patterns`.
+    #
+    # Pinned to 1.x rather than >=0.12, because the two answer a case differently: under 0.12.1's
+    # `gitignore` style `internal/*` also covers `internal/deep/a.txt` (a matched directory carries
+    # its subtree), and under 1.x it does not. On a deny list that difference is a hole that opens
+    # from a dependency upgrade alone, and the callers disagree about which direction is safe, so
+    # the range is narrowed to the one that is predictable. `tests/test_path_patterns.py` is the
+    # guard: every case runs against whatever version resolves.
+    "pathspec>=1.1,<2",
     "pydantic>=2.6",
 ]
 

@@ -205,6 +205,13 @@ makes a backend a drop-in.
 - `metadata`
 - `config_hash`
 
+`config_hash` identifies the parsed runtime configuration rather than every JSON representation
+detail. It hashes every policy value, including the raw `allowed_paths` and `denied_paths` arrays,
+while omitting only `tools[*].scope.path_pattern_encoding`. That additive field disambiguates a
+literal leading `!` for fresh JSON readers and does not change the in-memory `ToolScope` meaning.
+This normalization lets pre-v0.20 readers ignore the field and recompute the same hash during a
+rolling deployment.
+
 `ToolBinding` is the public tool unit:
 
 ```json

@@ -2057,7 +2057,7 @@ class AgentLoop:
             pending_binding_loads=tuple(cp.pending_binding_loads),
             tool_call_counts=dict(cp.tool_call_counts),
             previous_runtime_config=(
-                AgentRuntimeConfig.from_json(cp.previous_runtime_config)
+                AgentRuntimeConfig.from_durable_json(cp.previous_runtime_config)
                 if cp.previous_runtime_config is not None
                 else None
             ),

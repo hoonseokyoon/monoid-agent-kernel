@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference._shared.control_transport import (
@@ -21,10 +22,13 @@ from monoid_agent_kernel.reference._shared.control_transport import (
     CommandReceipt,
     CommandStatus,
     redact_command_credential as redact_command_credential,
+    sanitize_command_args,
     sanitize_command_data,
 )
 
 COMMAND_ENVELOPE_VERSION = namespaced_id("command-inbox.v1")
+_DURABLE_RUNTIME_CONFIG_KEY = "_monoid_durable_runtime_config"
+_DURABLE_RUNTIME_CONFIG_MARKER = object()
 
 
 @dataclass(frozen=True)
@@ -47,7 +51,7 @@ class StoredCommand:
             "run_id": self.run_id,
             "command_id": self.command_id,
             "type": self.type,
-            "args": sanitize_command_data(self.args),
+            "args": sanitize_command_args(self.type, self.args),
             "principal": self.principal.to_json(),
             "token_sha256": self.token_sha256,
             "reason": self.reason,
@@ -60,10 +64,19 @@ class StoredCommand:
     def control_command(
         self, *, token: str, transient_args: dict[str, Any] | None = None
     ) -> ControlCommand:
+        args = dict(self.args if transient_args is None else transient_args)
+        if transient_args is None and self.type == "replace_runtime_config":
+            config_payload = args.get("config")
+            if isinstance(config_payload, dict):
+                # A v0.19 worker could have queued this v1 command with literal leading bangs in
+                # tool scopes. Fresh commands are parsed strictly before enqueue; only the retained
+                # copy crosses the compatibility decoder here.
+                args["config"] = AgentRuntimeConfig.from_durable_json(config_payload).to_json()
+                args[_DURABLE_RUNTIME_CONFIG_KEY] = _DURABLE_RUNTIME_CONFIG_MARKER
         return ControlCommand(
             type=self.type,  # type: ignore[arg-type]
             run_id=self.run_id,
-            args={**(self.args if transient_args is None else transient_args), "token": token},
+            args={**args, "token": token},
             issuer=self.principal.actor,
             reason=self.reason,
             command_id=self.command_id,
@@ -89,7 +102,7 @@ class CommandStore(Protocol):
 def _same_command_identity(existing: StoredCommand, submitted: StoredCommand) -> bool:
     return (
         existing.type == submitted.type
-        and existing.args == sanitize_command_data(submitted.args)
+        and existing.args == sanitize_command_args(submitted.type, submitted.args)
         and existing.principal == submitted.principal
         and existing.reason == submitted.reason
     )
@@ -126,7 +139,10 @@ class InMemoryCommandStore:
             if pending >= max_pending:
                 raise CommandQueueFull(f"command queue is full for run {command.run_id}")
             persisted = StoredCommand(
-                **{**command.__dict__, "args": dict(sanitize_command_data(command.args))}
+                **{
+                    **command.__dict__,
+                    "args": sanitize_command_args(command.type, command.args),
+                }
             )
             self._commands[key] = persisted
             return self._receipt(persisted)
@@ -268,7 +284,9 @@ class SqliteCommandStore:
                     command.run_id,
                     command.command_id,
                     command.type,
-                    json.dumps(sanitize_command_data(command.args), sort_keys=True),
+                    json.dumps(
+                        sanitize_command_args(command.type, command.args), sort_keys=True
+                    ),
                     json.dumps(command.principal.to_json(), sort_keys=True),
                     command.reason,
                     command.created_at,

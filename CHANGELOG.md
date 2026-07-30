@@ -7,6 +7,85 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Security — `**` in a path pattern covered one directory level, not a subtree
+
+- **`deny_patterns` and `redact_patterns` now use gitignore-style wildcard syntax.**
+  Each normalized workspace path is matched independently; the table in `docs/CLI.md` is the
+  normative contract (directory carry-over therefore does not make `dir/*` cover grandchildren).
+  `matches_path_patterns` used `PurePath.match`, where `**` is a single `*` matched right-to-left.
+  So `internal/**` denied `internal/a.txt`, **not** `internal/deep/a.txt` — and did deny
+  `vendor/internal/a.txt`, which nobody asked for. `**/id_rsa` never matched a bare `id_rsa` at the
+  workspace root. Both of those patterns were already in the shipped documentation.
+  The previous minimum deny list in `docs/security/PRODUCTION_CHECKLIST.md`
+  (`.env`, `*.key`, `*.pem`, `**/id_rsa`, `.ssh/**`, `.git/**`) left three deep-path holes,
+  measured:
+
+  | path | before | after |
+  | --- | --- | --- |
+  | `.ssh/keys/deep/id_ed25519` | **not denied** | denied |
+  | `.git/refs/heads/main` | **not denied** | denied |
+  | `id_rsa` (workspace root) | **not denied** | denied |
+
+  It also omitted the `.ssh` and `.git` directory nodes themselves, which recursive move/delete
+  tools check as one root argument. The checklist now uses bare `.ssh` and `.git`, covering each
+  directory and its descendants when that directory or a descendant is the checked argument.
+  Recursive operations rooted at an allowed ancestor still require a backend/tool tree preflight;
+  the built-in recursive copy/move/delete path check currently sees the root argument only. This
+  existing limitation is explicit in the CLI guide and production checklist. Re-check any policy
+  written against an earlier version. Nothing caught the depth defect because every pattern fixture
+  in the repo used one-level paths.
+- **This moves an access boundary in both directions, and one caller is an allow-list.**
+  `matches_path_patterns` backs four policy fields: `PermissionPolicy.deny_patterns` and
+  `redact_patterns`, plus a tool binding's `ToolScope.denied_paths` and `allowed_paths`. For the
+  three deny-shaped fields, matching more is safer and this change closes holes. For
+  `allowed_paths`, matching more is *more permissive* — a binding scoped to `internal/**` now
+  admits `internal/deep/x`, which it previously refused. Review binding scopes as well as policies.
+  Patterns that were anchored by accident change too: `dir/**` no longer matches that directory at
+  arbitrary depth; write `**/dir/**` for that. A bare directory pattern changes as well:
+  `allowed_paths=["internal"]` used to cover only that node and now covers every directory named
+  `internal` plus its subtree at any depth. Use `/internal` to retain root anchoring, and audit any
+  scope that relied on node-only behavior. The synthetic workspace root remains outside every
+  pattern, preserving the previous fail-closed result for root-cwd allow-list checks.
+- **Negation is rejected rather than silently adopted.** `.gitignore` reads a leading `!` as
+  "un-match", which would have handed every deny list a way to punch holes in itself — with the
+  result depending on pattern *order*, while `PermissionPolicy.merged` combines two policies by
+  concatenating and de-duplicating, i.e. as a set. Fresh permission-policy files, run specs, CLI
+  flags, HTTP/control runtime configs, and `ToolScope` configuration now raise on an unescaped
+  negation. Write `\!name` to configure a literal leading `!`. JSON output keeps `!name` and adds
+  `"path_pattern_encoding": "monoid.literal-bang.v1"`, preserving old-reader matching while making
+  current round-trips unambiguous. Retained `manifest.v1`, `backend-run.v1`, `checkpoint.v1`, and
+  queued `command-inbox.v1` artifacts still decode the pre-v0.20 bare `!` spelling as a literal;
+  patterns accepted by the old `PurePath` grammar but rejected by fresh v0.20 configuration retain
+  the historical matcher on those artifact readers. The runtime-config semantic hash excludes
+  only this representation marker while continuing to hash the raw path arrays and every other
+  scope field. A v0.19 reader can therefore ignore the additive marker and recompute the same hash
+  during rolling recovery. An unmarked
+  pre-v0.20 `\!name` retains its historical literal-backslash meaning and cannot widen an old
+  allow-list to `!name`. Durable runtime-config commands now preserve the validated
+  `ToolBinding.authorization` policy enum (`allow`, `ask`, or `deny`) at its exact schema path;
+  credential-shaped `authorization` fields elsewhere remain redacted. A leading `#`
+  likewise stays literal rather than becoming a gitignore comment and silently dropping a rule.
+- **Fresh configuration spellings are validated before matching.** A leading `./` is normalized;
+  a trailing `/` covers both the directory node and its subtree; root-only and malformed patterns
+  fail during config load rather than at the first event. Source backslashes are rejected except
+  for the documented leading `\!` wire spelling: workspace input treats backslash as a separator,
+  while pathspec would reinterpret it as an escape. Workspace paths containing C0/DEL controls are
+  rejected. Windows rejects trailing-dot/space aliases, alternate data streams,
+  reserved device names, and 8.3 alias-shaped spellings. The matcher remains lexical: case and
+  Unicode-normalization aliases, plus symlink/hardlink identity, are existing workspace-backend
+  responsibilities described in the production checklist. It receives paths rather than a
+  workspace root, volume metadata, and filesystem object identities.
+- **New runtime dependency: `pathspec>=1.1,<2`.** The stdlib cannot express these semantics on this
+  project's floor — `PurePath.full_match` and `glob.translate` are 3.13+ while `requires-python` is
+  `>=3.11`, `fnmatch` lets `*` cross `/`, and `PurePath.match` is what was wrong. Using 3.13's
+  built-ins where available and hand-rolling a backport otherwise would be two implementations of
+  one security control. Pinned to 1.x rather than `>=0.12` because the two disagree on `dir/*`
+  against a grandchild, and a deny-list hole that opens from a dependency upgrade is not
+  acceptable; `tests/test_path_patterns.py` runs every case against whatever version resolves.
+- `Workspace.glob` is deliberately **not** changed. It is `fnmatch` over a discovery API the model
+  calls to find files, where matching too much returns files it could already list. This function
+  decides access, so the two want opposite defaults.
+
 ### Changed — content egress from the event stream (breaking for `events.jsonl` consumers)
 
 - **`turn.settled` and `run.finished` no longer carry `final_text` for model-authored answers.**
