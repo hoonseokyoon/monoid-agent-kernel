@@ -44,6 +44,7 @@ def _is_chat_message(payload: object) -> bool:
     return (
         isinstance(message_id, str)
         and bool(message_id.strip())
+        and isinstance(role, str)
         and role in {"user", "assistant", "error"}
         and isinstance(payload.get("content"), str)
         and isinstance(attachments, list)

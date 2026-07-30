@@ -38,12 +38,18 @@ function hasExactKeys(payload: Record<string, unknown>, expected: readonly strin
     && expected.every((key) => Object.prototype.hasOwnProperty.call(payload, key));
 }
 
+function areChatAttachments(payload: unknown): payload is ChatMessage["attachments"] {
+  if (!Array.isArray(payload)) return false;
+  for (const attachment of payload) {
+    if (!isRecord(attachment)
+      || typeof attachment.name !== "string"
+      || typeof attachment.mime !== "string") return false;
+  }
+  return true;
+}
+
 function isChatMessage(payload: unknown): payload is ChatMessage {
   if (!isRecord(payload)) return false;
-  const attachmentsAreValid = Array.isArray(payload.attachments)
-    && payload.attachments.every((attachment) => isRecord(attachment)
-      && typeof attachment.name === "string"
-      && typeof attachment.mime === "string");
   const roleIsValid = payload.role === "user"
     || payload.role === "assistant"
     || payload.role === "error";
@@ -51,15 +57,20 @@ function isChatMessage(payload: unknown): payload is ChatMessage {
     && payload.id.trim().length > 0
     && roleIsValid
     && typeof payload.content === "string"
-    && attachmentsAreValid
+    && areChatAttachments(payload.attachments)
     && typeof payload.created_at === "number"
     && Number.isFinite(payload.created_at)
     && (payload.source === undefined || isRecord(payload.source));
 }
 
 function areChatMessages(payload: unknown): payload is ChatMessage[] {
-  if (!Array.isArray(payload) || !payload.every(isChatMessage)) return false;
-  return new Set(payload.map((message) => message.id)).size === payload.length;
+  if (!Array.isArray(payload)) return false;
+  const ids = new Set<string>();
+  for (const message of payload) {
+    if (!isChatMessage(message) || ids.has(message.id)) return false;
+    ids.add(message.id);
+  }
+  return true;
 }
 
 export function isChatTranscriptResponse(payload: unknown): payload is ChatTranscriptResponse {

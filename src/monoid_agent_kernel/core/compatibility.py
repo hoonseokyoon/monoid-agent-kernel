@@ -393,9 +393,15 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         supported_readers=("studio.chat.message.v1",),
         namespace_aliases=(),
         reader_policy="permissive",
-        source=("reference/studio/chat_projection.py:ChatProjection.read",),
+        source=(
+            "reference/studio/chat_projection.py:ChatProjection.read",
+            "reference/studio/chat_projection.py:is_supported_chat_response",
+        ),
         accepts_missing_version=True,
-        notes="JSONL projection reader skips malformed records and does not gate by version.",
+        notes=(
+            "The JSONL reader skips invalid JSON and non-object records without gating by version; "
+            "strict transcript readers require the renderable core fields and allow extensions."
+        ),
     ),
 )
 

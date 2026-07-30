@@ -131,6 +131,7 @@ const malformedMessages = [
   message({ role: 7 }),
   message({ content: null }),
   message({ attachments: {} }),
+  message({ attachments: Array(1) }),
   message({ attachments: [null] }),
   message({ attachments: [[]] }),
   message({ attachments: [{ mime: "text/plain" }] }),
@@ -155,6 +156,13 @@ for (const malformedMessage of malformedMessages) {
     event_log_error: "",
   });
 }
+
+await rejects({
+  schema_version: "studio.chat.v2",
+  ...base,
+  messages: Array(1),
+  event_log_error: "",
+});
 
 await rejects({
   schema_version: "studio.chat.v2",
