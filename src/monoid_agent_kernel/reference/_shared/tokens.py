@@ -340,12 +340,13 @@ class TokenManager:
         expected_kind = _required_text(kind, "expected token kind")
         if type(audience) is str:
             raw_audiences = (audience,)
-        elif type(audience) in {list, tuple, set, frozenset} and all(
-            type(value) is str for value in audience
-        ):
-            raw_audiences = tuple(audience)
         else:
-            raise TokenError("expected token audience must be a string collection")
+            if isinstance(audience, str):
+                raise TokenError("expected token audience must be a string collection")
+            try:
+                raw_audiences = tuple(audience)
+            except TypeError as exc:
+                raise TokenError("expected token audience must be a string collection") from exc
         expected_audiences = tuple(
             _required_text(value, "expected token audience") for value in raw_audiences
         )

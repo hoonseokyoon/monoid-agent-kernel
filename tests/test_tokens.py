@@ -165,6 +165,31 @@ def test_token_manager_rejects_metadata_key_collisions() -> None:
         )
 
 
+def test_token_manager_verify_accepts_lazy_audience_iterables() -> None:
+    manager = TokenManager.from_secret("x" * 32)
+    token = _issue(manager)
+
+    claims = manager.verify(
+        token,
+        kind="web_gateway",
+        audience=(value for value in ("legacy.example", "csp.web-gateway")),
+    )
+
+    assert claims.audience == "csp.web-gateway"
+
+
+def test_token_manager_verify_rejects_non_string_lazy_audience_entries() -> None:
+    manager = TokenManager.from_secret("x" * 32)
+    token = _issue(manager)
+
+    with pytest.raises(TokenError, match="expected token audience must be a non-empty string"):
+        manager.verify(
+            token,
+            kind="web_gateway",
+            audience=(value for value in ("csp.web-gateway", 7)),  # type: ignore[arg-type]
+        )
+
+
 def test_token_manager_rejects_string_where_accepted_issuer_collection_is_required() -> None:
     with pytest.raises(TokenError, match="accepted token issuers must be a list"):
         TokenManager(
