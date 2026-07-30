@@ -78,11 +78,11 @@ def test_export_import_revocation_state_roundtrip() -> None:
 def test_vault_child_split_live_leases_and_shared_revocations() -> None:
     parent = CapabilityVault()
     parent.admit(
-        CapabilityRequest(capability="web.search"),
+        CapabilityRequest(capability="web.search", ttl_seconds=9_000_000_000),
         CapabilityLease(capability="web.search", token_ref="parent-live", expires_at=9e9),
     )
     parent.admit(
-        CapabilityRequest(capability="web.fetch"),
+        CapabilityRequest(capability="web.fetch", ttl_seconds=9_000_000_000),
         CapabilityLease(capability="web.fetch", token_ref="parent-durable", expires_at=9e9, durable=True),
     )
 
@@ -92,7 +92,7 @@ def test_vault_child_split_live_leases_and_shared_revocations() -> None:
     assert child.token_for("web.fetch", now=0.0) == "parent-durable"
 
     child.admit(
-        CapabilityRequest(capability="web.search"),
+        CapabilityRequest(capability="web.search", ttl_seconds=9_000_000_000),
         CapabilityLease(capability="web.search", token_ref="child-live", expires_at=9e9),
     )
     parent.revoke(capability="web.search")

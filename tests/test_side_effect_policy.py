@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.side_effect_policy import (
     SIDE_EFFECT_OUTBOX_MISSING,
@@ -42,6 +44,26 @@ def test_side_effect_policy_from_config_reads_strict_metadata() -> None:
     )
 
     assert side_effect_policy_from_config(config).mode == "strict"
+
+
+@pytest.mark.parametrize("mode", [[], "stric", " strict ", True, None])
+def test_side_effect_policy_from_config_rejects_malformed_explicit_mode(mode: object) -> None:
+    config = AgentRuntimeConfig(
+        definition_id="demo",
+        metadata={"tool_side_effect_policy": {"mode": mode}},
+    )
+
+    with pytest.raises(ValueError, match="mode must be compat or strict"):
+        side_effect_policy_from_config(config)
+
+
+def test_side_effect_policy_from_config_defaults_only_when_mode_is_absent() -> None:
+    config = AgentRuntimeConfig(
+        definition_id="demo",
+        metadata={"tool_side_effect_policy": {}},
+    )
+
+    assert side_effect_policy_from_config(config).mode == "compat"
 
 
 def test_compat_mode_does_not_block_external_side_effect() -> None:
@@ -127,3 +149,28 @@ def test_binding_runtime_overrides_tool_annotations() -> None:
 
     assert declaration.external is False
     assert declaration.delivery == "idempotent"
+
+
+@pytest.mark.parametrize(
+    ("runtime", "message"),
+    [
+        ({"external_side_effect": []}, "external_side_effect must be a boolean"),
+        ({"side_effect_delivery": "unknown"}, "side_effect_delivery must be outbox or idempotent"),
+        ({"side_effect_delivery": 1}, "side_effect_delivery must be outbox or idempotent"),
+        ({"idempotency_key_arg": "  "}, "idempotency_key_arg must be a non-empty string"),
+        ({"idempotency_key_arg": 1}, "idempotency_key_arg must be a non-empty string"),
+    ],
+)
+def test_binding_runtime_rejects_malformed_reserved_side_effect_fields(
+    runtime: dict[str, object],
+    message: str,
+) -> None:
+    tool = _tool(
+        annotations={
+            "external_side_effect": True,
+            "side_effect_delivery": "idempotent",
+        }
+    )
+
+    with pytest.raises(ValueError, match=message):
+        side_effect_declaration_from_tool(tool, runtime)

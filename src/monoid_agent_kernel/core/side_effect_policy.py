@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
-from monoid_agent_kernel.tools.base import ToolSpec
+if TYPE_CHECKING:
+    from monoid_agent_kernel.tools.base import ToolSpec
 
 ToolSideEffectPolicyMode = Literal["compat", "strict"]
 SideEffectDelivery = Literal["outbox", "idempotent"]
@@ -19,6 +20,10 @@ class ToolSideEffectPolicy:
     """Runtime policy for externally visible tool side effects."""
 
     mode: ToolSideEffectPolicyMode = "compat"
+
+    def __post_init__(self) -> None:
+        if type(self.mode) is not str or self.mode not in {"compat", "strict"}:
+            raise ValueError("tool side-effect policy mode must be compat or strict")
 
 
 @dataclass(frozen=True)
@@ -44,15 +49,41 @@ class SideEffectAdmission:
 def side_effect_policy_from_config(config: Any) -> ToolSideEffectPolicy:
     """Read the side-effect policy from ``AgentRuntimeConfig.metadata``-like objects."""
 
-    metadata = getattr(config, "metadata", {}) or {}
-    raw = metadata.get("tool_side_effect_policy") if isinstance(metadata, Mapping) else None
+    metadata = getattr(config, "metadata", {})
+    if not isinstance(metadata, Mapping) or "tool_side_effect_policy" not in metadata:
+        return ToolSideEffectPolicy(mode="compat")
+
+    raw = metadata["tool_side_effect_policy"]
     if isinstance(raw, Mapping):
-        mode = str(raw.get("mode") or "compat").strip().lower()
+        if "mode" not in raw:
+            return ToolSideEffectPolicy(mode="compat")
+        mode = raw["mode"]
+    elif isinstance(raw, str):
+        mode = raw
     else:
-        mode = str(raw or "compat").strip().lower()
-    if mode == "strict":
-        return ToolSideEffectPolicy(mode="strict")
-    return ToolSideEffectPolicy(mode="compat")
+        raise ValueError("tool side-effect policy must be an object or mode string")
+    if not isinstance(mode, str) or mode not in {"compat", "strict"}:
+        raise ValueError("tool side-effect policy mode must be compat or strict")
+    return ToolSideEffectPolicy(mode=mode)
+
+
+def validate_side_effect_settings(
+    settings: Mapping[str, Any],
+    *,
+    source: str = "side-effect declaration",
+) -> None:
+    """Validate reserved side-effect declaration fields without coercion."""
+
+    if "external_side_effect" in settings and type(settings["external_side_effect"]) is not bool:
+        raise ValueError(f"{source} external_side_effect must be a boolean")
+    if "side_effect_delivery" in settings:
+        delivery = settings["side_effect_delivery"]
+        if not isinstance(delivery, str) or delivery not in {"outbox", "idempotent"}:
+            raise ValueError(f"{source} side_effect_delivery must be outbox or idempotent")
+    if "idempotency_key_arg" in settings:
+        key_arg = settings["idempotency_key_arg"]
+        if not isinstance(key_arg, str) or not key_arg.strip():
+            raise ValueError(f"{source} idempotency_key_arg must be a non-empty string")
 
 
 def side_effect_declaration_from_tool(
@@ -67,13 +98,20 @@ def side_effect_declaration_from_tool(
 
     runtime = binding_runtime or {}
     annotations = spec.annotations or {}
-    external = _bool_setting("external_side_effect", runtime, annotations)
-    delivery = _str_setting("side_effect_delivery", runtime, annotations)
-    idempotency_key_arg = _str_setting("idempotency_key_arg", runtime, annotations) or "idempotency_key"
+    validate_side_effect_settings(runtime, source="binding runtime")
+    validate_side_effect_settings(annotations, source="tool annotations")
+    external = _setting("external_side_effect", runtime, annotations, False)
+    delivery = _setting("side_effect_delivery", runtime, annotations, "")
+    idempotency_key_arg = _setting(
+        "idempotency_key_arg",
+        runtime,
+        annotations,
+        "idempotency_key",
+    )
     return SideEffectDeclaration(
         external=external,
         delivery=delivery,
-        idempotency_key_arg=idempotency_key_arg,
+        idempotency_key_arg=idempotency_key_arg.strip(),
     )
 
 
@@ -94,7 +132,8 @@ def admit_tool_side_effect(
 
     if declaration.delivery == "idempotent":
         key_arg = declaration.idempotency_key_arg
-        if str(arguments.get(key_arg) or "").strip():
+        idempotency_key = arguments.get(key_arg)
+        if type(idempotency_key) is str and idempotency_key.strip():
             return SideEffectAdmission(declaration=declaration)
         return SideEffectAdmission(
             allowed=False,
@@ -129,25 +168,14 @@ def verify_outbox_side_effect(
     )
 
 
-def _bool_setting(key: str, runtime: Mapping[str, Any], annotations: Mapping[str, Any]) -> bool:
+def _setting(
+    key: str,
+    runtime: Mapping[str, Any],
+    annotations: Mapping[str, Any],
+    default: Any,
+) -> Any:
     if key in runtime:
-        return _as_bool(runtime.get(key))
+        return runtime[key]
     if key in annotations:
-        return _as_bool(annotations.get(key))
-    return False
-
-
-def _str_setting(key: str, runtime: Mapping[str, Any], annotations: Mapping[str, Any]) -> str:
-    if key in runtime:
-        return str(runtime.get(key) or "").strip()
-    if key in annotations:
-        return str(annotations.get(key) or "").strip()
-    return ""
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
+        return annotations[key]
+    return default

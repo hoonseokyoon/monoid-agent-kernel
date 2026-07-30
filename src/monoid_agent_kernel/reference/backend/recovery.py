@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -27,6 +26,7 @@ from monoid_agent_kernel.core.result import (
     Suspension,
     suspension_from_checkpoint_payload,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference.backend.ports import (
     DriveOpenSessionPort,
@@ -276,7 +276,9 @@ class RecoveryService:
 
     def read_recover_attempts(self, run_dir: Path) -> int:
         try:
-            payload = json.loads(self._recover_attempts_path(run_dir).read_text(encoding="utf-8"))
+            payload = loads_json_ingress(
+                self._recover_attempts_path(run_dir).read_text(encoding="utf-8")
+            )
             return int(payload["count"])
         except (FileNotFoundError, ValueError, KeyError, OSError, TypeError):
             return 0

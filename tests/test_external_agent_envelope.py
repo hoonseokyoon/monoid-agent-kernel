@@ -61,6 +61,101 @@ def test_external_agent_envelope_rejects_malformed_payload() -> None:
         )
 
 
+def test_external_agent_envelope_normalizes_direct_json_content() -> None:
+    envelope = validate_external_agent_envelope(
+        {
+            "protocol": EXTERNAL_AGENT_ENVELOPE_VERSION,
+            "peer_id": "worker\ud800",
+            "message_id": "msg\ud800",
+            "parts": [
+                {"type": "text", "text": "hello\ud800"},
+                {"type": "data", "data": {"score": float("nan")}},
+            ],
+            "result": {
+                "state": "completed\ud800",
+                "terminal": True,
+                "metadata": {"limit": float("inf")},
+                "error": {
+                    "code": "peer\ud800",
+                    "message": "failed\ud800",
+                    "retryable": False,
+                },
+            },
+            "created_at": 1.0,
+            "metadata": {"label": "bad\ud800", "score": float("-inf")},
+        }
+    )
+
+    assert envelope.peer_id == "worker\ufffd"
+    assert envelope.parts[0].text == "hello\ufffd"
+    assert envelope.parts[1].data == {"score": None}
+    assert envelope.result is not None
+    assert envelope.result.state == "completed\ufffd"
+    assert envelope.result.metadata == {"limit": None}
+    assert envelope.result.error is not None
+    assert envelope.result.error.code == "peer\ufffd"
+    assert envelope.metadata == {"label": "bad\ufffd", "score": None}
+
+    payload = envelope.to_json()
+    json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    inbox = external_agent_envelope_to_inbox_message(envelope, run_id="run\ud800")
+    assert inbox.run_id == "run\ufffd"
+    assert json.loads(inbox.content[1]["text"]) == {"score": None}
+
+
+def test_external_agent_envelope_normalizes_direct_dataclass_and_rejects_controls() -> None:
+    envelope = ExternalAgentEnvelope(
+        peer_id="worker\ud800",
+        message_id="msg\ud800",
+        parts=(
+            ExternalAgentPart(
+                type="data",
+                data={"score": float("nan"), "text": "bad\ud800"},
+            ),
+        ),
+        created_at=1.0,
+        metadata={"limit": float("inf")},
+    )
+
+    payload = envelope.to_json()
+    assert payload["peer_id"] == "worker\ufffd"
+    assert payload["parts"][0]["data"] == {"score": None, "text": "bad\ufffd"}
+    assert payload["metadata"] == {"limit": None}
+    inbox = external_agent_envelope_to_inbox_message(envelope, run_id="run-1")
+    assert json.loads(inbox.content[0]["text"]) == {
+        "score": None,
+        "text": "bad\ufffd",
+    }
+
+    for invalid_created_at in (float("nan"), 10**400):
+        with pytest.raises(ValueError, match="created_at must be a finite number"):
+            ExternalAgentEnvelope(
+                peer_id="worker",
+                message_id="msg",
+                parts=(ExternalAgentPart(type="text", text="hello"),),
+                created_at=invalid_created_at,
+            ).to_json()
+    with pytest.raises(ValueError, match="retryable must be a boolean"):
+        normalize_external_agent_error(
+            "failed",
+            retryable=1,  # type: ignore[arg-type]
+        )
+
+
+def test_external_agent_envelope_rejects_normalized_key_collisions() -> None:
+    data = {"\ud800": 1}
+    data["\ufffd"] = 2
+    with pytest.raises(ValueError, match="keys collide"):
+        validate_external_agent_envelope(
+            {
+                "protocol": EXTERNAL_AGENT_ENVELOPE_VERSION,
+                "peer_id": "worker",
+                "message_id": "msg",
+                "parts": [{"type": "data", "data": data}],
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -151,6 +246,22 @@ def test_outbox_request_converts_to_external_agent_envelope() -> None:
     assert envelope.parts[0].text == "please do X"
     assert envelope.capability_ref == "lease-handle-1"
     assert trace_id_of(envelope.traceparent) == trace_id_of(traceparent)
+
+
+@pytest.mark.parametrize("field", ["task_id", "request_id", "reply_to_id"])
+@pytest.mark.parametrize("invalid", [1, {"id": "forged"}, ["forged"]])
+def test_outbox_request_rejects_non_string_external_agent_identifiers(
+    field: str, invalid: object
+) -> None:
+    request = OutboxRequest(
+        destination="worker",
+        payload={"text": "please do X", field: invalid},
+        id="outbox-1",
+        idempotency_key="message-1",
+    )
+
+    with pytest.raises(ValueError, match=rf"{field} must be a string"):
+        external_agent_envelope_from_outbox_request(request)
 
 
 def test_outbox_request_converts_to_external_agent_envelope_with_sender_peer_id() -> None:

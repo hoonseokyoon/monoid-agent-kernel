@@ -105,13 +105,17 @@ def test_gateway_adapter_prefers_token_provider_and_reresolves() -> None:
         return f"tok-{calls['n']}"
 
     adapter = GatewayModelAdapter(
-        ModelConfig(gateway_url="https://llm-gateway.internal/v1/turns"), token="static", token_provider=provider
+        ModelConfig(gateway_url="https://llm-gateway.internal/v1/turns"),
+        token="static",
+        token_provider=provider,
     )
     assert adapter._headers()["Authorization"] == "Bearer tok-1"
     assert adapter._headers()["Authorization"] == "Bearer tok-2"  # re-resolved each request
 
     # No provider -> the static token is used unchanged (back-compat).
-    plain = GatewayModelAdapter(ModelConfig(gateway_url="https://llm-gateway.internal/v1/turns"), token="static")
+    plain = GatewayModelAdapter(
+        ModelConfig(gateway_url="https://llm-gateway.internal/v1/turns"), token="static"
+    )
     assert plain._headers()["Authorization"] == "Bearer static"
 
 
@@ -167,7 +171,9 @@ def test_gateway_response_parser_returns_model_turn() -> None:
         {
             "turn_handle": "turn_1",
             "final_text": None,
-            "tool_calls": [{"call_id": "call_1", "name": "fs_read", "arguments": "{\"path\":\"a.md\"}"}],
+            "tool_calls": [
+                {"call_id": "call_1", "name": "fs_read", "arguments": '{"path":"a.md"}'}
+            ],
             "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
         }
     )
@@ -176,6 +182,415 @@ def test_gateway_response_parser_returns_model_turn() -> None:
     assert turn.tool_calls[0].id == "call_1"
     assert turn.tool_calls[0].arguments == {"path": "a.md"}
     assert turn.usage["total_tokens"] == 15
+
+
+@pytest.mark.parametrize("payload", ([], 1, None, "response"))
+def test_gateway_response_parser_rejects_non_object_success_payloads(payload: object) -> None:
+    with pytest.raises(ModelAdapterError) as caught:
+        _parse_gateway_response(payload)
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.retryable is False
+
+
+def test_gateway_one_shot_substitutes_nonfinite_tool_arguments_only(monkeypatch: Any) -> None:
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return (
+                b'{"tool_calls":[{"call_id":"call_1","name":"score",'
+                b'"arguments":{"value":NaN,"overflow":1e9999}}]}'
+            )
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.providers.gateway.urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+    adapter = GatewayModelAdapter(
+        ModelConfig(gateway_url="http://gateway.local/internal/llm/turns"),
+        token="run-token",
+    )
+
+    turn = adapter.next_turn(ModelRequest("score", "sys", (), None))
+
+    assert turn.tool_calls[0].arguments == {"value": None, "overflow": None}
+    assert turn.raw["tool_calls"][0]["arguments"] == {"value": None, "overflow": None}
+
+
+@pytest.mark.parametrize(
+    "response_body",
+    (
+        b'{"final_text":"partial","stop_reason":NaN}',
+        b'{"final_text":"partial","response_id":Infinity}',
+        b'{"final_text":"partial","usage":NaN}',
+    ),
+)
+def test_gateway_one_shot_rejects_nonfinite_envelope_controls(
+    monkeypatch: Any,
+    response_body: bytes,
+) -> None:
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return response_body
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.providers.gateway.urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+    adapter = GatewayModelAdapter(
+        ModelConfig(gateway_url="http://gateway.local/internal/llm/turns"),
+        token="run-token",
+    )
+
+    with pytest.raises(ModelAdapterError) as caught:
+        adapter.next_turn(ModelRequest("finish", "sys", (), None))
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    "frame",
+    (
+        '{"type":NaN}',
+        '{"type":"turn_complete","stop_reason":NaN}',
+        '{"type":"text_delta","text":NaN}',
+    ),
+)
+def test_gateway_sse_rejects_nonfinite_envelope_controls(frame: str) -> None:
+    from monoid_agent_kernel.providers.gateway import _decode_sse_chunk
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _decode_sse_chunk([frame])
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"provider_retried": True, "final_text": 42},
+        {"provider_retried": True, "final_text": "partial", "usage": {"input_tokens": 1.5}},
+    ),
+)
+def test_gateway_response_validation_preserves_upstream_retry_evidence(
+    payload: dict[str, Any],
+) -> None:
+    with pytest.raises(ModelAdapterError) as caught:
+        _parse_gateway_response(payload)
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.provider_retried is True
+
+
+@pytest.mark.parametrize(
+    "frame",
+    (
+        {"type": "text_delta", "provider_retried": True, "text": 42},
+        {
+            "type": "turn_complete",
+            "provider_retried": True,
+            "usage": {"output_tokens": 1.5},
+        },
+    ),
+)
+def test_gateway_stream_validation_preserves_upstream_retry_evidence(
+    frame: dict[str, Any],
+) -> None:
+    from monoid_agent_kernel.providers.gateway import _chunk_from_event
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _chunk_from_event(frame)
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.provider_retried is True
+
+
+@pytest.mark.parametrize(
+    ("payload", "field_name"),
+    [
+        ({"final_text": "done", "provider_retried": "false"}, "provider_retried"),
+        ({"error": "busy", "retryable": "false"}, "retryable"),
+    ],
+)
+def test_gateway_one_shot_rejects_truthy_non_boolean_controls(
+    monkeypatch: Any,
+    payload: dict[str, Any],
+    field_name: str,
+) -> None:
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.providers.gateway.urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+    adapter = GatewayModelAdapter(
+        ModelConfig(gateway_url="http://gateway.local/internal/llm/turns"),
+        token="run-token",
+    )
+
+    with pytest.raises(ModelAdapterError) as caught:
+        adapter.next_turn(ModelRequest("finish", "sys", (), None))
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.retryable is False
+    assert caught.value.provider_retried is False
+    assert field_name in str(caught.value)
+
+
+def test_gateway_one_shot_maps_non_utf8_json_to_bad_response(monkeypatch: Any) -> None:
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"\xff\xfe not utf-8"
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.providers.gateway.urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+    adapter = GatewayModelAdapter(
+        ModelConfig(gateway_url="http://gateway.local/internal/llm/turns"),
+        token="run-token",
+    )
+
+    with pytest.raises(ModelAdapterError) as caught:
+        adapter.next_turn(ModelRequest("finish", "sys", (), None))
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.retryable is False
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"type": "text_delta", "text": "hi", "provider_retried": "false"},
+        {"type": "error", "error": "busy", "retryable": "false"},
+    ],
+)
+def test_gateway_sse_rejects_truthy_non_boolean_controls(frame: dict[str, Any]) -> None:
+    from monoid_agent_kernel.providers.gateway import _aiter_sse_chunks
+
+    class Response:
+        async def aiter_lines(self):
+            yield f"data: {json.dumps(frame)}"
+            yield ""
+
+    async def consume() -> list[Any]:
+        return [chunk async for chunk in _aiter_sse_chunks(Response())]
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(consume())
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.retryable is False
+    assert caught.value.provider_retried is False
+
+
+@pytest.mark.parametrize("invalid", ["1", True, 1.9, -1])
+def test_gateway_sse_rejects_coercible_tool_call_indices(invalid: object) -> None:
+    from monoid_agent_kernel.providers.gateway import _chunk_from_event
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _chunk_from_event(
+            {
+                "type": "tool_call_delta",
+                "index": invalid,
+                "arguments_fragment": "{}",
+            }
+        )
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.retryable is False
+    assert "index" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error": "bad", "http_status": "503"},
+        {"type": "error", "error": "bad", "http_status": 1.9},
+    ],
+)
+def test_gateway_rejects_coercible_wire_http_status(payload: dict[str, Any]) -> None:
+    from monoid_agent_kernel.providers.gateway import _chunk_from_event, _parse_gateway_response
+
+    parser = _chunk_from_event if "type" in payload else _parse_gateway_response
+    with pytest.raises(ModelAdapterError) as caught:
+        parser(payload)
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.retryable is False
+    assert "http_status" in str(caught.value)
+
+
+@pytest.mark.parametrize("field_name", ["retryable", "provider_retried"])
+def test_gateway_non_200_rejects_truthy_non_boolean_controls(field_name: str) -> None:
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+
+    body = json.dumps({"error": "busy", field_name: "false"})
+    with pytest.raises(ModelAdapterError) as caught:
+        _error_from_status_body(503, body)
+
+    assert caught.value.provider_error_code == "gateway_bad_response"
+    assert caught.value.http_status == 503
+    assert caught.value.retryable is False
+    assert caught.value.provider_retried is False
+    assert field_name in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_code"),
+    [(429, "gateway_rate_limited"), (503, "gateway_server_error")],
+)
+def test_gateway_malformed_json_error_keeps_http_retry_taxonomy(
+    status: int, expected_code: str
+) -> None:
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+
+    error = _error_from_status_body(status, "{\ufffd")
+
+    assert error.provider_error_code == expected_code
+    assert error.retryable is True
+    assert error.http_status == status
+    assert "invalid JSON error response" in str(error)
+
+
+def test_gateway_retries_non_utf8_http_error_body_then_succeeds(monkeypatch: Any) -> None:
+    calls = 0
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"turn_handle":"turn_ok","final_text":"done"}'
+
+    def fake_urlopen(request: Any, timeout: Any) -> Response:
+        del timeout
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise HTTPError(
+                request.full_url,
+                503,
+                "Service Unavailable",
+                {},
+                io.BytesIO(b"{\xff"),
+            )
+        return Response()
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=2, initial_delay_s=0, jitter_s=0),
+        ),
+        token="run-token",
+    )
+
+    turn = adapter.next_turn(ModelRequest("finish", "sys", (), None))
+
+    assert calls == 2
+    assert turn.final_text == "done"
+    assert turn.provider_retried is True
+
+
+def test_gateway_stream_retries_non_utf8_http_error_body_then_succeeds(
+    monkeypatch: Any,
+) -> None:
+    httpx = pytest.importorskip("httpx")
+
+    calls = 0
+
+    class ErrorResponse:
+        status_code = 503
+
+        async def __aenter__(self) -> ErrorResponse:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aread(self) -> bytes:
+            return b"{\xff"
+
+    class SuccessResponse:
+        status_code = 200
+
+        async def __aenter__(self) -> SuccessResponse:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"turn_complete","response_id":"turn_ok"}'
+            yield ""
+
+    class Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Client:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> ErrorResponse | SuccessResponse:
+            nonlocal calls
+            calls += 1
+            return ErrorResponse() if calls == 1 else SuccessResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=2, initial_delay_s=0, jitter_s=0),
+        ),
+        token="run-token",
+    )
+
+    async def consume() -> list[Any]:
+        return [
+            chunk
+            async for chunk in adapter.astream_turn(ModelRequest("finish", "sys", (), None))
+        ]
+
+    chunks = asyncio.run(consume())
+
+    assert calls == 2
+    assert chunks[-1].response_id == "turn_ok"
+    assert chunks[-1].provider_retried is True
 
 
 def test_gateway_retries_retryable_http_error_then_succeeds(monkeypatch) -> None:
@@ -274,7 +689,9 @@ def test_gateway_does_not_retry_auth_error(monkeypatch) -> None:
             401,
             "Unauthorized",
             {},
-            io.BytesIO(b'{"error":"bad token","error_code":"gateway_auth_error","retryable":false}'),
+            io.BytesIO(
+                b'{"error":"bad token","error_code":"gateway_auth_error","retryable":false}'
+            ),
         )
 
     monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
@@ -373,7 +790,9 @@ def test_adapters_send_full_messages_by_value(tmp_path: Path) -> None:
     items = oa_payload["input"]
     assert {"role": "user", "content": "hi"} in items
     assert any(it.get("type") == "function_call" and it.get("call_id") == "c1" for it in items)
-    assert any(it.get("type") == "function_call_output" and it.get("call_id") == "c1" for it in items)
+    assert any(
+        it.get("type") == "function_call_output" and it.get("call_id") == "c1" for it in items
+    )
     assert "previous_response_id" not in oa_payload
 
 
@@ -420,9 +839,12 @@ def test_gateway_reports_the_retry_on_a_successful_turn(monkeypatch) -> None:
 
     # Counterweight: a call that succeeds first time reports no retry.
     calls = 1
-    assert adapter.next_turn(
-        ModelRequest(instruction="hi", system_prompt="s", tools=())
-    ).provider_retried is False
+    assert (
+        adapter.next_turn(
+            ModelRequest(instruction="hi", system_prompt="s", tools=())
+        ).provider_retried
+        is False
+    )
 
 
 def test_gateway_keeps_retry_evidence_when_the_final_failure_is_not_an_adapter_error(
@@ -430,9 +852,8 @@ def test_gateway_keeps_retry_evidence_when_the_final_failure_is_not_an_adapter_e
 ) -> None:
     """A retried attempt can still end in something that is not a `ModelAdapterError`.
 
-    A body that is not valid UTF-8 raises `UnicodeDecodeError` at the decode step, which used to
-    escape unstamped — so the failure receipt denied a retry that had demonstrably happened. The
-    marker has to survive whichever exception type carries the failure out.
+    A response-body reader can fail outside the adapter's exception taxonomy. The marker has to
+    survive whichever exception type carries the failure out.
     """
     calls = 0
 
@@ -444,7 +865,7 @@ def test_gateway_keeps_retry_evidence_when_the_final_failure_is_not_an_adapter_e
             return None
 
         def read(self):
-            return b"\xff\xfe not utf-8"
+            raise RuntimeError("response body read failed")
 
     def fake_urlopen(request, timeout):
         del request, timeout
@@ -466,10 +887,10 @@ def test_gateway_keeps_retry_evidence_when_the_final_failure_is_not_an_adapter_e
 
     try:
         adapter.next_turn(ModelRequest(instruction="hi", system_prompt="s", tools=()))
-    except UnicodeDecodeError as exc:
+    except RuntimeError as exc:
         assert getattr(exc, "provider_retried", False) is True
-    else:  # pragma: no cover - the decode must fail for this test to mean anything
-        raise AssertionError("expected the invalid body to raise")
+    else:  # pragma: no cover - the reader must fail for this test to mean anything
+        raise AssertionError("expected the response reader to raise")
 
 
 def test_the_shipped_adapter_reports_its_retry_through_the_channel(monkeypatch: Any) -> None:
@@ -496,7 +917,9 @@ def test_the_shipped_adapter_reports_its_retry_through_the_channel(monkeypatch: 
     monkeypatch.setattr(gateway_module, "urlopen", _urlopen)
     monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
     adapter = GatewayModelAdapter(
-        config=ModelConfig(gateway_url="http://gateway.invalid", retry=ModelRetryConfig(max_attempts=3)),
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid", retry=ModelRetryConfig(max_attempts=3)
+        ),
         token="t",
     )
 
@@ -555,7 +978,11 @@ def test_a_backend_retry_survives_a_failed_gateway_call() -> None:
     )
     from monoid_agent_kernel.reference.llm_gateway.http import _stream_error_frame
 
-    retried_body = {"error": "refused", "error_code": "gateway_bad_request", "provider_retried": True}
+    retried_body = {
+        "error": "refused",
+        "error_code": "gateway_bad_request",
+        "provider_retried": True,
+    }
     with pytest.raises(ModelAdapterError) as one_shot:
         _parse_gateway_response(retried_body)
     assert one_shot.value.provider_retried is True
@@ -681,9 +1108,7 @@ def test_the_retry_is_reported_before_the_wait_not_after_it(monkeypatch: Any) ->
         "_sleep_before_retry",
         lambda *_a: order.append("wait"),
     )
-    monkeypatch.setattr(
-        gateway_module, "report_provider_retried", lambda: order.append("report")
-    )
+    monkeypatch.setattr(gateway_module, "report_provider_retried", lambda: order.append("report"))
 
     def _urlopen(*_args: Any, **_kwargs: Any) -> Any:
         raise URLError("reset")

@@ -192,6 +192,35 @@ def test_a_torn_utf8_sequence_does_not_fail_the_read(tmp_path: Path) -> None:
     assert events[0]["data"]["final_text"] == "survived the tear"
 
 
+def test_legacy_surrogate_text_is_repaired_and_nonfinite_lines_are_skipped(
+    tmp_path: Path,
+) -> None:
+    repaired = "legacy\ufffdtext"
+    digest = content_digest(repaired)
+    records = [
+        {
+            "kind": "settled_text",
+            "final_text": "ignored",
+            "final_text_digest": digest,
+            "score": float("nan"),
+        },
+        {
+            "kind": "settled_text",
+            "final_text": "legacy\ud800text",
+            "final_text_digest": digest,
+        },
+    ]
+    (tmp_path / "transcript.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert events[0]["data"]["final_text"] == repaired
+
+
 def test_a_record_whose_text_does_not_match_its_digest_is_refused(tmp_path: Path) -> None:
     """The digest names the content, so the join verifies rather than trusts.
 

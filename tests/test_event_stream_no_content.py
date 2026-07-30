@@ -169,6 +169,9 @@ def test_the_delta_channel_republishes_the_answer_unless_it_is_switched_off(
     # Resolved into the field, not at the emit site: a loop reporting `True` while streaming nothing
     # is the same half-bound shape the switch exists to remove.
     assert off.emit_output_deltas is False
+    # A caller retaining the mutable loop cannot re-enable a deployment-wide content route after
+    # construction. The public request can change, while the effective operator decision cannot.
+    off.emit_output_deltas = True
     off_result = off.run_once("go")
 
     assert _events(off_result.run_dir, "model.output.delta") == []

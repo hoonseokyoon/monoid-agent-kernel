@@ -18,7 +18,7 @@ from monoid_agent_kernel.core.content import (
     non_text_part_types,
 )
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
-from monoid_agent_kernel.core.spec import AgentRunSpec, text_from_parts
+from monoid_agent_kernel.core.spec import AgentRunSpec, input_to_parts, text_from_parts
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -51,6 +51,13 @@ def test_effective_input_synthesizes_text_from_instruction() -> None:
     spec = AgentRunSpec(workspace_root=Path("/ws"), run_root=Path("runs"))
     assert spec.input == ()
     assert spec.effective_input == ()
+
+
+def test_submit_input_normalizes_lone_surrogates_in_text_and_references() -> None:
+    assert input_to_parts("hello \ud800") == (TextPart("hello �"),)
+    assert input_to_parts((ImagePart(source_ref="\ud800.png", mime_type="image/\udc00"),)) == (
+        ImagePart(source_ref="�.png", mime_type="image/�"),
+    )
 
 
 def test_effective_input_uses_explicit_parts() -> None:
@@ -116,7 +123,9 @@ def test_non_text_input_emits_degraded_warning(tmp_path: Path) -> None:
         run_root=tmp_path / "runs",
     )
 
-    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run_once(
+    result = AgentLoop(
+        spec=spec, model_adapter=adapter, runtime_config_provider=_provider()
+    ).run_once(
         (TextPart("describe the image"), ImagePart(source_ref="i.png", mime_type="image/png"))
     )
 
@@ -248,9 +257,9 @@ def test_text_only_input_emits_no_degraded_warning(tmp_path: Path) -> None:
     )
     spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
 
-    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run_once(
-        "plain text"
-    )
+    result = AgentLoop(
+        spec=spec, model_adapter=adapter, runtime_config_provider=_provider()
+    ).run_once("plain text")
 
     events = [
         json.loads(line)

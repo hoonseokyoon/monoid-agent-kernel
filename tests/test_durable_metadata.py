@@ -71,6 +71,7 @@ def test_run_metadata_validation_accepts_current_and_legacy_schema() -> None:
         ("metadata_generation", 0),
         ("limits", []),
         ("created_at", "now"),
+        ("created_at", 10**400),
     ),
 )
 def test_run_metadata_decoder_rejects_wrong_known_field_types(field: str, value: object) -> None:
@@ -133,7 +134,7 @@ def test_runtime_config_raw_hash_exception_rejects_unrelated_payload_drift() -> 
         runtime_config_from_metadata(meta)
 
 
-def test_runtime_config_legacy_hash_rejects_json_type_drift() -> None:
+def test_runtime_config_legacy_reader_rejects_json_type_drift() -> None:
     config = runtime_config(
         bindings=(
             tool_binding("fs.read", scope=ToolScope(allowed_paths=("!odd",))),
@@ -153,7 +154,7 @@ def test_runtime_config_legacy_hash_rejects_json_type_drift() -> None:
         "runtime_config_hash": raw_hash,
     }
 
-    with pytest.raises(ValueError, match="runtime config hash mismatch"):
+    with pytest.raises(ValueError, match="config_version"):
         runtime_config_from_metadata(meta)
 
 

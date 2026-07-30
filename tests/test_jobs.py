@@ -325,6 +325,19 @@ def test_subagent_cancel_waits_for_child_coroutine_to_stop_before_reentry(tmp_pa
         manager._shutdown_task_loop()
 
 
+@pytest.mark.parametrize("invalid", ["false", 0, None, float("nan")])
+def test_hosted_task_rejects_coercible_resume_control(
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    manager, _recorder, _sink = _manager(tmp_path)
+
+    with pytest.raises(ValueError, match="resume_on_exit must be a boolean"):
+        manager.start_task("hitl", {"prompt": "Approve?", "resume_on_exit": invalid})
+
+    assert manager.jobs == {}
+
+
 def test_non_resume_job_is_not_offered_for_reentry(tmp_path: Path) -> None:
     manager, _recorder, _sink = _manager(tmp_path)
     job = _start(manager, _python_command("print('quiet')"), resume_on_exit=False)

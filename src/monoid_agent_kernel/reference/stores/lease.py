@@ -11,7 +11,6 @@ the "shared board" that local files cannot be.
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from monoid_agent_kernel.core._util import file_lock, write_json_atomic
+from monoid_agent_kernel.core.json_ingress import is_finite_json_number, loads_json_ingress
 
 
 class LeaseStore(Protocol):
@@ -65,10 +65,27 @@ class LocalFsLeaseStore:
 
     def _read(self, run_id: str) -> dict[str, Any] | None:
         try:
-            payload = json.loads(self._lease_path(run_id).read_text(encoding="utf-8"))
+            payload = loads_json_ingress(self._lease_path(run_id).read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError, OSError):
             return None
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        stored_run_id = payload.get("run_id")
+        worker_id = payload.get("worker_id")
+        heartbeat_at = payload.get("heartbeat_at")
+        lease_ttl_s = payload.get("lease_ttl_s")
+        if (
+            type(stored_run_id) is not str
+            or not stored_run_id
+            or stored_run_id != run_id
+            or type(worker_id) is not str
+            or not worker_id
+            or not is_finite_json_number(heartbeat_at)
+            or not is_finite_json_number(lease_ttl_s)
+            or lease_ttl_s <= 0
+        ):
+            return None
+        return payload
 
     def candidate_run_ids(self) -> list[str]:
         if not self.run_root.is_dir():
@@ -91,8 +108,7 @@ class LocalFsLeaseStore:
         lease = self._read(run_id)
         if lease is None:
             return True  # no lease (crashed before writing, or a legacy run) -> reclaimable
-        ttl = float(lease.get("lease_ttl_s", 0.0))
-        return (time.time() - float(lease.get("heartbeat_at", 0.0))) > ttl
+        return (time.time() - lease["heartbeat_at"]) > lease["lease_ttl_s"]
 
     def try_claim(self, run_id: str, worker_id: str, ttl_s: float) -> bool:
         with file_lock(
@@ -107,7 +123,7 @@ class LocalFsLeaseStore:
 
     def owner(self, run_id: str) -> str | None:
         lease = self._read(run_id)
-        return str(lease["worker_id"]) if lease and "worker_id" in lease else None
+        return lease["worker_id"] if lease is not None else None
 
     def release(self, run_id: str) -> None:
         try:

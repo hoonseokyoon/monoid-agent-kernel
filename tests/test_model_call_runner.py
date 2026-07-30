@@ -38,10 +38,13 @@ from monoid_agent_kernel.model_call import (
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
+    ReasoningDelta,
     TextDelta,
+    ToolCall,
     ToolCallDelta,
     ToolObservation,
     TurnComplete,
+    normalize_model_request,
     report_provider_retried,
 )
 from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
@@ -176,6 +179,463 @@ def test_every_adapter_shape_reaches_the_same_turn(adapter: Any) -> None:
     assert isinstance(turn, ModelTurn), f"the dispatch returned a {type(turn).__name__}, not a turn"
     assert turn.final_text in {"answer", "one-shot fallback"}
     assert turn.final_text is not None
+
+
+def test_one_shot_normalizes_request_and_turn_before_adapter_receipt_and_observer() -> None:
+    class HostileAdapter:
+        def __init__(self) -> None:
+            self.request: ModelRequest | None = None
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.request = request
+            return ModelTurn(
+                response_id="r\ud800",
+                final_text="answer\udc00",
+                tool_calls=(
+                    ToolCall(
+                        id="call\ud800",
+                        name="tool\udc00",
+                        arguments={"text": "\ud800", "number": float("nan")},
+                    ),
+                ),
+                usage={"bad": float("inf")},  # type: ignore[dict-item]
+                raw={"value": -float("inf")},
+                reasoning=({"summary": "\ud83d\ude00", "score": float("nan")},),
+            )
+
+    original = ModelRequest(
+        instruction="prompt\ud800",
+        system_prompt="system\udc00",
+        tools=(),
+        messages=({"role": "user", "content": "\ud800", "number": float("nan")},),
+    )
+    adapter = HostileAdapter()
+    observer = RecordingObserver()
+
+    async def run() -> tuple[ModelTurn, Any]:
+        return await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="full")),
+            ),
+        ).acall(original)
+
+    turn, receipt = asyncio.run(run())
+
+    assert adapter.request is not None
+    assert adapter.request.instruction == "prompt�"
+    assert adapter.request.system_prompt == "system�"
+    assert adapter.request.messages == ({"role": "user", "content": "�", "number": None},)
+    assert original.instruction == "prompt\ud800"
+    assert receipt.prompt_digest == _digest(_prompt_payload(normalize_model_request(original)))
+    assert turn.final_text == "answer�"
+    assert turn.tool_calls[0].arguments == {"text": "�", "number": None}
+    assert turn.raw == {"value": None}
+    assert turn.reasoning == ({"summary": "😀", "score": None},)
+    rendered_capture = json.dumps(observer.captures[0].content, allow_nan=False, ensure_ascii=False)
+    rendered_capture.encode("utf-8")
+
+
+def test_stream_normalizes_each_visible_chunk_and_the_assembled_turn() -> None:
+    adapter = StreamingAdapter(
+        chunks=[
+            TextDelta("answer\ud800"),
+            ReasoningDelta("reason\udc00"),
+            ToolCallDelta(
+                index=0,
+                id="call\ud800",
+                name="tool\udc00",
+                arguments_fragment='{"value": NaN, "text": "\\ud800"}',
+            ),
+            TurnComplete(
+                response_id="r\ud800",
+                usage={"input_tokens": 3},
+                reasoning=({"summary": "\ud800", "score": float("nan")},),
+            ),
+        ]
+    )
+    seen: list[Any] = []
+
+    async def run() -> ModelTurn:
+        turn, _receipt = await ModelCallRunner(adapter=adapter).acall(
+            REQUEST, delta_consumer=seen.append
+        )
+        return turn
+
+    turn = asyncio.run(run())
+
+    text = "".join(chunk.text for chunk in seen if isinstance(chunk, TextDelta))
+    reasoning = "".join(chunk.text for chunk in seen if isinstance(chunk, ReasoningDelta))
+    tool_chunks = [chunk for chunk in seen if isinstance(chunk, ToolCallDelta)]
+    terminal = [chunk for chunk in seen if isinstance(chunk, TurnComplete)]
+    assert text == "answer�"
+    assert reasoning == "reason�"
+    assert tool_chunks == [ToolCallDelta(
+        index=0,
+        id="call�",
+        name="tool�",
+        arguments_fragment='{"value": NaN, "text": "\\ud800"}',
+    )]
+    assert terminal[0].usage == {"input_tokens": 3, "output_tokens": 0, "total_tokens": 3}
+    assert terminal[0].reasoning == ({"summary": "�", "score": None},)
+    assert turn.response_id == "r�"
+    assert turn.tool_calls[0].arguments == {"value": None, "text": "�"}
+
+
+def test_stream_preserves_surrogate_pairs_across_interleaved_logical_channels() -> None:
+    high, low = "\ud83d", "\ude00"
+    adapter = StreamingAdapter(
+        chunks=[
+            TextDelta(high),
+            ReasoningDelta(high),
+            ToolCallDelta(index=0, id="c", name="t", arguments_fragment='{"emoji":"' + high),
+            TextDelta(low),
+            ReasoningDelta(low),
+            ToolCallDelta(index=0, arguments_fragment=low + '"}'),
+            TurnComplete(),
+        ]
+    )
+    seen: list[Any] = []
+
+    async def run() -> ModelTurn:
+        return (
+            await ModelCallRunner(adapter=adapter).acall(REQUEST, delta_consumer=seen.append)
+        )[0]
+
+    turn = asyncio.run(run())
+
+    assert "".join(chunk.text for chunk in seen if isinstance(chunk, TextDelta)) == "😀"
+    assert "".join(chunk.text for chunk in seen if isinstance(chunk, ReasoningDelta)) == "😀"
+    assert "".join(
+        chunk.arguments_fragment for chunk in seen if isinstance(chunk, ToolCallDelta)
+    ) == '{"emoji":"😀"}'
+    assert turn.final_text == "😀"
+    assert turn.tool_calls[0].arguments == {"emoji": "😀"}
+
+
+def test_stream_flushes_lone_surrogates_in_original_global_order() -> None:
+    adapter = StreamingAdapter(
+        chunks=[
+            ReasoningDelta("\ud800"),
+            TextDelta("\ud800"),
+            ToolCallDelta(index=2, arguments_fragment="\ud800"),
+            TurnComplete(),
+        ]
+    )
+    seen: list[Any] = []
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=adapter).acall(REQUEST, delta_consumer=seen.append)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+    suffix = [chunk for chunk in seen if getattr(chunk, "text", "") == "�" or getattr(chunk, "arguments_fragment", "") == "�"]
+    assert [type(chunk) for chunk in suffix] == [ReasoningDelta, TextDelta, ToolCallDelta]
+
+
+def test_structural_turn_and_custom_init_subclasses_keep_compatibility() -> None:
+    class CustomRequest(ModelRequest):
+        def __init__(self, instruction: str) -> None:
+            super().__init__(instruction=instruction, system_prompt="sys", tools=())
+
+    class CustomTurn(ModelTurn):
+        def __init__(self, text: str) -> None:
+            super().__init__(final_text=text)
+
+    class Adapter:
+        request: ModelRequest | None = None
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.request = request
+            return CustomTurn("answer\ud800")
+
+    adapter = Adapter()
+    turn, _receipt = asyncio.run(ModelCallRunner(adapter=adapter).acall(CustomRequest("hi\ud800")))
+
+    assert isinstance(adapter.request, CustomRequest)
+    assert adapter.request.instruction == "hi�"
+    assert isinstance(turn, CustomTurn)
+    assert turn.final_text == "answer�"
+
+    class StructuralTurn:
+        final_text = "duck\ud800"
+        response_id = None
+        tool_calls = ()
+        usage = {}
+        raw = {}
+        reasoning = ()
+        stop_reason = "stop\ud800"
+        provider_retried = False
+
+    class StructuralAdapter:
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            return StructuralTurn()
+
+    structural, receipt = asyncio.run(ModelCallRunner(adapter=StructuralAdapter()).acall(REQUEST))
+    assert structural.final_text == "duck�"
+    assert receipt.stop_reason == "stop�"
+
+
+def test_ingress_rejection_keeps_an_attempt_zero_receipt_and_boundary_precedence() -> None:
+    class CountingAdapter:
+        calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.calls += 1
+            return ModelTurn(final_text="never")
+
+    request = replace(REQUEST, messages=({chr(0xD800): 1, chr(0xFFFD): 2},))
+    adapter = CountingAdapter()
+    observer = RecordingObserver()
+    runner = ModelCallRunner(
+        adapter=adapter,
+        subscriptions=(
+            ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="keys collide"):
+        asyncio.run(runner.acall(request))
+    assert adapter.calls == 0
+    assert observer.captures[0].receipt.attempts == 0
+
+    token = CancellationToken()
+    token.cancel()
+    cancelled_observer = RecordingObserver()
+    cancelled_runner = ModelCallRunner(
+        adapter=adapter,
+        current_cancellation_token=lambda: token,
+        subscriptions=(
+            ModelIOSubscription(
+                observer=cancelled_observer,
+                policy=CapturePolicy(mode="digest"),
+            ),
+        ),
+    )
+    with pytest.raises(RunCancelled):
+        asyncio.run(cancelled_runner.acall(request))
+    assert cancelled_observer.captures[0].receipt.error_code == "cancelled"
+
+
+def test_nonfinite_model_controls_are_rejected_before_dispatch() -> None:
+    class CountingAdapter:
+        calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.calls += 1
+            return ModelTurn(final_text="never")
+
+    adapter = CountingAdapter()
+    retry = replace(ModelConfig().retry, max_attempts=float("nan"))  # type: ignore[arg-type]
+    request = replace(REQUEST, model=replace(ModelConfig(), retry=retry))
+
+    with pytest.raises(ValueError, match="max_attempts"):
+        asyncio.run(ModelCallRunner(adapter=adapter).acall(request))
+    assert adapter.calls == 0
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        replace(ModelConfig(), provider=float("nan")),  # type: ignore[arg-type]
+        replace(
+            ModelConfig(),
+            retry=replace(ModelConfig().retry, retry_on=(float("nan"),)),  # type: ignore[arg-type]
+        ),
+    ],
+)
+def test_nonfinite_model_text_controls_leave_a_portable_attempt_zero_receipt(
+    config: ModelConfig,
+) -> None:
+    class CountingAdapter:
+        calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.calls += 1
+            return ModelTurn(final_text="never")
+
+    adapter = CountingAdapter()
+    observer = RecordingObserver()
+    runner = ModelCallRunner(
+        adapter=adapter,
+        subscriptions=(
+            ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        asyncio.run(runner.acall(replace(REQUEST, model=config)))
+
+    assert adapter.calls == 0
+    assert observer.captures[0].receipt.attempts == 0
+    json.dumps(observer.captures[0].receipt.to_json(), allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "retry_on",
+    [
+        ("",),
+        "gateway_timeout",
+    ],
+)
+def test_invalid_direct_retry_codes_are_rejected_before_dispatch(retry_on: object) -> None:
+    class CountingAdapter:
+        calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.calls += 1
+            return ModelTurn(final_text="never")
+
+    adapter = CountingAdapter()
+    retry = replace(ModelConfig().retry, retry_on=retry_on)  # type: ignore[arg-type]
+    request = replace(REQUEST, model=replace(ModelConfig(), retry=retry))
+
+    with pytest.raises(ValueError, match="model.retry.retry_on"):
+        asyncio.run(ModelCallRunner(adapter=adapter).acall(request))
+    assert adapter.calls == 0
+
+
+def test_normalized_adapter_fallback_config_is_the_config_actually_dispatched() -> None:
+    class Adapter:
+        config = replace(ModelConfig(), model="fallback\ud800")
+        seen_model: ModelConfig | None = None
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.seen_model = request.model
+            return ModelTurn(final_text="done")
+
+    adapter = Adapter()
+
+    _turn, receipt = asyncio.run(ModelCallRunner(adapter=adapter).acall(REQUEST))
+
+    assert adapter.seen_model is not None
+    assert adapter.seen_model.model == "fallback�"
+    assert receipt.model.model == "fallback�"
+
+
+def test_unconfigured_adapter_keeps_the_optional_request_model_absent() -> None:
+    class Adapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            if request.model is not None:
+                raise RuntimeError("an absent opt-in config was synthesized")
+            return ModelTurn(final_text="done")
+
+    turn, _receipt = asyncio.run(ModelCallRunner(adapter=Adapter()).acall(REQUEST))
+
+    assert turn.final_text == "done"
+
+
+def test_model_turn_envelope_canonicalization_preserves_a_paid_answer() -> None:
+    class Adapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(
+                response_id=float("nan"),  # type: ignore[arg-type]
+                final_text="done",
+                tool_calls=None,  # type: ignore[arg-type]
+                usage=None,  # type: ignore[arg-type]
+                raw=None,  # type: ignore[arg-type]
+                reasoning=None,  # type: ignore[arg-type]
+                stop_reason=float("nan"),  # type: ignore[arg-type]
+            )
+
+    turn, receipt = asyncio.run(ModelCallRunner(adapter=Adapter()).acall(REQUEST))
+
+    assert turn.final_text == "done"
+    assert turn.response_id is None
+    assert turn.tool_calls == ()
+    assert turn.usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    assert turn.raw == {}
+    assert turn.reasoning == ()
+    assert turn.stop_reason is None
+    json.dumps(receipt.to_json(), allow_nan=False)
+
+
+def test_nonfinite_required_model_fields_fail_before_persistence() -> None:
+    class Adapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(
+                tool_calls=(
+                    ToolCall(float("nan"), "tool", {}),  # type: ignore[arg-type]
+                )
+            )
+
+    with pytest.raises(ModelAdapterError, match="non-portable response"):
+        asyncio.run(ModelCallRunner(adapter=Adapter()).acall(REQUEST))
+
+
+@pytest.mark.parametrize("malformed", [None, object(), {"final_text": "not an attribute"}])
+def test_non_turn_provider_values_are_rejected(malformed: Any) -> None:
+    class Adapter:
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            return malformed
+
+    with pytest.raises(ModelAdapterError, match="non-portable response"):
+        asyncio.run(ModelCallRunner(adapter=Adapter()).acall(REQUEST))
+
+
+def test_nonfinite_stream_text_is_rejected_before_delta_delivery() -> None:
+    class Adapter:
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+            del request
+            yield TextDelta(float("nan"))  # type: ignore[arg-type]
+
+    delivered: list[Any] = []
+
+    with pytest.raises(ModelAdapterError, match="non-portable stream fragment"):
+        asyncio.run(
+            ModelCallRunner(adapter=Adapter()).acall(
+                REQUEST,
+                delta_consumer=delivered.append,
+            )
+        )
+
+    assert delivered == []
+
+
+def test_unknown_stream_fragment_is_rejected_before_delta_delivery() -> None:
+    class Adapter:
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+            del request
+            yield {"bad": float("nan")}  # type: ignore[misc]
+            yield TurnComplete()
+
+    delivered: list[Any] = []
+
+    with pytest.raises(ModelAdapterError, match="non-portable stream fragment"):
+        asyncio.run(
+            ModelCallRunner(adapter=Adapter()).acall(
+                REQUEST,
+                delta_consumer=delivered.append,
+            )
+        )
+
+    assert delivered == []
+
+
+def test_terminal_stream_chunk_stops_provider_iteration() -> None:
+    class Adapter:
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+            del request
+            yield TextDelta("done")
+            yield TurnComplete(response_id="r1")
+            raise RuntimeError("post-terminal provider defect")
+
+    delivered: list[Any] = []
+
+    turn, _receipt = asyncio.run(
+        ModelCallRunner(adapter=Adapter()).acall(
+            REQUEST,
+            delta_consumer=delivered.append,
+        )
+    )
+
+    assert turn.final_text == "done"
+    assert turn.response_id == "r1"
+    assert [type(chunk) for chunk in delivered] == [TextDelta, TurnComplete]
 
 
 @pytest.mark.parametrize("adapter_factory", [CallableObjectAdapter, AwaitableReturningAdapter])
@@ -566,6 +1026,7 @@ def test_a_run_told_to_stop_does_not_report_a_turn_it_happened_to_finish() -> No
 
 def test_a_blocking_adapter_is_abandoned_rather_than_awaited() -> None:
     """A sync ``next_turn`` cannot be interrupted, so the deadline abandons its thread."""
+
     class WedgedAdapter:
         def next_turn(self, request: ModelRequest) -> ModelTurn:
             del request
@@ -613,6 +1074,7 @@ def test_an_adapter_that_cancels_itself_is_reported_as_an_adapter_failure() -> N
         ("next_turn", SelfCancellingSync(), {}),
         ("astream_turn", SelfCancellingStream(), {"delta_consumer": lambda chunk: None}),
     ):
+
         async def run(adapter: Any = adapter, kwargs: Any = kwargs) -> None:
             await ModelCallRunner(adapter=adapter).acall(REQUEST, **kwargs)
 
@@ -730,58 +1192,25 @@ def test_the_replay_key_distinguishes_tools_sharing_an_id() -> None:
         tools=(_spec("t.x", "alpha", {"type": "object", "required": ["q"]}),),
     )
 
-    keys = {asyncio.run(_receipt_for(request)).request_digest for request in (plain, renamed, reschemad)}
+    keys = {
+        asyncio.run(_receipt_for(request)).request_digest for request in (plain, renamed, reschemad)
+    }
     assert len(keys) == 3
 
 
-@pytest.mark.parametrize(
-    ("label", "request_"),
-    [
-        (
-            "mixed mapping keys in a tool field",
-            ModelRequest(
-                instruction="hi",
-                system_prompt="s",
-                tools=(
-                    ToolSpec(
-                        id="t",
-                        description="d",
-                        input_schema={"type": "object"},
-                        capability="read",
-                        side_effect="read",
-                        handler=lambda **kwargs: None,
-                        guidance={1: "x", "kind": "y"},
-                    ),
-                ),
-            ),
-        ),
-        (
-            "a value JSON has no form for, in messages",
-            ModelRequest(
-                instruction="hi", system_prompt="s", tools=(), messages=({"role": "user", "x": object()},)
-            ),
-        ),
-        (
-            "mixed keys nested deep in messages",
-            ModelRequest(
-                instruction="hi", system_prompt="s", tools=(), messages=({"deep": {"a": {2: "b"}}},)
-            ),
-        ),
-    ],
-)
-def test_a_payload_the_serializer_cannot_carry_does_not_kill_the_call(
-    label: str, request_: ModelRequest
-) -> None:
+def test_an_arbitrary_scalar_the_serializer_cannot_carry_does_not_kill_the_call() -> None:
     """A digest is bookkeeping about a call, never a precondition for making one.
 
-    Digests are computed before the adapter is reached, so a value the canonical serializer chokes
-    on stopped the call from happening at all. `{1: "x", "kind": "y"}` is the sharp case: plain
-    `json.dumps` accepts it, but canonical JSON sorts keys and sorting `int` against `str` raises.
-
-    Parametrized across all three payload sources on purpose. The first guard covered only tool
-    fields and left `messages` and `observations` — both caller-filled — able to kill a call.
+    The portable-JSON batch intentionally leaves arbitrary scalar policy to its separate follow-up.
+    Until then, a value the canonical digest cannot carry still reaches the adapter without a replay
+    key. JSON object keys are different: semantic ingress rejects non-string keys before this path.
     """
-    del label
+    request_ = ModelRequest(
+        instruction="hi",
+        system_prompt="s",
+        tools=(),
+        messages=({"role": "user", "x": object()},),
+    )
 
     class Adapter:
         def next_turn(self, request: ModelRequest) -> ModelTurn:
@@ -797,6 +1226,48 @@ def test_a_payload_the_serializer_cannot_carry_does_not_kill_the_call(
     # by the digest tests above. Asserting both here is what made this test wrong twice.
     assert turn.final_text == "answer"
     assert isinstance(receipt.request_digest, str)
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        ModelRequest(
+            instruction="hi",
+            system_prompt="s",
+            tools=(
+                ToolSpec(
+                    id="t",
+                    description="d",
+                    input_schema={"type": "object"},
+                    capability="read",
+                    side_effect="read",
+                    handler=lambda **kwargs: None,
+                    guidance={1: "x", "kind": "y"},
+                ),
+            ),
+        ),
+        ModelRequest(
+            instruction="hi",
+            system_prompt="s",
+            tools=(),
+            messages=({"deep": {"a": {2: "b"}}},),
+        ),
+    ],
+)
+def test_non_string_json_object_keys_fail_at_semantic_ingress(request_: ModelRequest) -> None:
+    calls = 0
+
+    class Adapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            nonlocal calls
+            del request
+            calls += 1
+            return ModelTurn(final_text="answer")
+
+    with pytest.raises(ValueError, match="JSON object keys must be strings"):
+        asyncio.run(ModelCallRunner(adapter=Adapter()).acall(request_))
+
+    assert calls == 0
 
 
 def _self_cycle() -> dict[str, Any]:
@@ -874,8 +1345,12 @@ def test_a_key_json_coerces_digests_as_the_provider_would_receive_it() -> None:
 @pytest.mark.parametrize(
     "factory",
     [
-        pytest.param(lambda: type("HostileDict", (dict,), {"items": _raises})(a=1), id="dict-items"),
-        pytest.param(lambda: type("HostileList", (list,), {"__iter__": _raises})([1]), id="list-iter"),
+        pytest.param(
+            lambda: type("HostileDict", (dict,), {"items": _raises})(a=1), id="dict-items"
+        ),
+        pytest.param(
+            lambda: type("HostileList", (list,), {"__iter__": _raises})([1]), id="list-iter"
+        ),
     ],
 )
 def test_a_container_hook_that_raises_costs_the_key_not_the_call(factory: Any) -> None:
@@ -1106,6 +1581,63 @@ def test_tool_results_reach_the_redaction_policy() -> None:
     assert "sk-live-secret" not in json.dumps(capture.content, default=str)
 
 
+def test_custom_redactor_output_is_normalized_before_capture_delivery() -> None:
+    class Redactor:
+        def redact(self, value: Any, *, policy: Any) -> Any:
+            del value, policy
+            return {"text": "\ud800", "score": float("nan")}
+
+    observer = RecordingObserver()
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(
+            adapter=SyncAdapter(),
+            subscriptions=(
+                ModelIOSubscription(
+                    observer=observer,
+                    policy=CapturePolicy(mode="redacted", redactor=Redactor()),
+                ),
+            ),
+        ).acall(REQUEST)
+        return receipt
+
+    receipt = asyncio.run(run())
+
+    assert receipt.capture_downgrades == 0
+    assert observer.captures[0].content == {"text": "�", "score": None}
+    json.dumps(observer.captures[0].content, allow_nan=False)
+
+
+def test_custom_redactor_key_collision_downgrades_to_digest() -> None:
+    class Redactor:
+        def redact(self, value: Any, *, policy: Any) -> Any:
+            del value, policy
+            result = {"\ud800": 1}
+            result["�"] = 2
+            return result
+
+    observer = RecordingObserver()
+
+    async def run() -> Any:
+        _turn, receipt = await ModelCallRunner(
+            adapter=SyncAdapter(),
+            subscriptions=(
+                ModelIOSubscription(
+                    observer=observer,
+                    policy=CapturePolicy(mode="redacted", redactor=Redactor()),
+                ),
+            ),
+        ).acall(REQUEST)
+        return receipt
+
+    receipt = asyncio.run(run())
+
+    assert receipt.capture_downgrades == 1
+    assert observer.captures[0].mode == "digest"
+    assert observer.captures[0].downgraded_from == "redacted"
+    assert observer.captures[0].content is None
+
+
 def test_an_adapter_that_retried_internally_says_so_in_the_receipt() -> None:
     """`attempts` and `provider_retried` are not the same fact.
 
@@ -1169,7 +1701,9 @@ def test_an_explicit_request_model_still_wins_over_the_adapter_config() -> None:
     )
 
     async def run() -> Any:
-        _turn, receipt = await ModelCallRunner(adapter=_ConfiguredAdapter("fallback")).acall(request)
+        _turn, receipt = await ModelCallRunner(adapter=_ConfiguredAdapter("fallback")).acall(
+            request
+        )
         return receipt
 
     assert asyncio.run(run()).model.model == "explicit"
@@ -1328,9 +1862,9 @@ def test_a_boundary_already_crossed_is_never_paid_for() -> None:
             token.cancel()
         extra = {"delta_consumer": (lambda chunk: None)} if isinstance(adapter, Stream) else {}
         with pytest.raises(RunTimeout if expired else RunCancelled):
-            await ModelCallRunner(
-                adapter=adapter, current_cancellation_token=lambda: token
-            ).acall(REQUEST, deadline=(time.time() - 5) if expired else None, **extra)
+            await ModelCallRunner(adapter=adapter, current_cancellation_token=lambda: token).acall(
+                REQUEST, deadline=(time.time() - 5) if expired else None, **extra
+            )
 
     async def run() -> None:
         for adapter in (Sync(), Async(), Stream()):
@@ -1376,7 +1910,9 @@ def test_a_failed_call_still_produces_a_receipt_for_its_observers() -> None:
     async def run() -> None:
         await ModelCallRunner(
             adapter=BrokenAdapter(),
-            subscriptions=(ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
         ).acall(REQUEST)
 
     with pytest.raises(RuntimeError):
@@ -1393,7 +1929,9 @@ def test_observers_see_the_settled_call() -> None:
     async def run() -> None:
         await ModelCallRunner(
             adapter=SyncAdapter(),
-            subscriptions=(ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="full")),),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="full")),
+            ),
         ).acall(REQUEST)
 
     asyncio.run(run())
@@ -1418,7 +1956,9 @@ def test_a_broken_observer_does_not_fail_a_call_the_provider_was_paid_for() -> N
         turn, _receipt = await ModelCallRunner(
             adapter=SyncAdapter(),
             subscriptions=(
-                ModelIOSubscription(observer=ExplodingObserver(), policy=CapturePolicy(mode="full")),
+                ModelIOSubscription(
+                    observer=ExplodingObserver(), policy=CapturePolicy(mode="full")
+                ),
                 ModelIOSubscription(observer=healthy, policy=CapturePolicy(mode="full")),
             ),
         ).acall(REQUEST)
@@ -1428,12 +1968,8 @@ def test_a_broken_observer_does_not_fail_a_call_the_provider_was_paid_for() -> N
     assert len(healthy.captures) == 1
 
 
-def test_a_malformed_usage_count_is_dropped_rather_than_failing_the_call() -> None:
-    """The receipt refuses a negative count. Refusing it must not undo a call already billed.
-
-    Counterweight in the same assertion: the well-formed counters still land, so "drop everything"
-    does not pass.
-    """
+def test_a_malformed_recognized_usage_count_fails_closed() -> None:
+    """A malformed provider count cannot weaken a run's token budget."""
 
     class OddUsageAdapter:
         def next_turn(self, request: ModelRequest) -> ModelTurn:
@@ -1443,12 +1979,8 @@ def test_a_malformed_usage_count_is_dropped_rather_than_failing_the_call() -> No
                 usage={"input_tokens": 5, "output_tokens": -3, "cached": True},  # type: ignore[dict-item]
             )
 
-    async def run() -> Any:
-        _turn, receipt = await ModelCallRunner(adapter=OddUsageAdapter()).acall(REQUEST)
-        return receipt
-
-    receipt = asyncio.run(run())
-    assert dict(receipt.usage) == {"input_tokens": 5}
+    with pytest.raises(ModelAdapterError, match="non-portable response"):
+        asyncio.run(ModelCallRunner(adapter=OddUsageAdapter()).acall(REQUEST))
 
 
 def test_the_receipt_records_the_stop_reason_and_latency() -> None:
@@ -1787,9 +2319,7 @@ def test_capture_failing_does_not_replace_the_providers_failure() -> None:
     runner = ModelCallRunner(
         adapter=FailingAdapter(),
         subscriptions=(
-            ModelIOSubscription(
-                observer=RecordingObserver(), policy=CapturePolicy(mode="digest")
-            ),
+            ModelIOSubscription(observer=RecordingObserver(), policy=CapturePolicy(mode="digest")),
         ),
     )
     request = replace(REQUEST, messages=[{"role": "user", "content": Unprintable()}])
@@ -1876,13 +2406,8 @@ def test_a_sync_adapter_raising_stopiteration_does_not_hang_the_run() -> None:
 # --- receipt fields nothing was pinning ----------------------------------------------------------
 
 
-def test_a_zero_count_is_a_count_and_a_bad_key_costs_only_its_entry() -> None:
-    """`_recordable_usage` drops what the receipt would refuse, and nothing else.
-
-    A zero is a real count -- an accounting consumer must see `0`, not a missing key -- and a
-    non-string key would raise from `ModelCallReceipt.__post_init__`, failing a call the provider
-    has already been paid for, which is the one thing this helper exists to prevent.
-    """
+def test_unknown_usage_fields_cannot_change_canonical_accounting() -> None:
+    """Only recognized provider counters enter receipts and run budgets."""
 
     class OddUsageAdapter:
         def next_turn(self, request: ModelRequest) -> ModelTurn:
@@ -1896,7 +2421,11 @@ def test_a_zero_count_is_a_count_and_a_bad_key_costs_only_its_entry() -> None:
         _turn, receipt = await ModelCallRunner(adapter=OddUsageAdapter()).acall(REQUEST)
         return receipt
 
-    assert dict(asyncio.run(run()).usage) == {"input_tokens": 5, "cached_tokens": 0}
+    assert dict(asyncio.run(run()).usage) == {
+        "input_tokens": 5,
+        "output_tokens": 0,
+        "total_tokens": 5,
+    }
 
 
 def test_an_adapter_that_reports_no_stop_reason_records_an_empty_one() -> None:
@@ -1994,6 +2523,20 @@ def test_a_receipt_that_already_recorded_a_retry_keeps_it_through_a_failure() ->
     assert ModelCallReceipt().with_error(RuntimeError("boom")).provider_retried is False
 
 
+@pytest.mark.parametrize("invalid_control", [float("nan"), 1, "yes"])
+def test_error_receipt_rejects_truthy_non_boolean_controls(invalid_control: Any) -> None:
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+
+    error = RuntimeError("boom")
+    error.retryable = invalid_control  # type: ignore[attr-defined]
+    error.provider_retried = invalid_control  # type: ignore[attr-defined]
+
+    receipt = ModelCallReceipt().with_error(error)
+
+    assert receipt.retryable is False
+    assert receipt.provider_retried is False
+
+
 def test_an_abandoned_async_call_is_reported_the_way_an_abandoned_thread_is(
     caplog: Any,
 ) -> None:
@@ -2066,7 +2609,9 @@ async def _time_a_suppressed_close(grace: float, rescue_after: float) -> float:
     started = time.monotonic()
     try:
         with pytest.raises(ModelCallAborted):
-            await runner.acall(REQUEST, delta_consumer=lambda chunk: None, should_abort=lambda: True)
+            await runner.acall(
+                REQUEST, delta_consumer=lambda chunk: None, should_abort=lambda: True
+            )
         return time.monotonic() - started
     finally:
         release.set()
@@ -2202,7 +2747,9 @@ def test_a_host_whose_adapter_changes_is_read_once_per_call_and_not_once_per_pro
     assert receipt_one.provider_name == "FIRST"
     assert receipt_two.provider_name == "SECOND", "the receipt must name the adapter that answered"
     assert (first.requests, second.requests) == (1, 1)
-    assert reads == [0, 1], f"the adapter must be read exactly once per call, was read {len(reads)}x"
+    assert reads == [0, 1], (
+        f"the adapter must be read exactly once per call, was read {len(reads)}x"
+    )
 
 
 def test_a_close_is_granted_the_grace_and_the_grace_is_read_live(caplog: Any) -> None:
@@ -2562,9 +3109,9 @@ def test_interruption_is_mid_turn_only_while_something_consumes_deltas() -> None
     async def with_consumer() -> ModelTurn:
         seen: list[Any] = []
         return (
-            await ModelCallRunner(adapter=StreamingAdapter(chunks=[TextDelta(f"t{i}") for i in range(20)])).acall(
-                REQUEST, delta_consumer=seen.append, should_abort=stop_now
-            )
+            await ModelCallRunner(
+                adapter=StreamingAdapter(chunks=[TextDelta(f"t{i}") for i in range(20)])
+            ).acall(REQUEST, delta_consumer=seen.append, should_abort=stop_now)
         )[0]
 
     async def without_consumer() -> ModelTurn:

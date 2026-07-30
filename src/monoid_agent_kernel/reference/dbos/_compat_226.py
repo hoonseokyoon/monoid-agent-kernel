@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import math
 import os
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+
+from monoid_agent_kernel.core.json_ingress import is_finite_json_number
 
 _DBOS_ADAPTER_LOCK = threading.RLock()
 _TERMINAL_WORKFLOW_STATUSES = frozenset(
@@ -52,7 +53,7 @@ class _OwnedDbosWorkflowHandle226:
         return self.workflow_id
 
     def get_result(self, *, polling_interval_sec: float = 1.0) -> Any:
-        if not math.isfinite(polling_interval_sec) or polling_interval_sec <= 0:
+        if not is_finite_json_number(polling_interval_sec) or polling_interval_sec <= 0:
             raise ValueError("DBOS workflow result polling interval must be positive")
         while True:
             status = self.get_status()

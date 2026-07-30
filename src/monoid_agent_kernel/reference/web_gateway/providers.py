@@ -11,6 +11,7 @@ from urllib.parse import urlencode, urljoin
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from monoid_agent_kernel._version import user_agent
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress, normalize_json_ingress
 from monoid_agent_kernel.web import WebGatewayError, domain_allowed, domain_from_url
 
 DEFAULT_BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -508,7 +509,13 @@ def _request_json(
     error_prefix: str = "search provider",
     error_code_prefix: str = "web_search",
 ) -> dict[str, Any]:
-    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    data = (
+        None
+        if body is None
+        else json.dumps(
+            normalize_json_ingress(body), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+    )
     body = _urlopen_read_with_retry(
         Request(url, data=data, headers=headers, method=method),
         timeout_s=timeout_s,
@@ -516,11 +523,17 @@ def _request_json(
         error_code_prefix=error_code_prefix,
     )
     try:
-        payload = json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise WebGatewayError(f"{error_prefix} returned invalid JSON", error_code=f"{error_code_prefix}_bad_response") from exc
+        payload = loads_json_ingress(body.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise WebGatewayError(
+            f"{error_prefix} returned invalid JSON",
+            error_code=f"{error_code_prefix}_bad_response",
+        ) from exc
     if not isinstance(payload, dict):
-        raise WebGatewayError(f"{error_prefix} response must be an object", error_code=f"{error_code_prefix}_bad_response")
+        raise WebGatewayError(
+            f"{error_prefix} response must be an object",
+            error_code=f"{error_code_prefix}_bad_response",
+        )
     return payload
 
 

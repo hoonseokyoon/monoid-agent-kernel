@@ -75,6 +75,17 @@ class MalformedReturnValidator:
         return None  # noqa: RET501 - intentional bug under test
 
 
+class NonBooleanOutcomeValidator:
+    """Uses a truthy spelling of false; the validator boundary must reject it as a defect."""
+
+    id = "non-boolean-outcome"
+    schema = None
+
+    def validate(self, view: FinalOutputView) -> ValidationOutcome:
+        del view
+        return ValidationOutcome(ok="false", feedback="must reject")  # type: ignore[arg-type]
+
+
 class RequireFoo:
     id = "require.foo"
     schema = None
@@ -206,6 +217,20 @@ def test_malformed_validator_return_terminalizes_as_defect(tmp_path: Path) -> No
 
     assert result.status == "failed"
     assert result.error_code == "output_validator_error"
+
+
+def test_non_boolean_validator_outcome_terminalizes_as_defect(tmp_path: Path) -> None:
+    adapter = FakeModelAdapter(turns=[_text_turn("unsafe")])
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("non-boolean-outcome"),
+        output_validators=(NonBooleanOutcomeValidator(),),
+    ).run_once("go")
+
+    assert result.status == "failed"
+    assert result.error_code == "output_validator_error"
+    assert result.final_output is None
 
 
 # --- textless refusal / truncation (review fix ①) -----------------------------------------

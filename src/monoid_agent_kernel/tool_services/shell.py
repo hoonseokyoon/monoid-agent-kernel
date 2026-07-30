@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from monoid_agent_kernel.core.workspace import Workspace
+from monoid_agent_kernel.core.runtime_controls import validate_shell_runtime
 from monoid_agent_kernel.errors import ToolExecutionError, error_code_for_exception
 from monoid_agent_kernel.tasks import TaskManager
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -18,6 +19,7 @@ from monoid_agent_kernel.shell import (
     ShellCommandRule,
     ShellExecutionOptions,
     execute_shell,
+    validate_shell_approval_decision,
 )
 from monoid_agent_kernel.tool_services.base import CallContext
 
@@ -99,7 +101,13 @@ class ShellService:
                 approver_id="none",
             )
         else:
-            decision = provider.approve_shell(request)
+            try:
+                decision = validate_shell_approval_decision(provider.approve_shell(request))
+            except (TypeError, ValueError) as exc:
+                raise ToolExecutionError(
+                    "shell approval provider returned an invalid decision",
+                    error_code="tool_approval_invalid",
+                ) from exc
         approval_event_type = "tool.approval.approved" if decision.approved else "tool.approval.denied"
         self.recorder.emit(
             approval_event_type,
@@ -221,11 +229,8 @@ class ShellService:
 
 def _shell_options_from_call(call: CallContext) -> ShellExecutionOptions:
     runtime = call.runtime or {}
-    shell_runtime = runtime.get("shell", runtime) if isinstance(runtime, dict) else {}
-    if not isinstance(shell_runtime, dict):
-        shell_runtime = {}
-    runtime_payload = dict(shell_runtime)
-    runtime_payload["enabled"] = bool(runtime_payload.get("enabled", True))
+    runtime_payload = validate_shell_runtime(runtime)
+    runtime_payload.setdefault("enabled", True)
     runtime_options = ShellExecutionOptions.from_json(runtime_payload)
     scoped_command_rules = tuple(
         ShellCommandRule(action="allow", prefix=prefix)

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from monoid_agent_kernel.core.scope import ScopePolicyError, effective_signed_scope
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
+from monoid_agent_kernel.core.scope import (
+    WEB_POSITIVE_INTEGER_SCOPE_KEYS_BY_CAPABILITY,
+    ScopePolicyError,
+    effective_signed_scope,
+    validate_web_signed_scope_controls,
+)
 from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenError, TokenManager
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.identifiers import namespaced_id
@@ -235,23 +242,34 @@ class WebGatewayBackend:
 
     def handle_search(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = _normalize_request_payload(payload, capability="web.search")
         payload = _apply_signed_scope(claims, payload, expected_capability="web.search")
-        self._check_binding_limit(claims, payload, error_code="web_search_limit_exceeded")
+        payload = _normalize_request_payload(payload, capability="web.search")
         query = str(payload.get("query") or "")
         if not query.strip():
             raise ValueError("query is required")
         effective_max_results = max(1, int(payload.get("max_results") or 5))
         request_allowed = _domain_tuple(payload.get("allowed_domains") or ())
         request_blocked = _domain_tuple(payload.get("blocked_domains") or ())
-        raw_results = self.provider.search(query, max_results=effective_max_results)
+        self._reserve_binding_call(claims, payload, error_code="web_search_limit_exceeded")
+        raw_results = normalize_json_ingress(
+            self.provider.search(query, max_results=effective_max_results)
+        )
+        if not isinstance(raw_results, list):
+            raise WebGatewayError(
+                "web search provider response must be an array",
+                error_code="web_search_bad_response",
+            )
         results = [
             result
             for result in raw_results
-            if _result_allowed(result, request_allowed=request_allowed, request_blocked=request_blocked)
+            if isinstance(result, dict)
+            and _result_allowed(
+                result, request_allowed=request_allowed, request_blocked=request_blocked
+            )
         ][:effective_max_results]
         with self._lock:
             self._counts(claims.run_id).search_calls += 1
-            self._increment_binding_count(claims, payload)
             usage = self._tenant_usage(claims.tenant_id)
             usage.search_calls += 1
             usage.result_count += len(results)
@@ -266,8 +284,9 @@ class WebGatewayBackend:
 
     def handle_fetch(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = _normalize_request_payload(payload, capability="web.fetch")
         payload = _apply_signed_scope(claims, payload, expected_capability="web.fetch")
-        self._check_binding_limit(claims, payload, error_code="web_fetch_limit_exceeded")
+        payload = _normalize_request_payload(payload, capability="web.fetch")
         url = str(payload.get("url") or "")
         if not url.strip():
             raise ValueError("url is required")
@@ -282,14 +301,22 @@ class WebGatewayBackend:
         output_format = str(payload.get("format") or "text")
         effective_timeout_s = max(1, int(payload.get("timeout_s") or 30))
         effective_max_bytes = max(1, int(payload.get("max_bytes") or 100_000))
-        fetched = self.provider.fetch(
-            url,
-            format=output_format,
-            allowed_domains=request_allowed,
-            blocked_domains=request_blocked,
-            timeout_s=effective_timeout_s,
-            max_bytes=effective_max_bytes,
+        self._reserve_binding_call(claims, payload, error_code="web_fetch_limit_exceeded")
+        fetched = normalize_json_ingress(
+            self.provider.fetch(
+                url,
+                format=output_format,
+                allowed_domains=request_allowed,
+                blocked_domains=request_blocked,
+                timeout_s=effective_timeout_s,
+                max_bytes=effective_max_bytes,
+            )
         )
+        if not isinstance(fetched, dict):
+            raise WebGatewayError(
+                "web fetch provider response must be an object",
+                error_code="web_fetch_bad_response",
+            )
         final_url = str(fetched.get("final_url") or url)
         final_domain = domain_from_url(final_url)
         if not domain_allowed(final_domain, allowed_domains=request_allowed, blocked_domains=request_blocked):
@@ -323,7 +350,6 @@ class WebGatewayBackend:
         }
         with self._lock:
             self._counts(claims.run_id).fetch_calls += 1
-            self._increment_binding_count(claims, payload)
             usage = self._tenant_usage(claims.tenant_id)
             usage.fetch_calls += 1
             usage.bytes_returned += content_bytes
@@ -331,8 +357,9 @@ class WebGatewayBackend:
 
     def handle_context(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = _normalize_request_payload(payload, capability="web.context")
         payload = _apply_signed_scope(claims, payload, expected_capability="web.context")
-        self._check_binding_limit(claims, payload, error_code="web_context_limit_exceeded")
+        payload = _normalize_request_payload(payload, capability="web.context")
         query = str(payload.get("query") or "")
         if not query.strip():
             raise ValueError("query is required")
@@ -341,16 +368,24 @@ class WebGatewayBackend:
         effective_max_tokens = max(1, int(payload.get("max_tokens") or 8_192))
         effective_max_urls = max(1, int(payload.get("max_urls") or 8))
         effective_max_snippets = max(1, int(payload.get("max_snippets") or 50))
-        provider_result = self.provider.context(
-            query,
-            max_tokens=effective_max_tokens,
-            max_urls=effective_max_urls,
-            max_snippets=effective_max_snippets,
-            locale=_optional_string(payload.get("locale")),
-            freshness=_freshness_from_payload(payload),
-            allowed_domains=request_allowed,
-            blocked_domains=request_blocked,
+        self._reserve_binding_call(claims, payload, error_code="web_context_limit_exceeded")
+        provider_result = normalize_json_ingress(
+            self.provider.context(
+                query,
+                max_tokens=effective_max_tokens,
+                max_urls=effective_max_urls,
+                max_snippets=effective_max_snippets,
+                locale=_optional_string(payload.get("locale")),
+                freshness=_freshness_from_payload(payload),
+                allowed_domains=request_allowed,
+                blocked_domains=request_blocked,
+            )
         )
+        if not isinstance(provider_result, dict):
+            raise WebGatewayError(
+                "web context provider response must be an object",
+                error_code="web_context_bad_response",
+            )
         filtered = _filter_context_result(provider_result, request_allowed, request_blocked)
         context = str(filtered.get("context") or "")
         encoded = context.encode("utf-8")
@@ -376,7 +411,6 @@ class WebGatewayBackend:
         }
         with self._lock:
             self._counts(claims.run_id).context_calls += 1
-            self._increment_binding_count(claims, payload)
             usage = self._tenant_usage(claims.tenant_id)
             usage.context_calls += 1
             usage.context_source_count += len(sources)
@@ -393,22 +427,26 @@ class WebGatewayBackend:
         except TokenError as exc:
             raise PermissionDenied(str(exc)) from exc
 
-    def _check_binding_limit(self, claims: TokenClaims, payload: dict[str, Any], *, error_code: str) -> None:
+    def _reserve_binding_call(
+        self,
+        claims: TokenClaims,
+        payload: dict[str, Any],
+        *,
+        error_code: str,
+    ) -> None:
+        """Atomically consume one binding call before invoking the external provider."""
+
         binding_id = str(payload.get("binding_id") or "").strip()
         max_calls = int(payload.get("max_calls") or 0)
-        if not binding_id or max_calls <= 0:
-            return
-        with self._lock:
-            if self._counts(claims.run_id).binding_calls.get(binding_id, 0) >= max_calls:
-                self._tenant_usage(claims.tenant_id).failed_calls += 1
-                raise WebGatewayError("web binding call limit exceeded", error_code=error_code)
-
-    def _increment_binding_count(self, claims: TokenClaims, payload: dict[str, Any]) -> None:
-        binding_id = str(payload.get("binding_id") or "").strip()
         if not binding_id:
             return
-        counts = self._counts(claims.run_id)
-        counts.binding_calls[binding_id] = counts.binding_calls.get(binding_id, 0) + 1
+        with self._lock:
+            counts = self._counts(claims.run_id)
+            current = counts.binding_calls.get(binding_id, 0)
+            if max_calls > 0 and current >= max_calls:
+                self._tenant_usage(claims.tenant_id).failed_calls += 1
+                raise WebGatewayError("web binding call limit exceeded", error_code=error_code)
+            counts.binding_calls[binding_id] = current + 1
 
     def _counts(self, run_id: str) -> _RunWebCounts:
         return self._run_counts.setdefault(run_id, _RunWebCounts())
@@ -436,6 +474,35 @@ def _domain_tuple(value: Any) -> tuple[str, ...]:
     return tuple(str(item).strip().lower() for item in value if str(item).strip())
 
 
+def _normalize_request_payload(
+    payload: Any,
+    *,
+    capability: str,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("web request payload must be an object")
+    for key in WEB_POSITIVE_INTEGER_SCOPE_KEYS_BY_CAPABILITY[capability]:
+        _validate_integer_control(payload, key, minimum=1)
+    _validate_integer_control(payload, "max_calls", minimum=0)
+    normalized = normalize_json_ingress(payload)
+    if not isinstance(normalized, dict):  # pragma: no cover - guarded above
+        raise ValueError("web request payload must be an object")
+    return normalized
+
+
+def _validate_integer_control(payload: dict[str, Any], key: str, *, minimum: int) -> None:
+    if key not in payload or payload[key] is None:
+        return
+    value = payload[key]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{key} must be finite")
+    if type(value) is not int:
+        raise ValueError(f"{key} must be an integer")
+    if value < minimum:
+        requirement = "positive" if minimum == 1 else "non-negative"
+        raise ValueError(f"{key} must be {requirement}")
+
+
 def _apply_signed_scope(claims: TokenClaims, payload: dict[str, Any], *, expected_capability: str) -> dict[str, Any]:
     metadata = claims.metadata or {}
     scope = metadata.get("scope")
@@ -461,9 +528,18 @@ def _apply_signed_scope(claims: TokenClaims, payload: dict[str, Any], *, expecte
         )
 
     try:
-        return effective_signed_scope(scope, payload)
+        validate_web_signed_scope_controls(expected_capability, scope)
+        normalized_scope = normalize_json_ingress(scope)
+        if not isinstance(normalized_scope, dict):  # pragma: no cover - guarded above
+            raise ValueError("signed scope must be an object")
+        return effective_signed_scope(normalized_scope, payload)
     except ScopePolicyError as exc:
         raise WebGatewayError(_scope_error_message(exc), error_code=_scope_error_code(exc)) from exc
+    except ValueError as exc:
+        raise WebGatewayError(
+            f"web gateway token signed scope is invalid: {exc}",
+            error_code="web_scope_invalid",
+        ) from exc
 
 
 def _scope_error_message(exc: ScopePolicyError) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from support.runtime import runtime_config, runtime_provider
@@ -12,10 +13,18 @@ from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
-def _loop(tmp_path: Path, adapter: FakeModelAdapter, *tool_ids: str, limits: RunLimits | None = None) -> AgentLoop:
+def _reject_constant(value: str) -> None:
+    raise AssertionError(f"non-finite JSON constant persisted: {value}")
+
+
+def _loop(
+    tmp_path: Path, adapter: FakeModelAdapter, *tool_ids: str, limits: RunLimits | None = None
+) -> AgentLoop:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs", limits=limits or RunLimits())
+    spec = AgentRunSpec(
+        workspace_root=workspace, run_root=tmp_path / "runs", limits=limits or RunLimits()
+    )
     return AgentLoop(
         spec=spec,
         model_adapter=adapter,
@@ -40,7 +49,12 @@ def test_run_until_suspended_settles(tmp_path: Path) -> None:
 
 def test_run_until_suspended_parks_on_external_task_then_resumes(tmp_path: Path) -> None:
     adapter = FakeModelAdapter(
-        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick"}, "c1"),))]
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick"}, "c1"),),
+            )
+        ]
     )
     loop = _loop(tmp_path, adapter, "hitl.request")
     loop.open()
@@ -53,22 +67,63 @@ def test_run_until_suspended_parks_on_external_task_then_resumes(tmp_path: Path)
     assert s1.turn is None
 
     # Deliver the answer out of band, then resume.
-    loop.report_task_result(s1.awaiting_task_ids[0], {"answer": "Ada"})
+    loop.report_task_result(
+        s1.awaiting_task_ids[0],
+        {"answer": "Ada\ud800", "score": float("nan")},
+    )
     s2 = loop.run_until_suspended(None)
     loop.close()
 
     assert s2.reason == "settled"
     assert s2.turn is not None
     hitl_obs = [
-        obs for request in adapter.requests for obs in request.observations if obs.tool_name == "human_input"
+        obs
+        for request in adapter.requests
+        for obs in request.observations
+        if obs.tool_name == "human_input"
     ]
-    assert hitl_obs and hitl_obs[0].output["answer"] == "Ada"
+    assert hitl_obs and hitl_obs[0].output["answer"] == "Ada�"
+    assert hitl_obs[0].output["score"] is None
+
+
+def test_backend_created_hosted_task_normalizes_request_before_durable_write(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")])
+    loop = _loop(tmp_path, adapter)
+    loop.open()
+    try:
+        task_id = loop.create_task(
+            "hitl",
+            {
+                "prompt": "Choose \ud800",
+                "payload": {"text": "\udc00", "score": float("inf")},
+            },
+        )
+        assert loop._session is not None
+        task_path = (
+            loop._session.res.recorder.run_dir / "artifacts" / "tasks" / task_id / "task.json"
+        )
+        task = json.loads(
+            task_path.read_text(encoding="utf-8"),
+            parse_constant=_reject_constant,
+        )
+    finally:
+        loop.close()
+
+    assert task["prompt"] == "Choose �"
+    assert task["request"]["payload"] == {"text": "�", "score": None}
 
 
 def test_run_until_suspended_reports_limited(tmp_path: Path) -> None:
     # A tool call with a 1-step budget never settles -> limited.
     adapter = FakeModelAdapter(
-        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_write", {"path": "A.md", "content": "a"}, "c1"),))]
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_write", {"path": "A.md", "content": "a"}, "c1"),),
+            )
+        ]
     )
     loop = _loop(tmp_path, adapter, "fs.write", limits=RunLimits(max_steps=1))
     loop.open()

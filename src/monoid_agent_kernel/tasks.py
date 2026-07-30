@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import shutil
 import stat
 import subprocess
@@ -17,6 +16,11 @@ from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel._proc import file_size, proc_group_kwargs, terminate_process
 from monoid_agent_kernel.core._util import read_text_resilient, write_json_atomic
+from monoid_agent_kernel.core.json_ingress import (
+    loads_json_ingress,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
     TOOL_APPROVAL_TASK_KIND,
@@ -85,8 +89,7 @@ class TaskExecutor(Protocol):
     # input vs an in-process job that will finish on its own.
     in_process: bool
 
-    def cancel(self, manager: TaskManager, job: Task) -> None:
-        ...
+    def cancel(self, manager: TaskManager, job: Task) -> None: ...
 
 
 class ResultInjector(Protocol):
@@ -97,8 +100,7 @@ class ResultInjector(Protocol):
 
     kind: str
 
-    def observations(self, job: BackgroundJob, run_dir: Path) -> list[ToolObservation]:
-        ...
+    def observations(self, job: BackgroundJob, run_dir: Path) -> list[ToolObservation]: ...
 
 
 class TaskReporter(Protocol):
@@ -107,11 +109,11 @@ class TaskReporter(Protocol):
     cross the boundary, so an in-process reporter (the live manager) and a future
     durable/cross-process reporter share the same shape."""
 
-    def create_task(self, kind: str, request: dict[str, Any]) -> str:
-        ...
+    def create_task(self, kind: str, request: dict[str, Any]) -> str: ...
 
-    def report_result(self, task_id: str, result: dict[str, Any], *, status: str = "answered") -> dict[str, Any]:
-        ...
+    def report_result(
+        self, task_id: str, result: dict[str, Any], *, status: str = "answered"
+    ) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -285,7 +287,9 @@ class ShellTaskExecutor:
         cwd_rel = shell_runtime.validate_cwd(manager.workspace, cwd, manager.permission_policy)
         safe_env = shell_runtime.build_env(shell_options, env)
         argv = shell_runtime.shell_argv(shell_options.effective_shell(), command)
-        cwd_abs, tmp_root, before_snapshot = self._prepare_workspace(manager, cwd_rel, execution_workspace)
+        cwd_abs, tmp_root, before_snapshot = self._prepare_workspace(
+            manager, cwd_rel, execution_workspace
+        )
 
         job_id = f"job_{uuid.uuid4().hex[:12]}"
         job_dir = manager.recorder.artifacts_dir / "jobs" / job_id
@@ -359,7 +363,9 @@ class ShellTaskExecutor:
             return cwd_abs, None, _changed_entry_fingerprints(manager.workspace)
 
         tmp_root = Path(tempfile.mkdtemp(prefix="monoid-shell-job-")).resolve()
-        before = shell_runtime.materialize_workspace(manager.workspace, tmp_root, manager.permission_policy)
+        before = shell_runtime.materialize_workspace(
+            manager.workspace, tmp_root, manager.permission_policy
+        )
         cwd_abs = (tmp_root / cwd_rel).resolve()
         if not is_within(tmp_root, cwd_abs):
             raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
@@ -403,8 +409,12 @@ class ShellTaskExecutor:
             else:
                 await self._await_completion(manager, job, proc)
                 if job.execution_workspace == "isolated-copy" and job.status == "exited":
-                    after = shell_runtime.scan_materialized_workspace(job.tmp_root, manager.permission_policy)
-                    changed = shell_runtime.sync_workspace_changes(manager.workspace, job.before_snapshot, after)
+                    after = shell_runtime.scan_materialized_workspace(
+                        job.tmp_root, manager.permission_policy
+                    )
+                    changed = shell_runtime.sync_workspace_changes(
+                        manager.workspace, job.before_snapshot, after
+                    )
                     job.changed_paths = tuple(changed)
                 elif job.execution_workspace == "direct":
                     before = job.before_snapshot if isinstance(job.before_snapshot, dict) else {}
@@ -452,7 +462,10 @@ class ShellTaskExecutor:
                 job.output_truncated = True
                 job.exit_code = await self._terminate_and_reap(proc)
                 break
-            if total_bytes != job._last_output_event_bytes and now - job._last_output_event_at >= 0.25:
+            if (
+                total_bytes != job._last_output_event_bytes
+                and now - job._last_output_event_at >= 0.25
+            ):
                 job.stdout_bytes = stdout_bytes
                 job.stderr_bytes = stderr_bytes
                 job._last_output_event_at = now
@@ -584,8 +597,16 @@ class HostedTask:
         payload = require_object(payload, "hosted task checkpoint")
         task_id = parse_str(payload, "task_id")
         task_dir = artifacts_dir / "tasks" / task_id
-        result = require_object(payload["result"], "result") if "result" in payload and payload["result"] is not None else None
-        finished_at = parse_float(payload, "finished_at", default=0.0, allow_none=True) if "finished_at" in payload else None
+        result = (
+            require_object(payload["result"], "result")
+            if "result" in payload and payload["result"] is not None
+            else None
+        )
+        finished_at = (
+            parse_float(payload, "finished_at", default=0.0, allow_none=True)
+            if "finished_at" in payload
+            else None
+        )
         return cls(
             job_id=task_id,
             kind=parse_str(payload, "kind"),
@@ -596,7 +617,10 @@ class HostedTask:
             job_path=task_dir / "task.json",
             cancel_path=task_dir / "cancel.requested",
             created_by=parse_str(payload, "created_by", default="model"),
-            choices=tuple(parse_str({"choice": choice}, "choice") for choice in optional_list(payload, "choices")),
+            choices=tuple(
+                parse_str({"choice": choice}, "choice")
+                for choice in optional_list(payload, "choices")
+            ),
             request=require_object(payload["request"], "request") if "request" in payload else {},
             finished_at=finished_at,
             error=parse_str(payload, "error"),
@@ -657,7 +681,11 @@ class HostedTask:
 
     def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:
         del run_dir, tail_bytes
-        return self.result or {"type": f"{self.kind}_result", "task_id": self.job_id, "status": self.status}
+        return self.result or {
+            "type": f"{self.kind}_result",
+            "task_id": self.job_id,
+            "status": self.status,
+        }
 
 
 @dataclass
@@ -680,6 +708,8 @@ class HostedTaskExecutor:
     ) -> HostedTask:
         # Known fields are explicit; any other keys (e.g. an automation trigger
         # payload) are folded into the task's request.
+        if type(resume_on_exit) is not bool:
+            raise ValueError("hosted task resume_on_exit must be a boolean")
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         task_dir = manager.recorder.artifacts_dir / "tasks" / task_id
         task_dir.mkdir(parents=True, exist_ok=False)
@@ -794,6 +824,18 @@ class SubagentTaskExecutor:
             raise ToolExecutionError(
                 f"unknown subagent: {definition_id}", error_code="subagent_unknown"
             )
+        if type(depth) is not int or depth < 0:
+            raise ToolExecutionError(
+                "subagent depth must be a non-negative integer",
+                error_code="subagent_invalid",
+            )
+        if type(background) is not bool or (
+            resume_on_exit is not None and type(resume_on_exit) is not bool
+        ):
+            raise ToolExecutionError(
+                "subagent background controls must be booleans",
+                error_code="subagent_invalid",
+            )
         if depth >= self.max_depth:
             raise ToolExecutionError(
                 f"subagent depth cap reached (max {self.max_depth})",
@@ -805,7 +847,7 @@ class SubagentTaskExecutor:
                 f"subagent fan-out cap reached (max {self.max_subagents})",
                 error_code="subagent_fanout_exceeded",
             )
-        resume = bool(background) if resume_on_exit is None else bool(resume_on_exit)
+        resume = background if resume_on_exit is None else resume_on_exit
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         task_dir = manager.recorder.artifacts_dir / "tasks" / task_id
         task_dir.mkdir(parents=True, exist_ok=False)
@@ -818,8 +860,8 @@ class SubagentTaskExecutor:
             resume_on_exit=resume,
             request={
                 "definition_id": definition_id,
-                "depth": int(depth),
-                "background": bool(background),
+                "depth": depth,
+                "background": background,
                 **request,
             },
             created_by=created_by,
@@ -922,7 +964,9 @@ class TaskManager:
         }
         self.injectors = {
             "shell": ShellResultInjector(),
-            "hitl": HostedResultInjector(kind="hitl", tool_name="human_input", result_type="human_input_result"),
+            "hitl": HostedResultInjector(
+                kind="hitl", tool_name="human_input", result_type="human_input_result"
+            ),
             "automation": HostedResultInjector(
                 kind="automation", tool_name="automation", result_type="automation_result"
             ),
@@ -1036,16 +1080,26 @@ class TaskManager:
 
         The executor for ``kind`` decides how the task runs (in-process monitor or
         parked for an external reporter)."""
+        kind = normalize_unicode_scalars(kind)
+        if not isinstance(request, dict):
+            raise ValueError("task request must be an object")
+        if "resume_on_exit" in request and type(request["resume_on_exit"]) is not bool:
+            raise ValueError("task request resume_on_exit must be a boolean")
+        request = normalize_json_ingress(request)
         executor = self.executors.get(kind)
         if executor is None:
-            raise ToolExecutionError(f"no executor for task kind: {kind}", error_code="task_kind_unknown")
+            raise ToolExecutionError(
+                f"no executor for task kind: {kind}", error_code="task_kind_unknown"
+            )
         return executor.start(self, **request)  # type: ignore[attr-defined]
 
     def create_task(self, kind: str, request: dict[str, Any]) -> str:
         """TaskReporter entry: create a task and return its id (backend-initiated)."""
         return self.start_task(kind, request).job_id
 
-    def report_result(self, task_id: str, result: dict[str, Any], *, status: str = "answered") -> dict[str, Any]:
+    def report_result(
+        self, task_id: str, result: dict[str, Any], *, status: str = "answered"
+    ) -> dict[str, Any]:
         """External completion entry for hosted tasks (hitl/automation): set the
         terminal status/result and publish it through the shared reentry pipe.
 
@@ -1054,9 +1108,17 @@ class TaskManager:
         the agent observe the result twice). The dedup signal is the already-persisted+rehydrated
         ``ready_for_reentry``/``finished_at`` job state, so it holds across a restart with no extra
         bookkeeping. Mirrors the inbox's dedup-by-id (effectively-once result ingestion)."""
+        task_id = normalize_unicode_scalars(task_id)
+        status = normalize_unicode_scalars(status)
+        result = normalize_json_ingress(result)
         task = self.get_job(task_id)
         if task.ready_for_reentry or task.finished_at is not None:
-            return {"task_id": task_id, "status": task.status, "delivered": False, "duplicate": True}
+            return {
+                "task_id": task_id,
+                "status": task.status,
+                "delivered": False,
+                "duplicate": True,
+            }
         task.status = status  # type: ignore[assignment]
         task.finished_at = time.time()
         task.result = result  # type: ignore[attr-defined]
@@ -1175,8 +1237,7 @@ class TaskManager:
     def has_resume_jobs(self) -> bool:
         with self._lock:
             return bool(self._reentry_queue) or any(
-                job.resume_on_exit
-                and job.job_id not in self._delivered_reentry_jobs
+                job.resume_on_exit and job.job_id not in self._delivered_reentry_jobs
                 for job in self.jobs.values()
             )
 
@@ -1257,7 +1318,9 @@ class TaskManager:
         # we must NOT block it — the monitors need this very loop to run — so skip the wait;
         # the processes are already terminated.
         try:
-            on_job_loop = asyncio.get_running_loop() is self._run_loop and self._run_loop is not None
+            on_job_loop = (
+                asyncio.get_running_loop() is self._run_loop and self._run_loop is not None
+            )
         except RuntimeError:
             on_job_loop = False
         try:
@@ -1369,8 +1432,8 @@ def run_permission_policy(run_dir: Path) -> PermissionPolicy:
     if not manifest_path.exists():
         return PermissionPolicy(redact_patterns=("**",))
     try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, RecursionError) as exc:
+        payload = loads_json_ingress(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as exc:
         raise ValueError("manifest.json cannot be read as a policy manifest") from exc
     if not isinstance(payload, dict):
         raise ValueError("manifest.json is not a policy object")
@@ -1451,8 +1514,8 @@ def public_job_artifact_for(run_dir: Path, job_id: str) -> dict[str, Any]:
 
 def _read_job_artifact(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(read_text_resilient(path))
-    except (json.JSONDecodeError, RecursionError) as exc:
+        payload = loads_json_ingress(read_text_resilient(path))
+    except (ValueError, RecursionError) as exc:
         raise ValueError("job artifact is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise ValueError("job artifact is not an object")

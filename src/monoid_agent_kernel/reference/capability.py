@@ -23,6 +23,8 @@ from monoid_agent_kernel.core.capability import (
     CapabilityPending,
     CapabilityRequest,
 )
+from monoid_agent_kernel.core.json_ingress import normalize_unicode_scalars
+from monoid_agent_kernel.core.scope import validate_web_signed_scope_controls
 from monoid_agent_kernel.reference._shared.tokens import TokenKind, TokenManager
 
 # Capabilities whose lease token must be accepted by an EXISTING gateway (not the generic capability
@@ -57,8 +59,21 @@ class GatewayCapabilityBroker:
         ttl = req.ttl_seconds or 600
         kind, audience = self.gateway_token_kinds.get(req.capability, ("capability", self.audience))
         scope = dict(req.scope)
-        if req.binding_id and req.capability in self.gateway_token_kinds:
-            scope.setdefault("binding_id", req.binding_id)
+        if type(req.binding_id) is not str:
+            raise ValueError("capability request binding_id must be a string")
+        binding_id = normalize_unicode_scalars(req.binding_id).strip()
+        if binding_id and req.capability in self.gateway_token_kinds:
+            if "binding_id" in scope:
+                scoped_binding = scope["binding_id"]
+                if (
+                    type(scoped_binding) is not str
+                    or normalize_unicode_scalars(scoped_binding).strip() != binding_id
+                ):
+                    raise ValueError(
+                        "web capability scope binding_id must match the capability request"
+                    )
+            scope["binding_id"] = binding_id
+        validate_web_signed_scope_controls(req.capability, scope)
         token = self.token_manager.issue(
             kind=kind,
             audience=audience,

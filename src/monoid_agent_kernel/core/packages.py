@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 from monoid_agent_kernel.core._util import canonical_sha256, utc_timestamp, write_json_atomic
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress, normalize_json_ingress
 from monoid_agent_kernel.errors import PermissionDenied, WorkspaceError
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 from monoid_agent_kernel.workspace.paths import is_within, normalize_workspace_path
@@ -254,7 +255,7 @@ def apply_package(
         verification = _verify_materialized_source(package_source)
         if not verification.ok:
             raise WorkspaceError(f"package verification failed: {'; '.join(verification.issues)}")
-        approval_payload = _read_json(approval) if isinstance(approval, Path) else dict(approval)
+        approval_payload = _read_json(approval)
         _verify_approval_for_package(approval_payload, verification.package)
         if approval_payload["decision"] == "rejected":
             return _final_apply_result(
@@ -267,7 +268,7 @@ def apply_package(
         target = target.resolve()
         target.mkdir(parents=True, exist_ok=True)
         proposal = _read_json(verification.root / "proposal.json")
-        approved = tuple(str(path) for path in approval_payload.get("approved_paths") or ())
+        approved = tuple(approval_payload.get("approved_paths") or ())
         approved_set = set(approved or _proposal_changed_paths(verification.root))
         approved_files: list[dict[str, Any]] = []
         skipped: list[str] = []
@@ -518,6 +519,17 @@ def _write_snapshot(root: Path, file_info: dict[str, Any], target_path: Path) ->
 def _verify_approval_for_package(approval: dict[str, Any], package: dict[str, Any]) -> None:
     if approval.get("schema_version") not in ACCEPTED_APPROVAL_SCHEMA_VERSIONS:
         raise WorkspaceError("unsupported approval schema")
+    decision = approval.get("decision")
+    if type(decision) is not str or decision not in {"approved", "rejected"}:
+        raise WorkspaceError("approval decision must be approved or rejected")
+    for key in ("approval_hash", "package_hash", "proposal_hash"):
+        value = approval.get(key)
+        if type(value) is not str or not value:
+            raise WorkspaceError(f"approval {key} must be a non-empty string")
+    for key in ("approved_paths", "rejected_paths"):
+        paths = approval.get(key)
+        if not isinstance(paths, list) or not all(type(path) is str for path in paths):
+            raise WorkspaceError(f"approval {key} must be an array of strings")
     expected_hash = canonical_sha256(approval, drop=("approval_hash",))
     if approval.get("approval_hash") != expected_hash:
         raise WorkspaceError("approval_hash mismatch")
@@ -664,8 +676,10 @@ def _copy_package_source(source_root: Path, package: dict[str, Any], output_root
 
 def _read_json(path_or_payload: Path | dict[str, Any]) -> dict[str, Any]:
     if isinstance(path_or_payload, dict):
-        return dict(path_or_payload)
-    payload = json.loads(path_or_payload.read_text(encoding="utf-8"))
+        payload = normalize_json_ingress(path_or_payload)
+        assert isinstance(payload, dict)
+        return payload
+    payload = loads_json_ingress(path_or_payload.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise WorkspaceError(f"{path_or_payload.name} must contain an object")
     return payload
@@ -738,5 +752,6 @@ def _approval_id(
         },
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return "approval_" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()[:12]).decode("ascii").rstrip("=")

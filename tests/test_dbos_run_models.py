@@ -57,6 +57,17 @@ def test_dbos_resume_command_identity_is_retry_stable_and_round_trips() -> None:
     assert first.checkpoint_marker == retry.checkpoint_marker
 
 
+@pytest.mark.parametrize("invalid", [True, "1", float("nan"), float("inf"), 10**400])
+def test_dbos_resume_command_rejects_invalid_created_at(invalid: object) -> None:
+    with pytest.raises(ValueError, match="created_at must be a finite number"):
+        DbosResumeCommand("run_1", "resume_1", 7, created_at=invalid)  # type: ignore[arg-type]
+
+    payload = DbosResumeCommand("run_1", "resume_1", 7, created_at=1.0).to_json()
+    payload["created_at"] = invalid
+    with pytest.raises(ValueError, match="created_at must be a finite number"):
+        DbosResumeCommand.from_json(payload)
+
+
 def test_dbos_run_receipt_reconstructs_exact_durable_boundary() -> None:
     command = DbosResumeCommand("run_1", "resume_1", 4)
     suspension = Suspension(
@@ -193,7 +204,7 @@ def test_dbos_run_workflow_and_queue_ids_escape_components() -> None:
     )
 
 
-@pytest.mark.parametrize("polling_interval_s", (0.0, float("nan"), float("inf")))
+@pytest.mark.parametrize("polling_interval_s", (0.0, float("nan"), float("inf"), 10**400))
 def test_dbos_run_config_rejects_invalid_polling_interval(polling_interval_s: float) -> None:
     with pytest.raises(ValueError, match="queue settings"):
         DbosRunConfig(
@@ -202,7 +213,7 @@ def test_dbos_run_config_rejects_invalid_polling_interval(polling_interval_s: fl
         )
 
 
-@pytest.mark.parametrize("local_task_wait_s", (0.0, -1.0, float("nan"), float("inf")))
+@pytest.mark.parametrize("local_task_wait_s", (0.0, -1.0, float("nan"), float("inf"), 10**400))
 def test_dbos_run_config_rejects_invalid_local_task_wait(local_task_wait_s: float) -> None:
     with pytest.raises(ValueError, match="local_task_wait_s"):
         DbosRunConfig(
@@ -213,7 +224,7 @@ def test_dbos_run_config_rejects_invalid_local_task_wait(local_task_wait_s: floa
 
 @pytest.mark.parametrize(
     "checkpoint_retry_interval_s",
-    (0.0, -1.0, float("nan"), float("inf")),
+    (0.0, -1.0, float("nan"), float("inf"), 10**400),
 )
 def test_dbos_run_config_rejects_invalid_checkpoint_retry_interval(
     checkpoint_retry_interval_s: float,

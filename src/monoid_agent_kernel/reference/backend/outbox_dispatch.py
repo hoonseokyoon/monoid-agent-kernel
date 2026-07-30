@@ -8,7 +8,11 @@ from typing import Any, Protocol
 
 from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
-from monoid_agent_kernel.core.outbox import OutboxReceipt, OutboxRequest
+from monoid_agent_kernel.core.outbox import (
+    OutboxReceipt,
+    OutboxRequest,
+    validate_outbox_receipt,
+)
 from monoid_agent_kernel.core.trace_context import new_traceparent
 from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort, queued_message_snapshot
 
@@ -74,7 +78,7 @@ class OutboxDispatchService:
             if not request.traceparent:
                 request.traceparent = new_traceparent()
             try:
-                receipt = sender.send(request)
+                receipt = validate_outbox_receipt(sender.send(request))
             except Exception as exc:  # a sender raising is a retryable transport failure
                 receipt = OutboxReceipt(ok=False, error=str(exc), retryable=True)
             next_attempt_at = now + self.backoff_delay(request.attempts + 1)

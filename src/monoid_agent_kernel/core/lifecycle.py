@@ -148,7 +148,11 @@ _STATUS_STRING_TO_STATE: dict[str, SessionState] = {
 
 def session_state_value(state: SessionState | str) -> str:
     """Return the canonical wire value for a lifecycle state."""
-    return state.value if isinstance(state, SessionState) else SessionState(str(state)).value
+    if isinstance(state, SessionState):
+        return state.value
+    if type(state) is not str:
+        raise ValueError("session state must be a string")
+    return SessionState(state).value
 
 
 def session_state_from_run_status(
@@ -166,9 +170,15 @@ def session_state_from_run_status(
     """
     if isinstance(status, SessionState):
         return status
+    if type(status) is not str:
+        raise ValueError("run status must be a string")
+    if type(error_code) is not str:
+        raise ValueError("run error_code must be a string")
+    if type(terminal) is not bool:
+        raise ValueError("run terminal must be a boolean")
     if error_code == "cancelled" and status in {"limited", "failed"}:
         return SessionState.CANCELLED
-    return _STATUS_STRING_TO_STATE.get(str(status), SessionState.CREATED)
+    return _STATUS_STRING_TO_STATE.get(status, SessionState.CREATED)
 
 
 def lifecycle_from_status_artifact(
@@ -185,17 +195,28 @@ def lifecycle_from_status_artifact(
     status_payload = payload or {}
     state_value = status_payload.get("state")
     status_value = status_payload.get("status")
+    for field_name, value in (("state", state_value), ("status", status_value)):
+        if value is not None and type(value) is not str:
+            raise ValueError(f"status artifact {field_name} must be a string")
     raw_state = state_value or status_value
     if raw_state:
-        terminal = bool(status_payload.get("terminal"))
+        terminal_value = status_payload.get("terminal", False)
+        if type(terminal_value) is not bool:
+            raise ValueError("status artifact terminal must be a boolean")
+        terminal = terminal_value
+        error_code = status_payload.get("error_code", "")
+        if error_code is None:
+            error_code = ""
+        if type(error_code) is not str:
+            raise ValueError("status artifact error_code must be a string")
         state = session_state_from_run_status(
-            str(raw_state),
-            error_code=str(status_payload.get("error_code") or ""),
+            raw_state,
+            error_code=error_code,
             terminal=terminal,
         )
         if "terminal" not in status_payload:
-            state_text = str(state_value or "")
-            status_text = str(status_value or "")
+            state_text = state_value or ""
+            status_text = status_value or ""
             if state_text in {"completed", "failed", "cancelled"} or (
                 not state_text and status_text in {"completed", "failed", "limited", "cancelled"}
             ):

@@ -37,8 +37,10 @@ from monoid_agent_kernel.core.external_agent_envelope import (
     external_agent_envelope_to_inbox_message,
     validate_external_agent_envelope,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
 from monoid_agent_kernel.core.tool_surface import ToolQuota
+from monoid_agent_kernel.core.wire_validation import parse_float
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -245,6 +247,7 @@ class ReferenceCapabilityHarness:
         request = CapabilityRequest(
             capability=str(payload.get("capability") or ""),
             scope=dict(payload.get("scope") or {}),
+            ttl_seconds=payload.get("ttl_seconds", 600),
         )
         self.requests[request.request_id] = request
         return request.to_json()
@@ -258,10 +261,11 @@ class ReferenceCapabilityHarness:
         return sanitize_denied_capability_result(result, reason="denied by profile")
 
     def revoke_capability(self, payload: dict[str, Any]) -> dict[str, Any]:
+        before = None if payload.get("before") is None else parse_float(payload, "before")
         return self.vault.revoke(
             capability=(str(payload["capability"]) if payload.get("capability") else None),
             lease_id=(str(payload["lease_id"]) if payload.get("lease_id") else None),
-            before=(float(payload["before"]) if payload.get("before") is not None else None),
+            before=before,
         )
 
     def token_for(self, capability: str, *, now: float) -> str | None:
@@ -275,10 +279,12 @@ class ReferenceCapabilityHarness:
         return self.vault.export_revocations()
 
     def import_revocations(self, payload: dict[str, Any]) -> dict[str, Any]:
+        before = parse_float(payload, "revoked_before", default=0.0)
+        assert before is not None
         self.vault.import_revocations(
             lease_ids=list(payload.get("revoked_lease_ids") or ()),
             capabilities=list(payload.get("revoked_capabilities") or ()),
-            before=float(payload.get("revoked_before") or 0.0),
+            before=before,
             all_revoked=bool(payload.get("revoked_all", False)),
         )
         return self.vault.export_revocations()
@@ -1301,7 +1307,9 @@ class ReferenceBackendHarness:
     def task_result(self, run_id: str, token: str, task_id: str) -> dict[str, Any]:
         self.backend.status(run_id, token)
         task_path = self.backend._record(run_id).run_dir / "artifacts" / "tasks" / task_id / "task.json"
-        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task = loads_json_ingress(task_path.read_text(encoding="utf-8"))
+        if not isinstance(task, dict):
+            raise ValueError("task artifact must be a JSON object")
         return {"result": task["result"]}
 
     def side_effects(self, run_id: str, token: str) -> dict[str, Any]:

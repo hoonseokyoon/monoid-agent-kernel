@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 from monoid_agent_kernel.core._event_log import iter_committed_event_records
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.lifecycle import (
     TERMINAL_STATES,
     SessionState,
@@ -88,7 +88,7 @@ def diagnostic_event_summary(
 
 def _read_optional_json(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = loads_json_ingress(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return None
     return payload if isinstance(payload, dict) else None

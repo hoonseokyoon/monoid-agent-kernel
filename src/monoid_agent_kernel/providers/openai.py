@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from monoid_agent_kernel.core.json_ingress import loads_model_json_ingress
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.errors import ModelAdapterError
@@ -76,6 +77,39 @@ def _loop_is_live(loop: asyncio.AbstractEventLoop | None) -> bool:
     a live loop can be handed a close, and a live loop is also one that may have a call in flight.
     """
     return loop is not None and not loop.is_closed() and loop.is_running()
+
+
+def _stream_output_index(event: Any) -> int:
+    value = getattr(event, "output_index", 0)
+    if type(value) is not int or value < 0:
+        raise ModelAdapterError(
+            "OpenAI returned an invalid stream output_index; expected a non-negative integer",
+            provider_error_code="openai_bad_response",
+            retryable=False,
+        )
+    return value
+
+
+def _provider_string(value: Any, field_name: str, *, required: bool = False) -> str | None:
+    if value is None or value == "":
+        if required:
+            raise ModelAdapterError(f"OpenAI response {field_name} is required")
+        return None
+    if type(value) is not str:
+        raise ModelAdapterError(f"OpenAI response {field_name} must be a string")
+    return value
+
+
+def _first_provider_string(
+    field_name: str,
+    *values: Any,
+    required: bool = False,
+) -> str | None:
+    for value in values:
+        if value is None or value == "":
+            continue
+        return _provider_string(value, field_name, required=required)
+    return _provider_string(None, field_name, required=required)
 
 
 def _release_foreign_async_client(client: Any, loop: asyncio.AbstractEventLoop | None) -> None:
@@ -368,28 +402,44 @@ class OpenAIModelAdapter:
                 async for event in stream:
                     etype = getattr(event, "type", "")
                     if etype == "response.output_text.delta":
-                        text = getattr(event, "delta", "") or ""
+                        text = _provider_string(
+                            getattr(event, "delta", None), "output text delta"
+                        ) or ""
                         if text:
                             yield TextDelta(text)
                     elif etype == "response.reasoning_summary_text.delta":
                         # Display-only reasoning summary fragment (DX-13b). Only present when the
                         # request asked for a summary (reasoning.summary != "off").
-                        text = getattr(event, "delta", "") or ""
+                        text = _provider_string(
+                            getattr(event, "delta", None), "reasoning summary delta"
+                        ) or ""
                         if text:
                             yield ReasoningDelta(text)
                     elif etype == "response.output_item.added":
                         item = getattr(event, "item", None)
                         if item is not None and getattr(item, "type", "") == "function_call":
                             yield ToolCallDelta(
-                                index=int(getattr(event, "output_index", 0) or 0),
-                                id=str(getattr(item, "call_id", "") or getattr(item, "id", "") or "") or None,
-                                name=str(getattr(item, "name", "") or "") or None,
+                                index=_stream_output_index(event),
+                                id=_first_provider_string(
+                                    "function-call id",
+                                    getattr(item, "call_id", None),
+                                    getattr(item, "id", None),
+                                    required=True,
+                                ),
+                                name=_provider_string(
+                                    getattr(item, "name", None),
+                                    "function-call name",
+                                    required=True,
+                                ),
                             )
                     elif etype == "response.function_call_arguments.delta":
-                        frag = getattr(event, "delta", "") or ""
+                        frag = _provider_string(
+                            getattr(event, "delta", None),
+                            "function-call arguments delta",
+                        ) or ""
                         if frag:
                             yield ToolCallDelta(
-                                index=int(getattr(event, "output_index", 0) or 0),
+                                index=_stream_output_index(event),
                                 arguments_fragment=frag,
                             )
                     elif etype in ("response.completed", "response.incomplete"):
@@ -550,7 +600,11 @@ def _observation_input_item(observation: Any) -> dict[str, Any]:
     return {
         "type": "function_call_output",
         "call_id": observation.call_id,
-        "output": json.dumps(observation.output, ensure_ascii=False),
+                        "output": json.dumps(
+                            observation.output,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
     }
 
 
@@ -611,7 +665,11 @@ def _message_to_input_items(
             {
                 "type": "function_call_output",
                 "call_id": message.get("call_id") or "",
-                "output": json.dumps(message.get("content"), ensure_ascii=False),
+                        "output": json.dumps(
+                            message.get("content"),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
             }
         ]
         # Media a tool returned cannot ride the tool/function output on OpenAI — deliver
@@ -636,7 +694,11 @@ def _message_to_input_items(
                     "type": "function_call",
                     "call_id": call.get("id") or "",
                     "name": call.get("name") or "",
-                    "arguments": json.dumps(call.get("arguments") or {}, ensure_ascii=False),
+                    "arguments": json.dumps(
+                        call.get("arguments") or {},
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ),
                 }
             )
         return items
@@ -714,34 +776,71 @@ def _stop_reason_from_response(data: dict[str, Any], *, tool_calls_present: bool
 
 
 def _parse_response(data: dict[str, Any]) -> ModelTurn:
-    output = data.get("output") or []
+    output = data.get("output", [])
+    if output is None:
+        output = []
+    if not isinstance(output, (list, tuple)):
+        raise ModelAdapterError("OpenAI response output must be an array")
     tool_calls: list[ToolCall] = []
     text_parts: list[str] = []
     for item in output:
+        if not isinstance(item, dict):
+            raise ModelAdapterError("OpenAI response output items must be objects")
         item_type = item.get("type")
         if item_type == "function_call":
-            args_raw = item.get("arguments") or "{}"
+            args_raw = item.get("arguments")
+            if args_raw is None:
+                args_raw = {}
             try:
-                args = json.loads(args_raw) if isinstance(args_raw, str) else dict(args_raw)
-            except json.JSONDecodeError as exc:
+                if isinstance(args_raw, str):
+                    args = loads_model_json_ingress(args_raw)
+                elif isinstance(args_raw, dict):
+                    args = dict(args_raw)
+                else:
+                    args = None
+            except ValueError as exc:
                 raise ModelAdapterError(f"invalid function_call arguments for {item.get('name')}") from exc
+            if not isinstance(args, dict):
+                raise ModelAdapterError(
+                    f"invalid function_call arguments for {item.get('name')}: expected an object"
+                )
             tool_calls.append(
                 ToolCall(
-                    id=str(item.get("call_id") or item.get("id") or ""),
-                    name=str(item.get("name") or ""),
+                    id=_first_provider_string(
+                        "function-call id",
+                        item.get("call_id"),
+                        item.get("id"),
+                        required=True,
+                    )
+                    or "",
+                    name=_provider_string(
+                        item.get("name"),
+                        "function-call name",
+                        required=True,
+                    )
+                    or "",
                     arguments=args,
                 )
             )
         elif item_type == "message":
-            for part in item.get("content") or []:
+            content = item.get("content", [])
+            if content is None:
+                content = []
+            if not isinstance(content, (list, tuple)):
+                raise ModelAdapterError("OpenAI message content must be an array")
+            for part in content:
+                if not isinstance(part, dict):
+                    raise ModelAdapterError("OpenAI message content items must be objects")
                 if part.get("type") in {"output_text", "text"}:
-                    text_parts.append(str(part.get("text") or ""))
+                    text_parts.append(
+                        _provider_string(part.get("text"), "output text") or ""
+                    )
         elif item_type in {"output_text", "text"}:
-            text_parts.append(str(item.get("text") or ""))
+            text_parts.append(_provider_string(item.get("text"), "output text") or "")
 
     usage_out = normalize_usage(data.get("usage"), legacy_aliases=True)
     return ModelTurn(
-        response_id=data.get("id"),
+        response_id=_provider_string(data.get("id"), "response id"),
         final_text="".join(text_parts).strip() or None,
         tool_calls=tuple(tool_calls),
         usage=usage_out,

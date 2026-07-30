@@ -9,12 +9,13 @@ so all three layers harden in one place.
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.request import Request, urlopen
+
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 
 # Reject a declared request body larger than this outright (DoS / OOM guard). 10 MB
 # comfortably covers a by-value conversation turn while bounding a single request's cost.
@@ -28,11 +29,20 @@ class HttpRequestTooLarge(Exception):
     """The request body's declared Content-Length exceeds ``MAX_REQUEST_BYTES``."""
 
 
-def read_json_limited(handler: BaseHTTPRequestHandler, *, max_bytes: int = MAX_REQUEST_BYTES) -> dict[str, Any]:
+def read_json_limited(
+    handler: BaseHTTPRequestHandler, *, max_bytes: int = MAX_REQUEST_BYTES
+) -> dict[str, Any]:
     """Read a JSON object body, rejecting an over-large declared Content-Length before any
     bytes are read. Returns ``{}`` for an empty body. Raises ``HttpRequestTooLarge`` (-> 413)
     or ``ValueError`` (-> 400) on a malformed body."""
-    length = int(handler.headers.get("Content-Length") or "0")
+    try:
+        length = int(handler.headers.get("Content-Length") or "0")
+    except (TypeError, ValueError) as exc:
+        handler.close_connection = True
+        raise ValueError("invalid Content-Length") from exc
+    if length < 0:
+        handler.close_connection = True
+        raise ValueError("Content-Length must be non-negative")
     if length > max_bytes:
         # The declared body is rejected WITHOUT reading it (the OOM guard). That leaves the
         # client's already-sent bytes unconsumed, so the connection cannot be safely reused —
@@ -40,11 +50,11 @@ def read_json_limited(handler: BaseHTTPRequestHandler, *, max_bytes: int = MAX_R
         # also otherwise be misread as the next request, and the close races a TCP reset).
         handler.close_connection = True
         raise HttpRequestTooLarge(f"request body exceeds the {max_bytes}-byte limit")
-    if length <= 0:
+    if length == 0:
         return {}
     try:
-        payload = json.loads(handler.rfile.read(length).decode("utf-8"))
-    except json.JSONDecodeError as exc:
+        payload = loads_json_ingress(handler.rfile.read(length).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ValueError("invalid JSON request body") from exc
     if not isinstance(payload, dict):
         raise ValueError("JSON request body must be an object")
@@ -87,7 +97,9 @@ def wait_http_ready(base_url: str, *, timeout_s: float = 15.0) -> None:
 
 def log_http_request(logger: Any, handler: BaseHTTPRequestHandler, code: Any) -> None:
     """Structured access log for one request (method, path, status)."""
-    logger.info("http %s %s -> %s", getattr(handler, "command", "?"), getattr(handler, "path", "?"), code)
+    logger.info(
+        "http %s %s -> %s", getattr(handler, "command", "?"), getattr(handler, "path", "?"), code
+    )
 
 
 class HardenedThreadingHTTPServer(ThreadingHTTPServer):

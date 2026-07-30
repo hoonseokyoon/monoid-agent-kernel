@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -182,6 +183,51 @@ def test_web_gateway_applies_signed_scope_when_payload_omits_constraints() -> No
         gateway.handle_search(token, {"query": "binding"})
 
 
+def test_web_gateway_reserves_signed_call_limit_atomically() -> None:
+    class BlockingProvider(FakeWebProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+            self.calls_lock = threading.Lock()
+
+        def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
+            with self.calls_lock:
+                self.calls += 1
+            self.started.set()
+            if not self.release.wait(timeout=5):
+                raise TimeoutError("test provider was not released")
+            return super().search(query, max_results=max_results)
+
+    manager = _token_manager()
+    provider = BlockingProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(
+        manager,
+        scope={"binding_id": "search_docs", "max_calls": 1, "max_results": 1},
+    )
+
+    def call() -> dict[str, Any]:
+        return gateway.handle_search(token, {"query": "binding"})
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        first = executor.submit(call)
+        assert provider.started.wait(timeout=5)
+        competing = [executor.submit(call) for _ in range(7)]
+        failures = 0
+        for future in competing:
+            with pytest.raises(WebGatewayError, match="limit exceeded"):
+                future.result(timeout=5)
+            failures += 1
+        provider.release.set()
+        assert first.result(timeout=5)["result_count"] == 1
+
+    assert failures == 7
+    assert provider.calls == 1
+    assert gateway.tenant_usage("tenant_a")["failed_calls"] == 7
+
+
 def test_web_gateway_applies_signed_fetch_and_context_caps_when_omitted() -> None:
     class ObservingProvider(FakeWebProvider):
         last_timeout_s: int | None = None
@@ -324,6 +370,7 @@ def test_web_gateway_rejects_signed_binding_and_numeric_escalation() -> None:
             "binding_id": "search_docs",
             "max_calls": 1,
             "max_results": 1,
+            "recency_days": 7,
             "allowed_domains": ["docs.example.test"],
         },
     )
@@ -334,8 +381,254 @@ def test_web_gateway_rejects_signed_binding_and_numeric_escalation() -> None:
         gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "max_calls": 0})
     with pytest.raises(Exception, match="max_results exceeds signed token scope"):
         gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "max_results": 2})
+    with pytest.raises(Exception, match="recency_days exceeds signed token scope"):
+        gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "recency_days": 30})
 
     assert provider.search_calls == 0
+
+
+@pytest.mark.parametrize("signed_value", [None, float("nan")])
+@pytest.mark.parametrize("key", ["max_results", "max_calls", "recency_days"])
+def test_web_gateway_rejects_explicit_null_signed_numeric_caps(
+    key: str,
+    signed_value: object,
+) -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(
+        manager,
+        scope={"binding_id": "search_docs", key: signed_value},
+    )
+
+    with pytest.raises(WebGatewayError, match=rf"{key} must be an integer") as exc_info:
+        gateway.handle_search(
+            token,
+            {"binding_id": "search_docs", "query": "binding", "max_results": 999},
+        )
+
+    assert exc_info.value.error_code == "web_scope_invalid"
+    assert provider.search_calls == 0
+    assert gateway.tenant_usage("tenant_a")["search_calls"] == 0
+
+
+@pytest.mark.parametrize(
+    ("scope", "error"),
+    [
+        (
+            {"binding_id": float("nan"), "max_calls": 1, "max_results": 1},
+            "binding_id must be a non-empty string",
+        ),
+        ({"max_calls": 1, "max_results": 1}, "max_calls signed scope requires binding_id"),
+        (
+            {"binding_id": "search_docs", "allowed_domains": float("nan")},
+            "allowed_domains must be an array",
+        ),
+        (
+            {"binding_id": "search_docs", "blocked_domains": None},
+            "blocked_domains must be an array",
+        ),
+    ],
+)
+def test_web_gateway_rejects_signed_identity_or_domain_controls_that_normalize_to_null(
+    scope: dict[str, object],
+    error: str,
+) -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(manager, scope=scope)
+
+    with pytest.raises(WebGatewayError, match=error) as exc_info:
+        gateway.handle_search(token, {"query": "binding", "max_results": 999})
+
+    assert exc_info.value.error_code == "web_scope_invalid"
+    assert provider.search_calls == 0
+    assert gateway.tenant_usage("tenant_a")["search_calls"] == 0
+
+
+def test_web_gateway_normalizes_direct_python_requests_before_provider_calls() -> None:
+    class ObservingProvider:
+        search_request: tuple[str, int] | None = None
+        fetch_request: dict[str, Any] | None = None
+        context_request: dict[str, Any] | None = None
+
+        def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
+            self.search_request = (query, max_results)
+            return []
+
+        def fetch(
+            self,
+            url: str,
+            *,
+            format: str,
+            allowed_domains: tuple[str, ...] = (),
+            blocked_domains: tuple[str, ...] = (),
+            timeout_s: int | None = None,
+            max_bytes: int | None = None,
+        ) -> dict[str, Any]:
+            self.fetch_request = {
+                "url": url,
+                "format": format,
+                "allowed_domains": allowed_domains,
+                "blocked_domains": blocked_domains,
+                "timeout_s": timeout_s,
+                "max_bytes": max_bytes,
+            }
+            return {
+                "final_url": url,
+                "title": "observed",
+                "content": "content",
+                "source": "test",
+            }
+
+        def context(
+            self,
+            query: str,
+            *,
+            max_tokens: int,
+            max_urls: int,
+            max_snippets: int,
+            locale: str | None,
+            freshness: str | None,
+            allowed_domains: tuple[str, ...],
+            blocked_domains: tuple[str, ...],
+        ) -> dict[str, Any]:
+            self.context_request = {
+                "query": query,
+                "max_tokens": max_tokens,
+                "max_urls": max_urls,
+                "max_snippets": max_snippets,
+                "locale": locale,
+                "freshness": freshness,
+                "allowed_domains": allowed_domains,
+                "blocked_domains": blocked_domains,
+            }
+            return {"context": "", "sources": [], "chunks": [], "source": "test"}
+
+    manager = _token_manager()
+    provider = ObservingProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _web_token(manager)
+    surrogate = chr(0xD800)
+
+    search = gateway.handle_search(
+        token,
+        {
+            "query": f"query{surrogate}",
+            "max_results": 2,
+            "extension": {"score": float("nan"), "text": f"open{surrogate}"},
+        },
+    )
+    fetched = gateway.handle_fetch(
+        token,
+        {
+            "url": f"https://docs.example.test/page{surrogate}",
+            "format": f"text{surrogate}",
+            "allowed_domains": ["docs.example.test"],
+            "blocked_domains": [f"blocked{surrogate}.example.test"],
+        },
+    )
+    context = gateway.handle_context(
+        token,
+        {
+            "query": f"context{surrogate}",
+            "locale": f"en{surrogate}",
+            "freshness": f"pd{surrogate}",
+            "blocked_domains": [f"blocked{surrogate}.example.test"],
+        },
+    )
+
+    assert provider.search_request == ("query�", 2)
+    assert provider.fetch_request == {
+        "url": "https://docs.example.test/page�",
+        "format": "text�",
+        "allowed_domains": ("docs.example.test",),
+        "blocked_domains": ("blocked�.example.test",),
+        "timeout_s": 30,
+        "max_bytes": 100_000,
+    }
+    assert provider.context_request == {
+        "query": "context�",
+        "max_tokens": 8_192,
+        "max_urls": 8,
+        "max_snippets": 50,
+        "locale": "en�",
+        "freshness": "pd�",
+        "allowed_domains": (),
+        "blocked_domains": ("blocked�.example.test",),
+    }
+    assert search["query"] == "query�"
+    assert fetched["url"] == "https://docs.example.test/page�"
+    assert fetched["format"] == "text�"
+    assert context["query"] == "context�"
+    json.dumps(
+        {"search": search, "fetch": fetched, "context": context},
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("method_name", "payload", "error"),
+    [
+        ("handle_search", {"query": "q", "max_results": float("nan")}, "max_results must be finite"),
+        ("handle_search", {"query": "q", "max_results": True}, "max_results must be an integer"),
+        ("handle_search", {"query": "q", "max_results": 1.0}, "max_results must be an integer"),
+        ("handle_search", {"query": "q", "max_results": 0}, "max_results must be positive"),
+        ("handle_fetch", {"url": "https://docs.example.test", "timeout_s": float("inf")}, "timeout_s must be finite"),
+        ("handle_fetch", {"url": "https://docs.example.test", "max_bytes": "1"}, "max_bytes must be an integer"),
+        ("handle_context", {"query": "q", "max_tokens": float("-inf")}, "max_tokens must be finite"),
+        ("handle_context", {"query": "q", "max_urls": False}, "max_urls must be an integer"),
+        ("handle_context", {"query": "q", "max_snippets": 0}, "max_snippets must be positive"),
+        ("handle_context", {"query": "q", "recency_days": 0}, "recency_days must be positive"),
+        ("handle_search", {"query": "q", "max_calls": -1}, "max_calls must be non-negative"),
+        ("handle_fetch", {"url": "https://docs.example.test", "max_calls": float("nan")}, "max_calls must be finite"),
+    ],
+)
+def test_web_gateway_rejects_malformed_direct_numeric_controls_before_side_effects(
+    method_name: str,
+    payload: dict[str, Any],
+    error: str,
+) -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+
+    with pytest.raises(ValueError, match=error):
+        getattr(gateway, method_name)(_web_token(manager), payload)
+
+    assert provider.search_calls == 0
+    assert provider.fetch_calls == 0
+    assert provider.context_calls == 0
+    assert gateway.tenant_usage("tenant_a") == {
+        "tenant_id": "tenant_a",
+        "search_calls": 0,
+        "fetch_calls": 0,
+        "context_calls": 0,
+        "failed_calls": 0,
+        "result_count": 0,
+        "context_source_count": 0,
+        "bytes_returned": 0,
+        "context_bytes_returned": 0,
+    }
+
+
+def test_web_gateway_rejects_fractional_signed_integer_cap_before_provider() -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _scoped_web_token(
+        manager,
+        scope={"binding_id": "search", "max_results": 1.5},
+    )
+
+    with pytest.raises(WebGatewayError, match="max_results must be an integer") as exc_info:
+        gateway.handle_search(token, {"binding_id": "search", "query": "query"})
+
+    assert exc_info.value.error_code == "web_scope_invalid"
+    assert provider.search_calls == 0
+    assert gateway.tenant_usage("tenant_a")["search_calls"] == 0
 
 
 def test_web_gateway_client_retries_transient_connection_error(monkeypatch) -> None:

@@ -4,16 +4,20 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import compile_bound_tool_catalog
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_surface import (
     DefaultToolSurfaceResolver,
+    ToolAuthorization,
     ToolQuota,
     ToolScope,
     allowed_immediate_registry_tool_ids,
     immediate_registry_tool_ids,
+    validate_tool_authorization,
     visible_registry_tool_ids,
 )
 from monoid_agent_kernel.loop import AgentLoop
@@ -36,19 +40,108 @@ def _simple_tool(tool_id: str, *, capability: str = "test", side_effect: str = "
     )
 
 
+def test_tool_authorization_rejects_unknown_decision() -> None:
+    try:
+        ToolAuthorization(
+            tool_id="fs.read",
+            binding_id="fs.read",
+            model_name="fs_read",
+            decision="garbage",  # type: ignore[arg-type]
+            reason="custom_resolver",
+            exposure="immediate",
+        )
+    except ValueError as exc:
+        assert str(exc) == "tool authorization decision must be allow, ask, or deny"
+    else:
+        raise AssertionError("unknown authorization decision was accepted")
+
+
+def test_tool_authorization_boundary_rejects_forged_unknown_decision() -> None:
+    authorization = object.__new__(ToolAuthorization)
+    object.__setattr__(authorization, "decision", "garbage")
+
+    try:
+        validate_tool_authorization(authorization)
+    except ValueError as exc:
+        assert str(exc) == "tool authorization decision must be allow, ask, or deny"
+    else:
+        raise AssertionError("forged unknown authorization decision was accepted")
+
+
+@pytest.mark.parametrize(
+    "scope_name,field_name",
+    (
+        ("scope", "allowed_paths"),
+        ("scope", "denied_paths"),
+        ("scope", "allowed_domains"),
+        ("scope", "blocked_domains"),
+        ("scope", "command_allow_prefixes"),
+        ("scope", "command_deny_prefixes"),
+        ("scope", "env_allowlist"),
+        ("surface_scope", "command_allow_prefixes"),
+    ),
+)
+def test_tool_authorization_boundary_rejects_mutable_or_scalar_scope_fields(
+    scope_name: str,
+    field_name: str,
+) -> None:
+    malformed_scope = ToolScope()
+    object.__setattr__(malformed_scope, field_name, "echo safe")
+    kwargs = {scope_name: malformed_scope}
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{scope_name}\.{field_name} must be a tuple of strings",
+    ):
+        ToolAuthorization(
+            tool_id="shell.exec",
+            binding_id="shell.exec",
+            model_name="shell_exec",
+            decision="allow",
+            reason="custom_resolver",
+            exposure="immediate",
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+def test_tool_authorization_accepts_retained_legacy_path_markers() -> None:
+    scope = ToolScope.from_durable_json({"allowed_paths": [r"\!inert", "secret//file"]})
+
+    authorization = ToolAuthorization(
+        tool_id="fs.read",
+        binding_id="fs.read",
+        model_name="fs_read",
+        decision="allow",
+        reason="retained_runtime_config",
+        exposure="immediate",
+        scope=scope,
+        surface_scope=scope,
+    )
+
+    assert authorization.scope.allowed_paths == (r"\!inert", "secret//file")
+
+
 def test_resolver_uses_bound_catalog_and_binding_authorization() -> None:
     registry = ToolRegistry()
     registry.register_many((_simple_tool("alpha"), _simple_tool("beta"), _simple_tool("gamma")))
     config = runtime_config(
         bindings=(
-            tool_binding("alpha", binding_id="alpha_read", model_name="alpha_read", authorization="ask"),
-            tool_binding("beta", binding_id="beta_hidden", model_name="beta_hidden", exposure="hidden"),
-            tool_binding("gamma", binding_id="gamma_search", model_name="gamma_search", exposure="searchable"),
+            tool_binding(
+                "alpha", binding_id="alpha_read", model_name="alpha_read", authorization="ask"
+            ),
+            tool_binding(
+                "beta", binding_id="beta_hidden", model_name="beta_hidden", exposure="hidden"
+            ),
+            tool_binding(
+                "gamma", binding_id="gamma_search", model_name="gamma_search", exposure="searchable"
+            ),
         )
     )
     catalog = compile_bound_tool_catalog(config, registry)
 
-    snapshot = DefaultToolSurfaceResolver().resolve(bound_catalog=catalog, turn=type("Turn", (), {"turn_id": "t1"})())
+    snapshot = DefaultToolSurfaceResolver().resolve(
+        bound_catalog=catalog, turn=type("Turn", (), {"turn_id": "t1"})()
+    )
 
     assert [tool.id for tool in snapshot.immediate_tools] == ["alpha_read"]
     assert snapshot.authorization_for("alpha_read").decision == "ask"  # type: ignore[union-attr]
@@ -63,7 +156,9 @@ def test_resolver_hides_exhausted_quota_and_public_json_has_metadata() -> None:
     registry = ToolRegistry()
     registry.register_many((_simple_tool("fs.read", capability="fs.read"),))
     config = runtime_config(
-        bindings=(tool_binding("fs.read", quota=ToolQuota(max_calls_per_run=1), guidance="Read files."),)
+        bindings=(
+            tool_binding("fs.read", quota=ToolQuota(max_calls_per_run=1), guidance="Read files."),
+        )
     )
     catalog = compile_bound_tool_catalog(config, registry)
 
@@ -95,7 +190,9 @@ def test_public_tool_surface_redacts_authorization_runtime_and_scope() -> None:
     )
     catalog = compile_bound_tool_catalog(config, registry)
 
-    snapshot = DefaultToolSurfaceResolver().resolve(bound_catalog=catalog, turn=type("Turn", (), {"turn_id": "t1"})())
+    snapshot = DefaultToolSurfaceResolver().resolve(
+        bound_catalog=catalog, turn=type("Turn", (), {"turn_id": "t1"})()
+    )
     public = snapshot.to_public_json()
     auth = public["authorizations"]["web.search"]
 
@@ -142,7 +239,9 @@ def test_search_entries_include_grouping_metadata_and_defaults() -> None:
     )
     catalog = compile_bound_tool_catalog(config, registry)
 
-    snapshot = DefaultToolSurfaceResolver().resolve(bound_catalog=catalog, turn=type("Turn", (), {"turn_id": "t1"})())
+    snapshot = DefaultToolSurfaceResolver().resolve(
+        bound_catalog=catalog, turn=type("Turn", (), {"turn_id": "t1"})()
+    )
 
     entries = {entry.binding_id: entry for entry in snapshot.search_entries}
     docs = entries["docs_search"]
@@ -162,8 +261,14 @@ def test_tool_surface_searchable_binding_loads_next_turn(tmp_path: Path) -> None
     workspace.joinpath("notes.md").write_text("hello\n", encoding="utf-8")
     adapter = FakeModelAdapter(
         turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("tool_search", {"query": "read"}, "search1"),)),
-            ModelTurn(response_id="r2", tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "read1"),)),
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("tool_search", {"query": "read"}, "search1"),),
+            ),
+            ModelTurn(
+                response_id="r2",
+                tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "read1"),),
+            ),
             ModelTurn(final_text="done"),
         ]
     )
@@ -213,17 +318,23 @@ def test_tool_search_filters_by_group_and_tag_before_next_turn_load(tmp_path: Pa
             tool_binding(
                 "fs.read",
                 exposure="searchable",
-                metadata={"tool_search": {"namespace": "workspace", "group": "files", "tags": ["text"]}},
+                metadata={
+                    "tool_search": {"namespace": "workspace", "group": "files", "tags": ["text"]}
+                },
             ),
             tool_binding(
                 "fs.write",
                 exposure="searchable",
-                metadata={"tool_search": {"namespace": "workspace", "group": "files", "tags": ["write"]}},
+                metadata={
+                    "tool_search": {"namespace": "workspace", "group": "files", "tags": ["write"]}
+                },
             ),
             tool_binding(
                 "web.search",
                 exposure="searchable",
-                metadata={"tool_search": {"namespace": "docs", "group": "reference", "tags": ["text"]}},
+                metadata={
+                    "tool_search": {"namespace": "docs", "group": "reference", "tags": ["text"]}
+                },
             ),
             tool_binding("run.finish"),
         )
@@ -262,7 +373,9 @@ def test_search_result_is_not_callable_in_same_turn(tmp_path: Path) -> None:
             ModelTurn(final_text="done"),
         ]
     )
-    config = runtime_config(bindings=(tool_binding("fs.read", exposure="searchable"), tool_binding("run.finish")))
+    config = runtime_config(
+        bindings=(tool_binding("fs.read", exposure="searchable"), tool_binding("run.finish"))
+    )
 
     result = AgentLoop(
         spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
@@ -271,7 +384,9 @@ def test_search_result_is_not_callable_in_same_turn(tmp_path: Path) -> None:
     ).run_once("Read notes.")
 
     assert result.status == "completed"
-    assert "tool_not_in_surface" in result.run_dir.joinpath("transcript.jsonl").read_text(encoding="utf-8")
+    assert "tool_not_in_surface" in result.run_dir.joinpath("transcript.jsonl").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_quota_and_hidden_bindings_are_enforced(tmp_path: Path) -> None:
@@ -285,7 +400,9 @@ def test_quota_and_hidden_bindings_are_enforced(tmp_path: Path) -> None:
                 tool_calls=(
                     fake_tool_call("fs_read", {"path": "notes.md"}, "read1"),
                     fake_tool_call("fs_read", {"path": "notes.md"}, "read2"),
-                    fake_tool_call("fs_write", {"path": "x.md", "content": "x", "create_dirs": False}, "write1"),
+                    fake_tool_call(
+                        "fs_write", {"path": "x.md", "content": "x", "create_dirs": False}, "write1"
+                    ),
                 ),
             ),
             ModelTurn(final_text="done"),

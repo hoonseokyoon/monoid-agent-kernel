@@ -22,6 +22,8 @@ from urllib import request as urlrequest
 
 import click
 
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+
 from monoid_agent_kernel.core.model_io import content_digest
 from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.reference.studio import window
@@ -40,13 +42,18 @@ from monoid_agent_kernel.reference.studio.window import open_app_window
 
 
 def _http_json(url: str, *, method: str = "GET", payload: dict | None = None, timeout: float = 5.0) -> dict:
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    data = None if payload is None else json.dumps(payload, allow_nan=False).encode("utf-8")
     req = urlrequest.Request(url, data=data, method=method)
     if payload is not None:
         req.add_header("Content-Type", "application/json")
     with urlrequest.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
-    return json.loads(raw) if raw else {}
+    if not raw:
+        return {}
+    payload = loads_json_ingress(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("Studio response must be a JSON object")
+    return payload
 
 
 def _http_text(url: str, *, timeout: float = 5.0) -> str:
@@ -402,7 +409,7 @@ def studio_accept(
         host=host,
         timeout_s=timeout_s,
     )
-    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    click.echo(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
     if not result.get("ok"):
         raise SystemExit(1)
 

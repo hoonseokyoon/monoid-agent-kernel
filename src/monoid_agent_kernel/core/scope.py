@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
@@ -11,6 +12,7 @@ DEFAULT_NUMERIC_SCOPE_CAP_KEYS = frozenset(
     {
         "max_calls",
         "max_results",
+        "recency_days",
         "max_bytes",
         "timeout_s",
         "max_tokens",
@@ -19,8 +21,27 @@ DEFAULT_NUMERIC_SCOPE_CAP_KEYS = frozenset(
     }
 )
 
+DENY_LIST_SCOPE_KEYS = frozenset(
+    {"blocked_domains", "denied_paths", "command_deny_prefixes"}
+)
+EMPTY_SEQUENCE_IS_UNCONSTRAINED_KEYS = frozenset(
+    {
+        "allowed_domains",
+        "allowed_paths",
+        "command_allow_prefixes",
+        *DENY_LIST_SCOPE_KEYS,
+    }
+)
+SCOPE_METADATA_KEYS = frozenset({"path_pattern_encoding"})
 
-@dataclass(frozen=True)
+WEB_POSITIVE_INTEGER_SCOPE_KEYS_BY_CAPABILITY = {
+    "web.search": ("max_results", "recency_days"),
+    "web.fetch": ("timeout_s", "max_bytes"),
+    "web.context": ("max_tokens", "max_urls", "max_snippets", "recency_days"),
+}
+
+
+@dataclass
 class ScopePolicyError(ValueError):
     """Raised when a requested scope violates a signed or outer scope."""
 
@@ -32,6 +53,49 @@ class ScopePolicyError(ValueError):
         return self.detail
 
 
+def validate_web_signed_scope_controls(capability: str, scope: Mapping[str, Any]) -> None:
+    """Reject malformed numeric controls before a web capability token is minted or used.
+
+    Missing keys leave that dimension unconstrained. A present signed cap is an exact,
+    positive integer; explicit null cannot silently erase a limit.
+    """
+
+    keys = WEB_POSITIVE_INTEGER_SCOPE_KEYS_BY_CAPABILITY.get(capability)
+    if keys is None:
+        return
+    binding_id = None
+    if "binding_id" in scope:
+        binding_id = scope["binding_id"]
+        if type(binding_id) is not str or not binding_id.strip():
+            raise ValueError("binding_id must be a non-empty string")
+    for key in (*keys, "max_calls"):
+        if key not in scope:
+            continue
+        value = scope[key]
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"{key} must be finite")
+        if type(value) is not int:
+            raise ValueError(f"{key} must be an integer")
+        try:
+            finite = math.isfinite(float(value))
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError(f"{key} must be finite")
+        if value < 1:
+            raise ValueError(f"{key} must be positive")
+    if "max_calls" in scope and binding_id is None:
+        raise ValueError("max_calls signed scope requires binding_id")
+    for key in ("allowed_domains", "blocked_domains"):
+        if key not in scope:
+            continue
+        domains = scope[key]
+        if not isinstance(domains, (list, tuple)):
+            raise ValueError(f"{key} must be an array of strings")
+        if any(type(domain) is not str or not domain.strip() for domain in domains):
+            raise ValueError(f"{key} entries must be non-empty strings")
+
+
 def scope_within(
     inner: Mapping[str, Any],
     outer: Mapping[str, Any],
@@ -40,26 +104,48 @@ def scope_within(
 ) -> bool:
     """Return true when ``inner`` is no broader than ``outer``.
 
-    A missing outer key is unconstrained. Numeric caps narrow by choosing a smaller
-    value, list constraints narrow by subset, ``allowed_domains`` narrows by domain
-    pattern relation, and scalar constraints narrow by equality.
+    A missing outer key is unconstrained. A restrictive outer key must remain present
+    in ``inner``: omitting it would turn the grant into an unconstrained permission.
+    Numeric caps narrow by choosing a smaller value, allow lists narrow by subset,
+    deny lists narrow by superset, and scalar constraints narrow by equality.
     """
     numeric_key_set = frozenset(numeric_keys)
+    for key, outer_val in outer.items():
+        if key in SCOPE_METADATA_KEYS:
+            continue
+        if key not in inner and not _constraint_is_unconstrained(key, outer_val):
+            return False
     for key, inner_val in inner.items():
+        if key in SCOPE_METADATA_KEYS:
+            continue
         if key not in outer:
             continue
         outer_val = outer[key]
         if key == "allowed_domains" and _is_sequence(inner_val) and _is_sequence(outer_val):
             if not domain_patterns_within(_string_tuple(inner_val), _string_tuple(outer_val)):
                 return False
+        elif key in DENY_LIST_SCOPE_KEYS and _is_sequence(inner_val) and _is_sequence(outer_val):
+            if not set(inner_val) >= set(outer_val):
+                return False
         elif _is_sequence(inner_val) and _is_sequence(outer_val):
             if not set(inner_val) <= set(outer_val):
                 return False
-        elif key in numeric_key_set and _numeric_cap_within(inner_val, outer_val):
-            continue
+        elif key in numeric_key_set:
+            if not _numeric_cap_within(inner_val, outer_val):
+                return False
         elif inner_val != outer_val:
             return False
     return True
+
+
+def _constraint_is_unconstrained(key: str, value: Any) -> bool:
+    if value is None:
+        return True
+    return (
+        key in EMPTY_SEQUENCE_IS_UNCONSTRAINED_KEYS
+        and _is_sequence(value)
+        and not value
+    )
 
 
 def domain_patterns_within(requested: Iterable[str], signed: Iterable[str]) -> bool:
@@ -138,8 +224,11 @@ def _apply_numeric_cap(scope: Mapping[str, Any], payload: dict[str, Any], key: s
 def _positive_number(value: Any, *, key: str, reason: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ScopePolicyError(key, reason, f"{key} must be positive")
-    number = float(value)
-    if number <= 0:
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ScopePolicyError(key, reason, f"{key} must be positive") from exc
+    if not math.isfinite(number) or number <= 0:
         raise ScopePolicyError(key, reason, f"{key} must be positive")
     return number
 
@@ -153,7 +242,16 @@ def _numeric_cap_within(inner_val: Any, outer_val: Any) -> bool:
         return False
     if not isinstance(inner_val, int | float) or not isinstance(outer_val, int | float):
         return False
-    return float(inner_val) <= float(outer_val)
+    try:
+        inner_number = float(inner_val)
+        outer_number = float(outer_val)
+    except (OverflowError, ValueError):
+        return False
+    return (
+        math.isfinite(inner_number)
+        and math.isfinite(outer_number)
+        and inner_number <= outer_number
+    )
 
 
 def _domain_pattern_within(pattern: str, signed_pattern: str) -> bool:

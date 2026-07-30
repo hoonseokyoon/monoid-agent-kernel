@@ -369,6 +369,17 @@ def test_recordless_nonterminal_run_skips_direct_append(tmp_path) -> None:
     assert RunEventSequencer().run_dir_allows_direct_append(run_dir) is False
 
 
+def test_nonfinite_terminal_flag_cannot_authorize_direct_append(tmp_path) -> None:
+    run_dir = tmp_path / "runs" / "run_corrupt"
+    run_dir.mkdir(parents=True)
+    (run_dir / "status.json").write_text(
+        '{"run_id":"run_corrupt","state":"running","terminal":NaN}',
+        encoding="utf-8",
+    )
+
+    assert RunEventSequencer().run_dir_allows_direct_append(run_dir) is False
+
+
 def test_diagnostics_tail_uses_newest_known_sequence() -> None:
     sequencer = RunEventSequencer()
 

@@ -13,6 +13,11 @@ from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
     diagnostic_event_summary,
 )
+from monoid_agent_kernel.core.json_ingress import (
+    loads_json_ingress,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.core.lifecycle import (
     lifecycle_from_status_artifact,
     session_state_value,
@@ -45,7 +50,7 @@ class EventPageReader(Protocol):
 
 def _read_optional_json(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = loads_json_ingress(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -68,9 +73,18 @@ def _trace_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
 def _json_safe(value: Any) -> Any:
     """Render a value safe for JSON wire projection at any nesting depth."""
     try:
-        return json.loads(json.dumps(value, default=repr))
+        return loads_json_ingress(
+            json.dumps(
+                normalize_json_ingress(value),
+                default=repr,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+    except RecursionError:
+        return "<value exceeds JSON nesting limit>"
     except (TypeError, ValueError):
-        return repr(value)
+        return normalize_unicode_scalars(repr(value))
 
 
 def _status_payload_lifecycle(
@@ -110,7 +124,7 @@ class RunProjectionService:
         status_payload: dict[str, Any] | None = None
         if status_file.exists():
             # Resilient read: the run may be concurrently flipping status.json via atomic replace.
-            status_payload = json.loads(read_text_resilient(status_file))
+            status_payload = loads_json_ingress(read_text_resilient(status_file))
         record = self._context.active_record(run_id)
         if record is None:
             return {
@@ -308,7 +322,7 @@ class RunProjectionService:
                 status_path = run_dir / "status.json"
                 if status_path.exists():
                     try:
-                        payload = json.loads(read_text_resilient(status_path))
+                        payload = loads_json_ingress(read_text_resilient(status_path))
                         status_payload = payload if isinstance(payload, dict) else None
                     except (ValueError, OSError):
                         status_payload = None

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from support.runtime import runtime_config, runtime_provider, tool_binding
@@ -36,6 +37,8 @@ from monoid_agent_kernel.reference.capability import (
 )
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
+_LONG_TEST_TTL_SECONDS = 10_000_000_000
+
 
 def test_scope_within_list_subset_and_scalar_equality() -> None:
     assert scope_within({"allowed_domains": ["a.edu"]}, {"allowed_domains": ["a.edu", "b.edu"]})
@@ -63,13 +66,25 @@ def test_autogrant_broker_grants_requested_scope() -> None:
     assert lease.is_valid(now=1299.0) and not lease.is_valid(now=1301.0)
 
 
+@pytest.mark.parametrize("ttl", [True, 0, -1, 1.5, "60", None])
+def test_capability_request_requires_exact_positive_ttl(ttl: object) -> None:
+    with pytest.raises(ValueError, match="ttl_seconds must be a positive integer"):
+        CapabilityRequest(capability="web.search", ttl_seconds=ttl)  # type: ignore[arg-type]
+
+
 def test_vault_caches_valid_lease_and_expires() -> None:
     vault = CapabilityVault()
-    request = CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
-    lease = CapabilityLease(
-        capability="web.search", token_ref="t", expires_at=2000.0, scope={"allowed_domains": ["a.edu"]}
+    request = CapabilityRequest(
+        capability="web.search", scope={"allowed_domains": ["a.edu"]}, ttl_seconds=1000
     )
-    vault.admit(request, lease)
+    lease = CapabilityLease(
+        capability="web.search",
+        token_ref="t",
+        expires_at=2000.0,
+        issued_at=1000.0,
+        scope={"allowed_domains": ["a.edu"]},
+    )
+    vault.admit(request, lease, now=1000.0)
     assert vault.get_valid("web.search", {"allowed_domains": ["a.edu"]}, now=1999.0) is lease
     # Expired -> miss.
     assert vault.get_valid("web.search", {"allowed_domains": ["a.edu"]}, now=2001.0) is None
@@ -106,8 +121,10 @@ def test_pre_v020_literal_bang_lease_satisfies_current_marked_scope() -> None:
         "filesystem.read", current_scope, now=1999.0
     ) is legacy_lease
 
-    current_request = CapabilityRequest(capability="filesystem.read", scope=current_scope)
-    assert CapabilityVault().admit(current_request, legacy_lease) is legacy_lease
+    current_request = CapabilityRequest(
+        capability="filesystem.read", scope=current_scope, ttl_seconds=1000
+    )
+    assert CapabilityVault().admit(current_request, legacy_lease, now=1000.0) is legacy_lease
 
 
 def test_pre_v020_backslash_bang_lease_does_not_widen_to_current_literal_bang() -> None:
@@ -129,7 +146,7 @@ def test_pre_v020_backslash_bang_lease_does_not_widen_to_current_literal_bang() 
 
     current_request = CapabilityRequest(capability="filesystem.read", scope=current_scope)
     with pytest.raises(ValueError, match="wider scope"):
-        CapabilityVault().admit(current_request, legacy_lease)
+        CapabilityVault().admit(current_request, legacy_lease, now=1000.0)
 
 
 @pytest.mark.parametrize(
@@ -144,20 +161,22 @@ def test_pre_v020_hosted_capability_request_preserves_literal_bang_boundary(
     restored_request = CapabilityRequest(
         capability="filesystem.read",
         scope={"allowed_paths": [stored_pattern]},
+        ttl_seconds=1000,
     )
     current_lease = CapabilityLease(
         capability="filesystem.read",
         token_ref="current:literal-bang",
         expires_at=2000.0,
+        issued_at=1000.0,
         scope=_current_literal_bang_scope(),
     )
     vault = CapabilityVault()
 
     if accepted:
-        assert vault.admit(restored_request, current_lease) is current_lease
+        assert vault.admit(restored_request, current_lease, now=1000.0) is current_lease
     else:
         with pytest.raises(ValueError, match="wider scope"):
-            vault.admit(restored_request, current_lease)
+            vault.admit(restored_request, current_lease, now=1000.0)
 
 
 def test_vault_admit_rejects_scope_widening() -> None:
@@ -167,10 +186,34 @@ def test_vault_admit_rejects_scope_widening() -> None:
         capability="web.search",
         token_ref="t",
         expires_at=2000.0,
+        issued_at=1000.0,
         scope={"allowed_domains": ["a.edu", "evil.com"]},  # broader than requested
     )
     with pytest.raises(ValueError):
-        vault.admit(request, widened)
+        vault.admit(request, widened, now=1000.0)
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {"allowed_domains": ["a.edu"]},
+        {"blocked_domains": ["evil.test"]},
+        {"max_results": 5},
+        {"binding_id": "search_docs"},
+    ],
+)
+def test_vault_admit_rejects_omitted_requested_constraints(scope: dict[str, object]) -> None:
+    request = CapabilityRequest(capability="web.search", scope=scope)
+    omitted = CapabilityLease(
+        capability="web.search",
+        token_ref="t",
+        expires_at=2000.0,
+        issued_at=1000.0,
+        scope={},
+    )
+
+    with pytest.raises(ValueError, match="wider scope"):
+        CapabilityVault().admit(request, omitted, now=1000.0)
 
 
 def test_vault_admit_rejects_capability_mismatch() -> None:
@@ -180,11 +223,12 @@ def test_vault_admit_rejects_capability_mismatch() -> None:
         capability="web.fetch",
         token_ref="t",
         expires_at=2000.0,
+        issued_at=1000.0,
         scope={"allowed_domains": ["a.edu"]},
     )
 
     with pytest.raises(ValueError):
-        vault.admit(request, mismatched)
+        vault.admit(request, mismatched, now=1000.0)
 
     assert vault.token_for("web.fetch", now=0.0) is None
 
@@ -194,15 +238,73 @@ def test_vault_admit_accepts_narrower_numeric_web_caps() -> None:
     request = CapabilityRequest(
         capability="web.search",
         scope={"allowed_domains": ["a.edu"], "max_calls": 4, "max_results": 10},
+        ttl_seconds=1000,
     )
     narrowed = CapabilityLease(
         capability="web.search",
         token_ref="t",
         expires_at=2000.0,
+        issued_at=1000.0,
         scope={"allowed_domains": ["a.edu"], "max_calls": 2, "max_results": 5},
     )
 
-    assert vault.admit(request, narrowed) is narrowed
+    assert vault.admit(request, narrowed, now=1000.0) is narrowed
+
+
+def test_vault_admit_rejects_future_or_overlong_lease() -> None:
+    request = CapabilityRequest(capability="web.search", ttl_seconds=60)
+    future = CapabilityLease(
+        capability="web.search",
+        token_ref="future",
+        issued_at=1001.0,
+        expires_at=1060.0,
+    )
+    overlong = CapabilityLease(
+        capability="web.search",
+        token_ref="overlong",
+        issued_at=1000.0,
+        expires_at=1061.0,
+    )
+
+    with pytest.raises(ValueError, match="future-issued"):
+        CapabilityVault().admit(request, future, now=1000.0)
+    with pytest.raises(ValueError, match="requested ttl"):
+        CapabilityVault().admit(request, overlong, now=1000.0)
+
+
+def test_vault_admit_rejects_rotation_ceiling_beyond_requested_ttl() -> None:
+    request = CapabilityRequest(capability="web.search", ttl_seconds=60)
+    overlong_ceiling = CapabilityLease(
+        capability="web.search",
+        token_ref="overlong-ceiling",
+        issued_at=1000.0,
+        expires_at=1030.0,
+        max_expires_at=1061.0,
+        durable=True,
+    )
+
+    with pytest.raises(ValueError, match="requested ttl"):
+        CapabilityVault().admit(request, overlong_ceiling, now=1000.0)
+
+
+def test_future_dated_lease_cannot_bypass_revocation_watermark_or_restore() -> None:
+    vault = CapabilityVault()
+    vault.revoke(before=1000.0)
+    lease = CapabilityLease(
+        capability="web.search",
+        token_ref="future",
+        issued_at=1100.0,
+        expires_at=1200.0,
+    )
+
+    with pytest.raises(ValueError, match="future-issued"):
+        vault.admit(
+            CapabilityRequest(capability="web.search", ttl_seconds=200),
+            lease,
+            now=1000.0,
+        )
+    with pytest.raises(ValueError, match="future-issued"):
+        CapabilityVault().install(lease, now=1000.0)
 
 
 def test_request_and_lease_round_trip_json() -> None:
@@ -211,6 +313,9 @@ def test_request_and_lease_round_trip_json() -> None:
     lease = CapabilityLease(capability="email.send", token_ref="secret-ref://l", expires_at=1.0)
     assert lease.to_json()["protocol"] == "monoid.capability-lease.v1"
     assert CapabilityDenial(capability="email.send", reason="nope").to_json()["reason"] == "nope"
+
+    with pytest.raises(ValueError, match="finite number"):
+        CapabilityLease(capability="email.send", token_ref="t", expires_at=10**400)
 
 
 # --- loop integration: implicit (binding-declared) gating ---------------------------------
@@ -527,14 +632,15 @@ def test_approved_capability_preserves_lease_policy_fields(tmp_path: Path) -> No
     loop.open()
     parked = loop.run_until_suspended("go")
     assert parked.reason == "awaiting_tasks"
-    max_expires_at = time.time() + 900
     issued_at = time.time() - 5
+    max_expires_at = issued_at + 600
     lease_id = "lease_policy_ceiling"
     grant = _grant_lease()
     grant["lease"].update(
         {
             "lease_id": lease_id,
             "issued_at": issued_at,
+            "expires_at": issued_at + 300,
             "max_expires_at": max_expires_at,
         }
     )
@@ -585,12 +691,18 @@ def test_human_escalation_broker_returns_pending() -> None:
 
 def test_vault_export_durable_and_install_roundtrip() -> None:
     vault = CapabilityVault()
-    request = CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
+    request = CapabilityRequest(
+        capability="web.search",
+        scope={"allowed_domains": ["a.edu"]},
+        ttl_seconds=_LONG_TEST_TTL_SECONDS,
+    )
     # An ephemeral (sync) lease is NOT exported; a durable (approved) one is.
     vault.admit(request, CapabilityLease(capability="web.search", token_ref="t", expires_at=9e9, scope={"allowed_domains": ["a.edu"]}))
     assert vault.export_durable() == []
     vault.admit(
-        CapabilityRequest(capability="email.send", scope={}),
+        CapabilityRequest(
+            capability="email.send", scope={}, ttl_seconds=_LONG_TEST_TTL_SECONDS
+        ),
         CapabilityLease(capability="email.send", token_ref="secret-ref://l", expires_at=9e9, durable=True),
     )
     exported = vault.export_durable()
@@ -627,7 +739,12 @@ def _grant_lease() -> dict:
             "capability": "web.search",
             "token_ref": "approved:web.search",
             "expires_at": time.time() + 600,
-            "scope": {"allowed_domains": ["a.edu"]},
+            "scope": {
+                "allowed_domains": ["a.edu"],
+                "binding_id": "ext.fetch",
+                "max_calls": 20,
+                "max_results": 10,
+            },
         },
     }
 
@@ -748,7 +865,11 @@ def test_backend_no_factory_fails_requires_lease_closed(tmp_path: Path) -> None:
 
 def test_vault_revoke_per_capability_blocks_reads() -> None:
     vault = CapabilityVault()
-    request = CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
+    request = CapabilityRequest(
+        capability="web.search",
+        scope={"allowed_domains": ["a.edu"]},
+        ttl_seconds=_LONG_TEST_TTL_SECONDS,
+    )
     vault.admit(request, CapabilityLease(capability="web.search", token_ref="t", expires_at=9e9, scope={"allowed_domains": ["a.edu"]}))
     assert vault.token_for("web.search", now=0.0) == "t"
     vault.revoke(capability="web.search")
@@ -762,8 +883,12 @@ def test_vault_revoke_per_lease_id_and_watermark() -> None:
     vault = CapabilityVault()
     early = CapabilityLease(capability="cap.a", token_ref="ta", expires_at=9e9, issued_at=100.0)
     late = CapabilityLease(capability="cap.b", token_ref="tb", expires_at=9e9, issued_at=200.0)
-    vault.admit(CapabilityRequest(capability="cap.a"), early)
-    vault.admit(CapabilityRequest(capability="cap.b"), late)
+    vault.admit(
+        CapabilityRequest(capability="cap.a", ttl_seconds=_LONG_TEST_TTL_SECONDS), early
+    )
+    vault.admit(
+        CapabilityRequest(capability="cap.b", ttl_seconds=_LONG_TEST_TTL_SECONDS), late
+    )
     # A watermark kills the cohort issued before T (early), leaving the later one usable.
     vault.revoke(before=150.0)
     assert vault.token_for("cap.a", now=0.0) is None
@@ -799,7 +924,11 @@ def test_vault_export_import_revocations_roundtrip() -> None:
 def test_vault_fork_for_child_shares_revocations_without_live_lease_slots() -> None:
     parent = CapabilityVault()
     parent.admit(
-        CapabilityRequest(capability="web.search", scope={"binding_id": "parent"}),
+        CapabilityRequest(
+            capability="web.search",
+            scope={"binding_id": "parent"},
+            ttl_seconds=_LONG_TEST_TTL_SECONDS,
+        ),
         CapabilityLease(
             capability="web.search",
             token_ref="parent-token",
@@ -808,7 +937,11 @@ def test_vault_fork_for_child_shares_revocations_without_live_lease_slots() -> N
         ),
     )
     parent.admit(
-        CapabilityRequest(capability="web.fetch", scope={"binding_id": "shared"}),
+        CapabilityRequest(
+            capability="web.fetch",
+            scope={"binding_id": "shared"},
+            ttl_seconds=_LONG_TEST_TTL_SECONDS,
+        ),
         CapabilityLease(
             capability="web.fetch",
             token_ref="durable-token",
@@ -823,7 +956,11 @@ def test_vault_fork_for_child_shares_revocations_without_live_lease_slots() -> N
     assert child.token_for("web.fetch", now=0.0) == "durable-token"
 
     child.admit(
-        CapabilityRequest(capability="web.search", scope={"binding_id": "child"}),
+        CapabilityRequest(
+            capability="web.search",
+            scope={"binding_id": "child"},
+            ttl_seconds=_LONG_TEST_TTL_SECONDS,
+        ),
         CapabilityLease(
             capability="web.search",
             token_ref="child-token",
@@ -838,7 +975,11 @@ def test_vault_fork_for_child_shares_revocations_without_live_lease_slots() -> N
     assert child.token_for("web.search", now=0.0) is None
 
     child.admit(
-        CapabilityRequest(capability="web.context", scope={"binding_id": "child-only"}),
+        CapabilityRequest(
+            capability="web.context",
+            scope={"binding_id": "child-only"},
+            ttl_seconds=_LONG_TEST_TTL_SECONDS,
+        ),
         CapabilityLease(
             capability="web.context",
             token_ref="child-only-token",
@@ -1058,6 +1199,111 @@ def test_web_capability_request_scope_includes_signed_gateway_constraints(tmp_pa
     assert broker.last_request.scope["allowed_domains"] == ["a.edu"]
 
 
+def _web_scope_from_runtime(capability: str, runtime: dict[str, object]) -> dict[str, object]:
+    bound_tool = SimpleNamespace(
+        binding=SimpleNamespace(scope=ToolScope(), runtime={"web": runtime}),
+        base_spec=SimpleNamespace(capability=capability),
+        binding_id=capability,
+    )
+    return AgentLoop._capability_scope_for_tool(  # type: ignore[arg-type]
+        object.__new__(AgentLoop),
+        bound_tool,
+    )
+
+
+@pytest.mark.parametrize(
+    ("capability", "control"),
+    [
+        ("web.search", "max_calls"),
+        ("web.search", "max_search_calls"),
+        ("web.search", "max_results"),
+        ("web.fetch", "max_calls"),
+        ("web.fetch", "max_fetch_calls"),
+        ("web.fetch", "max_response_bytes"),
+        ("web.fetch", "max_bytes"),
+        ("web.fetch", "max_timeout_s"),
+        ("web.fetch", "timeout_s"),
+        ("web.context", "max_calls"),
+        ("web.context", "max_context_calls"),
+        ("web.context", "max_context_tokens"),
+        ("web.context", "max_tokens"),
+        ("web.context", "max_context_urls"),
+        ("web.context", "max_urls"),
+        ("web.context", "max_context_snippets"),
+        ("web.context", "max_snippets"),
+    ],
+)
+@pytest.mark.parametrize("invalid", ["999", True, 1.5, float("nan"), float("inf")])
+def test_web_runtime_budget_controls_reject_coercible_or_nonfinite_values(
+    capability: str,
+    control: str,
+    invalid: object,
+) -> None:
+    with pytest.raises(ValueError, match=rf"web runtime {control} must be"):
+        _web_scope_from_runtime(capability, {control: invalid})
+
+
+@pytest.mark.parametrize(
+    ("capability", "runtime", "error"),
+    [
+        ("web.search", {"max_calls": -1}, "max_calls must be non-negative"),
+        ("web.search", {"max_results": 0}, "max_results must be positive"),
+        ("web.fetch", {"max_response_bytes": 0}, "max_response_bytes must be positive"),
+        ("web.context", {"max_context_calls": -1}, "max_context_calls must be non-negative"),
+    ],
+)
+def test_web_runtime_budget_controls_reject_values_outside_their_ranges(
+    capability: str,
+    runtime: dict[str, object],
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        _web_scope_from_runtime(capability, runtime)
+
+
+def test_web_runtime_budget_aliases_preserve_zero_and_positive_values() -> None:
+    assert _web_scope_from_runtime(
+        "web.search",
+        {"max_search_calls": 0, "max_results": 7},
+    ) == {
+        "binding_id": "web.search",
+        "max_calls": 0,
+        "max_results": 7,
+    }
+    assert _web_scope_from_runtime(
+        "web.fetch",
+        {"max_fetch_calls": 3, "max_bytes": 123, "timeout_s": 9},
+    ) == {
+        "binding_id": "web.fetch",
+        "max_calls": 3,
+        "max_bytes": 123,
+        "timeout_s": 9,
+    }
+    assert _web_scope_from_runtime(
+        "web.context",
+        {
+            "max_context_calls": 2,
+            "max_tokens": 100,
+            "max_urls": 4,
+            "max_snippets": 8,
+        },
+    ) == {
+        "binding_id": "web.context",
+        "max_calls": 2,
+        "max_tokens": 100,
+        "max_urls": 4,
+        "max_snippets": 8,
+    }
+
+
+def test_web_runtime_rejects_malformed_shadowed_alias() -> None:
+    with pytest.raises(ValueError, match="max_search_calls must be"):
+        _web_scope_from_runtime(
+            "web.search",
+            {"max_calls": 2, "max_search_calls": "999"},
+        )
+
+
 def test_web_tool_falls_back_to_static_credential_when_not_gated(tmp_path: Path) -> None:
     client = _RecordingWebClient()
     # No requires_lease, no broker -> no lease; the per-call override is None and the client uses
@@ -1092,6 +1338,112 @@ def test_gateway_broker_mints_web_gateway_token_for_web_capabilities() -> None:
     other = broker.request(CapabilityRequest(capability="email.send", run_id="run_1"))
     assert isinstance(other, CapabilityLease)
     manager.verify(other.token_ref, kind="capability", audience="csp.capability-gateway", run_id="run_1")
+
+
+@pytest.mark.parametrize(
+    ("capability", "key", "value", "error"),
+    [
+        (
+            "web.search",
+            "max_results",
+            float("nan"),
+            "capability request scope must contain portable JSON values",
+        ),
+        ("web.search", "recency_days", None, "recency_days must be an integer"),
+        ("web.search", "max_calls", 0, "max_calls must be positive"),
+        (
+            "web.fetch",
+            "timeout_s",
+            float("inf"),
+            "capability request scope must contain portable JSON values",
+        ),
+        ("web.fetch", "max_bytes", "100", "max_bytes must be an integer"),
+        ("web.context", "max_tokens", 1.5, "max_tokens must be an integer"),
+        ("web.context", "max_urls", False, "max_urls must be an integer"),
+        ("web.context", "max_snippets", -1, "max_snippets must be positive"),
+        ("web.context", "recency_days", 10**400, "recency_days must be finite"),
+    ],
+)
+def test_gateway_broker_rejects_invalid_web_signed_scope_before_token_issue(
+    capability: str,
+    key: str,
+    value: object,
+    error: str,
+) -> None:
+    class RejectingTokenManager:
+        issue_called = False
+
+        def issue(self, **_kwargs: object) -> str:
+            self.issue_called = True
+            raise AssertionError("invalid signed scope reached TokenManager.issue")
+
+    manager = RejectingTokenManager()
+    broker = GatewayCapabilityBroker(  # type: ignore[arg-type]
+        token_manager=manager,
+        tenant_id="t",
+        user_id="u",
+    )
+
+    with pytest.raises(ValueError, match=error):
+        broker.request(
+            CapabilityRequest(
+                capability=capability,
+                scope={key: value},
+                run_id="run_1",
+            )
+        )
+
+    assert not manager.issue_called
+
+
+@pytest.mark.parametrize(
+    ("scope", "error"),
+    [
+        (
+            {"binding_id": float("nan"), "max_calls": 1},
+            "capability request scope must contain portable JSON values",
+        ),
+        ({"binding_id": "other", "max_calls": 1}, "binding_id must match"),
+        ({"allowed_domains": None}, "allowed_domains must be an array"),
+        (
+            {"allowed_domains": float("nan")},
+            "capability request scope must contain portable JSON values",
+        ),
+        (
+            {"blocked_domains": ["docs.example", float("nan")]},
+            "capability request scope must contain portable JSON values",
+        ),
+    ],
+)
+def test_gateway_broker_rejects_signed_identity_and_domain_omission(
+    scope: dict[str, object],
+    error: str,
+) -> None:
+    class RejectingTokenManager:
+        issue_called = False
+
+        def issue(self, **_kwargs: object) -> str:
+            self.issue_called = True
+            raise AssertionError("invalid signed scope reached TokenManager.issue")
+
+    manager = RejectingTokenManager()
+    broker = GatewayCapabilityBroker(  # type: ignore[arg-type]
+        token_manager=manager,
+        tenant_id="t",
+        user_id="u",
+    )
+
+    with pytest.raises(ValueError, match=error):
+        broker.request(
+            CapabilityRequest(
+                capability="web.search",
+                scope=scope,
+                run_id="run_1",
+                binding_id="search_docs",
+            )
+        )
+
+    assert not manager.issue_called
 
 
 def test_web_access_can_be_revoked_mid_run(tmp_path: Path) -> None:

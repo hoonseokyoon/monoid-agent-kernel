@@ -626,3 +626,93 @@ def test_enqueue_control_redacts_bearer_reintroduced_by_json_coercion(
         assert rotated_token not in raw_args[0]
 
     backend.cancel_run(submission.run_id, submission.run_token)
+
+
+def test_direct_control_ingress_is_canonical_before_sqlite_identity(
+    backend_factory: Any,
+    tmp_path: Path,
+) -> None:
+    workspace = backend_factory.workspace("command-json-ingress")
+    command_store = SqliteCommandStore(tmp_path / "commands.db")
+    backend = backend_factory.create(workspace=workspace, command_store=command_store)
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="wait",
+            runtime_config=runtime_config("run.finish"),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: backend._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+
+    lone_surrogate = chr(0xD800)
+
+    def command() -> ControlCommand:
+        return ControlCommand(
+            type="status",
+            run_id=submission.run_id,
+            command_id=f"cmd_{lone_surrogate}",
+            issuer=f"operator_{lone_surrogate}",
+            reason=f"check_{lone_surrogate}",
+            args={
+                "token": submission.run_token,
+                "payload": {
+                    "score": float("nan"),
+                    "text": f"bad{lone_surrogate}text",
+                },
+            },
+        )
+
+    first = backend.enqueue_control(command())
+    duplicate = backend.enqueue_control(command())
+
+    assert first.status == "completed"
+    assert duplicate.result == first.result
+    assert first.command_id == "cmd_\ufffd"
+    persisted = command_store.read_command(submission.run_id, f"cmd_{lone_surrogate}")
+    assert persisted is not None
+    assert persisted.command_id == "cmd_\ufffd"
+    assert persisted.principal.issuer == "operator_\ufffd"
+    assert persisted.reason == "check_\ufffd"
+    assert persisted.args["payload"] == {
+        "score": None,
+        "text": "bad\ufffdtext",
+    }
+
+    invalid_config = runtime_config("run.finish", version=2).to_json()
+    with pytest.raises(ValueError, match="expected_version must be an integer"):
+        backend.enqueue_control(
+            ControlCommand(
+                type="replace_runtime_config",
+                run_id=submission.run_id,
+                command_id="cmd_bad_expected_version",
+                args={
+                    "token": submission.run_token,
+                    "expected_version": float("nan"),
+                    "config": invalid_config,
+                },
+            )
+        )
+    assert (
+        command_store.read_command(submission.run_id, "cmd_bad_expected_version")
+        is None
+    )
+
+    with pytest.raises(ValueError, match="before must be a finite number"):
+        backend.enqueue_control(
+            ControlCommand(
+                type="revoke_capability",
+                run_id=submission.run_id,
+                command_id="cmd_bad_revoke_before",
+                args={"token": submission.run_token, "before": float("inf")},
+            )
+        )
+    assert command_store.read_command(submission.run_id, "cmd_bad_revoke_before") is None
+
+    backend.cancel_run(submission.run_id, submission.run_token)
+    backend.wait_for_run(submission.run_id, timeout_s=20)

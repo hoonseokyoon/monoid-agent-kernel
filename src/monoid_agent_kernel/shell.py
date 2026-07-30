@@ -61,11 +61,15 @@ class ShellCommandRule:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ShellCommandRule:
-        action = str(payload.get("action") or "")
-        prefix = str(payload.get("prefix") or "")
+        if not isinstance(payload, dict):
+            raise ValueError("shell command rule must be an object")
+        action = payload.get("action")
+        prefix = payload.get("prefix")
+        if type(action) is not str:
+            raise ValueError("shell command rule action must be allow or deny")
         if action not in {"allow", "deny"}:
             raise ValueError("shell command rule action must be allow or deny")
-        if not prefix.strip():
+        if type(prefix) is not str or not prefix.strip():
             raise ValueError("shell command rule prefix is required")
         return cls(action=action, prefix=prefix)
 
@@ -93,42 +97,65 @@ class ShellExecutionOptions:
     inherit_env_allowlist: tuple[str, ...] = _DEFAULT_INHERIT_ENV
     command_rules: tuple[ShellCommandRule, ...] = ()
 
+    def __post_init__(self) -> None:
+        self._validate_fields()
+
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ShellExecutionOptions:
         if payload is None:
             return cls()
         if not isinstance(payload, dict):
             raise ValueError("shell execution options must be an object")
-        rules = tuple(
-            ShellCommandRule.from_json(item)
-            for item in payload.get("command_rules") or ()
-        )
+        raw_rules = payload.get("command_rules", ())
+        if not isinstance(raw_rules, (list, tuple)):
+            raise ValueError("shell command_rules must be an array")
+        rules = tuple(ShellCommandRule.from_json(item) for item in raw_rules)
         return cls(
-            enabled=bool(payload.get("enabled", False)),
-            approval_mode=_approval_mode(str(payload.get("approval_mode") or "backend")),
-            shell=_shell_kind(str(payload.get("shell") or "auto")),
-            default_timeout_s=int(payload.get("default_timeout_s", 120)),
-            max_timeout_s=int(payload.get("max_timeout_s", 900)),
-            default_startup_wait_s=int(payload.get("default_startup_wait_s", 0)),
-            max_startup_wait_s=int(payload.get("max_startup_wait_s", 30)),
-            default_max_output_bytes=int(payload.get("default_max_output_bytes", 100_000)),
-            max_output_bytes=int(payload.get("max_output_bytes", 1_000_000)),
-            cwd_root=str(payload.get("cwd_root") or "workspace"),
+            enabled=_shell_bool(payload.get("enabled", False), "enabled"),
+            approval_mode=_approval_mode(
+                _shell_text(payload.get("approval_mode", "backend"), "approval_mode")
+            ),
+            shell=_shell_kind(_shell_text(payload.get("shell", "auto"), "shell")),
+            default_timeout_s=_shell_int(
+                payload.get("default_timeout_s", 120), "default_timeout_s", minimum=1
+            ),
+            max_timeout_s=_shell_int(
+                payload.get("max_timeout_s", 900), "max_timeout_s", minimum=1
+            ),
+            default_startup_wait_s=_shell_int(
+                payload.get("default_startup_wait_s", 0),
+                "default_startup_wait_s",
+                minimum=0,
+            ),
+            max_startup_wait_s=_shell_int(
+                payload.get("max_startup_wait_s", 30), "max_startup_wait_s", minimum=0
+            ),
+            default_max_output_bytes=_shell_int(
+                payload.get("default_max_output_bytes", 100_000),
+                "default_max_output_bytes",
+                minimum=1,
+            ),
+            max_output_bytes=_shell_int(
+                payload.get("max_output_bytes", 1_000_000),
+                "max_output_bytes",
+                minimum=1,
+            ),
+            cwd_root=_shell_text(payload.get("cwd_root", "workspace"), "cwd_root"),
             execution_workspace=_execution_workspace(
-                str(payload.get("execution_workspace") or "auto")
+                _shell_text(payload.get("execution_workspace", "auto"), "execution_workspace")
             ),
             env_allowlist=str_tuple(
-                payload.get("env_allowlist") or (),
+                payload.get("env_allowlist", ()),
                 type_error="expected an array of strings",
                 empty_error="empty string is not allowed",
             ),
             inherit_env_allowlist=str_tuple(
-                payload.get("inherit_env_allowlist") or _DEFAULT_INHERIT_ENV,
+                payload.get("inherit_env_allowlist", _DEFAULT_INHERIT_ENV),
                 type_error="expected an array of strings",
                 empty_error="empty string is not allowed",
             ),
             command_rules=rules,
-        ).validated()
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -180,6 +207,35 @@ class ShellExecutionOptions:
         ).validated()
 
     def validated(self) -> ShellExecutionOptions:
+        self._validate_fields()
+        return self
+
+    def _validate_fields(self) -> None:
+        _shell_bool(self.enabled, "enabled")
+        _shell_text(self.approval_mode, "approval_mode")
+        _shell_text(self.shell, "shell")
+        _shell_int(self.default_timeout_s, "default_timeout_s", minimum=1)
+        _shell_int(self.max_timeout_s, "max_timeout_s", minimum=1)
+        _shell_int(self.default_startup_wait_s, "default_startup_wait_s", minimum=0)
+        _shell_int(self.max_startup_wait_s, "max_startup_wait_s", minimum=0)
+        _shell_int(self.default_max_output_bytes, "default_max_output_bytes", minimum=1)
+        _shell_int(self.max_output_bytes, "max_output_bytes", minimum=1)
+        _shell_text(self.cwd_root, "cwd_root")
+        _shell_text(self.execution_workspace, "execution_workspace")
+        str_tuple(
+            self.env_allowlist,
+            type_error="expected an array of strings",
+            empty_error="empty string is not allowed",
+        )
+        str_tuple(
+            self.inherit_env_allowlist,
+            type_error="expected an array of strings",
+            empty_error="empty string is not allowed",
+        )
+        if not isinstance(self.command_rules, tuple) or not all(
+            isinstance(rule, ShellCommandRule) for rule in self.command_rules
+        ):
+            raise ValueError("shell command_rules must contain ShellCommandRule values")
         if self.approval_mode not in {"backend", "auto-approve", "deny"}:
             raise ValueError(f"unsupported shell approval mode: {self.approval_mode}")
         if self.shell not in {"auto", "bash", "powershell"}:
@@ -200,18 +256,29 @@ class ShellExecutionOptions:
             raise ValueError("shell output byte limits must be positive")
         if self.default_max_output_bytes > self.max_output_bytes:
             raise ValueError("default_max_output_bytes cannot exceed max_output_bytes")
-        return self
 
     def effective_timeout(self, requested: Any) -> int:
-        value = self.default_timeout_s if requested is None else int(requested)
+        value = (
+            self.default_timeout_s
+            if requested is None
+            else _shell_int(requested, "requested timeout_s", minimum=1)
+        )
         return max(1, min(value, self.max_timeout_s))
 
     def effective_output_limit(self, requested: Any) -> int:
-        value = self.default_max_output_bytes if requested is None else int(requested)
+        value = (
+            self.default_max_output_bytes
+            if requested is None
+            else _shell_int(requested, "requested max_output_bytes", minimum=1)
+        )
         return max(1, min(value, self.max_output_bytes))
 
     def effective_startup_wait(self, requested: Any) -> int:
-        value = self.default_startup_wait_s if requested is None else int(requested)
+        value = (
+            self.default_startup_wait_s
+            if requested is None
+            else _shell_int(requested, "requested startup_wait_s", minimum=0)
+        )
         return max(0, min(value, self.max_startup_wait_s))
 
     def effective_shell(self) -> Literal["bash", "powershell"]:
@@ -300,6 +367,9 @@ class ShellApprovalDecision:
     reason: str = ""
     approver_id: str = ""
 
+    def __post_init__(self) -> None:
+        validate_shell_approval_decision(self)
+
     def to_public_json(self) -> dict[str, Any]:
         return {
             "approved": self.approved,
@@ -311,6 +381,20 @@ class ShellApprovalDecision:
 class ShellApprovalProvider(Protocol):
     def approve_shell(self, request: ShellApprovalRequest) -> ShellApprovalDecision:
         ...
+
+
+def validate_shell_approval_decision(value: Any) -> ShellApprovalDecision:
+    """Validate an approval-provider result without truthiness or text coercion."""
+
+    if not isinstance(value, ShellApprovalDecision):
+        raise ValueError("shell approval provider must return ShellApprovalDecision")
+    if type(value.approved) is not bool:
+        raise ValueError("shell approval decision approved must be a boolean")
+    if type(value.reason) is not str:
+        raise ValueError("shell approval decision reason must be a string")
+    if type(value.approver_id) is not str:
+        raise ValueError("shell approval decision approver_id must be a string")
+    return value
 
 
 @dataclass(frozen=True)
@@ -736,6 +820,25 @@ def _ancestor_paths(rel: str) -> list[str]:
 def _sensitive_env_key(key: str) -> bool:
     upper = key.upper()
     return any(fragment in upper for fragment in _SENSITIVE_ENV_FRAGMENTS)
+
+
+def _shell_bool(value: Any, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"shell {field_name} must be a boolean")
+    return value
+
+
+def _shell_text(value: Any, field_name: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"shell {field_name} must be a string")
+    return value
+
+
+def _shell_int(value: Any, field_name: str, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        qualifier = "non-negative" if minimum == 0 else "positive"
+        raise ValueError(f"shell {field_name} must be a {qualifier} integer")
+    return value
 
 
 def _approval_mode(value: str) -> ShellApprovalMode:

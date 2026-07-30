@@ -36,6 +36,23 @@ def test_token_manager_issues_kid_header() -> None:
     assert claims.run_id == "run_1"
 
 
+def test_token_manager_rejects_key_ids_before_lossy_coercion() -> None:
+    with pytest.raises(TokenError, match="token key id must be a non-empty string"):
+        TokenManager.from_keyring(
+            {1: "a" * 32, "1": "b" * 32},  # type: ignore[dict-item]
+            active_kid="1",
+        )
+
+    manager = TokenManager.from_keyring({"1": "a" * 32}, active_kid="1")
+    with pytest.raises(TokenError, match="rotation key id must be a non-empty string"):
+        manager.rotate_key(
+            key_id=1,  # type: ignore[arg-type]
+            secret="b" * 32,
+            grace_s=30,
+            now=100,
+        )
+
+
 def test_token_manager_rotation_accepts_old_key_only_during_grace(monkeypatch: pytest.MonkeyPatch) -> None:
     clock = {"t": 1000.0}
     monkeypatch.setattr(token_module.time, "time", lambda: clock["t"])
@@ -84,8 +101,209 @@ def test_token_manager_ceil_fractional_revoke_watermark(monkeypatch: pytest.Monk
         revoked.verify(token, kind="web_gateway", audience="csp.web-gateway")
 
 
+@pytest.mark.parametrize(
+    "invalid",
+    ["9999999999", True, 1.0, 1.5, float("nan"), float("inf"), -1],
+)
+def test_token_manager_rejects_malformed_retired_key_epochs(invalid: object) -> None:
+    with pytest.raises(TokenError, match="accept-until epoch must be a non-negative integer"):
+        TokenManager(
+            secret=b"x" * 32,
+            retired_key_accept_until={"kid-old": invalid},  # type: ignore[dict-item]
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["9999999999", True, 1.0, 1.5, float("nan"), float("inf"), -1],
+)
+def test_token_manager_rejects_malformed_revoked_before_epochs(invalid: object) -> None:
+    with pytest.raises(TokenError, match="revoked-before epoch must be a non-negative integer"):
+        TokenManager(secret=b"x" * 32, revoked_before=invalid)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["9999999999", True, 1.0, 1.5, float("nan"), float("inf"), -1],
+)
+def test_token_manager_rejects_malformed_rotation_grace(invalid: object) -> None:
+    manager = TokenManager.from_secret("x" * 32)
+
+    with pytest.raises(TokenError, match="rotation grace_s must be a non-negative integer"):
+        manager.rotate_key(
+            key_id="kid-next",
+            secret="y" * 32,
+            grace_s=invalid,  # type: ignore[arg-type]
+            now=100,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["9999999999", True, 1.0, 1.5, float("nan"), float("inf"), -1],
+)
+def test_token_manager_rejects_malformed_rotation_now(invalid: object) -> None:
+    manager = TokenManager.from_secret("x" * 32)
+
+    with pytest.raises(TokenError, match="rotation now must be a non-negative integer"):
+        manager.rotate_key(
+            key_id="kid-next",
+            secret="y" * 32,
+            grace_s=30,
+            now=invalid,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["9999999999", True, float("nan"), float("inf"), -1],
+)
+def test_token_manager_rejects_malformed_revocation_cutoffs(invalid: object) -> None:
+    manager = TokenManager.from_secret("x" * 32)
+
+    with pytest.raises(TokenError, match="revocation cutoff must be a finite non-negative number"):
+        manager.revoke_issued_before(invalid)  # type: ignore[arg-type]
+
+
 def test_token_manager_wraps_malformed_header_as_token_error() -> None:
     manager = TokenManager.from_secret("x" * 32)
 
     with pytest.raises(TokenError, match="invalid token header"):
         manager.verify("bm90LWpzb24.e30.signature", kind="web_gateway", audience="csp.web-gateway")
+
+
+def test_token_manager_normalizes_direct_metadata_before_signing() -> None:
+    manager = TokenManager.from_secret("x" * 32)
+    token = manager.issue(
+        kind="web_gateway",
+        audience="csp.web-gateway",
+        run_id="run\ud800",
+        tenant_id="tenant\ud800",
+        user_id="user\ud800",
+        ttl_s=600,
+        metadata={"score": float("nan"), "label": "bad\ud800"},
+    )
+
+    claims = manager.verify(
+        token,
+        kind="web_gateway",
+        audience="csp.web-gateway",
+        run_id="run\ud800",
+    )
+    assert claims.run_id == "run\ufffd"
+    assert claims.tenant_id == "tenant\ufffd"
+    assert claims.user_id == "user\ufffd"
+    assert claims.metadata == {"score": None, "label": "bad\ufffd"}
+
+    with pytest.raises(TokenError, match="ttl_s must be a positive integer"):
+        manager.issue(
+            kind="web_gateway",
+            audience="csp.web-gateway",
+            run_id="run_1",
+            tenant_id="tenant",
+            user_id="user",
+            ttl_s=float("nan"),  # type: ignore[arg-type]
+        )
+
+
+def test_token_manager_rejects_metadata_key_collisions() -> None:
+    manager = TokenManager.from_secret("x" * 32)
+    metadata = {"\ud800": 1}
+    metadata["\ufffd"] = 2
+
+    with pytest.raises(ValueError, match="keys collide"):
+        manager.issue(
+            kind="web_gateway",
+            audience="csp.web-gateway",
+            run_id="run_1",
+            tenant_id="tenant",
+            user_id="user",
+            ttl_s=600,
+            metadata=metadata,
+        )
+
+
+def test_token_manager_rejects_string_where_accepted_issuer_collection_is_required() -> None:
+    with pytest.raises(TokenError, match="accepted token issuers must be a list"):
+        TokenManager(
+            secret=b"x" * 32,
+            accepted_issuers="abc",  # type: ignore[arg-type]
+        )
+    with pytest.raises(TokenError, match="accepted token issuers must be a list"):
+        TokenManager.from_keyring(
+            {"kid-a": b"x" * 32},
+            active_kid="kid-a",
+            accepted_issuers="abc",  # type: ignore[arg-type]
+        )
+
+
+def test_token_manager_rejects_string_where_revoked_id_collection_is_required() -> None:
+    manager = TokenManager.from_secret("x" * 32)
+    token = _issue(manager)
+    token_id = manager.verify(
+        token,
+        kind="web_gateway",
+        audience="csp.web-gateway",
+    ).token_id
+
+    with pytest.raises(TokenError, match="revoked token ids must be a list"):
+        TokenManager(
+            secret=manager.secret,
+            revoked_token_ids=token_id,  # type: ignore[arg-type]
+        )
+    with pytest.raises(TokenError, match="revoked token ids must be a list"):
+        TokenManager.from_keyring(
+            {"kid-a": manager.secret},
+            active_kid="kid-a",
+            revoked_token_ids=token_id,  # type: ignore[arg-type]
+        )
+
+    revoked = TokenManager(secret=manager.secret, revoked_token_ids=[token_id])
+    with pytest.raises(TokenError, match="token revoked"):
+        revoked.verify(token, kind="web_gateway", audience="csp.web-gateway")
+
+
+@pytest.mark.parametrize(
+    ("accepted_issuers", "revoked_token_ids"),
+    [
+        (["legacy.example"], ["jti_1"]),
+        (("legacy.example",), ("jti_1",)),
+        ({"legacy.example"}, {"jti_1"}),
+        (frozenset({"legacy.example"}), frozenset({"jti_1"})),
+    ],
+    ids=("list", "tuple", "set", "frozenset"),
+)
+def test_token_manager_accepts_explicit_text_collection_types(
+    accepted_issuers: object,
+    revoked_token_ids: object,
+) -> None:
+    manager = TokenManager(
+        secret=b"x" * 32,
+        accepted_issuers=accepted_issuers,  # type: ignore[arg-type]
+        revoked_token_ids=revoked_token_ids,  # type: ignore[arg-type]
+    )
+
+    assert manager.accepted_issuers == ("legacy.example",)
+    assert manager.revoked_token_ids == frozenset({"jti_1"})
+
+
+@pytest.mark.parametrize("invalid", [b"abc", {"abc": True}])
+def test_token_manager_rejects_bytes_and_mappings_as_text_collections(
+    invalid: object,
+) -> None:
+    with pytest.raises(TokenError, match="must be a list, tuple, set, or frozenset"):
+        TokenManager(
+            secret=b"x" * 32,
+            accepted_issuers=invalid,  # type: ignore[arg-type]
+        )
+
+
+def test_token_manager_rejects_integer_signing_secrets() -> None:
+    with pytest.raises(TokenError, match="must be exactly str or bytes"):
+        TokenManager(secret=32)  # type: ignore[arg-type]
+
+    with pytest.raises(TokenError, match="must be exactly str or bytes"):
+        TokenManager.from_keyring(
+            {"kid-a": 32},  # type: ignore[dict-item]
+            active_kid="kid-a",
+        )

@@ -6,6 +6,14 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, Union
 
 from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core.side_effect_policy import (
+    side_effect_policy_from_config,
+    validate_side_effect_settings,
+)
+from monoid_agent_kernel.core.runtime_controls import (
+    validate_shell_runtime,
+    validate_web_runtime,
+)
 from monoid_agent_kernel.core.spec import ModelConfig, RunLimits, RunMode
 from monoid_agent_kernel.core.tool_surface import (
     ToolAuthorization,
@@ -23,6 +31,51 @@ ToolRefKind = Literal["registry"]
 SubagentContext = Literal["fresh", "fork"]
 
 
+def _exact_bool(value: Any, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _positive_integer(value: Any, field_name: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _array_or_empty(value: Any, field_name: str) -> tuple[Any, ...] | list[Any]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be an array or null")
+    return value
+
+
+def _mapping_or_empty(value: Any, field_name: str) -> Mapping[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be an object or null")
+    return value
+
+
+def _text(value: Any, field_name: str, *, strip: bool = False, non_empty: bool = False) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a string")
+    result = value.strip() if strip else value
+    if non_empty and not result:
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return result
+
+
+def _aliased(payload: Mapping[str, Any], primary: str, alias: str, default: Any) -> Any:
+    if primary in payload:
+        return payload[primary]
+    if alias in payload:
+        return payload[alias]
+    return default
+
+
 @dataclass(frozen=True)
 class PromptSpec:
     system_prompt_base: str | None = None
@@ -37,11 +90,17 @@ class PromptSpec:
             return payload
         if not isinstance(payload, dict):
             raise ValueError("prompt must be an object")
-        base = payload.get("system_prompt_base", payload.get("base"))
+        base = _aliased(payload, "system_prompt_base", "base", None)
         return cls(
-            system_prompt_base=None if base is None else str(base),
-            persona_segments=_str_tuple(payload.get("persona_segments", payload.get("persona"))),
-            runtime_segments=_str_tuple(payload.get("runtime_segments", payload.get("runtime"))),
+            system_prompt_base=(
+                None if base is None else _text(base, "prompt system_prompt_base")
+            ),
+            persona_segments=_str_tuple(
+                _aliased(payload, "persona_segments", "persona", None)
+            ),
+            runtime_segments=_str_tuple(
+                _aliased(payload, "runtime_segments", "runtime", None)
+            ),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -65,12 +124,15 @@ class RegistryToolRef:
             return payload
         if not isinstance(payload, dict):
             raise ValueError("tool ref must be an object or string")
-        kind = str(payload.get("kind") or "registry")
+        kind = _text(payload.get("kind", "registry"), "tool ref kind")
         if kind != "registry":
             raise ValueError("only registry tool refs are supported")
-        tool_id = str(payload.get("tool_id") or payload.get("id") or "").strip()
-        if not tool_id:
-            raise ValueError("registry tool ref requires tool_id")
+        tool_id = _text(
+            _aliased(payload, "tool_id", "id", ""),
+            "registry tool ref tool_id",
+            strip=True,
+            non_empty=True,
+        )
         return cls(tool_id=tool_id)
 
     def to_json(self) -> dict[str, str]:
@@ -142,25 +204,43 @@ class ToolBinding:
         if ref_payload is None:
             ref_payload = {"tool_id": payload.get("tool") or payload.get("tool_id") or payload.get("id")}
         ref = RegistryToolRef.from_json(ref_payload)
-        binding_id = str(payload.get("binding_id") or payload.get("id") or ref.tool_id).strip()
-        if not binding_id:
-            raise ValueError("tool binding requires binding_id")
+        binding_id = _text(
+            _aliased(payload, "binding_id", "id", ref.tool_id),
+            "tool binding binding_id",
+            strip=True,
+            non_empty=True,
+        )
         model_name_raw = payload.get("model_name")
-        model_name = None if model_name_raw is None else str(model_name_raw).strip()
+        model_name = (
+            None
+            if model_name_raw is None
+            else _text(
+                model_name_raw,
+                "tool binding model_name",
+                strip=True,
+                non_empty=True,
+            )
+        )
         if model_name == "":
             raise ValueError("tool binding model_name cannot be empty")
-        exposure = str(payload.get("exposure") or "immediate")
+        exposure = payload.get("exposure", "immediate")
+        if not isinstance(exposure, str):
+            raise ValueError("tool binding exposure must be a string")
         if exposure not in {"immediate", "searchable", "hidden"}:
             raise ValueError("tool binding exposure must be immediate, searchable, or hidden")
-        authorization = str(payload.get("authorization") or "allow")
+        authorization = payload.get("authorization", "allow")
+        if not isinstance(authorization, str):
+            raise ValueError("tool binding authorization must be a string")
         if authorization not in {"allow", "ask", "deny"}:
             raise ValueError("tool binding authorization must be allow, ask, or deny")
-        runtime = payload.get("runtime") or {}
-        metadata = payload.get("metadata") or {}
-        if not isinstance(runtime, Mapping):
-            raise ValueError("tool binding runtime must be an object")
-        if not isinstance(metadata, Mapping):
-            raise ValueError("tool binding metadata must be an object")
+        runtime = _mapping_or_empty(payload.get("runtime"), "tool binding runtime")
+        metadata = _mapping_or_empty(payload.get("metadata"), "tool binding metadata")
+        if "requires_lease" in runtime:
+            lease_requirement = runtime["requires_lease"]
+            if type(lease_requirement) is not bool and lease_requirement != "optional":
+                raise ValueError(
+                    "tool binding runtime.requires_lease must be a boolean or 'optional'"
+                )
         return cls(
             binding_id=binding_id,
             ref=ref,
@@ -174,13 +254,15 @@ class ToolBinding:
                 else ToolScope.from_json(payload.get("scope"))
             ),
             quota=ToolQuota.from_json(payload.get("quota")),
-            title=str(payload.get("title") or ""),
-            summary=str(payload.get("summary") or ""),
-            risk=str(payload.get("risk") or ""),
+            title=_text(payload.get("title", ""), "tool binding title"),
+            summary=_text(payload.get("summary", ""), "tool binding summary"),
+            risk=_text(payload.get("risk", ""), "tool binding risk"),
             requires_approval=(
-                None if "requires_approval" not in payload else bool(payload["requires_approval"])
+                None
+                if "requires_approval" not in payload
+                else _exact_bool(payload["requires_approval"], "tool binding requires_approval")
             ),
-            reason=str(payload.get("reason") or ""),
+            reason=_text(payload.get("reason", ""), "tool binding reason"),
             runtime=dict(runtime),
             metadata=dict(metadata),
         )
@@ -227,15 +309,24 @@ class ToolSearchConfig:
             return payload
         if not isinstance(payload, dict):
             raise ValueError("tool_search must be an object")
-        top_k = int(payload.get("top_k", payload.get("search_top_k", 5)))
-        if top_k < 1:
-            raise ValueError("tool_search.top_k must be positive")
-        binding_id = str(payload.get("binding_id") or "tool.search").strip()
-        model_name = str(payload.get("model_name") or "tool_search").strip()
-        if not binding_id or not model_name:
-            raise ValueError("tool_search binding_id and model_name are required")
+        top_k = _positive_integer(
+            payload.get("top_k", payload.get("search_top_k", 5)),
+            "tool_search.top_k",
+        )
+        binding_id = _text(
+            payload.get("binding_id", "tool.search"),
+            "tool_search binding_id",
+            strip=True,
+            non_empty=True,
+        )
+        model_name = _text(
+            payload.get("model_name", "tool_search"),
+            "tool_search model_name",
+            strip=True,
+            non_empty=True,
+        )
         return cls(
-            enabled=bool(payload.get("enabled", True)),
+            enabled=_exact_bool(payload.get("enabled", True), "tool_search.enabled"),
             top_k=top_k,
             binding_id=binding_id,
             model_name=model_name,
@@ -265,19 +356,29 @@ class AgentDefinition:
     def from_json(cls, payload: dict[str, Any]) -> AgentDefinition:
         if not isinstance(payload, dict):
             raise ValueError("agent_definition must be an object")
-        agent_id = str(payload.get("id") or payload.get("name") or "").strip()
-        if not agent_id:
-            raise ValueError("agent_definition.id is required")
+        agent_id = _text(
+            _aliased(payload, "id", "name", ""),
+            "agent_definition.id",
+            strip=True,
+            non_empty=True,
+        )
         model_payload = payload.get("model")
         return cls(
             id=agent_id,
-            version=str(payload.get("version") or "1"),
-            description=str(payload.get("description") or ""),
+            version=_text(payload.get("version", "1"), "agent_definition.version"),
+            description=_text(
+                payload.get("description", ""), "agent_definition.description"
+            ),
             model=ModelConfig.from_json(model_payload) if model_payload is not None else None,
             prompt=PromptSpec.from_json(payload.get("prompt")),
-            tools=tuple(ToolBinding.from_json(item) for item in payload.get("tools") or ()),
+            tools=tuple(
+                ToolBinding.from_json(item)
+                for item in _array_or_empty(payload.get("tools"), "agent_definition.tools")
+            ),
             tool_search=ToolSearchConfig.from_json(payload.get("tool_search")),
-            metadata=dict(payload.get("metadata") or {}),
+            metadata=dict(
+                _mapping_or_empty(payload.get("metadata"), "agent_definition.metadata")
+            ),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -312,8 +413,12 @@ class OutputValidatorBinding:
         if not isinstance(payload, dict):
             raise ValueError("output validator binding must be an object")
         return cls(
-            validator_id=str(payload.get("validator_id") or payload.get("id") or ""),
-            enabled=bool(payload.get("enabled", True)),
+            validator_id=_text(
+                _aliased(payload, "validator_id", "id", ""),
+                "output validator id",
+                non_empty=True,
+            ),
+            enabled=_exact_bool(payload.get("enabled", True), "output validator enabled"),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -359,9 +464,22 @@ class AgentRuntimeConfig:
         if not isinstance(payload, dict):
             raise ValueError("runtime config must be an object")
         model_payload = payload.get("model")
+        config_version = _positive_integer(
+            payload.get("config_version", payload.get("version", 1)),
+            "runtime config_version",
+        )
+        tools_payload = _array_or_empty(payload.get("tools"), "runtime config tools")
+        validators_payload = _array_or_empty(
+            payload.get("output_validators"),
+            "runtime config output_validators",
+        )
         return cls(
-            definition_id=str(payload.get("definition_id") or payload.get("agent_id") or "default"),
-            config_version=int(payload.get("config_version") or payload.get("version") or 1),
+            definition_id=_text(
+                _aliased(payload, "definition_id", "agent_id", "default"),
+                "runtime config definition_id",
+                non_empty=True,
+            ),
+            config_version=config_version,
             model=ModelConfig.from_json(model_payload) if model_payload is not None else None,
             prompt=PromptSpec.from_json(payload.get("prompt")),
             tools=tuple(
@@ -370,13 +488,15 @@ class AgentRuntimeConfig:
                     if durable
                     else ToolBinding.from_json(item)
                 )
-                for item in payload.get("tools") or ()
+                for item in tools_payload
             ),
             tool_search=ToolSearchConfig.from_json(payload.get("tool_search")),
             output_validators=tuple(
-                OutputValidatorBinding.from_json(item) for item in payload.get("output_validators") or ()
+                OutputValidatorBinding.from_json(item) for item in validators_payload
             ),
-            metadata=dict(payload.get("metadata") or {}),
+            metadata=dict(
+                _mapping_or_empty(payload.get("metadata"), "runtime config metadata")
+            ),
         )
 
     @classmethod
@@ -749,6 +869,10 @@ def validate_runtime_config(config: AgentRuntimeConfig, registry_or_specs: ToolR
     else:
         registry = ToolRegistry()
         registry.register_many(registry_or_specs)
+    try:
+        side_effect_policy_from_config(config)
+    except ValueError as exc:
+        raise AgentConfigError(str(exc)) from exc
     compile_bound_tool_catalog(config, registry)
 
 
@@ -767,6 +891,10 @@ def collect_runtime_config_issues(
         registry.register_many(registry_or_specs)
     specs = {tool.id: tool for tool in registry.specs()}
     issues: list[str] = []
+    try:
+        side_effect_policy_from_config(config)
+    except ValueError as exc:
+        issues.append(str(exc))
     seen_binding_ids: set[str] = set()
     seen_model_names: set[str] = set()
     seen_call_names: dict[str, str] = {}
@@ -903,14 +1031,29 @@ def _model_tool_spec(spec: ToolSpec, binding: ToolBinding, model_name: str) -> T
 
 
 def _validate_binding_runtime(binding: ToolBinding) -> None:
+    try:
+        validate_side_effect_settings(
+            binding.runtime,
+            source=f"tool binding runtime {binding.binding_id}",
+        )
+    except ValueError as exc:
+        raise AgentConfigError(str(exc)) from exc
     if binding.ref.tool_id == "shell.exec":
-        shell_runtime = binding.runtime.get("shell", binding.runtime)
-        if shell_runtime is not None and not isinstance(shell_runtime, Mapping):
-            raise AgentConfigError(f"shell binding runtime must be an object: {binding.binding_id}")
+        try:
+            validate_shell_runtime(
+                binding.runtime,
+                source=f"shell binding runtime {binding.binding_id}",
+            )
+        except ValueError as exc:
+            raise AgentConfigError(str(exc)) from exc
     if binding.ref.tool_id.startswith("web."):
-        web_runtime = binding.runtime.get("web", binding.runtime)
-        if web_runtime is not None and not isinstance(web_runtime, Mapping):
-            raise AgentConfigError(f"web binding runtime must be an object: {binding.binding_id}")
+        try:
+            validate_web_runtime(
+                binding.runtime,
+                source=f"web binding runtime {binding.binding_id}",
+            )
+        except ValueError as exc:
+            raise AgentConfigError(str(exc)) from exc
 
 
 def _risk_for(spec: ToolSpec) -> str:
@@ -926,4 +1069,6 @@ def _str_tuple(value: Any) -> tuple[str, ...]:
         return ()
     if not isinstance(value, list | tuple):
         raise ValueError("expected an array of strings")
-    return tuple(str(item) for item in value)
+    if not all(type(item) is str for item in value):
+        raise ValueError("expected an array of strings")
+    return tuple(value)

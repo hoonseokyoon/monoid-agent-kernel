@@ -18,6 +18,7 @@ from monoid_agent_kernel.core.output_validator import (
     OutputValidator,
     OutputValidatorError,
     ValidationOutcome,
+    validate_validation_outcome,
 )
 from monoid_agent_kernel.core.result import AgentArtifact, AgentRunResult, AgentTurnResult, Suspension
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -86,11 +87,7 @@ def _run_output_validators(
     ok_values: list[tuple[str, Any]] = []
     for validator in validators:
         try:
-            outcome = validator.validate(view)
-            if not isinstance(outcome, ValidationOutcome):
-                raise TypeError(
-                    f"validate() must return a ValidationOutcome, got {type(outcome).__name__}"
-                )
+            outcome = validate_validation_outcome(validator.validate(view))
         except OutputRetry as exc:
             outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
         except ValueError as exc:

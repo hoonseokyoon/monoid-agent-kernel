@@ -19,6 +19,13 @@ from monoid_agent_kernel.public_view import public_error_message
 from monoid_agent_kernel.reference.backend.ports import LoopPort, MutableRunRecordPort, RunRecordPort
 
 
+def _nonnegative_metric(metrics: Mapping[str, Any], key: str) -> int:
+    value = metrics.get(key, 0)
+    if type(value) is not int or value < 0:
+        raise ValueError(f"run metric {key} must be a non-negative integer")
+    return value
+
+
 def set_record_state(
     record: RunRecordPort,
     state: SessionState | str,
@@ -59,17 +66,21 @@ class TenantUsage:
 
     def add_metrics(self, metrics: dict[str, Any]) -> None:
         self.runs += 1
-        self.input_tokens += int(metrics.get("input_tokens") or 0)
-        self.output_tokens += int(metrics.get("output_tokens") or 0)
-        self.total_tokens += int(metrics.get("total_tokens") or 0)
-        self.web_search_calls += int(metrics.get("web_search_calls") or 0)
-        self.web_fetch_calls += int(metrics.get("web_fetch_calls") or 0)
-        self.web_context_calls += int(metrics.get("web_context_calls") or 0)
-        self.web_failed_calls += int(metrics.get("web_failed_calls") or 0)
-        self.web_result_count += int(metrics.get("web_result_count") or 0)
-        self.web_bytes_returned += int(metrics.get("web_bytes_returned") or 0)
-        self.web_context_source_count += int(metrics.get("web_context_source_count") or 0)
-        self.web_context_bytes_returned += int(metrics.get("web_context_bytes_returned") or 0)
+        self.input_tokens += _nonnegative_metric(metrics, "input_tokens")
+        self.output_tokens += _nonnegative_metric(metrics, "output_tokens")
+        self.total_tokens += _nonnegative_metric(metrics, "total_tokens")
+        self.web_search_calls += _nonnegative_metric(metrics, "web_search_calls")
+        self.web_fetch_calls += _nonnegative_metric(metrics, "web_fetch_calls")
+        self.web_context_calls += _nonnegative_metric(metrics, "web_context_calls")
+        self.web_failed_calls += _nonnegative_metric(metrics, "web_failed_calls")
+        self.web_result_count += _nonnegative_metric(metrics, "web_result_count")
+        self.web_bytes_returned += _nonnegative_metric(metrics, "web_bytes_returned")
+        self.web_context_source_count += _nonnegative_metric(
+            metrics, "web_context_source_count"
+        )
+        self.web_context_bytes_returned += _nonnegative_metric(
+            metrics, "web_context_bytes_returned"
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {

@@ -1196,6 +1196,27 @@ def test_dispatch_revoke_capability_blocks_subsequent_call(
     backend.wait_for_run(run_id, timeout_s=20)
 
 
+@pytest.mark.parametrize("invalid", [True, "1", float("nan"), float("inf"), 10**400])
+def test_direct_dispatch_rejects_invalid_revocation_epoch(
+    tmp_path: Path, backend_factory: Any, invalid: object
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(
+        backend_factory,
+        workspace,
+        [ModelTurn(response_id="r1", final_text="ready")],
+    )
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    result = _dispatch(backend, run_id, token, "revoke_capability", before=invalid)
+
+    assert result.status == "error"
+    assert result.error_code == "control_error"
+    assert result.error == "before must be a finite number"
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
 def test_driver_pauses_mid_turn_then_resumes_to_settle(
     tmp_path: Path, backend_factory: Any
 ) -> None:

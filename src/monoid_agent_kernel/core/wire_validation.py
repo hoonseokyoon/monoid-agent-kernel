@@ -7,6 +7,8 @@ from typing import Any, TypeVar
 
 from pydantic import TypeAdapter, ValidationError
 
+from monoid_agent_kernel.core.json_ingress import is_finite_json_number
+
 
 class WireValidationError(ValueError):
     """Raised when a wire payload field is present with the wrong type."""
@@ -123,8 +125,8 @@ def parse_float(
         return default
     if value is None and allow_none:
         return None
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise WireValidationError(f"{key} must be a number")
+    if not is_finite_json_number(value):
+        raise WireValidationError(f"{key} must be a finite number")
     return float(value)
 
 

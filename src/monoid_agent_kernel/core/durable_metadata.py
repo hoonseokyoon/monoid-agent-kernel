@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -11,6 +9,7 @@ from typing import Any, Mapping, Protocol
 from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
+from monoid_agent_kernel.core.json_ingress import is_finite_json_number, loads_json_ingress
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 RUN_METADATA_SCHEMA_VERSION = namespaced_id("backend-run.v1")
@@ -59,9 +58,7 @@ def _require_nonnegative_int(value: object, field_name: str, *, minimum: int = 0
 
 def _require_finite_nonnegative_number(value: object, field_name: str) -> None:
     if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
+        not is_finite_json_number(value)
         or value < 0
     ):
         raise ValueError(f"backend-run {field_name} must be a finite non-negative number")
@@ -187,7 +184,7 @@ def read_run_metadata_checked(
     except OSError:
         return RUN_METADATA_CODEC.corrupt("backend-run metadata could not be read")
     try:
-        payload = json.loads(raw)
+        payload = loads_json_ingress(raw)
     except ValueError:
         return RUN_METADATA_CODEC.corrupt("backend-run metadata is not valid JSON")
     decoded = decode_run_metadata(payload)

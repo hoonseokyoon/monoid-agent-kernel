@@ -67,6 +67,18 @@ def test_tool_observation_round_trip() -> None:
     assert ToolObservation.from_json(obs.to_json()) == obs
 
 
+def test_tool_observation_rejects_coercible_background_flag() -> None:
+    with pytest.raises(ValueError, match="is_background must be a boolean"):
+        ToolObservation.from_json(
+            {
+                "call_id": "call_1",
+                "tool_name": "fs.read",
+                "output": {},
+                "is_background": "false",
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "suspension",
     (
@@ -499,6 +511,7 @@ def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
         ("queued_messages", [1]),
         ("active_input", {"input_id": "input", "phase": "running", "source_seq": True}),
         ("applied_input_receipts", {"input": {"terminal": "false"}}),
+        ("remaining_duration_s", 10**400),
     ),
 )
 def test_checkpoint_decoder_rejects_malformed_current_payload(field: str, value: object) -> None:

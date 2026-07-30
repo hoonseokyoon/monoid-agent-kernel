@@ -8,6 +8,7 @@ factory — a new backend is verified by adding one ``pytest.param``.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -88,3 +89,54 @@ def test_concurrent_claim_has_single_winner(lease_store: LeaseStore) -> None:
         thread.join()
 
     assert results.count(True) == 1
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("heartbeat_at", None),
+        ("heartbeat_at", True),
+        ("heartbeat_at", "1"),
+        ("heartbeat_at", 1e309),
+        ("heartbeat_at", 10**400),
+        ("lease_ttl_s", None),
+        ("lease_ttl_s", True),
+        ("lease_ttl_s", "30"),
+        ("lease_ttl_s", 0),
+        ("lease_ttl_s", 1e309),
+        ("lease_ttl_s", 10**400),
+        ("worker_id", 7),
+        ("worker_id", ""),
+        ("run_id", "other"),
+    ],
+)
+def test_local_fs_malformed_lease_is_reclaimable(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    payload = {
+        "run_id": "r",
+        "worker_id": "worker",
+        "heartbeat_at": time.time(),
+        "lease_ttl_s": 30,
+    }
+    payload[field] = value
+    (run_dir / "lease.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    store = LocalFsLeaseStore(tmp_path)
+    assert store.owner("r") is None
+    assert store.is_stale("r") is True
+
+
+def test_local_fs_overflowing_json_number_cannot_abort_recovery(tmp_path: Path) -> None:
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    (run_dir / "lease.json").write_text(
+        '{"run_id":"r","worker_id":"worker","heartbeat_at":1e309,"lease_ttl_s":30}',
+        encoding="utf-8",
+    )
+
+    store = LocalFsLeaseStore(tmp_path)
+    assert store.owner("r") is None
+    assert store.is_stale("r") is True

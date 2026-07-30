@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from monoid_agent_kernel._version import user_agent
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.env import getenv
 
@@ -20,7 +21,9 @@ DEFAULT_WEB_GATEWAY_TOKEN_ENV = "MONOID_WEB_GATEWAY_TOKEN"
 class WebGatewayError(NativeAgentError):
     error_code = "web_gateway_error"
 
-    def __init__(self, message: str, *, error_code: str | None = None, http_status: int | None = None) -> None:
+    def __init__(
+        self, message: str, *, error_code: str | None = None, http_status: int | None = None
+    ) -> None:
         super().__init__(message, error_code=error_code)
         self.http_status = http_status
 
@@ -41,9 +44,11 @@ class WebGatewayClient:
     def context(self, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
         return self._post("/internal/web/context", payload, token=token)
 
-    def _post(self, path: str, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
+    def _post(
+        self, path: str, payload: dict[str, Any], *, token: str | None = None
+    ) -> dict[str, Any]:
         url = f"{self.gateway_url.rstrip('/')}{path}"
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
         timeout_s = payload.get("timeout_s") or 30
         attempts = 3
         last_error: WebGatewayError | None = None
@@ -126,7 +131,9 @@ def domain_allowed(
         return False
     if any(domain_matches(normalized, pattern) for pattern in blocked_domains):
         return False
-    if allowed_domains and not any(domain_matches(normalized, pattern) for pattern in allowed_domains):
+    if allowed_domains and not any(
+        domain_matches(normalized, pattern) for pattern in allowed_domains
+    ):
         return False
     return True
 
@@ -143,8 +150,8 @@ def domain_matches(domain: str, pattern: str) -> bool:
 
 def _decode_json(body: bytes) -> dict[str, Any]:
     try:
-        payload = json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
+        payload = loads_json_ingress(body.decode("utf-8"))
+    except ValueError as exc:
         raise WebGatewayError("web gateway returned invalid JSON") from exc
     if not isinstance(payload, dict):
         raise WebGatewayError("web gateway response must be an object")
@@ -152,7 +159,9 @@ def _decode_json(body: bytes) -> dict[str, Any]:
         raise WebGatewayError(
             str(payload["error"]),
             error_code=str(payload.get("error_code") or "web_gateway_error"),
-            http_status=int(payload["http_status"]) if payload.get("http_status") is not None else None,
+            http_status=int(payload["http_status"])
+            if payload.get("http_status") is not None
+            else None,
         )
     return payload
 
@@ -160,8 +169,8 @@ def _decode_json(body: bytes) -> dict[str, Any]:
 def _error_from_http(exc: HTTPError) -> WebGatewayError:
     detail = exc.read().decode("utf-8", errors="replace")
     try:
-        payload = json.loads(detail)
-    except json.JSONDecodeError:
+        payload = loads_json_ingress(detail)
+    except ValueError:
         payload = {}
     if not isinstance(payload, dict):
         payload = {}

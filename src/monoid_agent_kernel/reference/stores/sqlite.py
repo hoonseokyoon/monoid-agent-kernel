@@ -33,6 +33,7 @@ from monoid_agent_kernel.core.checkpoint import (
     decode_checkpoint,
 )
 from monoid_agent_kernel.core.durable_codec import DurableLoadResult
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.durable_metadata import (
     RUN_METADATA_CODEC,
     bind_run_metadata_result,
@@ -91,18 +92,24 @@ class SqliteCheckpointStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
-        self._lock = threading.Lock()  # serialize this instance's writers; cross-process is BEGIN IMMEDIATE
+        self._lock = (
+            threading.Lock()
+        )  # serialize this instance's writers; cross-process is BEGIN IMMEDIATE
         _ensure_schema(self._db_path)
 
     def put(self, checkpoint: RunCheckpoint, blobs: Mapping[str, bytes] = {}) -> None:
-        manifest = json.dumps(checkpoint_payload_for_write(checkpoint), ensure_ascii=False)
+        manifest = json.dumps(
+            checkpoint_payload_for_write(checkpoint), ensure_ascii=False, allow_nan=False
+        )
         with self._lock:
             conn = _connect(self._db_path)
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 for sha, data in blobs.items():
                     # Content-addressed, write-once: an already-stored blob is left as-is.
-                    conn.execute("INSERT OR IGNORE INTO blobs(sha, data) VALUES (?, ?)", (sha, data))
+                    conn.execute(
+                        "INSERT OR IGNORE INTO blobs(sha, data) VALUES (?, ?)", (sha, data)
+                    )
                 conn.execute(
                     "INSERT OR REPLACE INTO checkpoints(run_id, seq, manifest) VALUES (?, ?, ?)",
                     (checkpoint.run_id, checkpoint.seq, manifest),
@@ -142,7 +149,7 @@ class SqliteCheckpointStore:
                 "checkpoint latest pointer references a missing manifest", sequence=seq
             ).map(lambda checkpoint: CheckpointRecord(seq=seq, checkpoint=checkpoint))
         try:
-            payload = json.loads(mrow[0])
+            payload = loads_json_ingress(mrow[0])
         except ValueError:
             return CHECKPOINT_CODEC.corrupt(
                 "checkpoint manifest is not valid JSON", sequence=seq
@@ -183,7 +190,7 @@ class SqliteCheckpointStore:
         return self._read_blob(sha256)
 
     def put_run_metadata(self, run_id: str, metadata: Mapping[str, object]) -> None:
-        payload = json.dumps(dict(metadata), ensure_ascii=False)
+        payload = json.dumps(dict(metadata), ensure_ascii=False, allow_nan=False)
         with self._lock:
             conn = _connect(self._db_path)
             try:
@@ -202,13 +209,15 @@ class SqliteCheckpointStore:
     def run_metadata(self, run_id: str) -> dict[str, object] | None:
         conn = _connect(self._db_path)
         try:
-            row = conn.execute("SELECT metadata FROM run_metadata WHERE run_id=?", (run_id,)).fetchone()
+            row = conn.execute(
+                "SELECT metadata FROM run_metadata WHERE run_id=?", (run_id,)
+            ).fetchone()
         finally:
             conn.close()
         if row is None:
             return None
         try:
-            payload = json.loads(row[0])
+            payload = loads_json_ingress(row[0])
         except ValueError:
             return None
         if not isinstance(payload, dict) or payload.get("run_id") != run_id:
@@ -218,13 +227,15 @@ class SqliteCheckpointStore:
     def run_metadata_checked(self, run_id: str) -> DurableLoadResult[dict[str, object]]:
         conn = _connect(self._db_path)
         try:
-            row = conn.execute("SELECT metadata FROM run_metadata WHERE run_id=?", (run_id,)).fetchone()
+            row = conn.execute(
+                "SELECT metadata FROM run_metadata WHERE run_id=?", (run_id,)
+            ).fetchone()
         finally:
             conn.close()
         if row is None:
             return RUN_METADATA_CODEC.missing()
         try:
-            payload = json.loads(row[0])
+            payload = loads_json_ingress(row[0])
         except ValueError:
             return RUN_METADATA_CODEC.corrupt("backend-run metadata is not valid JSON")
         return bind_run_metadata_result(decode_run_metadata(payload), run_id)

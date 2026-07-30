@@ -10,13 +10,23 @@ from jsonschema import Draft202012Validator
 
 from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
 from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
 
 EVENT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "required": ["schema_version", "event_id", "seq", "run_id", "timestamp", "type", "level", "data"],
+    "required": [
+        "schema_version",
+        "event_id",
+        "seq",
+        "run_id",
+        "timestamp",
+        "type",
+        "level",
+        "data",
+    ],
     "properties": {
         "schema_version": schema_version_property("event.v1"),
         "event_id": {"type": "string", "minLength": 1},
@@ -306,7 +316,13 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         required=("capability",),
     ),
     "capability.granted": _data_schema(
-        {"capability": _STR, "binding_id": _STR, "lease_id": _STR, "expires_at": _NUM, "scope": _OBJ},
+        {
+            "capability": _STR,
+            "binding_id": _STR,
+            "lease_id": _STR,
+            "expires_at": _NUM,
+            "scope": _OBJ,
+        },
         required=("capability",),
     ),
     "capability.denied": _data_schema(
@@ -347,7 +363,14 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "state": _STR_NULL,
             "duration_ms": _NUM,
         },
-        required=("command_id", "command", "target_run_id", "idempotency_key", "status", "result_code"),
+        required=(
+            "command_id",
+            "command",
+            "target_run_id",
+            "idempotency_key",
+            "status",
+            "result_code",
+        ),
     ),
     "control.command.failed": _data_schema(
         {
@@ -363,18 +386,38 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "failure_code": _STR,
             "duration_ms": _NUM,
         },
-        required=("command_id", "command", "target_run_id", "idempotency_key", "status", "error_code", "failure_code"),
+        required=(
+            "command_id",
+            "command",
+            "target_run_id",
+            "idempotency_key",
+            "status",
+            "error_code",
+            "failure_code",
+        ),
     ),
     "outbox.requested": _data_schema(
         {"request_id": _STR, "destination": _STR, "capability": _STR, "traceparent": _STR},
         required=("request_id",),
     ),
     "outbox.dispatched": _data_schema(
-        {"request_id": _STR, "destination": _STR, "reference": _STR, "attempts": _NUM, "traceparent": _STR},
+        {
+            "request_id": _STR,
+            "destination": _STR,
+            "reference": _STR,
+            "attempts": _NUM,
+            "traceparent": _STR,
+        },
         required=("request_id",),
     ),
     "outbox.failed": _data_schema(
-        {"request_id": _STR, "destination": _STR, "reason": _STR, "attempts": _NUM, "traceparent": _STR},
+        {
+            "request_id": _STR,
+            "destination": _STR,
+            "reason": _STR,
+            "attempts": _NUM,
+            "traceparent": _STR,
+        },
         required=("request_id",),
     ),
     "workspace.file.read": _data_schema(
@@ -842,7 +885,9 @@ JOB_SCHEMA: dict[str, Any] = {
         "command": {"type": "string"},
         "command_preview": {"type": "string"},
         "cwd": {"type": "string"},
-        "status": {"enum": ["running", "exited", "timed_out", "cancelled", "output_limited", "failed"]},
+        "status": {
+            "enum": ["running", "exited", "timed_out", "cancelled", "output_limited", "failed"]
+        },
         "started_at": {"type": "number"},
         "finished_at": {"type": ["number", "null"]},
         "duration_s": {"type": "number", "minimum": 0},
@@ -1130,7 +1175,7 @@ def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) ->
         if not line.strip():
             continue
         try:
-            record = json.loads(line)
+            record = loads_json_ingress(line)
         except (ValueError, RecursionError):
             continue  # already reported by the schema pass
         if not isinstance(record, dict) or record.get("kind") != "settled_text":
@@ -1141,14 +1186,10 @@ def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) ->
         label = f"{path.name}:{index}"
         claimed = record.get("final_text_digest")
         if claimed != content_digest(text):
-            issues.append(
-                ValidationIssue(label, "settled_text digest does not match final_text")
-            )
+            issues.append(ValidationIssue(label, "settled_text digest does not match final_text"))
         claimed_len = record.get("final_text_len")
         if claimed_len != content_length(text):
-            issues.append(
-                ValidationIssue(label, "settled_text length does not match final_text")
-            )
+            issues.append(ValidationIssue(label, "settled_text length does not match final_text"))
 
 
 def _read_json_artifact(path: Path) -> tuple[Any, ValidationIssue | None]:
@@ -1173,7 +1214,7 @@ def _read_json_artifact(path: Path) -> tuple[Any, ValidationIssue | None]:
     except UnicodeDecodeError:
         return None, ValidationIssue(path.name, "invalid UTF-8")
     try:
-        return json.loads(text), None
+        return loads_json_ingress(text), None
     except json.JSONDecodeError as exc:
         return None, ValidationIssue(path.name, f"invalid JSON: {exc.msg}")
     except (ValueError, RecursionError):
@@ -1193,7 +1234,9 @@ def _validate_json_file(path: Path, schema: dict[str, Any], issues: list[Validat
     _validate_object(payload, schema, issues, path.name)
 
 
-def _validate_object(payload: Any, schema: dict[str, Any], issues: list[ValidationIssue], label: str) -> None:
+def _validate_object(
+    payload: Any, schema: dict[str, Any], issues: list[ValidationIssue], label: str
+) -> None:
     validator = Draft202012Validator(schema)
     for error in sorted(validator.iter_errors(payload), key=lambda item: list(item.path)):
         suffix = ".".join(str(part) for part in error.path)
@@ -1219,7 +1262,7 @@ def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[Valida
         if not line.strip():
             continue
         try:
-            payload = json.loads(line)
+            payload = loads_json_ingress(line)
         except json.JSONDecodeError as exc:
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {exc.msg}"))
             continue
@@ -1239,7 +1282,7 @@ def _validate_event_file(path: Path, issues: list[ValidationIssue]) -> None:
         if not record.raw_bytes.strip():
             continue
         try:
-            event = json.loads(record.raw_bytes.decode("utf-8"))
+            event = loads_json_ingress(record.raw_bytes.decode("utf-8"))
         except UnicodeDecodeError:
             issues.append(ValidationIssue(f"{path.name}:{index}", "invalid UTF-8"))
             continue
@@ -1258,19 +1301,27 @@ def _validate_event_file(path: Path, issues: list[ValidationIssue]) -> None:
         schema = EVENT_DATA_SCHEMAS.get(event_type) if isinstance(event_type, str) else None
         if schema is None:
             issues.append(
-                ValidationIssue(f"{path.name}:{index}", f"no data schema for event type: {event_type!r}")
+                ValidationIssue(
+                    f"{path.name}:{index}", f"no data schema for event type: {event_type!r}"
+                )
             )
             continue
         data = event.get("data")
-        _validate_object(data if isinstance(data, dict) else {}, schema, issues, f"{path.name}:{index}.data")
+        _validate_object(
+            data if isinstance(data, dict) else {}, schema, issues, f"{path.name}:{index}.data"
+        )
 
 
 def _validate_manifest_workspace_index(run_dir: Path, issues: list[ValidationIssue]) -> None:
-    _validate_manifest_relative_file(run_dir, issues, "workspace_index_path", "workspace index file missing")
+    _validate_manifest_relative_file(
+        run_dir, issues, "workspace_index_path", "workspace index file missing"
+    )
 
 
 def _validate_manifest_workspace_base(run_dir: Path, issues: list[ValidationIssue]) -> None:
-    _validate_manifest_relative_file(run_dir, issues, "workspace_base_path", "workspace base file missing")
+    _validate_manifest_relative_file(
+        run_dir, issues, "workspace_base_path", "workspace base file missing"
+    )
 
 
 def _validate_manifest_relative_file(
@@ -1332,11 +1383,19 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
                 continue
             path = run_dir / snapshot_path
             if not path.exists():
-                issues.append(ValidationIssue(f"proposal.json.files.{index}.snapshot_path", "snapshot missing"))
+                issues.append(
+                    ValidationIssue(
+                        f"proposal.json.files.{index}.snapshot_path", "snapshot missing"
+                    )
+                )
                 continue
             actual = hashlib.sha256(path.read_bytes()).hexdigest()
             if file_info.get("snapshot_sha256") != actual:
-                issues.append(ValidationIssue(f"proposal.json.files.{index}.snapshot_sha256", "snapshot hash mismatch"))
+                issues.append(
+                    ValidationIssue(
+                        f"proposal.json.files.{index}.snapshot_sha256", "snapshot hash mismatch"
+                    )
+                )
 
 
 def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> None:
@@ -1347,7 +1406,9 @@ def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> No
     if not isinstance(package, dict):
         return
     if package.get("package_hash") != canonical_sha256(package, drop=("package_hash",)):
-        issues.append(ValidationIssue("proposal.package.json.package_hash", "package hash mismatch"))
+        issues.append(
+            ValidationIssue("proposal.package.json.package_hash", "package hash mismatch")
+        )
     seen: set[str] = set()
     for index, file_info in enumerate(package.get("files") or []):
         if not isinstance(file_info, dict):
@@ -1356,15 +1417,25 @@ def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> No
         if not isinstance(rel, str):
             continue
         if rel in seen:
-            issues.append(ValidationIssue(f"proposal.package.json.files.{index}.path", "duplicate package path"))
+            issues.append(
+                ValidationIssue(
+                    f"proposal.package.json.files.{index}.path", "duplicate package path"
+                )
+            )
         seen.add(rel)
         path = run_dir / rel
         if not path.exists() or not path.is_file():
-            issues.append(ValidationIssue(f"proposal.package.json.files.{index}.path", "package file missing"))
+            issues.append(
+                ValidationIssue(f"proposal.package.json.files.{index}.path", "package file missing")
+            )
             continue
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
         if file_info.get("sha256") != actual:
-            issues.append(ValidationIssue(f"proposal.package.json.files.{index}.sha256", "package file hash mismatch"))
+            issues.append(
+                ValidationIssue(
+                    f"proposal.package.json.files.{index}.sha256", "package file hash mismatch"
+                )
+            )
 
 
 def _validate_canonical_hash(path: Path, hash_key: str, issues: list[ValidationIssue]) -> None:

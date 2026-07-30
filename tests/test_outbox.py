@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from support.runtime import runtime_config, runtime_provider, tool_binding
 from support.waiting import eventually
 
@@ -64,6 +66,75 @@ def test_outbox_holder_pending_mark_export_import() -> None:
     fresh.import_(box.export())
     assert fresh.get("o1").status == "dispatched"  # full state round-trips
     assert {r.id for r in fresh.pending()} == {"o2"}
+
+
+def test_outbox_receipt_rejects_truthy_non_boolean() -> None:
+    with pytest.raises(ValueError, match="ok must be a boolean"):
+        OutboxReceipt(ok="false")  # type: ignore[arg-type]
+
+
+def test_record_outbox_result_rejects_forged_malformed_receipt_without_dispatching() -> None:
+    loop = object.__new__(AgentLoop)
+    loop._outbox = Outbox()
+    loop._session = None
+    request = loop._outbox.append(OutboxRequest(destination="peer", id="o1"))
+    malformed = object.__new__(OutboxReceipt)
+    object.__setattr__(malformed, "ok", "false")
+    object.__setattr__(malformed, "reference", "")
+    object.__setattr__(malformed, "error", "delivery failed")
+    object.__setattr__(malformed, "retryable", False)
+
+    with pytest.raises(ValueError, match="ok must be a boolean"):
+        loop.record_outbox_result(request.id, malformed)
+
+    assert request.status == "pending"
+    assert request.attempts == 0
+
+
+def test_late_outbox_receipts_cannot_reverse_a_terminal_state() -> None:
+    loop = object.__new__(AgentLoop)
+    loop._outbox = Outbox()
+    loop._session = None
+    dispatched = loop._outbox.append(OutboxRequest(destination="peer", id="delivered"))
+    failed = loop._outbox.append(OutboxRequest(destination="peer", id="dead-lettered"))
+
+    assert (
+        loop.record_outbox_result(
+            dispatched.id,
+            OutboxReceipt(ok=True, reference="provider-ref"),
+        )
+        == "dispatched"
+    )
+    assert (
+        loop.record_outbox_result(
+            dispatched.id,
+            OutboxReceipt(ok=False, error="late timeout", retryable=True),
+            next_attempt_at=1.0,
+        )
+        == "dispatched"
+    )
+    assert dispatched.attempts == 1
+    assert dispatched.reference == "provider-ref"
+    assert dispatched.error == ""
+
+    assert (
+        loop.record_outbox_result(
+            failed.id,
+            OutboxReceipt(ok=False, error="rejected", retryable=False),
+        )
+        == "failed"
+    )
+    assert (
+        loop.record_outbox_result(
+            failed.id,
+            OutboxReceipt(ok=True, reference="late-success"),
+        )
+        == "failed"
+    )
+    assert failed.attempts == 1
+    assert failed.reference == ""
+    assert failed.error == "rejected"
+    assert loop.due_outbox(10.0) == []
 
 
 # --- backend e2e: capability-gated staging + edge drain -----------------------------------

@@ -11,6 +11,7 @@ from support.backend_harness import (
     PermissionDenied,
     PermissionPolicy,
     RunnerBackend,
+    SqliteCheckpointStore,
     TokenError,
     TokenManager,
     ToolScope,
@@ -32,6 +33,7 @@ from support.backend_harness import (
     tool_binding,
 )
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.reference.backend.run_types import normalize_backend_run_request
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 pytestmark = pytest.mark.integration
@@ -62,6 +64,113 @@ def test_run_preparation_writes_initial_metadata_once(tmp_path: Path, monkeypatc
     assert (submission.run_dir / "run.json").exists()
     assert backend.wait_for_run(submission.run_id, timeout_s=20) is SessionState.COMPLETED
     assert calls == [submission.run_id]
+
+
+def test_direct_run_request_is_normalized_before_sqlite_admission(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    checkpoint_store = SqliteCheckpointStore(tmp_path / "shared.db")
+    captured_specs: list[Any] = []
+    adapters: list[FakeModelAdapter] = []
+
+    def factory(spec: Any, token: str) -> FakeModelAdapter:
+        del token
+        captured_specs.append(spec)
+        adapter = FakeModelAdapter(
+            turns=[ModelTurn(response_id="turn_1", final_text="done")]
+        )
+        adapters.append(adapter)
+        return adapter
+
+    backend = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=_token_manager(),
+        checkpoint_store=checkpoint_store,
+        model_adapter_factory=factory,
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello\ud800world",
+            runtime_config=_default_config(),
+            multi_turn=True,
+            metadata={"score": float("nan"), "label": "bad\ud800label"},
+        )
+    )
+
+    assert eventually(
+        lambda: backend._record(submission.run_id).state is SessionState.AWAITING_INPUT
+    )
+    local_metadata = json.loads(
+        (submission.run_dir / "run.json").read_text(encoding="utf-8")
+    )
+    shared_metadata = checkpoint_store.run_metadata(submission.run_id)
+    assert shared_metadata == local_metadata
+    assert local_metadata["title"] == "hello\ufffdworld"
+    assert captured_specs[0].metadata["score"] is None
+    assert captured_specs[0].metadata["label"] == "bad\ufffdlabel"
+    assert adapters[0].requests[0].instruction == "hello\ufffdworld"
+    json.dumps(
+        {"local": local_metadata, "spec": captured_specs[0].metadata},
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+    backend.cancel_run(submission.run_id, submission.run_token)
+    backend.wait_for_run(submission.run_id, timeout_s=20)
+
+    existing_run_dirs = set(run_root.iterdir())
+    with pytest.raises(ValueError, match="max_duration_s"):
+        backend.submit_run(
+            BackendRunRequest(
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=workspace,
+                instruction="invalid controls",
+                runtime_config=_default_config(),
+                max_duration_s=float("nan"),  # type: ignore[arg-type]
+            )
+        )
+    assert set(run_root.iterdir()) == existing_run_dirs
+
+    with pytest.raises(ValueError, match="metadata.subagent_depth"):
+        backend.submit_run(
+            BackendRunRequest(
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=workspace,
+                instruction="invalid reserved metadata control",
+                runtime_config=_default_config(),
+                metadata={"subagent_depth": -100},
+            )
+        )
+    assert set(run_root.iterdir()) == existing_run_dirs
+
+
+@pytest.mark.parametrize("field_name", ["max_steps", "max_tool_calls", "max_bytes_read"])
+def test_backend_run_request_preserves_zero_budget_semantics(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    workspace = _workspace(tmp_path)
+    request = BackendRunRequest(
+        tenant_id="tenant_a",
+        user_id="user_a",
+        workspace_root=workspace,
+        instruction="zero budget",
+        runtime_config=_default_config(),
+        **{field_name: 0},
+    )
+
+    normalized = normalize_backend_run_request(request)
+
+    assert getattr(normalized, field_name) == 0
 
 
 def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) -> None:

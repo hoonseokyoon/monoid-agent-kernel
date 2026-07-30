@@ -83,11 +83,16 @@ class EventSubscriptionFrame:
             return f": {self.comment}\n\n".encode("utf-8")
         if self.kind == "end":
             payload = json.dumps(
-                dict(self.lifecycle or {}), ensure_ascii=False, separators=(",", ":")
+                dict(self.lifecycle or {}),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
             )
             return f"event: end\ndata: {payload}\n\n".encode("utf-8")
         assert self.event is not None
-        payload = json.dumps(dict(self.event), ensure_ascii=False, separators=(",", ":"))
+        payload = json.dumps(
+            dict(self.event), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        )
         return f"id: {self.event_id}\ndata: {payload}\n\n".encode("utf-8")
 
 

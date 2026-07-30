@@ -56,22 +56,33 @@ def project_message_to_text(message: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
-def _first_positive(*values: Any) -> int | None:
-    """First value that coerces to a positive int, else ``None``."""
-    for value in values:
-        if value is None:
-            continue
-        try:
-            n = int(value)
-        except (TypeError, ValueError):
-            continue
-        if n > 0:
-            return n
+def _usage_object(value: Any, field_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"model usage {field_name} must be an object")
+    return value
+
+
+def _usage_count(payload: dict[str, Any], key: str) -> int | None:
+    if key not in payload:
+        return None
+    value = payload[key]
+    if type(value) is not int or value < 0:
+        raise ValueError(f"model usage {key} must be a non-negative integer")
+    return value
+
+
+def _first_count(*candidates: tuple[dict[str, Any], str]) -> int | None:
+    for payload, key in candidates:
+        value = _usage_count(payload, key)
+        if value is not None:
+            return value
     return None
 
 
 def normalize_usage(usage: dict[str, Any] | None, *, legacy_aliases: bool = False) -> dict[str, int]:
-    """Coerce a provider usage dict to ``{input_tokens, output_tokens, total_tokens}`` plus
+    """Validate provider usage as ``{input_tokens, output_tokens, total_tokens}`` plus
     optional priced sub-counts (``cache_read_tokens``, ``cache_creation_tokens``,
     ``reasoning_tokens``, ``audio_tokens``) included **only when present**.
 
@@ -82,40 +93,57 @@ def normalize_usage(usage: dict[str, Any] | None, *, legacy_aliases: bool = Fals
     being flattened away. ``legacy_aliases`` also accepts OpenAI's older ``prompt_tokens`` /
     ``completion_tokens`` names as fallbacks.
     """
-    usage = usage or {}
-    input_tokens = usage.get("input_tokens")
-    output_tokens = usage.get("output_tokens")
+    usage = _usage_object(usage, "payload")
+    input_candidates = [(usage, "input_tokens")]
+    output_candidates = [(usage, "output_tokens")]
     if legacy_aliases:
-        input_tokens = input_tokens or usage.get("prompt_tokens")
-        output_tokens = output_tokens or usage.get("completion_tokens")
+        input_candidates.append((usage, "prompt_tokens"))
+        output_candidates.append((usage, "completion_tokens"))
+    input_tokens = _first_count(*input_candidates)
+    output_tokens = _first_count(*output_candidates)
+    normalized_input = input_tokens if input_tokens is not None else 0
+    normalized_output = output_tokens if output_tokens is not None else 0
+    reported_total = _usage_count(usage, "total_tokens")
     normalized = {
-        "input_tokens": int(input_tokens or 0),
-        "output_tokens": int(output_tokens or 0),
-        "total_tokens": int(usage.get("total_tokens") or 0),
+        "input_tokens": normalized_input,
+        "output_tokens": normalized_output,
+        # Some provider-compatible adapters omit a total or under-report it.  The aggregate
+        # run budget must never be weaker than the accepted component counts.
+        "total_tokens": max(reported_total or 0, normalized_input + normalized_output),
     }
-    input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
-    output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
-    audio = (int(input_details.get("audio_tokens") or 0) + int(output_details.get("audio_tokens") or 0)) or None
+    input_details = _usage_object(
+        usage.get("input_tokens_details", usage.get("prompt_tokens_details")),
+        "input_tokens_details",
+    )
+    output_details = _usage_object(
+        usage.get("output_tokens_details", usage.get("completion_tokens_details")),
+        "output_tokens_details",
+    )
+    input_audio = _usage_count(input_details, "audio_tokens") or 0
+    output_audio = _usage_count(output_details, "audio_tokens") or 0
+    audio = input_audio + output_audio
     details = {
-        "cache_read_tokens": _first_positive(
-            usage.get("cache_read_tokens"),
-            usage.get("cache_read_input_tokens"),
-            input_details.get("cached_tokens"),
-            usage.get("cached_tokens"),
-            usage.get("cachedContentTokenCount"),
+        "cache_read_tokens": _first_count(
+            (usage, "cache_read_tokens"),
+            (usage, "cache_read_input_tokens"),
+            (input_details, "cached_tokens"),
+            (usage, "cached_tokens"),
+            (usage, "cachedContentTokenCount"),
         ),
-        "cache_creation_tokens": _first_positive(
-            usage.get("cache_creation_tokens"),
-            usage.get("cache_creation_input_tokens"),
+        "cache_creation_tokens": _first_count(
+            (usage, "cache_creation_tokens"),
+            (usage, "cache_creation_input_tokens"),
         ),
-        "reasoning_tokens": _first_positive(
-            usage.get("reasoning_tokens"),
-            output_details.get("reasoning_tokens"),
-            output_details.get("thinking_tokens"),
-            usage.get("thoughtsTokenCount"),
+        "reasoning_tokens": _first_count(
+            (usage, "reasoning_tokens"),
+            (output_details, "reasoning_tokens"),
+            (output_details, "thinking_tokens"),
+            (usage, "thoughtsTokenCount"),
         ),
-        "audio_tokens": _first_positive(usage.get("audio_tokens"), audio),
+        "audio_tokens": _first_count((usage, "audio_tokens")),
     }
+    if details["audio_tokens"] is None and audio:
+        details["audio_tokens"] = audio
     for key, value in details.items():
         if value:
             normalized[key] = value

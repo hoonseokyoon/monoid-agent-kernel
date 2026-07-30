@@ -33,6 +33,7 @@ from pydantic import TypeAdapter, ValidationError
 from monoid_agent_kernel._policy_util import dedupe
 from monoid_agent_kernel.core._util import canonical_hmac_sha256, canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.wire_validation import (
     WireValidationError,
@@ -83,7 +84,13 @@ def _folded_key(text: str) -> str:
     literal key `api-key`, since the candidate had already become `api_key`. Both sides now fold here or
     neither does.
     """
-    return text.strip().lower().replace("-", "_")
+    return normalize_unicode_scalars(text).strip().lower().replace("-", "_")
+
+
+def _normalized_string_tuple(value: Any, field_name: str) -> tuple[str, ...]:
+    if type(value) is not tuple or not all(type(item) is str for item in value):
+        raise ValueError(f"{field_name} must be a tuple of strings")
+    return tuple(normalize_unicode_scalars(item) for item in value)
 
 
 def _string_rules(payload: Mapping[str, Any], key: str, *, reject_blank: bool) -> tuple[str, ...]:
@@ -202,7 +209,16 @@ class RedactionPolicy:
     replacement: str = REDACTION_PLACEHOLDER
 
     def __post_init__(self) -> None:
-        for pattern in self.patterns:
+        secret_key_parts = _normalized_string_tuple(
+            self.secret_key_parts,
+            "redaction secret_key_parts",
+        )
+        patterns = _normalized_string_tuple(self.patterns, "redaction patterns")
+        literals = _normalized_string_tuple(self.literals, "redaction literals")
+        if type(self.replacement) is not str:
+            raise ValueError("redaction replacement must be a string")
+        replacement = normalize_unicode_scalars(self.replacement)
+        for pattern in patterns:
             try:
                 _compiled(pattern)
             except re.error as exc:
@@ -216,8 +232,11 @@ class RedactionPolicy:
         object.__setattr__(
             self,
             "secret_key_parts",
-            dedupe(_folded_key(part) for part in self.secret_key_parts if part.strip()),
+            dedupe(_folded_key(part) for part in secret_key_parts if part.strip()),
         )
+        object.__setattr__(self, "patterns", patterns)
+        object.__setattr__(self, "literals", literals)
+        object.__setattr__(self, "replacement", replacement)
 
     @classmethod
     def from_json(cls, payload: Any) -> RedactionPolicy:
@@ -299,6 +318,9 @@ class RedactionPolicy:
         the same text under the same policy always yields the same output, so a digest taken over a
         redacted view is comparable across processes.
         """
+        if type(text) is not str:
+            raise ValueError("redaction text must be a string")
+        text = normalize_unicode_scalars(text)
         for literal in self.literals:
             text = text.replace(literal, self.replacement)
         for pattern in self.patterns:
@@ -644,13 +666,41 @@ class ModelCallReceipt:
         recorded by its type name rather than its message: an arbitrary exception's message can carry
         request content, and the whole point of the receipt is that it holds none.
         """
-        error_code = getattr(exc, "error_code", "") or type(exc).__name__
+        try:
+            error_code = getattr(exc, "error_code", "") or type(exc).__name__
+            normalized_error_code = normalize_unicode_scalars(str(error_code))
+        except Exception:
+            normalized_error_code = type(exc).__name__
+        try:
+            provider_error_code = normalize_unicode_scalars(
+                str(getattr(exc, "provider_error_code", "") or "")
+            )
+        except Exception:
+            provider_error_code = ""
+        try:
+            retryable_value = getattr(exc, "retryable", False)
+            retryable = retryable_value if type(retryable_value) is bool else False
+        except Exception:
+            retryable = False
+        try:
+            http_status = getattr(exc, "http_status", None)
+        except Exception:
+            http_status = None
+        if isinstance(http_status, bool) or not isinstance(http_status, int):
+            http_status = None
+        try:
+            provider_retried_value = getattr(exc, "provider_retried", False)
+            provider_retried = (
+                provider_retried_value if type(provider_retried_value) is bool else False
+            )
+        except Exception:
+            provider_retried = False
         return replace(
             self,
-            error_code=str(error_code),
-            provider_error_code=str(getattr(exc, "provider_error_code", "") or ""),
-            retryable=bool(getattr(exc, "retryable", False)),
-            http_status=getattr(exc, "http_status", None),
+            error_code=normalized_error_code,
+            provider_error_code=provider_error_code,
+            retryable=retryable,
+            http_status=http_status,
             # A failed call is the one most likely to have been retried, so the marker has to
             # survive the failure path too -- recording it only on success would deny retries in
             # exactly the exhausted-budget case.
@@ -659,7 +709,7 @@ class ModelCallReceipt:
             # caller always passes a freshly built receipt, so nothing is lost yet; but every other
             # place this fact travels had to learn the same rule, and a receipt that had recorded a
             # retry before failing would silently unrecord it here.
-            provider_retried=self.provider_retried or bool(getattr(exc, "provider_retried", False)),
+            provider_retried=self.provider_retried or provider_retried,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -814,7 +864,11 @@ def redacted_fields_or_none(
     redacted = redacted_or_none(_detached_content(content), policy=policy, redactor=redactor)
     if not isinstance(redacted, Mapping):
         return None
-    return {str(key): value for key, value in redacted.items()}
+    try:
+        normalized = normalize_json_ingress({str(key): value for key, value in redacted.items()})
+    except Exception:
+        return None
+    return normalized if isinstance(normalized, Mapping) else None
 
 
 def _detached_content(content: Mapping[str, Any]) -> Mapping[str, Any]:

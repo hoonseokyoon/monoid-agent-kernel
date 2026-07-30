@@ -73,7 +73,7 @@ boundaries, and property tests for pure helper/parser surfaces.
 | `OR-09-SUBAGENT-BOUNDARY` | Subagent runtime links identity, capability, and trace boundaries: child runs have their own identity/accounting, isolated live lease slots, shared revocation, and parent-child diagnostics linkage. | `multi-agent`, `capability-security`, `durable-runner` | `core.subagent_runtime.SubagentRuntimeContext`, `validate_descendant_run_id`, `subagent_diagnostics_from_events`, `CapabilityVault.fork_for_child` |
 | `OR-10-TOOL-SURFACE-ADMISSION` | Tool execution follows the active turn surface: unavailable tools, hidden/searchable-only tools, denied bindings, and quota-exceeded bindings do not execute handlers. | `tool-agent` | `DefaultToolSurfaceResolver`, `ToolSurfaceSnapshot`, `AgentLoop` tool admission path |
 | `OR-11-GENERIC-ASK-APPROVAL` | `authorization="ask"` creates a durable approval task; approval revalidates the captured call before one execution, and denial returns an observation without invoking the handler. | `tool-agent`, `control-plane` | `core.tool_approval`, `TaskManager`, `AgentLoop` approval replay path |
-| `OR-12-DURABLE-SIDE-EFFECT` | External side-effect tools declare their delivery semantics; strict runtimes admit them through durable outbox staging or explicit idempotency keys, and outbox-declared handlers stage a durable request before success. | `side-effect-tool-agent` | `core.side_effect_policy`, `core.outbox`, `ToolContext.emit_outbox`, Reference edge drain |
+| `OR-12-DURABLE-SIDE-EFFECT` | External side-effect tools declare their delivery semantics; strict runtimes admit them through invocation-private outbox staging followed by durable commit, or through explicit idempotency keys. Outbox-declared handlers stage a private request and the runtime commits it only after the exact successful result and its side-effect post-processing complete. | `side-effect-tool-agent` | `core.side_effect_policy`, `core.outbox`, `ToolContext.emit_outbox`, Reference edge drain |
 | `OR-13-EXTERNAL-AGENT-ENVELOPE` | External agent messages preserve peer/message identity, restart-stable dedupe, correlation, causation, trace context, ordered text/data parts, and retryable pending/error state across inbox/outbox boundaries. | `message-fabric` | `core.external_agent_envelope`, `core.inbox`, `core.outbox`, Reference inbox-routing outbox sender |
 
 ## Identifier Namespace
@@ -88,6 +88,26 @@ to load where listed. The exact per-artifact reader policy, including permissive
 writer-only exceptions, is maintained in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Python Contracts
+
+### Portable JSON ingress
+
+Textual JSON accepted by kernel, Reference, provider, and retained-artifact readers has a maximum
+container nesting depth of 512 array/object levels. A document at level 513 is rejected with that
+boundary's invalid-input, bad-response, or corrupt-artifact taxonomy. The lexical depth scan uses an
+exact `str` and ignores delimiters inside JSON strings, so a `str` subclass cannot bypass the limit.
+
+External requests, control envelopes, and durable artifacts reject non-standard non-finite number
+tokens and exponent overflow. Model-authored content substitutes non-finite floats with JSON `null`
+at semantic ingress. Mixed LLM gateway responses keep envelope fields such as frame type, stop
+reason, retry evidence, usage, status, and identifiers strict; substitution applies to the nested
+model-authored tool arguments. Numeric control validation rejects values that cannot become finite
+Python floats, including arbitrarily large JSON integers, through each boundary's documented error
+taxonomy.
+
+Already-materialized Python and custom-adapter object graphs use the iterative semantic normalizer.
+They have no textual parser-depth limit, preserve shared/cyclic topology during normalization, and
+meet the downstream durable codec and strict JSON-writer constraints when persisted. Deep/cyclic
+object-graph durability remains a separate design concern.
 
 ### AgentLoop
 
@@ -853,16 +873,21 @@ edge/transport contract — the reference `RunnerBackend` wraps inbound content 
 ### Outbox Request
 
 `monoid.outbox-request.v1` (`core/outbox.py`, `OutboxRequest`): a tool **stages** an
-external side-effect (send an email, call a webhook) durably in the per-run `Outbox` instead of doing
-the IO inline. The request is checkpointed, so it survives a restart; the engine never performs the
+external side-effect (send an email, call a webhook) in its invocation-private transaction instead
+of doing the IO inline. A successful tool call commits the request to the durable per-run `Outbox`.
+The committed request is checkpointed, so it survives a restart; the engine never performs the
 send.
 
 - A tool handler calls `ToolContext.emit_outbox(destination, payload, *, capability,
-  idempotency_key="")`; the request is appended to the per-run `Outbox` (checkpointed in full as
-  `RunCheckpoint.outbox_requests`) and `outbox.requested` is emitted. The request carries the
+  idempotency_key="")`; the request remains private until the handler returns an exact successful
+  `ToolResult`, result post-processing completes, and strict side-effect verification plus event
+  emission pass. The loop then appends it to the per-run `Outbox` (checkpointed in full as
+  `RunCheckpoint.outbox_requests`) and emits
+  `outbox.requested`. A failed or malformed result, exception, cancellation, timeout, or late write
+  from an abandoned worker leaves no pending or due request for the edge. The request carries the
   capability lease **handle** (`token_ref`, captured via `capability_token(capability)`) — never a
   secret. Bind the outbox tool with `runtime.requires_lease` so the existing capability gate
-  brokers/revokes the lease *before* the send is staged (least-privilege egress).
+  brokers/revokes the lease *before* the request can commit (least-privilege egress).
 - **Edge drains, effectively-once**: `RunnerBackend(outbox_sender_factory=lambda request: ...)`
   supplies an `OutboxSender` (`send(request) -> OutboxReceipt`); the backend drains
   `loop.pending_outbox()` at each park/settle, performing the IO (resolving `token_ref` to the real
@@ -874,7 +899,7 @@ send.
 - **Backoff + redrive (retry decoupled from run activity)**: a retryable failure stamps a durable
   `next_attempt_at` on the request — capped exponential backoff with **full jitter** (`uniform(0,
   min(outbox_retry_cap_s, outbox_retry_base_s * outbox_retry_factor**attempts))`). The drain only
-  dispatches **due** requests (`loop.due_outbox(now)`; a freshly staged one has `next_attempt_at=0.0`
+  dispatches **due** requests (`loop.due_outbox(now)`; a freshly committed one has `next_attempt_at=0.0`
   → due immediately, so the happy path is unchanged), and because the schedule is on the checkpoint
   it survives a restart. The backend's **watchdog tick** also runs `_redrive_outbox()`: for each live
   run it marshals the drain onto the shared loop, so a due request is redispatched even while its run

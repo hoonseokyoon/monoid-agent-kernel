@@ -16,6 +16,9 @@ PROFILE = ProfileMetadata(
     harnesses=("multi-agent-backend", "capability"),
 )
 
+_PROFILE_LEASE_EXPIRES_AT = 4_102_444_800.0
+_PROFILE_REQUEST_TTL_SECONDS = int(_PROFILE_LEASE_EXPIRES_AT)
+
 
 def assert_multi_agent_backend_boundary_profile(harness: MultiAgentBackendHarness) -> None:
     """Run the backend subagent identity and diagnostics smoke matrix."""
@@ -97,14 +100,20 @@ def _admit_profile_lease(
     token_ref: str,
     durable: bool,
 ) -> dict[str, Any]:
-    request = harness.request_capability({"capability": capability, "scope": {}})
+    request = harness.request_capability(
+        {
+            "capability": capability,
+            "scope": {},
+            "ttl_seconds": _PROFILE_REQUEST_TTL_SECONDS,
+        }
+    )
     return harness.grant_capability(
         str(request["request_id"]),
         {
             "lease_id": lease_id,
             "capability": capability,
             "token_ref": token_ref,
-            "expires_at": 4_102_444_800.0,
+            "expires_at": _PROFILE_LEASE_EXPIRES_AT,
             "issued_at": 100.0,
             "durable": durable,
             "scope": {},

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -277,14 +278,16 @@ def test_side_effect_staging_ack_and_restart_state_are_idempotent() -> None:
 
 
 def test_capability_revocation_survives_restart_and_blocks_durable_handle() -> None:
+    now = time.time()
     lease = CapabilityLease(
         capability="web.search",
         token_ref="durable-handle",
-        expires_at=9e9,
+        expires_at=now + 600,
         durable=True,
+        issued_at=now,
     )
     before_restart = CapabilityVault()
-    before_restart.admit(CapabilityRequest(capability="web.search"), lease)
+    before_restart.admit(CapabilityRequest(capability="web.search"), lease, now=now)
     before_restart.revoke(capability="web.search")
 
     revocations = before_restart.export_revocations()

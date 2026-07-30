@@ -20,6 +20,7 @@ Security invariants the core enforces (see ``CapabilityVault.admit``):
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ from monoid_agent_kernel.core.capability_revocation import (
     is_lease_revoked,
 )
 from monoid_agent_kernel.core.lease_admission import validate_lease_admission
+from monoid_agent_kernel.core.json_ingress import is_finite_json_number
 from monoid_agent_kernel.core.scope import scope_within
 from monoid_agent_kernel.core.wire_validation import (
     parse_bool,
@@ -60,6 +62,17 @@ class CapabilityRequest:
     ttl_seconds: int = 600
     reason: str = ""
     request_id: str = field(default_factory=lambda: f"cap_req_{uuid.uuid4().hex[:12]}")
+
+    def __post_init__(self) -> None:
+        for field_name in ("capability", "run_id", "binding_id", "reason", "request_id"):
+            value = getattr(self, field_name)
+            if type(value) is not str:
+                raise ValueError(f"capability request {field_name} must be a string")
+        if not self.capability or not self.request_id:
+            raise ValueError("capability request identities must be non-empty strings")
+        if type(self.ttl_seconds) is not int or self.ttl_seconds <= 0:
+            raise ValueError("capability request ttl_seconds must be a positive integer")
+        _validate_json_scope(self.scope, "capability request scope")
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -98,6 +111,9 @@ class CapabilityLease:
     # past this — so a one-time human approval cannot be silently auto-extended forever. ``None`` =
     # no ceiling (the default for ephemeral sync grants); a policy/approval broker sets it.
     max_expires_at: float | None = None
+
+    def __post_init__(self) -> None:
+        _validate_lease_fields(self)
 
     def is_valid(self, now: float) -> bool:
         return now < self.expires_at
@@ -149,6 +165,73 @@ class CapabilityLease:
         if lease_id:
             kwargs["lease_id"] = lease_id
         return cls(**kwargs)
+
+
+def _finite_epoch(value: Any, field_name: str) -> float:
+    if not is_finite_json_number(value):
+        raise ValueError(f"{field_name} must be a finite number")
+    return float(value)
+
+
+def _validate_json_scope(scope: Any, field_name: str = "capability lease scope") -> None:
+    if not isinstance(scope, dict):
+        raise ValueError(f"{field_name} must be an object")
+    pending: list[tuple[Any, bool]] = [(scope, True)]
+    active: set[int] = set()
+    while pending:
+        value, entering = pending.pop()
+        if isinstance(value, (dict, list)) and not entering:
+            active.remove(id(value))
+            continue
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in active:
+                raise ValueError(f"{field_name} must not contain cycles")
+            active.add(identity)
+            pending.append((value, False))
+            for key, child in value.items():
+                if type(key) is not str:
+                    raise ValueError(f"{field_name} keys must be strings")
+                pending.append((child, True))
+            continue
+        if isinstance(value, list):
+            identity = id(value)
+            if identity in active:
+                raise ValueError(f"{field_name} must not contain cycles")
+            active.add(identity)
+            pending.append((value, False))
+            pending.extend((child, True) for child in value)
+            continue
+        if value is None or type(value) in {str, bool, int}:
+            continue
+        if type(value) is float and math.isfinite(value):
+            continue
+        raise ValueError(f"{field_name} must contain portable JSON values")
+
+
+def _validate_lease_fields(
+    lease: CapabilityLease,
+    *,
+    enforce_relations: bool = False,
+) -> None:
+    for field_name in ("capability", "token_ref", "lease_id"):
+        value = getattr(lease, field_name)
+        if type(value) is not str or not value:
+            raise ValueError(f"capability lease {field_name} must be a non-empty string")
+    expires_at = _finite_epoch(lease.expires_at, "capability lease expires_at")
+    issued_at = _finite_epoch(lease.issued_at, "capability lease issued_at")
+    if type(lease.durable) is not bool:
+        raise ValueError("capability lease durable must be a boolean")
+    _validate_json_scope(lease.scope)
+    if enforce_relations and issued_at > expires_at:
+        raise ValueError("capability lease issued_at cannot exceed expires_at")
+    if lease.max_expires_at is not None:
+        max_expires_at = _finite_epoch(
+            lease.max_expires_at,
+            "capability lease max_expires_at",
+        )
+        if enforce_relations and expires_at > max_expires_at:
+            raise ValueError("capability lease expires_at cannot exceed max_expires_at")
 
 
 @dataclass(frozen=True)
@@ -272,10 +355,32 @@ class CapabilityVault:
             return None
         return lease.token_ref
 
-    def admit(self, request: CapabilityRequest, lease: CapabilityLease) -> CapabilityLease:
+    def admit(
+        self,
+        request: CapabilityRequest,
+        lease: CapabilityLease,
+        *,
+        now: float | None = None,
+    ) -> CapabilityLease:
         """Store a granted lease after enforcing least-privilege (grant scope ⊆ request scope).
         Raises ``ValueError`` if the broker tried to widen scope or grant another capability."""
+        _validate_lease_fields(lease, enforce_relations=True)
+        current_time = time.time() if now is None else _finite_epoch(now, "lease admission time")
         validate_lease_admission(request.capability, request.scope, lease.capability, lease.scope)
+        if lease.issued_at > current_time:
+            raise ValueError("broker granted a future-issued capability lease")
+        lifetime_start = lease.issued_at if lease.issued_at > 0 else current_time
+        lifetime_ceiling = (
+            lease.max_expires_at
+            if lease.max_expires_at is not None
+            else lease.expires_at
+        )
+        if lifetime_ceiling - lifetime_start > request.ttl_seconds:
+            raise ValueError("broker granted a capability lease beyond the requested ttl")
+        if not lease.is_valid(current_time):
+            raise ValueError("broker granted an already-expired capability lease")
+        if self._is_revoked(lease):
+            raise ValueError("broker granted an already-revoked capability lease")
         self._leases[lease.capability] = lease
         return lease
 
@@ -348,9 +453,13 @@ class CapabilityVault:
             all_revoked=all_revoked,
         )
 
-    def install(self, lease: CapabilityLease) -> None:
-        """Directly install a lease (no scope re-check) — used on restore to rehydrate durable
-        leases from a trusted checkpoint. The lease was already scope-checked at grant time."""
+    def install(self, lease: CapabilityLease, *, now: float | None = None) -> None:
+        """Install a retained lease after validating structure and temporal relations."""
+
+        _validate_lease_fields(lease, enforce_relations=True)
+        current_time = time.time() if now is None else _finite_epoch(now, "lease install time")
+        if lease.issued_at > current_time:
+            raise ValueError("cannot install a future-issued capability lease")
         self._leases[lease.capability] = lease
 
 
@@ -368,9 +477,11 @@ class AutoGrantBroker:
 
         clock = self.now if callable(self.now) else time.time
         ttl = req.ttl_seconds or self.ttl_seconds
+        issued_at = clock()
         return CapabilityLease(
             capability=req.capability,
             token_ref=f"auto:{req.capability}",
-            expires_at=clock() + ttl,
+            expires_at=issued_at + ttl,
             scope=dict(req.scope),
+            issued_at=issued_at,
         )

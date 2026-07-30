@@ -518,6 +518,194 @@ def test_sync_tool_handler_sees_caller_context_variables(tmp_path: Path) -> None
     assert seen == ["acme"]
 
 
+@pytest.mark.parametrize(
+    ("boundary_kind", "expected_error_code"),
+    [("cancel", "cancelled"), ("timeout", "run_timeout")],
+)
+def test_abandoned_sync_tool_discards_outbox_and_refuses_late_emit(
+    tmp_path: Path,
+    boundary_kind: str,
+    expected_error_code: str,
+) -> None:
+    token = CancellationToken()
+    staged = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    late_errors: list[str] = []
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                ctx.emit_outbox("mail:first", {"body": "discard on boundary"})
+                staged.set()
+                release.wait(timeout=10)
+                try:
+                    ctx.emit_outbox("mail:late", {"body": "must be refused"})
+                except ToolExecutionError as exc:
+                    late_errors.append(exc.error_code)
+                else:  # pragma: no cover - the assertion below makes acceptance a test failure
+                    late_errors.append("accepted")
+                finally:
+                    finished.set()
+                return ToolResult(ok=True, content={})
+
+            return [
+                ToolSpec(
+                    id="sync.outbox_abandoned",
+                    description="stage outbox before an abandoned boundary",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    limits = RunLimits(max_duration_s=1) if boundary_kind == "timeout" else RunLimits()
+    loop = AgentLoop(
+        spec=_spec(tmp_path, limits=limits),
+        model_adapter=FakeModelAdapter(
+            turns=[ModelTurn(tool_calls=(fake_tool_call("sync_outbox_abandoned", {}, "c1"),))]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(
+                bindings=(
+                    tool_binding(
+                        "sync.outbox_abandoned",
+                        runtime={
+                            "external_side_effect": True,
+                            "side_effect_delivery": "outbox",
+                        },
+                    ),
+                )
+            )
+        ),
+        tool_providers=(Provider(),),
+        cancellation_token=token,
+        async_tool_cancel_grace_s=0.05,
+    )
+
+    async def run() -> object:
+        pending = asyncio.create_task(loop.arun_once("go"))
+        assert await asyncio.to_thread(staged.wait, 5)
+        assert loop.pending_outbox() == []
+        assert loop.due_outbox(10**20) == []
+        if boundary_kind == "cancel":
+            token.cancel()
+        return await asyncio.wait_for(pending, timeout=5)
+
+    result = asyncio.run(run())
+
+    assert result.status == "limited"
+    assert result.error_code == expected_error_code
+    assert loop.pending_outbox() == []
+    assert loop.due_outbox(10**20) == []
+    release.set()
+    assert finished.wait(timeout=5)
+    assert late_errors == ["tool_call_not_in_flight"]
+    assert loop.pending_outbox() == []
+
+
+def test_sync_child_thread_cannot_stage_into_the_next_calls_outbox(tmp_path: Path) -> None:
+    second_call_started = threading.Event()
+    late_emit_finished = threading.Event()
+    child_threads: list[threading.Thread] = []
+    late_errors: list[str] = []
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def spawn_late_emit(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+
+                def emit_during_next_call() -> None:
+                    if not second_call_started.wait(timeout=5):
+                        late_errors.append("second_call_did_not_start")
+                        late_emit_finished.set()
+                        return
+                    try:
+                        ctx.emit_outbox("mail:late", {"body": "from the previous call"})
+                    except ToolExecutionError as exc:
+                        late_errors.append(exc.error_code)
+                    else:  # pragma: no cover - the assertion below makes acceptance a test failure
+                        late_errors.append("accepted")
+                    finally:
+                        late_emit_finished.set()
+
+                child = threading.Thread(target=emit_during_next_call, daemon=True)
+                child_threads.append(child)
+                child.start()
+                return ToolResult(ok=True, content={})
+
+            def stage_current_emit(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                second_call_started.set()
+                if not late_emit_finished.wait(timeout=5):
+                    raise TimeoutError("previous call's child thread did not finish")
+                staged = ctx.emit_outbox("mail:current", {"body": "from the current call"})
+                return ToolResult(ok=True, content=staged)
+
+            return [
+                ToolSpec(
+                    id="sync.spawn_late_emit",
+                    description="spawn a child that outlives this tool call",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="read",
+                    handler=spawn_late_emit,
+                ),
+                ToolSpec(
+                    id="sync.stage_current_emit",
+                    description="stage an outbox request for the current tool call",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=stage_current_emit,
+                ),
+            ]
+
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(
+                    tool_calls=(
+                        fake_tool_call("sync_spawn_late_emit", {}, "c1"),
+                        fake_tool_call("sync_stage_current_emit", {}, "c2"),
+                    )
+                ),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(
+                bindings=(
+                    tool_binding("sync.spawn_late_emit"),
+                    tool_binding(
+                        "sync.stage_current_emit",
+                        runtime={
+                            "external_side_effect": True,
+                            "side_effect_delivery": "outbox",
+                        },
+                    ),
+                )
+            )
+        ),
+        tool_providers=(Provider(),),
+    )
+
+    result = asyncio.run(loop.arun_once("go"))
+
+    for child in child_threads:
+        child.join(timeout=5)
+    assert result.status == "completed"
+    assert late_errors == ["tool_call_not_in_flight"]
+    assert [request.destination for request in loop.pending_outbox()] == ["mail:current"]
+
+
 def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> None:
     """An abandoned handler keeps the authorization of the call it was invoked for.
 

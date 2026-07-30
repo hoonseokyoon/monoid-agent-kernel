@@ -11,6 +11,7 @@ from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.core.control_audit import ControlAuditPolicy
 from monoid_agent_kernel.core.lifecycle import LoopSession, SessionState
 from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_result
+from monoid_agent_kernel.core.wire_validation import parse_float
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManager
 from monoid_agent_kernel.reference.backend.ports import LoopPort, TokenClaimsPort
@@ -354,14 +355,14 @@ class BackendCommandService:
                 )
             )
         if ctype == "revoke_capability":
-            before = args.get("before")
+            before = None if args.get("before") is None else parse_float(args, "before")
             return ok(
                 self._context.capability_control.revoke_capability(
                     run_id,
                     token,
                     capability=(str(args["capability"]) if args.get("capability") else None),
                     lease_id=(str(args["lease_id"]) if args.get("lease_id") else None),
-                    before=(float(before) if before is not None else None),
+                    before=before,
                     reason=command.reason,
                 )
             )

@@ -2,16 +2,18 @@
 call a webhook) — without performing the IO in the core.
 
 The symmetric half of the inbox (``core/inbox.py``) and the outbound twin of a capability lease:
-when a tool wants to send something externally it **stages** an :class:`OutboxRequest` in a per-run
-:class:`Outbox` (append-only, checkpointed) rather than calling out inline. An *edge* relay (the
-reference ``RunnerBackend``) drains pending requests through an :class:`OutboxSender` and marks them
-dispatched — at-least-once, made effectively-once by the ``idempotency_key`` the external target
-honors (the Transactional-Outbox pattern with the checkpoint as the transaction).
+when a tool wants to send something externally it **stages** an :class:`OutboxRequest` in an
+invocation-private transaction rather than calling out inline. A valid successful tool result
+commits it to the per-run :class:`Outbox` (append-only, checkpointed); every unsuccessful invocation
+discards it before an edge can observe it. The edge relay (the reference ``RunnerBackend``) drains
+committed pending requests through an :class:`OutboxSender` and marks them dispatched —
+at-least-once, made effectively-once by the ``idempotency_key`` the external target honors (the
+Transactional-Outbox pattern with the checkpoint as the transaction).
 
 Security invariants (mirror the capability lease):
   - the secret never enters the core — a request carries ``token_ref`` (a capability lease handle),
     resolved to the real credential at the edge by the sender;
-  - the request is gated by a capability lease before it is ever staged (the binding declares
+  - the request is gated by a capability lease before it can commit (the binding declares
     ``requires_lease``; the loop's gate brokers it), so egress is least-privilege and revocable.
 """
 
@@ -142,6 +144,25 @@ class OutboxReceipt:
     error: str = ""
     retryable: bool = False
 
+    def __post_init__(self) -> None:
+        validate_outbox_receipt(self)
+
+
+def validate_outbox_receipt(value: Any) -> OutboxReceipt:
+    """Validate an edge sender result before it changes durable dispatch state."""
+
+    if not isinstance(value, OutboxReceipt):
+        raise ValueError("outbox sender must return OutboxReceipt")
+    if type(value.ok) is not bool:
+        raise ValueError("outbox receipt ok must be a boolean")
+    if type(value.reference) is not str:
+        raise ValueError("outbox receipt reference must be a string")
+    if type(value.error) is not str:
+        raise ValueError("outbox receipt error must be a string")
+    if type(value.retryable) is not bool:
+        raise ValueError("outbox receipt retryable must be a boolean")
+    return value
+
 
 @runtime_checkable
 class OutboxSender(Protocol):
@@ -191,6 +212,8 @@ class Outbox:
         request = self._requests.get(request_id)
         if request is None:
             return None
+        if request.status in {"dispatched", "failed"}:
+            return request
         request.status = status
         if attempts is not None:
             request.attempts = attempts

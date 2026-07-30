@@ -51,7 +51,9 @@ def _drain_to_sentinel(q: queue.Queue, *, deadline_s: float = 15.0) -> None:
             return
 
 
-def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> type[BaseHTTPRequestHandler]:
+def make_backend_handler(
+    backend: RunnerBackend, *, admin_token: str | None
+) -> type[BaseHTTPRequestHandler]:
     class BackendHttpHandler(BaseHTTPRequestHandler):
         server_version = "MonoidBackend/0.2"
 
@@ -131,7 +133,12 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     run_id = parts[2]
                     self._write_json(backend.job_status(run_id, self._bearer_token(), parts[4]))
                     return
-                if len(parts) == 6 and parts[:2] == ["v1", "runs"] and parts[3] == "jobs" and parts[5] == "logs":
+                if (
+                    len(parts) == 6
+                    and parts[:2] == ["v1", "runs"]
+                    and parts[3] == "jobs"
+                    and parts[5] == "logs"
+                ):
                     run_id = parts[2]
                     query = parse_qs(parsed.query)
                     tail_raw = (query.get("tail_bytes") or [None])[0]
@@ -151,14 +158,24 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     run_id = parts[2]
                     self._write_json(backend.proposal(run_id, self._bearer_token()))
                     return
-                if len(parts) == 5 and parts[:2] == ["v1", "runs"] and parts[3:5] == ["proposal", "diff"]:
+                if (
+                    len(parts) == 5
+                    and parts[:2] == ["v1", "runs"]
+                    and parts[3:5] == ["proposal", "diff"]
+                ):
                     run_id = parts[2]
                     self._write_json(backend.proposal_diff(run_id, self._bearer_token()))
                     return
-                if len(parts) >= 6 and parts[:2] == ["v1", "runs"] and parts[3:5] == ["proposal", "files"]:
+                if (
+                    len(parts) >= 6
+                    and parts[:2] == ["v1", "runs"]
+                    and parts[3:5] == ["proposal", "files"]
+                ):
                     run_id = parts[2]
                     proposal_path = unquote("/".join(parts[5:]))
-                    self._write_json(backend.proposal_file(run_id, self._bearer_token(), proposal_path))
+                    self._write_json(
+                        backend.proposal_file(run_id, self._bearer_token(), proposal_path)
+                    )
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "tenants"] and parts[3] == "usage":
                     self._require_admin()
@@ -174,7 +191,9 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                 if parsed.path == "/v1/runs":
                     self._require_admin()
                     request = self._parse_run_request(self._read_json())
-                    self._write_json(backend.submit_run(request).to_json(), status=HTTPStatus.ACCEPTED)
+                    self._write_json(
+                        backend.submit_run(request).to_json(), status=HTTPStatus.ACCEPTED
+                    )
                     return
                 if parsed.path == "/v1/runs/stream":
                     self._require_admin()
@@ -186,7 +205,12 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     run_id = parts[2]
                     self._write_json(backend.cancel_run(run_id, self._bearer_token()))
                     return
-                if len(parts) == 6 and parts[:2] == ["v1", "runs"] and parts[3] == "jobs" and parts[5] == "cancel":
+                if (
+                    len(parts) == 6
+                    and parts[:2] == ["v1", "runs"]
+                    and parts[3] == "jobs"
+                    and parts[5] == "cancel"
+                ):
                     run_id = parts[2]
                     self._write_json(backend.cancel_job(run_id, self._bearer_token(), parts[4]))
                     return
@@ -250,7 +274,9 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                             run_id,
                             self._bearer_token(),
                             kind=parse_str(payload, "kind"),
-                            request=require_object(payload["request"], "request") if "request" in payload else {},
+                            request=require_object(payload["request"], "request")
+                            if "request" in payload
+                            else {},
                         )
                     )
                     return
@@ -268,7 +294,9 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                             run_id,
                             self._bearer_token(),
                             task_id=task_id,
-                            result=require_object(payload["result"], "result") if "result" in payload else {},
+                            result=require_object(payload["result"], "result")
+                            if "result" in payload
+                            else {},
                             status=parse_str(payload, "status", default="answered"),
                         )
                     )
@@ -278,7 +306,9 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     action = parts[4]
                     payload = self._read_json()
                     if action == "export":
-                        self._write_json(backend.export_proposal_package(run_id, self._bearer_token()))
+                        self._write_json(
+                            backend.export_proposal_package(run_id, self._bearer_token())
+                        )
                         return
                     if action == "approve":
                         self._write_json(
@@ -332,16 +362,24 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
         def _parse_run_request(self, payload: dict[str, Any]) -> BackendRunRequest:
             max_duration_raw = payload.get("max_duration_s", 900)
             return BackendRunRequest(
-                tenant_id=str(payload["tenant_id"]),
-                user_id=str(payload["user_id"]),
-                workspace_root=Path(str(payload["workspace_root"])),
-                instruction=str(payload["instruction"]),
-                mode=str(payload.get("mode") or "propose"),  # type: ignore[arg-type]
-                workspace_backend=str(payload.get("workspace_backend") or "overlay"),  # type: ignore[arg-type]
-                max_steps=int(payload.get("max_steps") or 30),
-                max_tool_calls=int(payload.get("max_tool_calls") or 100),
-                max_bytes_read=int(payload.get("max_bytes_read") or 1_000_000),
-                max_duration_s=None if max_duration_raw is None else int(max_duration_raw),
+                tenant_id=parse_str(payload, "tenant_id"),
+                user_id=parse_str(payload, "user_id"),
+                workspace_root=Path(parse_str(payload, "workspace_root")),
+                instruction=parse_str(payload, "instruction"),
+                mode=parse_str(payload, "mode", default="propose"),  # type: ignore[arg-type]
+                workspace_backend=parse_str(  # type: ignore[arg-type]
+                    payload,
+                    "workspace_backend",
+                    default="overlay",
+                ),
+                max_steps=parse_int(payload, "max_steps", default=30),
+                max_tool_calls=parse_int(payload, "max_tool_calls", default=100),
+                max_bytes_read=parse_int(payload, "max_bytes_read", default=1_000_000),
+                max_duration_s=(
+                    None
+                    if max_duration_raw is None
+                    else parse_int(payload, "max_duration_s", default=900)
+                ),
                 permission_policy=PermissionPolicy.from_json(payload.get("permission_policy")),
                 agent_definition=(
                     AgentDefinition.from_json(payload["agent_definition"])
@@ -354,7 +392,9 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                     else None
                 ),
                 multi_turn=parse_bool(payload, "multi_turn", default=False),
-                metadata=require_object(payload["metadata"], "metadata") if "metadata" in payload else {},
+                metadata=require_object(payload["metadata"], "metadata")
+                if "metadata" in payload
+                else {},
             )
 
         def _stream_run_sse(self, request: BackendRunRequest) -> None:
@@ -386,8 +426,10 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                 # No frame was produced -> a pre-stream failure; re-raise it as a normal error
                 # response (SSE headers were never sent). future is done once the sentinel lands.
                 exc = future.exception()
-                raise exc if exc is not None else NativeAgentError(
-                    "stream produced no output", error_code="internal_error"
+                raise (
+                    exc
+                    if exc is not None
+                    else NativeAgentError("stream produced no output", error_code="internal_error")
                 )
             # Commit to the SSE body. This route is long-lived, so clear the 30s socket timeout.
             self.connection.settimeout(None)
@@ -401,7 +443,9 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
                 try:
                     self.wfile.write(
                         b"data: "
-                        + json.dumps(frame, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                        + json.dumps(
+                            frame, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                        ).encode("utf-8")
                         + b"\n\n"
                     )
                     self.wfile.flush()
@@ -462,13 +506,17 @@ def make_backend_handler(backend: RunnerBackend, *, admin_token: str | None) -> 
             else:
                 # Unexpected: redact (no stack trace / internals to the client) and log full
                 # detail server-side under a correlation id.
-                self._write_error(HTTPStatus.INTERNAL_SERVER_ERROR, redact_internal_error(_LOGGER, self, exc))
+                self._write_error(
+                    HTTPStatus.INTERNAL_SERVER_ERROR, redact_internal_error(_LOGGER, self, exc)
+                )
 
         def _write_error(self, status: HTTPStatus, message: str) -> None:
             self._write_json({"error": message}, status=status)
 
-        def _write_json(self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        def _write_json(
+            self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
+        ) -> None:
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -485,4 +533,6 @@ def create_backend_server(
     port: int,
     admin_token: str,
 ) -> HardenedThreadingHTTPServer:
-    return HardenedThreadingHTTPServer((host, port), make_backend_handler(backend, admin_token=admin_token))
+    return HardenedThreadingHTTPServer(
+        (host, port), make_backend_handler(backend, admin_token=admin_token)
+    )

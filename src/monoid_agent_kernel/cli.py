@@ -22,6 +22,7 @@ from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     StaticRuntimeConfigProvider,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import RunnerBackend
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -240,7 +241,9 @@ def run(
         if workspace is not None:
             raise click.ClickException("--spec cannot be combined with --workspace; the spec file is authoritative")
         try:
-            spec = AgentRunSpec.from_json(json.loads(spec_file.read_text(encoding="utf-8")))
+            spec = AgentRunSpec.from_json(
+                loads_json_ingress(spec_file.read_text(encoding="utf-8"))
+            )
         except Exception as exc:
             raise click.ClickException(f"failed to load --spec: {exc}") from exc
         if run_id is not None:
@@ -476,7 +479,7 @@ def status_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> Non
     # finished and a script polling this must not read that as still running.
     event_log_error = str(payload.get("event_log_error") or "")
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         if event_log_error:
             raise click.ClickException(event_log_error)
         return
@@ -510,7 +513,7 @@ def jobs_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
     payload = {"run_dir": str(run_dir), "jobs": public_job_artifacts(run_dir)}
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         return
     for job in payload["jobs"]:
         click.echo(
@@ -534,7 +537,7 @@ def job_status_command(job_id: str, run_dir_or_id: str, run_root: Path, json_out
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
     payload = public_job_artifact_for(run_dir, job_id)
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         return
     click.echo(f"job_id: {payload.get('job_id', '')}")
     click.echo(f"status: {payload.get('status', '')}")
@@ -575,7 +578,7 @@ def job_logs_command(
             offset=next_offset,
         )
         if json_output:
-            click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         elif payload.get("content"):
             click.echo(payload["content"], nl=False)
         next_offset = int(payload.get("next_offset") or 0)
@@ -594,7 +597,7 @@ def job_cancel_command(job_id: str, run_dir_or_id: str, run_root: Path, json_out
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
     payload = request_job_cancel(run_dir, job_id)
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"cancel_requested: {payload['job_id']}")
 
@@ -610,18 +613,20 @@ def proposal(run_dir_or_id: str, run_root: Path, file_path: str | None, json_out
     proposal_path = run_dir / "proposal.json"
     if not proposal_path.exists():
         raise click.ClickException(f"proposal.json not found: {proposal_path}")
-    payload = json.loads(proposal_path.read_text(encoding="utf-8"))
+    payload = loads_json_ingress(proposal_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise click.ClickException("proposal.json must contain an object")
     if file_path is not None:
         file_payload = _proposal_file_payload(run_dir, payload, file_path)
         if json_output:
-            click.echo(json.dumps(file_payload, ensure_ascii=False, sort_keys=True))
+            click.echo(
+                json.dumps(file_payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            )
         else:
             click.echo(file_payload["content"])
         return
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         return
     click.echo(f"run_id: {payload.get('run_id', '')}")
     click.echo(f"mode: {payload.get('mode', '')}")
@@ -649,7 +654,7 @@ def validate(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
         "issues": [issue.__dict__ for issue in issues],
     }
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     elif issues:
         for issue in issues:
             click.echo(f"{issue.path}: {issue.message}")
@@ -682,7 +687,7 @@ def package_export(run_dir_or_id: str, run_root: Path, output: Path, json_output
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"package: {output}")
         click.echo(f"package_hash: {payload['package_hash']}")
@@ -703,7 +708,7 @@ def package_verify(package_or_run_dir: str, run_root: Path, json_output: bool) -
         "package": result.package,
     }
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     elif result.ok:
         click.echo("ok")
         click.echo(f"package_hash: {result.package.get('package_hash', '')}")
@@ -723,7 +728,7 @@ def package_inspect(package_or_run_dir: str, run_root: Path, json_output: bool) 
     source = _resolve_package_source(package_or_run_dir, run_root)
     payload = inspect_package(source)
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         return
     click.echo(f"ok: {payload['ok']}")
     click.echo(f"package_hash: {payload.get('package', {}).get('package_hash', '')}")
@@ -743,7 +748,7 @@ def package_import(package_or_run_dir: str, run_root: Path, output: Path, json_o
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"imported: {payload['output']}")
         click.echo(f"package_hash: {payload['package_hash']}")
@@ -785,7 +790,7 @@ def package_approve(
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     if json_output:
-        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"approval: {output_path}")
         click.echo(f"approval_hash: {approval['approval_hash']}")
@@ -820,7 +825,7 @@ def package_reject(
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     if json_output:
-        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"approval: {output_path}")
         click.echo(f"approval_hash: {approval['approval_hash']}")
@@ -866,7 +871,7 @@ def package_apply(
         raise click.ClickException(str(exc)) from exc
     payload = result.to_json()
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"status: {payload['status']}")
         click.echo(f"apply_result: {output_path}")
@@ -1277,7 +1282,7 @@ def _load_agent_runtime_config(
     config_file = runtime_config_file or agent_definition_file
     assert config_file is not None
     try:
-        payload = json.loads(config_file.read_text(encoding="utf-8"))
+        payload = loads_json_ingress(config_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise click.ClickException(f"invalid agent config JSON: {exc.msg}") from exc
     try:
@@ -1301,7 +1306,7 @@ def _load_permission_policy(
     policy = PermissionPolicy()
     if policy_file is not None:
         try:
-            payload = json.loads(policy_file.read_text(encoding="utf-8"))
+            payload = loads_json_ingress(policy_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise ValueError(f"invalid permission policy JSON: {exc.msg}") from exc
         policy = PermissionPolicy.from_json(payload)
@@ -1346,7 +1351,7 @@ def _proposal_file_payload(run_dir: Path, proposal: dict[str, Any], file_path: s
 
 def _compact_event_line(line: str) -> str:
     try:
-        event = json.loads(line)
+        event = loads_json_ingress(line)
     except json.JSONDecodeError:
         return line.rstrip("\n")
     # Tool activity goes through the shared narration projection (the same one the Studio feed

@@ -21,6 +21,7 @@ from monoid_agent_kernel.reference.backend.run_types import (
     BackendRunRequest,
     BackendRunSubmission,
     _PreparedRun,
+    normalize_backend_run_request,
 )
 from monoid_agent_kernel.workspace.paths import is_within
 
@@ -51,6 +52,7 @@ class RunPreparationService:
         self._context = context
 
     def prepare(self, request: BackendRunRequest) -> _PreparedRun:
+        request = normalize_backend_run_request(request)
         self.validate_request(request)
         workspace_root = request.workspace_root.resolve()
         self.check_workspace_allowed(workspace_root)

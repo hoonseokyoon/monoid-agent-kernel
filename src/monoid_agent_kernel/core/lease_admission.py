@@ -8,7 +8,7 @@ from typing import Any, Mapping
 from monoid_agent_kernel.core.scope import scope_within
 
 
-@dataclass(frozen=True)
+@dataclass
 class LeaseAdmissionError(ValueError):
     """Raised when a capability lease cannot be admitted for a request."""
 
@@ -26,8 +26,23 @@ def validate_lease_admission(
     lease_scope: Mapping[str, Any],
 ) -> None:
     """Validate that a granted lease is no broader than the original request."""
-    requested = str(request_capability)
-    granted = str(lease_capability)
+    if type(request_capability) is not str or not request_capability:
+        raise LeaseAdmissionError(
+            "invalid_request_capability",
+            "requested capability must be a non-empty string",
+        )
+    if type(lease_capability) is not str or not lease_capability:
+        raise LeaseAdmissionError(
+            "invalid_lease_capability",
+            "granted capability must be a non-empty string",
+        )
+    if not isinstance(request_scope, Mapping) or not isinstance(lease_scope, Mapping):
+        raise LeaseAdmissionError(
+            "invalid_scope",
+            "capability request and lease scopes must be objects",
+        )
+    requested = request_capability
+    granted = lease_capability
     if granted != requested:
         raise LeaseAdmissionError(
             "capability_mismatch",

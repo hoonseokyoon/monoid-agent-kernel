@@ -18,6 +18,19 @@ def test_scope_within_preserves_list_numeric_and_scalar_rules() -> None:
     assert scope_within({"region": "us"}, {"region": "us"})
     assert not scope_within({"region": "eu"}, {"region": "us"})
     assert scope_within({"allowed_domains": ["x"]}, {})
+    assert not scope_within({}, {"allowed_domains": ["a.edu"]})
+    assert not scope_within({}, {"max_results": 5})
+    assert not scope_within({}, {"binding_id": "search_docs"})
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["blocked_domains", "denied_paths", "command_deny_prefixes"],
+)
+def test_scope_within_deny_lists_narrow_by_superset(key: str) -> None:
+    assert scope_within({key: ["base", "extra"]}, {key: ["base"]})
+    assert not scope_within({key: []}, {key: ["base"]})
+    assert not scope_within({}, {key: ["base"]})
 
 
 def test_scope_within_allows_wildcard_domain_narrowing() -> None:
@@ -90,3 +103,16 @@ def test_effective_signed_scope_reports_policy_violations(
 
     assert exc_info.value.key == key
     assert exc_info.value.reason == reason
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_effective_signed_scope_rejects_nonfinite_numeric_caps(value: float) -> None:
+    with pytest.raises(ScopePolicyError) as signed_error:
+        effective_signed_scope({"max_results": value}, {})
+    assert signed_error.value.reason == "signed_not_positive"
+
+    with pytest.raises(ScopePolicyError) as request_error:
+        effective_signed_scope({"max_results": 10}, {"max_results": value})
+    assert request_error.value.reason == "request_not_positive"
+
+    assert not scope_within({"max_results": value}, {"max_results": value})

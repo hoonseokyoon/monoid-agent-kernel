@@ -20,6 +20,17 @@ def test_normalize_usage_text_only_stays_three_keys() -> None:
     assert out == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
 
 
+def test_normalize_usage_derives_a_conservative_total() -> None:
+    assert normalize_usage({"input_tokens": 100, "output_tokens": 50}) == {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "total_tokens": 150,
+    }
+    assert normalize_usage(
+        {"input_tokens": 100, "output_tokens": 50, "total_tokens": 12}
+    )["total_tokens"] == 150
+
+
 def test_normalize_usage_preserves_anthropic_cache() -> None:
     out = normalize_usage(
         {
@@ -72,13 +83,13 @@ def test_run_limits_token_budget_round_trip() -> None:
 
 
 def test_token_budget_settles_limited(tmp_path: Path) -> None:
-    """Once accumulated usage crosses the cap, the next turn settles ``limited`` instead of
+    """Once accumulated usage reaches the cap, the next turn settles ``limited`` instead of
     starting (the run actuals, not an estimate, drive the check)."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     workspace.joinpath("notes.md").write_text("hello\n", encoding="utf-8")
     # Turn 1 calls a tool (so the loop continues) and reports 10 total tokens; turn 2's
-    # pre-call check sees 10 > 5 and stops before paying for it.
+    # pre-call check sees that the cap is fully spent and stops before paying for it.
     adapter = FakeModelAdapter(
         turns=[
             ModelTurn(
@@ -104,6 +115,37 @@ def test_token_budget_settles_limited(tmp_path: Path) -> None:
     assert result.status == "limited"
     assert result.error_code == "total_tokens_exceeded"
     # The second turn was never sent.
+    assert len(adapter.requests) == 1
+
+
+def test_token_budget_uses_derived_total_when_provider_omits_it(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace.joinpath("notes.md").write_text("hello\n", encoding="utf-8")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "c1"),),
+                usage={"input_tokens": 6, "output_tokens": 4},
+            ),
+            ModelTurn(response_id="r2", final_text="done"),
+        ]
+    )
+    spec = AgentRunSpec(
+        workspace_root=workspace,
+        run_root=tmp_path / "runs",
+        limits=RunLimits(max_total_tokens=10),
+    )
+
+    result = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("fs.read", "run.finish")),
+    ).run_once("read the notes")
+
+    assert result.status == "limited"
+    assert result.error_code == "total_tokens_exceeded"
     assert len(adapter.requests) == 1
 
 

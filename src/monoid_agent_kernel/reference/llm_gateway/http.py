@@ -42,7 +42,11 @@ def make_llm_gateway_handler(
                     self._write_json({"ok": True})
                     return
                 parts = [part for part in parsed.path.split("/") if part]
-                if len(parts) == 5 and parts[:3] == ["internal", "llm", "tenants"] and parts[4] == "usage":
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["internal", "llm", "tenants"]
+                    and parts[4] == "usage"
+                ):
                     self._require_admin()
                     self._write_json(gateway.tenant_usage(parts[3]))
                     return
@@ -154,8 +158,10 @@ def make_llm_gateway_handler(
                 status=status,
             )
 
-        def _write_json(self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        def _write_json(
+            self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
+        ) -> None:
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -183,7 +189,11 @@ def make_llm_gateway_handler(
 
         def _write_sse_frame(self, frame: dict[str, Any]) -> None:
             # Single-line JSON (no indent), flushed per frame so the stream is live.
-            self.wfile.write(b"data: " + json.dumps(frame, ensure_ascii=False).encode("utf-8") + b"\n\n")
+            self.wfile.write(
+                b"data: "
+                + json.dumps(frame, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                + b"\n\n"
+            )
             self.wfile.flush()
 
     return LlmGatewayHttpHandler
@@ -260,4 +270,6 @@ def create_llm_gateway_server(
     port: int,
     admin_token: str,
 ) -> HardenedThreadingHTTPServer:
-    return HardenedThreadingHTTPServer((host, port), make_llm_gateway_handler(gateway, admin_token=admin_token))
+    return HardenedThreadingHTTPServer(
+        (host, port), make_llm_gateway_handler(gateway, admin_token=admin_token)
+    )

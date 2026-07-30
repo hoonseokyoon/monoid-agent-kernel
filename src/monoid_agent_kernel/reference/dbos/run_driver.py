@@ -8,7 +8,6 @@ are outside this import and construction path.
 
 from __future__ import annotations
 
-import math
 import re
 import threading
 import time
@@ -24,6 +23,7 @@ from monoid_agent_kernel.core.checkpoint import (
     RunCheckpoint,
     load_latest_checked,
 )
+from monoid_agent_kernel.core.json_ingress import is_finite_json_number
 from monoid_agent_kernel.core.lifecycle import state_from_suspension
 from monoid_agent_kernel.core.result import (
     Suspension,
@@ -105,12 +105,12 @@ class DbosRunConfig:
             raise ValueError("DBOS name, application_version, and executor_id are required")
         if (
             not self.queue_name
-            or not math.isfinite(self.polling_interval_s)
+            or not is_finite_json_number(self.polling_interval_s)
             or self.polling_interval_s <= 0
         ):
             raise ValueError("DBOS queue settings must be positive and non-empty")
         if (
-            not math.isfinite(self.checkpoint_retry_interval_s)
+            not is_finite_json_number(self.checkpoint_retry_interval_s)
             or self.checkpoint_retry_interval_s <= 0
         ):
             raise ValueError("DBOS checkpoint_retry_interval_s must be positive")
@@ -120,7 +120,7 @@ class DbosRunConfig:
             or self.shutdown_grace_s < 1
         ):
             raise ValueError("DBOS shutdown_grace_s must be a positive whole number of seconds")
-        if not math.isfinite(self.local_task_wait_s) or self.local_task_wait_s <= 0:
+        if not is_finite_json_number(self.local_task_wait_s) or self.local_task_wait_s <= 0:
             raise ValueError("DBOS local_task_wait_s must be positive")
 
     def _host_config(self) -> _DbosHostConfig:
@@ -153,6 +153,9 @@ class DbosResumeCommand:
             or self.checkpoint_seq < 1
         ):
             raise ValueError("checkpoint_seq must be a positive integer")
+        if not is_finite_json_number(self.created_at):
+            raise ValueError("created_at must be a finite number")
+        object.__setattr__(self, "created_at", float(self.created_at))
 
     @property
     def identity_sha256(self) -> str:
@@ -189,7 +192,7 @@ class DbosResumeCommand:
             run_id=str(payload.get("run_id") or ""),
             command_id=str(payload.get("command_id") or ""),
             checkpoint_seq=checkpoint_seq,
-            created_at=float(payload.get("created_at") or 0.0),
+            created_at=payload.get("created_at", 0.0),  # type: ignore[arg-type]
         )
         recorded_identity = str(payload.get("identity_sha256") or "")
         if recorded_identity and recorded_identity != command.identity_sha256:

@@ -5,6 +5,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
+
 from monoid_agent_kernel.core._util import utc_timestamp
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -128,11 +130,9 @@ class AgentEvent:
 
 
 class EventSink(Protocol):
-    def emit(self, event: AgentEvent) -> None:
-        ...
+    def emit(self, event: AgentEvent) -> None: ...
 
-    def close(self) -> None:
-        ...
+    def close(self) -> None: ...
 
 
 @dataclass
@@ -194,11 +194,11 @@ def make_agent_event(
         schema_version=EVENT_SCHEMA_VERSION,
         event_id=f"evt_{uuid.uuid4().hex}",
         seq=seq,
-        run_id=run_id,
-        turn_id=turn_id,
-        parent_id=parent_id,
+        run_id=normalize_unicode_scalars(run_id),
+        turn_id=None if turn_id is None else normalize_unicode_scalars(turn_id),
+        parent_id=None if parent_id is None else normalize_unicode_scalars(parent_id),
         timestamp=utc_timestamp(),
-        type=event_type,
-        level=level,
-        data=dict(data or {}),
+        type=normalize_unicode_scalars(event_type),  # type: ignore[arg-type]
+        level=normalize_unicode_scalars(level),  # type: ignore[arg-type]
+        data=normalize_json_ingress(data or {}),
     )

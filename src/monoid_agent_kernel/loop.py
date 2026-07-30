@@ -6,6 +6,7 @@ import fnmatch
 import inspect
 import json
 import logging
+import math
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -49,6 +50,11 @@ from monoid_agent_kernel.core.media import (
     normalize_inline_media_part,
     resolve_wire_messages,
 )
+from monoid_agent_kernel.core.json_ingress import (
+    loads_json_ingress,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.core.context import (
     ContextProvider,
     TurnContext,
@@ -71,6 +77,10 @@ from monoid_agent_kernel.core.agents import (
     validate_runtime_config,
 )
 from monoid_agent_kernel.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
+from monoid_agent_kernel._runtime_config_ingress import (
+    normalize_runtime_config,
+    preflight_runtime_config,
+)
 from monoid_agent_kernel.core.result import (
     AgentRunResult,
     AgentTurnResult,
@@ -98,6 +108,8 @@ from monoid_agent_kernel.core.tool_surface import (
     ToolSurfaceSnapshot,
     allowed_immediate_registry_tool_ids,
     immediate_registry_tool_ids,
+    validate_tool_authorization,
+    validate_tool_surface_snapshot,
 )
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
@@ -145,7 +157,12 @@ from monoid_agent_kernel.core.capability import (
     CapabilityRequest,
     CapabilityVault,
 )
-from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
+from monoid_agent_kernel.core.outbox import (
+    Outbox,
+    OutboxReceipt,
+    OutboxRequest,
+    validate_outbox_receipt,
+)
 from monoid_agent_kernel.core.trace_context import new_traceparent
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.tasks import (
@@ -189,6 +206,8 @@ from monoid_agent_kernel.tools.base import (
     ToolRegistry,
     ToolResult,
     ToolSpec,
+    normalize_tool_result,
+    normalize_tool_spec,
 )
 from monoid_agent_kernel.tool_loader import FunctionToolProvider
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
@@ -204,6 +223,50 @@ class _CheckpointPersistError(RuntimeError):
 _LOGGER = logging.getLogger("monoid_agent_kernel.loop")
 
 
+def _require_operator_bool(value: object, field_name: str) -> None:
+    """Reject truthy/falsy substitutes for an operator-owned switch."""
+
+    if type(value) is not bool:
+        raise ValueError(f"AgentLoop {field_name} must be a boolean")
+
+
+def _require_operator_duration(value: object, field_name: str) -> float:
+    """Return one finite, non-negative operator-owned duration."""
+
+    message = f"AgentLoop {field_name} must be a finite non-negative number"
+    if type(value) not in {int, float} or value < 0:
+        raise ValueError(message)
+    try:
+        normalized = float(value)
+    except OverflowError as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(normalized):
+        raise ValueError(message)
+    return normalized
+
+
+def _web_runtime_budget(
+    runtime: Mapping[str, Any],
+    keys: tuple[str, ...],
+    default: int,
+    *,
+    minimum: int,
+) -> int:
+    """Read one web budget without turning malformed JSON controls into policy."""
+    selected: int | None = None
+    for key in keys:
+        if key not in runtime:
+            continue
+        value = runtime[key]
+        if type(value) is not int:
+            requirement = "non-negative" if minimum == 0 else "positive"
+            raise ValueError(f"web runtime {key} must be a {requirement} integer")
+        if value < minimum:
+            requirement = "non-negative" if minimum == 0 else "positive"
+            raise ValueError(f"web runtime {key} must be {requirement}")
+        if selected is None:
+            selected = value
+    return default if selected is None else selected
 
 
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
@@ -211,7 +274,9 @@ def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     tool id, binding id, and model name, so subagent allow/deny lists accept ids
     (``fs.read``), patterns (``mcp.*``, ``mcp.github.*``), or ``*`` for all."""
     candidates = (binding.ref.tool_id, binding.binding_id, binding.model_name or "")
-    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name)
+    return any(
+        fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name
+    )
 
 
 def _recoverable_turn_error(exc: BaseException) -> bool:
@@ -265,6 +330,38 @@ class FinishResult:
     summary: str
     outputs: tuple[str, ...] = ()
     notes: str | None = None
+
+
+@dataclass
+class _OutboxInvocation:
+    """Invocation-local outbox staging that is invisible to edge dispatch until committed."""
+
+    tool_call_id: str
+    turn_id: str
+    tool_event_id: str | None
+    _requests: list[OutboxRequest] = field(default_factory=list, repr=False)
+    _active: bool = field(default=True, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def stage(self, request: OutboxRequest) -> None:
+        with self._lock:
+            if not self._active:
+                raise ToolExecutionError(
+                    "tool call is no longer active; outbox staging was refused",
+                    error_code="tool_call_not_in_flight",
+                )
+            self._requests.append(request)
+
+    def close(self) -> None:
+        # A synchronous handler may still be unwinding in an abandoned worker. Closing the shared
+        # invocation object prevents that worker from publishing a late request after the run has
+        # stopped waiting for it.
+        with self._lock:
+            self._active = False
+
+    def requests(self) -> tuple[OutboxRequest, ...]:
+        with self._lock:
+            return tuple(self._requests)
 
 
 @dataclass
@@ -336,17 +433,60 @@ class AgentToolContext(ToolContext):
     # a refusal for authorization-bearing operations rather than an unrestricted scope.
     _call_fallback: CallContext | None = field(default=None, repr=False, compare=False)
 
+    # Outbox requests use a second, strictly call-local slot because they must not enter the globally
+    # dispatchable Outbox until the handler has returned a valid successful ToolResult. The same
+    # mutable invocation object is copied into an offloaded handler's ContextVar, so closing it also
+    # rejects late staging from an abandoned worker. Threads created by a handler do not inherit
+    # this authority: sharing a fallback would let a child from an earlier call stage into a later
+    # call's invocation.
+    _outbox_invocation_var: ContextVar[_OutboxInvocation | None] = field(
+        default_factory=lambda: ContextVar("monoid_outbox_invocation", default=None),
+        repr=False,
+        compare=False,
+    )
+
     def _live_call(self) -> CallContext | None:
         call = self._call_var.get()
         return self._call_fallback if call is None else call
 
-    def _enter_call(self, call: CallContext) -> None:
+    def _enter_call(self, call: CallContext, outbox_invocation: _OutboxInvocation) -> None:
+        if outbox_invocation.tool_call_id != call.tool_call_id:
+            raise ValueError("outbox invocation does not match the tool call")
         self._call_var.set(call)
         self._call_fallback = call
+        self._outbox_invocation_var.set(outbox_invocation)
 
-    def _exit_call(self) -> None:
+    def _exit_call(self, outbox_invocation: _OutboxInvocation) -> None:
+        outbox_invocation.close()
+        self._outbox_invocation_var.set(None)
         self._call_var.set(None)
         self._call_fallback = None
+
+    def _active_outbox_invocation(self, call: CallContext) -> _OutboxInvocation:
+        invocation = self._outbox_invocation_var.get()
+        if invocation is None or invocation.tool_call_id != call.tool_call_id:
+            raise ToolExecutionError(
+                "no tool call is in flight; outbox staging was refused",
+                error_code="tool_call_not_in_flight",
+            )
+        return invocation
+
+    def _commit_outbox_invocation(self, invocation: _OutboxInvocation) -> None:
+        if self.outbox is None:
+            raise ToolExecutionError("outbox is not available", error_code="outbox_unavailable")
+        for request in invocation.requests():
+            self.outbox.append(request)
+            self.recorder.emit(
+                "outbox.requested",
+                turn_id=invocation.turn_id,
+                parent_id=invocation.tool_event_id,
+                data={
+                    "request_id": request.id,
+                    "destination": request.destination,
+                    "capability": request.capability,
+                    "traceparent": request.traceparent,
+                },
+            )
 
     @property
     def _current_call(self) -> CallContext:
@@ -381,6 +521,10 @@ class AgentToolContext(ToolContext):
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
     ) -> dict[str, Any]:
+        path = normalize_unicode_scalars(path)
+        kind = normalize_unicode_scalars(kind)
+        label = None if label is None else normalize_unicode_scalars(label)
+        metadata = normalize_json_ingress(metadata)
         data, _digest = self.workspace.read_bytes(path)
         artifact = self.recorder.emit_artifact_bytes(
             workspace_path=self.workspace.normalize(path),
@@ -415,7 +559,9 @@ class AgentToolContext(ToolContext):
                 # capped when it reaches ``tool.call.started`` through ``args_preview``, so leaving
                 # it raw here made the second emit the wider door -- the twin-miss shape again. The
                 # tool's *return* value below stays raw: that goes back to the model, which wrote it.
-                "metadata": preview_value("metadata", dict(artifact.metadata), self.permission_policy),
+                "metadata": preview_value(
+                    "metadata", dict(artifact.metadata), self.permission_policy
+                ),
             },
         )
         return {
@@ -441,7 +587,9 @@ class AgentToolContext(ToolContext):
     def path_allowed(self, path: str, operation: str = "read") -> bool:
         try:
             rel = self.workspace.normalize(path)
-            permission_operation = operation if operation in {"read", "write", "artifact", "run"} else "read"
+            permission_operation = (
+                operation if operation in {"read", "write", "artifact", "run"} else "read"
+            )
             self.permission_policy.check_paths(permission_operation, (rel,))  # type: ignore[arg-type]
             scope = self._authorized_call.scope
             if scope.allowed_paths and not matches_path_patterns(rel, scope.allowed_paths):
@@ -469,6 +617,7 @@ class AgentToolContext(ToolContext):
         # a blank row and counted toward the ``completed/total`` denominator, making a capped plan
         # look permanently one step short of done. The count comes from the previewed length rather
         # than from ``PREVIEW_MAX_ITEMS`` so the cap stays stated in exactly one place.
+        items = normalize_json_ingress(items)
         self.plan = items
         published = preview_value("items", items, self.permission_policy, list_marker=False)
         data: dict[str, Any] = {"items": published}
@@ -478,7 +627,11 @@ class AgentToolContext(ToolContext):
         self.recorder.emit("plan.updated", data=data)
 
     def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
-        self.pending_finish = FinishResult(summary, tuple(outputs), notes)
+        self.pending_finish = FinishResult(
+            normalize_unicode_scalars(summary),
+            tuple(normalize_unicode_scalars(output) for output in outputs),
+            None if notes is None else normalize_unicode_scalars(notes),
+        )
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.shell_service.execute(args, self._authorized_call)
@@ -562,10 +715,14 @@ class AgentToolContext(ToolContext):
         )
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.search(args, self._authorized_call, capability_token=self.capability_token("web.search"))
+        return self.web_service.search(
+            args, self._authorized_call, capability_token=self.capability_token("web.search")
+        )
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.fetch(args, self._authorized_call, capability_token=self.capability_token("web.fetch"))
+        return self.web_service.fetch(
+            args, self._authorized_call, capability_token=self.capability_token("web.fetch")
+        )
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.web_service.context(
@@ -612,42 +769,45 @@ class AgentToolContext(ToolContext):
         expect_ack: bool = False,
         reply_to: str = "",
     ) -> dict[str, Any]:
-        """Stage a durable outbound side-effect. Captures the capability lease handle (never the
-        secret) so the edge sender can authenticate, appends the request to the run's outbox (which
-        is checkpointed), and emits ``outbox.requested``. The IO happens later, at the edge. With
-        ``expect_ack`` the edge delivers the send's receipt back as an inbox message (non-park)."""
+        """Stage an outbound side-effect in the current invocation's private transaction.
+
+        The loop publishes the request to the durable, edge-visible outbox only after the handler
+        returns a valid successful ToolResult (and strict outbox verification succeeds). With
+        ``expect_ack`` the edge delivers the send's receipt back as an inbox message (non-park).
+        """
         if self.outbox is None:
             raise ToolExecutionError("outbox is not available", error_code="outbox_unavailable")
-        call = self._current_call
+        call = self._authorized_call
+        invocation = self._active_outbox_invocation(call)
+        if type(expect_ack) is not bool:
+            raise ValueError("outbox expect_ack must be a boolean")
+        normalized_payload = normalize_json_ingress(payload)
+        if not isinstance(normalized_payload, dict):
+            raise ValueError("outbox payload must be an object")
+        normalized_destination = normalize_unicode_scalars(destination)
+        normalized_capability = normalize_unicode_scalars(capability)
         request = OutboxRequest(
-            destination=destination,
-            payload=dict(payload),
-            capability=capability,
-            token_ref=self.capability_token(capability) or "" if capability else "",
+            destination=normalized_destination,
+            payload=normalized_payload,
+            capability=normalized_capability,
+            token_ref=(self.capability_token(normalized_capability) or "")
+            if normalized_capability
+            else "",
             run_id=self.run_id,
-            idempotency_key=idempotency_key,
+            idempotency_key=normalize_unicode_scalars(idempotency_key),
             expect_ack=expect_ack,
-            reply_to=reply_to,
+            reply_to=normalize_unicode_scalars(reply_to),
             # A fresh root trace at staging (pure, no IO): the request carries an id from birth, the
             # edge derives a child span for the actual send. Observability only — never gates anything.
             traceparent=new_traceparent(),
         )
-        self.outbox.append(request)
-        self.recorder.emit(
-            "outbox.requested",
-            turn_id=call.turn_id,
-            parent_id=call.tool_event_id,
-            data={
-                "request_id": request.id,
-                "destination": destination,
-                "capability": capability,
-                "traceparent": request.traceparent,
-            },
-        )
+        invocation.stage(request)
         return {"status": "staged", "request_id": request.id}
 
 
-def _observation_message(observation: ToolObservation, media_store: dict[str, bytes]) -> dict[str, Any]:
+def _observation_message(
+    observation: ToolObservation, media_store: dict[str, bytes]
+) -> dict[str, Any]:
     """Provider-neutral by-value message for a tool/async observation. Preserves the
     ``is_background`` → role semantics the adapters use: a background/hosted result is a
     new user message; a tool result is a ``tool`` message keyed by ``call_id``."""
@@ -673,6 +833,7 @@ def _as_blob_reader(
     ``None`` source has no content — used when restoring a checkpoint with no workspace
     delta; reading any sha then raises (a delta entry without its blob is a bug)."""
     if blobs is None:
+
         def _empty(sha256: str) -> bytes:
             raise KeyError(sha256)
 
@@ -881,13 +1042,33 @@ class AgentLoop:
     _pause_requested: bool = field(default=False, init=False, repr=False)
     # Per-run cache of granted capability leases (handles only, never secrets). Deliberately not
     # checkpointed — on restore leases are re-brokered, so a stale handle never survives on disk.
-    _capability_vault: CapabilityVault = field(default_factory=CapabilityVault, init=False, repr=False)
+    _capability_vault: CapabilityVault = field(
+        default_factory=CapabilityVault, init=False, repr=False
+    )
     _outbox: Outbox = field(default_factory=Outbox, init=False, repr=False)
+    _output_deltas_operator_permitted: bool = field(default=True, init=False, repr=False)
     _bootstrapper: LoopBootstrapper = field(init=False, repr=False)
     _settle_coordinator: LoopSettleCoordinator = field(init=False, repr=False)
     _finalizer: LoopFinalizer = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        for field_name in (
+            "status_file",
+            "emit_output_deltas",
+            "inject_workspace_index",
+            "capability_auto_redispatch",
+        ):
+            _require_operator_bool(getattr(self, field_name), field_name)
+        for field_name in (
+            "async_tool_cancel_grace_s",
+            "async_model_cancel_grace_s",
+            "capability_rotate_skew_seconds",
+        ):
+            setattr(
+                self,
+                field_name,
+                _require_operator_duration(getattr(self, field_name), field_name),
+            )
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
         # can pass any of the three forms without hand-wrapping a StaticRuntimeConfigProvider.
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
@@ -906,11 +1087,18 @@ class AgentLoop:
         # `httpx` -- so a typo'd value was never validated for them at all. `getenv_bool`'s promise
         # that a malformed value is an error rather than a silent no-op has to hold for everyone.
         deltas_permitted = getenv_bool(OUTPUT_DELTAS_ENV, default=True)
+        self._output_deltas_operator_permitted = deltas_permitted
         if self.emit_output_deltas and not deltas_permitted:
             self.emit_output_deltas = False
         self._bootstrapper = LoopBootstrapper(self)
         self._settle_coordinator = LoopSettleCoordinator(self)
         self._finalizer = LoopFinalizer(self)
+
+    def _output_deltas_enabled(self) -> bool:
+        """Return the live request gated by the immutable deployment decision."""
+
+        _require_operator_bool(self.emit_output_deltas, "emit_output_deltas")
+        return self.emit_output_deltas and self._output_deltas_operator_permitted
 
     @classmethod
     def from_config(
@@ -956,7 +1144,7 @@ class AgentLoop:
 
             AgentLoop.from_tools(spec, adapter, [word_count]).run_once("count the words")
         """
-        specs = tuple(tools)
+        specs = tuple(normalize_tool_spec(tool) for tool in tools)
         provider = FunctionToolProvider(lambda _ctx: specs)
         config = AgentRuntimeConfig(
             definition_id=definition_id,
@@ -984,7 +1172,10 @@ class AgentLoop:
 
         Validates against the builtin tools plus any ``tools`` you'll bind (or an explicit
         ``registry``). The run ``spec`` is not needed — tool validation doesn't depend on it."""
-        issues: list[str] = []
+        normalized_config, issues = preflight_runtime_config(config)
+        if normalized_config is None:
+            return issues
+        config = normalized_config
         if registry is None:
             registry = ToolRegistry()
             registry.register_many(builtin_tools(None))  # type: ignore[arg-type]
@@ -1206,6 +1397,11 @@ class AgentLoop:
         request = self._outbox.get(request_id)
         if request is None:
             return ""
+        receipt = validate_outbox_receipt(receipt)
+        # The first terminal receipt wins. Duplicate or late edge reports are idempotent and cannot
+        # requeue a request that another drainer already delivered or dead-lettered.
+        if request.status in {"dispatched", "failed"}:
+            return request.status
         attempts = request.attempts + 1
         recorder = self._session.res.recorder if self._session is not None else None
         if receipt.ok:
@@ -1576,7 +1772,8 @@ class AgentLoop:
             session = self._require_open()
             if not session.terminal:
                 if seed_messages:
-                    session.state.messages = [dict(message) for message in seed_messages]
+                    normalized_messages = normalize_json_ingress(seed_messages)
+                    session.state.messages = [dict(message) for message in normalized_messages]
                 if seed_media_blobs:
                     session.state.media_blobs = dict(seed_media_blobs)
                 await self.asubmit(user_input)
@@ -1687,7 +1884,7 @@ class AgentLoop:
         sink = self._stream_sink
         if sink is not None and sink.active:
             delta_consumer = sink.push_delta
-        elif self.emit_output_deltas:
+        elif self._output_deltas_enabled():
             assert self._session is not None
             recorder = self._session.res.recorder
 
@@ -1804,7 +2001,11 @@ class AgentLoop:
         the backend or another thread calls this to deliver a result, waking a
         parked run. The result is injected per the task kind's ResultInjector."""
         session = self._require_open()
-        reported = session.res.context.job_manager.report_result(task_id, result, status=status)
+        reported = session.res.context.job_manager.report_result(
+            normalize_unicode_scalars(task_id),
+            normalize_json_ingress(result),
+            status=normalize_unicode_scalars(status),
+        )
         if persist_checkpoint:
             self._persist_checkpoint(session)
         return reported
@@ -1885,7 +2086,9 @@ class AgentLoop:
             # Durable (approved) capability leases — handles only — so a restart does not re-prompt.
             capability_leases=self._capability_vault.export_durable(),
             outbox_requests=self._outbox.export(),
-            pending_capability_replays=[dict(replay) for replay in state.pending_capability_replays],
+            pending_capability_replays=[
+                dict(replay) for replay in state.pending_capability_replays
+            ],
             pending_tool_approval_replays=[
                 dict(replay) for replay in state.pending_tool_approval_replays
             ],
@@ -2022,7 +2225,9 @@ class AgentLoop:
         finally:
             self._restoring = False
 
-    def _rehydrate(self, cp: RunCheckpoint, res: _RunResources, blob_reader: Callable[[str], bytes]) -> None:
+    def _rehydrate(
+        self, cp: RunCheckpoint, res: _RunResources, blob_reader: Callable[[str], bytes]
+    ) -> None:
         # Deadline carry-over: downtime while parked does not count against
         # max_duration_s (a run parked overnight on a human should not time out). Keep
         # the elapsed-so-far consistent so _build_metrics duration stays sane.
@@ -2053,7 +2258,9 @@ class AgentLoop:
                 if cp.pending_user_input is not None
                 else None
             ),
-            pending_observations=tuple(ToolObservation.from_json(obs) for obs in cp.pending_observations),
+            pending_observations=tuple(
+                ToolObservation.from_json(obs) for obs in cp.pending_observations
+            ),
             pending_binding_loads=tuple(cp.pending_binding_loads),
             tool_call_counts=dict(cp.tool_call_counts),
             previous_runtime_config=(
@@ -2066,7 +2273,9 @@ class AgentLoop:
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
-            pending_capability_replays=tuple(dict(replay) for replay in cp.pending_capability_replays),
+            pending_capability_replays=tuple(
+                dict(replay) for replay in cp.pending_capability_replays
+            ),
             pending_tool_approval_replays=tuple(
                 dict(replay) for replay in cp.pending_tool_approval_replays
             ),
@@ -2099,7 +2308,9 @@ class AgentLoop:
         # Re-apply the agent's workspace delta on top of the (backend-re-provisioned)
         # base, so the restored workspace matches the checkpoint instant and
         # changed_entries() reports the same delta again.
-        self._apply_workspace_delta(res.workspace, cp.workspace_delta, blob_reader, self.spec.limits)
+        self._apply_workspace_delta(
+            res.workspace, cp.workspace_delta, blob_reader, self.spec.limits
+        )
         manager = res.context.job_manager
         # Publish the restored durable baseline before registering hosted tasks. If any later
         # rehydration step fails, cleanup preserves every task owned by the source checkpoint.
@@ -2111,9 +2322,7 @@ class AgentLoop:
             terminal=cp.terminal,
             # Continue the sequence so the next park commits cp.seq + 1.
             checkpoint_seq=cp.seq,
-            last_suspension=(
-                dict(cp.last_suspension) if cp.last_suspension is not None else None
-            ),
+            last_suspension=(dict(cp.last_suspension) if cp.last_suspension is not None else None),
             applied_input_ids=set(cp.applied_input_ids),
             active_input=(dict(cp.active_input) if cp.active_input is not None else None),
             applied_input_receipts={
@@ -2127,7 +2336,10 @@ class AgentLoop:
             },
         )
         manager.restore_state(
-            [HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir) for payload in cp.hosted_tasks],
+            [
+                HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir)
+                for payload in cp.hosted_tasks
+            ],
             reentry_queue=cp.reentry_queue,
             delivered_reentry_jobs=cp.delivered_reentry_jobs,
         )
@@ -2188,8 +2400,10 @@ class AgentLoop:
         observations: list[ToolObservation] = []
         for job_file in sorted(jobs_dir.glob("*/job.json")):
             try:
-                payload = json.loads(job_file.read_text(encoding="utf-8"))
+                payload = loads_json_ingress(job_file.read_text(encoding="utf-8"))
             except (ValueError, OSError):
+                continue
+            if not isinstance(payload, dict):
                 continue
             if payload.get("status") != "running":
                 continue
@@ -2237,7 +2451,10 @@ class AgentLoop:
             for sub_id, definition in self.subagent_definitions.items()
         }
         registry.register(agent_spawn_tool(catalog))
-        context.subagent_depth = int(self.spec.metadata.get("subagent_depth", 0) or 0)
+        subagent_depth = self.spec.metadata.get("subagent_depth", 0)
+        if type(subagent_depth) is not int or subagent_depth < 0:
+            raise ValueError("spec.metadata.subagent_depth must be a non-negative integer")
+        context.subagent_depth = subagent_depth
         job_manager.executors["subagent"] = SubagentTaskExecutor(
             run_child=self._run_subagent_child,
             definition_ids=tuple(self.subagent_definitions.keys()),
@@ -2258,7 +2475,9 @@ class AgentLoop:
         ``SubagentTaskExecutor._arun`` then publishes it through the reentry pipe."""
         recorder = manager.recorder
         definition_id = str(task.request.get("definition_id") or "")
-        depth = int(task.request.get("depth", 0) or 0)
+        depth = task.request.get("depth", 0)
+        if type(depth) is not int or depth < 0:
+            raise ValueError("subagent task depth must be a non-negative integer")
         background = bool(task.request.get("background", False))
         parent_event_id = task.request.get("parent_event_id")
         turn_id = task.request.get("turn_id")
@@ -2334,7 +2553,7 @@ class AgentLoop:
             status_file=False,
             # Inherit token streaming so a child's work streams into its own events.jsonl too
             # (an observer can tail run_root/<child_run_id>/events.jsonl for live subagent output).
-            emit_output_deltas=self.emit_output_deltas,
+            emit_output_deltas=self._output_deltas_enabled(),
         )
         child._capability_vault = self._capability_vault.fork_for_child()
         result = await child.arun_once(
@@ -2352,7 +2571,9 @@ class AgentLoop:
             for key, value in usage.items():
                 amount = int(value)
                 parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + amount
-                self._session.state.total_usage[key] = self._session.state.total_usage.get(key, 0) + amount
+                self._session.state.total_usage[key] = (
+                    self._session.state.total_usage.get(key, 0) + amount
+                )
         task.result = subagent.result_payload(
             status=result.status,
             final_text=result.final_text,
@@ -2569,15 +2790,19 @@ class AgentLoop:
                 providers.append(provider)  # type: ignore[arg-type]
         return tuple(providers)
 
-    def _current_runtime_config(self, registry: ToolRegistry, *, validate: bool = True) -> AgentRuntimeConfig:
-        config = (
-            self.runtime_config_provider.current_config(self.spec.run_id)
-        )
+    def _current_runtime_config(
+        self, registry: ToolRegistry, *, validate: bool = True
+    ) -> AgentRuntimeConfig:
+        config = self.runtime_config_provider.current_config(self.spec.run_id)
         if config is None:
             raise AgentConfigError(
                 "runtime config provider returned no config",
                 error_code="agent_config_missing",
             )
+        try:
+            config = normalize_runtime_config(config)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise AgentConfigError(f"invalid runtime config: {exc}") from exc
         if validate:
             validate_runtime_config(config, registry)
         return config
@@ -2622,7 +2847,9 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
-    async def _apump_turn(self, state: RunState, res: _RunResources, session: _Session) -> Suspension:
+    async def _apump_turn(
+        self, state: RunState, res: _RunResources, session: _Session
+    ) -> Suspension:
         context = res.context
         recorder = res.recorder
         deadline = res.deadline
@@ -2645,7 +2872,9 @@ class AgentLoop:
             local_step = session.submit_local_step
             session.session_step += 1
             step = session.session_step
-            background_observations = self._pop_background_observations(context, recorder, step, state)
+            background_observations = self._pop_background_observations(
+                context, recorder, step, state
+            )
             if background_observations:
                 state.pending_observations = (*state.pending_observations, *background_observations)
             turn_id = f"turn_{step:04d}"
@@ -2671,7 +2900,8 @@ class AgentLoop:
             # authorization, exposure, and quota filtering, this is replaced with the visible
             # surface's registry tool ids before context providers see the turn.
             turn_context = replace(
-                turn_context, bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools)
+                turn_context,
+                bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools),
             )
             self._emit_runtime_config_if_changed(
                 recorder=recorder,
@@ -2682,12 +2912,14 @@ class AgentLoop:
                 parent_id=turn_started.event_id,
             )
             pending_binding_loads = state.pending_binding_loads
-            surface_snapshot = self.tool_surface_resolver.resolve(
-                bound_catalog=bound_catalog,
-                turn=turn_context,
-                pending_binding_loads=pending_binding_loads,
-                previous_snapshot=state.previous_surface_snapshot,
-                call_counts=state.tool_call_counts,
+            surface_snapshot = validate_tool_surface_snapshot(
+                self.tool_surface_resolver.resolve(
+                    bound_catalog=bound_catalog,
+                    turn=turn_context,
+                    pending_binding_loads=pending_binding_loads,
+                    previous_snapshot=state.previous_surface_snapshot,
+                    call_counts=state.tool_call_counts,
+                )
             )
             if not surface_snapshot.turn_id:
                 surface_snapshot = replace(surface_snapshot, turn_id=turn_id)
@@ -2707,7 +2939,7 @@ class AgentLoop:
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
                     data=surface_snapshot.to_public_json(),
-            )
+                )
             state.previous_surface_snapshot = surface_snapshot
             state.pending_binding_loads = ()
             call_counts_before_replays = dict(state.tool_call_counts)
@@ -2770,15 +3002,19 @@ class AgentLoop:
             # Replays run before the model request. If they consumed quota, rebuild the
             # model-facing surface so context providers and tools see the post-replay limits.
             if state.tool_call_counts != call_counts_before_replays:
-                refreshed_surface_snapshot = self.tool_surface_resolver.resolve(
-                    bound_catalog=bound_catalog,
-                    turn=turn_context,
-                    pending_binding_loads=pending_binding_loads,
-                    previous_snapshot=surface_snapshot,
-                    call_counts=state.tool_call_counts,
+                refreshed_surface_snapshot = validate_tool_surface_snapshot(
+                    self.tool_surface_resolver.resolve(
+                        bound_catalog=bound_catalog,
+                        turn=turn_context,
+                        pending_binding_loads=pending_binding_loads,
+                        previous_snapshot=surface_snapshot,
+                        call_counts=state.tool_call_counts,
+                    )
                 )
                 if not refreshed_surface_snapshot.turn_id:
-                    refreshed_surface_snapshot = replace(refreshed_surface_snapshot, turn_id=turn_id)
+                    refreshed_surface_snapshot = replace(
+                        refreshed_surface_snapshot, turn_id=turn_id
+                    )
                 context.configure_tool_search(
                     refreshed_surface_snapshot.search_entries,
                     runtime_config.tool_search.top_k,
@@ -2807,7 +3043,9 @@ class AgentLoop:
                     if not dynamic_segment
                     else f"{dynamic_segment}\n\n{surface_snapshot.delta_notice}"
                 )
-            static_system_prompt = self._system_prompt_for_config(runtime_config, res.static_segments)
+            static_system_prompt = self._system_prompt_for_config(
+                runtime_config, res.static_segments
+            )
             turn_system_prompt = (
                 static_system_prompt
                 if not dynamic_segment
@@ -2905,7 +3143,9 @@ class AgentLoop:
                 wire_messages = resolve_wire_messages(
                     wire_messages,
                     WorkspaceMediaResolver(
-                        res.workspace, blobs=state.media_blobs, blob_reader=self._media_blob_reader()
+                        res.workspace,
+                        blobs=state.media_blobs,
+                        blob_reader=self._media_blob_reader(),
                     ),
                     encoding=getattr(self.model_adapter, "wire_image_encoding", "base64"),
                 )
@@ -3020,7 +3260,9 @@ class AgentLoop:
                     # trust boundary, and real ids are short. A compromised or buggy proxy
                     # echoing an unbounded string onto the public stream is a channel no
                     # review of *tool* arguments would ever look at.
-                    "response_id": public_identifier(turn.response_id) if turn.response_id else turn.response_id,
+                    "response_id": public_identifier(turn.response_id)
+                    if turn.response_id
+                    else turn.response_id,
                     "tool_calls": len(turn.tool_calls),
                     "has_final": bool(turn.final_text),
                     "usage": turn.usage,
@@ -3155,7 +3397,10 @@ class AgentLoop:
         limits = self.spec.limits
         if len(state.messages) > limits.max_messages:
             return "message_count_exceeded"
-        size = sum(len(json.dumps(message, ensure_ascii=False)) for message in state.messages)
+        size = sum(
+            len(json.dumps(message, ensure_ascii=False, allow_nan=False))
+            for message in state.messages
+        )
         if size > limits.max_message_log_bytes:
             return "message_log_bytes_exceeded"
         return None
@@ -3166,11 +3411,20 @@ class AgentLoop:
         the authoritative provider actuals summed across turns, not an estimate."""
         limits = self.spec.limits
         usage = state.total_usage
-        if limits.max_input_tokens is not None and usage.get("input_tokens", 0) > limits.max_input_tokens:
+        if (
+            limits.max_input_tokens is not None
+            and usage.get("input_tokens", 0) >= limits.max_input_tokens
+        ):
             return "input_tokens_exceeded"
-        if limits.max_output_tokens is not None and usage.get("output_tokens", 0) > limits.max_output_tokens:
+        if (
+            limits.max_output_tokens is not None
+            and usage.get("output_tokens", 0) >= limits.max_output_tokens
+        ):
             return "output_tokens_exceeded"
-        if limits.max_total_tokens is not None and usage.get("total_tokens", 0) > limits.max_total_tokens:
+        if (
+            limits.max_total_tokens is not None
+            and usage.get("total_tokens", 0) >= limits.max_total_tokens
+        ):
             return "total_tokens_exceeded"
         return None
 
@@ -3178,7 +3432,10 @@ class AgentLoop:
         """Return ``"wire_bytes_exceeded"`` if the resolved per-turn wire payload (inline
         base64 media included) outgrows ``max_message_log_bytes``, else ``None``. Distinct
         from the durable by-reference log cap, which never carries bytes."""
-        size = sum(len(json.dumps(message, ensure_ascii=False)) for message in wire_messages)
+        size = sum(
+            len(json.dumps(message, ensure_ascii=False, allow_nan=False))
+            for message in wire_messages
+        )
         if size > self.spec.limits.max_message_log_bytes:
             return "wire_bytes_exceeded"
         return None
@@ -3279,7 +3536,9 @@ class AgentLoop:
         delivered: list[ToolObservation] = []
         for observation in observations:
             if observation.output.get("type") == TOOL_APPROVAL_RESULT_TYPE:
-                observation = self._handle_tool_approval_result(observation, context, recorder, state)
+                observation = self._handle_tool_approval_result(
+                    observation, context, recorder, state
+                )
             recorder.transcript(
                 {
                     "kind": "tool_observation",
@@ -3650,6 +3909,13 @@ class AgentLoop:
         binding_id = bound_tool.binding_id
         immediate_binding_ids = {tool.id for tool in snapshot.immediate_tools}
         authorization = snapshot.authorization_for(binding_id)
+        if authorization is not None:
+            authorization = validate_tool_authorization(authorization)
+            if (
+                authorization.binding_id != binding_id
+                or authorization.tool_id != bound_tool.base_spec.id
+            ):
+                raise ValueError("tool surface authorization identity does not match the bound tool")
         if authorization is not None and authorization.decision == "deny":
             raise PermissionDenied(
                 f"tool binding denied by config: {binding_id}",
@@ -3736,6 +4002,7 @@ class AgentLoop:
         started_event: AgentEvent,
         authorization: ToolAuthorization,
         deadline: float | None,
+        outbox_invocation: _OutboxInvocation,
     ) -> ToolResult:
         spec = bound_tool.base_spec
         context._enter_call(
@@ -3749,7 +4016,8 @@ class AgentLoop:
                 authorization=authorization,
                 scope=authorization.scope,
                 runtime=bound_tool.runtime,
-            )
+            ),
+            outbox_invocation,
         )
         try:
             handler = spec.handler
@@ -3770,7 +4038,7 @@ class AgentLoop:
             if not isinstance(result, ToolResult):
                 raise TypeError("tool handler must return ToolResult")
         finally:
-            context._exit_call()
+            context._exit_call(outbox_invocation)
         return result
 
     async def _await_native_tool_handler(
@@ -3798,7 +4066,10 @@ class AgentLoop:
                 pending,
                 deadline=deadline,
                 token=self.cancellation_token,
-                grace_s=self.async_tool_cancel_grace_s,
+                grace_s=_require_operator_duration(
+                    self.async_tool_cancel_grace_s,
+                    "async_tool_cancel_grace_s",
+                ),
                 check_boundary=self._check_run_boundary,
             )
         except CalleeCancelled as exc:
@@ -4088,27 +4359,35 @@ class AgentLoop:
                         # once the lease is granted. Not counted against the binding's call quota.
                         result = pending
                     else:
-                        call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
-                        outbox_count = (
-                            len(self._outbox.export()) if side_effect_admission.requires_outbox else 0
+                        call_counts[bound_tool.binding_id] = (
+                            call_counts.get(bound_tool.binding_id, 0) + 1
                         )
-                        result = await self._ainvoke_handler(
-                            bound_tool,
-                            context,
-                            arguments,
-                            call_id=call_id,
+                        outbox_invocation = _OutboxInvocation(
+                            tool_call_id=call_id,
                             turn_id=turn_id,
-                            recorder=recorder,
-                            started_event=started_event,
-                            authorization=authorization,
-                            deadline=deadline,
+                            tool_event_id=started_event.event_id,
+                        )
+                        result = normalize_tool_result(
+                            await self._ainvoke_handler(
+                                bound_tool,
+                                context,
+                                arguments,
+                                call_id=call_id,
+                                turn_id=turn_id,
+                                recorder=recorder,
+                                started_event=started_event,
+                                authorization=authorization,
+                                deadline=deadline,
+                                outbox_invocation=outbox_invocation,
+                            )
                         )
                         if result.ok:
+                            staged_requests = outbox_invocation.requests()
                             if side_effect_admission.requires_outbox:
                                 side_effect_admission = verify_outbox_side_effect(
                                     side_effect_admission,
-                                    outbox_count,
-                                    len(self._outbox.export()),
+                                    0,
+                                    len(staged_requests),
                                 )
                                 if not side_effect_admission.allowed:
                                     raise ToolExecutionError(
@@ -4124,6 +4403,13 @@ class AgentLoop:
                                 turn_id,
                                 started_event.event_id,
                             )
+                            # Every successful handler commits its local requests, including compat
+                            # and idempotent declarations. Commit only after all result-derived
+                            # side-effect processing succeeds: a malformed success payload must not
+                            # leave a dispatchable request behind when the call is reported failed.
+                            # Strict outbox mode adds only the non-empty verification above; it does
+                            # not own the general emit_outbox contract.
+                            context._commit_outbox_invocation(outbox_invocation)
         except (RunCancelled, RunTimeout, TurnInterrupted):
             raise
         except ToolExecutionError as exc:
@@ -4168,6 +4454,10 @@ class AgentLoop:
                     parent_id=parent_id,
                 )
 
+        try:
+            result = normalize_tool_result(result)
+        except Exception as exc:
+            result = normalize_tool_result(_failure_result(exc))
         return self._finalize_tool_call(
             recorder,
             spec=spec,
@@ -4252,7 +4542,10 @@ class AgentLoop:
             )
         cached = self._capability_vault.get_valid(capability, scope, now=now)
         if cached is not None:
-            skew = self.capability_rotate_skew_seconds
+            skew = _require_operator_duration(
+                self.capability_rotate_skew_seconds,
+                "capability_rotate_skew_seconds",
+            )
             if skew > 0 and cached.can_rotate(now, skew):
                 self._rotate_capability_lease(
                     cached,
@@ -4386,31 +4679,69 @@ class AgentLoop:
                 "max_snippets": 256,
             },
         }[feature]
-        max_calls = web_runtime.get("max_calls", web_runtime.get(f"max_{feature}_calls", defaults["max_calls"]))
-        scope.setdefault("max_calls", max(0, int(max_calls)))
+        max_calls = _web_runtime_budget(
+            web_runtime,
+            ("max_calls", f"max_{feature}_calls"),
+            defaults["max_calls"],
+            minimum=0,
+        )
+        scope.setdefault("max_calls", max_calls)
         if feature == "search":
-            scope.setdefault("max_results", max(1, int(web_runtime.get("max_results", defaults["max_results"]))))
+            scope.setdefault(
+                "max_results",
+                _web_runtime_budget(
+                    web_runtime,
+                    ("max_results",),
+                    defaults["max_results"],
+                    minimum=1,
+                ),
+            )
         elif feature == "fetch":
             scope.setdefault(
                 "max_bytes",
-                max(1, int(web_runtime.get("max_response_bytes", web_runtime.get("max_bytes", defaults["max_bytes"])))),
+                _web_runtime_budget(
+                    web_runtime,
+                    ("max_response_bytes", "max_bytes"),
+                    defaults["max_bytes"],
+                    minimum=1,
+                ),
             )
             scope.setdefault(
                 "timeout_s",
-                max(1, int(web_runtime.get("max_timeout_s", web_runtime.get("timeout_s", defaults["timeout_s"])))),
+                _web_runtime_budget(
+                    web_runtime,
+                    ("max_timeout_s", "timeout_s"),
+                    defaults["timeout_s"],
+                    minimum=1,
+                ),
             )
         else:
             scope.setdefault(
                 "max_tokens",
-                max(1, int(web_runtime.get("max_context_tokens", web_runtime.get("max_tokens", defaults["max_tokens"])))),
+                _web_runtime_budget(
+                    web_runtime,
+                    ("max_context_tokens", "max_tokens"),
+                    defaults["max_tokens"],
+                    minimum=1,
+                ),
             )
             scope.setdefault(
                 "max_urls",
-                max(1, int(web_runtime.get("max_context_urls", web_runtime.get("max_urls", defaults["max_urls"])))),
+                _web_runtime_budget(
+                    web_runtime,
+                    ("max_context_urls", "max_urls"),
+                    defaults["max_urls"],
+                    minimum=1,
+                ),
             )
             scope.setdefault(
                 "max_snippets",
-                max(1, int(web_runtime.get("max_context_snippets", web_runtime.get("max_snippets", defaults["max_snippets"])))),
+                _web_runtime_budget(
+                    web_runtime,
+                    ("max_context_snippets", "max_snippets"),
+                    defaults["max_snippets"],
+                    minimum=1,
+                ),
             )
         return scope
 
@@ -4485,7 +4816,10 @@ class AgentLoop:
                 "workspace.file.read",
                 turn_id=turn_id,
                 parent_id=parent_id,
-                data={"tool": spec.id, "paths": _public_paths_from_args(spec, arguments, self.permission_policy)},
+                data={
+                    "tool": spec.id,
+                    "paths": _public_paths_from_args(spec, arguments, self.permission_policy),
+                },
             )
         elif spec.emits_workspace_diff:
             if (
@@ -4552,8 +4886,12 @@ def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
     priced sub-counts (cache_read/cache_creation/reasoning/audio) accumulate too when the
     adapter reports them, so they reach metrics and the token-budget check."""
     for key, value in turn.usage.items():
-        if isinstance(value, bool) or not isinstance(value, int):
-            continue
+        if type(value) is not int or value < 0:
+            raise ModelAdapterError(
+                f"model usage {key} must be a non-negative integer",
+                provider_error_code="model_bad_response",
+                retryable=False,
+            )
         total_usage[key] = total_usage.get(key, 0) + value
 
 
@@ -4593,7 +4931,11 @@ def _rank_tool_search_entries(
         return sum(1 for term in terms if term in haystack)
 
     scored = [(score(entry), index, entry) for index, entry in enumerate(entries)]
-    return [entry for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1])) if value > 0]
+    return [
+        entry
+        for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1]))
+        if value > 0
+    ]
 
 
 def _filter_tool_search_entries(
@@ -4684,7 +5026,9 @@ def _tool_start_data(
         "tool": public_identifier(call_name),
         "capability": spec.capability if spec is not None else None,
         "side_effect": spec.side_effect if spec is not None else None,
-        "paths": _public_paths_from_args(spec, arguments, permission_policy) if spec is not None else [],
+        "paths": _public_paths_from_args(spec, arguments, permission_policy)
+        if spec is not None
+        else [],
         "args_preview": preview,
     }
 

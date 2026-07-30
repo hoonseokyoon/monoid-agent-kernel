@@ -12,6 +12,7 @@ from support.runtime import runtime_config, tool_binding
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.control import ControlResult
 from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.reference._shared.control_transport import command_identity_sha256
 from monoid_agent_kernel.reference.command_inbox import (
     CommandConflict,
     CommandPrincipal,
@@ -67,6 +68,28 @@ def test_bearer_redaction_covers_nested_keys_and_values() -> None:
         "nested": {"prefix-[redacted]": "[redacted]"},
         "tuple": ["safe", "[redacted]"],
     }
+
+
+def test_command_identity_hash_uses_canonical_json_ingress() -> None:
+    lone_surrogate = chr(0xD800)
+    raw = command_identity_sha256(
+        command_type="status",
+        args={"score": float("nan"), "text": f"bad{lone_surrogate}text"},
+        principal=CommandPrincipal(
+            f"tenant_{lone_surrogate}",
+            f"user_{lone_surrogate}",
+            f"issuer_{lone_surrogate}",
+        ),
+        reason=f"reason_{lone_surrogate}",
+    )
+    canonical = command_identity_sha256(
+        command_type="status",
+        args={"score": None, "text": "bad\ufffdtext"},
+        principal=CommandPrincipal("tenant_\ufffd", "user_\ufffd", "issuer_\ufffd"),
+        reason="reason_\ufffd",
+    )
+
+    assert raw == canonical
 
 
 def test_retained_replace_config_command_migrates_pre_v020_literal_bangs() -> None:
@@ -148,6 +171,13 @@ def test_append_is_idempotent_and_claims_in_order(store: CommandStore) -> None:
     assert receipt.status == "completed"
     assert receipt.result is not None and receipt.result["data"]["state"] == "running"
     assert store.claim("run_1", "worker", claim_ttl_s=30).command_id == "cmd_2"  # type: ignore[union-attr]
+
+
+def test_command_store_rejects_overflowing_numeric_controls(store: CommandStore) -> None:
+    with pytest.raises(ValueError, match="finite number"):
+        store.append(_command("cmd_huge_time", created_at=10**400), max_pending=10)
+    with pytest.raises(ValueError, match="finite number"):
+        store.claim("run_1", "worker", claim_ttl_s=10**400)
 
 
 def test_duplicate_id_rejects_a_different_authenticated_command(store: CommandStore) -> None:

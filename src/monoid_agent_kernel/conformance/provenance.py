@@ -14,6 +14,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from monoid_agent_kernel.core.json_ingress import (
+    normalize_json_ingress,
+    parse_finite_json_float,
+    reject_nonfinite_json_constant,
+)
 from monoid_agent_kernel.identifiers import namespaced_id
 
 CONFORMANCE_EVIDENCE_VERSION = namespaced_id("conformance-evidence.v1")
@@ -509,7 +514,14 @@ def verify_conformance_evidence(
 def _load_evidence_json(data: bytes) -> Mapping[str, Any]:
     try:
         text = data.decode("utf-8")
-        payload = json.loads(text, object_pairs_hook=_unique_object)
+        payload = normalize_json_ingress(
+            json.loads(
+                text,
+                object_pairs_hook=_unique_object,
+                parse_constant=reject_nonfinite_json_constant,
+                parse_float=parse_finite_json_float,
+            )
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise ValueError("invalid conformance evidence JSON") from exc
     return _closed_mapping(payload, "conformance evidence")

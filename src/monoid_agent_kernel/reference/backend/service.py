@@ -12,13 +12,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import thread as _cf_thread
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, get_args
 
+from monoid_agent_kernel._runtime_config_ingress import normalize_runtime_config
 from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     SubagentDefinition,
 )
-from monoid_agent_kernel.core.control import ControlCommand, ControlResult
+from monoid_agent_kernel.core.control import ControlCommand, ControlCommandType, ControlResult
 from monoid_agent_kernel.core.durable_metadata import (
     ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS,
     RUN_METADATA_SCHEMA_VERSION,
@@ -37,6 +38,11 @@ from monoid_agent_kernel.core.outbox import OutboxSender, OutboxReceipt
 from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
+)
+from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
 )
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
@@ -116,6 +122,7 @@ from monoid_agent_kernel.reference.backend.run_types import (
     BackendRunRequest,
     BackendRunSubmission,
     _PreparedRun,
+    normalize_backend_run_request,
 )
 from monoid_agent_kernel.reference.backend.session import (
     BackendSessionContext,
@@ -145,6 +152,8 @@ _ACCEPTED_RUN_META_SCHEMA_VERSIONS = ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS
 _RUN_EVENT_SEQUENCER = RunEventSequencer()
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.backend")
+_CONTROL_COMMAND_TYPES = frozenset(get_args(ControlCommandType))
+_CONTROL_CONFIG_SENTINEL = object()
 
 
 def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
@@ -154,6 +163,88 @@ def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
 
 def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
     return validate_run_metadata(payload)
+
+
+def _control_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    return normalize_unicode_scalars(value)
+
+
+def _validate_control_operational_args(
+    command_type: str, args: dict[str, Any]
+) -> None:
+    token = args.get("token", "")
+    if not isinstance(token, str):
+        raise ValueError("control command token must be a string")
+
+    text_fields: tuple[str, ...] = ()
+    object_fields: tuple[str, ...] = ()
+    if command_type in {"approve", "deny"}:
+        text_fields = ("task_id", "answer", "reason", "status")
+        object_fields = ("result",)
+    elif command_type == "create_task":
+        text_fields = ("kind",)
+        object_fields = ("request",)
+    elif command_type == "report_task_result":
+        text_fields = ("task_id", "status")
+        object_fields = ("result",)
+
+    for field_name in text_fields:
+        if field_name in args and not isinstance(args[field_name], str):
+            raise ValueError(f"control command {field_name} must be a string")
+    for field_name in object_fields:
+        if field_name in args and not isinstance(args[field_name], dict):
+            raise ValueError(f"control command {field_name} must be an object")
+
+    if command_type == "replace_runtime_config" and "expected_version" in args:
+        if type(args["expected_version"]) is not int:
+            raise ValueError("control command expected_version must be an integer")
+    if command_type == "revoke_capability":
+        for field_name in ("capability", "lease_id"):
+            value = args.get(field_name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"control command {field_name} must be a string or null")
+        if args.get("before") is not None:
+            before = args["before"]
+            if not is_finite_json_number(before):
+                raise ValueError("control command before must be a finite number or null")
+
+
+def _normalize_control_command_ingress(command: ControlCommand) -> ControlCommand:
+    """Canonicalize a direct control command before authorization and durable identity."""
+
+    if not isinstance(command, ControlCommand):
+        raise ValueError("command must be a ControlCommand")
+    command_type = _control_text(command.type, "control command type")
+    if command_type not in _CONTROL_COMMAND_TYPES:
+        raise ValueError("control command type is invalid")
+    if not isinstance(command.args, dict):
+        raise ValueError("control command args must be an object")
+
+    raw_args = dict(command.args)
+    _validate_control_operational_args(command_type, raw_args)
+    # Preserve the fresh runtime-config payload until its typed parser has seen the original
+    # controls. Open JSON metadata is normalized by normalize_runtime_config after parsing.
+    raw_config = (
+        raw_args.pop("config", _CONTROL_CONFIG_SENTINEL)
+        if command_type == "replace_runtime_config"
+        else _CONTROL_CONFIG_SENTINEL
+    )
+    args = normalize_json_ingress(raw_args)
+    if not isinstance(args, dict):  # the direct dict check above guarantees this today
+        raise ValueError("control command args must be an object")
+    if raw_config is not _CONTROL_CONFIG_SENTINEL:
+        args["config"] = raw_config
+    return replace(
+        command,
+        type=command_type,  # type: ignore[arg-type]
+        run_id=_control_text(command.run_id, "control command run_id"),
+        args=args,
+        issuer=_control_text(command.issuer, "control command issuer"),
+        reason=_control_text(command.reason, "control command reason"),
+        command_id=_control_text(command.command_id, "control command command_id"),
+    )
 
 
 def _backend_builtin_tool_specs(
@@ -252,6 +343,22 @@ def _get_shared_loop() -> asyncio.AbstractEventLoop:
             atexit.register(_teardown_loop, loop, thread, executor)
             _shared_loop = loop
         return _shared_loop
+
+
+def _backend_integer(value: Any, field_name: str, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        qualifier = "non-negative" if minimum == 0 else "positive"
+        raise ValueError(f"{field_name} must be a {qualifier} integer")
+    return value
+
+
+def _backend_number(value: Any, field_name: str, *, allow_zero: bool = False) -> int | float:
+    if not is_finite_json_number(value):
+        raise ValueError(f"{field_name} must be a finite number")
+    if value < 0 or (value == 0 and not allow_zero):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{field_name} must be {qualifier}")
+    return value
 
 
 @dataclass
@@ -395,6 +502,38 @@ class RunnerBackend:
     _commands: BackendCommandService = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        for field_name in (
+            "run_token_ttl_s",
+            "llm_gateway_token_ttl_s",
+            "web_gateway_token_ttl_s",
+            "task_callback_token_ttl_s",
+            "max_turns",
+            "max_consecutive_turn_failures",
+            "outbox_max_attempts",
+            "max_recover_attempts",
+            "max_message_bytes",
+            "max_message_queue_depth",
+            "command_queue_limit",
+        ):
+            _backend_integer(getattr(self, field_name), field_name, minimum=1)
+        _backend_integer(self.max_concurrent_runs, "max_concurrent_runs", minimum=0)
+        # Zero intentionally disables retained event-index source slots and falls back to
+        # authoritative uncached page reads.
+        _backend_integer(self.event_index_max_sources, "event_index_max_sources", minimum=0)
+        for field_name in (
+            "idle_timeout_s",
+            "max_session_lifetime_s",
+            "task_wait_poll_s",
+            "outbox_retry_factor",
+            "lease_ttl_s",
+            "watchdog_interval_s",
+            "command_claim_ttl_s",
+        ):
+            _backend_number(getattr(self, field_name), field_name)
+        for field_name in ("outbox_retry_base_s", "outbox_retry_cap_s"):
+            _backend_number(getattr(self, field_name), field_name, allow_zero=True)
+        if type(self.emit_output_deltas) is not bool:
+            raise ValueError("emit_output_deltas must be a boolean")
         self._worker_id = uuid.uuid4().hex
         self._event_index = ReferenceEventOffsetIndex(
             max_sources=self.event_index_max_sources,
@@ -416,8 +555,6 @@ class RunnerBackend:
             self.lease_store = LocalFsLeaseStore(self.run_root)
         if self.command_store is None:
             self.command_store = InMemoryCommandStore()
-        if self.command_queue_limit < 1 or self.command_claim_ttl_s <= 0:
-            raise ValueError("command queue limit and claim ttl must be positive")
         self._run_preparation = self._build_run_preparation_service()
         self._run_state = self._build_run_state_mutation_service()
         self._loop_factory = self._build_loop_factory()
@@ -977,6 +1114,7 @@ class RunnerBackend:
         return pending
 
     def submit_run(self, request: BackendRunRequest) -> BackendRunSubmission:
+        request = normalize_backend_run_request(request)
         prepared = self._prepare_run_record(request)
         # Run executes as a coroutine on the shared loop (coroutine-per-run), not a thread.
         self._spawn(
@@ -1056,13 +1194,17 @@ class RunnerBackend:
     def enqueue_control(self, command: ControlCommand) -> CommandReceipt:
         """Authenticate, sanitize, and durably enqueue one idempotent command."""
 
+        command = _normalize_control_command_ingress(command)
         args = dict(command.args)
-        token = str(args.pop("token", "") or "")
+        token = args.pop("token", "")
+        assert isinstance(token, str)  # validated by _normalize_control_command_ingress
         principal = self._authorize_command_principal(command, args=args, token=token)
         if command.type == "replace_runtime_config":
             # This is the fresh operator boundary. Stored v1 commands have a separate compatibility
             # decoder when claimed, so a new ambiguous bare ``!`` never acquires legacy meaning.
-            parsed_config = AgentRuntimeConfig.from_json(args.get("config"))
+            parsed_config = normalize_runtime_config(
+                AgentRuntimeConfig.from_json(args.get("config"))
+            )
             args["config"] = parsed_config.to_json()
         with self._lock:
             locally_owned = command.run_id in self._records
@@ -1764,6 +1906,7 @@ class RunnerBackend:
         hosted-task park is surfaced in the result frame and then closed (HITL-over-stream is
         deferred), so this never leaves a resumable run dangling.
         """
+        request = normalize_backend_run_request(request)
         prepared = self._prepare_run_record(request)
         async for frame in self._run_execution.stream_prepared(prepared, request):
             yield frame

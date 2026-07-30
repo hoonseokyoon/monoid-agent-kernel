@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from monoid_agent_kernel.core._event_log import read_committed_event_payloads
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 
 CHAT_SCHEMA_V1 = "studio.chat.v1"
@@ -100,7 +101,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             if not line.strip():
                 continue
             try:
-                payload = json.loads(line)
+                payload = loads_json_ingress(line)
             except ValueError:
                 continue
             if isinstance(payload, dict):
@@ -111,7 +112,9 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 def _write_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(dict(payload), sort_keys=True, ensure_ascii=False) + "\n")
+        handle.write(
+            json.dumps(dict(payload), sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
+        )
 
 
 def _read_committed_events(path: Path) -> tuple[list[dict[str, Any]], str]:
@@ -241,7 +244,7 @@ class ChatProjection:
             return
         meta_path = self.run_dir / "run.json"
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta = loads_json_ingress(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
         if not isinstance(meta, dict):

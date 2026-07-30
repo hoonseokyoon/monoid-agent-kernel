@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+from copy import copy
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -8,9 +10,14 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.json_ingress import (
+    loads_model_json_ingress,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers._common import normalize_usage
-from monoid_agent_kernel.tools.base import ToolSpec
+from monoid_agent_kernel.tools.base import ToolSpec, normalize_tool_spec
 
 # Why a model turn ended, promoted from the raw provider payload onto the typed turn surface.
 # ``stop`` = normal completion; ``length`` = truncated (hit max tokens); ``refusal`` = the model
@@ -29,7 +36,7 @@ def format_async_result_text(output: dict[str, Any]) -> str:
         return str(message)
     return (
         "An asynchronous task completed. Treat this as the result of the previously "
-        f"started task:\n{json.dumps(output, ensure_ascii=False)}"
+        f"started task:\n{json.dumps(output, ensure_ascii=False, allow_nan=False)}"
     )
 
 
@@ -63,15 +70,35 @@ class ToolObservation:
     def from_json(cls, payload: dict[str, Any]) -> ToolObservation:
         # Lenient read: accept the pre-rename ``images`` key so a checkpoint written before
         # the media rename still restores its tool-returned media.
+        if not isinstance(payload, dict):
+            raise ValueError("tool observation must be an object")
         media = payload.get("media")
         if media is None:
             media = payload.get("images")
+        call_id = payload.get("call_id")
+        tool_name = payload.get("tool_name")
+        output = payload.get("output")
+        if type(call_id) is not str or not call_id:
+            raise ValueError("tool observation call_id must be a non-empty string")
+        if type(tool_name) is not str or not tool_name:
+            raise ValueError("tool observation tool_name must be a non-empty string")
+        if not isinstance(output, dict):
+            raise ValueError("tool observation output must be an object")
+        is_background = payload.get("is_background", False)
+        if type(is_background) is not bool:
+            raise ValueError("tool observation is_background must be a boolean")
+        if media is None:
+            media = ()
+        if not isinstance(media, (list, tuple)) or not all(
+            isinstance(part, dict) for part in media
+        ):
+            raise ValueError("tool observation media must be an array of objects")
         return cls(
-            call_id=str(payload.get("call_id") or ""),
-            tool_name=str(payload.get("tool_name") or ""),
-            output=dict(payload.get("output") or {}),
-            is_background=bool(payload.get("is_background", False)),
-            media=tuple(dict(part) for part in media or ()),
+            call_id=call_id,
+            tool_name=tool_name,
+            output=dict(output),
+            is_background=is_background,
+            media=tuple(dict(part) for part in media),
         )
 
 
@@ -167,8 +194,7 @@ class ModelAdapter(Protocol):
     third-party adapter that omits them.
     """
 
-    def next_turn(self, request: ModelRequest) -> ModelTurn:
-        ...
+    def next_turn(self, request: ModelRequest) -> ModelTurn: ...
 
 
 class AsyncModelAdapter(Protocol):
@@ -376,6 +402,508 @@ class TurnComplete:
 ModelStreamChunk = TextDelta | ReasoningDelta | ToolCallDelta | TurnComplete
 
 
+def _normalize_required_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    return normalize_unicode_scalars(value)
+
+
+def _normalize_retry_codes(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("model.retry.retry_on must be an array of non-empty strings")
+    normalized: list[str] = []
+    for code in value:
+        text = _normalize_required_text(code, "model.retry.retry_on item")
+        if not text:
+            raise ValueError("model.retry.retry_on entries must be non-empty strings")
+        normalized.append(text)
+    return tuple(normalized)
+
+
+def _normalize_optional_text(value: Any, field_name: str) -> str | None:
+    normalized = normalize_json_ingress(value)
+    if normalized is None:
+        return None
+    if not isinstance(normalized, str):
+        raise ValueError(f"{field_name} must be a string or null")
+    return normalized
+
+
+def _require_bool(value: Any, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _require_nonnegative_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _copy_with_fields(value: Any, /, **changes: Any) -> Any:
+    """Copy a dataclass-like extension without calling its public constructor again.
+
+    ``dataclasses.replace`` dispatches through ``type(value).__init__``.  Public extension
+    subclasses commonly expose a smaller convenience constructor, so using ``replace`` at
+    an ingress boundary turned otherwise valid adapters and tools into ``TypeError``.  A
+    shallow copy preserves the extension type and its private state; frozen fields can then
+    be installed without mutating the caller's object.
+    """
+
+    cloned = copy(value)
+    for name, replacement in changes.items():
+        object.__setattr__(cloned, name, replacement)
+    return cloned
+
+
+def _control_number(
+    value: Any,
+    field_name: str,
+    *,
+    minimum: int,
+    inclusive: bool,
+) -> int | float:
+    if type(value) not in (int, float):
+        raise ValueError(f"{field_name} must be a finite number")
+    try:
+        finite = math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        finite = False
+    if not finite:
+        raise ValueError(f"{field_name} must be a finite number")
+    outside_range = value < minimum if inclusive else value <= minimum
+    if outside_range:
+        requirement = "non-negative" if inclusive and minimum == 0 else "greater than zero"
+        raise ValueError(f"{field_name} must be {requirement}")
+    return value
+
+
+def _positive_control_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field_name} must be an integer greater than zero")
+    return value
+
+
+def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
+    """Normalize model metadata and reject non-finite control values.
+
+    Content values can become JSON ``null`` without changing their meaning. Retry delays and
+    timeouts have no meaningful ``null`` behavior, so invalid direct-Python configuration is
+    rejected before an adapter is invoked.
+    """
+
+    if config is None:
+        return None
+    reasoning = _copy_with_fields(
+        config.reasoning,
+        effort=_normalize_required_text(config.reasoning.effort, "model.reasoning.effort"),
+        summary=_normalize_required_text(config.reasoning.summary, "model.reasoning.summary"),
+        on_unsupported=_normalize_required_text(
+            config.reasoning.on_unsupported,
+            "model.reasoning.on_unsupported",
+        ),
+    )
+    retry = _copy_with_fields(
+        config.retry,
+        max_attempts=_positive_control_int(config.retry.max_attempts, "model.retry.max_attempts"),
+        initial_delay_s=_control_number(
+            config.retry.initial_delay_s,
+            "model.retry.initial_delay_s",
+            minimum=0,
+            inclusive=True,
+        ),
+        max_delay_s=_control_number(
+            config.retry.max_delay_s,
+            "model.retry.max_delay_s",
+            minimum=0,
+            inclusive=True,
+        ),
+        backoff_multiplier=_control_number(
+            config.retry.backoff_multiplier,
+            "model.retry.backoff_multiplier",
+            minimum=0,
+            inclusive=False,
+        ),
+        jitter_s=_control_number(
+            config.retry.jitter_s,
+            "model.retry.jitter_s",
+            minimum=0,
+            inclusive=True,
+        ),
+        retry_on=_normalize_retry_codes(config.retry.retry_on),
+    )
+    return _copy_with_fields(
+        config,
+        provider=_normalize_required_text(config.provider, "model.provider"),
+        model=_normalize_required_text(config.model, "model.model"),
+        timeout_s=_control_number(
+            config.timeout_s,
+            "model.timeout_s",
+            minimum=0,
+            inclusive=False,
+        ),
+        gateway_url=_normalize_optional_text(config.gateway_url, "model.gateway_url"),
+        reasoning=reasoning,
+        retry=retry,
+    )
+
+
+def normalize_model_request(request: ModelRequest) -> ModelRequest:
+    """Copy a call request into the portable JSON/Unicode domain."""
+
+    observations = tuple(
+        _copy_with_fields(
+            observation,
+            call_id=_normalize_required_text(observation.call_id, "tool observation call_id"),
+            tool_name=_normalize_required_text(
+                observation.tool_name,
+                "tool observation tool_name",
+            ),
+            output=normalize_json_ingress(observation.output),
+            is_background=_require_bool(
+                observation.is_background,
+                "tool observation is_background",
+            ),
+            media=tuple(normalize_json_ingress(observation.media)),
+        )
+        for observation in request.observations
+    )
+    messages = None
+    if request.messages is not None:
+        messages = tuple(normalize_json_ingress(request.messages))
+    return _copy_with_fields(
+        request,
+        instruction=_normalize_optional_text(request.instruction, "model request instruction"),
+        system_prompt=_normalize_required_text(
+            request.system_prompt,
+            "model request system_prompt",
+        ),
+        tools=tuple(normalize_tool_spec(spec) for spec in request.tools),
+        previous_turn_handle=_normalize_optional_text(
+            request.previous_turn_handle,
+            "model request previous_turn_handle",
+        ),
+        observations=observations,
+        model=normalize_model_config(request.model),
+        messages=messages,
+    )
+
+
+def _normalize_model_turn(turn: Any) -> Any:
+    """Copy one model outcome before receipts, observers, previews, or persistence see it.
+
+    The adapter protocol names :class:`ModelTurn`, while older integrations also return a
+    structurally compatible object.  Preserve that supported shape and normalize every
+    attribute it exposes.
+    """
+
+    if not isinstance(turn, ModelTurn) and not any(
+        hasattr(turn, field_name) for field_name in ("final_text", "tool_calls", "stop_reason")
+    ):
+        raise ValueError("model turn has no outcome fields")
+
+    final_text = _normalize_optional_text(
+        getattr(turn, "final_text", None),
+        "model turn final_text",
+    )
+    stop_reason = _normalize_optional_text(
+        getattr(turn, "stop_reason", None),
+        "model turn stop_reason",
+    )
+    has_settled_outcome = bool(final_text) or stop_reason in ("refusal", "length")
+    tool_calls = getattr(turn, "tool_calls", ())
+    if tool_calls is None:
+        tool_calls = ()
+    if not isinstance(tool_calls, (list, tuple)):
+        if has_settled_outcome:
+            tool_calls = ()
+        else:
+            raise ValueError("model turn tool_calls must be an array or null")
+    normalized_calls = []
+    for call in tool_calls:
+        if not all(hasattr(call, field_name) for field_name in ("id", "name", "arguments")):
+            if has_settled_outcome:
+                # Standalone runners have long preserved an odd extra entry beside a paid final
+                # answer so their capture layer can record a bounded repr placeholder. It never
+                # becomes an executable call because the settled answer wins in AgentLoop.
+                normalized_calls.append(call)
+                continue
+            raise ValueError("model turn tool call has an invalid shape")
+        try:
+            arguments = getattr(call, "arguments", {})
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                raise ValueError("model turn tool call arguments must be an object or null")
+            normalized_calls.append(
+                _copy_with_fields(
+                    call,
+                    id=_normalize_required_text(getattr(call, "id"), "model tool call id"),
+                    name=_normalize_required_text(getattr(call, "name"), "model tool call name"),
+                    arguments=normalize_json_ingress(arguments),
+                )
+            )
+        except Exception:
+            if not has_settled_outcome:
+                raise
+    tool_calls = tuple(normalized_calls) if isinstance(tool_calls, tuple) else normalized_calls
+
+    reasoning = getattr(turn, "reasoning", ())
+    if not isinstance(reasoning, (list, tuple)):
+        reasoning = ()
+    normalized_reasoning = normalize_json_ingress(reasoning)
+    reasoning = tuple(normalized_reasoning) if isinstance(reasoning, tuple) else normalized_reasoning
+
+    usage = getattr(turn, "usage", {})
+    if usage is None:
+        usage = {}
+    if not isinstance(usage, dict):
+        raise ValueError("model turn usage must be an object")
+    usage = normalize_usage(usage)
+    raw = getattr(turn, "raw", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    changes = {
+        "response_id": _normalize_optional_text(
+            getattr(turn, "response_id", None),
+            "model turn response_id",
+        ),
+        "final_text": final_text,
+        "tool_calls": tool_calls,
+        "usage": usage,
+        "raw": normalize_json_ingress(raw),
+        "reasoning": reasoning,
+        "stop_reason": stop_reason,
+        "provider_retried": _require_bool(
+            getattr(turn, "provider_retried", False),
+            "model turn provider_retried",
+        ),
+    }
+    try:
+        return _copy_with_fields(turn, **changes)
+    except Exception:
+        # Some structural adapters return immutable tuple-like records.  Their extension type
+        # cannot be copied safely, so converge on the protocol's concrete value instead of
+        # returning un-normalized provider data.
+        return ModelTurn(**changes)
+
+
+def normalize_model_turn(turn: Any) -> Any:
+    """Normalize provider output and classify an unusable response as a model failure."""
+
+    try:
+        return _normalize_model_turn(turn)
+    except ModelAdapterError:
+        raise
+    except Exception as exc:
+        raise ModelAdapterError("model adapter returned a non-portable response") from exc
+
+
+def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
+    """Normalize a provider stream fragment before delivery and assembly."""
+
+    if isinstance(chunk, TextDelta):
+        return _copy_with_fields(
+            chunk,
+            text=_normalize_required_text(chunk.text, "text delta text"),
+            provider_retried=_require_bool(
+                chunk.provider_retried,
+                "text delta provider_retried",
+            ),
+        )
+    if isinstance(chunk, ReasoningDelta):
+        return _copy_with_fields(
+            chunk,
+            text=_normalize_required_text(chunk.text, "reasoning delta text"),
+            provider_retried=_require_bool(
+                chunk.provider_retried,
+                "reasoning delta provider_retried",
+            ),
+        )
+    if isinstance(chunk, ToolCallDelta):
+        return _copy_with_fields(
+            chunk,
+            index=_require_nonnegative_int(chunk.index, "tool call delta index"),
+            arguments_fragment=_normalize_required_text(
+                chunk.arguments_fragment,
+                "tool call delta arguments_fragment",
+            ),
+            id=_normalize_optional_text(chunk.id, "tool call delta id"),
+            name=_normalize_optional_text(chunk.name, "tool call delta name"),
+            provider_retried=_require_bool(
+                chunk.provider_retried,
+                "tool call delta provider_retried",
+            ),
+        )
+    if isinstance(chunk, TurnComplete):
+        reasoning = chunk.reasoning
+        if reasoning is None:
+            reasoning = ()
+        if not isinstance(reasoning, (list, tuple)):
+            raise ValueError("turn complete reasoning must be an array or null")
+        normalized_reasoning = normalize_json_ingress(reasoning)
+        reasoning = (
+            tuple(normalized_reasoning) if isinstance(reasoning, tuple) else normalized_reasoning
+        )
+        usage = chunk.usage
+        if usage is None:
+            usage = {}
+        if not isinstance(usage, dict):
+            raise ValueError("turn complete usage must be an object or null")
+        return _copy_with_fields(
+            chunk,
+            response_id=_normalize_optional_text(chunk.response_id, "turn complete response_id"),
+            usage=normalize_usage(usage),
+            reasoning=reasoning,
+            stop_reason=_normalize_optional_text(chunk.stop_reason, "turn complete stop_reason"),
+            provider_retried=_require_bool(
+                chunk.provider_retried,
+                "turn complete provider_retried",
+            ),
+        )
+    raise ValueError(f"unsupported model stream fragment: {type(chunk).__name__}")
+
+
+def normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
+    """Normalize one provider fragment and classify unusable output as a model failure."""
+
+    try:
+        return _normalize_model_stream_chunk(chunk)
+    except ModelAdapterError:
+        raise
+    except Exception as exc:
+        raise ModelAdapterError("model adapter returned a non-portable stream fragment") from exc
+
+
+@dataclass
+class _UnicodeScalarChunkBuffer:
+    pending_high: str = ""
+    provider_retried: bool = False
+    sequence: int | None = None
+
+    def feed(self, text: Any, *, provider_retried: bool, sequence: int) -> tuple[Any, bool]:
+        if not isinstance(text, str):
+            raise ValueError("model stream text fragment must be a string")
+        inherited_sequence = self.sequence
+        combined = self.pending_high + text
+        inherited_retry = self.provider_retried
+        self.pending_high = ""
+        self.provider_retried = False
+        self.sequence = None
+        if combined and 0xD800 <= ord(combined[-1]) <= 0xDBFF:
+            self.pending_high = combined[-1]
+            self.provider_retried = inherited_retry or provider_retried
+            self.sequence = inherited_sequence if inherited_sequence is not None and not text else sequence
+            combined = combined[:-1]
+        return normalize_unicode_scalars(combined), inherited_retry or provider_retried
+
+    def flush(self) -> tuple[str, bool, int] | None:
+        if not self.pending_high:
+            return None
+        retried = self.provider_retried
+        sequence = self.sequence if self.sequence is not None else 0
+        self.pending_high = ""
+        self.provider_retried = False
+        self.sequence = None
+        return "\ufffd", retried, sequence
+
+
+class ModelStreamIngressNormalizer:
+    """Normalize chunks while preserving surrogate pairs split within one logical channel."""
+
+    def __init__(self) -> None:
+        self._text = _UnicodeScalarChunkBuffer()
+        self._reasoning = _UnicodeScalarChunkBuffer()
+        self._tool_arguments: dict[int, _UnicodeScalarChunkBuffer] = {}
+        self._sequence = 0
+
+    def normalize(self, chunk: ModelStreamChunk) -> list[ModelStreamChunk]:
+        try:
+            return self._normalize(chunk)
+        except ModelAdapterError:
+            raise
+        except Exception as exc:
+            raise ModelAdapterError(
+                "model adapter returned a non-portable stream fragment"
+            ) from exc
+
+    def _normalize(self, chunk: ModelStreamChunk) -> list[ModelStreamChunk]:
+        sequence = self._sequence
+        self._sequence += 1
+        if isinstance(chunk, TextDelta):
+            value, retried = self._text.feed(
+                chunk.text,
+                provider_retried=_require_bool(
+                    chunk.provider_retried,
+                    "text delta provider_retried",
+                ),
+                sequence=sequence,
+            )
+            return [_copy_with_fields(chunk, text=value, provider_retried=retried)]
+        if isinstance(chunk, ReasoningDelta):
+            value, retried = self._reasoning.feed(
+                chunk.text,
+                provider_retried=_require_bool(
+                    chunk.provider_retried,
+                    "reasoning delta provider_retried",
+                ),
+                sequence=sequence,
+            )
+            return [_copy_with_fields(chunk, text=value, provider_retried=retried)]
+        if isinstance(chunk, ToolCallDelta):
+            index = _require_nonnegative_int(chunk.index, "tool call delta index")
+            buffer = self._tool_arguments.setdefault(index, _UnicodeScalarChunkBuffer())
+            value, retried = buffer.feed(
+                chunk.arguments_fragment,
+                provider_retried=_require_bool(
+                    chunk.provider_retried,
+                    "tool call delta provider_retried",
+                ),
+                sequence=sequence,
+            )
+            return [
+                _copy_with_fields(
+                    chunk,
+                    index=index,
+                    arguments_fragment=value,
+                    id=_normalize_optional_text(chunk.id, "tool call delta id"),
+                    name=_normalize_optional_text(chunk.name, "tool call delta name"),
+                    provider_retried=retried,
+                )
+            ]
+        if not isinstance(chunk, TurnComplete):
+            raise ValueError(f"unsupported model stream fragment: {type(chunk).__name__}")
+        terminal = normalize_model_stream_chunk(chunk)
+        emitted = self.finish()
+        emitted.append(terminal)
+        return emitted
+
+    def finish(self) -> list[ModelStreamChunk]:
+        pending: list[tuple[int, ModelStreamChunk]] = []
+        text = self._text.flush()
+        if text is not None:
+            pending.append((text[2], TextDelta(text[0], text[1])))
+        reasoning = self._reasoning.flush()
+        if reasoning is not None:
+            pending.append((reasoning[2], ReasoningDelta(reasoning[0], reasoning[1])))
+        for index, buffer in self._tool_arguments.items():
+            arguments = buffer.flush()
+            if arguments is not None:
+                pending.append(
+                    (
+                        arguments[2],
+                        ToolCallDelta(
+                            index=index,
+                            arguments_fragment=arguments[0],
+                            provider_retried=arguments[1],
+                        ),
+                    )
+                )
+        pending.sort(key=lambda item: item[0])
+        return [chunk for _sequence, chunk in pending]
+
+
 def mark_provider_retried(error: BaseException) -> None:
     """Record on an escaping error that the adapter's retry loop had already run.
 
@@ -489,8 +1017,8 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         slot = slots[index]
         raw = str(slot["args"]).strip()
         try:
-            arguments = json.loads(raw) if raw else {}
-        except json.JSONDecodeError as exc:
+            arguments = loads_model_json_ingress(raw) if raw else {}
+        except ValueError as exc:
             raise ModelAdapterError(
                 f"invalid streamed tool-call arguments for {slot['name']}",
                 provider_error_code="stream_bad_tool_args",
@@ -500,7 +1028,9 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
                 f"streamed tool-call arguments for {slot['name']} are not an object",
                 provider_error_code="stream_bad_tool_args",
             )
-        tool_calls.append(ToolCall(id=str(slot["id"] or ""), name=str(slot["name"] or ""), arguments=arguments))
+        tool_calls.append(
+            ToolCall(id=str(slot["id"] or ""), name=str(slot["name"] or ""), arguments=arguments)
+        )
     # No explicit stop_reason streamed (older gateway / a chunk source that omits it): infer the
     # common cases so the loop's branch still works — tool calls present → tool_calls, else stop.
     if stop_reason is None:

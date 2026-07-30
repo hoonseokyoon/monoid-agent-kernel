@@ -24,6 +24,12 @@ PROFILE = ProfileMetadata(
     harnesses=("backend", "capability", "gateway"),
 )
 
+_PROFILE_LEASE_EXPIRES_AT = 4_102_444_800.0
+_PROFILE_LEASE_MAX_EXPIRES_AT = 4_102_445_000.0
+# The profile uses fixed epochs so external harnesses can compare exact payloads. Declare the
+# matching long-lived request explicitly; admission must never infer authority beyond the request.
+_PROFILE_REQUEST_TTL_SECONDS = int(_PROFILE_LEASE_MAX_EXPIRES_AT)
+
 
 def assert_capability_security_lease_admission(harness: CapabilityHarness) -> None:
     """Run the lease-admission conformance smoke matrix."""
@@ -31,6 +37,7 @@ def assert_capability_security_lease_admission(harness: CapabilityHarness) -> No
         {
             "capability": "web.search",
             "scope": {"allowed_domains": ["*.example.test"], "max_results": 5},
+            "ttl_seconds": _PROFILE_REQUEST_TTL_SECONDS,
         }
     )
     request_id = str(request["request_id"])
@@ -38,9 +45,9 @@ def assert_capability_security_lease_admission(harness: CapabilityHarness) -> No
         "lease_id": "lease_profile_ok",
         "capability": "web.search",
         "token_ref": "approved:web.search",
-        "expires_at": 4_102_444_800.0,
+        "expires_at": _PROFILE_LEASE_EXPIRES_AT,
         "issued_at": 1_700_000_000.0,
-        "max_expires_at": 4_102_445_000.0,
+        "max_expires_at": _PROFILE_LEASE_MAX_EXPIRES_AT,
         "durable": True,
         "scope": {"allowed_domains": ["docs.example.test"], "max_results": 3},
     }
@@ -55,7 +62,11 @@ def assert_capability_security_lease_admission(harness: CapabilityHarness) -> No
     assert admitted["scope"] == lease["scope"]
 
     widened = harness.request_capability(
-        {"capability": "web.search", "scope": {"allowed_domains": ["docs.example.test"], "max_results": 2}}
+        {
+            "capability": "web.search",
+            "scope": {"allowed_domains": ["docs.example.test"], "max_results": 2},
+            "ttl_seconds": _PROFILE_REQUEST_TTL_SECONDS,
+        }
     )
     _assert_raises(
         lambda: harness.grant_capability(
@@ -63,21 +74,27 @@ def assert_capability_security_lease_admission(harness: CapabilityHarness) -> No
             {
                 "capability": "web.search",
                 "token_ref": "approved:web.search",
-                "expires_at": 4_102_444_800.0,
+                "expires_at": _PROFILE_LEASE_EXPIRES_AT,
                 "scope": {"allowed_domains": ["*.example.test"], "max_results": 5},
             },
         ),
         "wider scope",
     )
 
-    mismatch = harness.request_capability({"capability": "web.search", "scope": {}})
+    mismatch = harness.request_capability(
+        {
+            "capability": "web.search",
+            "scope": {},
+            "ttl_seconds": _PROFILE_REQUEST_TTL_SECONDS,
+        }
+    )
     _assert_raises(
         lambda: harness.grant_capability(
             str(mismatch["request_id"]),
             {
                 "capability": "web.fetch",
                 "token_ref": "approved:web.fetch",
-                "expires_at": 4_102_444_800.0,
+                "expires_at": _PROFILE_LEASE_EXPIRES_AT,
                 "scope": {},
             },
         ),
@@ -191,14 +208,20 @@ def _admit_profile_lease(
     scope: dict[str, Any] | None = None,
     durable: bool = False,
 ) -> dict[str, Any]:
-    request = harness.request_capability({"capability": capability, "scope": scope or {}})
+    request = harness.request_capability(
+        {
+            "capability": capability,
+            "scope": scope or {},
+            "ttl_seconds": _PROFILE_REQUEST_TTL_SECONDS,
+        }
+    )
     return harness.grant_capability(
         str(request["request_id"]),
         {
             "lease_id": lease_id,
             "capability": capability,
             "token_ref": token_ref,
-            "expires_at": 4_102_444_800.0,
+            "expires_at": _PROFILE_LEASE_EXPIRES_AT,
             "issued_at": issued_at,
             "durable": durable,
             "scope": scope or {},

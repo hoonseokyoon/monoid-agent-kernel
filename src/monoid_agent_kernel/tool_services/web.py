@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from monoid_agent_kernel.core.scope import effective_signed_scope
+from monoid_agent_kernel.core.runtime_controls import (
+    exact_runtime_integer,
+    validate_web_runtime,
+)
 from monoid_agent_kernel.errors import ToolExecutionError, error_code_for_exception
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.public_view import public_error_message
@@ -18,6 +22,14 @@ from monoid_agent_kernel.web import (
     public_query_preview,
     public_url_preview,
 )
+
+
+def _domain_array(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)) or not all(type(item) is str for item in value):
+        raise ValueError(f"web tool {field_name} must be an array of strings")
+    return [item.strip().lower() for item in value if item.strip()]
 
 
 @dataclass
@@ -67,14 +79,18 @@ class WebService:
 
     def _runtime(self, call: CallContext) -> dict[str, Any]:
         runtime = call.runtime or {}
-        if not isinstance(runtime, dict):
-            return {}
-        web_runtime = runtime.get("web", runtime)
-        return dict(web_runtime) if isinstance(web_runtime, dict) else {}
+        return validate_web_runtime(runtime)
 
     def _max_calls(self, call: CallContext, feature: str, default: int) -> int:
         runtime = self._runtime(call)
-        return max(0, int(runtime.get("max_calls", runtime.get(f"max_{feature}_calls", default))))
+        for key in ("max_calls", f"max_{feature}_calls"):
+            if key in runtime:
+                return exact_runtime_integer(
+                    runtime[key],
+                    field_name=f"web binding runtime {key}",
+                    minimum=0,
+                )
+        return default
 
     def _bounded_int(
         self,
@@ -82,24 +98,37 @@ class WebService:
         requested: Any,
         *,
         default_key: str,
-        max_key: str,
+        max_keys: tuple[str, ...],
         default_value: int,
         max_value: int,
     ) -> int:
         runtime = self._runtime(call)
-        effective_default = int(runtime.get(default_key, default_value))
-        effective_max = int(runtime.get(max_key, max_value))
-        value = effective_default if requested is None else int(requested)
+        effective_default = exact_runtime_integer(
+            runtime.get(default_key, default_value),
+            field_name=f"web binding runtime {default_key}",
+            minimum=1,
+        )
+        selected_max_key = next((key for key in max_keys if key in runtime), max_keys[0])
+        effective_max = exact_runtime_integer(
+            runtime.get(selected_max_key, max_value),
+            field_name=f"web binding runtime {selected_max_key}",
+            minimum=1,
+        )
+        value = (
+            effective_default
+            if requested is None
+            else exact_runtime_integer(
+                requested,
+                field_name=f"web tool argument for {selected_max_key}",
+                minimum=1,
+            )
+        )
         return max(1, min(value, effective_max))
 
     def _domain_filters(self, args: dict[str, Any], call: CallContext) -> tuple[list[str], list[str]]:
         requested: dict[str, Any] = {}
-        requested_allowed = [
-            str(item).strip().lower() for item in args.get("allowed_domains") or () if str(item).strip()
-        ]
-        requested_blocked = [
-            str(item).strip().lower() for item in args.get("blocked_domains") or () if str(item).strip()
-        ]
+        requested_allowed = _domain_array(args.get("allowed_domains"), "allowed_domains")
+        requested_blocked = _domain_array(args.get("blocked_domains"), "blocked_domains")
         if requested_allowed:
             requested["allowed_domains"] = requested_allowed
         if requested_blocked:
@@ -162,7 +191,7 @@ class WebService:
             call,
             requested_max_results,
             default_key="default_max_results",
-            max_key="max_results",
+            max_keys=("max_results",),
             default_value=5,
             max_value=10,
         )
@@ -226,7 +255,7 @@ class WebService:
             call,
             requested_timeout_s,
             default_key="default_timeout_s",
-            max_key="max_timeout_s",
+            max_keys=("max_timeout_s", "timeout_s"),
             default_value=30,
             max_value=60,
         )
@@ -234,7 +263,7 @@ class WebService:
             call,
             requested_max_bytes,
             default_key="default_max_response_bytes",
-            max_key="max_response_bytes",
+            max_keys=("max_response_bytes", "max_bytes"),
             default_value=100_000,
             max_value=1_000_000,
         )
@@ -310,7 +339,7 @@ class WebService:
             call,
             requested_max_tokens,
             default_key="default_max_context_tokens",
-            max_key="max_context_tokens",
+            max_keys=("max_context_tokens", "max_tokens"),
             default_value=8_192,
             max_value=32_768,
         )
@@ -318,7 +347,7 @@ class WebService:
             call,
             requested_max_urls,
             default_key="default_max_context_urls",
-            max_key="max_context_urls",
+            max_keys=("max_context_urls", "max_urls"),
             default_value=8,
             max_value=20,
         )
@@ -326,7 +355,7 @@ class WebService:
             call,
             requested_max_snippets,
             default_key="default_max_context_snippets",
-            max_key="max_context_snippets",
+            max_keys=("max_context_snippets", "max_snippets"),
             default_value=50,
             max_value=256,
         )
