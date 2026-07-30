@@ -16,6 +16,7 @@ from monoid_agent_kernel.core.tool_surface import (
     ToolScope,
 )
 from monoid_agent_kernel.errors import AgentConfigError
+from monoid_agent_kernel.permissions import PATH_PATTERN_ENCODING_FIELD
 from monoid_agent_kernel.tools.base import ToolRegistry, ToolSpec
 
 ToolRefKind = Literal["registry"]
@@ -124,6 +125,15 @@ class ToolBinding:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> ToolBinding:
+        return cls._from_json(payload, durable=False)
+
+    @classmethod
+    def from_durable_json(cls, payload: dict[str, Any]) -> ToolBinding:
+        """Read a binding embedded in a retained runtime-config artifact."""
+        return cls._from_json(payload, durable=True)
+
+    @classmethod
+    def _from_json(cls, payload: dict[str, Any], *, durable: bool) -> ToolBinding:
         if isinstance(payload, ToolBinding):
             return payload
         if not isinstance(payload, dict):
@@ -158,7 +168,11 @@ class ToolBinding:
             exposure=exposure,  # type: ignore[arg-type]
             authorization=authorization,  # type: ignore[arg-type]
             guidance=ToolGuidance.from_json(payload.get("guidance")),
-            scope=ToolScope.from_json(payload.get("scope")),
+            scope=(
+                ToolScope.from_durable_json(payload.get("scope"))
+                if durable
+                else ToolScope.from_json(payload.get("scope"))
+            ),
             quota=ToolQuota.from_json(payload.get("quota")),
             title=str(payload.get("title") or ""),
             summary=str(payload.get("summary") or ""),
@@ -331,6 +345,15 @@ class AgentRuntimeConfig:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> AgentRuntimeConfig:
+        return cls._from_json(payload, durable=False)
+
+    @classmethod
+    def from_durable_json(cls, payload: dict[str, Any]) -> AgentRuntimeConfig:
+        """Read a retained backend/checkpoint config without relaxing operator input."""
+        return cls._from_json(payload, durable=True)
+
+    @classmethod
+    def _from_json(cls, payload: dict[str, Any], *, durable: bool) -> AgentRuntimeConfig:
         if isinstance(payload, AgentRuntimeConfig):
             return payload
         if not isinstance(payload, dict):
@@ -341,7 +364,14 @@ class AgentRuntimeConfig:
             config_version=int(payload.get("config_version") or payload.get("version") or 1),
             model=ModelConfig.from_json(model_payload) if model_payload is not None else None,
             prompt=PromptSpec.from_json(payload.get("prompt")),
-            tools=tuple(ToolBinding.from_json(item) for item in payload.get("tools") or ()),
+            tools=tuple(
+                (
+                    ToolBinding.from_durable_json(item)
+                    if durable
+                    else ToolBinding.from_json(item)
+                )
+                for item in payload.get("tools") or ()
+            ),
             tool_search=ToolSearchConfig.from_json(payload.get("tool_search")),
             output_validators=tuple(
                 OutputValidatorBinding.from_json(item) for item in payload.get("output_validators") or ()
@@ -368,7 +398,7 @@ class AgentRuntimeConfig:
 
     @property
     def config_hash(self) -> str:
-        return canonical_sha256(self._json_payload())
+        return canonical_sha256(self._semantic_hash_payload())
 
     def to_json(self) -> dict[str, Any]:
         payload = self._json_payload()
@@ -386,6 +416,22 @@ class AgentRuntimeConfig:
             "output_validators": [binding.to_json() for binding in self.output_validators],
             "metadata": dict(self.metadata),
         }
+
+    def _semantic_hash_payload(self) -> dict[str, Any]:
+        """Return the runtime meaning, excluding the path-pattern wire discriminator.
+
+        ``path_pattern_encoding`` only tells a fresh JSON reader how to decode a raw leading
+        ``!``. It is not part of ``ToolScope``'s in-memory policy, and durable readers preserve the
+        same meaning with or without it. Keeping it out of the semantic hash also lets a v0.19
+        reader ignore the additive field and recompute the same hash during rolling recovery.
+        Raw path arrays and every other scope field remain hash-authoritative.
+        """
+        payload = self._json_payload()
+        for binding in payload["tools"]:
+            scope = binding.get("scope")
+            if isinstance(scope, dict):
+                scope.pop(PATH_PATTERN_ENCODING_FIELD, None)
+        return payload
 
 
 @dataclass(frozen=True)

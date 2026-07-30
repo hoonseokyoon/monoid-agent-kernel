@@ -210,7 +210,7 @@ def runtime_config_from_metadata(meta: Mapping[str, Any]) -> AgentRuntimeConfig:
     config_payload = meta.get("runtime_config")
     if not isinstance(config_payload, dict):
         raise ValueError("run metadata is missing runtime_config")
-    config = AgentRuntimeConfig.from_json(config_payload)
+    config = AgentRuntimeConfig.from_durable_json(config_payload)
     expected_hash = str(meta.get("runtime_config_hash") or config_payload.get("config_hash") or "")
     if expected_hash and expected_hash != config.config_hash:
         raise ValueError("runtime config hash mismatch in run metadata")

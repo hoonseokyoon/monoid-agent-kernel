@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 
 from support.runtime import runtime_config
+from support.runtime import tool_binding
 
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.durable_metadata import (
     ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS,
     RUN_METADATA_SCHEMA_VERSION,
@@ -15,6 +17,7 @@ from monoid_agent_kernel.core.durable_metadata import (
     validate_run_metadata,
 )
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.core.tool_surface import ToolScope
 
 
 def _metadata(run_id: str = "run_1", *, version: int = 1) -> dict:
@@ -82,6 +85,100 @@ def test_runtime_config_hash_mismatch_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="runtime config hash mismatch"):
         runtime_config_from_metadata(meta)
+
+
+def test_runtime_config_keeps_pre_v020_literal_bang_hash_compatible() -> None:
+    config = runtime_config(
+        bindings=(
+            tool_binding(
+                "fs.read",
+                scope=ToolScope(allowed_paths=("!odd",), denied_paths=("./!private",)),
+            ),
+        )
+    )
+    legacy_payload = config.to_json()
+    legacy_payload["tools"][0]["scope"].pop("path_pattern_encoding")
+    legacy_payload["tools"][0]["scope"]["allowed_paths"] = ["!odd"]
+    legacy_payload["tools"][0]["scope"]["denied_paths"] = ["./!private"]
+    hash_payload = dict(legacy_payload)
+    hash_payload.pop("config_hash")
+    legacy_hash = canonical_sha256(hash_payload)
+    legacy_payload["config_hash"] = legacy_hash
+    meta = {
+        **_metadata(),
+        "runtime_config": legacy_payload,
+        "runtime_config_hash": legacy_hash,
+    }
+
+    restored = runtime_config_from_metadata(meta)
+
+    assert restored.tools[0].scope == config.tools[0].scope
+    assert restored.config_hash == config.config_hash == legacy_hash
+
+
+def test_runtime_config_raw_hash_exception_rejects_unrelated_payload_drift() -> None:
+    config_payload = _metadata()["runtime_config"]
+    config_payload["unexpected"] = "must not be hash-authoritative"
+    hash_payload = dict(config_payload)
+    hash_payload.pop("config_hash")
+    raw_hash = canonical_sha256(hash_payload)
+    config_payload["config_hash"] = raw_hash
+    meta = {
+        **_metadata(),
+        "runtime_config": config_payload,
+        "runtime_config_hash": raw_hash,
+    }
+
+    with pytest.raises(ValueError, match="runtime config hash mismatch"):
+        runtime_config_from_metadata(meta)
+
+
+def test_runtime_config_legacy_hash_rejects_json_type_drift() -> None:
+    config = runtime_config(
+        bindings=(
+            tool_binding("fs.read", scope=ToolScope(allowed_paths=("!odd",))),
+        )
+    )
+    legacy_payload = config.to_json()
+    legacy_payload["tools"][0]["scope"].pop("path_pattern_encoding")
+    legacy_payload["tools"][0]["scope"]["allowed_paths"] = ["!odd"]
+    legacy_payload["config_version"] = True
+    hash_payload = dict(legacy_payload)
+    hash_payload.pop("config_hash")
+    raw_hash = canonical_sha256(hash_payload)
+    legacy_payload["config_hash"] = raw_hash
+    meta = {
+        **_metadata(),
+        "runtime_config": legacy_payload,
+        "runtime_config_hash": raw_hash,
+    }
+
+    with pytest.raises(ValueError, match="runtime config hash mismatch"):
+        runtime_config_from_metadata(meta)
+
+
+def test_runtime_config_retains_old_hash_for_legacy_purepath_scope() -> None:
+    config = runtime_config(
+        bindings=(
+            tool_binding("fs.read", scope=ToolScope(allowed_paths=("secret/file",))),
+        )
+    )
+    legacy_payload = config.to_json()
+    legacy_payload["tools"][0]["scope"]["allowed_paths"] = ["secret//file"]
+    hash_payload = dict(legacy_payload)
+    hash_payload.pop("config_hash")
+    legacy_hash = canonical_sha256(hash_payload)
+    legacy_payload["config_hash"] = legacy_hash
+    meta = {
+        **_metadata(),
+        "runtime_config": legacy_payload,
+        "runtime_config_hash": legacy_hash,
+    }
+
+    restored = runtime_config_from_metadata(meta)
+
+    assert restored.config_hash == legacy_hash
+    assert restored.to_json()["tools"][0]["scope"]["allowed_paths"] == ["secret//file"]
 
 
 def test_shared_metadata_materializes_local_recovery_descriptor(tmp_path) -> None:

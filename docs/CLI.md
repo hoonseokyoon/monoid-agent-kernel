@@ -151,7 +151,9 @@ independently. This table is the exact contract:
 
 A leading `!` (negation) is **rejected**: it would make the result depend on pattern order, and
 merging two policies treats their patterns as a set.
-A literal leading `!` is written as `\!` in configuration and JSON output.
+A literal leading `!` is written as `\!` in operator configuration. Serialized JSON keeps the
+literal `!` and adds `"path_pattern_encoding": "monoid.literal-bang.v1"`, so current readers can
+distinguish it from negation without changing how pre-v0.20 readers match the pattern.
 A leading `#` stays literal; it does not turn the rest of the pattern into a gitignore comment.
 Leading `./` is normalized. Backslash is a workspace path separator rather than a pattern escape;
 the leading `\!` configuration spelling is its only accepted source-level use. Root-only (`/`, `.`,

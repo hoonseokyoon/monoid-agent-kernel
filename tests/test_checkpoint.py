@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 from support.process import python_command as _python_command
-from support.runtime import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.checkpoint import (
     SCHEMA_VERSION,
     LocalFsCheckpointStore,
@@ -25,6 +26,7 @@ from monoid_agent_kernel.core.result import (
     suspension_from_checkpoint_payload,
 )
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn, ToolObservation
@@ -1023,6 +1025,47 @@ def test_restore_carries_remaining_deadline(tmp_path: Path) -> None:
     # Downtime does not count against max_duration_s: the resumed deadline is ~now+remaining,
     # so the run is not immediately limited even though it was parked for a long time.
     assert 290.0 < (res.deadline - time.time()) < 300.5
+    loop.close()
+
+
+def test_restore_reads_pre_v020_runtime_config_scope_from_checkpoint(tmp_path: Path) -> None:
+    config = runtime_config(
+        bindings=(
+            tool_binding(
+                "fs.read",
+                scope=ToolScope(allowed_paths=("!odd",), denied_paths=("./!private",)),
+            ),
+        )
+    )
+    legacy_payload = config.to_json()
+    legacy_payload["tools"][0]["scope"].pop("path_pattern_encoding")
+    legacy_payload["tools"][0]["scope"]["allowed_paths"] = ["!odd"]
+    legacy_payload["tools"][0]["scope"]["denied_paths"] = ["./!private"]
+    hash_payload = dict(legacy_payload)
+    hash_payload.pop("config_hash")
+    legacy_payload["config_hash"] = canonical_sha256(hash_payload)
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.read")),
+    )
+
+    loop.restore(
+        RunCheckpoint(
+            run_id=spec.run_id,
+            status="completed",
+            previous_runtime_config=legacy_payload,
+        )
+    )
+
+    restored = loop._session.state.previous_runtime_config  # type: ignore[union-attr]
+    assert restored is not None
+    assert restored.tools[0].scope == config.tools[0].scope
+    assert restored.to_json()["tools"][0]["scope"]["allowed_paths"] == ["!odd"]
+    assert restored.to_json()["tools"][0]["scope"]["path_pattern_encoding"] == (
+        "monoid.literal-bang.v1"
+    )
     loop.close()
 
 

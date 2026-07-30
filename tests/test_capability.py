@@ -21,6 +21,10 @@ from monoid_agent_kernel.core.capability import (
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.permissions import (
+    PATH_PATTERN_ENCODING_FIELD,
+    PATH_PATTERN_ENCODING_LITERAL_BANG,
+)
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -71,6 +75,89 @@ def test_vault_caches_valid_lease_and_expires() -> None:
     assert vault.get_valid("web.search", {"allowed_domains": ["a.edu"]}, now=2001.0) is None
     # A need broader than the cached lease -> miss (must re-request).
     assert vault.get_valid("web.search", {"allowed_domains": ["a.edu", "b.edu"]}, now=1999.0) is None
+
+
+def _current_literal_bang_scope() -> dict[str, object]:
+    scope = {
+        key: value
+        for key, value in ToolScope(allowed_paths=("!odd",)).to_json().items()
+        if value
+    }
+    assert scope[PATH_PATTERN_ENCODING_FIELD] == PATH_PATTERN_ENCODING_LITERAL_BANG
+    return scope
+
+
+def test_pre_v020_literal_bang_lease_satisfies_current_marked_scope() -> None:
+    current_scope = _current_literal_bang_scope()
+    legacy_lease = CapabilityLease.from_json(
+        {
+            "protocol": "monoid.capability-lease.v1",
+            "lease_id": "lease_pre_v020_raw_bang",
+            "capability": "filesystem.read",
+            "token_ref": "legacy:raw-bang",
+            "expires_at": 2000.0,
+            "scope": {"allowed_paths": ["!odd"]},
+        }
+    )
+
+    restored_vault = CapabilityVault()
+    restored_vault.install(legacy_lease)
+    assert restored_vault.get_valid(
+        "filesystem.read", current_scope, now=1999.0
+    ) is legacy_lease
+
+    current_request = CapabilityRequest(capability="filesystem.read", scope=current_scope)
+    assert CapabilityVault().admit(current_request, legacy_lease) is legacy_lease
+
+
+def test_pre_v020_backslash_bang_lease_does_not_widen_to_current_literal_bang() -> None:
+    current_scope = _current_literal_bang_scope()
+    legacy_lease = CapabilityLease.from_json(
+        {
+            "protocol": "monoid.capability-lease.v1",
+            "lease_id": "lease_pre_v020_backslash_bang",
+            "capability": "filesystem.read",
+            "token_ref": "legacy:backslash-bang",
+            "expires_at": 2000.0,
+            "scope": {"allowed_paths": [r"\!odd"]},
+        }
+    )
+
+    restored_vault = CapabilityVault()
+    restored_vault.install(legacy_lease)
+    assert restored_vault.get_valid("filesystem.read", current_scope, now=1999.0) is None
+
+    current_request = CapabilityRequest(capability="filesystem.read", scope=current_scope)
+    with pytest.raises(ValueError, match="wider scope"):
+        CapabilityVault().admit(current_request, legacy_lease)
+
+
+@pytest.mark.parametrize(
+    ("stored_pattern", "accepted"),
+    [("!odd", True), (r"\!odd", False)],
+)
+def test_pre_v020_hosted_capability_request_preserves_literal_bang_boundary(
+    stored_pattern: str,
+    accepted: bool,
+) -> None:
+    # Hosted capability tasks retain the original request scope as an untyped JSON object.
+    restored_request = CapabilityRequest(
+        capability="filesystem.read",
+        scope={"allowed_paths": [stored_pattern]},
+    )
+    current_lease = CapabilityLease(
+        capability="filesystem.read",
+        token_ref="current:literal-bang",
+        expires_at=2000.0,
+        scope=_current_literal_bang_scope(),
+    )
+    vault = CapabilityVault()
+
+    if accepted:
+        assert vault.admit(restored_request, current_lease) is current_lease
+    else:
+        with pytest.raises(ValueError, match="wider scope"):
+            vault.admit(restored_request, current_lease)
 
 
 def test_vault_admit_rejects_scope_widening() -> None:

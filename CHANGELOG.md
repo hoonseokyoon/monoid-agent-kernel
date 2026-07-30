@@ -49,11 +49,23 @@ out in commit messages and here.
 - **Negation is rejected rather than silently adopted.** `.gitignore` reads a leading `!` as
   "un-match", which would have handed every deny list a way to punch holes in itself — with the
   result depending on pattern *order*, while `PermissionPolicy.merged` combines two policies by
-  concatenating and de-duplicating, i.e. as a set. Manifest, CLI, and `ToolScope` configuration now
-  raise on an unescaped negation. Write `\!name` to configure a literal leading `!`; JSON output
-  uses that spelling so direct Python policies round-trip. A leading `#` likewise stays literal
-  rather than becoming a gitignore comment and silently dropping a rule.
-- **Compatibility spellings are validated before matching.** A leading `./` is normalized;
+  concatenating and de-duplicating, i.e. as a set. Fresh permission-policy files, run specs, CLI
+  flags, HTTP/control runtime configs, and `ToolScope` configuration now raise on an unescaped
+  negation. Write `\!name` to configure a literal leading `!`. JSON output keeps `!name` and adds
+  `"path_pattern_encoding": "monoid.literal-bang.v1"`, preserving old-reader matching while making
+  current round-trips unambiguous. Retained `manifest.v1`, `backend-run.v1`, `checkpoint.v1`, and
+  queued `command-inbox.v1` artifacts still decode the pre-v0.20 bare `!` spelling as a literal;
+  patterns accepted by the old `PurePath` grammar but rejected by fresh v0.20 configuration retain
+  the historical matcher on those artifact readers. The runtime-config semantic hash excludes
+  only this representation marker while continuing to hash the raw path arrays and every other
+  scope field. A v0.19 reader can therefore ignore the additive marker and recompute the same hash
+  during rolling recovery. An unmarked
+  pre-v0.20 `\!name` retains its historical literal-backslash meaning and cannot widen an old
+  allow-list to `!name`. Durable runtime-config commands now preserve the validated
+  `ToolBinding.authorization` policy enum (`allow`, `ask`, or `deny`) at its exact schema path;
+  credential-shaped `authorization` fields elsewhere remain redacted. A leading `#`
+  likewise stays literal rather than becoming a gitignore comment and silently dropping a rule.
+- **Fresh configuration spellings are validated before matching.** A leading `./` is normalized;
   a trailing `/` covers both the directory node and its subtree; root-only and malformed patterns
   fail during config load rather than at the first event. Source backslashes are rejected except
   for the documented leading `\!` wire spelling: workspace input treats backslash as a separator,

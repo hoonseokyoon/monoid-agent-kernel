@@ -20,7 +20,13 @@ import pytest
 
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import PermissionDenied, WorkspaceError
-from monoid_agent_kernel.permissions import PermissionPolicy, _compiled, matches_path_patterns
+from monoid_agent_kernel.permissions import (
+    PATH_PATTERN_ENCODING_FIELD,
+    PATH_PATTERN_ENCODING_LITERAL_BANG,
+    PermissionPolicy,
+    _compiled,
+    matches_path_patterns,
+)
 
 # (pattern, path, matches) -- read as "an operator who writes <pattern> means <path> is covered".
 CASES: tuple[tuple[str, str, bool], ...] = (
@@ -421,10 +427,57 @@ def test_literal_negation_has_an_unambiguous_policy_json_round_trip() -> None:
 
     payload = policy.to_json()
     assert payload == {
-        "deny_patterns": [r"\!odd", "./secrets/**"],
-        "redact_patterns": [r"\!private/", "private/"],
+        "deny_patterns": ["!odd", "./secrets/**"],
+        "redact_patterns": ["!private/", "private/"],
+        PATH_PATTERN_ENCODING_FIELD: PATH_PATTERN_ENCODING_LITERAL_BANG,
     }
     assert PermissionPolicy.from_json(payload) == policy
+
+
+def test_durable_policy_decoder_migrates_the_legacy_literal_bang() -> None:
+    payload = {
+        "deny_patterns": ["!odd", "./!nested"],
+        "redact_patterns": [r"\!private"],
+    }
+
+    policy = PermissionPolicy.from_durable_json(payload)
+
+    assert policy.deny_patterns == ("!odd", "./!nested")
+    assert policy.redact_patterns == (r"\!private",)
+    assert policy.is_path_redacted("!private") is False
+    assert policy.to_json() == {
+        "deny_patterns": ["!odd", "./!nested"],
+        "redact_patterns": [r"\!private"],
+        PATH_PATTERN_ENCODING_FIELD: PATH_PATTERN_ENCODING_LITERAL_BANG,
+    }
+    assert PermissionPolicy.from_durable_json(policy.to_json()) == policy
+    with pytest.raises(ValueError, match="legacy-ambiguous"):
+        PermissionPolicy.from_json(policy.to_json())
+    assert payload["deny_patterns"] == ["!odd", "./!nested"]
+    with pytest.raises(ValueError, match="negated path patterns"):
+        PermissionPolicy.from_json(payload)
+    with pytest.raises(ValueError, match="invalid retained path pattern"):
+        PermissionPolicy.from_durable_json({"deny_patterns": ["."]})
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "expected"),
+    [
+        ("secret//file", "secret/file", True),
+        ("secret/./file", "secret/file", True),
+        ("[", "[", True),
+        ("public\u00a0", "public\u00a0", True),
+        ("../outside", "outside", False),
+        (r"folder\name", "folder/name", False),
+    ],
+)
+def test_durable_policy_preserves_pre_v020_purepath_patterns(
+    pattern: str, path: str, expected: bool
+) -> None:
+    policy = PermissionPolicy.from_durable_json({"deny_patterns": [pattern]})
+
+    assert policy.is_path_denied(path) is expected
+    assert policy.to_json()["deny_patterns"] == [pattern]
 
 
 def test_literal_negation_has_an_unambiguous_tool_scope_json_round_trip() -> None:
@@ -433,9 +486,36 @@ def test_literal_negation_has_an_unambiguous_tool_scope_json_round_trip() -> Non
     )
 
     payload = scope.to_json()
-    assert payload["allowed_paths"] == [r"\!odd", "./public/**"]
-    assert payload["denied_paths"] == [r"\!private/", "private/"]
+    assert payload["allowed_paths"] == ["!odd", "./public/**"]
+    assert payload["denied_paths"] == ["!private/", "private/"]
+    assert payload[PATH_PATTERN_ENCODING_FIELD] == PATH_PATTERN_ENCODING_LITERAL_BANG
     assert ToolScope.from_json(payload) == scope
+
+
+def test_durable_tool_scope_decoder_keeps_operator_input_strict() -> None:
+    payload = {"allowed_paths": ["!odd"], "denied_paths": ["./!private"]}
+
+    scope = ToolScope.from_durable_json(payload)
+
+    assert scope.allowed_paths == ("!odd",)
+    assert scope.denied_paths == ("./!private",)
+    assert scope.to_json()["allowed_paths"] == ["!odd"]
+    assert scope.to_json()["denied_paths"] == ["./!private"]
+    assert scope.to_json()[PATH_PATTERN_ENCODING_FIELD] == PATH_PATTERN_ENCODING_LITERAL_BANG
+    with pytest.raises(ValueError, match="negated path patterns"):
+        ToolScope.from_json(payload)
+
+
+def test_unmarked_pre_v020_backslash_bang_scope_remains_inert() -> None:
+    legacy = ToolScope.from_durable_json({"allowed_paths": [r"\!odd"]})
+
+    assert matches_path_patterns("!odd", legacy.allowed_paths) is False
+    serialized = legacy.to_json()
+    assert serialized["allowed_paths"] == [r"\!odd"]
+    assert serialized[PATH_PATTERN_ENCODING_FIELD] == PATH_PATTERN_ENCODING_LITERAL_BANG
+    assert ToolScope.from_durable_json(serialized) == legacy
+    with pytest.raises(ValueError, match="legacy-ambiguous"):
+        ToolScope.from_json(serialized)
 
 
 @pytest.mark.parametrize(

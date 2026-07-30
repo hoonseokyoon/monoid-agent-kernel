@@ -104,6 +104,35 @@ def sanitize_command_data(value: Any, *, key: str = "") -> Any:
     return repr(value)
 
 
+def sanitize_command_args(command_type: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize durable args while retaining validated tool authorization policy values."""
+
+    sanitized = sanitize_command_data(args)
+    assert isinstance(sanitized, dict)
+    if command_type != "replace_runtime_config":
+        return sanitized
+
+    source_config = args.get("config")
+    target_config = sanitized.get("config")
+    if not isinstance(source_config, dict) or not isinstance(target_config, dict):
+        return sanitized
+    source_tools = source_config.get("tools")
+    target_tools = target_config.get("tools")
+    if not isinstance(source_tools, list) or not isinstance(target_tools, list):
+        return sanitized
+
+    for source_tool, target_tool in zip(source_tools, target_tools, strict=True):
+        if not isinstance(source_tool, dict) or not isinstance(target_tool, dict):
+            continue
+        authorization = source_tool.get("authorization")
+        if isinstance(authorization, str) and authorization in {"allow", "ask", "deny"}:
+            # ``ToolBinding.authorization`` is a policy enum, not an HTTP credential. Keep the
+            # exception at this exact validated runtime-config path; every other key named
+            # ``authorization`` remains redacted by ``sanitize_command_data``.
+            target_tool["authorization"] = authorization
+    return sanitized
+
+
 def redact_command_credential(value: Any, credential: str) -> Any:
     """Remove the authenticated bearer value if a caller repeated it in payload text."""
 
@@ -134,7 +163,7 @@ def command_identity_sha256(
 
     payload = {
         "type": command_type,
-        "args": sanitize_command_data(args),
+        "args": sanitize_command_args(command_type, args),
         "principal": principal.to_json(),
         "reason": reason,
     }

@@ -357,6 +357,50 @@ def test_status_projection_redacts_paths_from_manifest_policy(tmp_path: Path) ->
     assert projection["changed_paths"] == ["[redacted-path]"]
 
 
+@pytest.mark.parametrize(
+    ("stored_pattern", "encoding", "changed_path", "expected_path"),
+    [
+        ("!private", None, "!private", "[redacted-path]"),
+        (r"\!private", None, "!private", "!private"),
+        ("!private", "monoid.literal-bang.v1", "!private", "[redacted-path]"),
+        ("secret//file", None, "secret/file", "[redacted-path]"),
+        ("secret/./file", None, "secret/file", "[redacted-path]"),
+        ("[", None, "[", "[redacted-path]"),
+        ("public\u00a0", None, "public\u00a0", "[redacted-path]"),
+    ],
+)
+def test_status_projection_reads_legacy_and_current_literal_bang_patterns(
+    tmp_path: Path,
+    stored_pattern: str,
+    encoding: str | None,
+    changed_path: str,
+    expected_path: str,
+) -> None:
+    run_dir = tmp_path / "runs" / "run_legacy"
+    run_dir.mkdir(parents=True)
+    policy = {"deny_patterns": [], "redact_patterns": [stored_pattern]}
+    if encoding is not None:
+        policy["path_pattern_encoding"] = encoding
+    run_dir.joinpath("manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "monoid.manifest.v1",
+                "permission_policy": policy,
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir.joinpath("proposal.json").write_text(
+        json.dumps({"run_id": "run_legacy", "changed_paths": [changed_path]}),
+        encoding="utf-8",
+    )
+
+    projection = project_run_status(run_dir)
+
+    assert projection["run_id"] == "run_legacy"
+    assert projection["changed_paths"] == [expected_path]
+
+
 def test_loop_records_unknown_malformed_and_permission_failures_as_events(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

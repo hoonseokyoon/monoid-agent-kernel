@@ -6,7 +6,12 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.permissions import (
-    parse_path_patterns,
+    PATH_PATTERN_ENCODING_FIELD,
+    PATH_PATTERN_ENCODING_LITERAL_BANG,
+    parse_durable_path_patterns,
+    parse_serialized_path_patterns,
+    path_pattern_encoding,
+    path_patterns_need_encoding_marker,
     serialize_path_patterns,
     validate_internal_path_patterns,
 )
@@ -121,9 +126,38 @@ class ToolScope:
             return payload
         if not isinstance(payload, Mapping):
             raise ValueError("tool scope must be an object")
+        encoding = path_pattern_encoding(payload)
         return cls(
-            allowed_paths=parse_path_patterns(payload.get("allowed_paths")),
-            denied_paths=parse_path_patterns(payload.get("denied_paths")),
+            allowed_paths=parse_serialized_path_patterns(
+                payload.get("allowed_paths"), encoding=encoding
+            ),
+            denied_paths=parse_serialized_path_patterns(
+                payload.get("denied_paths"), encoding=encoding
+            ),
+            allowed_domains=_str_tuple(payload.get("allowed_domains")),
+            blocked_domains=_str_tuple(payload.get("blocked_domains")),
+            command_allow_prefixes=_str_tuple(payload.get("command_allow_prefixes")),
+            command_deny_prefixes=_str_tuple(payload.get("command_deny_prefixes")),
+            env_allowlist=_str_tuple(payload.get("env_allowlist")),
+        )
+
+    @classmethod
+    def from_durable_json(cls, payload: Any) -> ToolScope:
+        """Read a retained scope while preserving pre-v0.20 literal leading bangs."""
+        if payload is None:
+            return cls()
+        if isinstance(payload, ToolScope):
+            return payload
+        if not isinstance(payload, Mapping):
+            raise ValueError("tool scope must be an object")
+        encoding = path_pattern_encoding(payload)
+        return cls(
+            allowed_paths=parse_durable_path_patterns(
+                payload.get("allowed_paths"), encoding=encoding
+            ),
+            denied_paths=parse_durable_path_patterns(
+                payload.get("denied_paths"), encoding=encoding
+            ),
             allowed_domains=_str_tuple(payload.get("allowed_domains")),
             blocked_domains=_str_tuple(payload.get("blocked_domains")),
             command_allow_prefixes=_str_tuple(payload.get("command_allow_prefixes")),
@@ -132,7 +166,7 @@ class ToolScope:
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "allowed_paths": serialize_path_patterns(self.allowed_paths),
             "denied_paths": serialize_path_patterns(self.denied_paths),
             "allowed_domains": list(self.allowed_domains),
@@ -141,6 +175,9 @@ class ToolScope:
             "command_deny_prefixes": list(self.command_deny_prefixes),
             "env_allowlist": list(self.env_allowlist),
         }
+        if path_patterns_need_encoding_marker(self.allowed_paths, self.denied_paths):
+            payload[PATH_PATTERN_ENCODING_FIELD] = PATH_PATTERN_ENCODING_LITERAL_BANG
+        return payload
 
 
 @dataclass(frozen=True)
