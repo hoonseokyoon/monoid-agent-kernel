@@ -115,8 +115,7 @@ out in commit messages and here.
 - **A backward wall-clock correction no longer invalidates a live or completed task.** Background
   jobs and hosted tasks clamp a negative timestamp-derived `duration_s` to zero, so schema
   validation cannot abort start, output, or terminal publication before a completed task reaches
-  the reentry queue. Public readers also normalize that one derived field in retained artifacts
-  written before this fix, preserving operator visibility without rewriting the source artifact.
+  the reentry queue.
 - **Breaking: `monoid_agent_kernel.tasks.list_job_artifacts` and `get_job_artifact` are gone**,
   replaced by `public_job_artifacts` and `public_job_artifact_for`, which project rather than
   return the raw artifact and read the run's policy from its own `manifest.json`. Renamed rather

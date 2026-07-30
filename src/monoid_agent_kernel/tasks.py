@@ -1063,7 +1063,7 @@ class TaskManager:
         self.mark_ready(task)
         return {"task_id": task_id, "status": status, "delivered": True, "duplicate": False}
 
-    def mark_ready(self, job: Task) -> None:
+    def mark_ready(self, job: BackgroundJob) -> None:
         """Single completion entry: publish a finished task to the reentry queue.
 
         Called by the in-process shell monitor and (for hosted kinds) by an
@@ -1071,15 +1071,12 @@ class TaskManager:
         with self._condition:
             if job.ready_for_reentry:
                 return
-            # Do not mark the completion ready before its durable write succeeds. Once it does,
-            # make reentry observable before the terminal event projection: an event/sink failure
-            # must not strand a completed task outside the queue.
-            self._write_job(job)
             job.ready_for_reentry = True
+            self._write_job(job)
+            self._emit_terminal_event(job)
             if job.resume_on_exit:
                 self._reentry_queue.append(job.job_id)
             self._condition.notify_all()
-            self._emit_terminal_event(job)
 
     def start_shell_job(
         self,
@@ -1324,14 +1321,14 @@ class TaskManager:
                     return
             time.sleep(0.02)
 
-    def _emit_terminal_event(self, job: Task) -> None:
+    def _emit_terminal_event(self, job: BackgroundJob) -> None:
         event_type, level = job.terminal_event()
         self.recorder.emit(event_type, data=self._public_job_payload(job), level=level)
 
-    def _public_job_payload(self, job: Task) -> dict[str, Any]:
+    def _public_job_payload(self, job: BackgroundJob) -> dict[str, Any]:
         return job.public_payload(self.recorder.run_dir, self.permission_policy)
 
-    def _write_job(self, job: Task) -> None:
+    def _write_job(self, job: BackgroundJob) -> None:
         write_json_atomic(job.job_path, job.to_json(self.recorder.run_dir))
 
 
