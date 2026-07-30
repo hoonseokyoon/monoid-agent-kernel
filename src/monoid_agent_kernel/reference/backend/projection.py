@@ -83,6 +83,10 @@ def _json_safe(value: Any) -> Any:
         )
     except RecursionError:
         return "<value exceeds JSON nesting limit>"
+    except json.JSONDecodeError as exc:
+        if exc.msg == "JSON nesting exceeds the parser limit":
+            return "<value exceeds JSON nesting limit>"
+        return normalize_unicode_scalars(repr(value))
     except (TypeError, ValueError):
         return normalize_unicode_scalars(repr(value))
 

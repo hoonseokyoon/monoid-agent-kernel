@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import sqlite3
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -261,11 +261,17 @@ def test_backend_json_safe_projection_normalizes_non_json_numbers_and_unicode() 
 
 
 def test_backend_json_safe_projection_bounds_excessive_nesting() -> None:
-    value: Any = "leaf"
-    for _ in range(sys.getrecursionlimit() + 100):
-        value = [value]
+    at_limit: Any = "leaf"
+    for _ in range(512):
+        at_limit = [at_limit]
 
-    assert _json_safe(value) == "<value exceeds JSON nesting limit>"
+    projected = _json_safe(at_limit)
+    for _ in range(512):
+        assert isinstance(projected, list) and len(projected) == 1
+        projected = projected[0]
+    assert projected == "leaf"
+
+    assert _json_safe([at_limit]) == "<value exceeds JSON nesting limit>"
 
 
 class _NonJsonWebProvider:
@@ -627,8 +633,7 @@ def test_gateway_http_writer_rejects_nonfinite_payloads(
         adapter.next_turn(ModelRequest(instruction="test", system_prompt="sys", tools=()))
 
 
-@pytest.mark.asyncio
-async def test_gateway_stream_http_writer_rejects_nonfinite_payloads(
+def test_gateway_stream_http_writer_rejects_nonfinite_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = GatewayModelAdapter(
@@ -638,4 +643,4 @@ async def test_gateway_stream_http_writer_rejects_nonfinite_payloads(
 
     stream = adapter.astream_turn(ModelRequest(instruction="test", system_prompt="sys", tools=()))
     with pytest.raises(ValueError, match="Out of range float values"):
-        await anext(stream)
+        asyncio.run(anext(stream))
