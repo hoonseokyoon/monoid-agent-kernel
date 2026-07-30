@@ -52,6 +52,13 @@ import monoid_agent_kernel.shell as shell_runtime
 # block the shared job loop indefinitely (see ``ShellTaskExecutor._terminate_and_reap``).
 _REAP_TIMEOUT_S = 10.0
 
+
+def _nonnegative_wall_duration(started_at: float, finished_at: float | None) -> float:
+    """Derive a schema-safe duration from durable wall-clock timestamps."""
+    end = finished_at if finished_at is not None else time.time()
+    return max(0.0, end - started_at)
+
+
 BackgroundJobStatus = Literal[
     "running",
     "exited",
@@ -145,7 +152,7 @@ class BackgroundJob:
 
     @property
     def duration_s(self) -> float:
-        return (self.finished_at or time.time()) - self.started_at
+        return _nonnegative_wall_duration(self.started_at, self.finished_at)
 
     def stdout_relpath(self, run_dir: Path) -> str:
         return self.stdout_path.relative_to(run_dir).as_posix()
@@ -528,7 +535,7 @@ class HostedTask:
 
     @property
     def duration_s(self) -> float:
-        return (self.finished_at or time.time()) - self.started_at
+        return _nonnegative_wall_duration(self.started_at, self.finished_at)
 
     def to_json(self, run_dir: Path) -> dict[str, Any]:
         del run_dir
