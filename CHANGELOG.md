@@ -9,13 +9,16 @@ out in commit messages and here.
 
 ### Security — `**` in a path pattern covered one directory level, not a subtree
 
-- **`deny_patterns` and `redact_patterns` now use `.gitignore` wildcard semantics.**
+- **`deny_patterns` and `redact_patterns` now use gitignore-style wildcard syntax.**
+  Each normalized workspace path is matched independently; the table in `docs/CLI.md` is the
+  normative contract (directory carry-over therefore does not make `dir/*` cover grandchildren).
   `matches_path_patterns` used `PurePath.match`, where `**` is a single `*` matched right-to-left.
   So `internal/**` denied `internal/a.txt`, **not** `internal/deep/a.txt` — and did deny
   `vendor/internal/a.txt`, which nobody asked for. `**/id_rsa` never matched a bare `id_rsa` at the
   workspace root. Both of those patterns were already in the shipped documentation.
-  The minimum deny list `docs/security/PRODUCTION_CHECKLIST.md` recommends
-  (`.env`, `*.key`, `*.pem`, `**/id_rsa`, `.ssh/**`, `.git/**`) left three holes, measured:
+  The previous minimum deny list in `docs/security/PRODUCTION_CHECKLIST.md`
+  (`.env`, `*.key`, `*.pem`, `**/id_rsa`, `.ssh/**`, `.git/**`) left three deep-path holes,
+  measured:
 
   | path | before | after |
   | --- | --- | --- |
@@ -23,20 +26,43 @@ out in commit messages and here.
   | `.git/refs/heads/main` | **not denied** | denied |
   | `id_rsa` (workspace root) | **not denied** | denied |
 
-  Re-check any policy written against an earlier version. Nothing caught this because every
-  pattern fixture in the repo used one-level paths.
+  It also omitted the `.ssh` and `.git` directory nodes themselves, which recursive move/delete
+  tools check as one root argument. The checklist now uses bare `.ssh` and `.git`, covering each
+  directory and its descendants when that directory or a descendant is the checked argument.
+  Recursive operations rooted at an allowed ancestor still require a backend/tool tree preflight;
+  the built-in recursive copy/move/delete path check currently sees the root argument only. This
+  existing limitation is explicit in the CLI guide and production checklist. Re-check any policy
+  written against an earlier version. Nothing caught the depth defect because every pattern fixture
+  in the repo used one-level paths.
 - **This moves an access boundary in both directions, and one caller is an allow-list.**
-  `matches_path_patterns` backs four call sites: `deny_patterns`, `redact_patterns`, and a
-  capability lease's `denied_paths` *and* `allowed_paths`. For the three deny-shaped ones, matching
-  more is safer and this change closes holes. For `allowed_paths`, matching more is *more
-  permissive* — a lease scoped to `internal/**` now admits `internal/deep/x`, which it previously
-  refused. Review lease scopes as well as policies. Patterns that were anchored by accident change
-  too: `dir/**` no longer matches that directory at arbitrary depth; write `**/dir/**` for that.
+  `matches_path_patterns` backs four policy fields: `PermissionPolicy.deny_patterns` and
+  `redact_patterns`, plus a tool binding's `ToolScope.denied_paths` and `allowed_paths`. For the
+  three deny-shaped fields, matching more is safer and this change closes holes. For
+  `allowed_paths`, matching more is *more permissive* — a binding scoped to `internal/**` now
+  admits `internal/deep/x`, which it previously refused. Review binding scopes as well as policies.
+  Patterns that were anchored by accident change too: `dir/**` no longer matches that directory at
+  arbitrary depth; write `**/dir/**` for that. A bare directory pattern changes as well:
+  `allowed_paths=["internal"]` used to cover only that node and now covers every directory named
+  `internal` plus its subtree at any depth. Use `/internal` to retain root anchoring, and audit any
+  scope that relied on node-only behavior. The synthetic workspace root remains outside every
+  pattern, preserving the previous fail-closed result for root-cwd allow-list checks.
 - **Negation is rejected rather than silently adopted.** `.gitignore` reads a leading `!` as
   "un-match", which would have handed every deny list a way to punch holes in itself — with the
   result depending on pattern *order*, while `PermissionPolicy.merged` combines two policies by
-  concatenating and de-duplicating, i.e. as a set. `PermissionPolicy.from_json` now raises on such
-  a pattern, and the matcher keeps `!` literal, which is the meaning it already had.
+  concatenating and de-duplicating, i.e. as a set. Manifest, CLI, and `ToolScope` configuration now
+  raise on an unescaped negation. Write `\!name` to configure a literal leading `!`; JSON output
+  uses that spelling so direct Python policies round-trip. A leading `#` likewise stays literal
+  rather than becoming a gitignore comment and silently dropping a rule.
+- **Compatibility spellings are validated before matching.** A leading `./` is normalized;
+  a trailing `/` covers both the directory node and its subtree; root-only and malformed patterns
+  fail during config load rather than at the first event. Source backslashes are rejected except
+  for the documented leading `\!` wire spelling: workspace input treats backslash as a separator,
+  while pathspec would reinterpret it as an escape. Workspace paths containing C0/DEL controls are
+  rejected. Windows rejects trailing-dot/space aliases, alternate data streams,
+  reserved device names, and 8.3 alias-shaped spellings. The matcher remains lexical: case and
+  Unicode-normalization aliases, plus symlink/hardlink identity, are existing workspace-backend
+  responsibilities described in the production checklist. It receives paths rather than a
+  workspace root, volume metadata, and filesystem object identities.
 - **New runtime dependency: `pathspec>=1.1,<2`.** The stdlib cannot express these semantics on this
   project's floor — `PurePath.full_match` and `glob.translate` are 3.13+ while `requires-python` is
   `>=3.11`, `fnmatch` lets `*` cross `/`, and `PurePath.match` is what was wrong. Using 3.13's

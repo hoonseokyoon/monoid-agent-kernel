@@ -201,6 +201,31 @@ def test_cli_permission_policy_flags_remain_run_boundary(monkeypatch: pytest.Mon
     }
 
 
+@pytest.mark.parametrize("option", ["--deny-path", "--redact-path"])
+def test_cli_rejects_negated_permission_patterns(option: str, tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_file = _write_config(tmp_path / "runtime.json", "run.finish")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--instruction",
+            "Finish.",
+            "--runtime-config-file",
+            str(config_file),
+            option,
+            "!secrets/**",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "negated path patterns are not supported" in result.output
+
+
 def test_cli_requires_web_gateway_for_web_bindings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

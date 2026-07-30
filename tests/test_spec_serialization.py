@@ -10,6 +10,7 @@ from support.runtime import runtime_config, tool_binding
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, ToolSearchConfig
 from monoid_agent_kernel.core.content import DocumentPart, ImagePart, TextPart
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ReasoningConfig, RunLimits
+from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
 
@@ -28,7 +29,9 @@ def test_agent_run_spec_round_trip_is_run_specific() -> None:
         mode="propose",
         workspace_backend="staging",
         limits=RunLimits(max_steps=7, max_tool_calls=11, max_bytes_read=1234, max_duration_s=99),
-        permission_policy=PermissionPolicy(deny_patterns=(".env",), redact_patterns=("*.key",)),
+        permission_policy=PermissionPolicy(
+            deny_patterns=(".env", "!odd"), redact_patterns=("*.key", "!private")
+        ),
         input=(TextPart(text="hello"),),
         metadata={"tenant": "a"},
     )
@@ -42,6 +45,8 @@ def test_agent_run_spec_round_trip_is_run_specific() -> None:
     assert "tool_policy" not in payload
     assert "shell_policy" not in payload
     assert "web_policy" not in payload
+    assert payload["permission_policy"]["deny_patterns"] == [".env", r"\!odd"]
+    assert payload["permission_policy"]["redact_patterns"] == ["*.key", r"\!private"]
 
 
 def test_runtime_config_round_trip_hash_and_model() -> None:
@@ -51,7 +56,11 @@ def test_runtime_config_round_trip_hash_and_model() -> None:
         model=ModelConfig(model="gpt-x", reasoning=ReasoningConfig(effort="high", summary="auto")),
         prompt=PromptSpec(persona_segments=("Be direct.",), runtime_segments=("Use concise edits.",)),
         tools=(
-            tool_binding("fs.read", guidance="Read before writing."),
+            tool_binding(
+                "fs.read",
+                guidance="Read before writing.",
+                scope=ToolScope(allowed_paths=("!odd",), denied_paths=("!private",)),
+            ),
             tool_binding("run.finish"),
         ),
         tool_search=ToolSearchConfig(enabled=True, top_k=3),

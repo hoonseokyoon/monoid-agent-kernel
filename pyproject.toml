@@ -25,8 +25,9 @@ classifiers = [
 dependencies = [
     "click>=8.1",
     "jsonschema>=4.21",
-    # `.gitignore` wildcard matching for PermissionPolicy's path patterns. Not stdlib-able on this
-    # floor: `PurePath.full_match` and `glob.translate` are 3.13+ while `requires-python` is >=3.11,
+    # Gitignore-style wildcard matching for PermissionPolicy and ToolScope path patterns. Not
+    # stdlib-able on this floor: `PurePath.full_match` and `glob.translate` are 3.13+ while
+    # `requires-python` is >=3.11,
     # `fnmatch` lets `*` cross `/`, and `PurePath.match` is the one that was wrong. See
     # `permissions.matches_path_patterns`.
     #

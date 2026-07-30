@@ -5,6 +5,11 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.permissions import (
+    parse_path_patterns,
+    serialize_path_patterns,
+    validate_internal_path_patterns,
+)
 from monoid_agent_kernel.tools.base import ToolSpec
 
 ToolExposure = Literal["immediate", "searchable", "hidden"]
@@ -100,6 +105,14 @@ class ToolScope:
     command_deny_prefixes: tuple[str, ...] = ()
     env_allowlist: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "allowed_paths", validate_internal_path_patterns(self.allowed_paths)
+        )
+        object.__setattr__(
+            self, "denied_paths", validate_internal_path_patterns(self.denied_paths)
+        )
+
     @classmethod
     def from_json(cls, payload: Any) -> ToolScope:
         if payload is None:
@@ -109,8 +122,8 @@ class ToolScope:
         if not isinstance(payload, Mapping):
             raise ValueError("tool scope must be an object")
         return cls(
-            allowed_paths=_str_tuple(payload.get("allowed_paths")),
-            denied_paths=_str_tuple(payload.get("denied_paths")),
+            allowed_paths=parse_path_patterns(payload.get("allowed_paths")),
+            denied_paths=parse_path_patterns(payload.get("denied_paths")),
             allowed_domains=_str_tuple(payload.get("allowed_domains")),
             blocked_domains=_str_tuple(payload.get("blocked_domains")),
             command_allow_prefixes=_str_tuple(payload.get("command_allow_prefixes")),
@@ -120,8 +133,8 @@ class ToolScope:
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "allowed_paths": list(self.allowed_paths),
-            "denied_paths": list(self.denied_paths),
+            "allowed_paths": serialize_path_patterns(self.allowed_paths),
+            "denied_paths": serialize_path_patterns(self.denied_paths),
             "allowed_domains": list(self.allowed_domains),
             "blocked_domains": list(self.blocked_domains),
             "command_allow_prefixes": list(self.command_allow_prefixes),

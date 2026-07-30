@@ -136,19 +136,42 @@ monoid run \
 `deny_patterns` blocks tool and shell access. `redact_patterns` masks paths in the public
 event/status stream only; private run artifacts keep real paths and contents.
 
-Both are **`.gitignore` wildcard patterns**, matched against the workspace-relative path:
+Both use **gitignore-style wildcard syntax**, with each normalized workspace-relative path matched
+independently. This table is the exact contract:
 
 | pattern | covers | does not cover |
 | --- | --- | --- |
 | `.env`, `*.key` | that name at **any** depth (`a/b/.env`) | `.envx` |
 | `internal/**` | everything under `internal/`, any depth | `internal` itself; `vendor/internal/x` |
 | `internal` | the directory and its contents, at any depth | `internals` |
+| `internal/` | canonicalized to `internal`; the node and its contents | `internals` |
 | `internal/*` | direct children only | `internal/deep/x` |
 | `**/id_rsa` | that name anywhere, root included | `id_rsa_backup` |
-| `**/secrets/**` | a `secrets` directory wherever it appears | — |
+| `**/secrets` | a `secrets` directory and its contents, wherever it appears | `secret` |
 
 A leading `!` (negation) is **rejected**: it would make the result depend on pattern order, and
 merging two policies treats their patterns as a set.
+A literal leading `!` is written as `\!` in configuration and JSON output.
+A leading `#` stays literal; it does not turn the rest of the pattern into a gitignore comment.
+Leading `./` is normalized. Backslash is a workspace path separator rather than a pattern escape;
+the leading `\!` configuration spelling is its only accepted source-level use. Root-only (`/`, `.`,
+`./`), malformed, and control-character patterns are rejected during configuration load. The
+synthetic workspace root (`.` or an empty path) is not a workspace entry and matches no pattern;
+scopes grant paths below it explicitly.
+
+Workspace paths containing C0/DEL controls are rejected. Windows additionally rejects ambiguous
+Win32 aliases (trailing dot/space, alternate data streams, reserved devices, and 8.3 alias-shaped
+segments). Case and Unicode-normalization aliases, plus symlink and hardlink identity, belong to the
+workspace backend because this matcher compares normalized lexical paths and has no workspace root
+or volume metadata. This includes the built-in local backend when it runs on a case-insensitive or
+normalization-insensitive volume. Hosted deployments should test, canonicalize or reject aliases,
+and document those relations as required by the production checklist.
+
+Path rules evaluate the path arguments presented to the policy. The built-in recursive
+`fs.copy`/`fs.move`/`fs.delete` flow currently checks its root argument, not every descendant. An
+allowed ancestor can therefore contain a denied descendant. Deployments that expose recursive
+operations must add backend/tool tree preflight or disallow those operations across mixed-policy
+trees.
 
 > **Changed in v0.20.** These were previously matched with `PurePath.match`, where `**` behaved as
 > a single `*`. `internal/**` covered one level and missed `internal/deep/x`, while also matching

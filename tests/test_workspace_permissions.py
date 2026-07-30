@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from monoid_agent_kernel.errors import PermissionDenied, WorkspaceError
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
+from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
 
 def test_normalizes_and_blocks_parent_escape(tmp_path: Path) -> None:
@@ -15,6 +17,40 @@ def test_normalizes_and_blocks_parent_escape(tmp_path: Path) -> None:
     assert workspace.normalize("a\\b.txt") == "a/b.txt"
     with pytest.raises(WorkspaceError):
         workspace.normalize("../secret.txt")
+
+
+@pytest.mark.parametrize("path", ["safe\nname", "safe\x00name", "safe\x1fname", "safe\x7fname"])
+def test_rejects_nonportable_control_characters(path: str) -> None:
+    with pytest.raises(WorkspaceError, match="control characters"):
+        normalize_workspace_path(path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path aliases only")
+@pytest.mark.parametrize(
+    "path",
+    [
+        "secret.txt.",
+        "secret.txt ",
+        "secret.txt::$DATA",
+        "NUL",
+        "CON.txt",
+        "COM1.log",
+        "PYPROJ~1.TOM",
+    ],
+)
+def test_rejects_windows_alias_and_device_spellings(path: str) -> None:
+    with pytest.raises(WorkspaceError):
+        normalize_workspace_path(path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path aliases only")
+def test_workspace_never_reads_through_a_windows_alias(tmp_path: Path) -> None:
+    tmp_path.joinpath("secret.txt").write_text("classified", encoding="utf-8")
+    workspace = LocalWorkspaceBackend(tmp_path)
+
+    for alias in ("secret.txt.", "secret.txt ", "secret.txt::$DATA"):
+        with pytest.raises(WorkspaceError):
+            workspace.read_bytes(alias)
 
 
 def test_blocks_symlink_escape(tmp_path: Path) -> None:
