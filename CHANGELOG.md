@@ -109,6 +109,9 @@ out in commit messages and here.
   a redact-all policy; a present manifest with missing/null `permission_policy` is corrupt and
   raises. When a run declares any `redact_patterns`, a non-empty job `error` is replaced as a unit:
   shell scan failures can interpolate a sensitive path that never reaches `changed_paths`.
+- **A listing skips only a job artifact that disappears during its read.** `FileNotFoundError` is
+  the expected completion/cleanup race. Permission, device, and other I/O failures now propagate
+  instead of silently removing a running job from CLI, backend, Studio, and status projections.
 - **Breaking: `monoid_agent_kernel.tasks.list_job_artifacts` and `get_job_artifact` are gone**,
   replaced by `public_job_artifacts` and `public_job_artifact_for`, which project rather than
   return the raw artifact and read the run's policy from its own `manifest.json`. Renamed rather
@@ -138,6 +141,8 @@ out in commit messages and here.
   on a clean read) and the Studio chat response carries the same required field. **Breaking:** the
   expanded Studio response is identified as `studio.chat.v2`; strict v1 clients must upgrade to
   read the new writer. The bundled reader retains exact v1 and v2 support for reader-first rollout.
+  It validates that envelope at the HTTP boundary before hydration: unknown versions, same-version
+  expansion, missing v2 fields, malformed common fields, and non-object responses fail visibly.
   Corruption before `run.finished` leaves a finished run projecting as `running`, and a degraded
   projection that does not say it is degraded reads as a complete, shorter run. `monoid status`
   prints what it could project and then **exits non-zero**, on both the `--json` and the human

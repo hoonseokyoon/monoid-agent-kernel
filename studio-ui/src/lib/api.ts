@@ -22,6 +22,36 @@ import type {
   StudioConfig,
 } from "./types";
 
+const CHAT_V1_KEYS = ["schema_version", "run_id", "messages", "event_cursor"] as const;
+const CHAT_V2_KEYS = [...CHAT_V1_KEYS, "event_log_error"] as const;
+const CHAT_TRANSCRIPT_PROTOCOL_ERROR =
+  "Studio returned an unsupported or malformed chat transcript response.";
+
+function isRecord(payload: unknown): payload is Record<string, unknown> {
+  return typeof payload === "object" && payload !== null && !Array.isArray(payload);
+}
+
+function hasExactKeys(payload: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(payload);
+  return actual.length === expected.length
+    && expected.every((key) => Object.prototype.hasOwnProperty.call(payload, key));
+}
+
+export function isChatTranscriptResponse(payload: unknown): payload is ChatTranscriptResponse {
+  if (!isRecord(payload)) return false;
+  const commonFieldsAreValid = typeof payload.run_id === "string"
+    && Array.isArray(payload.messages)
+    && Number.isInteger(payload.event_cursor);
+  if (!commonFieldsAreValid) return false;
+  if (payload.schema_version === "studio.chat.v1") {
+    return hasExactKeys(payload, CHAT_V1_KEYS);
+  }
+  if (payload.schema_version === "studio.chat.v2") {
+    return typeof payload.event_log_error === "string" && hasExactKeys(payload, CHAT_V2_KEYS);
+  }
+  return false;
+}
+
 export class StudioApiError extends Error {
   readonly status: number;
   readonly payload: unknown;
@@ -34,6 +64,13 @@ export class StudioApiError extends Error {
   }
 }
 
+export function decodeChatTranscriptResponse(payload: unknown): ChatTranscriptResponse {
+  if (!isChatTranscriptResponse(payload)) {
+    throw new StudioApiError(CHAT_TRANSCRIPT_PROTOCOL_ERROR, 502, payload);
+  }
+  return payload;
+}
+
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -43,10 +80,11 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
       ...init?.headers,
     },
   });
-  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-  if (!response.ok || typeof payload.error === "string") {
+  const payload: unknown = await response.json().catch(() => ({}));
+  const error = isRecord(payload) ? payload.error : undefined;
+  if (!response.ok || typeof error === "string") {
     throw new StudioApiError(
-      typeof payload.error === "string" ? payload.error : `${response.status} ${response.statusText}`,
+      typeof error === "string" ? error : `${response.status} ${response.statusText}`,
       response.status,
       payload,
     );
@@ -67,8 +105,10 @@ export const studioApi = {
   previewProfile: (profile: Profile) => post<ProfilePreviewResponse>("/api/profile-preview", profile),
   sessions: (profileId?: string) =>
     json<SessionsResponse>(`/api/sessions${profileId ? `?profile_id=${encodeURIComponent(profileId)}` : ""}`),
-  transcript: (runId: string) =>
-    json<ChatTranscriptResponse>(`/api/chat-transcript?run_id=${encodeURIComponent(runId)}`),
+  transcript: async (runId: string) =>
+    decodeChatTranscriptResponse(
+      await json<unknown>(`/api/chat-transcript?run_id=${encodeURIComponent(runId)}`),
+    ),
   subagentEvents: (childRunId: string, from = 0, signal?: AbortSignal) =>
     json<EventsResponse>(
       `/api/subagent-events?run_id=${encodeURIComponent(childRunId)}&from=${Math.max(0, from)}`,

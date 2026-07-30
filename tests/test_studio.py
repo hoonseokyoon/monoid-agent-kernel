@@ -92,6 +92,7 @@ def test_index_serves_compiled_svelte_shell_and_assets(studio: StudioServer) -> 
         "profile-editor-popup",
         "chat-log",
         "transcript-event-log-error",
+        "Studio returned an unsupported or malformed chat transcript response.",
         "composer",
         "right-panel-tabs",
         "settings-config-popup",

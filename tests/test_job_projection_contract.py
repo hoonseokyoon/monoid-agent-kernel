@@ -14,6 +14,7 @@ exists as well.
 
 from __future__ import annotations
 
+import errno
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +22,7 @@ from typing import Any, Callable
 import pytest
 from jsonschema import Draft202012Validator
 
+import monoid_agent_kernel.tasks as tasks_module
 from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.schemas import (
     PUBLIC_JOB_SCHEMA,
@@ -126,6 +128,21 @@ READERS: dict[str, Callable[[Path], dict[str, Any]]] = {
     )["job"],
 }
 
+LISTING_READERS: dict[str, Callable[[Path], list[dict[str, Any]]]] = {
+    "tasks": public_job_artifacts,
+    "project_run_status": lambda run_dir: project_run_status(run_dir)["jobs"],
+    "backend": lambda run_dir: _job_service(run_dir).jobs(
+        "run_projection", "token"
+    )["jobs"],
+}
+
+NAMED_READERS: dict[str, Callable[[Path], dict[str, Any]]] = {
+    "tasks": lambda run_dir: public_job_artifact_for(run_dir, JOB_ID),
+    "backend": lambda run_dir: _job_service(run_dir).job_status(
+        "run_projection", "token", JOB_ID
+    )["job"],
+}
+
 
 @pytest.fixture()
 def run_dir(tmp_path: Path) -> Path:
@@ -133,6 +150,14 @@ def run_dir(tmp_path: Path) -> Path:
     path.mkdir()
     _write_job_artifact(path)
     return path
+
+
+def _write_additional_job(run_dir: Path, job_id: str) -> None:
+    job_dir = run_dir / "artifacts" / "jobs" / job_id
+    job_dir.mkdir(parents=True)
+    payload = _job(run_dir).to_json(run_dir)
+    payload["job_id"] = job_id
+    job_dir.joinpath("job.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
 @pytest.mark.parametrize("reader", sorted(READERS))
@@ -402,3 +427,130 @@ def test_job_listing_does_not_follow_an_out_of_run_symlink(tmp_path: Path) -> No
         pytest.skip(f"directory symlinks unavailable: {exc}")
 
     assert public_job_artifacts(run_dir) == []
+
+
+@pytest.mark.parametrize("reader", LISTING_READERS.values(), ids=LISTING_READERS)
+def test_job_listing_skips_only_the_artifact_that_disappears_during_the_read(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: Callable[[Path], list[dict[str, Any]]],
+) -> None:
+    disappearing_job_id = f"{JOB_ID}_z"
+    _write_additional_job(run_dir, disappearing_job_id)
+    original_read = tasks_module._read_job_artifact
+
+    def disappeared(path: Path) -> dict[str, Any]:
+        if path.parent.name == disappearing_job_id:
+            raise FileNotFoundError("job artifact disappeared")
+        return original_read(path)
+
+    monkeypatch.setattr(tasks_module, "_read_job_artifact", disappeared)
+
+    assert [job["job_id"] for job in reader(run_dir)] == [JOB_ID]
+
+
+@pytest.mark.parametrize("reader", LISTING_READERS.values(), ids=LISTING_READERS)
+@pytest.mark.parametrize(
+    "error_type,error_number",
+    [
+        (PermissionError, errno.EACCES),
+        (OSError, errno.EIO),
+        (NotADirectoryError, errno.ENOTDIR),
+        (IsADirectoryError, errno.EISDIR),
+    ],
+    ids=["permission", "io", "not-a-directory", "is-a-directory"],
+)
+def test_job_listing_propagates_non_transient_artifact_read_failures(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: Callable[[Path], list[dict[str, Any]]],
+    error_type: type[OSError],
+    error_number: int,
+) -> None:
+    failing_job_id = f"{JOB_ID}_z"
+    _write_additional_job(run_dir, failing_job_id)
+    original_read = tasks_module._read_job_artifact
+    failure = error_type(error_number, "job artifact read failure")
+
+    def failed_read(path: Path) -> dict[str, Any]:
+        if path.parent.name == failing_job_id:
+            raise failure
+        return original_read(path)
+
+    monkeypatch.setattr(tasks_module, "_read_job_artifact", failed_read)
+
+    with pytest.raises(OSError) as raised:
+        reader(run_dir)
+
+    assert raised.value is failure
+
+
+@pytest.mark.parametrize("reader", LISTING_READERS.values(), ids=LISTING_READERS)
+@pytest.mark.parametrize(
+    "error_type,error_number",
+    [(PermissionError, errno.EACCES), (OSError, errno.EIO)],
+    ids=["permission", "io"],
+)
+def test_job_listing_propagates_directory_enumeration_failures(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: Callable[[Path], list[dict[str, Any]]],
+    error_type: type[OSError],
+    error_number: int,
+) -> None:
+    jobs_root = (run_dir / "artifacts" / "jobs").resolve()
+    real_iterdir = Path.iterdir
+    failure = error_type(error_number, "job directory enumeration failure")
+
+    def denied_iterdir(path: Path):
+        if path == jobs_root:
+            raise failure
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_iterdir)
+
+    with pytest.raises(OSError) as raised:
+        reader(run_dir)
+
+    assert raised.value is failure
+
+
+@pytest.mark.parametrize("reader", NAMED_READERS.values(), ids=NAMED_READERS)
+def test_named_job_reader_normalizes_a_disappearance_race_to_unknown_job(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: Callable[[Path], dict[str, Any]],
+) -> None:
+    def disappeared(_path: Path) -> dict[str, Any]:
+        raise FileNotFoundError("job artifact disappeared")
+
+    monkeypatch.setattr(tasks_module, "_read_job_artifact", disappeared)
+
+    with pytest.raises(KeyError, match="unknown job"):
+        reader(run_dir)
+
+
+@pytest.mark.parametrize("reader", NAMED_READERS.values(), ids=NAMED_READERS)
+@pytest.mark.parametrize(
+    "error_type,error_number",
+    [(PermissionError, errno.EACCES), (OSError, errno.EIO)],
+    ids=["permission", "io"],
+)
+def test_named_job_reader_propagates_non_transient_read_failures(
+    run_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: Callable[[Path], dict[str, Any]],
+    error_type: type[OSError],
+    error_number: int,
+) -> None:
+    failure = error_type(error_number, "job artifact read failure")
+
+    def failed_read(_path: Path) -> dict[str, Any]:
+        raise failure
+
+    monkeypatch.setattr(tasks_module, "_read_job_artifact", failed_read)
+
+    with pytest.raises(OSError) as raised:
+        reader(run_dir)
+
+    assert raised.value is failure

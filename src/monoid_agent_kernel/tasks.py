@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel._proc import file_size, proc_group_kwargs, terminate_process
-from monoid_agent_kernel.core._util import write_json_atomic
+from monoid_agent_kernel.core._util import read_text_resilient, write_json_atomic
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
     TOOL_APPROVAL_TASK_KIND,
@@ -1392,23 +1393,35 @@ def public_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:
     raw form one default argument away, which is how this got here.
     """
     jobs_dir = run_dir / "artifacts" / "jobs"
-    if not jobs_dir.exists():
+    try:
+        jobs_root = jobs_dir.resolve(strict=True)
+    except FileNotFoundError:
         return []
-    jobs_root = jobs_dir.resolve()
     if not is_within(run_dir.resolve(), jobs_root):
         raise ValueError("job directory escapes run directory")
     # One manifest read for the whole listing, not one per job file.
     policy = run_permission_policy(run_dir)
+    # ``Path.glob`` suppresses scan errors on supported Python versions. An unreadable jobs
+    # directory must fail visibly rather than project an empty list, so enumerate directly and
+    # let non-disappearance errors propagate.
+    try:
+        job_dirs = sorted(jobs_root.iterdir(), key=lambda item: item.name)
+    except FileNotFoundError:
+        return []
     jobs: list[dict[str, Any]] = []
-    for path in sorted(jobs_dir.glob("*/job.json")):
-        resolved_path = path.resolve()
-        if not is_within(jobs_root, resolved_path):
-            continue
+    for job_dir in job_dirs:
         try:
-            payload = _read_job_artifact(path)
-        except OSError:
+            if not stat.S_ISDIR(job_dir.stat().st_mode):
+                continue
+            resolved_path = (job_dir / "job.json").resolve(strict=True)
+            if not is_within(jobs_root, resolved_path):
+                continue
+            # Read the canonical path that was checked, not the possibly retargeted symlink.
+            payload = _read_job_artifact(resolved_path)
+        except FileNotFoundError:
+            # A job can be cleaned up between snapshot enumeration and its artifact read.
             continue
-        if payload.get("job_id") != path.parent.name:
+        if payload.get("job_id") != job_dir.name:
             raise ValueError("job artifact id does not match its directory")
         jobs.append(public_job_artifact(payload, policy))
     return jobs
@@ -1417,12 +1430,13 @@ def public_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:
 def public_job_artifact_for(run_dir: Path, job_id: str) -> dict[str, Any]:
     """One background job, projected for publication. See ``public_job_artifacts``."""
     job_dir = _job_dir(run_dir, job_id)
-    path = job_dir / "job.json"
-    if not path.exists():
-        raise KeyError(f"unknown job: {job_id}")
-    if not is_within(job_dir, path.resolve()):
-        raise ValueError("job artifact escapes its job directory")
-    payload = _read_job_artifact(path)
+    try:
+        resolved_path = (job_dir / "job.json").resolve(strict=True)
+        if not is_within(job_dir, resolved_path):
+            raise ValueError("job artifact escapes its job directory")
+        payload = _read_job_artifact(resolved_path)
+    except FileNotFoundError as exc:
+        raise KeyError(f"unknown job: {job_id}") from exc
     if payload.get("job_id") != job_id:
         raise ValueError("job artifact id does not match its directory")
     return public_job_artifact(payload, run_permission_policy(run_dir))
@@ -1430,7 +1444,7 @@ def public_job_artifact_for(run_dir: Path, job_id: str) -> dict[str, Any]:
 
 def _read_job_artifact(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(read_text_resilient(path))
     except (json.JSONDecodeError, RecursionError) as exc:
         raise ValueError("job artifact is not valid JSON") from exc
     if not isinstance(payload, dict):
