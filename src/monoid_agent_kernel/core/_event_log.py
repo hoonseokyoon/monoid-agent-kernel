@@ -100,6 +100,52 @@ def iter_committed_event_records(
         yield _decode_committed_event_record(path, record)
 
 
+@dataclass(frozen=True)
+class CommittedEventRead:
+    """Everything readable from an event log, plus why the read stopped early."""
+
+    payloads: list[dict[str, Any]]
+    corruption: str
+    """Empty when the whole file was read. Otherwise the reason, ready to show a person."""
+
+
+def read_committed_event_payloads(path: Path) -> CommittedEventRead:
+    """Read a whole event log, stopping cleanly at corruption instead of raising through.
+
+    For the *projection* readers only. ``iter_committed_event_records`` is right to raise -- a
+    corrupt log is real and a reader that pretends otherwise is worse than one that fails -- but
+    ``project_run_status`` and Studio's chat catch-up are called by surfaces that must still
+    answer: ``monoid status --json`` printed a 4.8 KB traceback where ``monoid watch`` printed one
+    clean line, and Studio's ``do_GET`` had no handler at all, so the request died mid-response.
+
+    It returns the reason rather than swallowing it, and callers publish that reason on the
+    projection they build. A degraded projection that does not say it is degraded is worse than the
+    traceback it replaces: corruption before ``run.finished`` leaves a finished run reading
+    ``running``, and a poller would wait on it forever.
+
+    ``iter_committed_event_records`` is a generator, so records before the bad one have already been
+    yielded and are kept. ``EventLogChanged`` is a subclass of ``EventLogCorruption`` and means
+    something transient rather than corrupt -- it cannot arise here, because every raise of it
+    requires ``end_offset`` and this is an unbounded snapshot read.
+    """
+    payloads: list[dict[str, Any]] = []
+    previous_seq: int | None = None
+    try:
+        for record in iter_committed_event_records(path):
+            if previous_seq is not None and record.seq <= previous_seq:
+                raise EventLogCorruption(
+                    f"committed event log sequence is not increasing: {path} "
+                    f"at byte {record.byte_offset}"
+                )
+            payloads.append(record.payload)
+            previous_seq = record.seq
+    except EventLogCorruption as exc:
+        return CommittedEventRead(payloads=payloads, corruption=str(exc))
+    except OSError as exc:
+        return CommittedEventRead(payloads=payloads, corruption=f"event log could not be read: {exc}")
+    return CommittedEventRead(payloads=payloads, corruption="")
+
+
 def iter_open_committed_event_records(
     path: Path,
     handle: BinaryIO,
@@ -483,7 +529,7 @@ def _decode_event_record(path: Path, byte_offset: int, raw_record: bytes) -> dic
         ) from exc
     try:
         payload = json.loads(text)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise EventLogCorruption(
             f"committed event log record is not valid JSON: {path} at byte {byte_offset}"
         ) from exc

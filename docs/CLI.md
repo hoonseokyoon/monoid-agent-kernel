@@ -252,5 +252,18 @@ monoid job logs <job_id> --run <run_id> --stream stdout --tail-bytes 4096
 monoid job cancel <job_id> --run <run_id>
 ```
 
+`jobs` and `job status` print the **public projection** of `artifacts/jobs/<id>/job.json` rather
+than the artifact: `command` is dropped and `command_preview` carries the bounded rendering, and
+`cwd` and `changed_paths` are redacted against the run's `permission_policy.redact_patterns`. Read
+the artifact off disk if you are inside the trust boundary and need the exact command. The response
+uses `monoid.public-background-job.v1`; `artifact_schema_version` records the validated durable
+input version. A missing manifest redacts every path, and malformed policy metadata is an error.
+
+`monoid status` exits non-zero when the run's `events.jsonl` is corrupt, after printing what it
+could project. The projection carries the reason in `event_log_error`. Its other fields combine
+the latest readable run artifacts with the valid event prefix and may therefore describe different
+points in time. Treat the entire degraded projection as diagnostic; do not poll `state` without
+checking the error field.
+
 For the full run-directory artifact set (`events.jsonl`, `transcript.jsonl`,
 `diff.patch`, `proposal.json`, …), see [OBSERVABILITY.md](OBSERVABILITY.md#outputs).

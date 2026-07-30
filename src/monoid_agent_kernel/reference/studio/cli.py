@@ -25,6 +25,10 @@ import click
 from monoid_agent_kernel.core.model_io import content_digest
 from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.reference.studio import window
+from monoid_agent_kernel.reference.studio.chat_projection import (
+    CHAT_SCHEMA_VERSION,
+    is_supported_chat_response,
+)
 from monoid_agent_kernel.reference.studio.server import (
     _SAMPLE_SKILLS_DIR,
     StudioConfig,
@@ -135,7 +139,8 @@ def run_acceptance(
         transcript_roles = [str(message.get("role") or "") for message in transcript_messages]
         check(
             "chat-transcript",
-            transcript.get("schema_version") == "studio.chat.v1"
+            transcript.get("schema_version") == CHAT_SCHEMA_VERSION
+            and is_supported_chat_response(transcript)
             and transcript.get("run_id") == run_id
             and transcript_roles[:2] == ["user", "assistant"],
             ",".join(transcript_roles),

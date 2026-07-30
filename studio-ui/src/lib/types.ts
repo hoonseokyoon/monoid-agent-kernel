@@ -120,12 +120,21 @@ export interface ChatMessage {
   source?: Record<string, unknown>;
 }
 
-export interface ChatTranscriptResponse {
-  schema_version: string;
+interface ChatTranscriptResponseBase {
   run_id: string;
   messages: ChatMessage[];
   event_cursor: number;
 }
+
+export type ChatTranscriptResponse =
+  | (ChatTranscriptResponseBase & {
+      schema_version: "studio.chat.v1";
+      event_log_error?: never;
+    })
+  | (ChatTranscriptResponseBase & {
+      schema_version: "studio.chat.v2";
+      event_log_error: string;
+    });
 
 export interface ChatResponse {
   run_id?: string;
@@ -261,8 +270,7 @@ export interface FilePreviewResponse {
 export interface JobSummary {
   job_id: string;
   status?: string;
-  command?: string;
-  [key: string]: unknown;
+  command_preview: string;
 }
 
 export interface JobsResponse {
@@ -281,6 +289,7 @@ export interface RunViewState {
   approvals: ApprovalRequest[];
   usage: UsageSummary;
   plan: PlanItem[];
+  eventLogError: string | null;
   error: string | null;
   errorRetryable: boolean;
   manualRetryCandidate: boolean;

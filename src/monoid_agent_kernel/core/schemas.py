@@ -10,7 +10,7 @@ from jsonschema import Draft202012Validator
 
 from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
 from monoid_agent_kernel.core._util import canonical_sha256
-from monoid_agent_kernel.identifiers import schema_version_property
+from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
 
@@ -832,6 +832,13 @@ JOB_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": schema_version_property("background-job.v1"),
         "job_id": {"type": "string", "minLength": 1},
+        # `BackgroundJob.to_json` has written `kind` since the tool bundle was widened, and this
+        # schema is `additionalProperties: false` -- so `monoid validate` reported
+        # "Additional properties are not allowed ('kind' was unexpected)" on every run that started
+        # a background job, and no test noticed because none validated a run directory that had
+        # one. Declared optional rather than required: a `background-job.v1` artifact written
+        # before that change has no `kind`, and this schema still has to read it.
+        "kind": {"type": "string"},
         "command": {"type": "string"},
         "command_preview": {"type": "string"},
         "cwd": {"type": "string"},
@@ -856,6 +863,90 @@ JOB_SCHEMA: dict[str, Any] = {
         "effective_startup_wait_s": {"type": "integer", "minimum": 0},
         "execution_workspace": {"enum": ["isolated-copy", "direct"]},
         "resume_on_exit": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
+PUBLIC_JOB_SCHEMA_VERSION = namespaced_id("public-background-job.v1")
+_PUBLIC_PATH_PREVIEW_SCHEMA: dict[str, Any] = {
+    "oneOf": [
+        {"type": "string"},
+        {
+            "type": "object",
+            "required": ["redacted", "type", "bytes"],
+            "properties": {
+                "redacted": {"const": True},
+                "type": {"const": "str"},
+                "bytes": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": ["type", "preview", "bytes", "truncated"],
+            "properties": {
+                "type": {"const": "str"},
+                "preview": {"type": "string"},
+                "bytes": {"type": "integer", "minimum": 0},
+                "truncated": {"const": True},
+            },
+            "additionalProperties": False,
+        },
+    ]
+}
+
+# The public projection is a different wire shape from the durable artifact: it drops `command`,
+# transforms paths, and identifies the input version separately. Giving the transformed object the
+# durable `background-job.v1` discriminator made every response invalid against its own schema.
+PUBLIC_JOB_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "schema_version",
+        "artifact_schema_version",
+        "job_id",
+        "command_preview",
+        "cwd",
+        "status",
+        "started_at",
+        "duration_s",
+        "stdout_path",
+        "stderr_path",
+        "stdout_bytes",
+        "stderr_bytes",
+        "effective_timeout_s",
+        "effective_max_output_bytes",
+        "effective_startup_wait_s",
+        "execution_workspace",
+        "resume_on_exit",
+    ],
+    "properties": {
+        "schema_version": {"enum": [PUBLIC_JOB_SCHEMA_VERSION]},
+        "artifact_schema_version": schema_version_property("background-job.v1"),
+        "job_id": JOB_SCHEMA["properties"]["job_id"],
+        "kind": JOB_SCHEMA["properties"]["kind"],
+        "command_preview": {"type": "string"},
+        "cwd": _PUBLIC_PATH_PREVIEW_SCHEMA,
+        "status": JOB_SCHEMA["properties"]["status"],
+        "started_at": JOB_SCHEMA["properties"]["started_at"],
+        "finished_at": JOB_SCHEMA["properties"]["finished_at"],
+        "duration_s": JOB_SCHEMA["properties"]["duration_s"],
+        "exit_code": JOB_SCHEMA["properties"]["exit_code"],
+        "timed_out": JOB_SCHEMA["properties"]["timed_out"],
+        "output_truncated": JOB_SCHEMA["properties"]["output_truncated"],
+        "error": {"type": "string"},
+        "changed_paths": JOB_SCHEMA["properties"]["changed_paths"],
+        "stdout_path": {"type": "string"},
+        "stderr_path": {"type": "string"},
+        "stdout_bytes": JOB_SCHEMA["properties"]["stdout_bytes"],
+        "stderr_bytes": JOB_SCHEMA["properties"]["stderr_bytes"],
+        "requested_timeout_s": JOB_SCHEMA["properties"]["requested_timeout_s"],
+        "effective_timeout_s": JOB_SCHEMA["properties"]["effective_timeout_s"],
+        "requested_max_output_bytes": JOB_SCHEMA["properties"]["requested_max_output_bytes"],
+        "effective_max_output_bytes": JOB_SCHEMA["properties"]["effective_max_output_bytes"],
+        "requested_startup_wait_s": JOB_SCHEMA["properties"]["requested_startup_wait_s"],
+        "effective_startup_wait_s": JOB_SCHEMA["properties"]["effective_startup_wait_s"],
+        "execution_workspace": JOB_SCHEMA["properties"]["execution_workspace"],
+        "resume_on_exit": JOB_SCHEMA["properties"]["resume_on_exit"],
     },
     "additionalProperties": False,
 }

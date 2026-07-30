@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel._proc import file_size, proc_group_kwargs, terminate_process
-from monoid_agent_kernel.core._util import write_json_atomic
+from monoid_agent_kernel.core._util import read_text_resilient, write_json_atomic
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
     TOOL_APPROVAL_TASK_KIND,
@@ -33,9 +34,8 @@ from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ToolObservation
 from monoid_agent_kernel.public_view import (
-    preview_value,
     public_capability_result,
-    public_path,
+    public_job_artifact,
     public_result_content,
 )
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -51,6 +51,13 @@ import monoid_agent_kernel.shell as shell_runtime
 # Upper bound on awaiting a process exit after termination, so a Windows reap race can never
 # block the shared job loop indefinitely (see ``ShellTaskExecutor._terminate_and_reap``).
 _REAP_TIMEOUT_S = 10.0
+
+
+def _nonnegative_wall_duration(started_at: float, finished_at: float | None) -> float:
+    """Derive a schema-safe duration from durable wall-clock timestamps."""
+    end = finished_at if finished_at is not None else time.time()
+    return max(0.0, end - started_at)
+
 
 BackgroundJobStatus = Literal[
     "running",
@@ -145,10 +152,7 @@ class BackgroundJob:
 
     @property
     def duration_s(self) -> float:
-        return (self.finished_at or time.time()) - self.started_at
-
-    def public_paths(self, permission_policy: PermissionPolicy) -> list[str]:
-        return [public_path(path, permission_policy) for path in self.changed_paths]
+        return _nonnegative_wall_duration(self.started_at, self.finished_at)
 
     def stdout_relpath(self, run_dir: Path) -> str:
         return self.stdout_path.relative_to(run_dir).as_posix()
@@ -217,16 +221,10 @@ class BackgroundJob:
         return event_type, level
 
     def public_payload(self, run_dir: Path, permission_policy: PermissionPolicy) -> dict[str, Any]:
-        payload = self.to_json(run_dir)
-        payload["changed_paths"] = self.public_paths(permission_policy)
-        payload.pop("command", None)
-        # The same `cwd` from the same `shell.exec` call came out `{"redacted": true}` on
-        # `tool.approval.requested` / `shell.exec.started` and as the path on `job.started` /
-        # `job.finished`, then into `status.json["jobs"]` -- so backgrounding a command was enough
-        # to route around `redact_patterns`. `changed_paths` above stays exact: it is the
-        # declared-contract family, and only this hand-copied field was ever unbounded.
-        payload["cwd"] = preview_value("cwd", payload.get("cwd"), permission_policy)
-        return payload
+        # The whole projection lives in `public_view.public_job_artifact`, because the same
+        # `job.json` is re-read off disk by four other readers and each of them had its own answer.
+        # This method is the *event* path; keeping the rules here is what let the disk path diverge.
+        return public_job_artifact(self.to_json(run_dir), permission_policy)
 
     def result_observation(self, run_dir: Path, *, tail_bytes: int = 8192) -> dict[str, Any]:
         stdout = read_job_log_text(run_dir, self.job_id, stream="stdout", tail_bytes=tail_bytes)
@@ -537,7 +535,7 @@ class HostedTask:
 
     @property
     def duration_s(self) -> float:
-        return (self.finished_at or time.time()) - self.started_at
+        return _nonnegative_wall_duration(self.started_at, self.finished_at)
 
     def to_json(self, run_dir: Path) -> dict[str, Any]:
         del run_dir
@@ -1356,28 +1354,108 @@ def _changed_entry_delta(
     return sorted(path for path in paths if before.get(path) != after.get(path))
 
 
-def list_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:
+def run_permission_policy(run_dir: Path) -> PermissionPolicy:
+    """The policy a run was started with, read back from its own ``manifest.json``.
+
+    Any reader that projects a run's artifacts needs this, and until now only ``core.projections``
+    had it -- which is most of why the other four readers of ``job.json`` published raw values.
+
+    A missing manifest yields a redact-all policy. A present manifest must contain the required
+    policy object and parse as durable data. `manifest.json` has required `permission_policy` since
+    v0.19.2, so treating a missing/null member as "no patterns" turns corruption into a silent
+    fail-open publication boundary.
+    """
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        return PermissionPolicy(redact_patterns=("**",))
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("manifest.json cannot be read as a policy manifest") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("manifest.json is not a policy object")
+    permission_policy = payload.get("permission_policy")
+    if not isinstance(permission_policy, dict):
+        raise ValueError("manifest.json has no valid permission_policy")
+    for key in ("deny_patterns", "redact_patterns"):
+        patterns = permission_policy.get(key)
+        if not isinstance(patterns, list) or any(type(pattern) is not str for pattern in patterns):
+            raise ValueError("manifest.json has no valid permission_policy")
+    try:
+        return PermissionPolicy.from_durable_json(permission_policy)
+    except (TypeError, ValueError, RecursionError) as exc:
+        # Parser errors can quote the rejected encoding or pattern. This function is an HTTP/CLI
+        # publication boundary, so preserve the cause for debugging without echoing manifest
+        # content in the public exception message.
+        raise ValueError("manifest.json has no valid permission_policy") from exc
+
+
+def public_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:
+    """Every background job of a run, projected for publication.
+
+    Named ``public_`` and taking no policy argument on purpose. It replaces ``list_job_artifacts``,
+    which returned the raw artifact and was reached by ``monoid jobs --json``, the reference
+    backend's ``/v1/runs/<id>/jobs`` and (through it) Studio's ``/api/jobs``. An optional
+    ``permission_policy=None`` parameter would have been a smaller change and would have left the
+    raw form one default argument away, which is how this got here.
+    """
     jobs_dir = run_dir / "artifacts" / "jobs"
-    if not jobs_dir.exists():
+    try:
+        jobs_root = jobs_dir.resolve(strict=True)
+    except FileNotFoundError:
+        return []
+    if not is_within(run_dir.resolve(), jobs_root):
+        raise ValueError("job directory escapes run directory")
+    # One manifest read for the whole listing, not one per job file.
+    policy = run_permission_policy(run_dir)
+    # ``Path.glob`` suppresses scan errors on supported Python versions. An unreadable jobs
+    # directory must fail visibly rather than project an empty list, so enumerate directly and
+    # let non-disappearance errors propagate.
+    try:
+        job_dirs = sorted(jobs_root.iterdir(), key=lambda item: item.name)
+    except FileNotFoundError:
         return []
     jobs: list[dict[str, Any]] = []
-    for path in sorted(jobs_dir.glob("*/job.json")):
+    for job_dir in job_dirs:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+            if not stat.S_ISDIR(job_dir.stat().st_mode):
+                continue
+            resolved_path = (job_dir / "job.json").resolve(strict=True)
+            if not is_within(jobs_root, resolved_path):
+                continue
+            # Read the canonical path that was checked, not the possibly retargeted symlink.
+            payload = _read_job_artifact(resolved_path)
+        except FileNotFoundError:
+            # A job can be cleaned up between snapshot enumeration and its artifact read.
             continue
-        if isinstance(payload, dict):
-            jobs.append(payload)
+        if payload.get("job_id") != job_dir.name:
+            raise ValueError("job artifact id does not match its directory")
+        jobs.append(public_job_artifact(payload, policy))
     return jobs
 
 
-def get_job_artifact(run_dir: Path, job_id: str) -> dict[str, Any]:
-    path = _job_dir(run_dir, job_id) / "job.json"
-    if not path.exists():
-        raise KeyError(f"unknown job: {job_id}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def public_job_artifact_for(run_dir: Path, job_id: str) -> dict[str, Any]:
+    """One background job, projected for publication. See ``public_job_artifacts``."""
+    job_dir = _job_dir(run_dir, job_id)
+    try:
+        resolved_path = (job_dir / "job.json").resolve(strict=True)
+        if not is_within(job_dir, resolved_path):
+            raise ValueError("job artifact escapes its job directory")
+        payload = _read_job_artifact(resolved_path)
+    except FileNotFoundError as exc:
+        raise KeyError(f"unknown job: {job_id}") from exc
+    if payload.get("job_id") != job_id:
+        raise ValueError("job artifact id does not match its directory")
+    return public_job_artifact(payload, run_permission_policy(run_dir))
+
+
+def _read_job_artifact(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(read_text_resilient(path))
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("job artifact is not valid JSON") from exc
     if not isinstance(payload, dict):
-        raise ValueError("job artifact is invalid")
+        raise ValueError("job artifact is not an object")
     return payload
 
 
@@ -1429,5 +1507,3 @@ def _job_dir(run_dir: Path, job_id: str) -> Path:
     if not is_within(run_dir.resolve(), path):
         raise ValueError("job path escapes run directory")
     return path
-
-

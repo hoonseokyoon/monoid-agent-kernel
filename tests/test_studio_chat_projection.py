@@ -3,7 +3,113 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
+from monoid_agent_kernel.reference.studio.chat_projection import (
+    CHAT_SCHEMA_V1,
+    CHAT_SCHEMA_V2,
+    ChatProjection,
+    is_supported_chat_response,
+)
+
+
+def test_chat_response_reader_distinguishes_the_v1_and_v2_shapes() -> None:
+    base = {"run_id": "run-1", "messages": [], "event_cursor": -1}
+
+    assert is_supported_chat_response({"schema_version": CHAT_SCHEMA_V1, **base})
+    assert not is_supported_chat_response(
+        {"schema_version": CHAT_SCHEMA_V1, **base, "event_log_error": ""}
+    )
+    assert is_supported_chat_response(
+        {"schema_version": CHAT_SCHEMA_V2, **base, "event_log_error": ""}
+    )
+    assert not is_supported_chat_response({"schema_version": CHAT_SCHEMA_V2, **base})
+    assert not is_supported_chat_response(
+        {"schema_version": CHAT_SCHEMA_V2, **base, "event_log_error": None}
+    )
+    assert not is_supported_chat_response(
+        {"schema_version": "studio.chat.v3", **base, "event_log_error": ""}
+    )
+
+
+def test_chat_response_reader_validates_required_message_fields_but_allows_extensions() -> None:
+    message = {
+        "id": "message-1",
+        "role": "assistant",
+        "content": "done",
+        "attachments": [
+            {"name": "result.txt", "mime": "text/plain", "future_attachment_member": True}
+        ],
+        "created_at": 1.25,
+        "source": {"kind": "event", "future_source_member": True},
+        "schema_version": "studio.chat.message.v999",
+        "future_message_member": True,
+    }
+
+    def response(messages: list[object]) -> dict[str, object]:
+        return {
+            "schema_version": CHAT_SCHEMA_V2,
+            "run_id": "run-1",
+            "messages": messages,
+            "event_cursor": -1,
+            "event_log_error": "",
+        }
+
+    legacy_message = dict(message)
+    legacy_message.pop("schema_version")
+    legacy_message.pop("source")
+    assert is_supported_chat_response(response([]))
+    assert is_supported_chat_response(response([message]))
+    assert is_supported_chat_response(response([legacy_message]))
+    assert is_supported_chat_response(
+        response(
+            [
+                {**legacy_message, "id": "message-user", "role": "user"},
+                {**legacy_message, "id": "message-assistant", "role": "assistant"},
+                {**legacy_message, "id": "message-error", "role": "error"},
+            ]
+        )
+    )
+
+    def without_required_field(field: str) -> dict[str, object]:
+        candidate = dict(legacy_message)
+        candidate.pop(field)
+        return candidate
+
+    for malformed in (
+        None,
+        [],
+        {"legacy_or_future_member": True},
+        without_required_field("id"),
+        without_required_field("role"),
+        without_required_field("content"),
+        without_required_field("attachments"),
+        without_required_field("created_at"),
+        {**legacy_message, "id": ""},
+        {**legacy_message, "id": "   "},
+        {**message, "id": 7},
+        {**message, "role": "system"},
+        {**message, "role": 7},
+        {**message, "role": []},
+        {**message, "content": None},
+        {**message, "attachments": {}},
+        {**message, "attachments": [None]},
+        {**message, "attachments": [[]]},
+        {**message, "attachments": [{"mime": "text/plain"}]},
+        {**message, "attachments": [{"name": 7, "mime": "text/plain"}]},
+        {**message, "attachments": [{"name": "result.txt"}]},
+        {**message, "attachments": [{"name": "result.txt", "mime": 7}]},
+        {**message, "created_at": "1"},
+        {**message, "created_at": True},
+        {**message, "created_at": float("nan")},
+        {**message, "created_at": float("inf")},
+        {**message, "created_at": float("-inf")},
+        {**message, "created_at": 10**1000},
+        {**message, "source": None},
+        {**message, "source": []},
+        {**message, "source": "event"},
+    ):
+        assert not is_supported_chat_response(response([malformed]))
+
+    assert not is_supported_chat_response(response([legacy_message, dict(legacy_message)]))
 
 
 def test_chat_projection_dedupes_user_messages_and_strips_attachment_bytes(tmp_path: Path) -> None:
@@ -121,7 +227,7 @@ def test_chat_projection_backfills_legacy_title_and_events(tmp_path: Path) -> No
 
     body = ChatProjection(tmp_path).catch_up("run-1")
 
-    assert body["schema_version"] == "studio.chat.v1"
+    assert body["schema_version"] == "studio.chat.v2"
     assert body["event_cursor"] == 7
     assert [(message["role"], message["content"]) for message in body["messages"]] == [
         ("user", "legacy prompt"),

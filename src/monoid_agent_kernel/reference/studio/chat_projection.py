@@ -3,20 +3,92 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from monoid_agent_kernel.core._event_log import iter_committed_event_records
+from monoid_agent_kernel.core._event_log import read_committed_event_payloads
 from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 
-CHAT_SCHEMA_VERSION = "studio.chat.v1"
+CHAT_SCHEMA_V1 = "studio.chat.v1"
+CHAT_SCHEMA_V2 = "studio.chat.v2"
+# v2 adds the required ``event_log_error`` member to the HTTP response. Keeping the v1
+# discriminator would make the expanded object invalid for strict v1 consumers.
+CHAT_SCHEMA_VERSION = CHAT_SCHEMA_V2
+SUPPORTED_CHAT_SCHEMA_VERSIONS = (CHAT_SCHEMA_V1, CHAT_SCHEMA_V2)
 CHAT_MESSAGE_SCHEMA_VERSION = "studio.chat.message.v1"
 CHAT_FILE_NAME = "studio.chat.jsonl"
 
 _ASSISTANT_EVENT_TYPES = {"turn.settled"}
 _ERROR_EVENT_TYPES = {"turn.failed", "run.failed", "ModelAdapterError"}
+
+
+def _is_chat_message(payload: object) -> bool:
+    """Validate renderer-required fields while permitting additive message metadata."""
+    if not isinstance(payload, dict):
+        return False
+    message_id = payload.get("id")
+    role = payload.get("role")
+    attachments = payload.get("attachments")
+    created_at = payload.get("created_at")
+    try:
+        created_at_is_valid = (
+            isinstance(created_at, (int, float))
+            and not isinstance(created_at, bool)
+            and math.isfinite(created_at)
+        )
+    except OverflowError:
+        created_at_is_valid = False
+    return (
+        isinstance(message_id, str)
+        and bool(message_id.strip())
+        and isinstance(role, str)
+        and role in {"user", "assistant", "error"}
+        and isinstance(payload.get("content"), str)
+        and isinstance(attachments, list)
+        and all(
+            isinstance(attachment, dict)
+            and isinstance(attachment.get("name"), str)
+            and isinstance(attachment.get("mime"), str)
+            for attachment in attachments
+        )
+        and created_at_is_valid
+        and ("source" not in payload or isinstance(payload.get("source"), dict))
+    )
+
+
+def is_supported_chat_response(payload: object) -> bool:
+    """Whether ``payload`` is one exact Studio chat response shape this release reads."""
+    if not isinstance(payload, dict):
+        return False
+    version = payload.get("schema_version")
+    keys = {"schema_version", "run_id", "messages", "event_cursor"}
+    if version == CHAT_SCHEMA_V2:
+        keys.add("event_log_error")
+        if not isinstance(payload.get("event_log_error"), str):
+            return False
+    elif version != CHAT_SCHEMA_V1:
+        return False
+    messages = payload.get("messages")
+    messages_are_valid = isinstance(messages, list) and all(
+        _is_chat_message(message) for message in messages
+    )
+    message_ids = (
+        [message["id"] for message in messages if isinstance(message, dict)]
+        if messages_are_valid
+        else []
+    )
+    cursor = payload.get("event_cursor")
+    return (
+        set(payload) == keys
+        and isinstance(payload.get("run_id"), str)
+        and messages_are_valid
+        and len(message_ids) == len(set(message_ids))
+        and isinstance(cursor, int)
+        and not isinstance(cursor, bool)
+    )
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -42,15 +114,20 @@ def _write_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
         handle.write(json.dumps(dict(payload), sort_keys=True, ensure_ascii=False) + "\n")
 
 
-def _read_committed_events(path: Path) -> list[dict[str, Any]]:
+def _read_committed_events(path: Path) -> tuple[list[dict[str, Any]], str]:
     # Studio's catch-up reads events.jsonl straight off disk rather than through the backend
     # projection, so it needs hydration of its own. Without it a restored session renders empty
     # assistant bubbles while the live SSE page — which does go through the projection — shows the
     # text, and `_record_from_event` drops a message whose content is empty rather than showing
     # anything is missing.
-    return hydrate_settled_text(
-        [record.payload for record in iter_committed_event_records(path)], path.parent
-    )
+    #
+    # Through the lenient reader for the same reason `core.projections` uses it: this ran under a
+    # `do_GET` with no exception handler, so one corrupt byte killed the request mid-response and
+    # the session rendered as if it had no history. The reason is carried out to the caller and
+    # published, because a transcript that silently stops at the damage looks like a short
+    # conversation rather than a truncated one.
+    read = read_committed_event_payloads(path)
+    return hydrate_settled_text(read.payloads, path.parent), read.corruption
 
 
 def _sorted_chat_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -120,12 +197,15 @@ class ChatProjection:
                 continue
         return cursor
 
-    def response(self, run_id: str) -> dict[str, Any]:
+    def response(self, run_id: str, *, event_log_error: str = "") -> dict[str, Any]:
         return {
             "schema_version": CHAT_SCHEMA_VERSION,
             "run_id": run_id,
             "messages": self.read(),
             "event_cursor": self.event_cursor(),
+            # Always present, empty when the log read cleanly, so a client tests one field rather
+            # than inferring truncation from a transcript that looks complete.
+            "event_log_error": event_log_error,
         }
 
     def append_user(
@@ -192,8 +272,9 @@ class ChatProjection:
 
     def catch_up(self, run_id: str) -> dict[str, Any]:
         self.ensure_legacy_user_from_run_meta()
-        self.project_events(_read_committed_events(self.run_dir / "events.jsonl"))
-        return self.response(run_id)
+        events, event_log_error = _read_committed_events(self.run_dir / "events.jsonl")
+        self.project_events(events)
+        return self.response(run_id, event_log_error=event_log_error)
 
     def _record_from_event(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
         event_type = str(event.get("type") or "")

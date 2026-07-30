@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from monoid_agent_kernel.tasks import (
-    get_job_artifact,
-    list_job_artifacts,
+    public_job_artifact_for,
+    public_job_artifacts,
     read_job_log_text,
     request_job_cancel,
 )
@@ -28,7 +28,7 @@ class JobService:
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)
         record = self._context.record(run_id)
-        jobs = list_job_artifacts(record.run_dir)
+        jobs = public_job_artifacts(record.run_dir)
         return {"run_id": run_id, "tenant_id": record.tenant_id, "jobs": jobs}
 
     def job_status(self, run_id: str, token: str, job_id: str) -> dict[str, Any]:
@@ -37,7 +37,7 @@ class JobService:
         return {
             "run_id": run_id,
             "tenant_id": record.tenant_id,
-            "job": get_job_artifact(record.run_dir, job_id),
+            "job": public_job_artifact_for(record.run_dir, job_id),
         }
 
     def job_logs(

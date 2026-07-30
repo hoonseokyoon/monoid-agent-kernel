@@ -28,6 +28,7 @@ export function initialRunState(runId: string | null = null): RunViewState {
     approvals: [],
     usage: { input: 0, output: 0, total: 0 },
     plan: [],
+    eventLogError: null,
     error: null,
     errorRetryable: false,
     manualRetryCandidate: false,
@@ -46,6 +47,9 @@ export function hydrateTranscript(
     runId: transcript.run_id,
     messages: transcript.messages ?? [],
     replayCursor: Number.isInteger(transcript.event_cursor) ? transcript.event_cursor : -1,
+    eventLogError: transcript.schema_version === "studio.chat.v2" && transcript.event_log_error
+      ? transcript.event_log_error
+      : null,
   };
 }
 

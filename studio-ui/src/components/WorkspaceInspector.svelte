@@ -60,7 +60,7 @@
       <div class="inspector-section-title"><span>Background jobs</span><small>{jobs.length}</small></div>
       <div class="mini-jobs">
         {#each jobs.slice(0, 8) as job}
-          <div><span class:running={job.status === "running"}></span><strong>{job.command || job.job_id}</strong><small>{job.status || "unknown"}</small></div>
+          <div><span class:running={job.status === "running"}></span><strong>{job.command_preview || job.job_id}</strong><small>{job.status || "unknown"}</small></div>
         {/each}
       </div>
     </section>

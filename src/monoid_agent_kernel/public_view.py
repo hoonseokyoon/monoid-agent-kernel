@@ -3,6 +3,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
+from monoid_agent_kernel.core.schemas import (
+    JOB_SCHEMA,
+    PUBLIC_JOB_SCHEMA,
+    PUBLIC_JOB_SCHEMA_VERSION,
+)
 from monoid_agent_kernel.errors import WorkspaceError
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.web import public_query_preview, public_url_preview
@@ -165,6 +172,115 @@ def public_proposal_file(file: dict[str, Any], policy: PermissionPolicy) -> dict
         "change_kind": file.get("change_kind"),
         "snapshot_path": REDACTED_PATH if redacted else file.get("snapshot_path"),
     }
+
+
+_JOB_ARTIFACT_VALIDATOR = Draft202012Validator(JOB_SCHEMA)
+_PUBLIC_JOB_VALIDATOR = Draft202012Validator(PUBLIC_JOB_SCHEMA)
+_REDACTED_JOB_ERROR = "[redacted-job-error]"
+
+# Values whose artifact schema already constrains them to bounded enums, numbers, booleans, or a
+# stable identifier. Every string that can contain prose or a path is handled explicitly below.
+_JOB_COPIED_KEYS = frozenset(
+    {
+        "job_id",
+        "status",
+        "started_at",
+        "finished_at",
+        "duration_s",
+        "exit_code",
+        "timed_out",
+        "output_truncated",
+        "stdout_bytes",
+        "stderr_bytes",
+        "requested_timeout_s",
+        "effective_timeout_s",
+        "requested_max_output_bytes",
+        "effective_max_output_bytes",
+        "requested_startup_wait_s",
+        "effective_startup_wait_s",
+        "execution_workspace",
+        "resume_on_exit",
+    }
+)
+
+
+def public_job_artifact(job: Mapping[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
+    """The publishable form of one ``artifacts/jobs/<id>/job.json``. One function, every reader.
+
+    It was three, across six call sites, and only one of them was right. ``BackgroundJob.to_json``
+    is written to disk raw and then re-read by ``monoid jobs --json``, ``monoid job status --json``,
+    the reference backend's ``/v1/runs/<id>/jobs`` and Studio's ``/api/jobs``, each of which
+    published ``command``, ``cwd`` and ``changed_paths`` verbatim; ``core.projections`` had a fourth
+    answer that dropped ``command`` and redacted ``changed_paths`` but left ``cwd`` exact. The one
+    correct projection reached only the event sink -- so **backgrounding a command was enough to
+    route around** ``redact_patterns``, which is the same sentence a comment in ``tasks`` already
+    used about the event path when that half was fixed and this half was not.
+
+    ``job.json`` does not get ``task.json``'s "private by location" exemption: it is served over
+    HTTP by two surfaces. See ``docs/OBSERVABILITY.md``.
+
+    The durable input is validated before projection, and the output is built from an explicit
+    allowlist and validated against ``PUBLIC_JOB_SCHEMA``. A retained or tampered artifact cannot
+    invent a field and have a public reader copy it through.
+
+    The fields receive these treatments:
+
+    - ``command`` is dropped outright. ``command_preview`` is already in the artifact and is built
+      by ``shell.preview_command``, so a reader loses no field, only the unbounded copy of it.
+    - ``cwd`` and the log paths are previewed because they are paths.
+    - ``changed_paths`` is redacted but **not** truncated: it is the declared-contract family that
+      ``proposal.json`` publishes and ``core.packages`` resolves back to real files, and a shortened
+      path there does not name a shorter file, it breaks replay.
+    - ``error`` is bounded when no path redaction policy exists. With any redaction policy it is
+      replaced as a unit: shell scan failures interpolate a path that need not appear in
+      ``changed_paths``, so substring guessing would fail open.
+
+    The public object has its own ``monoid.public-background-job.v1`` discriminator. The original
+    durable version remains in ``artifact_schema_version``; labeling a shape without required
+    ``command`` as ``background-job.v1`` made it invalid against the schema named on the object.
+    """
+    artifact = dict(job)
+    try:
+        artifact_error = next(_JOB_ARTIFACT_VALIDATOR.iter_errors(artifact), None)
+    except RecursionError:
+        artifact_error = True
+    if artifact_error is not None:
+        raise ValueError("job artifact does not match monoid.background-job.v1")
+
+    public: dict[str, Any] = {
+        "schema_version": PUBLIC_JOB_SCHEMA_VERSION,
+        "artifact_schema_version": artifact["schema_version"],
+    }
+    public.update({key: artifact[key] for key in _JOB_COPIED_KEYS if key in artifact})
+    if "kind" in artifact:
+        public["kind"] = public_identifier(str(artifact["kind"]))
+    public["command_preview"] = truncate_inline_text(
+        str(artifact["command_preview"]), threshold=PREVIEW_BYTE_THRESHOLD, budget=200
+    )
+    public["cwd"] = preview_value("cwd", artifact["cwd"], policy)
+    for key in ("stdout_path", "stderr_path"):
+        public[key] = public_inline_path(str(artifact[key]), policy)
+    if "changed_paths" in artifact:
+        public["changed_paths"] = [public_path(path, policy) for path in artifact["changed_paths"]]
+    if "error" in artifact:
+        error = str(artifact["error"])
+        public["error"] = (
+            _REDACTED_JOB_ERROR
+            if error and policy.redact_patterns
+            else truncate_inline_text(
+                public_error_message(error),
+                threshold=PREVIEW_BYTE_THRESHOLD,
+                budget=PREVIEW_BYTE_BUDGET,
+            )
+        )
+
+    try:
+        projection_error = next(_PUBLIC_JOB_VALIDATOR.iter_errors(public), None)
+    except RecursionError:
+        projection_error = True
+    if projection_error is not None:
+        raise ValueError("public job projection does not match monoid.public-background-job.v1")
+    return public
 
 
 def args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:

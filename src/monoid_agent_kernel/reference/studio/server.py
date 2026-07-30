@@ -2001,6 +2001,24 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
 
         # --- GET ---------------------------------------------------------------------
         def do_GET(self) -> None:  # noqa: N802
+            """Route a GET, and never let an exception out.
+
+            ``do_POST`` has had this handler all along and ``do_GET`` had none, so anything the
+            routes below did not anticipate reached ``BaseHTTPRequestHandler`` -- which logs the
+            traceback and drops the connection, with no status line the browser can act on. The
+            route that made it reachable was ``/api/chat-transcript``: it catches ``NativeAgentError``
+            only, and a corrupt ``events.jsonl`` raises ``EventLogCorruption`` (a ``ValueError``).
+            """
+            try:
+                self._route_get()
+            except Exception:  # pragma: no cover - defensive
+                _LOGGER.exception("studio GET failed")
+                try:
+                    self._write_json({"error": "internal error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                except Exception:  # noqa: BLE001 - the response is already on the wire (SSE)
+                    _LOGGER.debug("studio GET error response could not be written", exc_info=True)
+
+        def _route_get(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path in ("/", "/index.html"):
                 self._serve_app_index()

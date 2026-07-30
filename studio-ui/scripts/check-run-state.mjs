@@ -12,7 +12,7 @@ const compiled = ts.transpileModule(source, {
   fileName: "run-state.ts",
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.outputText).toString("base64")}`;
-const { initialRunState, isRunBusy, reduceRunEvent } = await import(moduleUrl);
+const { hydrateTranscript, initialRunState, isRunBusy, reduceRunEvent } = await import(moduleUrl);
 
 function event(type, data, seq) {
   return {
@@ -24,7 +24,77 @@ function event(type, data, seq) {
   };
 }
 
-let state = reduceRunEvent(
+let state = hydrateTranscript(initialRunState(), {
+  schema_version: "studio.chat.v1",
+  run_id: "v1-run",
+  messages: [],
+  event_cursor: -1,
+});
+assert.equal(state.eventLogError, null, "a supported v1 transcript has no degradation signal");
+
+state = hydrateTranscript(initialRunState(), {
+  schema_version: "studio.chat.v2",
+  run_id: "clean-v2-run",
+  messages: [],
+  event_cursor: 3,
+  event_log_error: "",
+});
+assert.equal(state.eventLogError, null, "a clean v2 transcript must not show a warning");
+
+const degradedMessage = {
+  id: "assistant:safe-prefix",
+  role: "assistant",
+  content: "safe prefix",
+  attachments: [],
+  created_at: 1,
+};
+state = hydrateTranscript(initialRunState(), {
+  schema_version: "studio.chat.v2",
+  run_id: "degraded-v2-run",
+  messages: [degradedMessage],
+  event_cursor: 7,
+  event_log_error: "events.jsonl line 9 is not valid JSON",
+});
+assert.equal(state.eventLogError, "events.jsonl line 9 is not valid JSON");
+assert.equal(state.messages[0], degradedMessage, "the readable transcript prefix must remain visible");
+assert.equal(state.replayCursor, 7);
+
+state = hydrateTranscript(
+  {
+    ...initialRunState("failed-run-before-hydration"),
+    status: "failed",
+    error: "provider failed",
+    errorRetryable: true,
+    manualRetryCandidate: true,
+    manualRetryReady: true,
+  },
+  {
+    schema_version: "studio.chat.v2",
+    run_id: "failed-run-before-hydration",
+    messages: [],
+    event_cursor: 2,
+    event_log_error: "event sequence is descending",
+  },
+);
+assert.deepEqual(
+  {
+    status: state.status,
+    error: state.error,
+    errorRetryable: state.errorRetryable,
+    manualRetryCandidate: state.manualRetryCandidate,
+    manualRetryReady: state.manualRetryReady,
+  },
+  {
+    status: "failed",
+    error: "provider failed",
+    errorRetryable: true,
+    manualRetryCandidate: true,
+    manualRetryReady: true,
+  },
+  "transcript degradation must not replace run failure or retry state",
+);
+
+state = reduceRunEvent(
   initialRunState("failed-run"),
   event("run.failed", { error: "provider failed" }, 1),
 );
@@ -107,4 +177,4 @@ assert.equal(isRunBusy("awaiting-approval"), true);
 assert.equal(isRunBusy("stopping"), true, "stop and pause requests must keep the composer busy");
 assert.equal(isRunBusy("stopped"), false);
 
-console.log("Run-state checks passed (13 scenarios).");
+console.log("Run-state checks passed (17 scenarios).");
