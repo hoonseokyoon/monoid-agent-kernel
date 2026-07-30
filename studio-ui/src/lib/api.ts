@@ -1,6 +1,7 @@
 import type {
   ApplyResponse,
   AttachmentInput,
+  ChatMessage,
   ChatResponse,
   ChatTranscriptResponse,
   EventsResponse,
@@ -37,10 +38,34 @@ function hasExactKeys(payload: Record<string, unknown>, expected: readonly strin
     && expected.every((key) => Object.prototype.hasOwnProperty.call(payload, key));
 }
 
+function isChatMessage(payload: unknown): payload is ChatMessage {
+  if (!isRecord(payload)) return false;
+  const attachmentsAreValid = Array.isArray(payload.attachments)
+    && payload.attachments.every((attachment) => isRecord(attachment)
+      && typeof attachment.name === "string"
+      && typeof attachment.mime === "string");
+  const roleIsValid = payload.role === "user"
+    || payload.role === "assistant"
+    || payload.role === "error";
+  return typeof payload.id === "string"
+    && payload.id.trim().length > 0
+    && roleIsValid
+    && typeof payload.content === "string"
+    && attachmentsAreValid
+    && typeof payload.created_at === "number"
+    && Number.isFinite(payload.created_at)
+    && (payload.source === undefined || isRecord(payload.source));
+}
+
+function areChatMessages(payload: unknown): payload is ChatMessage[] {
+  if (!Array.isArray(payload) || !payload.every(isChatMessage)) return false;
+  return new Set(payload.map((message) => message.id)).size === payload.length;
+}
+
 export function isChatTranscriptResponse(payload: unknown): payload is ChatTranscriptResponse {
   if (!isRecord(payload)) return false;
   const commonFieldsAreValid = typeof payload.run_id === "string"
-    && Array.isArray(payload.messages)
+    && areChatMessages(payload.messages)
     && Number.isInteger(payload.event_cursor);
   if (!commonFieldsAreValid) return false;
   if (payload.schema_version === "studio.chat.v1") {

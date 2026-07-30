@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,39 @@ _ASSISTANT_EVENT_TYPES = {"turn.settled"}
 _ERROR_EVENT_TYPES = {"turn.failed", "run.failed", "ModelAdapterError"}
 
 
+def _is_chat_message(payload: object) -> bool:
+    """Validate renderer-required fields while permitting additive message metadata."""
+    if not isinstance(payload, dict):
+        return False
+    message_id = payload.get("id")
+    role = payload.get("role")
+    attachments = payload.get("attachments")
+    created_at = payload.get("created_at")
+    try:
+        created_at_is_valid = (
+            isinstance(created_at, (int, float))
+            and not isinstance(created_at, bool)
+            and math.isfinite(created_at)
+        )
+    except OverflowError:
+        created_at_is_valid = False
+    return (
+        isinstance(message_id, str)
+        and bool(message_id.strip())
+        and role in {"user", "assistant", "error"}
+        and isinstance(payload.get("content"), str)
+        and isinstance(attachments, list)
+        and all(
+            isinstance(attachment, dict)
+            and isinstance(attachment.get("name"), str)
+            and isinstance(attachment.get("mime"), str)
+            for attachment in attachments
+        )
+        and created_at_is_valid
+        and ("source" not in payload or isinstance(payload.get("source"), dict))
+    )
+
+
 def is_supported_chat_response(payload: object) -> bool:
     """Whether ``payload`` is one exact Studio chat response shape this release reads."""
     if not isinstance(payload, dict):
@@ -36,11 +70,21 @@ def is_supported_chat_response(payload: object) -> bool:
             return False
     elif version != CHAT_SCHEMA_V1:
         return False
+    messages = payload.get("messages")
+    messages_are_valid = isinstance(messages, list) and all(
+        _is_chat_message(message) for message in messages
+    )
+    message_ids = (
+        [message["id"] for message in messages if isinstance(message, dict)]
+        if messages_are_valid
+        else []
+    )
     cursor = payload.get("event_cursor")
     return (
         set(payload) == keys
         and isinstance(payload.get("run_id"), str)
-        and isinstance(payload.get("messages"), list)
+        and messages_are_valid
+        and len(message_ids) == len(set(message_ids))
         and isinstance(cursor, int)
         and not isinstance(cursor, bool)
     )

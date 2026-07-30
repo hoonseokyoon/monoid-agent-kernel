@@ -146,8 +146,12 @@ out in commit messages and here.
   on a clean read) and the Studio chat response carries the same required field. **Breaking:** the
   expanded Studio response is identified as `studio.chat.v2`; strict v1 clients must upgrade to
   read the new writer. The bundled reader retains exact v1 and v2 support for reader-first rollout.
-  It validates that envelope at the HTTP boundary before hydration: unknown versions, same-version
-  expansion, missing v2 fields, malformed common fields, and non-object responses fail visibly.
+  It validates the response at the HTTP boundary before hydration: unknown versions, same-version
+  envelope expansion, missing v2 fields, malformed common fields, non-object responses, and chat
+  messages missing renderer-required fields fail visibly. Message ids must be non-empty and unique;
+  roles, content, attachment metadata, timestamps, and optional sources are type-checked before the
+  keyed Svelte view receives them. Message-level version identifiers remain optional and ungated,
+  and additional message, attachment, and source fields remain compatible.
   Corruption before `run.finished` leaves a finished run projecting as `running`, and a degraded
   projection that does not say it is degraded reads as a complete, shorter run. `monoid status`
   prints what it could project and then **exits non-zero**, on both the `--json` and the human

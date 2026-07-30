@@ -15,6 +15,8 @@ const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.outputText
 const { StudioApiError, studioApi } = await import(moduleUrl);
 
 let responsePayload;
+let accepted = 0;
+let rejected = 0;
 globalThis.fetch = async () => ({
   ok: true,
   status: 200,
@@ -22,17 +24,33 @@ globalThis.fetch = async () => ({
   json: async () => responsePayload,
 });
 
+const message = (overrides = {}) => ({
+  id: "message-1",
+  role: "assistant",
+  content: "done",
+  attachments: [{ name: "result.txt", mime: "text/plain" }],
+  // A fractional value catches an accidental Number.isInteger check.
+  created_at: 1.25,
+  ...overrides,
+});
+const validMessage = message({
+  attachments: [{ name: "result.txt", mime: "text/plain", future_attachment_member: true }],
+  source: { kind: "event", future_source_member: true },
+  // Message records remain version- and extension-permissive even though the renderer-required
+  // fields are validated. This unknown identifier and the additive members must remain accepted.
+  schema_version: "studio.chat.message.v999",
+  future_message_member: true,
+});
 const base = {
   run_id: "run-1",
-  // Message records have their own permissive compatibility contract. This boundary validates
-  // the response envelope without turning nested message expansion into a breaking change.
-  messages: [{ legacy_or_future_member: true }],
+  messages: [validMessage],
   event_cursor: -1,
 };
 
 async function accepts(payload) {
   responsePayload = payload;
   assert.equal(await studioApi.transcript("run-1"), payload);
+  accepted += 1;
 }
 
 async function rejects(payload) {
@@ -50,6 +68,7 @@ async function rejects(payload) {
       return true;
     },
   );
+  rejected += 1;
 }
 
 await accepts({ schema_version: "studio.chat.v1", ...base });
@@ -58,6 +77,17 @@ await accepts({
   schema_version: "studio.chat.v2",
   ...base,
   event_log_error: "events.jsonl is corrupt",
+});
+await accepts({ schema_version: "studio.chat.v1", ...base, messages: [] });
+await accepts({
+  schema_version: "studio.chat.v2",
+  ...base,
+  messages: [
+    message({ id: "message-user", role: "user", content: "question" }),
+    message({ id: "message-assistant" }),
+    message({ id: "message-error", role: "error", content: "failure" }),
+  ],
+  event_log_error: "",
 });
 
 for (const malformed of [
@@ -79,4 +109,58 @@ for (const malformed of [
   await rejects(malformed);
 }
 
-console.log("Studio chat-transcript boundary checks passed (17 scenarios).");
+function withoutRequiredField(field) {
+  const candidate = message();
+  delete candidate[field];
+  return candidate;
+}
+
+const malformedMessages = [
+  null,
+  [],
+  { legacy_or_future_member: true },
+  withoutRequiredField("id"),
+  withoutRequiredField("role"),
+  withoutRequiredField("content"),
+  withoutRequiredField("attachments"),
+  withoutRequiredField("created_at"),
+  message({ id: "" }),
+  message({ id: "   " }),
+  message({ id: 7 }),
+  message({ role: "system" }),
+  message({ role: 7 }),
+  message({ content: null }),
+  message({ attachments: {} }),
+  message({ attachments: [null] }),
+  message({ attachments: [[]] }),
+  message({ attachments: [{ mime: "text/plain" }] }),
+  message({ attachments: [{ name: 7, mime: "text/plain" }] }),
+  message({ attachments: [{ name: "result.txt" }] }),
+  message({ attachments: [{ name: "result.txt", mime: 7 }] }),
+  message({ created_at: "1" }),
+  message({ created_at: true }),
+  message({ created_at: Number.NaN }),
+  message({ created_at: Number.POSITIVE_INFINITY }),
+  message({ created_at: Number.NEGATIVE_INFINITY }),
+  message({ source: null }),
+  message({ source: [] }),
+  message({ source: "event" }),
+];
+
+for (const malformedMessage of malformedMessages) {
+  await rejects({
+    schema_version: "studio.chat.v2",
+    ...base,
+    messages: [malformedMessage],
+    event_log_error: "",
+  });
+}
+
+await rejects({
+  schema_version: "studio.chat.v2",
+  ...base,
+  messages: [message(), message()],
+  event_log_error: "",
+});
+
+console.log(`Studio chat-transcript boundary checks passed (${accepted + rejected} scenarios).`);
