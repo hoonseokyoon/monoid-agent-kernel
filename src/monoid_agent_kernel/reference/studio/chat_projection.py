@@ -11,12 +11,39 @@ from typing import Any, Iterable, Mapping, Sequence
 from monoid_agent_kernel.core._event_log import read_committed_event_payloads
 from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 
-CHAT_SCHEMA_VERSION = "studio.chat.v1"
+CHAT_SCHEMA_V1 = "studio.chat.v1"
+CHAT_SCHEMA_V2 = "studio.chat.v2"
+# v2 adds the required ``event_log_error`` member to the HTTP response. Keeping the v1
+# discriminator would make the expanded object invalid for strict v1 consumers.
+CHAT_SCHEMA_VERSION = CHAT_SCHEMA_V2
+SUPPORTED_CHAT_SCHEMA_VERSIONS = (CHAT_SCHEMA_V1, CHAT_SCHEMA_V2)
 CHAT_MESSAGE_SCHEMA_VERSION = "studio.chat.message.v1"
 CHAT_FILE_NAME = "studio.chat.jsonl"
 
 _ASSISTANT_EVENT_TYPES = {"turn.settled"}
 _ERROR_EVENT_TYPES = {"turn.failed", "run.failed", "ModelAdapterError"}
+
+
+def is_supported_chat_response(payload: object) -> bool:
+    """Whether ``payload`` is one exact Studio chat response shape this release reads."""
+    if not isinstance(payload, dict):
+        return False
+    version = payload.get("schema_version")
+    keys = {"schema_version", "run_id", "messages", "event_cursor"}
+    if version == CHAT_SCHEMA_V2:
+        keys.add("event_log_error")
+        if not isinstance(payload.get("event_log_error"), str):
+            return False
+    elif version != CHAT_SCHEMA_V1:
+        return False
+    cursor = payload.get("event_cursor")
+    return (
+        set(payload) == keys
+        and isinstance(payload.get("run_id"), str)
+        and isinstance(payload.get("messages"), list)
+        and isinstance(cursor, int)
+        and not isinstance(cursor, bool)
+    )
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

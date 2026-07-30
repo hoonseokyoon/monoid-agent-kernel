@@ -108,6 +108,8 @@ Studio chat state is stored per run in `studio.chat.jsonl`. The chat panel resto
 assistant, and error messages from `/api/chat-transcript` before replaying `events.jsonl` for
 trace and activity state. `events.jsonl` remains the public trace stream, and `transcript.jsonl`
 remains the private model-call log.
+The transcript route writes `studio.chat.v2`; its required `event_log_error` is empty for a
+complete read and explains when the returned messages stop at event-log corruption.
 
 Stable test hooks are present on the main shell (`data-testid="studio-shell"`), left config panel,
 profile switcher/list, chat log, composer, right-panel tabs, settings/config surfaces, and

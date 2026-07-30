@@ -145,7 +145,9 @@ curl -H "Authorization: Bearer $RUN_TOKEN" \
 not the artifact: `command` is dropped (`command_preview` carries the bounded rendering), and
 `cwd` and `changed_paths` are redacted against the run's `permission_policy.redact_patterns`. The
 same projection backs `monoid jobs --json`, `monoid job status --json` and Studio's `/api/jobs`,
-so a job reads the same on every surface. See
+so a job reads the same on every surface. Projected jobs identify
+`monoid.public-background-job.v1`; `artifact_schema_version` records the validated durable source
+version. Missing policy metadata fails closed. See
 [OBSERVABILITY.md](OBSERVABILITY.md#outputs).
 
 `/status` returns lifecycle state, for example `{"state":"running","terminal":false}`.

@@ -471,8 +471,8 @@ def status_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> Non
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
     payload = project_run_status(run_dir)
     # The projection degrades rather than raising, so this surface decides what that means. It
-    # prints the partial answer first -- a caller asked for it and the fields before the damage are
-    # the only ones there are -- and then fails, because `state` may name a run that has since
+    # prints the partial snapshot-and-prefix answer first -- a caller asked for it and it is the
+    # only answer available -- and then fails, because `state` may name a run that has since
     # finished and a script polling this must not read that as still running.
     event_log_error = str(payload.get("event_log_error") or "")
     if json_output:

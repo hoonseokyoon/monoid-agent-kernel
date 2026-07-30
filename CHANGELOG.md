@@ -99,6 +99,16 @@ out in commit messages and here.
   `public_view.public_job_artifact`, and `BackgroundJob.public_payload` calls it like everyone else.
   The artifact on disk is unchanged — it is the run's own record, `JOB_SCHEMA` requires those
   fields, and `monoid validate` reads the file rather than a reader.
+- **The transformed object now names its own contract.** Public readers write
+  `schema_version: monoid.public-background-job.v1` and retain the durable input identifier as
+  `artifact_schema_version`. Reusing `monoid.background-job.v1` was incorrect: that schema requires
+  the removed `command` and a string `cwd`. Readers validate the durable artifact, copy only the
+  classified public fields, and validate the projection before returning it. Unknown fields,
+  malformed values, and out-of-run symlinks therefore fail closed.
+- **Missing policy metadata and path-bearing job errors fail closed.** A missing manifest produces
+  a redact-all policy; a present manifest with missing/null `permission_policy` is corrupt and
+  raises. When a run declares any `redact_patterns`, a non-empty job `error` is replaced as a unit:
+  shell scan failures can interpolate a sensitive path that never reaches `changed_paths`.
 - **Breaking: `monoid_agent_kernel.tasks.list_job_artifacts` and `get_job_artifact` are gone**,
   replaced by `public_job_artifacts` and `public_job_artifact_for`, which project rather than
   return the raw artifact and read the run's policy from its own `manifest.json`. Renamed rather
@@ -125,11 +135,14 @@ out in commit messages and here.
   `read_committed_event_payloads`, which keeps every record before the damage and returns the
   reason.
 - **The reason is published, not swallowed.** `project_run_status` carries `event_log_error` (empty
-  on a clean read) and the Studio chat response carries the same field. This is the half that
-  matters: corruption before `run.finished` leaves a finished run projecting as `running`, and a
-  degraded projection that does not say it is degraded reads as a complete, shorter run. `monoid
-  status` prints what it could project and then **exits non-zero**, on both the `--json` and the
-  human branch.
+  on a clean read) and the Studio chat response carries the same required field. **Breaking:** the
+  expanded Studio response is identified as `studio.chat.v2`; strict v1 clients must upgrade to
+  read the new writer. The bundled reader retains exact v1 and v2 support for reader-first rollout.
+  Corruption before `run.finished` leaves a finished run projecting as `running`, and a degraded
+  projection that does not say it is degraded reads as a complete, shorter run. `monoid status`
+  prints what it could project and then **exits non-zero**, on both the `--json` and the human
+  branch. This PR establishes the REST signal; rendering it as a browser warning stays in the
+  already-separated Studio frontend rebuild item.
 - `read_event_page` and `reference/event_reader.py` deliberately still raise. The backend already
   answers with a clean 500, and silently shortening a *paged* reader would read as end-of-stream.
 - **Studio's `do_GET` now has the exception handler `do_POST` has always had**, so an unanticipated

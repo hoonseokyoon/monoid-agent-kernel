@@ -129,9 +129,16 @@ def read_committed_event_payloads(path: Path) -> CommittedEventRead:
     requires ``end_offset`` and this is an unbounded snapshot read.
     """
     payloads: list[dict[str, Any]] = []
+    previous_seq: int | None = None
     try:
         for record in iter_committed_event_records(path):
+            if previous_seq is not None and record.seq <= previous_seq:
+                raise EventLogCorruption(
+                    f"committed event log sequence is not increasing: {path} "
+                    f"at byte {record.byte_offset}"
+                )
             payloads.append(record.payload)
+            previous_seq = record.seq
     except EventLogCorruption as exc:
         return CommittedEventRead(payloads=payloads, corruption=str(exc))
     except OSError as exc:
@@ -522,7 +529,7 @@ def _decode_event_record(path: Path, byte_offset: int, raw_record: bytes) -> dic
         ) from exc
     try:
         payload = json.loads(text)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise EventLogCorruption(
             f"committed event log record is not valid JSON: {path} at byte {byte_offset}"
         ) from exc

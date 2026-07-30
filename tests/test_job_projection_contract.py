@@ -19,9 +19,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from monoid_agent_kernel.core.projections import project_run_status
-from monoid_agent_kernel.core.schemas import validate_run_dir
+from monoid_agent_kernel.core.schemas import (
+    PUBLIC_JOB_SCHEMA,
+    PUBLIC_JOB_SCHEMA_VERSION,
+    validate_run_dir,
+)
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import REDACTED_PATH
 from monoid_agent_kernel.reference.backend.jobs import JobService, JobServiceContext
@@ -203,23 +208,14 @@ def test_the_artifact_on_disk_is_untouched(run_dir: Path) -> None:
 
 
 def test_every_key_of_the_artifact_is_classified(run_dir: Path) -> None:
-    """The projection copies unknown keys through, so this is what stops a newly added field from
-    being published by default: adding a key to ``BackgroundJob.to_json`` fails here until whoever
-    added it decides which of the three treatments it gets.
-
-    An allowlist in ``public_job_artifact`` would enforce it in code instead, and was rejected --
-    it would drop the new field from every public reader without saying so, and a silent omission
-    is the failure this release exists to close. The enforcement is loud here rather than silent
-    there.
-    """
+    """Runtime uses an allowlist; this assertion makes a new writer field fail loudly in CI until
+    its public treatment and schema are chosen."""
     dropped = {"command"}
-    previewed = {"cwd"}
+    versioned = {"schema_version"}
+    previewed = {"kind", "command_preview", "cwd", "error", "stdout_path", "stderr_path"}
     redacted_exactly = {"changed_paths"}
     copied_through = {
-        "schema_version",
         "job_id",
-        "kind",
-        "command_preview",
         "status",
         "started_at",
         "finished_at",
@@ -227,9 +223,6 @@ def test_every_key_of_the_artifact_is_classified(run_dir: Path) -> None:
         "exit_code",
         "timed_out",
         "output_truncated",
-        "error",
-        "stdout_path",
-        "stderr_path",
         "stdout_bytes",
         "stderr_bytes",
         "requested_timeout_s",
@@ -243,11 +236,14 @@ def test_every_key_of_the_artifact_is_classified(run_dir: Path) -> None:
     }
 
     written = set(_job(run_dir).to_json(run_dir))
-    classified = dropped | previewed | redacted_exactly | copied_through
+    classified = dropped | versioned | previewed | redacted_exactly | copied_through
     assert written == classified, "a field of job.json is not classified in the public projection"
 
-    published = set(public_job_artifacts(run_dir)[0])
-    assert published == written - dropped
+    projection = public_job_artifacts(run_dir)[0]
+    assert set(projection) == (written - dropped) | {"artifact_schema_version"}
+    assert projection["schema_version"] == PUBLIC_JOB_SCHEMA_VERSION
+    assert projection["artifact_schema_version"] == _job(run_dir).to_json(run_dir)["schema_version"]
+    Draft202012Validator(PUBLIC_JOB_SCHEMA).validate(projection)
 
 
 def test_every_reader_of_job_json_is_covered() -> None:
@@ -286,8 +282,29 @@ def test_a_manifest_that_cannot_be_parsed_is_an_error_not_an_empty_policy(tmp_pa
     run_dir = tmp_path / "run_bad_manifest"
     run_dir.mkdir()
 
-    # No manifest at all: nothing was declared, so honouring nothing is exact.
-    assert run_permission_policy(run_dir) == PermissionPolicy()
+    # No manifest cannot prove that no paths were declared, so publication redacts every path.
+    assert run_permission_policy(run_dir) == PermissionPolicy(redact_patterns=("**",))
+
+    invalid_payloads = (
+        {},
+        {"permission_policy": None},
+        {"permission_policy": {}},
+        {"permission_policy": {"deny_patterns": [], "redact_patterns": None}},
+        {"permission_policy": {"deny_patterns": None, "redact_patterns": []}},
+        {"permission_policy": {"deny_patterns": [1], "redact_patterns": []}},
+        {
+            "permission_policy": {
+                "deny_patterns": [],
+                "redact_patterns": [],
+                "path_pattern_encoding": "secret-unsupported-encoding",
+            }
+        },
+    )
+    for payload in invalid_payloads:
+        (run_dir / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError) as error:
+            run_permission_policy(run_dir)
+        assert "secret-unsupported-encoding" not in str(error.value)
 
     (run_dir / "manifest.json").write_text('{"permission_policy": "not-an-object"}', encoding="utf-8")
     with pytest.raises(ValueError):
@@ -303,8 +320,7 @@ def test_a_manifest_that_cannot_be_parsed_is_an_error_not_an_empty_policy(tmp_pa
 
 
 def test_a_run_with_no_manifest_still_drops_the_command(tmp_path: Path) -> None:
-    """The default policy redacts no paths, and `command` is dropped regardless -- it is not a
-    redaction decision, it is a field that has a bounded replacement."""
+    """Missing policy metadata redacts all paths, while `command` is always dropped."""
     run_dir = tmp_path / "run_no_manifest"
     job_dir = run_dir / "artifacts" / "jobs" / JOB_ID
     job_dir.mkdir(parents=True)
@@ -314,4 +330,75 @@ def test_a_run_with_no_manifest_still_drops_the_command(tmp_path: Path) -> None:
 
     job = public_job_artifacts(run_dir)[0]
     assert "command" not in job
-    assert job["cwd"] == SECRET_DIR
+    assert job["cwd"]["redacted"] is True
+    assert job["changed_paths"] == [REDACTED_PATH]
+
+
+def test_unknown_or_malformed_artifact_fields_fail_closed(run_dir: Path) -> None:
+    path = run_dir / "artifacts" / "jobs" / JOB_ID / "job.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["raw_command"] = "super-secret-command"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as unknown:
+        public_job_artifacts(run_dir)
+    assert "super-secret-command" not in str(unknown.value)
+
+    payload.pop("raw_command")
+    payload["cwd"] = {"secret": SECRET_DIR}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError):
+        public_job_artifacts(run_dir)
+
+
+def test_stored_command_preview_is_rebounded_before_publication(run_dir: Path) -> None:
+    path = run_dir / "artifacts" / "jobs" / JOB_ID / "job.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["command_preview"] = "x" * 10_000
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    preview = public_job_artifacts(run_dir)[0]["command_preview"]
+
+    assert preview.endswith("…")
+    assert len(preview.encode("utf-8")) <= 203
+
+
+def test_job_error_is_withheld_when_path_redaction_is_active(run_dir: Path) -> None:
+    path = run_dir / "artifacts" / "jobs" / JOB_ID / "job.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["error"] = f"shell produced a symlink: {SECRET_FILE}"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    for reader in sorted(set(READERS) - {"event_sink"}):
+        assert READERS[reader](run_dir)["error"] == "[redacted-job-error]"
+
+    in_memory = _job(run_dir)
+    in_memory.error = f"shell produced a symlink: {SECRET_FILE}"
+    assert in_memory.public_payload(
+        run_dir, PermissionPolicy(redact_patterns=("secrets/**",))
+    )["error"] == "[redacted-job-error]"
+
+
+def test_job_listing_does_not_follow_an_out_of_run_symlink(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_symlink"
+    run_dir.mkdir()
+    run_dir.joinpath("manifest.json").write_text(
+        json.dumps(
+            {"permission_policy": {"deny_patterns": [], "redact_patterns": []}}
+        ),
+        encoding="utf-8",
+    )
+    jobs_dir = run_dir / "artifacts" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    outside = tmp_path / "outside" / "linked"
+    outside.mkdir(parents=True)
+    outside.joinpath("job.json").write_text(
+        json.dumps(_job(run_dir).to_json(run_dir)), encoding="utf-8"
+    )
+    link = jobs_dir / JOB_ID
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    assert public_job_artifacts(run_dir) == []

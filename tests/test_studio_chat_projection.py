@@ -3,7 +3,31 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
+from monoid_agent_kernel.reference.studio.chat_projection import (
+    CHAT_SCHEMA_V1,
+    CHAT_SCHEMA_V2,
+    ChatProjection,
+    is_supported_chat_response,
+)
+
+
+def test_chat_response_reader_distinguishes_the_v1_and_v2_shapes() -> None:
+    base = {"run_id": "run-1", "messages": [], "event_cursor": -1}
+
+    assert is_supported_chat_response({"schema_version": CHAT_SCHEMA_V1, **base})
+    assert not is_supported_chat_response(
+        {"schema_version": CHAT_SCHEMA_V1, **base, "event_log_error": ""}
+    )
+    assert is_supported_chat_response(
+        {"schema_version": CHAT_SCHEMA_V2, **base, "event_log_error": ""}
+    )
+    assert not is_supported_chat_response({"schema_version": CHAT_SCHEMA_V2, **base})
+    assert not is_supported_chat_response(
+        {"schema_version": CHAT_SCHEMA_V2, **base, "event_log_error": None}
+    )
+    assert not is_supported_chat_response(
+        {"schema_version": "studio.chat.v3", **base, "event_log_error": ""}
+    )
 
 
 def test_chat_projection_dedupes_user_messages_and_strips_attachment_bytes(tmp_path: Path) -> None:
@@ -121,7 +145,7 @@ def test_chat_projection_backfills_legacy_title_and_events(tmp_path: Path) -> No
 
     body = ChatProjection(tmp_path).catch_up("run-1")
 
-    assert body["schema_version"] == "studio.chat.v1"
+    assert body["schema_version"] == "studio.chat.v2"
     assert body["event_cursor"] == 7
     assert [(message["role"], message["content"]) for message in body["messages"]] == [
         ("user", "legacy prompt"),

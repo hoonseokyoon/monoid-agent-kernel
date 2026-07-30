@@ -631,7 +631,7 @@ def test_studio_chat_transcript_http_route(studio: StudioServer) -> None:
     with urlopen(f"{studio.base_url}/api/chat-transcript?run_id={run_id}", timeout=5) as response:
         body = json.loads(response.read().decode("utf-8"))
 
-    assert body["schema_version"] == "studio.chat.v1"
+    assert body["schema_version"] == "studio.chat.v2"
     assert body["run_id"] == run_id
     assert body["messages"][0]["content"] == "route check"
     assert body["event_cursor"] >= 0

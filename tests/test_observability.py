@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import sys
 from pathlib import Path
 
 import pytest
@@ -957,3 +958,80 @@ def test_a_missing_or_empty_event_log_is_not_corruption(tmp_path: Path) -> None:
     empty_path.write_text("", encoding="utf-8")
     empty = read_committed_event_payloads(empty_path)
     assert empty.payloads == [] and empty.corruption == ""
+
+
+@pytest.mark.parametrize("sequence", [(1, 1), (2, 1)])
+def test_lenient_event_read_stops_at_a_non_increasing_sequence(
+    tmp_path: Path, sequence: tuple[int, int]
+) -> None:
+    from monoid_agent_kernel.core._event_log import read_committed_event_payloads
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        "".join(
+            json.dumps({"seq": seq, "type": "run.started", "data": {}}) + "\n"
+            for seq in sequence
+        ),
+        encoding="utf-8",
+    )
+
+    read = read_committed_event_payloads(events_path)
+
+    assert [payload["seq"] for payload in read.payloads] == [sequence[0]]
+    assert "sequence is not increasing" in read.corruption
+
+
+def test_status_and_studio_degrade_on_recursion_depth_json(tmp_path: Path) -> None:
+    from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
+
+    run_dir = tmp_path / "run_deep_event"
+    run_dir.mkdir()
+    prefix = json.dumps(
+        {"seq": 1, "type": "run.failed", "data": {"error": "safe prefix"}}
+    )
+    depth = sys.getrecursionlimit() + 100
+    deeply_nested = (
+        '{"seq":2,"type":"run.failed","data":{"nested":'
+        + "[" * depth
+        + "0"
+        + "]" * depth
+        + "}}"
+    )
+    run_dir.joinpath("events.jsonl").write_text(
+        prefix + "\n" + deeply_nested + "\n", encoding="utf-8"
+    )
+
+    status = project_run_status(run_dir)
+    transcript = ChatProjection(run_dir).catch_up("run-deep-event")
+
+    assert "not valid JSON" in status["event_log_error"]
+    assert status["state"] == "failed"
+    assert [message["content"] for message in transcript["messages"]] == ["safe prefix"]
+    assert "not valid JSON" in transcript["event_log_error"]
+
+
+def test_degraded_status_can_mix_snapshot_and_event_prefix_fields(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_mixed_projection"
+    run_dir.mkdir()
+    run_dir.joinpath("status.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-mixed",
+                "state": "completed",
+                "terminal": True,
+                "last_event_seq": 3,
+                "last_event_type": "run.finished",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _corrupt_event_log(run_dir)
+
+    projection = project_run_status(run_dir)
+
+    assert "not valid JSON" in projection["event_log_error"]
+    # Snapshot metadata can be newer than the valid event prefix. The error flag marks the whole
+    # mixed projection as diagnostic instead of promising one coherent point in time.
+    assert projection["last_event_seq"] == 3
+    assert projection["last_event_type"] == "run.finished"
+    assert projection["state"] == "running"

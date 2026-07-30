@@ -59,6 +59,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `workspace-index` | durable | `monoid.workspace-index.v1` | json-schema | `monoid.workspace-index.v1`<br>`native-agent-runner.workspace-index.v1` |
 | `proposal` | durable | `monoid.proposal.v2` | json-schema | `monoid.proposal.v2`<br>`native-agent-runner.proposal.v2` |
 | `background-job` | durable | `monoid.background-job.v1` | json-schema | `monoid.background-job.v1`<br>`native-agent-runner.background-job.v1` |
+| `public-background-job` | wire | `monoid.public-background-job.v1` | json-schema | `monoid.public-background-job.v1` |
 | `task` | durable | `monoid.task.v1` | writer-only | None (writer-only) |
 | `proposal-package` | durable | `monoid.proposal-package.v1` | json-schema | `monoid.proposal-package.v1`<br>`native-agent-runner.proposal-package.v1` |
 | `approval` | durable | `monoid.approval.v1` | json-schema | `monoid.approval.v1`<br>`native-agent-runner.approval.v1` |
@@ -69,7 +70,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `conformance-report` | reference | `monoid.conformance-report.v1` | checked | `monoid.conformance-report.v1`<br>`monoid.conformance-report.v2` |
 | `conformance-evidence` | reference | `monoid.conformance-evidence.v1` | strict | `monoid.conformance-evidence.v1` |
 | `conformance-fixtures` | reference | `monoid.conformance-fixtures.v1` | strict | `monoid.conformance-fixtures.v1` |
-| `studio-chat` | reference | `studio.chat.v1` | strict | `studio.chat.v1` |
+| `studio-chat` | reference | `studio.chat.v2` | strict | `studio.chat.v1`<br>`studio.chat.v2` |
 | `studio-chat-message` | reference | `studio.chat.message.v1` | permissive; missing id accepted | `studio.chat.message.v1` |
 <!-- compatibility-registry:end -->
 

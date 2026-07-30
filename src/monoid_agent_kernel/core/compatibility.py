@@ -270,6 +270,14 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         legacy_reader=True,
     ),
     _monoid_artifact(
+        "public-background-job.v1",
+        kind="wire",
+        reader_policy="json-schema",
+        source=("core/schemas.py:PUBLIC_JOB_SCHEMA",),
+        legacy_reader=False,
+        notes="Public projection; artifact_schema_version identifies the durable source shape.",
+    ),
+    _monoid_artifact(
         "task.v1",
         kind="durable",
         reader_policy="writer-only",
@@ -368,11 +376,15 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
     CompatibilityArtifact(
         key="studio-chat",
         kind="reference",
-        current_writer="studio.chat.v1",
-        supported_readers=("studio.chat.v1",),
+        current_writer="studio.chat.v2",
+        supported_readers=("studio.chat.v1", "studio.chat.v2"),
         namespace_aliases=(),
         reader_policy="strict",
-        source=("reference/studio/chat_projection.py:ChatProjection.response",),
+        source=(
+            "reference/studio/chat_projection.py:is_supported_chat_response",
+            "reference/studio/chat_projection.py:ChatProjection.response",
+        ),
+        notes="v2 adds the required event_log_error member for degraded event-log reads.",
     ),
     CompatibilityArtifact(
         key="studio-chat-message",

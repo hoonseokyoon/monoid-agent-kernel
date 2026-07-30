@@ -1352,21 +1352,34 @@ def run_permission_policy(run_dir: Path) -> PermissionPolicy:
     Any reader that projects a run's artifacts needs this, and until now only ``core.projections``
     had it -- which is most of why the other four readers of ``job.json`` published raw values.
 
-    **No manifest means the default policy; an unreadable one is an error.** The distinction is the
-    whole point and the first draft of this function got it wrong by collapsing both to the
-    default. A run directory with no manifest declared no patterns, so honouring none of them is
-    exact. A manifest that exists and cannot be parsed might declare any patterns at all, and
-    answering "then there are none" is a redaction control failing *open* -- silently, on the one
-    input where the operator most needs it not to. Raising costs a caller a traceback on a corrupt
-    run directory; guessing costs them the redaction they configured.
+    A missing manifest yields a redact-all policy. A present manifest must contain the required
+    policy object and parse as durable data. `manifest.json` has required `permission_policy` since
+    v0.19.2, so treating a missing/null member as "no patterns" turns corruption into a silent
+    fail-open publication boundary.
     """
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.exists():
-        return PermissionPolicy()
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return PermissionPolicy(redact_patterns=("**",))
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("manifest.json cannot be read as a policy manifest") from exc
     if not isinstance(payload, dict):
-        raise ValueError(f"manifest.json is not an object: {manifest_path}")
-    return PermissionPolicy.from_durable_json(payload.get("permission_policy"))
+        raise ValueError("manifest.json is not a policy object")
+    permission_policy = payload.get("permission_policy")
+    if not isinstance(permission_policy, dict):
+        raise ValueError("manifest.json has no valid permission_policy")
+    for key in ("deny_patterns", "redact_patterns"):
+        patterns = permission_policy.get(key)
+        if not isinstance(patterns, list) or any(type(pattern) is not str for pattern in patterns):
+            raise ValueError("manifest.json has no valid permission_policy")
+    try:
+        return PermissionPolicy.from_durable_json(permission_policy)
+    except (TypeError, ValueError, RecursionError) as exc:
+        # Parser errors can quote the rejected encoding or pattern. This function is an HTTP/CLI
+        # publication boundary, so preserve the cause for debugging without echoing manifest
+        # content in the public exception message.
+        raise ValueError("manifest.json has no valid permission_policy") from exc
 
 
 def public_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:
@@ -1381,28 +1394,48 @@ def public_job_artifacts(run_dir: Path) -> list[dict[str, Any]]:
     jobs_dir = run_dir / "artifacts" / "jobs"
     if not jobs_dir.exists():
         return []
+    jobs_root = jobs_dir.resolve()
+    if not is_within(run_dir.resolve(), jobs_root):
+        raise ValueError("job directory escapes run directory")
     # One manifest read for the whole listing, not one per job file.
     policy = run_permission_policy(run_dir)
     jobs: list[dict[str, Any]] = []
     for path in sorted(jobs_dir.glob("*/job.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        resolved_path = path.resolve()
+        if not is_within(jobs_root, resolved_path):
             continue
-        if isinstance(payload, dict):
-            jobs.append(public_job_artifact(payload, policy))
+        try:
+            payload = _read_job_artifact(path)
+        except OSError:
+            continue
+        if payload.get("job_id") != path.parent.name:
+            raise ValueError("job artifact id does not match its directory")
+        jobs.append(public_job_artifact(payload, policy))
     return jobs
 
 
 def public_job_artifact_for(run_dir: Path, job_id: str) -> dict[str, Any]:
     """One background job, projected for publication. See ``public_job_artifacts``."""
-    path = _job_dir(run_dir, job_id) / "job.json"
+    job_dir = _job_dir(run_dir, job_id)
+    path = job_dir / "job.json"
     if not path.exists():
         raise KeyError(f"unknown job: {job_id}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("job artifact is invalid")
+    if not is_within(job_dir, path.resolve()):
+        raise ValueError("job artifact escapes its job directory")
+    payload = _read_job_artifact(path)
+    if payload.get("job_id") != job_id:
+        raise ValueError("job artifact id does not match its directory")
     return public_job_artifact(payload, run_permission_policy(run_dir))
+
+
+def _read_job_artifact(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("job artifact is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("job artifact is not an object")
+    return payload
 
 
 def read_job_log_text(
@@ -1453,4 +1486,3 @@ def _job_dir(run_dir: Path, job_id: str) -> Path:
     if not is_within(run_dir.resolve(), path):
         raise ValueError("job path escapes run directory")
     return path
-

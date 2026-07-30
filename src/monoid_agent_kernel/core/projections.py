@@ -66,9 +66,9 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         "apply_hash": apply_result.get("apply_hash"),
         "last_event_seq": int(status_payload.get("last_event_seq") or 0),
         "last_event_type": status_payload.get("last_event_type") or "",
-        # Empty on a clean read. When it is not, every field above it was projected from the
-        # records *before* the damage and none of them can be trusted to be current -- in
-        # particular `state`, which stays `running` for a run that finished past the bad byte.
+        # Empty on a clean read. A degraded result combines the run's durable snapshots with the
+        # valid event prefix, so none of its state fields can be trusted as current without first
+        # checking this member.
         "event_log_error": "",
     }
     _apply_event_projection(run_dir / "events.jsonl", projection, permission_policy)

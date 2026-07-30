@@ -28,7 +28,8 @@ Each run writes:
   `changed_paths` — it is the run's own record and `JOB_SCHEMA` requires them — but it does *not*
   get `task.json`'s "private by location" exemption below, because two surfaces serve it over HTTP
   (`/v1/runs/<id>/jobs` and Studio's `/api/jobs`). Every reader goes through one projection
-  (`public_view.public_job_artifact`): `command` is dropped, `command_preview` stays, `cwd` is
+  (`public_view.public_job_artifact`, schema `monoid.public-background-job.v1`): `command` is
+  dropped, `command_preview` stays bounded, `cwd` is
   previewed and `changed_paths` redacted against `redact_patterns`. That is five readers with one
   answer; it was five with three, and the raw ones meant **backgrounding a command was enough to
   route around `redact_patterns`** — the same `cwd` came out `{"redacted": true}` on
@@ -143,6 +144,10 @@ Studio adds `studio.chat.jsonl` inside each Studio run directory as the browser-
 projection. The Studio UI restores user, assistant, and error messages from
 `/api/chat-transcript`, then replays `events.jsonl` for trace and activity panels.
 `transcript.jsonl` remains the private model-call log.
+
+The `/api/chat-transcript` response is `studio.chat.v2`. It requires `event_log_error`, which is
+empty after a complete read and carries the failure reason when Studio returns only the committed
+prefix of a corrupt `events.jsonl`. This member is the wire-format change from v1.
 
 **`studio.chat.jsonl` carries whole model answers and whole user prompts**, and is content-bearing
 and served over HTTP. It is not the only one: `RunProjectionService.events` hydrates `final_text`
