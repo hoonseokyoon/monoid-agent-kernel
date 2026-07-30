@@ -93,11 +93,18 @@ Carried, deliberately:
   task) is the exception and *does* mask secret-named keys, because a human acts on it directly. So
   an `api_key` argument is masked on an `ask`-gated call and published verbatim on an `allow` call.
   If you want it masked on both, attach the example sink, or do not pass credentials as tool
-  arguments. `PermissionPolicy.redact_patterns` will not help: it is a *workspace path* glob list,
-  consulted only for fields that name a path — `path`, `root`, `cwd`, and any `*_path` argument
-  such as `fs.move`'s `source_path` / `destination_path`. It was previously consulted for the first
-  three only, which meant one `fs.move` published `paths: ["[redacted-path]"]` alongside
+  arguments. `PermissionPolicy.redact_patterns` will not help: it is a list of **`.gitignore`
+  wildcard patterns over workspace paths**, consulted only for fields that name a path — `path`,
+  `root`, `cwd`, and any `*_path` argument such as `fs.move`'s `source_path` /
+  `destination_path`. It was previously consulted for the first three only, which meant one
+  `fs.move` published `paths: ["[redacted-path]"]` alongside
   `args_preview.source_path: "secrets/creds.txt"` on the same event.
+  A pattern with no slash (`.env`, `*.key`) matches that name at any depth; `dir/**` covers the
+  subtree and is anchored at the workspace root; `**/name` matches anywhere including the root;
+  `dir/*` is direct children only. A leading `!` is rejected rather than read as negation, because
+  negation makes the answer depend on pattern order and `merged` combines policies as a set. The
+  full table is in [CLI.md](CLI.md#path-permissions). **Changed in v0.20** — `**` previously
+  behaved as a single `*`, so `dir/**` covered exactly one level.
 - The **approval** preview (`arguments_preview`) is bounded far more loosely than the trace preview,
   and it does **not** blank file-content fields. A person reads it to decide whether a call may run:
   a command cut mid-string hides the part that matters (with the model choosing where that part

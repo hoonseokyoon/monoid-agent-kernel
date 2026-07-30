@@ -136,6 +136,25 @@ monoid run \
 `deny_patterns` blocks tool and shell access. `redact_patterns` masks paths in the public
 event/status stream only; private run artifacts keep real paths and contents.
 
+Both are **`.gitignore` wildcard patterns**, matched against the workspace-relative path:
+
+| pattern | covers | does not cover |
+| --- | --- | --- |
+| `.env`, `*.key` | that name at **any** depth (`a/b/.env`) | `.envx` |
+| `internal/**` | everything under `internal/`, any depth | `internal` itself; `vendor/internal/x` |
+| `internal` | the directory and its contents, at any depth | `internals` |
+| `internal/*` | direct children only | `internal/deep/x` |
+| `**/id_rsa` | that name anywhere, root included | `id_rsa_backup` |
+| `**/secrets/**` | a `secrets` directory wherever it appears | — |
+
+A leading `!` (negation) is **rejected**: it would make the result depend on pattern order, and
+merging two policies treats their patterns as a set.
+
+> **Changed in v0.20.** These were previously matched with `PurePath.match`, where `**` behaved as
+> a single `*`. `internal/**` covered one level and missed `internal/deep/x`, while also matching
+> `vendor/internal/x`, and `**/id_rsa` never matched a bare `id_rsa` at the root. If you relied on
+> a `dir/**` pattern matching that directory at *any* depth, write `**/dir/**`.
+
 Public events keep file content out of the stream and mask `redact_patterns` paths.
 Your backend owns any extra redaction for secret-bearing tool arguments or shell commands
 (see [OBSERVABILITY.md](OBSERVABILITY.md#event-sinks)).

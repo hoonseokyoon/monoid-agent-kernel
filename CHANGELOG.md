@@ -7,6 +7,47 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Security — `**` in a path pattern covered one directory level, not a subtree
+
+- **`deny_patterns` and `redact_patterns` now use `.gitignore` wildcard semantics.**
+  `matches_path_patterns` used `PurePath.match`, where `**` is a single `*` matched right-to-left.
+  So `internal/**` denied `internal/a.txt`, **not** `internal/deep/a.txt` — and did deny
+  `vendor/internal/a.txt`, which nobody asked for. `**/id_rsa` never matched a bare `id_rsa` at the
+  workspace root. Both of those patterns were already in the shipped documentation.
+  The minimum deny list `docs/security/PRODUCTION_CHECKLIST.md` recommends
+  (`.env`, `*.key`, `*.pem`, `**/id_rsa`, `.ssh/**`, `.git/**`) left three holes, measured:
+
+  | path | before | after |
+  | --- | --- | --- |
+  | `.ssh/keys/deep/id_ed25519` | **not denied** | denied |
+  | `.git/refs/heads/main` | **not denied** | denied |
+  | `id_rsa` (workspace root) | **not denied** | denied |
+
+  Re-check any policy written against an earlier version. Nothing caught this because every
+  pattern fixture in the repo used one-level paths.
+- **This moves an access boundary in both directions, and one caller is an allow-list.**
+  `matches_path_patterns` backs four call sites: `deny_patterns`, `redact_patterns`, and a
+  capability lease's `denied_paths` *and* `allowed_paths`. For the three deny-shaped ones, matching
+  more is safer and this change closes holes. For `allowed_paths`, matching more is *more
+  permissive* — a lease scoped to `internal/**` now admits `internal/deep/x`, which it previously
+  refused. Review lease scopes as well as policies. Patterns that were anchored by accident change
+  too: `dir/**` no longer matches that directory at arbitrary depth; write `**/dir/**` for that.
+- **Negation is rejected rather than silently adopted.** `.gitignore` reads a leading `!` as
+  "un-match", which would have handed every deny list a way to punch holes in itself — with the
+  result depending on pattern *order*, while `PermissionPolicy.merged` combines two policies by
+  concatenating and de-duplicating, i.e. as a set. `PermissionPolicy.from_json` now raises on such
+  a pattern, and the matcher keeps `!` literal, which is the meaning it already had.
+- **New runtime dependency: `pathspec>=1.1,<2`.** The stdlib cannot express these semantics on this
+  project's floor — `PurePath.full_match` and `glob.translate` are 3.13+ while `requires-python` is
+  `>=3.11`, `fnmatch` lets `*` cross `/`, and `PurePath.match` is what was wrong. Using 3.13's
+  built-ins where available and hand-rolling a backport otherwise would be two implementations of
+  one security control. Pinned to 1.x rather than `>=0.12` because the two disagree on `dir/*`
+  against a grandchild, and a deny-list hole that opens from a dependency upgrade is not
+  acceptable; `tests/test_path_patterns.py` runs every case against whatever version resolves.
+- `Workspace.glob` is deliberately **not** changed. It is `fnmatch` over a discovery API the model
+  calls to find files, where matching too much returns files it could already list. This function
+  decides access, so the two want opposite defaults.
+
 ### Changed — content egress from the event stream (breaking for `events.jsonl` consumers)
 
 - **`turn.settled` and `run.finished` no longer carry `final_text` for model-authored answers.**

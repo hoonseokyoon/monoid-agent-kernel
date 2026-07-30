@@ -28,6 +28,11 @@ default must be changed for production.
       `mode="apply"` is reserved for explicitly privileged paths.
 - [ ] A deny/redact policy is set per run — there is no secure default. At
       minimum deny `.env`, `*.key`, `*.pem`, `**/id_rsa`, `.ssh/**`, `.git/**`.
+      Patterns are `.gitignore` wildcards — see [CLI.md](../CLI.md#path-permissions).
+      **On < v0.20 this exact list left holes**: `**` behaved as a single `*`, so
+      `.ssh/**` did not cover `.ssh/keys/deep/id_ed25519`, `.git/**` did not cover
+      `.git/refs/heads/main`, and `**/id_rsa` did not cover a bare `id_rsa` at the
+      workspace root. Re-check any policy written against an earlier version.
 - [ ] The workspace root is per-tenant isolated; no host-sensitive directory is
       mounted as a workspace.
 - [ ] The `Workspace` backend passes `tests/test_workspace_contract.py`, and its
