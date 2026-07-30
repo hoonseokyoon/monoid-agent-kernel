@@ -246,6 +246,27 @@ def test_hosted_task_duration_is_nonnegative_after_clock_rollback(tmp_path: Path
     assert terminal[0].data["duration_s"] == 0.0
 
 
+def test_terminal_event_failure_does_not_strand_reentry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _recorder, _sink = _manager(tmp_path)
+    task = manager.start_task("hitl", {"prompt": "Approve?", "resume_on_exit": True})
+    task.status = "answered"
+    task.finished_at = task.started_at
+    task.result = {"status": "answered"}
+
+    def fail_terminal_event(_job: Any) -> None:
+        raise RuntimeError("event sink failed")
+
+    monkeypatch.setattr(manager, "_emit_terminal_event", fail_terminal_event)
+    with pytest.raises(RuntimeError, match="event sink failed"):
+        manager.mark_ready(task)
+
+    assert task.ready_for_reentry is True
+    assert manager.has_resume_jobs() is True
+    assert [obs.output["task_id"] for obs in manager.pop_reentry_observations()] == [task.job_id]
+
+
 def test_hosted_task_cancel_marks_ready_for_reentry(tmp_path: Path) -> None:
     manager, _recorder, sink = _manager(tmp_path)
     task = manager.start_task("hitl", {"prompt": "Approve?", "resume_on_exit": True})

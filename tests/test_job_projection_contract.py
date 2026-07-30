@@ -232,6 +232,20 @@ def test_the_artifact_on_disk_is_untouched(run_dir: Path) -> None:
     assert [issue for issue in validate_run_dir(run_dir) if "job.json" in issue.path] == []
 
 
+def test_retained_negative_duration_preserves_operator_visibility(run_dir: Path) -> None:
+    """Repair the projection copy while retaining the invalid source artifact for diagnosis."""
+    path = run_dir / "artifacts" / "jobs" / JOB_ID / "job.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["duration_s"] = -1.25
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    for reader in sorted(set(READERS) - {"event_sink"}):
+        assert READERS[reader](run_dir)["duration_s"] == 0.0
+
+    assert json.loads(path.read_text(encoding="utf-8"))["duration_s"] == -1.25
+    assert [issue for issue in validate_run_dir(run_dir) if "job.json" in issue.path]
+
+
 def test_every_key_of_the_artifact_is_classified(run_dir: Path) -> None:
     """Runtime uses an allowlist; this assertion makes a new writer field fail loudly in CI until
     its public treatment and schema are chosen."""

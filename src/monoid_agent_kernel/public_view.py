@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -221,7 +222,9 @@ def public_job_artifact(job: Mapping[str, Any], policy: PermissionPolicy) -> dic
 
     The durable input is validated before projection, and the output is built from an explicit
     allowlist and validated against ``PUBLIC_JOB_SCHEMA``. A retained or tampered artifact cannot
-    invent a field and have a public reader copy it through.
+    invent a field and have a public reader copy it through. One compatibility repair is applied to
+    the local copy first: older writers could derive a negative ``duration_s`` when the wall clock
+    moved backward, so that derived value is clamped to zero before the normal strict validation.
 
     The fields receive these treatments:
 
@@ -240,6 +243,14 @@ def public_job_artifact(job: Mapping[str, Any], policy: PermissionPolicy) -> dic
     ``command`` as ``background-job.v1`` made it invalid against the schema named on the object.
     """
     artifact = dict(job)
+    duration = artifact.get("duration_s")
+    negative_duration = (
+        isinstance(duration, int) and not isinstance(duration, bool) and duration < 0
+    ) or (
+        isinstance(duration, float) and math.isfinite(duration) and duration < 0
+    )
+    if negative_duration:
+        artifact["duration_s"] = 0.0
     try:
         artifact_error = next(_JOB_ARTIFACT_VALIDATOR.iter_errors(artifact), None)
     except RecursionError:
