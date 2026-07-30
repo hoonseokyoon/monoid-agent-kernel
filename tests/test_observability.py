@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import inspect
-import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -981,7 +981,11 @@ def test_lenient_event_read_stops_at_a_non_increasing_sequence(
     assert "sequence is not increasing" in read.corruption
 
 
-def test_status_and_studio_degrade_on_recursion_depth_json(tmp_path: Path) -> None:
+def test_status_and_studio_degrade_when_json_decoder_hits_recursion_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.core import _event_log
     from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
 
     run_dir = tmp_path / "run_deep_event"
@@ -989,16 +993,30 @@ def test_status_and_studio_degrade_on_recursion_depth_json(tmp_path: Path) -> No
     prefix = json.dumps(
         {"seq": 1, "type": "run.failed", "data": {"error": "safe prefix"}}
     )
-    depth = sys.getrecursionlimit() + 100
     deeply_nested = (
         '{"seq":2,"type":"run.failed","data":{"nested":'
-        + "[" * depth
-        + "0"
-        + "]" * depth
+        + "[[0]]"
         + "}}"
     )
     run_dir.joinpath("events.jsonl").write_text(
         prefix + "\n" + deeply_nested + "\n", encoding="utf-8"
+    )
+
+    real_loads = json.loads
+
+    def recursion_error_for_nested_event(
+        payload: str | bytes | bytearray,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if '"nested"' in str(payload):
+            raise RecursionError("simulated JSON decoder recursion limit")
+        return real_loads(payload, *args, **kwargs)
+
+    monkeypatch.setattr(
+        _event_log,
+        "json",
+        SimpleNamespace(loads=recursion_error_for_nested_event),
     )
 
     status = project_run_status(run_dir)

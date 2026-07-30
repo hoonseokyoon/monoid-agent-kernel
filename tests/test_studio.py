@@ -91,6 +91,7 @@ def test_index_serves_compiled_svelte_shell_and_assets(studio: StudioServer) -> 
         "profile-switcher",
         "profile-editor-popup",
         "chat-log",
+        "transcript-event-log-error",
         "composer",
         "right-panel-tabs",
         "settings-config-popup",
@@ -99,6 +100,7 @@ def test_index_serves_compiled_svelte_shell_and_assets(studio: StudioServer) -> 
         "/api/proposal-file-raw",
         "Starting delegated work",
         "Previewed from the proposal snapshot",
+        "command_preview",
     ):
         assert hook in javascript
 

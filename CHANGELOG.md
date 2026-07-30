@@ -141,8 +141,8 @@ out in commit messages and here.
   Corruption before `run.finished` leaves a finished run projecting as `running`, and a degraded
   projection that does not say it is degraded reads as a complete, shorter run. `monoid status`
   prints what it could project and then **exits non-zero**, on both the `--json` and the human
-  branch. This PR establishes the REST signal; rendering it as a browser warning stays in the
-  already-separated Studio frontend rebuild item.
+  branch. Studio renders the same reason as a persistent **Transcript is incomplete** warning;
+  replayed lifecycle events cannot clear it or turn it into a retryable model failure.
 - `read_event_page` and `reference/event_reader.py` deliberately still raise. The backend already
   answers with a clean 500, and silently shortening a *paged* reader would read as end-of-stream.
 - **Studio's `do_GET` now has the exception handler `do_POST` has always had**, so an unanticipated
