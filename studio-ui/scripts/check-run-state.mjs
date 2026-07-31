@@ -177,4 +177,27 @@ assert.equal(isRunBusy("awaiting-approval"), true);
 assert.equal(isRunBusy("stopping"), true, "stop and pause requests must keep the composer busy");
 assert.equal(isRunBusy("stopped"), false);
 
-console.log("Run-state checks passed (17 scenarios).");
+state = reduceRunEvent(
+  initialRunState("bounded-plan"),
+  event(
+    "plan.updated",
+    {
+      items: [
+        { step: "visible complete", status: "completed" },
+        { step: "visible active", status: "in_progress" },
+      ],
+      truncated_items: 5,
+    },
+    1,
+  ),
+);
+assert.equal(state.plan.length, 2, "the reducer must retain every visible typed plan item");
+assert.equal(state.planTruncatedItems, 5, "the reducer must retain the out-of-band omission count");
+
+state = reduceRunEvent(
+  state,
+  event("plan.updated", { items: [{ step: "complete plan", status: "completed" }] }, 2),
+);
+assert.equal(state.planTruncatedItems, 0, "a later complete plan must clear the prior omission count");
+
+console.log("Run-state checks passed (19 scenarios).");

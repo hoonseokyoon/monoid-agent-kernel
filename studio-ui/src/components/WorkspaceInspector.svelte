@@ -3,11 +3,12 @@
   import type { FilePreviewResponse, JobSummary, PlanItem, WorkspaceFile } from "../lib/types";
   import Icon from "./Icon.svelte";
 
-  let { workspaceName, files, jobs, plan, onRefresh } = $props<{
+  let { workspaceName, files, jobs, plan, planTruncatedItems, onRefresh } = $props<{
     workspaceName: string;
     files: WorkspaceFile[];
     jobs: JobSummary[];
     plan: PlanItem[];
+    planTruncatedItems: number;
     onRefresh: () => Promise<void>;
   }>();
 
@@ -44,14 +45,17 @@
   <header class="inspector-heading"><div><div class="eyebrow">Current context</div><h2>Workspace</h2></div><button class="icon-button" title="Refresh workspace" onclick={() => void refresh()}><Icon name="retry" size={14} /></button></header>
   <div class="workspace-card"><span class="workspace-icon"><Icon name="files" size={16} /></span><div><strong>{workspaceName || "Workspace"}</strong><small>Local · propose mode</small></div><span class="healthy"><i></i>Ready</span></div>
 
-  {#if plan.length}
+  {#if plan.length || planTruncatedItems}
     <section class="inspector-section">
-      <div class="inspector-section-title"><span>Active plan</span><small>{plan.filter((item: PlanItem) => item.status === "completed").length}/{plan.length}</small></div>
+      <div class="inspector-section-title"><span>Active plan</span><small>{plan.filter((item: PlanItem) => item.status === "completed").length}/{plan.length}{planTruncatedItems ? " shown" : ""}</small></div>
       <div class="mini-plan">
         {#each plan as item}
           <div class:active={item.status === "in_progress"} class:complete={item.status === "completed"}><span>{#if item.status === "completed"}<Icon name="check" size={10} />{:else}<i></i>{/if}</span><strong>{item.step}</strong></div>
         {/each}
       </div>
+      {#if planTruncatedItems}
+        <div class="plan-truncation-note" role="status"><Icon name="alert" size={12} /><span>{planTruncatedItems} additional {planTruncatedItems === 1 ? "step was" : "steps were"} omitted from this bounded preview.</span></div>
+      {/if}
     </section>
   {/if}
 

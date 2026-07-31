@@ -7,6 +7,15 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — Studio plan truncation is visible (gap 9)
+
+- Studio now preserves `plan.updated.truncated_items` in its run state. The Workspace inspector
+  labels the completion count as the visible subset and shows how many additional steps the
+  bounded public preview omitted; the Trace view reports both the original total and the omitted
+  count. A 25-step plan capped to 20 no longer reads as a complete 20-step plan.
+- Rebuilt the committed `web/dist` bundle from the pinned Node/npm toolchain. The Studio source,
+  reducer contract check, and packaged wheel assets therefore carry the same behavior.
+
 ### Added — policy-gated OpenTelemetry preset (W9)
 
 - `OtelEventSink` now accepts `parent_context`, `span_mode`, and `capture_policy`. A valid
@@ -406,9 +415,9 @@ out in commit messages and here.
   rather than changed, because changing it would reverse a deliberate architectural decision;
 - and the delta channel remains **on by default in Studio** unless switched off.
 
-Five gaps remain open after this review. Four related gaps are closed above or in the portable-JSON
+Four gaps remain open after this review. Five related gaps are closed above or in the portable-JSON
 batch: `job.json`'s readers, the corrupt-event-log guard, lone-surrogate ingress, and non-finite
-number ingress and serialization.
+number ingress and serialization, plus Studio's plan-truncation rendering.
 
 - **Non-string scalars bypass the byte cap entirely.** `preview_value` bounds `str` and returns
   everything else unchanged, so a 4300-digit integer — model-authored, arbitrary content in base ten
@@ -442,11 +451,6 @@ number ingress and serialization.
   needs nothing but plain JSON. "Content stays off the public stream" and "100 KB per tool call" are
   both true today, which is the honest way to state where this release got to: it closed the routes
   that leaked a value *whole*, and did not make the stream a bounded channel.
-- **Nothing renders `truncated_items`.** The count reaches `events.jsonl` and `status.json`, and the
-  shipped Studio bundle drops it: a 25-step plan reads `Plan · 20 steps` and `20/20`. The count
-  exists precisely so the cap is not silent, and on that surface it still is. Closing it means
-  changing `studio-ui/` and rebuilding `web/dist`, which this release deliberately leaves untouched.
-
 See `docs/OBSERVABILITY.md` for the full public/private split.
 
 - Added `ModelCallRunner`, which executes one model call against any adapter shape — a blocking

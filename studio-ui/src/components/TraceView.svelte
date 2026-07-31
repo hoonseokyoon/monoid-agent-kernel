@@ -11,7 +11,15 @@
     const scope = data.studio_scope === "subagent" ? `Subagent · ${String(data.subagent_type ?? "delegate")} · ` : "";
     if (event.type === "tool.call.started") return `${scope}Tool · ${String(data.tool ?? "call")}`;
     if (event.type.startsWith("subagent.")) return `Subagent · ${String(data.subagent_type ?? data.status ?? "task")}`;
-    if (event.type === "plan.updated") return `${scope}Plan · ${Array.isArray(data.items) ? data.items.length : 0} steps`;
+    if (event.type === "plan.updated") {
+      const shown = Array.isArray(data.items) ? data.items.length : 0;
+      const omitted = typeof data.truncated_items === "number"
+        && Number.isSafeInteger(data.truncated_items)
+        && data.truncated_items >= 0
+        ? data.truncated_items
+        : 0;
+      return `${scope}Plan · ${shown + omitted} steps${omitted ? ` · ${omitted} omitted` : ""}`;
+    }
     return scope + event.type.replaceAll(".", " · ");
   }
 
