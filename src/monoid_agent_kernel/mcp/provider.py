@@ -21,8 +21,15 @@ from collections.abc import Iterable
 from typing import Any
 
 from monoid_agent_kernel.core.agents import RegistryToolRef, ToolBinding
+from monoid_agent_kernel.core.json_ingress import normalize_unicode_scalars
 from monoid_agent_kernel.mcp.client import McpError, McpHttpClient
 from monoid_agent_kernel.tools.base import ToolResult, ToolSideEffect, ToolSpec
+
+
+def _normalized_tool_filter(value: Any, field_name: str) -> tuple[str, ...]:
+    if type(value) is not tuple or not all(type(item) is str for item in value):
+        raise ValueError(f"MCP {field_name} must be a tuple of strings")
+    return tuple(normalize_unicode_scalars(item) for item in value)
 
 
 class McpToolProvider:
@@ -34,14 +41,25 @@ class McpToolProvider:
         *,
         server: str,
         token: str | None = None,
-        allowed_tools: Iterable[str] | None = None,
-        blocked_tools: Iterable[str] | None = None,
+        allowed_tools: tuple[str, ...] | None = None,
+        blocked_tools: tuple[str, ...] | None = None,
         timeout_s: float = 30.0,
     ) -> None:
-        self._server = server
+        if type(server) is not str or not server:
+            raise ValueError("MCP server name must be a non-empty string")
+        self._server = normalize_unicode_scalars(server)
         self._client = McpHttpClient(url, token, timeout_s=timeout_s)
-        self._allowed = set(allowed_tools) if allowed_tools is not None else None
-        self._blocked = set(blocked_tools or ())
+        self._allowed = (
+            None
+            if allowed_tools is None
+            else set(_normalized_tool_filter(allowed_tools, "allowed_tools"))
+        )
+        self._blocked = set(
+            _normalized_tool_filter(
+                () if blocked_tools is None else blocked_tools,
+                "blocked_tools",
+            )
+        )
         self._tools: list[dict[str, Any]] | None = None  # discovered MCP tool descriptors (cached)
         self._resources: list[dict[str, Any]] | None = None  # discovered MCP resource descriptors
         self._prompts: list[dict[str, Any]] | None = None  # discovered MCP prompt descriptors
@@ -70,7 +88,9 @@ class McpToolProvider:
             self._tools = [
                 t
                 for t in tools
-                if self._selected(str(t.get("name") or ""), f"mcp.{self._server}.{str(t.get('name') or '')}")
+                if self._selected(
+                    str(t.get("name") or ""), f"mcp.{self._server}.{str(t.get('name') or '')}"
+                )
             ]
         return self._tools
 
@@ -95,7 +115,9 @@ class McpToolProvider:
             raise
 
     def _selected(self, *names: str) -> bool:
-        candidates = {name for name in names if name}
+        candidates = {
+            normalize_unicode_scalars(name) for name in names if type(name) is str and name
+        }
         if not candidates:
             return False
         if candidates & self._blocked:
@@ -230,7 +252,11 @@ class McpToolProvider:
                 input_schema=_object_schema(
                     {
                         "name": {"type": "string"},
-                        "arguments": {"type": "object", "additionalProperties": True, "default": {}},
+                        "arguments": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "default": {},
+                        },
                     },
                     required=["name"],
                 ),
@@ -265,7 +291,10 @@ class McpToolProvider:
         expose only server-provided descriptors."""
         return {
             "tools": [
-                {"id": f"mcp.{self._server}.{str(tool.get('name') or '')}", "description": str(tool.get("description") or "")}
+                {
+                    "id": f"mcp.{self._server}.{str(tool.get('name') or '')}",
+                    "description": str(tool.get("description") or ""),
+                }
                 for tool in self._discover()
             ],
             "resources": list(self._discover_resources()) if self._resource_read_selected() else [],
@@ -277,7 +306,9 @@ class McpToolProvider:
             try:
                 result = self._client.call_tool(mcp_name, arguments)
             except McpError as exc:
-                return ToolResult(ok=False, error=str(exc), error_code="mcp_call_failed", retryable=True)
+                return ToolResult(
+                    ok=False, error=str(exc), error_code="mcp_call_failed", retryable=True
+                )
             return _to_tool_result(result)
 
         return handler
@@ -288,7 +319,9 @@ class McpToolProvider:
             try:
                 result = self._client.read_resource(uri)
             except McpError as exc:
-                return ToolResult(ok=False, error=str(exc), error_code="mcp_resource_read_failed", retryable=True)
+                return ToolResult(
+                    ok=False, error=str(exc), error_code="mcp_resource_read_failed", retryable=True
+                )
             return ToolResult(ok=True, content=result)
 
         return handler
@@ -298,9 +331,13 @@ class McpToolProvider:
             name = str(arguments.get("name") or "")
             prompt_args = arguments.get("arguments") or {}
             try:
-                result = self._client.get_prompt(name, prompt_args if isinstance(prompt_args, dict) else {})
+                result = self._client.get_prompt(
+                    name, prompt_args if isinstance(prompt_args, dict) else {}
+                )
             except McpError as exc:
-                return ToolResult(ok=False, error=str(exc), error_code="mcp_prompt_get_failed", retryable=True)
+                return ToolResult(
+                    ok=False, error=str(exc), error_code="mcp_prompt_get_failed", retryable=True
+                )
             return ToolResult(ok=True, content=result)
 
         return handler
@@ -340,7 +377,9 @@ def _to_tool_result(call_result: dict[str, Any]) -> ToolResult:
     stringifying the whole object."""
     text = _join_text(call_result.get("content"))
     if call_result.get("isError"):
-        return ToolResult(ok=False, error=text or "MCP tool error", error_code="mcp_tool_error", category="tool")
+        return ToolResult(
+            ok=False, error=text or "MCP tool error", error_code="mcp_tool_error", category="tool"
+        )
     content: dict[str, Any] = {}
     structured = call_result.get("structuredContent")
     if structured is not None:
@@ -356,7 +395,9 @@ def _to_tool_result(call_result: dict[str, Any]) -> ToolResult:
 def _join_text(blocks: Any) -> str:
     if not isinstance(blocks, list):
         return ""
-    parts = [str(b.get("text") or "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+    parts = [
+        str(b.get("text") or "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"
+    ]
     return "\n".join(p for p in parts if p)
 
 
@@ -371,17 +412,29 @@ def _collect_media(blocks: Any) -> list[dict[str, Any]]:
             continue
         block_type = block.get("type")
         if block_type in ("image", "audio"):
-            media.append({"type": block_type, "mime_type": block.get("mimeType"), "data": block.get("data")})
+            media.append(
+                {"type": block_type, "mime_type": block.get("mimeType"), "data": block.get("data")}
+            )
         elif block_type == "resource":
             resource = block.get("resource") or {}
             if isinstance(resource, dict):
-                media.append({"type": "resource", "uri": resource.get("uri"), "mime_type": resource.get("mimeType")})
+                media.append(
+                    {
+                        "type": "resource",
+                        "uri": resource.get("uri"),
+                        "mime_type": resource.get("mimeType"),
+                    }
+                )
         elif block_type == "resource_link":
-            media.append({"type": "resource_link", "uri": block.get("uri"), "name": block.get("name")})
+            media.append(
+                {"type": "resource_link", "uri": block.get("uri"), "name": block.get("name")}
+            )
     return media
 
 
-def _object_schema(properties: dict[str, Any], *, required: list[str] | None = None) -> dict[str, Any]:
+def _object_schema(
+    properties: dict[str, Any], *, required: list[str] | None = None
+) -> dict[str, Any]:
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",

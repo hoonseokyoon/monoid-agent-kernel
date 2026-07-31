@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -119,6 +120,91 @@ def test_dbos_envelope_redacts_bearer_reintroduced_by_non_json_repr() -> None:
         "bytes": "b'[redacted]'",
         "opaque": "OpaqueValue([redacted])",
     }
+
+
+def test_dbos_envelope_normalizes_json_content_before_identity_and_serialization() -> None:
+    lone_surrogate = chr(0xD800)
+    command = ControlCommand(
+        type="status",
+        run_id=f"run_{lone_surrogate}",
+        command_id=f"cmd_{lone_surrogate}",
+        issuer=f"operator_{lone_surrogate}",
+        reason=f"check_{lone_surrogate}",
+        args={
+            "score": float("nan"),
+            "text": f"bad{lone_surrogate}text",
+        },
+    )
+
+    first = DbosControlEnvelope.from_control_command(
+        command,
+        tenant_id=f"tenant_{lone_surrogate}",
+        user_id=f"user_{lone_surrogate}",
+    )
+    retry = DbosControlEnvelope.from_control_command(
+        command,
+        tenant_id=f"tenant_{lone_surrogate}",
+        user_id=f"user_{lone_surrogate}",
+    )
+
+    assert first.run_id == "run_\ufffd"
+    assert first.command_id == "cmd_\ufffd"
+    assert first.args == {"score": None, "text": "bad\ufffdtext"}
+    assert first.principal == first.principal.__class__(
+        "tenant_\ufffd", "user_\ufffd", "operator_\ufffd"
+    )
+    assert first.reason == "check_\ufffd"
+    assert retry.identity_sha256 == first.identity_sha256
+    encoded = json.dumps(
+        first.to_json(),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    restored = DbosControlEnvelope.from_json(json.loads(encoded.decode("utf-8")))
+    assert restored == first
+    assert restored.identity_sha256 == first.identity_sha256
+
+
+@pytest.mark.parametrize("invalid", [True, "1", float("nan"), float("inf"), 10**400])
+def test_dbos_envelope_rejects_invalid_created_at(invalid: object) -> None:
+    valid = DbosControlEnvelope.from_control_command(
+        ControlCommand(type="status", run_id="run_1", command_id="cmd_1"),
+        tenant_id="tenant",
+        user_id="user",
+    )
+
+    with pytest.raises(ValueError, match="DBOS control created_at must be a finite number"):
+        DbosControlEnvelope(
+            run_id=valid.run_id,
+            command_id=valid.command_id,
+            type=valid.type,
+            args=valid.args,
+            principal=valid.principal,
+            created_at=invalid,  # type: ignore[arg-type]
+        )
+
+    payload = valid.to_json()
+    payload["created_at"] = invalid
+    with pytest.raises(ValueError, match="DBOS control created_at must be a finite number"):
+        DbosControlEnvelope.from_json(payload)
+
+
+def test_dbos_envelope_rejects_keys_that_collide_after_unicode_repair() -> None:
+    lone_surrogate = chr(0xD800)
+    args = {lone_surrogate: "first", "\ufffd": "second"}
+
+    with pytest.raises(ValueError, match="keys collide"):
+        DbosControlEnvelope.from_control_command(
+            ControlCommand(
+                type="status",
+                run_id="run_1",
+                command_id="cmd_1",
+                args=args,
+            ),
+            tenant_id="tenant",
+            user_id="user",
+        )
 
 
 @pytest.mark.parametrize("identifier", ("run_id", "command_id"))

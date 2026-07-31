@@ -88,7 +88,9 @@ def test_workspace_delta_cap_settles_run_as_limited(tmp_path: Path) -> None:
         turns=[
             ModelTurn(
                 response_id="r1",
-                tool_calls=(fake_tool_call("fs_write", {"path": "big.txt", "content": "x" * 50}, "c1"),),
+                tool_calls=(
+                    fake_tool_call("fs_write", {"path": "big.txt", "content": "x" * 50}, "c1"),
+                ),
             ),
             ModelTurn(
                 response_id="r2",
@@ -103,7 +105,9 @@ def test_workspace_delta_cap_settles_run_as_limited(tmp_path: Path) -> None:
     )
 
     result = AgentLoop(
-        spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.write", "run.finish")
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=_provider("fs.write", "run.finish"),
     ).run_once("write a big file")
 
     assert result.status == "limited"
@@ -119,9 +123,9 @@ def test_default_system_prompt_is_composed_base(tmp_path: Path) -> None:
     adapter = _finish_only_adapter()
     spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
 
-    AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider("run.finish")).run_once(
-        "Inspect."
-    )
+    AgentLoop(
+        spec=spec, model_adapter=adapter, runtime_config_provider=_provider("run.finish")
+    ).run_once("Inspect.")
 
     assert adapter.requests[0].system_prompt == compose_system_prompt()
 
@@ -180,7 +184,9 @@ def test_loop_read_write_finish_happy_path(tmp_path: Path) -> None:
             ),
             ModelTurn(
                 response_id="r2",
-                tool_calls=(fake_tool_call("run_finish", {"summary": "Created SUMMARY.md"}, "call_finish"),),
+                tool_calls=(
+                    fake_tool_call("run_finish", {"summary": "Created SUMMARY.md"}, "call_finish"),
+                ),
             ),
         ]
     )
@@ -263,7 +269,9 @@ def test_unknown_tool_is_recorded_as_observation(tmp_path: Path) -> None:
     workspace.mkdir()
     adapter = FakeModelAdapter(
         turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("missing_tool", {}, "call_missing"),)),
+            ModelTurn(
+                response_id="r1", tool_calls=(fake_tool_call("missing_tool", {}, "call_missing"),)
+            ),
             ModelTurn(final_text="done"),
         ]
     )
@@ -810,7 +818,9 @@ def test_ask_authorization_non_answered_approval_never_invokes_handler(tmp_path:
     sink = MemoryEventSink()
     adapter = FakeModelAdapter(
         turns=[
-            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "cancelled"}, "call_1"),)),
+            ModelTurn(
+                tool_calls=(fake_tool_call("demo_approval", {"value": "cancelled"}, "call_1"),)
+            ),
             ModelTurn(final_text="park"),
             ModelTurn(final_text="cancelled approval denied"),
         ]
@@ -877,8 +887,7 @@ def test_ask_authorization_replay_rejects_approval_key_mismatch(tmp_path: Path) 
     assert result.status == "completed"
     assert provider.calls == 0
     assert any(
-        event.type == "permission.denied"
-        and event.data.get("error_code") == "tool_approval_stale"
+        event.type == "permission.denied" and event.data.get("error_code") == "tool_approval_stale"
         for event in sink.events
     )
 
@@ -1041,7 +1050,10 @@ def test_shell_binding_auto_approve_updates_proposal(tmp_path: Path) -> None:
 
     assert result.status == "completed"
     assert not workspace.joinpath("SHELL.md").exists()
-    assert result.run_dir.joinpath("proposal", "files", "SHELL.md").read_text(encoding="utf-8") == "shell\n"
+    assert (
+        result.run_dir.joinpath("proposal", "files", "SHELL.md").read_text(encoding="utf-8")
+        == "shell\n"
+    )
     events = result.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8")
     assert "tool.approval.approved" in events
     assert "shell.exec.finished" in events
@@ -1058,7 +1070,9 @@ def test_loop_limits_and_cancellation(tmp_path: Path) -> None:
         ),
         model_adapter=FakeModelAdapter(
             turns=[
-                ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),)),
+                ModelTurn(
+                    response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),)
+                ),
                 ModelTurn(response_id="r2"),
             ]
         ),
@@ -1116,7 +1130,17 @@ def test_metrics_surface_reasoning_tokens_when_reported(tmp_path: Path) -> None:
     # R10: reasoning tokens reach the metrics.updated event when the adapter reports them, so the
     # studio meter can show the reasoning share.
     adapter = FakeModelAdapter(
-        turns=[ModelTurn(final_text="done", usage={"input_tokens": 5, "output_tokens": 9, "total_tokens": 14, "reasoning_tokens": 7})]
+        turns=[
+            ModelTurn(
+                final_text="done",
+                usage={
+                    "input_tokens": 5,
+                    "output_tokens": 9,
+                    "total_tokens": 14,
+                    "reasoning_tokens": 7,
+                },
+            )
+        ]
     )
     loop, sink, _ = _loop_with(tmp_path, adapter)
     loop.open()
@@ -1130,7 +1154,13 @@ def test_metrics_surface_reasoning_tokens_when_reported(tmp_path: Path) -> None:
 
 def test_metrics_omit_reasoning_tokens_when_absent(tmp_path: Path) -> None:
     # A non-reasoning model reports none → the key is omitted (no "🧠0" noise in the meter).
-    adapter = FakeModelAdapter(turns=[ModelTurn(final_text="done", usage={"input_tokens": 5, "output_tokens": 9, "total_tokens": 14})])
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                final_text="done", usage={"input_tokens": 5, "output_tokens": 9, "total_tokens": 14}
+            )
+        ]
+    )
     loop, sink, _ = _loop_with(tmp_path, adapter)
     loop.open()
     try:
@@ -1151,7 +1181,9 @@ def test_recoverable_turn_error_classifier() -> None:
 
 
 def test_turn_failed_suspension_is_non_terminal(tmp_path: Path) -> None:
-    adapter = _ScriptedAdapter([ModelAdapterError("bad effort", http_status=400, error_code="model_error")])
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad effort", http_status=400, error_code="model_error")]
+    )
     loop, sink, run_root = _loop_with(tmp_path, adapter)
     loop.open()
     try:
@@ -1227,7 +1259,10 @@ def test_generic_model_error_is_terminal(tmp_path: Path) -> None:
 def test_turn_failed_after_tool_round_clears_observations(tmp_path: Path) -> None:
     adapter = _ScriptedAdapter(
         [
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_write", {"path": "a.md", "content": "x"}, "c1"),)),
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_write", {"path": "a.md", "content": "x"}, "c1"),),
+            ),
             ModelAdapterError("transient", http_status=503, retryable=True),
             ModelTurn(response_id="r3", final_text="done"),
         ]
@@ -1264,7 +1299,11 @@ def test_promotion_preserves_provider_details_from_turn_failed(tmp_path: Path) -
     # A recoverable provider failure records provider detail on the turn.failed; promoting it with
     # fail_recoverable() (a fresh error with no provider fields) must NOT blank that detail.
     adapter = _ScriptedAdapter(
-        [ModelAdapterError("bad request", http_status=400, provider_error_code="invalid_request_error")]
+        [
+            ModelAdapterError(
+                "bad request", http_status=400, provider_error_code="invalid_request_error"
+            )
+        ]
     )
     loop, sink, run_root = _loop_with(tmp_path, adapter)
     loop.open()
@@ -1284,7 +1323,12 @@ def test_fresh_terminal_failure_clears_stale_provider_details(tmp_path: Path) ->
     # for an UNRELATED reason, run.failed must reflect that new cause, not the stale detail.
     adapter = _ScriptedAdapter(
         [
-            ModelAdapterError("rate limited", http_status=429, provider_error_code="rate_limit_exceeded", retryable=True),
+            ModelAdapterError(
+                "rate limited",
+                http_status=429,
+                provider_error_code="rate_limit_exceeded",
+                retryable=True,
+            ),
             ModelAdapterError("server boom", http_status=500),  # terminal, no provider code
         ]
     )
@@ -1317,7 +1361,9 @@ class _SelfInterruptingAdapter:
         self.calls += 1
         if self.calls == 1:
             self.loop.interrupt_turn()
-            return ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),))
+            return ModelTurn(
+                response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),)
+            )
         return ModelTurn(response_id="r2", final_text="resumed ok")
 
 
@@ -1377,7 +1423,13 @@ def _streaming_loop(tmp_path: Path, adapter, *, emit: bool):
 
 def test_autonomous_drive_emits_output_deltas(tmp_path: Path) -> None:
     adapter = FakeStreamingModelAdapter(
-        chunk_turns=[[TextDelta("Hel"), TextDelta("lo"), TurnComplete(response_id="r1", usage={"total_tokens": 3})]]
+        chunk_turns=[
+            [
+                TextDelta("Hel"),
+                TextDelta("lo"),
+                TurnComplete(response_id="r1", usage={"total_tokens": 3}),
+            ]
+        ]
     )
     loop, sink = _streaming_loop(tmp_path, adapter, emit=True)
     loop.open()
@@ -1496,3 +1548,215 @@ def test_from_tools_wires_a_custom_tool_end_to_end(tmp_path: Path) -> None:
     # ...and its result came back as an observation.
     observations = [obs for req in adapter.requests for obs in req.observations]
     assert any(obs.output.get("result") == {"echoed": "hello"} for obs in observations)
+
+
+def test_from_tools_normalizes_specs_before_binding_and_surface_hashes(tmp_path: Path) -> None:
+    def handler(_context: ToolContext, _arguments: dict) -> ToolResult:
+        return ToolResult(ok=True, content={})
+
+    hostile = ToolSpec(
+        id="custom.\ud800",
+        description="description \ud800",
+        input_schema={"type": "object", "default": float("nan")},
+        capability="",
+        side_effect="read",
+        handler=handler,
+        provider_name="custom_\ud800",
+        annotations={"score": float("nan")},
+    )
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")])
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop.from_tools(spec, adapter, [hostile]).run_once("inspect tools")
+
+    assert result.status == "completed"
+    exposed = next(tool for tool in adapter.requests[0].tools if tool.id == "custom.�")
+    assert exposed.provider_name == "custom_�"
+    assert exposed.description.startswith("description �")
+    assert exposed.input_schema["default"] is None
+    assert exposed.annotations["score"] is None
+
+
+def test_custom_tool_result_is_normalized_before_observation_and_persistence(
+    tmp_path: Path,
+) -> None:
+    from monoid_agent_kernel.tools.decorator import tool
+
+    @tool(id="custom.hostile", side_effect="read")
+    def hostile() -> dict:
+        """Return values Python accepts and portable JSON does not."""
+
+        return {
+            "text": "\ud800",
+            "numbers": [float("nan"), float("inf"), -float("inf")],
+        }
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_hostile", {}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="done\ud800"),
+        ]
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    loop = AgentLoop.from_tools(spec, adapter, [hostile])
+    result = loop.run_once("run hostile tool")
+
+    expected = {"text": "�", "numbers": [None, None, None]}
+    observations = [obs for request in adapter.requests for obs in request.observations]
+    assert any(observation.output.get("result") == expected for observation in observations)
+    assert result.final_text == "done�"
+
+    def reject_constant(value: str) -> None:
+        pytest.fail(f"non-finite JSON constant persisted: {value}")
+
+    run_dir = spec.run_root / result.run_id
+    for name in ("events.jsonl", "transcript.jsonl"):
+        for line in run_dir.joinpath(name).read_text(encoding="utf-8").splitlines():
+            if line:
+                json.loads(line, parse_constant=reject_constant)
+    for name in ("status.json", "metrics.json"):
+        json.loads(
+            run_dir.joinpath(name).read_text(encoding="utf-8"),
+            parse_constant=reject_constant,
+        )
+    assert list(run_dir.glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "hostile_result",
+    [
+        ToolResult(ok=float("nan"), content={}),  # type: ignore[arg-type]
+        ToolResult(ok=False, retryable=float("nan")),  # type: ignore[arg-type]
+    ],
+)
+def test_invalid_tool_result_control_fields_become_observable_tool_failures(
+    tmp_path: Path,
+    hostile_result: ToolResult,
+) -> None:
+    def handler(_context: ToolContext, _arguments: dict) -> ToolResult:
+        return hostile_result
+
+    spec = ToolSpec(
+        id="custom.hostile_control",
+        description="Return an invalid control field.",
+        input_schema={"type": "object"},
+        capability="",
+        side_effect="read",
+        handler=handler,
+    )
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_hostile_control", {}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    run_spec = AgentRunSpec(workspace_root=tmp_path / "ws", run_root=tmp_path / "runs")
+    run_spec.workspace_root.mkdir()
+
+    result = AgentLoop.from_tools(run_spec, adapter, [spec]).run_once("run hostile tool")
+
+    assert result.status == "completed"
+    assert result.final_text == "recovered"
+    assert len(adapter.requests) == 2
+    observation = adapter.requests[1].observations[0].output
+    assert observation["ok"] is False
+    assert observation["error"]["code"] == "tool_handler_error"
+    assert observation["error"]["retryable"] is True
+
+
+def test_invalid_success_flag_cannot_emit_success_side_effect_evidence(tmp_path: Path) -> None:
+    def handler(_context: ToolContext, _arguments: dict) -> ToolResult:
+        return ToolResult(
+            ok=1,  # type: ignore[arg-type]
+            content={"changed_paths": ["claimed.txt"]},
+        )
+
+    spec = ToolSpec(
+        id="custom.invalid_success",
+        description="Return a malformed success flag.",
+        input_schema={"type": "object"},
+        capability="",
+        side_effect="write",
+        handler=handler,
+        emits_workspace_diff=True,
+        changed_paths_source="result_content",
+    )
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_invalid_success", {}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    run_spec = AgentRunSpec(workspace_root=tmp_path / "ws", run_root=tmp_path / "runs")
+    run_spec.workspace_root.mkdir()
+
+    result = AgentLoop.from_tools(run_spec, adapter, [spec]).run_once("run malformed tool")
+
+    events = [
+        json.loads(line)
+        for line in result.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert not any(event["type"] == "workspace.file.changed" for event in events)
+    assert adapter.requests[1].observations[0].output["ok"] is False
+
+
+def test_tool_result_is_normalized_before_background_event_decision(tmp_path: Path) -> None:
+    def handler(_context: ToolContext, _arguments: dict) -> ToolResult:
+        return ToolResult(
+            ok=True,
+            content={
+                "job_id": float("nan"),
+                "status": "running",
+                "changed_paths": ["normalized.txt"],
+            },
+        )
+
+    spec = ToolSpec(
+        id="custom.background_shape",
+        description="Return a non-finite background identifier.",
+        input_schema={"type": "object"},
+        capability="",
+        side_effect="write",
+        handler=handler,
+        emits_workspace_diff=True,
+        changed_paths_source="result_content",
+        skip_emit_if_background=True,
+    )
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_background_shape", {}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="done"),
+        ]
+    )
+    run_spec = AgentRunSpec(workspace_root=tmp_path / "ws", run_root=tmp_path / "runs")
+    run_spec.workspace_root.mkdir()
+
+    result = AgentLoop.from_tools(run_spec, adapter, [spec]).run_once("run normalized tool")
+
+    events = [
+        json.loads(line)
+        for line in result.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    changed = [event for event in events if event["type"] == "workspace.file.changed"]
+    assert len(changed) == 1
+    assert changed[0]["data"]["paths"] == ["normalized.txt"]
+    assert adapter.requests[1].observations[0].output["result"]["job_id"] is None

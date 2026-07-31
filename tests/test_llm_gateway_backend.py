@@ -23,7 +23,14 @@ from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
 from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
-from monoid_agent_kernel.providers.base import ModelTurn, TextDelta, ToolCall, TurnComplete
+from monoid_agent_kernel.providers.base import (
+    ModelTurn,
+    ReasoningDelta,
+    TextDelta,
+    ToolCall,
+    ToolCallDelta,
+    TurnComplete,
+)
 from monoid_agent_kernel.providers.gateway import _chunk_from_event, _parse_gateway_response
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
@@ -63,7 +70,9 @@ def _payload(*, previous_turn_handle: str | None = None) -> dict:
     }
     if previous_turn_handle:
         payload["previous_turn_handle"] = previous_turn_handle
-        payload["observations"] = [{"call_id": "call_1", "tool_name": "fs_read", "output": {"ok": True}}]
+        payload["observations"] = [
+            {"call_id": "call_1", "tool_name": "fs_read", "output": {"ok": True}}
+        ]
     else:
         payload["instruction"] = "Read notes."
     return payload
@@ -111,6 +120,132 @@ def test_llm_gateway_validates_token_and_returns_opaque_turn_handle() -> None:
     assert gateway.handle_turn(token, other_model)["turn_handle"].startswith("turn_")
 
 
+def test_llm_gateway_python_boundary_normalizes_request_and_response_values() -> None:
+    manager = _token_manager()
+    seen_requests = []
+
+    class Adapter:
+        def next_turn(self, request):
+            seen_requests.append(request)
+            return ModelTurn(
+                final_text="done\ud800",
+                tool_calls=(
+                    ToolCall(
+                        "call\ud800",
+                        "tool\udc00",
+                        {"text": "\ud800", "number": float("nan")},
+                    ),
+                ),
+                raw={"number": float("inf")},
+            )
+
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: Adapter(),
+    )
+    payload = _payload()
+    payload["instruction"] = "prompt\ud800"
+    payload["tools"][0]["input_schema"]["example"] = {
+        "text": "\ud800",
+        "number": -float("inf"),
+    }
+
+    result = gateway.handle_turn(_llm_token(manager), payload)
+
+    assert seen_requests[0].instruction == "prompt�"
+    assert seen_requests[0].tools[0].input_schema["example"] == {
+        "text": "�",
+        "number": None,
+    }
+    assert result["final_text"] == "done�"
+    assert result["tool_calls"] == [
+        {"call_id": "call�", "name": "tool�", "arguments": {"text": "�", "number": None}}
+    ]
+
+
+def test_llm_gateway_stream_preserves_split_surrogate_pairs_per_channel() -> None:
+    manager = _token_manager()
+
+    class Adapter:
+        async def astream_turn(self, request):
+            del request
+            yield TextDelta("\ud83d")
+            yield ReasoningDelta("\ud83d")
+            yield ToolCallDelta(
+                index=0,
+                arguments_fragment='{"emoji":"\ud83d',
+                id="call\ud800",
+                name="tool\udc00",
+            )
+            yield ReasoningDelta("\ude00")
+            yield TextDelta("\ude00")
+            yield ToolCallDelta(index=0, arguments_fragment='\ude00"}')
+            yield TurnComplete(response_id="response\ud800", usage={"total_tokens": 1})
+
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: Adapter(),
+    )
+
+    frames = list(gateway.handle_turn_stream(_llm_token(manager), _payload()))
+
+    assert "".join(frame["text"] for frame in frames if frame["type"] == "text_delta") == "😀"
+    assert "".join(frame["text"] for frame in frames if frame["type"] == "reasoning_delta") == "😀"
+    tool_frames = [frame for frame in frames if frame["type"] == "tool_call_delta"]
+    assert "".join(frame["arguments_fragment"] for frame in tool_frames) == '{"emoji":"😀"}'
+    assert tool_frames[0]["id"] == "call�"
+    assert tool_frames[0]["name"] == "tool�"
+    assert frames[-1]["type"] == "turn_complete"
+
+
+def test_llm_gateway_flushes_pending_surrogate_before_provider_error() -> None:
+    manager = _token_manager()
+
+    class Adapter:
+        async def astream_turn(self, request):
+            del request
+            yield TextDelta("\ud800")
+            raise RuntimeError("provider stream failed")
+
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: Adapter(),
+    )
+    frames = gateway.handle_turn_stream(_llm_token(manager), _payload())
+
+    assert next(frames) == {"type": "text_delta", "text": ""}
+    assert next(frames) == {"type": "text_delta", "text": "�"}
+    with pytest.raises(RuntimeError, match="provider stream failed"):
+        next(frames)
+
+
+def test_llm_gateway_classifies_nonportable_provider_output_as_bad_gateway() -> None:
+    manager = _token_manager()
+
+    class Adapter:
+        def next_turn(self, request):
+            del request
+            arguments = {chr(0xD800): 1}
+            arguments["�"] = 2
+            return ModelTurn(
+                tool_calls=(
+                    ToolCall(
+                        "call_1",
+                        "tool_1",
+                        arguments,
+                    ),
+                )
+            )
+
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: Adapter(),
+    )
+
+    with pytest.raises(ModelAdapterError, match="non-portable response"):
+        gateway.handle_turn(_llm_token(manager), _payload())
+
+
 def test_llm_gateway_accepts_legacy_turn_protocol_during_migration() -> None:
     manager = _token_manager()
     gateway = LlmGatewayBackend(
@@ -154,7 +289,10 @@ def test_llm_gateway_rejects_cross_run_turn_handle() -> None:
         lambda payload: payload.update({"observations": {}}),
         lambda payload: payload["tools"][0].update({"input_schema": []}),
         lambda payload: payload.update(
-            {"previous_turn_handle": "turn_1", "observations": [{"call_id": "c1", "is_background": "false"}]}
+            {
+                "previous_turn_handle": "turn_1",
+                "observations": [{"call_id": "c1", "is_background": "false"}],
+            }
         ),
         lambda payload: payload.update(
             {"previous_turn_handle": "turn_1", "observations": [{"call_id": "c1", "output": []}]}
@@ -181,7 +319,9 @@ def test_llm_gateway_http_endpoint_and_usage(tmp_path: Path) -> None:
     gateway = LlmGatewayBackend(
         token_manager=manager,
         provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
-            turns=[ModelTurn(response_id="provider_1", final_text="done", usage={"total_tokens": 9})]
+            turns=[
+                ModelTurn(response_id="provider_1", final_text="done", usage={"total_tokens": 9})
+            ]
         ),
     )
     server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
@@ -276,7 +416,11 @@ def test_runner_backend_can_use_http_llm_gateway_end_to_end(tmp_path: Path) -> N
     gateway = LlmGatewayBackend(
         token_manager=manager,
         provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
-            turns=[ModelTurn(response_id="provider_1", final_text="gateway done", usage={"total_tokens": 11})]
+            turns=[
+                ModelTurn(
+                    response_id="provider_1", final_text="gateway done", usage={"total_tokens": 11}
+                )
+            ]
         ),
     )
     server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
@@ -358,7 +502,9 @@ def test_fake_full_stack_contract_propose_proposal_usage_and_auth(tmp_path: Path
         return adapters[claims.run_id]
 
     gateway = LlmGatewayBackend(token_manager=manager, provider_adapter_factory=factory)
-    gateway_server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="gateway-admin")
+    gateway_server = create_llm_gateway_server(
+        gateway, host="127.0.0.1", port=0, admin_token="gateway-admin"
+    )
     gateway_thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
     gateway_thread.start()
     gateway_url = f"http://127.0.0.1:{gateway_server.server_address[1]}"
@@ -368,7 +514,9 @@ def test_fake_full_stack_contract_propose_proposal_usage_and_auth(tmp_path: Path
         allowed_workspace_roots=(workspace,),
         llm_gateway_url=f"{gateway_url}/internal/llm/turns",
     )
-    runner_server = create_backend_server(runner_backend, host="127.0.0.1", port=0, admin_token="runner-admin")
+    runner_server = create_backend_server(
+        runner_backend, host="127.0.0.1", port=0, admin_token="runner-admin"
+    )
     runner_thread = threading.Thread(target=runner_server.serve_forever, daemon=True)
     runner_thread.start()
     runner_url = f"http://127.0.0.1:{runner_server.server_address[1]}"
@@ -401,7 +549,9 @@ def test_fake_full_stack_contract_propose_proposal_usage_and_auth(tmp_path: Path
         assert proposal["proposal_hash"]
         assert proposal["diff_sha256"]
         assert proposal["files"][0]["path"] == "SUMMARY.md"
-        proposed_file = _json_get(f"{runner_url}/v1/runs/{run_id}/proposal/files/SUMMARY.md", token=run_token)
+        proposed_file = _json_get(
+            f"{runner_url}/v1/runs/{run_id}/proposal/files/SUMMARY.md", token=run_token
+        )
         assert proposed_file["content"] == "Summary from fake gateway\n"
         result = _json_get(f"{runner_url}/v1/runs/{run_id}/result", token=run_token)
         assert result["ready"] is True
@@ -592,9 +742,7 @@ def test_a_failing_backends_retry_reaches_the_wire_too(retried: bool) -> None:
     assert body["error_code"] == "gateway_bad_request"
     assert body["provider_retried"] is retried
     # And the client reads back what the wire said, which is the half a receipt is built from.
-    error = pytest.raises(
-        ModelAdapterError, _parse_gateway_response, body
-    ).value
+    error = pytest.raises(ModelAdapterError, _parse_gateway_response, body).value
     assert error.provider_retried is retried
 
 

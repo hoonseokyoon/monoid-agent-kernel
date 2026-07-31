@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 
 import pytest
 from support.http import http_json, serving
@@ -71,7 +72,9 @@ def _parked_multi_turn_run(backend: RunnerBackend, workspace: Path) -> tuple[str
 
 
 def _dispatch(backend: RunnerBackend, run_id: str, token: str, ctype: str, **args: Any) -> Any:
-    return backend.dispatch(ControlCommand(type=ctype, run_id=run_id, args={"token": token, **args}))  # type: ignore[arg-type]
+    return backend.dispatch(
+        ControlCommand(type=ctype, run_id=run_id, args={"token": token, **args})
+    )  # type: ignore[arg-type]
 
 
 def _events(backend: RunnerBackend, run_id: str) -> list[dict[str, Any]]:
@@ -523,7 +526,9 @@ def test_dispatch_inspect_and_health_report_live_state(
     tmp_path: Path, backend_factory: Any
 ) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     inspect = _dispatch(backend, run_id, token, "inspect")
@@ -547,7 +552,9 @@ def test_dispatch_emits_control_audit_events_without_token_leak(
     tmp_path: Path, backend_factory: Any
 ) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     status = backend.dispatch(
@@ -586,7 +593,9 @@ def test_dispatch_emits_control_audit_events_without_token_leak(
             )
         )
 
-    events = [event for event in _events(backend, run_id) if event["type"].startswith("control.command.")]
+    events = [
+        event for event in _events(backend, run_id) if event["type"].startswith("control.command.")
+    ]
     by_id = {(event["type"], event["data"]["command_id"]): event["data"] for event in events}
 
     received = by_id[("control.command.received", "cmd_status")]
@@ -623,7 +632,9 @@ def test_dispatch_control_audit_uses_live_recorder_sequence(
     tmp_path: Path, backend_factory: Any
 ) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     status = _dispatch(backend, run_id, token, "status")
@@ -636,8 +647,12 @@ def test_dispatch_control_audit_uses_live_recorder_sequence(
     seqs = [event["seq"] for event in events]
     assert seqs == sorted(seqs)
     assert len(seqs) == len(set(seqs))
-    completed_seq = max(event["seq"] for event in events if event["type"] == "control.command.completed")
-    after_seq = next(event["seq"] for event in events if event["type"] == "control.test.after_audit")
+    completed_seq = max(
+        event["seq"] for event in events if event["type"] == "control.command.completed"
+    )
+    after_seq = next(
+        event["seq"] for event in events if event["type"] == "control.test.after_audit"
+    )
     assert after_seq > completed_seq
 
     backend.cancel_run(run_id, token)
@@ -648,7 +663,9 @@ def test_dispatch_skips_run_audit_before_loop_owns_sequence(
     tmp_path: Path, backend_factory: Any
 ) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
     record = backend._record(run_id)
     loop = record.loop
@@ -704,7 +721,9 @@ def test_control_audit_skips_direct_append_when_loop_is_not_open(
     tmp_path: Path, backend_factory: Any
 ) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
     record = backend._record(run_id)
     loop = record.loop
@@ -785,7 +804,9 @@ def test_control_audit_skips_recordless_nonterminal_run(
 
 def test_dispatch_routes_existing_ops_and_unknown(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     assert _dispatch(backend, run_id, token, "status").status == "ok"
@@ -799,19 +820,46 @@ def test_dispatch_routes_existing_ops_and_unknown(tmp_path: Path, backend_factor
     assert resume.status == "ok"
     assert resume.data["resumed"] is True
 
-    # Unknown command type stays forward-compatible: unsupported, not a crash.
-    unknown = _dispatch(backend, run_id, token, "frobnicate")
+    # Direct callers stay forward-compatible. Text still crosses the same Unicode-scalar
+    # normalization boundary as known command types before the dispatcher sees it.
+    unknown = _dispatch(backend, run_id, token, f"frob{chr(0xD800)}nicate")
     assert unknown.status == "unsupported"
+    assert unknown.type == "frob\ufffdnicate"
     assert unknown.error_code == "unknown_control_command"
+
+    class StringSubclass(str):
+        pass
+
+    for invalid_type in (True, StringSubclass("status")):
+        with pytest.raises(ValueError, match="control command type must be a string"):
+            backend.dispatch(
+                ControlCommand(  # type: ignore[arg-type]
+                    type=invalid_type,
+                    run_id=run_id,
+                    args={"token": token},
+                )
+            )
+
+    with pytest.raises(ValueError, match="expected_version must be an integer"):
+        backend.dispatch(
+            ControlCommand(
+                type="replace_runtime_config",
+                run_id=run_id,
+                args={"token": token, "expected_version": True, "config": _config().to_json()},
+            )
+        )
 
     cancel = _dispatch(backend, run_id, token, "cancel")
     assert cancel.status == "ok"
-    assert backend.wait_for_run(run_id, timeout_s=20) in {"completed", "failed", "limited", "cancelled"}
+    assert backend.wait_for_run(run_id, timeout_s=20) in {
+        "completed",
+        "failed",
+        "limited",
+        "cancelled",
+    }
 
 
-def test_dispatch_inspect_on_terminal_run_is_error(
-    tmp_path: Path, backend_factory: Any
-) -> None:
+def test_dispatch_inspect_on_terminal_run_is_error(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
     backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="done")])
     submission = backend.submit_run(
@@ -835,7 +883,9 @@ def test_dispatch_inspect_on_terminal_run_is_error(
 
 def test_dispatch_bad_token_raises_permission_denied(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
     with pytest.raises(PermissionDenied):
         backend.dispatch(ControlCommand(type="inspect", run_id=run_id, args={"token": "bad"}))
@@ -843,9 +893,13 @@ def test_dispatch_bad_token_raises_permission_denied(tmp_path: Path, backend_fac
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_http_control_route_dispatches_inspect(tmp_path: Path, backend_factory: Any) -> None:
+def test_http_control_route_keeps_strict_decoder_and_dispatches_inspect(
+    tmp_path: Path, backend_factory: Any
+) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
     with serving(server) as base_url:
         created = http_json(
@@ -863,6 +917,20 @@ def test_http_control_route_dispatches_inspect(tmp_path: Path, backend_factory: 
         run_id, run_token = created["run_id"], created["run_token"]
         assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
 
+        for malformed, expected_error in (
+            ({"type": "frobnicate"}, "type must be one of"),
+            ({"type": "status", "issuer": 7}, "issuer must be a string"),
+        ):
+            with pytest.raises(HTTPError) as caught:
+                http_json(
+                    f"{base_url}/v1/runs/{run_id}/control",
+                    malformed,
+                    token=run_token,
+                )
+            assert caught.value.code == 400
+            error = json.loads(caught.value.read().decode("utf-8"))["error"]
+            assert expected_error in error
+
         result = http_json(
             f"{base_url}/v1/runs/{run_id}/control",
             {"type": "inspect"},
@@ -876,13 +944,13 @@ def test_http_control_route_dispatches_inspect(tmp_path: Path, backend_factory: 
         backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_capability_task_kind_creates_and_resolves(
-    tmp_path: Path, backend_factory: Any
-) -> None:
+def test_capability_task_kind_creates_and_resolves(tmp_path: Path, backend_factory: Any) -> None:
     # Step 5: a scoped-capability request rides the hosted-task seam. The Daemon creates a
     # capability park and resolves it via report_task_result (both reachable through dispatch).
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     created = backend.create_task(
@@ -909,7 +977,9 @@ def test_dispatch_report_task_result_accepts_callback_token(
     tmp_path: Path, backend_factory: Any
 ) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     task = backend.create_task(
@@ -934,9 +1004,14 @@ def test_dispatch_report_task_result_accepts_callback_token(
 
     assert result.status == "ok"
     assert result.data["delivered"] is True
-    events = [event for event in _events(backend, run_id) if event["type"].startswith("control.command.")]
+    events = [
+        event for event in _events(backend, run_id) if event["type"].startswith("control.command.")
+    ]
     by_id = {(event["type"], event["data"]["command_id"]): event["data"] for event in events}
-    assert by_id[("control.command.received", "cmd_callback_result")]["command"] == "report_task_result"
+    assert (
+        by_id[("control.command.received", "cmd_callback_result")]["command"]
+        == "report_task_result"
+    )
     assert by_id[("control.command.completed", "cmd_callback_result")]["result_code"] == "ok"
 
     backend.cancel_run(run_id, token)
@@ -945,7 +1020,9 @@ def test_dispatch_report_task_result_accepts_callback_token(
 
 def test_dispatch_approve_accepts_callback_token(tmp_path: Path, backend_factory: Any) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     task = backend.create_task(
@@ -975,7 +1052,9 @@ def test_dispatch_deny_overwrites_conflicting_result_fields(
     tmp_path: Path, backend_factory: Any
 ) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     task = backend.create_task(
@@ -1008,11 +1087,7 @@ def test_dispatch_deny_overwrites_conflicting_result_fields(
     assert denied.status == "ok"
     job = json.loads(
         (
-            backend._record(run_id).run_dir
-            / "artifacts"
-            / "tasks"
-            / task["task_id"]
-            / "task.json"
+            backend._record(run_id).run_dir / "artifacts" / "tasks" / task["task_id"] / "task.json"
         ).read_text(encoding="utf-8")
     )
     assert job["result"]["answer"] == "Deny"
@@ -1030,7 +1105,9 @@ def test_dispatch_approve_and_deny_are_audited_task_decisions(
     tmp_path: Path, backend_factory: Any
 ) -> None:
     workspace = _workspace(tmp_path)
-    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")])
+    backend = _backend(
+        backend_factory, workspace, [ModelTurn(response_id="r1", final_text="first")]
+    )
     run_id, token = _parked_multi_turn_run(backend, workspace)
 
     approve_task = backend.create_task(
@@ -1071,7 +1148,9 @@ def test_dispatch_approve_and_deny_are_audited_task_decisions(
     assert denied.status == "ok"
     assert denied.data["delivered"] is True
 
-    events = [event for event in _events(backend, run_id) if event["type"].startswith("control.command.")]
+    events = [
+        event for event in _events(backend, run_id) if event["type"].startswith("control.command.")
+    ]
     by_id = {(event["type"], event["data"]["command_id"]): event["data"] for event in events}
     assert by_id[("control.command.received", "cmd_approve")]["command"] == "approve"
     assert by_id[("control.command.completed", "cmd_approve")]["result_code"] == "ok"
@@ -1079,8 +1158,12 @@ def test_dispatch_approve_and_deny_are_audited_task_decisions(
     assert by_id[("control.command.completed", "cmd_deny")]["idempotency_key"] == "cmd_deny"
 
     tasks_dir = backend._record(run_id).run_dir / "artifacts" / "tasks"
-    approved_job = json.loads((tasks_dir / approve_task["task_id"] / "task.json").read_text(encoding="utf-8"))
-    denied_job = json.loads((tasks_dir / deny_task["task_id"] / "task.json").read_text(encoding="utf-8"))
+    approved_job = json.loads(
+        (tasks_dir / approve_task["task_id"] / "task.json").read_text(encoding="utf-8")
+    )
+    denied_job = json.loads(
+        (tasks_dir / deny_task["task_id"] / "task.json").read_text(encoding="utf-8")
+    )
     assert approved_job["result"]["approved"] is True
     assert denied_job["result"]["approved"] is False
     assert denied_job["result"]["granted"] is False

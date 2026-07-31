@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import inspect
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -12,7 +11,7 @@ from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.cli import _read_watch_batch, main
 from monoid_agent_kernel.core._event_log import EventLogChanged, inspect_event_log_tail
-from monoid_agent_kernel.core.events import EventBus
+from monoid_agent_kernel.core.events import AgentEvent, EventBus
 from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
@@ -38,7 +37,9 @@ def _provider(*tool_ids: str):
 
 def _runtime_config_file(tmp_path: Path, *tool_ids: str) -> Path:
     path = tmp_path / "runtime-config.json"
-    path.write_text(json.dumps(runtime_config(*(tool_ids or ("run.finish",))).to_json()), encoding="utf-8")
+    path.write_text(
+        json.dumps(runtime_config(*(tool_ids or ("run.finish",))).to_json()), encoding="utf-8"
+    )
     return path
 
 
@@ -73,6 +74,42 @@ def test_event_bus_schema_sequence_and_memory_sink() -> None:
     assert payload["schema_version"] == "monoid.event.v1"
     assert payload["type"] == "run.started"
     assert "kind" not in payload
+
+
+def test_event_bus_normalizes_python_values_before_any_sink_sees_them() -> None:
+    memory = MemoryEventSink()
+    bus = EventBus("run_\ud800", (memory,))
+
+    event = bus.emit(
+        "metrics.updated",
+        data={"\ud800": [float("nan"), float("inf"), -float("inf")]},
+    )
+
+    assert event.run_id == "run_�"
+    assert event.data == {"�": [None, None, None]}
+    assert memory.events == [event]
+
+
+def test_jsonl_sink_rejects_non_finite_values_if_an_ingress_is_bypassed(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    sink = JsonlEventSink(path)
+    event = AgentEvent(
+        schema_version="monoid.event.v1",
+        event_id="evt_1",
+        seq=1,
+        run_id="run_1",
+        timestamp="2026-07-30T00:00:00Z",
+        type="metrics.updated",
+        data={"value": float("nan")},
+    )
+
+    try:
+        with pytest.raises(ValueError, match="Out of range float values"):
+            sink.emit(event)
+    finally:
+        sink.close()
+
+    assert path.read_bytes() == b""
 
 
 def test_jsonl_and_status_sinks_flush_and_update(tmp_path: Path) -> None:
@@ -156,9 +193,9 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     )
     spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
 
-    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run_once(
-        "Clean notes."
-    )
+    result = AgentLoop(
+        spec=spec, model_adapter=adapter, runtime_config_provider=_provider()
+    ).run_once("Clean notes.")
 
     types = [event["type"] for event in _events(result.run_dir)]
     assert types[0] == "run.started"
@@ -178,7 +215,9 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     assert proposal["files"][0]["snapshot_path"] == "proposal/files/SUMMARY.md"
     assert proposal["proposal_hash"]
     assert status["manifest_path"] == "manifest.json"
-    workspace_index = json.loads(result.run_dir.joinpath("workspace.index.json").read_text(encoding="utf-8"))
+    workspace_index = json.loads(
+        result.run_dir.joinpath("workspace.index.json").read_text(encoding="utf-8")
+    )
     assert workspace_index["schema_version"] == "monoid.workspace-index.v1"
     assert any(entry["path"] == "notes.md" for entry in workspace_index["entries"])
     projection = project_run_status(result.run_dir)
@@ -208,7 +247,9 @@ def test_otel_event_sink_emits_genai_span_tree(tmp_path: Path) -> None:
         turns=[
             ModelTurn(
                 response_id="r1",
-                tool_calls=(fake_tool_call("fs_write", {"path": "OUT.md", "content": "hi\n"}, "c1"),),
+                tool_calls=(
+                    fake_tool_call("fs_write", {"path": "OUT.md", "content": "hi\n"}, "c1"),
+                ),
             ),
             ModelTurn(final_text="done"),
         ]
@@ -449,7 +490,11 @@ def test_loop_limited_status_is_public_event(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     adapter = FakeModelAdapter(
-        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),))]
+        turns=[
+            ModelTurn(
+                response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),)
+            )
+        ]
     )
     spec = AgentRunSpec(
         workspace_root=workspace,
@@ -534,9 +579,7 @@ def make_sink():
     stdout_text = result.stdout if has_separate_stderr else result.output
     assert result.exit_code == 0, stderr_text
     stdout_events = [
-        json.loads(line)
-        for line in stdout_text.splitlines()
-        if line.strip().startswith("{")
+        json.loads(line) for line in stdout_text.splitlines() if line.strip().startswith("{")
     ]
     assert stdout_events[0]["type"] == "run.started"
     assert stdout_events[-1]["type"] == "run.finished"
@@ -758,11 +801,15 @@ def test_cli_proposal_command_reads_snapshot_file(tmp_path: Path) -> None:
     )
     spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
     result = AgentLoop(
-        spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.write", "run.finish")
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=_provider("fs.write", "run.finish"),
     ).run_once("Write summary.")
 
     runner = CliRunner()
-    summary = runner.invoke(main, ["proposal", str(result.run_dir), "--file", "SUMMARY.md", "--json"])
+    summary = runner.invoke(
+        main, ["proposal", str(result.run_dir), "--file", "SUMMARY.md", "--json"]
+    )
 
     assert summary.exit_code == 0
     payload = json.loads(summary.stdout)
@@ -969,8 +1016,7 @@ def test_lenient_event_read_stops_at_a_non_increasing_sequence(
     events_path = tmp_path / "events.jsonl"
     events_path.write_text(
         "".join(
-            json.dumps({"seq": seq, "type": "run.started", "data": {}}) + "\n"
-            for seq in sequence
+            json.dumps({"seq": seq, "type": "run.started", "data": {}}) + "\n" for seq in sequence
         ),
         encoding="utf-8",
     )
@@ -990,14 +1036,8 @@ def test_status_and_studio_degrade_when_json_decoder_hits_recursion_error(
 
     run_dir = tmp_path / "run_deep_event"
     run_dir.mkdir()
-    prefix = json.dumps(
-        {"seq": 1, "type": "run.failed", "data": {"error": "safe prefix"}}
-    )
-    deeply_nested = (
-        '{"seq":2,"type":"run.failed","data":{"nested":'
-        + "[[0]]"
-        + "}}"
-    )
+    prefix = json.dumps({"seq": 1, "type": "run.failed", "data": {"error": "safe prefix"}})
+    deeply_nested = '{"seq":2,"type":"run.failed","data":{"nested":' + "[[0]]" + "}}"
     run_dir.joinpath("events.jsonl").write_text(
         prefix + "\n" + deeply_nested + "\n", encoding="utf-8"
     )
@@ -1013,11 +1053,7 @@ def test_status_and_studio_degrade_when_json_decoder_hits_recursion_error(
             raise RecursionError("simulated JSON decoder recursion limit")
         return real_loads(payload, *args, **kwargs)
 
-    monkeypatch.setattr(
-        _event_log,
-        "json",
-        SimpleNamespace(loads=recursion_error_for_nested_event),
-    )
+    monkeypatch.setattr(_event_log, "loads_json_ingress", recursion_error_for_nested_event)
 
     status = project_run_status(run_dir)
     transcript = ChatProjection(run_dir).catch_up("run-deep-event")

@@ -21,6 +21,7 @@ from monoid_agent_kernel.reference.backend.run_types import (
     BackendRunRequest,
     BackendRunSubmission,
     _PreparedRun,
+    normalize_backend_run_request,
 )
 from monoid_agent_kernel.workspace.paths import is_within
 
@@ -51,6 +52,7 @@ class RunPreparationService:
         self._context = context
 
     def prepare(self, request: BackendRunRequest) -> _PreparedRun:
+        request = normalize_backend_run_request(request)
         self.validate_request(request)
         workspace_root = request.workspace_root.resolve()
         self.check_workspace_allowed(workspace_root)
@@ -158,7 +160,10 @@ class RunPreparationService:
     def check_workspace_allowed(self, workspace_root: Path) -> None:
         if not workspace_root.exists() or not workspace_root.is_dir():
             raise ValueError(f"workspace root does not exist: {workspace_root}")
-        if not any(is_within(root, workspace_root) for root in self._context.allowed_workspace_roots_provider()):
+        if not any(
+            is_within(root, workspace_root)
+            for root in self._context.allowed_workspace_roots_provider()
+        ):
             raise PermissionDenied(f"workspace root is outside allowed roots: {workspace_root}")
 
     def write_run_meta(self, record: BackendRunRecord, request: BackendRunRequest) -> None:

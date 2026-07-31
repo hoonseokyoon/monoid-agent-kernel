@@ -34,6 +34,25 @@ def test_echo_adapter_replies_with_latest_user_text() -> None:
     assert turn.usage["total_tokens"] > 0
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_studio_rejects_non_finite_json_constants(studio: StudioServer, constant: str) -> None:
+    import urllib.error
+    import urllib.request
+
+    body = f'{{"message":"hello","value":{constant}}}'.encode()
+    request = urllib.request.Request(
+        f"{studio.base_url}/api/chat",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(request)
+
+    assert caught.value.code == 400
+
+
 def test_vendor_route_serves_katex_offline(studio: StudioServer) -> None:
     import urllib.error
     import urllib.request
@@ -135,7 +154,9 @@ def test_studio_profiles_can_be_saved_and_reloaded(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     run_root = tmp_path / "runs"
-    server = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root))
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root)
+    )
 
     saved = server.save_profile(
         {
@@ -153,7 +174,9 @@ def test_studio_profiles_can_be_saved_and_reloaded(tmp_path: Path) -> None:
     assert saved["capabilities"] == ["read", "web"]
     assert saved["built_in"] is False
 
-    reloaded = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root))
+    reloaded = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root)
+    )
     profiles = {profile["id"]: profile for profile in reloaded.profiles()["profiles"]}
     assert profiles["release-reviewer"]["instructions"] == "Always call out release blockers."
     assert profiles["release-reviewer"]["model"] == "gpt-profile"
@@ -199,7 +222,9 @@ def test_studio_start_chat_uses_selected_profile_runtime_config(tmp_path: Path) 
 def test_studio_settings_hot_swap_preserves_run_profiles(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    server = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"))
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs")
+    )
     server.start()
     try:
         profile = server.save_profile(
@@ -235,7 +260,9 @@ def test_studio_settings_hot_swap_preserves_run_profiles(tmp_path: Path) -> None
         server._backend.replace_runtime_config = replace_runtime_config  # type: ignore[method-assign]
 
         all_caps = [item["key"] for item in server.settings()["available"]]
-        server.update_settings(capabilities=all_caps, model="gpt-global", effort="low", summary="auto")
+        server.update_settings(
+            capabilities=all_caps, model="gpt-global", effort="low", summary="auto"
+        )
 
         profile_config = replaced["profile-run"]
         default_config = replaced["default-run"]
@@ -308,9 +335,7 @@ def test_subagent_events_uses_root_ancestor_token_for_nested_child(tmp_path: Pat
             from_seq: int = 0,
             last_event_id: str | None = None,
         ) -> EventSubscription:
-            cursor = SequenceCursor.resolve(
-                from_seq=from_seq, last_event_id=last_event_id
-            )
+            cursor = SequenceCursor.resolve(from_seq=from_seq, last_event_id=last_event_id)
             return EventSubscription(
                 lambda next_seq, limit: self.descendant_events(
                     parent_run_id,
@@ -355,7 +380,9 @@ def test_runtime_config_binds_read_write_hitl_shell_and_web() -> None:
     } <= refs
     # The plan tool is always bound (observability) and the prompt nudges its use.
     assert "run.update_plan" in refs
-    assert config.prompt.system_prompt_base and "run_update_plan" in config.prompt.system_prompt_base
+    assert (
+        config.prompt.system_prompt_base and "run_update_plan" in config.prompt.system_prompt_base
+    )
     # The shell binding refuses obviously destructive commands and auto-approves the rest.
     shell = next(b for b in config.tools if b.ref.tool_id == "shell.exec")
     assert any(p.startswith("rm") for p in shell.scope.command_deny_prefixes)
@@ -372,7 +399,10 @@ def test_describe_event_maps_tool_activity_to_human_text() -> None:
     }
     assert describe_event(started) == "Reading notes.md"
     # A successful finish is implied by the next step — not shown.
-    assert describe_event({"type": "tool.call.finished", "data": {"tool": "fs_read", "ok": True}}) is None
+    assert (
+        describe_event({"type": "tool.call.finished", "data": {"tool": "fs_read", "ok": True}})
+        is None
+    )
     # A failure surfaces with its error.
     failed = describe_event(
         {"type": "tool.call.finished", "data": {"tool": "fs_read", "ok": False, "error": "boom"}}
@@ -479,7 +509,9 @@ def test_agent_reads_a_file_and_emits_activity(tmp_path: Path) -> None:
         server.shutdown()
 
 
-def test_get_routes_answer_with_json_instead_of_dropping_the_connection(studio: StudioServer) -> None:
+def test_get_routes_answer_with_json_instead_of_dropping_the_connection(
+    studio: StudioServer,
+) -> None:
     """`do_GET` had no exception handler while `do_POST` had one all along.
 
     Anything a route did not anticipate reached `BaseHTTPRequestHandler`, which logs the traceback

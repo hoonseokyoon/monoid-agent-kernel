@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from monoid_agent_kernel.core.json_ingress import normalize_unicode_scalars
+
 
 @dataclass(frozen=True)
 class TextPart:
@@ -62,6 +64,34 @@ class VideoPart:
 ContentPart = TextPart | ImagePart | DocumentPart | AudioPart | VideoPart
 
 
+def normalize_content_part(part: ContentPart) -> ContentPart:
+    """Copy one externally supplied part into the portable Unicode domain."""
+
+    if isinstance(part, TextPart):
+        return TextPart(text=normalize_unicode_scalars(part.text))
+    if isinstance(part, ImagePart):
+        return ImagePart(
+            source_ref=normalize_unicode_scalars(part.source_ref),
+            mime_type=normalize_unicode_scalars(part.mime_type),
+        )
+    if isinstance(part, DocumentPart):
+        return DocumentPart(
+            source_ref=normalize_unicode_scalars(part.source_ref),
+            mime_type=normalize_unicode_scalars(part.mime_type),
+        )
+    if isinstance(part, AudioPart):
+        return AudioPart(
+            source_ref=normalize_unicode_scalars(part.source_ref),
+            mime_type=normalize_unicode_scalars(part.mime_type),
+        )
+    if isinstance(part, VideoPart):
+        return VideoPart(
+            source_ref=normalize_unicode_scalars(part.source_ref),
+            mime_type=normalize_unicode_scalars(part.mime_type),
+        )
+    raise ValueError(f"unsupported content part: {part!r}")
+
+
 def non_text_part_types(parts: tuple[ContentPart, ...]) -> list[str]:
     """Distinct ``type`` values of the non-text parts, in first-seen order.
     Empty when every part is text (the only kind forwarded today)."""
@@ -87,15 +117,32 @@ def content_part_to_json(part: ContentPart) -> dict[str, Any]:
 
 
 def content_part_from_json(payload: dict[str, Any]) -> ContentPart:
+    if not isinstance(payload, dict):
+        raise ValueError("content part must be an object")
+
+    def required_text(field_name: str) -> str:
+        value = payload.get(field_name)
+        if type(value) is not str:
+            raise ValueError(f"content part {field_name} must be a string")
+        return normalize_unicode_scalars(value)
+
     kind = payload.get("type")
     if kind == "text":
-        return TextPart(text=str(payload["text"]))
+        return TextPart(text=required_text("text"))
     if kind == "image":
-        return ImagePart(source_ref=str(payload["source_ref"]), mime_type=str(payload["mime_type"]))
+        return ImagePart(
+            source_ref=required_text("source_ref"), mime_type=required_text("mime_type")
+        )
     if kind == "document":
-        return DocumentPart(source_ref=str(payload["source_ref"]), mime_type=str(payload["mime_type"]))
+        return DocumentPart(
+            source_ref=required_text("source_ref"), mime_type=required_text("mime_type")
+        )
     if kind == "audio":
-        return AudioPart(source_ref=str(payload["source_ref"]), mime_type=str(payload["mime_type"]))
+        return AudioPart(
+            source_ref=required_text("source_ref"), mime_type=required_text("mime_type")
+        )
     if kind == "video":
-        return VideoPart(source_ref=str(payload["source_ref"]), mime_type=str(payload["mime_type"]))
+        return VideoPart(
+            source_ref=required_text("source_ref"), mime_type=required_text("mime_type")
+        )
     raise ValueError(f"unknown content part type: {kind!r}")

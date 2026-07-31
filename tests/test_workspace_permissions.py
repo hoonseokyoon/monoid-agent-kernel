@@ -19,6 +19,20 @@ def test_normalizes_and_blocks_parent_escape(tmp_path: Path) -> None:
         workspace.normalize("../secret.txt")
 
 
+def test_direct_permission_patterns_share_the_unicode_scalar_domain() -> None:
+    policy = PermissionPolicy(
+        deny_patterns=("private/\ud800-secret",),
+        redact_patterns=("private/\ud800-secret",),
+    )
+
+    assert policy.deny_patterns == ("private/\ufffd-secret",)
+    assert policy.redact_patterns == ("private/\ufffd-secret",)
+    assert policy.is_path_denied("private/\ud800-secret")
+    assert policy.is_path_redacted("private/\ud800-secret")
+    assert policy.is_path_denied("private/\ufffd-secret")
+    assert policy.is_path_redacted("private/\ufffd-secret")
+
+
 @pytest.mark.parametrize("path", ["safe\nname", "safe\x00name", "safe\x1fname", "safe\x7fname"])
 def test_rejects_nonportable_control_characters(path: str) -> None:
     with pytest.raises(WorkspaceError, match="control characters"):
@@ -112,7 +126,9 @@ def test_workspace_base_snapshot_includes_secret_looking_paths_by_default(tmp_pa
     assert payload["workspace_backend"] == "overlay"
     assert any(entry["path"] == "notes.md" and entry["sha256"] for entry in payload["entries"])
     assert any(entry["path"] == ".env" and entry["sha256"] for entry in payload["entries"])
-    assert any(entry["path"] == "tokenizer.json" and entry["sha256"] for entry in payload["entries"])
+    assert any(
+        entry["path"] == "tokenizer.json" and entry["sha256"] for entry in payload["entries"]
+    )
     serialized = str(payload)
     assert ".env" in serialized
     assert "tokenizer.json" in serialized

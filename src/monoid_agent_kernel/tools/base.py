@@ -1,18 +1,50 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from monoid_agent_kernel.core.content import ContentPart
+from monoid_agent_kernel.core.content import ContentPart, normalize_content_part
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.errors import ToolExecutionError
 
 ToolSideEffect = Literal["read", "write", "artifact", "run", "shell"]
 ToolPreviewKind = Literal["args", "shell", "web", "finish"]
 ToolChangedPathsSource = Literal["path_args", "result_content"]
 ToolResultPayloadKind = Literal["paths", "shell_exec"]
+
+
+def _copy_with_fields(value: Any, /, **changes: Any) -> Any:
+    """Preserve extension subclasses whose convenience ``__init__`` omits base fields."""
+
+    cloned = copy(value)
+    for name, replacement in changes.items():
+        object.__setattr__(cloned, name, replacement)
+    return cloned
+
+
+def _require_bool(value: Any, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _required_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    return normalize_unicode_scalars(value)
+
+
+def _optional_text(value: Any, field_name: str) -> str | None:
+    normalized = normalize_json_ingress(value)
+    if normalized is None:
+        return None
+    if not isinstance(normalized, str):
+        raise ValueError(f"{field_name} must be a string or null")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -44,60 +76,68 @@ class ToolResult:
         return obs
 
 
+def normalize_tool_result(result: ToolResult) -> ToolResult:
+    """Copy a handler result into the kernel's portable JSON/Unicode domain."""
+
+    if not isinstance(result, ToolResult):
+        raise ValueError("tool handler must return ToolResult")
+    if not isinstance(result.content, dict):
+        raise ValueError("tool result content must be an object")
+    if not isinstance(result.media, (list, tuple)):
+        raise ValueError("tool result media must be an array")
+    content = normalize_json_ingress(result.content)
+    if not isinstance(content, dict):
+        raise ValueError("tool result content must be an object")
+    return _copy_with_fields(
+        result,
+        ok=_require_bool(result.ok, "tool result ok"),
+        content=content,
+        error=_required_text(result.error, "tool result error"),
+        error_code=_required_text(result.error_code, "tool result error_code"),
+        retryable=_require_bool(result.retryable, "tool result retryable"),
+        category=_required_text(result.category, "tool result category"),
+        media=tuple(normalize_content_part(part) for part in result.media),
+    )
+
+
 class ToolContext(Protocol):
-    def emit_artifact(self, path: str, kind: str, label: str | None, metadata: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def emit_artifact(
+        self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
+    ) -> dict[str, Any]: ...
 
-    def list_artifacts(self) -> list[dict[str, Any]]:
-        ...
+    def list_artifacts(self) -> list[dict[str, Any]]: ...
 
-    def update_plan(self, items: list[dict[str, Any]]) -> None:
-        ...
+    def update_plan(self, items: list[dict[str, Any]]) -> None: ...
 
-    def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
-        ...
+    def finish(self, summary: str, outputs: list[str], notes: str | None) -> None: ...
 
-    def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def run_script(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def run_script(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def list_jobs(self) -> list[dict[str, Any]]:
-        ...
+    def list_jobs(self) -> list[dict[str, Any]]: ...
 
-    def job_status(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def job_status(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def job_logs(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def job_logs(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def job_cancel(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def job_cancel(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def job_wait(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def job_wait(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def request_human_input(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def request_human_input(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def spawn_subagent(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def spawn_subagent(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
-    def path_allowed(self, path: str, operation: str = "read") -> bool:
-        ...
+    def path_allowed(self, path: str, operation: str = "read") -> bool: ...
 
-    def search_tools(self, args: dict[str, Any]) -> dict[str, Any]:
-        ...
+    def search_tools(self, args: dict[str, Any]) -> dict[str, Any]: ...
 
     def capability_token(self, capability: str) -> str | None:
         """The access handle (``token_ref``) of the lease the loop acquired for ``capability``
@@ -163,14 +203,48 @@ class ToolSpec:
         return self.provider_name or self.id.replace(".", "_")
 
 
+def normalize_tool_spec(spec: ToolSpec) -> ToolSpec:
+    """Copy one model-visible tool definition into the portable JSON domain."""
+
+    examples = normalize_json_ingress(spec.examples)
+    return _copy_with_fields(
+        spec,
+        id=_required_text(spec.id, "tool id"),
+        description=_required_text(spec.description, "tool description"),
+        input_schema=normalize_json_ingress(spec.input_schema),
+        capability=_required_text(spec.capability, "tool capability"),
+        side_effect=_required_text(spec.side_effect, "tool side_effect"),
+        provider_name=_optional_text(spec.provider_name, "tool provider_name"),
+        path_args=tuple(_required_text(value, "tool path_args item") for value in spec.path_args),
+        preview_kind=_required_text(spec.preview_kind, "tool preview_kind"),
+        emits_workspace_diff=_require_bool(
+            spec.emits_workspace_diff,
+            "tool emits_workspace_diff",
+        ),
+        changed_paths_source=_required_text(
+            spec.changed_paths_source,
+            "tool changed_paths_source",
+        ),
+        result_payload_kind=_required_text(
+            spec.result_payload_kind,
+            "tool result_payload_kind",
+        ),
+        skip_emit_if_background=_require_bool(
+            spec.skip_emit_if_background,
+            "tool skip_emit_if_background",
+        ),
+        guidance=normalize_json_ingress(spec.guidance),
+        examples=tuple(examples),
+        annotations=normalize_json_ingress(spec.annotations),
+    )
+
+
 class ToolProvider(Protocol):
-    def get_tools(self, context: ToolContext) -> Iterable[ToolSpec]:
-        ...
+    def get_tools(self, context: ToolContext) -> Iterable[ToolSpec]: ...
 
 
 class DynamicToolProvider(Protocol):
-    def get_tools_for_turn(self, context: ToolContext, turn: Any) -> Iterable[ToolSpec]:
-        ...
+    def get_tools_for_turn(self, context: ToolContext, turn: Any) -> Iterable[ToolSpec]: ...
 
 
 @dataclass
@@ -179,6 +253,7 @@ class ToolRegistry:
     _by_exported_name: dict[str, ToolSpec] = field(default_factory=dict)
 
     def register(self, spec: ToolSpec) -> None:
+        spec = normalize_tool_spec(spec)
         if spec.id in self._by_id:
             raise ValueError(f"duplicate tool id: {spec.id}")
         if spec.exported_name in self._by_exported_name:

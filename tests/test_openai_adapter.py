@@ -7,7 +7,15 @@ generic "provider call failed". It must never echo the body's prose (PII/prompt 
 
 from __future__ import annotations
 
-from monoid_agent_kernel.providers.openai import _model_error_from_openai
+from types import SimpleNamespace
+
+import pytest
+
+from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.providers.openai import (
+    _model_error_from_openai,
+    _stream_output_index,
+)
 
 
 class _FakeApiError(Exception):
@@ -25,6 +33,15 @@ _QUOTA_BODY = {
     "type": "insufficient_quota",
     "message": "You exceeded your current quota, please check your plan and billing details.",
 }
+
+
+@pytest.mark.parametrize("invalid", ["1", True, 1.9, -1])
+def test_openai_stream_rejects_coercible_output_indices(invalid: object) -> None:
+    with pytest.raises(ModelAdapterError) as caught:
+        _stream_output_index(SimpleNamespace(output_index=invalid))
+
+    assert caught.value.provider_error_code == "openai_bad_response"
+    assert caught.value.retryable is False
 
 
 def test_streaming_error_without_status_recovers_code_and_infers_status() -> None:
@@ -46,7 +63,9 @@ def test_model_not_found_without_status_infers_404() -> None:
 
 
 def test_4xx_with_status_is_preserved_with_body_code() -> None:
-    me = _model_error_from_openai(_FakeApiError(status_code=429, body={"code": "rate_limit_exceeded"}))
+    me = _model_error_from_openai(
+        _FakeApiError(status_code=429, body={"code": "rate_limit_exceeded"})
+    )
     assert me.http_status == 429
     assert me.provider_error_code == "rate_limit_exceeded"
     assert me.retryable is True  # a true rate limit can clear on retry

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
 from support.waiting import eventually
@@ -18,7 +21,7 @@ from monoid_agent_kernel.core.external_agent_envelope import (
 )
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_surface import ToolScope
-from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.loop import AgentLoop, AgentToolContext
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
@@ -28,13 +31,19 @@ from monoid_agent_kernel.reference.outbox import (
     OutboxToolProvider,
     RecordingOutboxSender,
 )
+from monoid_agent_kernel.tool_services import CallContext
 
 
 # --- core types + holder ------------------------------------------------------------------
 
 
 def test_outbox_request_round_trips() -> None:
-    req = OutboxRequest(destination="email", payload={"to": "x@a.edu"}, capability="outbox.send", token_ref="auto:outbox.send")
+    req = OutboxRequest(
+        destination="email",
+        payload={"to": "x@a.edu"},
+        capability="outbox.send",
+        token_ref="auto:outbox.send",
+    )
     payload = req.to_json()
     assert payload["protocol"] == "monoid.outbox-request.v1"
     assert payload["idempotency_key"] == req.id  # defaults to the request id
@@ -64,6 +73,128 @@ def test_outbox_holder_pending_mark_export_import() -> None:
     fresh.import_(box.export())
     assert fresh.get("o1").status == "dispatched"  # full state round-trips
     assert {r.id for r in fresh.pending()} == {"o2"}
+
+
+def test_outbox_request_direct_construction_normalizes_portable_json() -> None:
+    request = OutboxRequest(
+        destination="peer\ud800",
+        payload={"text\ud800": "value\udfff", "nan": float("nan")},
+        capability="send\ud800",
+        reference="ref\ud800",
+    )
+
+    assert request.destination == "peer\ufffd"
+    assert request.capability == "send\ufffd"
+    assert request.reference == "ref\ufffd"
+    assert request.payload == {"text\ufffd": "value\ufffd", "nan": None}
+    json.dumps(request.to_json(), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"destination": 1}, "destination must be a string"),
+        ({"destination": "peer", "idempotency_key": False}, "idempotency_key must be a string"),
+        ({"destination": "peer", "expect_ack": 1}, "expect_ack must be a boolean"),
+        ({"destination": "peer", "payload": []}, "payload must be an object"),
+    ],
+)
+def test_outbox_request_direct_construction_rejects_non_exact_controls(
+    kwargs: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        OutboxRequest(**kwargs)
+
+
+def test_outbox_receipt_direct_construction_normalizes_and_validates() -> None:
+    receipt = OutboxReceipt(ok=True, reference="ref\ud800", error="error\udfff")
+
+    assert receipt.reference == "ref\ufffd"
+    assert receipt.error == "error\ufffd"
+    with pytest.raises(ValueError, match="ok must be a boolean"):
+        OutboxReceipt(ok=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="reference must be a string"):
+        OutboxReceipt(ok=True, reference=False)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="retryable must be a boolean"):
+        OutboxReceipt(ok=False, retryable="yes")  # type: ignore[arg-type]
+
+
+def test_emit_outbox_normalizes_before_staging_and_rejects_coercible_controls() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    context = SimpleNamespace(
+        outbox=Outbox(),
+        _current_call=CallContext("call-1", "turn-1", "event-1"),
+        capability_token=lambda capability: f"token:{capability}",
+        run_id="run-1",
+        recorder=SimpleNamespace(
+            emit=lambda event_type, **kwargs: events.append((event_type, kwargs))
+        ),
+    )
+
+    AgentToolContext.emit_outbox(
+        context,
+        "peer\ud800",
+        {"value": float("inf"), "text": "payload\ud800"},
+        capability="send\ud800",
+        idempotency_key="key\ud800",
+        expect_ack=True,
+        reply_to="reply\ud800",
+    )
+
+    [request] = context.outbox.pending()
+    assert request.destination == "peer\ufffd"
+    assert request.capability == "send\ufffd"
+    assert request.token_ref == "token:send\ufffd"
+    assert request.idempotency_key == "key\ufffd"
+    assert request.reply_to == "reply\ufffd"
+    assert request.payload == {"value": None, "text": "payload\ufffd"}
+    assert events[0][1]["data"]["destination"] == "peer\ufffd"
+
+    with pytest.raises(ValueError, match="expect_ack must be a boolean"):
+        AgentToolContext.emit_outbox(
+            context,
+            "peer",
+            {},
+            expect_ack=1,  # type: ignore[arg-type]
+        )
+    assert len(context.outbox.pending()) == 1
+
+
+def test_record_outbox_result_normalizes_forged_receipt_before_state_change() -> None:
+    loop = object.__new__(AgentLoop)
+    loop._outbox = Outbox()
+    loop._session = None
+    request = loop._outbox.append(OutboxRequest(destination="peer", id="o1"))
+    receipt = object.__new__(OutboxReceipt)
+    object.__setattr__(receipt, "ok", True)
+    object.__setattr__(receipt, "reference", "ref\ud800")
+    object.__setattr__(receipt, "error", "")
+    object.__setattr__(receipt, "retryable", False)
+
+    assert loop.record_outbox_result(request.id, receipt) == "dispatched"
+    assert request.reference == "ref\ufffd"
+
+
+def test_record_outbox_result_rejects_malformed_forged_receipt_without_mutation() -> None:
+    loop = object.__new__(AgentLoop)
+    loop._outbox = Outbox()
+    loop._session = None
+    request = loop._outbox.append(OutboxRequest(destination="peer", id="o1"))
+    receipt = object.__new__(OutboxReceipt)
+    object.__setattr__(receipt, "ok", "false")
+    object.__setattr__(receipt, "reference", "")
+    object.__setattr__(receipt, "error", "delivery failed")
+    object.__setattr__(receipt, "retryable", False)
+
+    with pytest.raises(ValueError, match="ok must be a boolean"):
+        loop.record_outbox_result(request.id, receipt)
+
+    assert request.status == "pending"
+    assert request.attempts == 0
+
+    with pytest.raises(ValueError, match="request_id must be a string"):
+        loop.record_outbox_result(1, OutboxReceipt(ok=True))  # type: ignore[arg-type]
+    assert request.status == "pending"
 
 
 # --- backend e2e: capability-gated staging + edge drain -----------------------------------
@@ -103,17 +234,30 @@ def _run(backend: RunnerBackend, workspace: Path, *, multi_turn: bool = False) -
     return submission.run_id, submission.run_token
 
 
-_SEND = ModelTurn(response_id="r1", tool_calls=(fake_tool_call("outbox_send", {"destination": "email", "payload": {"to": "x@a.edu"}}, "c1"),))
+_SEND = ModelTurn(
+    response_id="r1",
+    tool_calls=(
+        fake_tool_call("outbox_send", {"destination": "email", "payload": {"to": "x@a.edu"}}, "c1"),
+    ),
+)
 _SEND_ACK = ModelTurn(
     response_id="r1",
-    tool_calls=(fake_tool_call("outbox_send", {"destination": "email", "payload": {"to": "x@a.edu"}, "expect_ack": True}, "c1"),),
+    tool_calls=(
+        fake_tool_call(
+            "outbox_send",
+            {"destination": "email", "payload": {"to": "x@a.edu"}, "expect_ack": True},
+            "c1",
+        ),
+    ),
 )
 _DONE = ModelTurn(response_id="rN", final_text="done")
 
 
 def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(backend_factory: Any) -> None:
     sender = RecordingOutboxSender()
-    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    backend, workspace = _outbox_backend(
+        backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker()
+    )
     run_id, _token = _run(backend, workspace)
     assert backend.wait_for_run(run_id, timeout_s=20) == "completed"
 
@@ -121,7 +265,12 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(backend_factory
     assert [r.destination for r in sender.sent] == ["email"]
     assert sender.sent[0].token_ref == "auto:outbox.send"
 
-    events = [json.loads(line) for line in (backend._record(run_id).run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    events = [
+        json.loads(line)
+        for line in (backend._record(run_id).run_dir / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
     assert any(e["type"] == "outbox.requested" for e in events)
     dispatched = [e for e in events if e["type"] == "outbox.dispatched"]
     assert dispatched and dispatched[0]["data"]["destination"] == "email"
@@ -140,7 +289,9 @@ def test_outbox_staged_then_dispatched_by_edge_with_lease_handle(backend_factory
 
 def test_strict_outbox_side_effect_stages_and_dispatches(backend_factory: Any) -> None:
     sender = RecordingOutboxSender()
-    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    backend, workspace = _outbox_backend(
+        backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker()
+    )
     binding = tool_binding(
         "outbox.send",
         runtime={
@@ -180,7 +331,9 @@ def test_outbox_not_staged_when_capability_denied(backend_factory: Any) -> None:
     from monoid_agent_kernel.reference.capability import DenyAllBroker
 
     sender = RecordingOutboxSender()
-    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=DenyAllBroker())
+    backend, workspace = _outbox_backend(
+        backend_factory, [_SEND, _DONE], sender=sender, broker=DenyAllBroker()
+    )
     run_id, _token = _run(backend, workspace)
     backend.wait_for_run(run_id, timeout_s=20)
     # The gate denied the capability -> the tool never ran -> nothing was staged or dispatched.
@@ -191,11 +344,18 @@ def test_outbox_retryable_failure_then_dead_letters(backend_factory: Any) -> Non
     # A retryable sender keeps the request pending across drains; bound the attempts so it
     # eventually dead-letters as failed rather than looping forever.
     sender = FailingOutboxSender(retryable=True)
-    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    backend, workspace = _outbox_backend(
+        backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker()
+    )
     backend.outbox_max_attempts = 1  # fail on the first attempt
     run_id, _token = _run(backend, workspace)
     backend.wait_for_run(run_id, timeout_s=20)
-    events = [json.loads(line) for line in (backend._record(run_id).run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    events = [
+        json.loads(line)
+        for line in (backend._record(run_id).run_dir / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
     failed = [e for e in events if e["type"] == "outbox.failed"]
     assert failed and failed[0]["data"]["destination"] == "email"
 
@@ -211,7 +371,9 @@ def test_pending_outbox_survives_snapshot_restore(tmp_path: Path) -> None:
     binding = tool_binding("outbox.send", runtime={"requires_lease": True}, scope=ToolScope())
     loop1 = AgentLoop(
         spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
-        model_adapter=FakeModelAdapter(turns=[_SEND, ModelTurn(response_id="rw", final_text="staged")]),
+        model_adapter=FakeModelAdapter(
+            turns=[_SEND, ModelTurn(response_id="rw", final_text="staged")]
+        ),
         runtime_config_provider=runtime_provider(runtime_config(bindings=(binding,))),
         tool_providers=(OutboxToolProvider(),),
         capability_broker=AutoGrantBroker(),
@@ -238,7 +400,10 @@ def test_pending_outbox_survives_snapshot_restore(tmp_path: Path) -> None:
     assert restored[0].token_ref == "auto:outbox.send"  # the handle survived the restart
 
     # The edge can now dispatch the restored request.
-    assert loop2.record_outbox_result(restored[0].id, OutboxReceipt(ok=True, reference="r")) == "dispatched"
+    assert (
+        loop2.record_outbox_result(restored[0].id, OutboxReceipt(ok=True, reference="r"))
+        == "dispatched"
+    )
     assert loop2.pending_outbox() == []
     loop2.close()
 
@@ -256,13 +421,19 @@ def test_outbox_request_next_attempt_at_round_trips() -> None:
 def test_backoff_delay_is_capped_with_full_jitter(backend_factory: Any) -> None:
     sender = RecordingOutboxSender()
     backend, _ws = _outbox_backend(backend_factory, [_DONE], sender=sender)
-    backend.outbox_retry_base_s, backend.outbox_retry_factor, backend.outbox_retry_cap_s = 1.0, 2.0, 10.0
+    backend.outbox_retry_base_s, backend.outbox_retry_factor, backend.outbox_retry_cap_s = (
+        1.0,
+        2.0,
+        10.0,
+    )
     backend._outbox_rng.seed(1234)
     # Full jitter: each delay lands within [0, ceiling]; the ceiling grows with attempts but is capped.
     for attempts in range(1, 12):
         ceiling = min(10.0, 1.0 * 2.0**attempts)
         assert 0.0 <= backend._outbox_backoff_delay(attempts) <= ceiling
-    assert all(backend._outbox_backoff_delay(20) <= 10.0 for _ in range(50))  # never exceeds the cap
+    assert all(
+        backend._outbox_backoff_delay(20) <= 10.0 for _ in range(50)
+    )  # never exceeds the cap
 
 
 def test_retryable_failure_stamps_future_schedule_and_is_not_due(tmp_path: Path) -> None:
@@ -271,7 +442,9 @@ def test_retryable_failure_stamps_future_schedule_and_is_not_due(tmp_path: Path)
     binding = tool_binding("outbox.send", runtime={"requires_lease": True}, scope=ToolScope())
     loop = AgentLoop(
         spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
-        model_adapter=FakeModelAdapter(turns=[_SEND, ModelTurn(response_id="rw", final_text="staged")]),
+        model_adapter=FakeModelAdapter(
+            turns=[_SEND, ModelTurn(response_id="rw", final_text="staged")]
+        ),
         runtime_config_provider=runtime_provider(runtime_config(bindings=(binding,))),
         tool_providers=(OutboxToolProvider(),),
         capability_broker=AutoGrantBroker(),
@@ -287,7 +460,9 @@ def test_retryable_failure_stamps_future_schedule_and_is_not_due(tmp_path: Path)
     assert status == "pending"
     assert loop.due_outbox(now) == []  # scheduled into the future — not due yet
     assert [r.id for r in loop.due_outbox(now + 60)] == [req.id]  # due once its time arrives
-    assert [r.id for r in loop.pending_outbox()] == [req.id]  # still in the full pending set (snapshot)
+    assert [r.id for r in loop.pending_outbox()] == [
+        req.id
+    ]  # still in the full pending set (snapshot)
     loop.close()
 
 
@@ -376,7 +551,9 @@ def test_outbox_ack_delivered_to_run_inbox_and_consumed(backend_factory: Any) ->
 
 def test_outbox_without_expect_ack_delivers_no_inbox_message(backend_factory: Any) -> None:
     sender = RecordingOutboxSender()
-    backend, workspace = _outbox_backend(backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker())
+    backend, workspace = _outbox_backend(
+        backend_factory, [_SEND, _DONE], sender=sender, broker=AutoGrantBroker()
+    )
     run_id, _token = _run(backend, workspace)
     assert backend.wait_for_run(run_id, timeout_s=20) == "completed"
     assert sender.sent and not sender.sent[0].expect_ack
@@ -389,7 +566,11 @@ def test_outbox_without_expect_ack_delivers_no_inbox_message(backend_factory: An
 
 def _send_to(peer: str, text: str, call_id: str) -> ModelTurn:
     return ModelTurn(
-        tool_calls=(fake_tool_call("outbox_send", {"destination": peer, "payload": {"text": text}}, call_id),)
+        tool_calls=(
+            fake_tool_call(
+                "outbox_send", {"destination": peer, "payload": {"text": text}}, call_id
+            ),
+        )
     )
 
 
@@ -458,9 +639,13 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(
         binding = tool_binding("outbox.send", runtime={"requires_lease": True}, scope=ToolScope())
         sub = backend.submit_run(
             BackendRunRequest(
-                tenant_id="tenant_a", user_id="user_a", workspace_root=workspace,
-                instruction=instruction, runtime_config=runtime_config(bindings=(binding,)),
-                multi_turn=True, metadata={"message_fabric_peer_id": name},
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=workspace,
+                instruction=instruction,
+                runtime_config=runtime_config(bindings=(binding,)),
+                multi_turn=True,
+                metadata={"message_fabric_peer_id": name},
             )
         )
         tokens[sub.run_id] = sub.run_token
@@ -469,7 +654,9 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(
     try:
         worker_id = spawn("worker", "stand by for planner")
         directory["worker"] = worker_id
-        assert eventually(lambda: backend.status(worker_id, tokens[worker_id]).get("state") == "awaiting_input")
+        assert eventually(
+            lambda: backend.status(worker_id, tokens[worker_id]).get("state") == "awaiting_input"
+        )
         planner_id = spawn("planner", "collaborate with worker")
         directory["planner"] = planner_id
 
@@ -479,16 +666,22 @@ def test_a2a_outbox_routes_into_peer_inbox_bidirectional(
                 return False
             events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
             return any(
-                e["type"] == "outbox.dispatched" and e["data"].get("destination") == dest for e in events
+                e["type"] == "outbox.dispatched" and e["data"].get("destination") == dest
+                for e in events
             )
 
-        assert eventually(lambda: dispatched_to(planner_id, "worker"))   # A -> B
-        assert eventually(lambda: dispatched_to(worker_id, "planner"))   # B -> A (so B received A's message)
+        assert eventually(lambda: dispatched_to(planner_id, "worker"))  # A -> B
+        assert eventually(
+            lambda: dispatched_to(worker_id, "planner")
+        )  # B -> A (so B received A's message)
         assert ("worker", "external-agent:planner") in delivered_sources
         assert ("planner", "external-agent:worker") in delivered_sources
 
         # The inbox is idempotent: once a message id has been processed, re-delivering it is a no-op.
-        assert backend.send_message(worker_id, tokens[worker_id], "dup", message_id="m-dup")["status"] == "queued"
+        assert (
+            backend.send_message(worker_id, tokens[worker_id], "dup", message_id="m-dup")["status"]
+            == "queued"
+        )
         assert eventually(lambda: "m-dup" in backend._record(worker_id).seen_inbox_ids)
         again = backend.send_message(worker_id, tokens[worker_id], "dup", message_id="m-dup")
         assert again["status"] == "duplicate"

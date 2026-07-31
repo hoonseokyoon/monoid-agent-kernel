@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from support.backend_harness import (
@@ -29,6 +30,68 @@ from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
 from monoid_agent_kernel.recorder import append_event_to_run
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_backend_http_rejects_nonfinite_json_constants(tmp_path: Path, value: float) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    server, thread, base_url = _start_server(backend)
+    try:
+        with pytest.raises(HTTPError) as exc_info:
+            _json_request(
+                f"{base_url}/v1/runs",
+                {
+                    "tenant_id": "tenant_a",
+                    "user_id": "user_a",
+                    "workspace_root": str(workspace),
+                    "instruction": "Run.",
+                    "metadata": {"value": value},
+                },
+                token="admin",
+            )
+        assert exc_info.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_backend_http_rejects_finite_syntax_that_overflows_the_runtime(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    server, thread, base_url = _start_server(backend)
+    try:
+        body = (
+            "{"
+            '"tenant_id":"tenant_a",'
+            '"user_id":"user_a",'
+            f'"workspace_root":{json.dumps(str(workspace))},'
+            '"instruction":"Run.",'
+            '"max_duration_s":1e9999'
+            "}"
+        ).encode("utf-8")
+        request = Request(
+            f"{base_url}/v1/runs",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer admin",
+            },
+            method="POST",
+        )
+
+        with pytest.raises(HTTPError) as exc_info:
+            urlopen(request, timeout=5)
+
+        assert exc_info.value.code == 400
+        assert b"invalid JSON request body" in exc_info.value.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_backend_http_rejects_oversized_request(tmp_path: Path) -> None:
@@ -82,7 +145,12 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
         with pytest.raises(HTTPError) as exc_info:
             _json_request(
                 f"{base_url}/v1/runs",
-                {"tenant_id": "tenant_a", "user_id": "user_a", "workspace_root": str(workspace), "instruction": "Run."},
+                {
+                    "tenant_id": "tenant_a",
+                    "user_id": "user_a",
+                    "workspace_root": str(workspace),
+                    "instruction": "Run.",
+                },
             )
         assert exc_info.value.code == 401
 
@@ -130,7 +198,9 @@ def test_backend_http_create_status_result_events_and_usage(tmp_path: Path) -> N
                 "traceparent": traceparent,
             },
         )
-        diagnostics = _json_get(f"{base_url}/v1/runs/{run_id}/diagnostics?event_limit=1", token=run_token)
+        diagnostics = _json_get(
+            f"{base_url}/v1/runs/{run_id}/diagnostics?event_limit=1", token=run_token
+        )
         assert diagnostics["status"]["state"] == "completed"
         assert diagnostics["status"]["terminal"] is True
         assert [event["seq"] for event in diagnostics["events"]["items"]] == [trace_event.seq]
@@ -178,7 +248,9 @@ def test_backend_event_sse_resumes_from_last_event_id_without_duplicates(tmp_pat
         with urlopen(request, timeout=10) as response:
             assert response.headers["Content-Type"].startswith("text/event-stream")
             body = response.read().decode("utf-8")
-        ids = [int(line.removeprefix("id: ")) for line in body.splitlines() if line.startswith("id: ")]
+        ids = [
+            int(line.removeprefix("id: ")) for line in body.splitlines() if line.startswith("id: ")
+        ]
         return ids, body
 
     try:
@@ -363,7 +435,9 @@ def test_backend_http_multi_turn_messages_and_task_endpoints(tmp_path: Path) -> 
     # (Detailed worker/injection behavior is covered by the in-process tests above.)
     workspace = _workspace(tmp_path)
     adapters: list = []
-    backend = _hitl_backend(tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")])
+    backend = _hitl_backend(
+        tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")]
+    )
     backend.idle_timeout_s = 15.0
     server, thread, base_url = _start_server(backend)
     try:
@@ -382,10 +456,14 @@ def test_backend_http_multi_turn_messages_and_task_endpoints(tmp_path: Path) -> 
         run_id, run_token = created["run_id"], created["run_token"]
 
         # First turn settles -> the session parks awaiting the next user message.
-        assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input", timeout_s=20)
+        assert eventually(
+            lambda: backend._record(run_id).state.value == "awaiting_input", timeout_s=20
+        )
 
         # A follow-up message is threaded as a second user turn.
-        queued = _json_request(f"{base_url}/v1/runs/{run_id}/messages", {"content": "again"}, token=run_token)
+        queued = _json_request(
+            f"{base_url}/v1/runs/{run_id}/messages", {"content": "again"}, token=run_token
+        )
         assert queued["status"] == "queued"
         assert eventually(
             lambda: len([r for a in adapters for r in a.requests if r.instruction]) >= 2,
@@ -395,7 +473,9 @@ def test_backend_http_multi_turn_messages_and_task_endpoints(tmp_path: Path) -> 
         assert "hello" in instructions and "again" in instructions
 
         # Create an automation task -> scoped callback token + URL.
-        assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input", timeout_s=20)
+        assert eventually(
+            lambda: backend._record(run_id).state.value == "awaiting_input", timeout_s=20
+        )
         task = _json_request(
             f"{base_url}/v1/runs/{run_id}/tasks",
             {"kind": "automation", "request": {"description": "call external system"}},

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.errors import ToolExecutionError
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.shell import ShellApprovalDecision
 from monoid_agent_kernel.tool_services import CallContext, JobsService, ShellService, WebService
 from monoid_agent_kernel.tool_services.shell import _shell_options_from_call
 
@@ -75,6 +79,46 @@ def test_shell_service_metrics_start_at_zero() -> None:
         "failed_shell_calls": 0,
         "total_shell_duration_s": 0.0,
     }
+
+
+def test_shell_approval_decision_rejects_truthy_non_boolean() -> None:
+    with pytest.raises(ValueError, match="approved must be a boolean"):
+        ShellApprovalDecision(approved="false")  # type: ignore[arg-type]
+
+
+def test_shell_service_rejects_malformed_provider_decision_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executed: list[str] = []
+
+    class _MalformedProvider:
+        def approve_shell(self, request: Any) -> Any:
+            del request
+            return SimpleNamespace(approved="false", reason="denied", approver_id="policy")
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.tool_services.shell.execute_shell",
+        lambda **kwargs: executed.append(kwargs["command"]),
+    )
+    service = ShellService(
+        run_id="r",
+        workspace=SimpleNamespace(backend_kind="overlay"),  # type: ignore[arg-type]
+        recorder=_RecordingRecorder(events=[]),  # type: ignore[arg-type]
+        job_manager=None,  # type: ignore[arg-type]
+        permission_policy=PermissionPolicy(),
+        approval_provider=_MalformedProvider(),  # type: ignore[arg-type]
+    )
+    call = CallContext(
+        tool_call_id="c1",
+        turn_id="t1",
+        tool_event_id="e1",
+        runtime={"shell": {"enabled": True}},
+    )
+
+    with pytest.raises(ToolExecutionError, match="invalid decision"):
+        service.execute({"command": "echo SHOULD_NOT_RUN"}, call)
+
+    assert executed == []
 
 
 def test_shell_options_merge_runtime_and_binding_scope() -> None:

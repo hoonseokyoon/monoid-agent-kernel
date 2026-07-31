@@ -79,7 +79,9 @@ def _events(run_dir: Path, event_type: str) -> list[dict[str, Any]]:
 
 
 def test_model_authored_settled_text_is_recorded(tmp_path: Path) -> None:
-    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="the model wrote this")])
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(response_id="r1", final_text="the model wrote this")]
+    )
 
     run_dir = _run(_spec(tmp_path), adapter)
 
@@ -270,7 +272,9 @@ def test_the_run_finish_summary_never_reaches_the_tool_call_event(
 
     # ``tool`` carries the wire call name (``run_finish``), not the spec id (``run.finish``).
     started = [
-        event for event in _events(run_dir, "tool.call.started") if event["data"]["tool"] == "run_finish"
+        event
+        for event in _events(run_dir, "tool.call.started")
+        if event["data"]["tool"] == "run_finish"
     ]
     assert started, "the run.finish tool call never started"
     preview = started[-1]["data"]["args_preview"]
@@ -320,7 +324,11 @@ def test_the_approval_request_redacts_the_summary_too() -> None:
         model_name="run_finish",
         call_name="run_finish",
         call_id="c1",
-        arguments={"summary": "SENTINEL-the-answer", "notes": "SENTINEL-notes", "outputs": ["n.md"]},
+        arguments={
+            "summary": "SENTINEL-the-answer",
+            "notes": "SENTINEL-notes",
+            "outputs": ["n.md"],
+        },
         reason="ask",
         turn_id="turn_0001",
         tool_event_id=None,
@@ -500,6 +508,7 @@ def test_a_transcript_with_undecodable_bytes_is_reported(tmp_path: Path) -> None
     [
         pytest.param(b'{"a": "b\xffc"}', "invalid UTF-8", id="undecodable-bytes"),
         pytest.param(b"1" * 5000, "decoder limit exceeded", id="oversized-int"),
+        pytest.param(b'{"value": NaN}', "invalid JSON", id="non-finite-number"),
     ],
 )
 def test_a_corrupt_json_artifact_is_reported_not_raised(
@@ -529,7 +538,9 @@ def test_a_corrupt_json_artifact_is_reported_not_raised(
 
 
 @pytest.mark.parametrize("artifact", ["metrics.json", "events.jsonl", "transcript.jsonl"])
-def test_a_deeply_nested_artifact_never_crashes_the_validator(tmp_path: Path, artifact: str) -> None:
+def test_a_deeply_nested_artifact_never_crashes_the_validator(
+    tmp_path: Path, artifact: str
+) -> None:
     """All three validator siblings survive deep nesting, whichever way the decoder reacts.
 
     Deliberately does NOT pin the message. Python 3.12 decoupled the C-level recursion limit from
@@ -559,12 +570,8 @@ def test_a_deeply_nested_artifact_never_crashes_the_validator(tmp_path: Path, ar
 @pytest.mark.parametrize(
     ("mutate", "expected"),
     [
-        pytest.param(
-            {"final_text": "TAMPERED answer"}, "digest does not match", id="text-altered"
-        ),
-        pytest.param(
-            {"final_text_digest": "0" * 64}, "digest does not match", id="digest-altered"
-        ),
+        pytest.param({"final_text": "TAMPERED answer"}, "digest does not match", id="text-altered"),
+        pytest.param({"final_text_digest": "0" * 64}, "digest does not match", id="digest-altered"),
         pytest.param({"final_text_len": 999}, "length does not match", id="length-altered"),
     ],
 )
@@ -595,8 +602,7 @@ def test_validation_refuses_a_settled_text_record_the_reader_would_reject(
 
     issues = validate_run_dir(run_dir)
     assert any(
-        issue.path.startswith("transcript.jsonl:") and expected in issue.message
-        for issue in issues
+        issue.path.startswith("transcript.jsonl:") and expected in issue.message for issue in issues
     ), issues
 
 

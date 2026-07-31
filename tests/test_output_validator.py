@@ -75,6 +75,17 @@ class MalformedReturnValidator:
         return None  # noqa: RET501 - intentional bug under test
 
 
+class NonBooleanOutcomeValidator:
+    """Uses a truthy spelling of false; the validator boundary must reject it as a defect."""
+
+    id = "non-boolean-outcome"
+    schema = None
+
+    def validate(self, view: FinalOutputView) -> ValidationOutcome:
+        del view
+        return ValidationOutcome(ok="false", feedback="must reject")  # type: ignore[arg-type]
+
+
 class RequireFoo:
     id = "require.foo"
     schema = None
@@ -153,7 +164,9 @@ def test_validator_accepts_valid_json_and_sets_final_output(tmp_path: Path) -> N
 
 
 def test_validator_retries_then_succeeds(tmp_path: Path) -> None:
-    adapter = FakeModelAdapter(turns=[_text_turn("not json at all"), _text_turn('{"summary": "fixed"}')])
+    adapter = FakeModelAdapter(
+        turns=[_text_turn("not json at all"), _text_turn('{"summary": "fixed"}')]
+    )
     result = AgentLoop(
         spec=_spec(tmp_path),
         model_adapter=adapter,
@@ -208,13 +221,29 @@ def test_malformed_validator_return_terminalizes_as_defect(tmp_path: Path) -> No
     assert result.error_code == "output_validator_error"
 
 
+def test_non_boolean_validator_outcome_terminalizes_as_defect(tmp_path: Path) -> None:
+    adapter = FakeModelAdapter(turns=[_text_turn("unsafe")])
+    result = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
+        runtime_config_provider=_provider("non-boolean-outcome"),
+        output_validators=(NonBooleanOutcomeValidator(),),
+    ).run_once("go")
+
+    assert result.status == "failed"
+    assert result.error_code == "output_validator_error"
+    assert result.final_output is None
+
+
 # --- textless refusal / truncation (review fix ①) -----------------------------------------
 
 
 def test_textless_refusal_settles_output_refused(tmp_path: Path) -> None:
     # An OpenAI refusal content part yields stop_reason="refusal" with NO final text — it must
     # still settle output_refused, not the "neither text nor tool calls" model error.
-    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text=None, stop_reason="refusal")])
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(response_id="r1", final_text=None, stop_reason="refusal")]
+    )
     result = AgentLoop(
         spec=_spec(tmp_path),
         model_adapter=adapter,
@@ -227,7 +256,9 @@ def test_textless_refusal_settles_output_refused(tmp_path: Path) -> None:
 
 
 def test_textless_truncation_settles_output_truncated(tmp_path: Path) -> None:
-    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text=None, stop_reason="length")])
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(response_id="r1", final_text=None, stop_reason="length")]
+    )
     result = AgentLoop(
         spec=_spec(tmp_path),
         model_adapter=adapter,
@@ -279,7 +310,9 @@ def test_refusal_settles_output_refused_without_validating(tmp_path: Path) -> No
 
 
 def test_truncation_settles_output_truncated_without_validating(tmp_path: Path) -> None:
-    adapter = FakeModelAdapter(turns=[_text_turn('{"summary": "complete enough"}', stop_reason="length")])
+    adapter = FakeModelAdapter(
+        turns=[_text_turn('{"summary": "complete enough"}', stop_reason="length")]
+    )
     result = AgentLoop(
         spec=_spec(tmp_path),
         model_adapter=adapter,
@@ -297,8 +330,14 @@ def test_truncation_settles_output_truncated_without_validating(tmp_path: Path) 
 def test_run_finish_path_validates_and_repairs(tmp_path: Path) -> None:
     adapter = FakeModelAdapter(
         turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "bad"}, "c1"),)),
-            ModelTurn(response_id="r2", tool_calls=(fake_tool_call("run_finish", {"summary": "ok now"}, "c2"),)),
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "bad"}, "c1"),),
+            ),
+            ModelTurn(
+                response_id="r2",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "ok now"}, "c2"),),
+            ),
         ]
     )
     result = AgentLoop(
@@ -386,7 +425,9 @@ def test_output_retries_survives_checkpoint_round_trip(tmp_path: Path) -> None:
 
 def test_openai_stop_reason_mapping() -> None:
     assert _stop_reason_from_response({"status": "completed"}, tool_calls_present=False) == "stop"
-    assert _stop_reason_from_response({"status": "completed"}, tool_calls_present=True) == "tool_calls"
+    assert (
+        _stop_reason_from_response({"status": "completed"}, tool_calls_present=True) == "tool_calls"
+    )
     assert (
         _stop_reason_from_response(
             {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
@@ -402,12 +443,21 @@ def test_openai_stop_reason_mapping() -> None:
         == "refusal"
     )
     # A refusal content part on an otherwise-complete response.
-    refusal_doc = {"status": "completed", "output": [{"type": "message", "content": [{"type": "refusal"}]}]}
+    refusal_doc = {
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "refusal"}]}],
+    }
     assert _stop_reason_from_response(refusal_doc, tool_calls_present=False) == "refusal"
 
 
 def test_openai_parse_response_carries_stop_reason() -> None:
-    turn = _parse_response({"id": "x", "status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}]})
+    turn = _parse_response(
+        {
+            "id": "x",
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+        }
+    )
     assert turn.stop_reason == "stop"
 
 
@@ -417,7 +467,9 @@ def test_fake_streaming_infers_stop_reason() -> None:
 
 
 def test_gateway_wire_round_trips_stop_reason() -> None:
-    turn = _parse_gateway_response({"final_text": "done", "tool_calls": [], "stop_reason": "length"})
+    turn = _parse_gateway_response(
+        {"final_text": "done", "tool_calls": [], "stop_reason": "length"}
+    )
     assert turn.stop_reason == "length"
     # Older gateway without the field: inferred.
     inferred = _parse_gateway_response({"final_text": "done", "tool_calls": []})
@@ -464,7 +516,10 @@ def test_contradictory_validators_exhaust_with_failure_rollup(tmp_path: Path) ->
     # Both validators show up as failing across attempts — the contradiction signal.
     assert by_validator.get("require.foo") and by_validator.get("forbid.foo")
     # Same roll-up surfaced in the run result metrics.
-    assert set(result.metrics["output_validation"]["failures_by_validator"]) == {"require.foo", "forbid.foo"}
+    assert set(result.metrics["output_validation"]["failures_by_validator"]) == {
+        "require.foo",
+        "forbid.foo",
+    }
 
 
 # --- E3: per-validator outputs keyed by id -------------------------------------------------
@@ -506,9 +561,20 @@ def test_outputs_keyed_by_validator_id(tmp_path: Path) -> None:
 def test_repair_turn_with_non_finish_tool_does_not_resettle(tmp_path: Path) -> None:
     adapter = FakeModelAdapter(
         turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "bad"}, "c1"),)),
-            ModelTurn(response_id="r2", tool_calls=(fake_tool_call("fs_write", {"path": "note.md", "content": "written"}, "c2"),)),
-            ModelTurn(response_id="r3", tool_calls=(fake_tool_call("run_finish", {"summary": "ok done"}, "c3"),)),
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "bad"}, "c1"),),
+            ),
+            ModelTurn(
+                response_id="r2",
+                tool_calls=(
+                    fake_tool_call("fs_write", {"path": "note.md", "content": "written"}, "c2"),
+                ),
+            ),
+            ModelTurn(
+                response_id="r3",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "ok done"}, "c3"),),
+            ),
         ]
     )
     result = AgentLoop(
@@ -536,7 +602,11 @@ def test_rejected_finish_metadata_cleared_on_natural_repair(tmp_path: Path) -> N
         turns=[
             ModelTurn(
                 response_id="r1",
-                tool_calls=(fake_tool_call("run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"),),
+                tool_calls=(
+                    fake_tool_call(
+                        "run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"
+                    ),
+                ),
             ),
             _text_turn("ok now"),
         ]
@@ -558,7 +628,10 @@ def test_rejected_finish_tool_output_preserved_in_messages(tmp_path: Path) -> No
     # validator-feedback user message — else a by-value adapter sees a dangling function_call.
     adapter = FakeModelAdapter(
         turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "bad"}, "c1"),)),
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "bad"}, "c1"),),
+            ),
             _text_turn("ok now"),
         ]
     )
@@ -574,7 +647,8 @@ def test_rejected_finish_tool_output_preserved_in_messages(tmp_path: Path) -> No
         i for i, m in enumerate(repair_msgs) if m.get("role") == "tool" and m.get("call_id") == "c1"
     )
     user_repair_idx = next(
-        i for i, m in enumerate(repair_msgs)
+        i
+        for i, m in enumerate(repair_msgs)
         if m.get("role") == "user" and "did not satisfy" in str(m.get("content", ""))
     )
     assert tool_idx < user_repair_idx
@@ -586,7 +660,11 @@ def test_exhausted_rejected_finish_metadata_cleared(tmp_path: Path) -> None:
         turns=[
             ModelTurn(
                 response_id="r1",
-                tool_calls=(fake_tool_call("run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"),),
+                tool_calls=(
+                    fake_tool_call(
+                        "run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"
+                    ),
+                ),
             ),
         ]
     )
@@ -638,7 +716,10 @@ def test_finish_output_logged_when_all_validators_disabled(tmp_path: Path) -> No
     )
     adapter = FakeModelAdapter(
         turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "anything"}, "c1"),)),
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "anything"}, "c1"),),
+            ),
             _text_turn("second answer"),
         ]
     )
@@ -658,7 +739,9 @@ def test_finish_output_logged_when_all_validators_disabled(tmp_path: Path) -> No
         i for i, m in enumerate(second_msgs) if m.get("role") == "tool" and m.get("call_id") == "c1"
     )
     user2_idx = next(
-        i for i, m in enumerate(second_msgs) if m.get("role") == "user" and "second" in str(m.get("content", ""))
+        i
+        for i, m in enumerate(second_msgs)
+        if m.get("role") == "user" and "second" in str(m.get("content", ""))
     )
     assert tool_idx < user2_idx
 
@@ -680,7 +763,9 @@ def test_prior_finish_outputs_not_leaked_into_next_natural_turn(tmp_path: Path) 
         turns=[
             ModelTurn(
                 response_id="r1",
-                tool_calls=(fake_tool_call("run_finish", {"summary": "done", "outputs": ["a.txt"]}, "c1"),),
+                tool_calls=(
+                    fake_tool_call("run_finish", {"summary": "done", "outputs": ["a.txt"]}, "c1"),
+                ),
             ),
             _text_turn("plain answer"),
         ]
@@ -706,7 +791,10 @@ def test_successful_finish_tool_output_logged_before_next_user_message(tmp_path:
     # run parks, or the next user message interleaves ahead of it (dangling function_call).
     adapter = FakeModelAdapter(
         turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "ok done"}, "c1"),)),
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("run_finish", {"summary": "ok done"}, "c1"),),
+            ),
             _text_turn("ok bye"),
         ]
     )
@@ -726,7 +814,9 @@ def test_successful_finish_tool_output_logged_before_next_user_message(tmp_path:
         i for i, m in enumerate(second_msgs) if m.get("role") == "tool" and m.get("call_id") == "c1"
     )
     user2_idx = next(
-        i for i, m in enumerate(second_msgs) if m.get("role") == "user" and "second" in str(m.get("content", ""))
+        i
+        for i, m in enumerate(second_msgs)
+        if m.get("role") == "user" and "second" in str(m.get("content", ""))
     )
     assert tool_idx < user2_idx
 
@@ -825,13 +915,18 @@ def test_validate_flags_unknown_validator_binding() -> None:
         tools=(),
         output_validators=(OutputValidatorBinding(validator_id="json.strict", enabled=False),),
     )
-    assert not any("validator_id" in issue for issue in AgentLoop.validate(good, output_validators=(StrictJsonValidator(),)))
+    assert not any(
+        "validator_id" in issue
+        for issue in AgentLoop.validate(good, output_validators=(StrictJsonValidator(),))
+    )
 
 
 # --- settle-FSM refactor: lifecycle matrix + decide/apply purity --------------------------
 
 
-@pytest.mark.parametrize("case", ["no_validators", "accepted", "reprompt_then_natural", "exhausted"])
+@pytest.mark.parametrize(
+    "case", ["no_validators", "accepted", "reprompt_then_natural", "exhausted"]
+)
 def test_finish_metadata_lifecycle_matrix(tmp_path: Path, case: str) -> None:
     """One place that pins the run.finish metadata lifecycle — the bug class behind 5 review
     rounds. Invariant: a finish's outputs survive to the result IFF that finish was accepted; a
@@ -839,22 +934,43 @@ def test_finish_metadata_lifecycle_matrix(tmp_path: Path, case: str) -> None:
     finish_outputs = ["keep.txt"]
     if case == "no_validators":
         # No validators: the finish is accepted as-is and keeps its outputs.
-        adapter = FakeModelAdapter(turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "all good", "outputs": finish_outputs}, "c1"),)),
-        ])
+        adapter = FakeModelAdapter(
+            turns=[
+                ModelTurn(
+                    response_id="r1",
+                    tool_calls=(
+                        fake_tool_call(
+                            "run_finish", {"summary": "all good", "outputs": finish_outputs}, "c1"
+                        ),
+                    ),
+                ),
+            ]
+        )
         result = AgentLoop(
-            spec=_spec(tmp_path), model_adapter=adapter,
-            runtime_config_provider=_provider(tools=("run.finish",)), output_validators=(),
+            spec=_spec(tmp_path),
+            model_adapter=adapter,
+            runtime_config_provider=_provider(tools=("run.finish",)),
+            output_validators=(),
         ).run_once("go")
         assert result.status == "completed"
         assert result.final_outputs == ("keep.txt",)  # accepted finish keeps its outputs
         assert result.final_text == "all good"
     elif case == "accepted":
-        adapter = FakeModelAdapter(turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "ok done", "outputs": finish_outputs}, "c1"),)),
-        ])
+        adapter = FakeModelAdapter(
+            turns=[
+                ModelTurn(
+                    response_id="r1",
+                    tool_calls=(
+                        fake_tool_call(
+                            "run_finish", {"summary": "ok done", "outputs": finish_outputs}, "c1"
+                        ),
+                    ),
+                ),
+            ]
+        )
         result = AgentLoop(
-            spec=_spec(tmp_path), model_adapter=adapter,
+            spec=_spec(tmp_path),
+            model_adapter=adapter,
             runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
             output_validators=(ContainsOkValidator(),),
         ).run_once("go")
@@ -864,12 +980,22 @@ def test_finish_metadata_lifecycle_matrix(tmp_path: Path, case: str) -> None:
     elif case == "reprompt_then_natural":
         # A rejected finish (with outputs) repaired by a natural answer: the finish's outputs are
         # cleared and must not leak; the final settle is a plain text answer (no outputs).
-        adapter = FakeModelAdapter(turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"),)),
-            _text_turn("ok now"),
-        ])
+        adapter = FakeModelAdapter(
+            turns=[
+                ModelTurn(
+                    response_id="r1",
+                    tool_calls=(
+                        fake_tool_call(
+                            "run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"
+                        ),
+                    ),
+                ),
+                _text_turn("ok now"),
+            ]
+        )
         result = AgentLoop(
-            spec=_spec(tmp_path), model_adapter=adapter,
+            spec=_spec(tmp_path),
+            model_adapter=adapter,
             runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
             output_validators=(ContainsOkValidator(),),
         ).run_once("go")
@@ -877,17 +1003,29 @@ def test_finish_metadata_lifecycle_matrix(tmp_path: Path, case: str) -> None:
         assert result.final_outputs == ()  # rejected finish's outputs cleared
         assert result.final_output == "ok now"
     else:  # exhausted
-        adapter = FakeModelAdapter(turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"),)),
-        ])
+        adapter = FakeModelAdapter(
+            turns=[
+                ModelTurn(
+                    response_id="r1",
+                    tool_calls=(
+                        fake_tool_call(
+                            "run_finish", {"summary": "bad", "outputs": ["stale.txt"]}, "c1"
+                        ),
+                    ),
+                ),
+            ]
+        )
         result = AgentLoop(
-            spec=_spec(tmp_path, limits=RunLimits(max_output_retries=0)), model_adapter=adapter,
+            spec=_spec(tmp_path, limits=RunLimits(max_output_retries=0)),
+            model_adapter=adapter,
             runtime_config_provider=_provider("contains.ok", tools=("run.finish",)),
             output_validators=(ContainsOkValidator(),),
         ).run_once("go")
         assert result.status == "limited"
         assert result.error_code == "output_validator_unsatisfied"
-        assert result.final_outputs == ()  # rejected finish's OUTPUTS cleared (the leak that mattered)
+        assert (
+            result.final_outputs == ()
+        )  # rejected finish's OUTPUTS cleared (the leak that mattered)
         # An exhausted finish keeps its summary as final_text (the "Stopped…" fallback only fills an
         # EMPTY final_text); only the outputs/notes are dropped. This pins the existing contract.
         assert result.final_text == "bad"
@@ -900,7 +1038,8 @@ def test_decide_settle_is_pure(tmp_path: Path) -> None:
     sink = MemoryEventSink()
     adapter = FakeModelAdapter(turns=[_text_turn("placeholder")])
     loop = AgentLoop(
-        spec=_spec(tmp_path), model_adapter=adapter,
+        spec=_spec(tmp_path),
+        model_adapter=adapter,
         runtime_config_provider=_provider("contains.ok"),
         output_validators=(ContainsOkValidator(),),
         event_sinks=(sink,),

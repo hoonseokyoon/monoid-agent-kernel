@@ -5,9 +5,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
+from monoid_agent_kernel._runtime_config_ingress import normalize_runtime_config
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, validate_runtime_config
 from monoid_agent_kernel.core.checkpoint import CheckpointStore
-from monoid_agent_kernel.core.durable_metadata import DurableMetadataCommitter, runtime_config_from_metadata
+from monoid_agent_kernel.core.durable_metadata import (
+    DurableMetadataCommitter,
+    runtime_config_from_metadata,
+)
 from monoid_agent_kernel.reference.backend.ports import RunRecordPort
 from monoid_agent_kernel.reference.backend.run_state import record_terminal as _record_terminal
 
@@ -82,6 +86,11 @@ class RuntimeConfigService:
         config: AgentRuntimeConfig,
     ) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)
+        if type(expected_version) is not int or expected_version < 0:
+            raise ValueError("expected runtime config version must be a non-negative integer")
+        if type(issuer) is not str or type(reason) is not str:
+            raise ValueError("runtime config issuer and reason must be strings")
+        config = normalize_runtime_config(config)
         validate_runtime_config(config, self._context.builtin_tool_specs_provider())
         record = self._context.record(run_id)
 

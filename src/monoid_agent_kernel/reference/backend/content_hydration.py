@@ -26,12 +26,12 @@ turn a cosmetic gap into a dead endpoint.
 
 from __future__ import annotations
 
-import json
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
 from monoid_agent_kernel.core.model_io import content_digest
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 
 TRANSCRIPT_FILE_NAME = "transcript.jsonl"
 SETTLED_TEXT_KIND = "settled_text"
@@ -162,7 +162,7 @@ def _settled_text_entry(line: str) -> tuple[str | None, str | None]:
     if not line:
         return None, None
     try:
-        record = json.loads(line)
+        record = loads_json_ingress(line)
     except (ValueError, RecursionError):
         # ``RecursionError`` as well as ``ValueError``: a deeply nested line makes the C scanner
         # exceed the interpreter's stack, and the read path runs on a deeper HTTP-handler stack

@@ -55,9 +55,7 @@ def test_run_metadata_validation_accepts_current_and_legacy_schema() -> None:
         ).status
         == "loaded"
     )
-    assert decode_run_metadata(
-        {**current, "limits": {"max_duration_s": None}}
-    ).status == "loaded"
+    assert decode_run_metadata({**current, "limits": {"max_duration_s": None}}).status == "loaded"
 
 
 @pytest.mark.parametrize(
@@ -78,6 +76,18 @@ def test_run_metadata_decoder_rejects_wrong_known_field_types(field: str, value:
     payload[field] = value
 
     assert decode_run_metadata(payload).status == "corrupt"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"created_at": 10**400},
+        {"runtime_config_committed_at": 10**400},
+        {"limits": {"max_duration_s": 10**400}},
+    ),
+)
+def test_run_metadata_decoder_rejects_float_overflowing_integers(payload: dict) -> None:
+    assert decode_run_metadata({**_metadata(), **payload}).status == "corrupt"
 
 
 def test_runtime_config_hash_mismatch_is_rejected() -> None:
@@ -133,11 +143,9 @@ def test_runtime_config_raw_hash_exception_rejects_unrelated_payload_drift() -> 
         runtime_config_from_metadata(meta)
 
 
-def test_runtime_config_legacy_hash_rejects_json_type_drift() -> None:
+def test_runtime_config_legacy_reader_rejects_json_type_drift() -> None:
     config = runtime_config(
-        bindings=(
-            tool_binding("fs.read", scope=ToolScope(allowed_paths=("!odd",))),
-        )
+        bindings=(tool_binding("fs.read", scope=ToolScope(allowed_paths=("!odd",))),)
     )
     legacy_payload = config.to_json()
     legacy_payload["tools"][0]["scope"].pop("path_pattern_encoding")
@@ -153,15 +161,13 @@ def test_runtime_config_legacy_hash_rejects_json_type_drift() -> None:
         "runtime_config_hash": raw_hash,
     }
 
-    with pytest.raises(ValueError, match="runtime config hash mismatch"):
+    with pytest.raises(ValueError, match="config_version"):
         runtime_config_from_metadata(meta)
 
 
 def test_runtime_config_retains_old_hash_for_legacy_purepath_scope() -> None:
     config = runtime_config(
-        bindings=(
-            tool_binding("fs.read", scope=ToolScope(allowed_paths=("secret/file",))),
-        )
+        bindings=(tool_binding("fs.read", scope=ToolScope(allowed_paths=("secret/file",))),)
     )
     legacy_payload = config.to_json()
     legacy_payload["tools"][0]["scope"]["allowed_paths"] = ["secret//file"]

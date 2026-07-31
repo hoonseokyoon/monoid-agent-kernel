@@ -15,7 +15,10 @@ from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
 
 from monoid_agent_kernel.reference.backend.http import create_backend_server
-from monoid_agent_kernel.reference.backend.service import BackendRunRequest
+from monoid_agent_kernel.reference.backend.service import (
+    BackendRunRequest,
+    _normalize_control_command_ingress,
+)
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.command_inbox import (
     CommandPrincipal,
@@ -29,6 +32,17 @@ from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE, TASK_CALLBACK_AUDI
 from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.permissions import matches_path_patterns
+
+
+def test_direct_control_rejects_float_overflowing_revocation_watermark() -> None:
+    with pytest.raises(ValueError, match="before must be a finite number"):
+        _normalize_control_command_ingress(
+            ControlCommand(
+                type="revoke_capability",
+                run_id="run_1",
+                args={"before": 10**400},
+            )
+        )
 
 
 def test_fresh_queued_runtime_config_rejects_a_bare_negation(
@@ -51,9 +65,7 @@ def test_fresh_queued_runtime_config_rejects_a_bare_negation(
         timeout_s=10,
     )
     config = runtime_config(
-        bindings=(
-            tool_binding("fs.read", scope=ToolScope(allowed_paths=("!literal",))),
-        ),
+        bindings=(tool_binding("fs.read", scope=ToolScope(allowed_paths=("!literal",))),),
         version=2,
     ).to_json()
     config["tools"][0]["scope"].pop("path_pattern_encoding")
@@ -333,13 +345,13 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
 
             duplicate = http_json(
                 f"{base_url}/v1/runs/{submission.run_id}/control",
-                    {
-                        "type": "status",
-                        "command_id": "cmd_cross_worker",
-                        "issuer": "operator-name",
-                        "reason": f"requested with {submission.run_token}",
-                        "args": {"access_token": "must-not-persist"},
-                    },
+                {
+                    "type": "status",
+                    "command_id": "cmd_cross_worker",
+                    "issuer": "operator-name",
+                    "reason": f"requested with {submission.run_token}",
+                    "args": {"access_token": "must-not-persist"},
+                },
                 token=submission.run_token,
             )
             assert duplicate["status"] == "ok"
@@ -370,9 +382,7 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
     ]
     assert len(received) == 1
     assert received[0]["data"]["actor"] == "tenant_a/user_a (operator-name)"
-    assert received[0]["data"]["token_sha256"] == TokenManager.token_sha256(
-        submission.run_token
-    )
+    assert received[0]["data"]["token_sha256"] == TokenManager.token_sha256(submission.run_token)
 
     with sqlite3.connect(db) as conn:
         row = conn.execute(
@@ -427,9 +437,7 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
     def append_with_watchdog_race(
         command: Any, *, max_pending: int, require_empty: bool = False
     ) -> Any:
-        receipt = original_append(
-            command, max_pending=max_pending, require_empty=require_empty
-        )
+        receipt = original_append(command, max_pending=max_pending, require_empty=require_empty)
         if command.type == "create_task":
             immediate_requirements.append(require_empty)
             started = threading.Event()
@@ -524,9 +532,7 @@ def test_enqueue_control_redacts_bearer_reintroduced_by_json_coercion(
 ) -> None:
     workspace = backend_factory.workspace(f"workspace-{store_kind}")
     db = tmp_path / "commands.db"
-    command_store = (
-        InMemoryCommandStore() if store_kind == "memory" else SqliteCommandStore(db)
-    )
+    command_store = InMemoryCommandStore() if store_kind == "memory" else SqliteCommandStore(db)
     token_manager = backend_factory.token_manager()
     backend = backend_factory.create(
         workspace=workspace,

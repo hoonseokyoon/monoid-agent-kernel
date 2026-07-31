@@ -30,6 +30,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass, fields, replace
 from typing import Any
 
@@ -43,6 +44,7 @@ from monoid_agent_kernel.core._sync_bridge import (
 )
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.core.model_io import (
     ModelCallReceipt,
     ModelIOSubscription,
@@ -57,15 +59,20 @@ from monoid_agent_kernel.errors import (
 )
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
+    ModelStreamIngressNormalizer,
     ModelStreamChunk,
     ModelTurn,
     assemble_streamed_turn,
     collect_retry_reports,
     mark_provider_retried,
+    normalize_model_request,
+    normalize_model_config,
+    normalize_model_turn,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.model_call")
+
 
 DeltaConsumer = Callable[[ModelStreamChunk], None]
 """Receives every chunk of a streamed call, in order, as it arrives.
@@ -119,6 +126,7 @@ _MAX_DIGEST_BYTES = 4 * 1024 * 1024
 # is exactly how a payload once passed validation and then raised mid-hash.
 _CANONICAL_ENCODER = json.JSONEncoder(
     ensure_ascii=False,
+    allow_nan=False,
     sort_keys=True,
     separators=(",", ":"),
     check_circular=True,
@@ -230,7 +238,10 @@ def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
     return {
         key: value
         for key, value in usage.items()
-        if isinstance(key, str) and not isinstance(value, bool) and isinstance(value, int) and value >= 0
+        if isinstance(key, str)
+        and not isinstance(value, bool)
+        and isinstance(value, int)
+        and value >= 0
     }
 
 
@@ -255,6 +266,39 @@ def _safe_repr(value: Any) -> str:
         return f"<unrepresentable {type(value).__name__}>"
     except Exception:
         return "<unrepresentable>"
+
+
+def _copy_with_fields(value: Any, /, **changes: Any) -> Any:
+    """Shallow-copy an extension value without invoking its convenience constructor."""
+
+    cloned = copy(value)
+    for name, replacement in changes.items():
+        object.__setattr__(cloned, name, replacement)
+    return cloned
+
+
+def _normalize_invocation_context(context: InvocationContext) -> InvocationContext:
+    attempt = context.attempt
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise ValueError("invocation attempt must be an integer greater than zero")
+    normalized_attributes = normalize_json_ingress(dict(context.attributes))
+    changes = {
+        "run_id": normalize_unicode_scalars(context.run_id),
+        "skill_id": normalize_unicode_scalars(context.skill_id),
+        "skill_digest": normalize_unicode_scalars(context.skill_digest),
+        "step_id": normalize_unicode_scalars(context.step_id),
+        "attempt": attempt,
+        "batch_id": normalize_unicode_scalars(context.batch_id),
+        "item_id": normalize_unicode_scalars(context.item_id),
+        "case_id": normalize_unicode_scalars(context.case_id),
+        "traceparent": normalize_unicode_scalars(context.traceparent),
+        "tracestate": normalize_unicode_scalars(context.tracestate),
+        "attributes": normalized_attributes,
+    }
+    try:
+        return _copy_with_fields(context, **changes)
+    except Exception:
+        return InvocationContext(**changes)
 
 
 def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, Any]:
@@ -282,26 +326,31 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
     otherwise and was wrong about both halves.
     """
 
-    content: dict[str, Any] = {
-        "system_prompt": request.system_prompt,
-        "instruction": request.instruction,
-        "messages": list(request.messages or ()),
-        "observations": [observation.to_json() for observation in request.observations],
-        "previous_turn_handle": request.previous_turn_handle or "",
-    }
-    if turn is not None:
-        content["output_text"] = getattr(turn, "final_text", "") or ""
-        # Probed and per-call, so one tool call the adapter built oddly costs its own entry rather
-        # than the whole record. A `__slots__` object has no `__dict__` and used to raise from here,
-        # which is a display surface failing a call that already happened.
-        calls: list[dict[str, Any]] = []
-        for call in getattr(turn, "tool_calls", ()) or ():
-            try:
-                calls.append(dict(vars(call)))
-            except Exception:
-                calls.append({"repr": _safe_repr(call)})
-        content["tool_calls"] = calls
-    return content
+    try:
+        content: dict[str, Any] = {
+            "system_prompt": request.system_prompt,
+            "instruction": request.instruction,
+            "messages": list(request.messages or ()),
+            "observations": [observation.to_json() for observation in request.observations],
+            "previous_turn_handle": request.previous_turn_handle or "",
+        }
+        if turn is not None:
+            content["output_text"] = getattr(turn, "final_text", "") or ""
+            # Probed and per-call, so one tool call the adapter built oddly costs its own entry rather
+            # than the whole record. A `__slots__` object has no `__dict__` and used to raise from here,
+            # which is a display surface failing a call that already happened.
+            calls: list[dict[str, Any]] = []
+            for call in getattr(turn, "tool_calls", ()) or ():
+                try:
+                    calls.append(dict(vars(call)))
+                except Exception:
+                    calls.append({"repr": _safe_repr(call)})
+            content["tool_calls"] = calls
+        return normalize_json_ingress(content)
+    except Exception:
+        # Capture is diagnostic.  A malformed custom object may reduce it to metadata-only,
+        # while the provider result and its receipt still reach the caller.
+        return {}
 
 
 @dataclass
@@ -367,8 +416,12 @@ class ModelCallRunner:
     no subscriptions and still pays that; anyone trimming the cost should start there and not
     expect this field to gate it."""
 
-    def _effective_model(self, request: ModelRequest, adapter: Any) -> ModelConfig:
-        """The config the adapter will actually run under.
+    def _effective_model(
+        self,
+        request: ModelRequest,
+        adapter: Any,
+    ) -> tuple[ModelConfig, ModelConfig | None]:
+        """The config recorded for the call and an explicit dispatch override when one exists.
 
         `ModelRequest.model` is optional and every shipped adapter falls back to its own
         `self.config`, so a receipt built from the request alone reports the *default* model no
@@ -377,7 +430,8 @@ class ModelCallRunner:
         """
 
         if request.model is not None:
-            return request.model
+            normalized = normalize_model_config(request.model) or ModelConfig()
+            return normalized, normalized
         # Tolerant of a raising probe for the reason `_destination` gives: a replay key is
         # bookkeeping, and an adapter that cannot answer must not thereby lose its call. Plain
         # `getattr(..., None)` swallowed only `AttributeError`, so a `config` property that raised
@@ -390,7 +444,10 @@ class ModelCallRunner:
             configured = getattr(adapter, "config", None)
         except Exception:
             configured = None
-        return configured if isinstance(configured, ModelConfig) else ModelConfig()
+        if isinstance(configured, ModelConfig):
+            normalized = normalize_model_config(configured) or ModelConfig()
+            return normalized, normalized
+        return ModelConfig(), None
 
     def _destination(self, model: ModelConfig, adapter: Any) -> str:
         """Where this adapter would send a call under `model`, or `""` if it does not say.
@@ -408,12 +465,14 @@ class ModelCallRunner:
             resolve = getattr(adapter, "resolve_destination", None)
             if not callable(resolve):
                 return ""
-            return str(resolve(model) or "")
+            return normalize_unicode_scalars(str(resolve(model) or ""))
         except Exception:
             return ""
 
     def _token(self) -> CancellationToken | None:
-        return None if self.current_cancellation_token is None else self.current_cancellation_token()
+        return (
+            None if self.current_cancellation_token is None else self.current_cancellation_token()
+        )
 
     def _current_adapter(self) -> Any:
         """The adapter for one call. Read **once** per call and threaded through from there.
@@ -475,27 +534,32 @@ class ModelCallRunner:
 
         started = time.monotonic()
         adapter = self._current_adapter()
-        model = self._effective_model(request, adapter)
         # Same tolerance as the other two adapter probes, and for the same reason. Undefended, a
         # `provider_name` property that raised -- or whose `str()` did -- lost the call before the
         # adapter was ever invoked, over a field nothing reads for control flow.
         try:
-            provider = str(getattr(adapter, "provider_name", "") or "")
+            provider = normalize_unicode_scalars(str(getattr(adapter, "provider_name", "") or ""))
         except Exception:
             provider = ""
+        try:
+            provisional_context = _normalize_invocation_context(
+                context if context is not None else InvocationContext()
+            )
+        except Exception:
+            provisional_context = InvocationContext()
+        try:
+            raw_model = getattr(request, "model", None)
+            provisional_model = (
+                normalize_model_config(raw_model)
+                if isinstance(raw_model, ModelConfig)
+                else ModelConfig()
+            ) or ModelConfig()
+        except Exception:
+            provisional_model = ModelConfig()
         receipt = ModelCallReceipt(
-            context=context if context is not None else InvocationContext(),
-            model=model,
+            context=provisional_context,
+            model=provisional_model,
             provider_name=provider,
-            prompt_digest=_digest(_prompt_payload(request)),
-            request_digest=_digest(
-                _request_payload(
-                    request,
-                    model,
-                    provider=provider,
-                    destination=self._destination(model, adapter),
-                )
-            ),
         )
         with collect_retry_reports() as progress:
             # Whether the kernel got as far as reaching into the adapter, which is what `attempts`
@@ -518,8 +582,31 @@ class ModelCallRunner:
                 # distinguishable here; `_adrive` is called from nowhere else, so the check still
                 # exists once.
                 self._check_cancel_or_deadline(deadline)
+                request = normalize_model_request(request)
+                normalized_context = _normalize_invocation_context(
+                    context if context is not None else InvocationContext()
+                )
+                model, dispatch_model = self._effective_model(request, adapter)
+                if dispatch_model is not None:
+                    request = copy(request)
+                    object.__setattr__(request, "model", dispatch_model)
+                receipt = replace(
+                    receipt,
+                    context=normalized_context,
+                    model=model,
+                    prompt_digest=_digest(_prompt_payload(request)),
+                    request_digest=_digest(
+                        _request_payload(
+                            request,
+                            model,
+                            provider=provider,
+                            destination=self._destination(model, adapter),
+                        )
+                    ),
+                )
                 reached_adapter = True
                 turn = await self._adrive(request, deadline, should_abort, delta_consumer, adapter)
+                turn = normalize_model_turn(turn)
             except BaseException as exc:
                 # What the adapter managed to say before this call stopped producing outcomes. A
                 # boundary raised by the race is not something the adapter can stamp, and an
@@ -566,17 +653,31 @@ class ModelCallRunner:
         # *no* receipt was produced at all and an answer the provider had already been paid for was
         # discarded over a token counter. `_recordable_usage` already refuses to fail a paid call
         # over a malformed usage *value*; this is the same rule for a malformed usage *type*.
-        usage = getattr(turn, "usage", None)
+        try:
+            usage = getattr(turn, "usage", None)
+            normalized_usage = (
+                normalize_json_ingress(dict(usage)) if isinstance(usage, Mapping) else {}
+            )
+        except Exception:
+            normalized_usage = {}
+        try:
+            stop_reason = normalize_unicode_scalars(str(getattr(turn, "stop_reason", "") or ""))
+        except Exception:
+            stop_reason = ""
+        try:
+            turn_retried = bool(getattr(turn, "provider_retried", False))
+        except Exception:
+            turn_retried = False
         return replace(
             receipt,
-            stop_reason=str(getattr(turn, "stop_reason", "") or ""),
-            usage=_recordable_usage(usage if isinstance(usage, Mapping) else {}),
+            stop_reason=stop_reason,
+            usage=_recordable_usage(normalized_usage),
             # Probed rather than read as an attribute: a third-party adapter may return any
             # turn-shaped object, and a missing flag means "did not retry", which is true of every
             # adapter with no retry loop. Combined with what the adapter reported through the
             # channel, since either alone is a partial view and neither can contradict the other:
             # both only ever say that a retry happened.
-            provider_retried=retried or bool(getattr(turn, "provider_retried", False)),
+            provider_retried=retried or turn_retried,
         )
 
     def _publish(
@@ -670,16 +771,49 @@ class ModelCallRunner:
         async def consume() -> ModelTurn:
             nonlocal retried
             chunks: list[ModelStreamChunk] = []
+            ingress = ModelStreamIngressNormalizer()
             try:
                 async for chunk in agen:
                     if not driving:
                         break
-                    if getattr(chunk, "provider_retried", False):
-                        retried = True
-                    chunks.append(chunk)
-                    delta_consumer(chunk)
+                    try:
+                        normalized_chunks = ingress.normalize(chunk)
+                    except ModelAdapterError:
+                        raise
+                    except Exception as exc:
+                        raise ModelAdapterError(
+                            "model adapter returned a non-portable stream fragment"
+                        ) from exc
+                    for normalized_chunk in normalized_chunks:
+                        if getattr(normalized_chunk, "provider_retried", False):
+                            retried = True
+                        chunks.append(normalized_chunk)
+                        delta_consumer(normalized_chunk)
                     if should_abort is not None and should_abort():
+                        for normalized_chunk in ingress.finish():
+                            if getattr(normalized_chunk, "provider_retried", False):
+                                retried = True
+                            chunks.append(normalized_chunk)
+                            delta_consumer(normalized_chunk)
                         raise ModelCallAborted("model call aborted")
+                for normalized_chunk in ingress.finish():
+                    if getattr(normalized_chunk, "provider_retried", False):
+                        retried = True
+                    chunks.append(normalized_chunk)
+                    delta_consumer(normalized_chunk)
+            except BaseException:
+                # A boundary can end the stream after a provider-delivered high surrogate and
+                # before its continuation arrives.  At that point the unit is definitively lone;
+                # deliver its replacement before propagating the original outcome.  Preserve the
+                # original failure if a diagnostic consumer also rejects the synthetic suffix.
+                if driving:
+                    with contextlib.suppress(Exception):
+                        for normalized_chunk in ingress.finish():
+                            if getattr(normalized_chunk, "provider_retried", False):
+                                retried = True
+                            chunks.append(normalized_chunk)
+                            delta_consumer(normalized_chunk)
+                raise
             finally:
                 # Provider async iterators own network resources, so the iterator is closed
                 # explicitly rather than left to finalization.

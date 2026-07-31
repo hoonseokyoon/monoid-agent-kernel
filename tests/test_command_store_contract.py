@@ -69,6 +69,40 @@ def test_bearer_redaction_covers_nested_keys_and_values() -> None:
     }
 
 
+def test_store_rejects_float_overflowing_control_numbers(store: CommandStore) -> None:
+    with pytest.raises(ValueError, match="command created_at must be a finite number"):
+        store.append(_command("cmd_huge", created_at=10**400), max_pending=10)
+
+    store.append(_command("cmd_claim"), max_pending=10)
+    with pytest.raises(ValueError, match="claim_ttl_s must be a finite number"):
+        store.claim("run_1", "worker", claim_ttl_s=10**400)
+
+
+def test_store_rejects_string_subclasses_before_command_type_membership(
+    store: CommandStore,
+) -> None:
+    class SpoofedCommandType(str):
+        def __new__(cls):
+            return super().__new__(cls, "evil")
+
+        def __hash__(self) -> int:
+            return hash("status")
+
+        def __eq__(self, _other: object) -> bool:
+            return True
+
+    command = StoredCommand(
+        run_id="run_1",
+        command_id="cmd_spoofed_type",
+        type=SpoofedCommandType(),
+        args={},
+        principal=CommandPrincipal("tenant", "user", "operator"),
+    )
+
+    with pytest.raises(ValueError, match="command type must be a string"):
+        store.append(command, max_pending=10)
+
+
 def test_retained_replace_config_command_migrates_pre_v020_literal_bangs() -> None:
     config = runtime_config(
         bindings=(

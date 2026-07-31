@@ -19,11 +19,14 @@ from monoid_agent_kernel.core.wire_validation import (
     require_object,
 )
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
+from monoid_agent_kernel.providers._common import normalize_usage
 from monoid_agent_kernel.providers.base import (
     ModelAdapter,
     ModelRequest,
+    ModelStreamIngressNormalizer,
     ModelStreamChunk,
     ModelTurn,
     ReasoningDelta,
@@ -32,6 +35,7 @@ from monoid_agent_kernel.providers.base import (
     ToolObservation,
     TurnComplete,
     assemble_streamed_turn,
+    normalize_model_turn,
 )
 from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
 from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
@@ -74,10 +78,11 @@ class LlmGatewayUsage:
     total_tokens: int = 0
 
     def add(self, usage: dict[str, int]) -> None:
+        normalized = normalize_usage(usage)
         self.calls += 1
-        self.input_tokens += int(usage.get("input_tokens") or 0)
-        self.output_tokens += int(usage.get("output_tokens") or 0)
-        self.total_tokens += int(usage.get("total_tokens") or 0)
+        self.input_tokens += normalized["input_tokens"]
+        self.output_tokens += normalized["output_tokens"]
+        self.total_tokens += normalized["total_tokens"]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -99,28 +104,37 @@ class LlmGatewayBackend:
 
     def handle_turn(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
+        payload = normalize_json_ingress(payload)
         request = _parse_turn_request(payload)
         self._validate_request_against_claims(request, claims)
         # By-value carries the full conversation as messages → forward statelessly, no
         # handle lookup. The legacy by-reference path still translates handle → response id.
         provider_previous_response_id = (
-            None if request.messages is not None else self._provider_previous_response_id(request, claims)
+            None
+            if request.messages is not None
+            else self._provider_previous_response_id(request, claims)
         )
         adapter = self._build_adapter(claims, request)
-        turn = adapter.next_turn(
-            ModelRequest(
-                instruction=request.instruction,
-                system_prompt=request.system_prompt,
-                tools=request.tools,
-                previous_turn_handle=provider_previous_response_id,
-                observations=request.observations,
-                model=ModelConfig(provider="openai", model=request.model, reasoning=request.reasoning),
-                messages=request.messages,
+        turn = normalize_model_turn(
+            adapter.next_turn(
+                ModelRequest(
+                    instruction=request.instruction,
+                    system_prompt=request.system_prompt,
+                    tools=request.tools,
+                    previous_turn_handle=provider_previous_response_id,
+                    observations=request.observations,
+                    model=ModelConfig(
+                        provider="openai", model=request.model, reasoning=request.reasoning
+                    ),
+                    messages=request.messages,
+                )
             )
         )
         turn_handle = self._record_turn(claims, request, turn)
         with self._lock:
-            self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(turn.usage)
+            self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(
+                turn.usage
+            )
         return {
             "protocol": namespaced_id("llm-turn-result.v1"),
             "turn_handle": turn_handle,
@@ -149,10 +163,13 @@ class LlmGatewayBackend:
         ``turn_complete`` frame is yielded.
         """
         claims = self._authorize(token)
+        payload = normalize_json_ingress(payload)
         request = _parse_turn_request(payload)
         self._validate_request_against_claims(request, claims)
         provider_previous_response_id = (
-            None if request.messages is not None else self._provider_previous_response_id(request, claims)
+            None
+            if request.messages is not None
+            else self._provider_previous_response_id(request, claims)
         )
         adapter = self._build_adapter(claims, request)
         model_request = ModelRequest(
@@ -177,7 +194,22 @@ class LlmGatewayBackend:
         collected: list[ModelStreamChunk] = []
         astream_turn = getattr(adapter, "astream_turn", None)
         if astream_turn is not None:
-            for chunk in _pump_astream(astream_turn, model_request):
+            ingress = ModelStreamIngressNormalizer()
+            try:
+                for provider_chunk in _pump_astream(astream_turn, model_request):
+                    for chunk in ingress.normalize(provider_chunk):
+                        collected.append(chunk)
+                        frame = _chunk_to_frame(chunk)
+                        if frame is not None:
+                            yield frame
+            except BaseException:
+                for chunk in ingress.finish():
+                    collected.append(chunk)
+                    frame = _chunk_to_frame(chunk)
+                    if frame is not None:
+                        yield frame
+                raise
+            for chunk in ingress.finish():
                 collected.append(chunk)
                 frame = _chunk_to_frame(chunk)
                 if frame is not None:
@@ -185,7 +217,7 @@ class LlmGatewayBackend:
         else:
             # The provider can't stream: synthesize a minimal delta sequence from the
             # one-shot turn so consumers still see text/tool frames before turn_complete.
-            turn = adapter.next_turn(model_request)
+            turn = normalize_model_turn(adapter.next_turn(model_request))
             # The synthesized chunks carry the turn's retry evidence too. They stand in for a
             # stream the provider could not produce, so anything the turn reports about the call
             # has to survive the substitution.
@@ -198,7 +230,11 @@ class LlmGatewayBackend:
             for index, call in enumerate(turn.tool_calls):
                 chunk = ToolCallDelta(
                     index=index,
-                    arguments_fragment=json.dumps(call.arguments, ensure_ascii=False),
+                    arguments_fragment=json.dumps(
+                        call.arguments,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ),
                     id=call.id,
                     name=call.name,
                     provider_retried=turn.provider_retried,
@@ -215,10 +251,12 @@ class LlmGatewayBackend:
             )
         # Assemble once: the same usage drives both the meter and the outgoing frame, and the
         # assembled response id is what the opaque turn_handle maps to for continuation.
-        turn = assemble_streamed_turn(collected)
+        turn = normalize_model_turn(assemble_streamed_turn(collected))
         turn_handle = self._record_turn(claims, request, turn)
         with self._lock:
-            self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(turn.usage)
+            self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(
+                turn.usage
+            )
         yield {
             "type": "turn_complete",
             "turn_handle": turn_handle,
@@ -366,12 +404,19 @@ def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
     protocol = parse_str(payload, "protocol")
     if protocol not in ACCEPTED_LLM_TURN_PROTOCOL_VERSIONS:
         raise ValueError("unsupported LLM gateway protocol")
-    reasoning_raw = require_object(payload["reasoning"], "reasoning") if "reasoning" in payload else {}
+    reasoning_raw = (
+        require_object(payload["reasoning"], "reasoning") if "reasoning" in payload else {}
+    )
     previous_turn_handle = parse_str(payload, "previous_turn_handle") or None
-    observations = tuple(_parse_observation(item) for item in optional_list(payload, "observations"))
+    observations = tuple(
+        _parse_observation(item) for item in optional_list(payload, "observations")
+    )
     instruction = parse_str(payload, "instruction")
     messages = (
-        tuple(require_object(item, "message") for item in require_list(payload["messages"], "messages"))
+        tuple(
+            require_object(item, "message")
+            for item in require_list(payload["messages"], "messages")
+        )
         if payload.get("messages") is not None
         else None
     )

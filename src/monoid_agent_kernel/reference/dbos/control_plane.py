@@ -25,6 +25,11 @@ from typing import Any, Literal, get_args
 from urllib.parse import quote
 
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
+from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference._shared.control_transport import (
@@ -58,6 +63,12 @@ DBOS_CONTROL_STEP_NAME = namespaced_id("reference.dbos-control-step.v1")
 
 DbosControlType = Literal["pause", "resume", "cancel", "status"]
 DbosDispatcher = Callable[["DbosControlEnvelope"], ControlResult]
+
+
+def _envelope_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"DBOS control {field_name} must be a string")
+    return normalize_unicode_scalars(value)
 
 
 @dataclass(frozen=True)
@@ -112,13 +123,39 @@ class DbosControlEnvelope:
     created_at: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
-        if not self.run_id or not self.command_id:
+        run_id = _envelope_text(self.run_id, "run_id")
+        command_id = _envelope_text(self.command_id, "command_id")
+        command_type = _envelope_text(self.type, "type")
+        if not run_id or not command_id:
             raise ValueError("run_id and command_id are required")
-        if self.type not in get_args(DbosControlType):
-            raise ValueError(f"unsupported DBOS control command: {self.type!r}")
-        sanitized = sanitize_command_data(self.args)
-        if sanitized != self.args:
+        if command_type not in get_args(DbosControlType):
+            raise ValueError(f"unsupported DBOS control command: {command_type!r}")
+        if not isinstance(self.args, dict):
+            raise ValueError("DBOS control args must be an object")
+        args = normalize_json_ingress(self.args)
+        assert isinstance(args, dict)
+        sanitized = sanitize_command_data(args)
+        if sanitized != args:
             raise ValueError("DBOS control args must be credential-free before persistence")
+        if not isinstance(self.principal, CommandPrincipal):
+            raise ValueError("DBOS control principal must be a CommandPrincipal")
+        principal = CommandPrincipal(
+            tenant_id=_envelope_text(self.principal.tenant_id, "principal tenant_id"),
+            user_id=_envelope_text(self.principal.user_id, "principal user_id"),
+            issuer=_envelope_text(self.principal.issuer, "principal issuer"),
+        )
+        token_sha256 = _envelope_text(self.token_sha256, "token_sha256")
+        reason = _envelope_text(self.reason, "reason")
+        if not is_finite_json_number(self.created_at):
+            raise ValueError("DBOS control created_at must be a finite number")
+        object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "command_id", command_id)
+        object.__setattr__(self, "type", command_type)
+        object.__setattr__(self, "args", args)
+        object.__setattr__(self, "principal", principal)
+        object.__setattr__(self, "token_sha256", token_sha256)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "created_at", float(self.created_at))
 
     @property
     def identity_sha256(self) -> str:
@@ -145,6 +182,8 @@ class DbosControlEnvelope:
 
     @classmethod
     def from_json(cls, payload: Mapping[str, Any]) -> DbosControlEnvelope:
+        if not isinstance(payload, Mapping):
+            raise ValueError("DBOS control envelope must be an object")
         if payload.get("schema_version") != _DBOS_CONTROL_ENVELOPE_VERSION:
             raise ValueError("unsupported DBOS control envelope version")
         principal_payload = payload.get("principal")
@@ -154,20 +193,20 @@ class DbosControlEnvelope:
         if not isinstance(args, dict):
             raise ValueError("DBOS control args must be an object")
         envelope = cls(
-            run_id=str(payload.get("run_id") or ""),
-            command_id=str(payload.get("command_id") or ""),
-            type=str(payload.get("type") or ""),  # type: ignore[arg-type]
+            run_id=payload.get("run_id", ""),  # type: ignore[arg-type]
+            command_id=payload.get("command_id", ""),  # type: ignore[arg-type]
+            type=payload.get("type", ""),  # type: ignore[arg-type]
             args=dict(args),
             principal=CommandPrincipal(
-                tenant_id=str(principal_payload.get("tenant_id") or ""),
-                user_id=str(principal_payload.get("user_id") or ""),
-                issuer=str(principal_payload.get("issuer") or ""),
+                tenant_id=principal_payload.get("tenant_id", ""),  # type: ignore[arg-type]
+                user_id=principal_payload.get("user_id", ""),  # type: ignore[arg-type]
+                issuer=principal_payload.get("issuer", ""),  # type: ignore[arg-type]
             ),
-            token_sha256=str(payload.get("token_sha256") or ""),
-            reason=str(payload.get("reason") or ""),
-            created_at=float(payload.get("created_at") or 0.0),
+            token_sha256=payload.get("token_sha256", ""),  # type: ignore[arg-type]
+            reason=payload.get("reason", ""),  # type: ignore[arg-type]
+            created_at=payload.get("created_at", 0.0),  # type: ignore[arg-type]
         )
-        recorded_identity = str(payload.get("identity_sha256") or "")
+        recorded_identity = _envelope_text(payload.get("identity_sha256", ""), "identity_sha256")
         if recorded_identity and recorded_identity != envelope.identity_sha256:
             raise ValueError("DBOS control envelope identity mismatch")
         return envelope
@@ -180,14 +219,25 @@ class DbosControlEnvelope:
         tenant_id: str,
         user_id: str,
     ) -> DbosControlEnvelope:
+        if not isinstance(command, ControlCommand):
+            raise ValueError("command must be a ControlCommand")
         if command.type not in get_args(DbosControlType):
             raise ValueError(f"command {command.type!r} is not supported by the DBOS spike")
+        tenant_id = _envelope_text(tenant_id, "principal tenant_id")
+        user_id = _envelope_text(user_id, "principal user_id")
         if not tenant_id or not user_id:
             raise ValueError("authenticated tenant_id and user_id are required")
+        if not isinstance(command.args, dict):
+            raise ValueError("DBOS control args must be an object")
         args = dict(command.args)
-        token = str(args.pop("token", "") or "")
-        command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
-        if token and (token in command.run_id or token in command_id):
+        token = args.pop("token", "")
+        if not isinstance(token, str):
+            raise ValueError("DBOS control token must be a string")
+        token = normalize_unicode_scalars(token)
+        run_id = _envelope_text(command.run_id, "run_id")
+        raw_command_id = _envelope_text(command.command_id, "command_id")
+        command_id = raw_command_id or f"control_{uuid.uuid4().hex[:12]}"
+        if token and (token in run_id or token in command_id):
             raise NativeAgentError(
                 "run_id and command_id must not contain the authenticated credential",
                 error_code="invalid_command_id",
@@ -199,17 +249,17 @@ class DbosControlEnvelope:
             token,
         )
         return cls(
-            run_id=command.run_id,
+            run_id=run_id,
             command_id=command_id,
             type=command.type,  # type: ignore[arg-type]
             args=dict(execution_args),
             principal=CommandPrincipal(
-                tenant_id=str(redact_command_credential(tenant_id, token)),
-                user_id=str(redact_command_credential(user_id, token)),
-                issuer=str(redact_command_credential(command.issuer, token)),
+                tenant_id=redact_command_credential(tenant_id, token),
+                user_id=redact_command_credential(user_id, token),
+                issuer=redact_command_credential(command.issuer, token),
             ),
             token_sha256=TokenManager.token_sha256(token),
-            reason=str(redact_command_credential(command.reason, token)),
+            reason=redact_command_credential(command.reason, token),
         )
 
 
@@ -335,9 +385,7 @@ class DbosControlPlane:
     def _preflight_queue_configuration(self) -> None:
         from sqlalchemy.exc import DBAPIError
 
-        client = self._dbos_module.DBOSClient(
-            system_database_url=self.config.system_database_url
-        )
+        client = self._dbos_module.DBOSClient(system_database_url=self.config.system_database_url)
         try:
             try:
                 queue = self._register_control_queue(client)
@@ -384,8 +432,9 @@ class DbosControlPlane:
     def _enqueue_envelope(self, command: DbosControlEnvelope) -> CommandReceipt:
         self._require_launched()
         workflow_id = self.workflow_id(command.run_id, command.command_id)
-        with self._dbos_module.SetWorkflowID(workflow_id), self._dbos_module.SetEnqueueOptions(
-            queue_partition_key=command.run_id
+        with (
+            self._dbos_module.SetWorkflowID(workflow_id),
+            self._dbos_module.SetEnqueueOptions(queue_partition_key=command.run_id),
         ):
             handle = self._runtime.enqueue_workflow(
                 self._queue_name,
@@ -741,9 +790,7 @@ class _HostedDbosControlPlane(DbosControlPlane):
     def _raise_hosted_ownership_error(self) -> None:
         with self._state_lock:
             self._accepting = False
-        self._host._fence(
-            "DBOS control-plane runtime ownership changed; terminate the process"
-        )
+        self._host._fence("DBOS control-plane runtime ownership changed; terminate the process")
         raise DbosProcessOwnershipError(
             "DBOS process-global runtime ownership changed; terminate the process"
         ) from None

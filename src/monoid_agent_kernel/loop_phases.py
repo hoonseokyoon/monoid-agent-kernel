@@ -18,11 +18,20 @@ from monoid_agent_kernel.core.output_validator import (
     OutputValidator,
     OutputValidatorError,
     ValidationOutcome,
+    validate_validation_outcome,
 )
-from monoid_agent_kernel.core.result import AgentArtifact, AgentRunResult, AgentTurnResult, Suspension
+from monoid_agent_kernel.core.result import (
+    AgentArtifact,
+    AgentRunResult,
+    AgentTurnResult,
+    Suspension,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.streaming import QueueEventSink
-from monoid_agent_kernel.core.tool_surface import tool_surface_manifest
+from monoid_agent_kernel.core.tool_surface import (
+    tool_surface_manifest,
+    validate_tool_surface_snapshot,
+)
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.core.workspace_index import build_workspace_index
 from monoid_agent_kernel.model_call import ModelCallRunner
@@ -75,7 +84,9 @@ def _output_repair_message(failures: list[tuple[str, str]]) -> str:
         "Correct it and respond again:"
     ]
     for validator_id, feedback in failures:
-        lines.append(f"- ({validator_id}) {feedback}" if feedback else f"- ({validator_id}) invalid output")
+        lines.append(
+            f"- ({validator_id}) {feedback}" if feedback else f"- ({validator_id}) invalid output"
+        )
     return "\n".join(lines)
 
 
@@ -86,11 +97,7 @@ def _run_output_validators(
     ok_values: list[tuple[str, Any]] = []
     for validator in validators:
         try:
-            outcome = validator.validate(view)
-            if not isinstance(outcome, ValidationOutcome):
-                raise TypeError(
-                    f"validate() must return a ValidationOutcome, got {type(outcome).__name__}"
-                )
+            outcome = validate_validation_outcome(validator.validate(view))
         except OutputRetry as exc:
             outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
         except ValueError as exc:
@@ -124,7 +131,10 @@ class LoopBootstrapper:
 
     def bootstrap(self) -> _RunResources:
         loop = self._loop
-        if loop.permission_policy == PermissionPolicy() and loop.spec.permission_policy != PermissionPolicy():
+        if (
+            loop.permission_policy == PermissionPolicy()
+            and loop.spec.permission_policy != PermissionPolicy()
+        ):
             loop.permission_policy = loop.spec.permission_policy
         workspace_factory = loop.workspace_factory or default_local_workspace_factory
         workspace = workspace_factory(loop.spec)
@@ -229,9 +239,11 @@ class LoopBootstrapper:
             plan=(),
             pending_observation_count=0,
         )
-        initial_surface = loop.tool_surface_resolver.resolve(
-            bound_catalog=initial_bound_catalog,
-            turn=initial_turn,
+        initial_surface = validate_tool_surface_snapshot(
+            loop.tool_surface_resolver.resolve(
+                bound_catalog=initial_bound_catalog,
+                turn=initial_turn,
+            )
         )
         initial_visible_tool_specs = list(initial_surface.immediate_tools)
         workspace_index = build_workspace_index(workspace, run_id=loop.spec.run_id)
@@ -265,8 +277,12 @@ class LoopBootstrapper:
                     "config_version": initial_runtime_config.config_version,
                     "config_hash": initial_runtime_config.config_hash,
                 },
-                workspace_index_path=str(workspace_index_path.relative_to(recorder.run_dir).as_posix()),
-                workspace_base_path=str(workspace_base_path.relative_to(recorder.run_dir).as_posix()),
+                workspace_index_path=str(
+                    workspace_index_path.relative_to(recorder.run_dir).as_posix()
+                ),
+                workspace_base_path=str(
+                    workspace_base_path.relative_to(recorder.run_dir).as_posix()
+                ),
             )
             recorder.write_manifest(manifest)
             recorder.emit(
@@ -280,7 +296,9 @@ class LoopBootstrapper:
                     "workspace_base_path": "workspace.base.json",
                     "model_provider": (initial_runtime_config.model or ModelConfig()).provider,
                     "model": (initial_runtime_config.model or ModelConfig()).model,
-                    "reasoning_effort": (initial_runtime_config.model or ModelConfig()).reasoning.effort,
+                    "reasoning_effort": (
+                        initial_runtime_config.model or ModelConfig()
+                    ).reasoning.effort,
                     "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
                     "agent_config_hash": initial_runtime_config.config_hash,
                 },
@@ -315,13 +333,19 @@ class LoopSettleCoordinator:
         loop = self._loop
         if turn.stop_reason == "refusal":
             return SettleDecision(
-                kind="terminal", reason="settled", status="failed",
-                error_code="output_refused", terminal_reason="refusal",
+                kind="terminal",
+                reason="settled",
+                status="failed",
+                error_code="output_refused",
+                terminal_reason="refusal",
             )
         if turn.stop_reason == "length":
             return SettleDecision(
-                kind="terminal", reason="limited", status="limited",
-                error_code="output_truncated", terminal_reason="truncation",
+                kind="terminal",
+                reason="limited",
+                status="limited",
+                error_code="output_truncated",
+                terminal_reason="truncation",
             )
 
         validators = loop._active_output_validators(runtime_config)
@@ -329,7 +353,9 @@ class LoopSettleCoordinator:
             return SettleDecision(kind="accept")
 
         view = self.build_final_output_view(state, res, context)
-        failures, ok_values, defect = await asyncio.to_thread(_run_output_validators, validators, view)
+        failures, ok_values, defect = await asyncio.to_thread(
+            _run_output_validators, validators, view
+        )
         if defect is not None:
             return SettleDecision(kind="defect", defect=defect)
         if not failures:
@@ -342,8 +368,11 @@ class LoopSettleCoordinator:
         }
         if state.output_retries >= loop.spec.limits.max_output_retries:
             return SettleDecision(
-                kind="exhausted", reason="limited", status="limited",
-                error_code="output_validator_unsatisfied", new_history_entry=entry,
+                kind="exhausted",
+                reason="limited",
+                status="limited",
+                error_code="output_validator_unsatisfied",
+                new_history_entry=entry,
             )
         return SettleDecision(kind="reprompt", failures=tuple(failures), new_history_entry=entry)
 
@@ -369,7 +398,9 @@ class LoopSettleCoordinator:
 
         if decision.new_history_entry is not None:
             state.output_failure_history.append(decision.new_history_entry)
-            recorder.emit("output.validation.failed", data=decision.new_history_entry, level="warning")
+            recorder.emit(
+                "output.validation.failed", data=decision.new_history_entry, level="warning"
+            )
 
         if decision.kind == "accept":
             state.output_values = dict(decision.ok_values)
@@ -379,7 +410,11 @@ class LoopSettleCoordinator:
         elif decision.kind == "terminal":
             state.status = decision.status
             state.error_code = decision.error_code
-            recorder.emit("output.validation.failed", data={"reason": decision.terminal_reason}, level="warning")
+            recorder.emit(
+                "output.validation.failed",
+                data={"reason": decision.terminal_reason},
+                level="warning",
+            )
         elif decision.kind == "exhausted":
             state.status = decision.status
             if not state.final_text:
@@ -415,7 +450,9 @@ class LoopSettleCoordinator:
 
         if decision.kind == "reprompt":
             state.pending_observations = ()
-            state.messages.append({"role": "user", "content": _output_repair_message(list(decision.failures))})
+            state.messages.append(
+                {"role": "user", "content": _output_repair_message(list(decision.failures))}
+            )
             return None
 
         if decision.kind == "accept":
@@ -498,7 +535,8 @@ class LoopFinalizer:
         context = res.context
         model = (
             state.previous_runtime_config.model
-            if state.previous_runtime_config is not None and state.previous_runtime_config.model is not None
+            if state.previous_runtime_config is not None
+            and state.previous_runtime_config.model is not None
             else ModelConfig()
         )
         metrics = {
@@ -514,7 +552,8 @@ class LoopFinalizer:
             # in the third file. Found by driving runs and grepping the output rather than by reading
             # this function, which is how it survived several passes over the surrounding code.
             "changed_paths": [
-                public_path(str(path), loop.permission_policy) for path in res.workspace.changed_paths()
+                public_path(str(path), loop.permission_policy)
+                for path in res.workspace.changed_paths()
             ],
             "workspace_backend": loop.spec.workspace_backend,
             "requested_reasoning_effort": model.reasoning.effort,
@@ -643,7 +682,9 @@ class LoopFinalizer:
                 **_settled_text_fields(recorder, state),
                 "error_code": state.error_code,
                 "changed_paths": public_changed,
-                "output_validators": len(loop._active_output_validators(state.previous_runtime_config)),
+                "output_validators": len(
+                    loop._active_output_validators(state.previous_runtime_config)
+                ),
                 "output_retries": state.output_retries,
             },
         )

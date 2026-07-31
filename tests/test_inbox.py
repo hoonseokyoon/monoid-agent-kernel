@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from support.runtime import runtime_config
 from support.waiting import eventually
 
@@ -21,6 +23,7 @@ from monoid_agent_kernel.reference.backend.service import (
     RunnerBackend,
     _queued_message_to_loop_input,
 )
+from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore
 
 
 # --- envelope contract --------------------------------------------------------------------
@@ -85,7 +88,10 @@ def _backend(backend_factory: Any, turns: list[ModelTurn]) -> tuple[RunnerBacken
 def test_duplicate_message_id_is_processed_once(backend_factory: Any) -> None:
     backend, workspace = _backend(
         backend_factory,
-        [ModelTurn(response_id="r1", final_text="first"), ModelTurn(response_id="r2", final_text="second")],
+        [
+            ModelTurn(response_id="r1", final_text="first"),
+            ModelTurn(response_id="r2", final_text="second"),
+        ],
     )
     submission = backend.submit_run(
         BackendRunRequest(
@@ -119,7 +125,9 @@ def test_duplicate_message_id_is_processed_once(backend_factory: Any) -> None:
 
 
 def test_send_message_propagates_trace_context_onto_envelope(backend_factory: Any) -> None:
-    backend, workspace = _backend(backend_factory, [ModelTurn(response_id="r1", final_text="first")])
+    backend, workspace = _backend(
+        backend_factory, [ModelTurn(response_id="r1", final_text="first")]
+    )
     submission = backend.submit_run(
         BackendRunRequest(
             tenant_id="tenant_a",
@@ -146,15 +154,132 @@ def test_send_message_propagates_trace_context_onto_envelope(backend_factory: An
 
     object.__setattr__(backend._session_boundary._context, "enqueue_message_and_checkpoint", spy)
     tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-    backend.send_message(run_id, token, content="go", message_id="m1", traceparent=tp, tracestate="v=1")
+    backend.send_message(
+        run_id, token, content="go", message_id="m1", traceparent=tp, tracestate="v=1"
+    )
     assert captured and captured[0]["traceparent"] == tp and captured[0]["tracestate"] == "v=1"
 
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)
 
 
+def test_send_message_normalizes_before_sqlite_checkpoint(
+    backend_factory: Any,
+    tmp_path: Path,
+) -> None:
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(
+        workspace=workspace,
+        checkpoint_store=SqliteCheckpointStore(tmp_path / "shared.db"),
+        turns=[
+            ModelTurn(response_id="r1", final_text="first"),
+            ModelTurn(response_id="r2", final_text="second"),
+        ],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=runtime_config("fs.read", "run.finish"),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
+    captured: list[dict[str, Any]] = []
+    original = backend._session_boundary._context.enqueue_message_and_checkpoint
+
+    def spy(record: Any, message: Any) -> None:
+        captured.append(message)
+        original(record, message)
+
+    object.__setattr__(backend._session_boundary._context, "enqueue_message_and_checkpoint", spy)
+    queued = backend.send_message(
+        run_id,
+        token,
+        content="hello\ud800",
+        message_id="message\ud800",
+        source="source\ud800",
+        metadata={"score": float("nan"), "label": "bad\ud800"},
+    )
+
+    assert queued == {
+        "run_id": run_id,
+        "status": "queued",
+        "message_id": "message\ufffd",
+    }
+    assert captured[0]["content"] == "hello\ufffd"
+    assert captured[0]["source"] == "source\ufffd"
+    assert captured[0]["metadata"] == {"score": None, "label": "bad\ufffd"}
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
+def test_send_message_validates_envelope_before_persisting_inline_media(
+    backend_factory: Any,
+    tmp_path: Path,
+) -> None:
+    workspace = backend_factory.workspace()
+    store = SqliteCheckpointStore(tmp_path / "shared.db")
+    backend = backend_factory.create(
+        workspace=workspace,
+        checkpoint_store=store,
+        turns=[ModelTurn(response_id="r1", final_text="first")],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=runtime_config("fs.read", "run.finish"),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state.value == "awaiting_input")
+
+    persisted: list[bytes] = []
+    original_put_blob = store.put_blob
+
+    def spy_put_blob(received_run_id: str, data: bytes) -> str:
+        persisted.append(data)
+        return original_put_blob(received_run_id, data)
+
+    store.put_blob = spy_put_blob  # type: ignore[method-assign]
+    inline_image = {
+        "type": "image",
+        "source_ref": "data:image/png;base64,YQ==",
+        "mime_type": "image/png",
+    }
+    colliding_metadata: dict[str, int] = {}
+    colliding_metadata["\ud800"] = 1
+    colliding_metadata["\ufffd"] = 2
+    with pytest.raises(ValueError, match="collide after ingress normalization"):
+        backend.send_message(
+            run_id,
+            token,
+            content=[inline_image],
+            metadata=colliding_metadata,
+        )
+    assert persisted == []
+
+    object.__setattr__(backend._session_boundary._context, "max_message_bytes_provider", lambda: 1)
+    with pytest.raises(ValueError, match="exceeds"):
+        backend.send_message(run_id, token, content=[inline_image])
+    assert persisted == []
+
+    backend.cancel_run(run_id, token)
+    backend.wait_for_run(run_id, timeout_s=20)
+
+
 def test_message_without_id_gets_a_generated_envelope_id(backend_factory: Any) -> None:
-    backend, workspace = _backend(backend_factory, [ModelTurn(response_id="r1", final_text="first")])
+    backend, workspace = _backend(
+        backend_factory, [ModelTurn(response_id="r1", final_text="first")]
+    )
     submission = backend.submit_run(
         BackendRunRequest(
             tenant_id="tenant_a",

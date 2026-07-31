@@ -24,7 +24,15 @@ from monoid_agent_kernel.core._util import (
     write_json_atomic,
 )
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
-from monoid_agent_kernel.core.lifecycle import SessionState, session_state_from_run_status, session_state_value
+from monoid_agent_kernel.core.json_ingress import (
+    loads_json_ingress,
+    normalize_json_ingress,
+)
+from monoid_agent_kernel.core.lifecycle import (
+    SessionState,
+    session_state_from_run_status,
+    session_state_value,
+)
 from monoid_agent_kernel.core.manifest import RunManifest
 from monoid_agent_kernel.core.model_io import content_digest, content_length
 from monoid_agent_kernel.core.result import AgentArtifact
@@ -453,7 +461,7 @@ class AgentRecorder:
             "finished_at": time.time(),
             **metrics,
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json_atomic(path, payload)
         return path
 
     def write_failure(self, payload: dict[str, Any]) -> Path:
@@ -489,27 +497,14 @@ class AgentRecorder:
 
 
 def _write_jsonl(handle: TextIO, payload: dict[str, Any]) -> None:
-    line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
     try:
         line.encode("utf-8")
     except UnicodeEncodeError:
-        # JSON permits a lone surrogate (``\ud800``); UTF-8 cannot encode one. ``json.loads`` hands
-        # them back happily -- from a tool-call argument, an HTTP body, or the user's own
-        # instruction -- and this write then raised ``UnicodeEncodeError``, which surfaced as
-        # ``_CheckpointPersistError`` out of ``run_once``. One character in a prompt ended the run,
-        # with no model involved.
-        #
-        # Retrying with ``ensure_ascii=True`` escapes it to a ``\udXXX`` sequence and writes valid,
-        # ASCII-safe JSON. Only the offending record pays for it: ordinary Hangul and emoji stay raw
-        # and compact on the common path, which is why the flag is not simply flipped.
-        #
-        # **This does not make a run survive a lone surrogate.** ``preview_value``'s byte
-        # measurement and ``canonical_sha256`` both call ``.encode("utf-8")`` and raise first; the
-        # only complete fix is to sanitize on the way in, which is a wider change than this hardening
-        # and is recorded as an open gap in the changelog. What this *does* close is the write itself
-        # -- notably ``write_json_atomic``, which failed between the temp write and the replace and
-        # left an orphan ``.tmp`` in the run root forever.
-        line = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        # Manually constructed events can bypass semantic ingress. Repair them to valid Unicode so
+        # the persisted record remains encodable after it is read and projected onto a later wire.
+        normalized = normalize_json_ingress(payload)
+        line = json.dumps(normalized, ensure_ascii=False, sort_keys=True, allow_nan=False)
     handle.write(line + "\n")
     handle.flush()
 
@@ -548,7 +543,7 @@ def _run_id_from_run_dir(run_dir: Path) -> str:
     status_path = run_dir / "status.json"
     if status_path.exists():
         try:
-            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status = loads_json_ingress(status_path.read_text(encoding="utf-8"))
             if isinstance(status, dict) and isinstance(status.get("run_id"), str):
                 return status["run_id"]
         except (OSError, ValueError):
@@ -556,7 +551,7 @@ def _run_id_from_run_dir(run_dir: Path) -> str:
     proposal_path = run_dir / "proposal.json"
     if proposal_path.exists():
         try:
-            proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+            proposal = loads_json_ingress(proposal_path.read_text(encoding="utf-8"))
             if isinstance(proposal, dict) and isinstance(proposal.get("run_id"), str):
                 return proposal["run_id"]
         except (OSError, ValueError):
@@ -572,7 +567,7 @@ def _read_status_last_event_seq(run_dir: Path) -> int | None:
     except (OSError, UnicodeError) as exc:
         raise EventLogCorruption("status event watermark cannot be verified") from exc
     try:
-        status = json.loads(raw_status)
+        status = loads_json_ingress(raw_status)
     except ValueError as exc:
         raise EventLogCorruption("status event watermark cannot be verified") from exc
     if not isinstance(status, dict):
@@ -602,7 +597,7 @@ def _update_status_last_event(run_dir: Path, event: AgentEvent) -> None:
     if not status_path.exists():
         return
     try:
-        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status = loads_json_ingress(status_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return
     if not isinstance(status, dict):

@@ -29,7 +29,15 @@ def test_the_empty_policy_already_masks_secret_named_keys() -> None:
 
 @pytest.mark.parametrize(
     "key",
-    ["api_key", "API_KEY", "X-Api-Key", "x_api_key", "authorization", "refresh_token", "db_password"],
+    [
+        "api_key",
+        "API_KEY",
+        "X-Api-Key",
+        "x_api_key",
+        "authorization",
+        "refresh_token",
+        "db_password",
+    ],
 )
 def test_secret_key_matching_folds_case_and_hyphens_and_matches_substrings(key: str) -> None:
     assert RedactionPolicy().names_a_secret(key) is True
@@ -75,6 +83,42 @@ def test_a_programmatic_rule_is_normalized_too() -> None:
     assert DefaultRedactor().redact({"API_KEY": "sk-leaks"}, policy=policy) == {
         "API_KEY": REDACTION_PLACEHOLDER
     }
+
+
+def test_programmatic_redaction_rules_share_the_unicode_scalar_domain() -> None:
+    policy = RedactionPolicy(
+        secret_key_parts=("api\ud800key",),
+        patterns=("secret\ud800value",),
+        literals=("literal\ud800value",),
+        replacement="[masked]\ud800",
+    )
+
+    assert policy.secret_key_parts == ("api\ufffdkey",)
+    assert policy.patterns == ("secret\ufffdvalue",)
+    assert policy.literals == ("literal\ufffdvalue",)
+    assert policy.replacement == "[masked]\ufffd"
+    assert policy.redact_text("literal\ufffdvalue secret\ufffdvalue") == (
+        "[masked]\ufffd [masked]\ufffd"
+    )
+    assert DefaultRedactor().redact({"api\ufffdkey": "TOPSECRET"}, policy=policy) == {
+        "api\ufffdkey": "[masked]\ufffd"
+    }
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"secret_key_parts": ["api_key"]},
+        {"patterns": ["secret"]},
+        {"literals": ["secret"]},
+        {"replacement": 7},
+    ],
+)
+def test_programmatic_redaction_controls_require_exact_string_shapes(
+    kwargs: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError):
+        RedactionPolicy(**kwargs)
 
 
 def test_a_hyphenated_rule_matches_the_keys_it_was_written_for() -> None:
@@ -395,9 +439,7 @@ def test_effective_redactor_is_none_for_a_policy_that_lost_its_custom_one() -> N
         def redact(self, value: Any, *, policy: RedactionPolicy) -> Any:
             return value
 
-    restored = CapturePolicy.from_json(
-        CapturePolicy(mode="redacted", redactor=Custom()).to_json()
-    )
+    restored = CapturePolicy.from_json(CapturePolicy(mode="redacted", redactor=Custom()).to_json())
 
     assert restored.effective_redactor is None
     # Still the default for a policy that never had one, which is what keeps zero-config redaction work.
@@ -453,7 +495,9 @@ def test_from_json_without_a_redactor_does_not_claim_one_was_lost() -> None:
     assert restored.restored_without_redactor is False
 
 
-def test_from_json_treats_absent_and_null_redaction_alike_but_still_validates_a_present_one() -> None:
+def test_from_json_treats_absent_and_null_redaction_alike_but_still_validates_a_present_one() -> (
+    None
+):
     assert CapturePolicy.from_json({"mode": "full"}).redaction is None
     assert CapturePolicy.from_json({"mode": "full", "redaction": None}).redaction is None
     with pytest.raises(WireValidationError):

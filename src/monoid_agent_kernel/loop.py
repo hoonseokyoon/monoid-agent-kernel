@@ -49,6 +49,11 @@ from monoid_agent_kernel.core.media import (
     normalize_inline_media_part,
     resolve_wire_messages,
 )
+from monoid_agent_kernel.core.json_ingress import (
+    loads_json_ingress,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.core.context import (
     ContextProvider,
     TurnContext,
@@ -71,6 +76,10 @@ from monoid_agent_kernel.core.agents import (
     validate_runtime_config,
 )
 from monoid_agent_kernel.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
+from monoid_agent_kernel._runtime_config_ingress import (
+    normalize_runtime_config,
+    preflight_runtime_config,
+)
 from monoid_agent_kernel.core.result import (
     AgentRunResult,
     AgentTurnResult,
@@ -98,6 +107,7 @@ from monoid_agent_kernel.core.tool_surface import (
     ToolSurfaceSnapshot,
     allowed_immediate_registry_tool_ids,
     immediate_registry_tool_ids,
+    validate_tool_surface_snapshot,
 )
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
@@ -145,7 +155,13 @@ from monoid_agent_kernel.core.capability import (
     CapabilityRequest,
     CapabilityVault,
 )
-from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
+from monoid_agent_kernel.core.outbox import (
+    Outbox,
+    OutboxReceipt,
+    OutboxRequest,
+    normalize_outbox_receipt,
+)
+from monoid_agent_kernel.core.runtime_controls import exact_runtime_bool, exact_runtime_string
 from monoid_agent_kernel.core.trace_context import new_traceparent
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.tasks import (
@@ -189,6 +205,8 @@ from monoid_agent_kernel.tools.base import (
     ToolRegistry,
     ToolResult,
     ToolSpec,
+    normalize_tool_result,
+    normalize_tool_spec,
 )
 from monoid_agent_kernel.tool_loader import FunctionToolProvider
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
@@ -204,14 +222,14 @@ class _CheckpointPersistError(RuntimeError):
 _LOGGER = logging.getLogger("monoid_agent_kernel.loop")
 
 
-
-
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     """True if a tool binding matches any fnmatch pattern. Matched against the binding's
     tool id, binding id, and model name, so subagent allow/deny lists accept ids
     (``fs.read``), patterns (``mcp.*``, ``mcp.github.*``), or ``*`` for all."""
     candidates = (binding.ref.tool_id, binding.binding_id, binding.model_name or "")
-    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name)
+    return any(
+        fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name
+    )
 
 
 def _recoverable_turn_error(exc: BaseException) -> bool:
@@ -381,6 +399,10 @@ class AgentToolContext(ToolContext):
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
     ) -> dict[str, Any]:
+        path = normalize_unicode_scalars(path)
+        kind = normalize_unicode_scalars(kind)
+        label = None if label is None else normalize_unicode_scalars(label)
+        metadata = normalize_json_ingress(metadata)
         data, _digest = self.workspace.read_bytes(path)
         artifact = self.recorder.emit_artifact_bytes(
             workspace_path=self.workspace.normalize(path),
@@ -415,7 +437,9 @@ class AgentToolContext(ToolContext):
                 # capped when it reaches ``tool.call.started`` through ``args_preview``, so leaving
                 # it raw here made the second emit the wider door -- the twin-miss shape again. The
                 # tool's *return* value below stays raw: that goes back to the model, which wrote it.
-                "metadata": preview_value("metadata", dict(artifact.metadata), self.permission_policy),
+                "metadata": preview_value(
+                    "metadata", dict(artifact.metadata), self.permission_policy
+                ),
             },
         )
         return {
@@ -441,7 +465,9 @@ class AgentToolContext(ToolContext):
     def path_allowed(self, path: str, operation: str = "read") -> bool:
         try:
             rel = self.workspace.normalize(path)
-            permission_operation = operation if operation in {"read", "write", "artifact", "run"} else "read"
+            permission_operation = (
+                operation if operation in {"read", "write", "artifact", "run"} else "read"
+            )
             self.permission_policy.check_paths(permission_operation, (rel,))  # type: ignore[arg-type]
             scope = self._authorized_call.scope
             if scope.allowed_paths and not matches_path_patterns(rel, scope.allowed_paths):
@@ -469,6 +495,7 @@ class AgentToolContext(ToolContext):
         # a blank row and counted toward the ``completed/total`` denominator, making a capped plan
         # look permanently one step short of done. The count comes from the previewed length rather
         # than from ``PREVIEW_MAX_ITEMS`` so the cap stays stated in exactly one place.
+        items = normalize_json_ingress(items)
         self.plan = items
         published = preview_value("items", items, self.permission_policy, list_marker=False)
         data: dict[str, Any] = {"items": published}
@@ -478,7 +505,11 @@ class AgentToolContext(ToolContext):
         self.recorder.emit("plan.updated", data=data)
 
     def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
-        self.pending_finish = FinishResult(summary, tuple(outputs), notes)
+        self.pending_finish = FinishResult(
+            normalize_unicode_scalars(summary),
+            tuple(normalize_unicode_scalars(output) for output in outputs),
+            None if notes is None else normalize_unicode_scalars(notes),
+        )
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.shell_service.execute(args, self._authorized_call)
@@ -562,10 +593,14 @@ class AgentToolContext(ToolContext):
         )
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.search(args, self._authorized_call, capability_token=self.capability_token("web.search"))
+        return self.web_service.search(
+            args, self._authorized_call, capability_token=self.capability_token("web.search")
+        )
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.fetch(args, self._authorized_call, capability_token=self.capability_token("web.fetch"))
+        return self.web_service.fetch(
+            args, self._authorized_call, capability_token=self.capability_token("web.fetch")
+        )
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.web_service.context(
@@ -618,10 +653,26 @@ class AgentToolContext(ToolContext):
         ``expect_ack`` the edge delivers the send's receipt back as an inbox message (non-park)."""
         if self.outbox is None:
             raise ToolExecutionError("outbox is not available", error_code="outbox_unavailable")
+        normalized_payload = normalize_json_ingress(payload)
+        if not isinstance(normalized_payload, dict):
+            raise ValueError("outbox payload must be an object")
+        destination = normalize_unicode_scalars(
+            exact_runtime_string(destination, field_name="outbox destination")
+        )
+        capability = normalize_unicode_scalars(
+            exact_runtime_string(capability, field_name="outbox capability")
+        )
+        idempotency_key = normalize_unicode_scalars(
+            exact_runtime_string(idempotency_key, field_name="outbox idempotency_key")
+        )
+        expect_ack = exact_runtime_bool(expect_ack, field_name="outbox expect_ack")
+        reply_to = normalize_unicode_scalars(
+            exact_runtime_string(reply_to, field_name="outbox reply_to")
+        )
         call = self._current_call
         request = OutboxRequest(
             destination=destination,
-            payload=dict(payload),
+            payload=normalized_payload,
             capability=capability,
             token_ref=self.capability_token(capability) or "" if capability else "",
             run_id=self.run_id,
@@ -639,31 +690,37 @@ class AgentToolContext(ToolContext):
             parent_id=call.tool_event_id,
             data={
                 "request_id": request.id,
-                "destination": destination,
-                "capability": capability,
+                "destination": request.destination,
+                "capability": request.capability,
                 "traceparent": request.traceparent,
             },
         )
         return {"status": "staged", "request_id": request.id}
 
 
-def _observation_message(observation: ToolObservation, media_store: dict[str, bytes]) -> dict[str, Any]:
+def _observation_message(
+    observation: ToolObservation, media_store: dict[str, bytes]
+) -> dict[str, Any]:
     """Provider-neutral by-value message for a tool/async observation. Preserves the
     ``is_background`` → role semantics the adapters use: a background/hosted result is a
     new user message; a tool result is a ``tool`` message keyed by ``call_id``."""
+    output = normalize_json_ingress(observation.output)
     if observation.is_background:
-        return {"role": "user", "content": format_async_result_text(observation.output)}
+        return {
+            "role": "user",
+            "content": format_async_result_text(output),
+        }
     message: dict[str, Any] = {
         "role": "tool",
-        "call_id": observation.call_id,
-        "content": observation.output,
+        "call_id": normalize_unicode_scalars(observation.call_id),
+        "content": output,
     }
     if observation.media:
         # By reference; resolved to wire blocks at send time and delivered per provider (a follow-up
         # user message for OpenAI/gateway). Inline (data:) media a tool returned is normalized to a
         # durable blob here, symmetric with user-input media — so tool media survives restart too.
         message["media"] = normalize_inline_media_dicts(list(observation.media), media_store)
-    return message
+    return normalize_json_ingress(message)
 
 
 def _as_blob_reader(
@@ -673,6 +730,7 @@ def _as_blob_reader(
     ``None`` source has no content — used when restoring a checkpoint with no workspace
     delta; reading any sha then raises (a delta entry without its blob is a bug)."""
     if blobs is None:
+
         def _empty(sha256: str) -> bytes:
             raise KeyError(sha256)
 
@@ -881,7 +939,9 @@ class AgentLoop:
     _pause_requested: bool = field(default=False, init=False, repr=False)
     # Per-run cache of granted capability leases (handles only, never secrets). Deliberately not
     # checkpointed — on restore leases are re-brokered, so a stale handle never survives on disk.
-    _capability_vault: CapabilityVault = field(default_factory=CapabilityVault, init=False, repr=False)
+    _capability_vault: CapabilityVault = field(
+        default_factory=CapabilityVault, init=False, repr=False
+    )
     _outbox: Outbox = field(default_factory=Outbox, init=False, repr=False)
     _bootstrapper: LoopBootstrapper = field(init=False, repr=False)
     _settle_coordinator: LoopSettleCoordinator = field(init=False, repr=False)
@@ -956,7 +1016,7 @@ class AgentLoop:
 
             AgentLoop.from_tools(spec, adapter, [word_count]).run_once("count the words")
         """
-        specs = tuple(tools)
+        specs = tuple(normalize_tool_spec(tool) for tool in tools)
         provider = FunctionToolProvider(lambda _ctx: specs)
         config = AgentRuntimeConfig(
             definition_id=definition_id,
@@ -984,7 +1044,10 @@ class AgentLoop:
 
         Validates against the builtin tools plus any ``tools`` you'll bind (or an explicit
         ``registry``). The run ``spec`` is not needed — tool validation doesn't depend on it."""
-        issues: list[str] = []
+        normalized_config, issues = preflight_runtime_config(config)
+        if normalized_config is None:
+            return issues
+        config = normalized_config
         if registry is None:
             registry = ToolRegistry()
             registry.register_many(builtin_tools(None))  # type: ignore[arg-type]
@@ -1203,9 +1266,13 @@ class AgentLoop:
         ``max_attempts`` attempts, then dead-letters it as ``failed``; a non-retryable failure fails
         immediately. The loop never computes the schedule — it records what the edge decided. The
         ``idempotency_key`` makes the (at-least-once) redispatch safe."""
+        request_id = normalize_unicode_scalars(
+            exact_runtime_string(request_id, field_name="outbox request_id")
+        )
         request = self._outbox.get(request_id)
         if request is None:
             return ""
+        receipt = normalize_outbox_receipt(receipt)
         attempts = request.attempts + 1
         recorder = self._session.res.recorder if self._session is not None else None
         if receipt.ok:
@@ -1576,7 +1643,8 @@ class AgentLoop:
             session = self._require_open()
             if not session.terminal:
                 if seed_messages:
-                    session.state.messages = [dict(message) for message in seed_messages]
+                    normalized_messages = normalize_json_ingress(seed_messages)
+                    session.state.messages = [dict(message) for message in normalized_messages]
                 if seed_media_blobs:
                     session.state.media_blobs = dict(seed_media_blobs)
                 await self.asubmit(user_input)
@@ -1804,7 +1872,11 @@ class AgentLoop:
         the backend or another thread calls this to deliver a result, waking a
         parked run. The result is injected per the task kind's ResultInjector."""
         session = self._require_open()
-        reported = session.res.context.job_manager.report_result(task_id, result, status=status)
+        reported = session.res.context.job_manager.report_result(
+            normalize_unicode_scalars(task_id),
+            normalize_json_ingress(result),
+            status=normalize_unicode_scalars(status),
+        )
         if persist_checkpoint:
             self._persist_checkpoint(session)
         return reported
@@ -1885,7 +1957,9 @@ class AgentLoop:
             # Durable (approved) capability leases — handles only — so a restart does not re-prompt.
             capability_leases=self._capability_vault.export_durable(),
             outbox_requests=self._outbox.export(),
-            pending_capability_replays=[dict(replay) for replay in state.pending_capability_replays],
+            pending_capability_replays=[
+                dict(replay) for replay in state.pending_capability_replays
+            ],
             pending_tool_approval_replays=[
                 dict(replay) for replay in state.pending_tool_approval_replays
             ],
@@ -2022,7 +2096,9 @@ class AgentLoop:
         finally:
             self._restoring = False
 
-    def _rehydrate(self, cp: RunCheckpoint, res: _RunResources, blob_reader: Callable[[str], bytes]) -> None:
+    def _rehydrate(
+        self, cp: RunCheckpoint, res: _RunResources, blob_reader: Callable[[str], bytes]
+    ) -> None:
         # Deadline carry-over: downtime while parked does not count against
         # max_duration_s (a run parked overnight on a human should not time out). Keep
         # the elapsed-so-far consistent so _build_metrics duration stays sane.
@@ -2035,6 +2111,14 @@ class AgentLoop:
                 else res.started
             )
             res = replace(res, deadline=now + cp.remaining_duration_s, started=started)
+        previous_runtime_config = None
+        if cp.previous_runtime_config is not None:
+            try:
+                previous_runtime_config = normalize_runtime_config(
+                    AgentRuntimeConfig.from_durable_json(cp.previous_runtime_config)
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise AgentConfigError(f"invalid restored runtime config: {exc}") from exc
         state = RunState(
             status=cp.status,
             error=cp.error,
@@ -2053,20 +2137,20 @@ class AgentLoop:
                 if cp.pending_user_input is not None
                 else None
             ),
-            pending_observations=tuple(ToolObservation.from_json(obs) for obs in cp.pending_observations),
+            pending_observations=tuple(
+                ToolObservation.from_json(obs) for obs in cp.pending_observations
+            ),
             pending_binding_loads=tuple(cp.pending_binding_loads),
             tool_call_counts=dict(cp.tool_call_counts),
-            previous_runtime_config=(
-                AgentRuntimeConfig.from_durable_json(cp.previous_runtime_config)
-                if cp.previous_runtime_config is not None
-                else None
-            ),
+            previous_runtime_config=previous_runtime_config,
             total_tool_calls=cp.total_tool_calls,
             output_retries=cp.output_retries,
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
-            pending_capability_replays=tuple(dict(replay) for replay in cp.pending_capability_replays),
+            pending_capability_replays=tuple(
+                dict(replay) for replay in cp.pending_capability_replays
+            ),
             pending_tool_approval_replays=tuple(
                 dict(replay) for replay in cp.pending_tool_approval_replays
             ),
@@ -2099,7 +2183,9 @@ class AgentLoop:
         # Re-apply the agent's workspace delta on top of the (backend-re-provisioned)
         # base, so the restored workspace matches the checkpoint instant and
         # changed_entries() reports the same delta again.
-        self._apply_workspace_delta(res.workspace, cp.workspace_delta, blob_reader, self.spec.limits)
+        self._apply_workspace_delta(
+            res.workspace, cp.workspace_delta, blob_reader, self.spec.limits
+        )
         manager = res.context.job_manager
         # Publish the restored durable baseline before registering hosted tasks. If any later
         # rehydration step fails, cleanup preserves every task owned by the source checkpoint.
@@ -2111,9 +2197,7 @@ class AgentLoop:
             terminal=cp.terminal,
             # Continue the sequence so the next park commits cp.seq + 1.
             checkpoint_seq=cp.seq,
-            last_suspension=(
-                dict(cp.last_suspension) if cp.last_suspension is not None else None
-            ),
+            last_suspension=(dict(cp.last_suspension) if cp.last_suspension is not None else None),
             applied_input_ids=set(cp.applied_input_ids),
             active_input=(dict(cp.active_input) if cp.active_input is not None else None),
             applied_input_receipts={
@@ -2127,7 +2211,10 @@ class AgentLoop:
             },
         )
         manager.restore_state(
-            [HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir) for payload in cp.hosted_tasks],
+            [
+                HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir)
+                for payload in cp.hosted_tasks
+            ],
             reentry_queue=cp.reentry_queue,
             delivered_reentry_jobs=cp.delivered_reentry_jobs,
         )
@@ -2188,8 +2275,10 @@ class AgentLoop:
         observations: list[ToolObservation] = []
         for job_file in sorted(jobs_dir.glob("*/job.json")):
             try:
-                payload = json.loads(job_file.read_text(encoding="utf-8"))
+                payload = loads_json_ingress(job_file.read_text(encoding="utf-8"))
             except (ValueError, OSError):
+                continue
+            if not isinstance(payload, dict):
                 continue
             if payload.get("status") != "running":
                 continue
@@ -2263,7 +2352,12 @@ class AgentLoop:
         parent_event_id = task.request.get("parent_event_id")
         turn_id = task.request.get("turn_id")
         definition = self.subagent_definitions[definition_id]
-        parent_config = self.runtime_config_provider.current_config(self.spec.run_id)
+        try:
+            parent_config = normalize_runtime_config(
+                self.runtime_config_provider.current_config(self.spec.run_id)
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise AgentConfigError(f"invalid runtime config: {exc}") from exc
         is_fork = definition.context == "fork"
         subagent = SubagentRuntimeContext.create(
             parent_run_id=self.spec.run_id,
@@ -2352,7 +2446,9 @@ class AgentLoop:
             for key, value in usage.items():
                 amount = int(value)
                 parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + amount
-                self._session.state.total_usage[key] = self._session.state.total_usage.get(key, 0) + amount
+                self._session.state.total_usage[key] = (
+                    self._session.state.total_usage.get(key, 0) + amount
+                )
         task.result = subagent.result_payload(
             status=result.status,
             final_text=result.final_text,
@@ -2569,15 +2665,19 @@ class AgentLoop:
                 providers.append(provider)  # type: ignore[arg-type]
         return tuple(providers)
 
-    def _current_runtime_config(self, registry: ToolRegistry, *, validate: bool = True) -> AgentRuntimeConfig:
-        config = (
-            self.runtime_config_provider.current_config(self.spec.run_id)
-        )
+    def _current_runtime_config(
+        self, registry: ToolRegistry, *, validate: bool = True
+    ) -> AgentRuntimeConfig:
+        config = self.runtime_config_provider.current_config(self.spec.run_id)
         if config is None:
             raise AgentConfigError(
                 "runtime config provider returned no config",
                 error_code="agent_config_missing",
             )
+        try:
+            config = normalize_runtime_config(config)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise AgentConfigError(f"invalid runtime config: {exc}") from exc
         if validate:
             validate_runtime_config(config, registry)
         return config
@@ -2622,7 +2722,9 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
-    async def _apump_turn(self, state: RunState, res: _RunResources, session: _Session) -> Suspension:
+    async def _apump_turn(
+        self, state: RunState, res: _RunResources, session: _Session
+    ) -> Suspension:
         context = res.context
         recorder = res.recorder
         deadline = res.deadline
@@ -2645,7 +2747,9 @@ class AgentLoop:
             local_step = session.submit_local_step
             session.session_step += 1
             step = session.session_step
-            background_observations = self._pop_background_observations(context, recorder, step, state)
+            background_observations = self._pop_background_observations(
+                context, recorder, step, state
+            )
             if background_observations:
                 state.pending_observations = (*state.pending_observations, *background_observations)
             turn_id = f"turn_{step:04d}"
@@ -2671,7 +2775,8 @@ class AgentLoop:
             # authorization, exposure, and quota filtering, this is replaced with the visible
             # surface's registry tool ids before context providers see the turn.
             turn_context = replace(
-                turn_context, bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools)
+                turn_context,
+                bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools),
             )
             self._emit_runtime_config_if_changed(
                 recorder=recorder,
@@ -2682,12 +2787,14 @@ class AgentLoop:
                 parent_id=turn_started.event_id,
             )
             pending_binding_loads = state.pending_binding_loads
-            surface_snapshot = self.tool_surface_resolver.resolve(
-                bound_catalog=bound_catalog,
-                turn=turn_context,
-                pending_binding_loads=pending_binding_loads,
-                previous_snapshot=state.previous_surface_snapshot,
-                call_counts=state.tool_call_counts,
+            surface_snapshot = validate_tool_surface_snapshot(
+                self.tool_surface_resolver.resolve(
+                    bound_catalog=bound_catalog,
+                    turn=turn_context,
+                    pending_binding_loads=pending_binding_loads,
+                    previous_snapshot=state.previous_surface_snapshot,
+                    call_counts=state.tool_call_counts,
+                )
             )
             if not surface_snapshot.turn_id:
                 surface_snapshot = replace(surface_snapshot, turn_id=turn_id)
@@ -2707,7 +2814,7 @@ class AgentLoop:
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
                     data=surface_snapshot.to_public_json(),
-            )
+                )
             state.previous_surface_snapshot = surface_snapshot
             state.pending_binding_loads = ()
             call_counts_before_replays = dict(state.tool_call_counts)
@@ -2770,15 +2877,19 @@ class AgentLoop:
             # Replays run before the model request. If they consumed quota, rebuild the
             # model-facing surface so context providers and tools see the post-replay limits.
             if state.tool_call_counts != call_counts_before_replays:
-                refreshed_surface_snapshot = self.tool_surface_resolver.resolve(
-                    bound_catalog=bound_catalog,
-                    turn=turn_context,
-                    pending_binding_loads=pending_binding_loads,
-                    previous_snapshot=surface_snapshot,
-                    call_counts=state.tool_call_counts,
+                refreshed_surface_snapshot = validate_tool_surface_snapshot(
+                    self.tool_surface_resolver.resolve(
+                        bound_catalog=bound_catalog,
+                        turn=turn_context,
+                        pending_binding_loads=pending_binding_loads,
+                        previous_snapshot=surface_snapshot,
+                        call_counts=state.tool_call_counts,
+                    )
                 )
                 if not refreshed_surface_snapshot.turn_id:
-                    refreshed_surface_snapshot = replace(refreshed_surface_snapshot, turn_id=turn_id)
+                    refreshed_surface_snapshot = replace(
+                        refreshed_surface_snapshot, turn_id=turn_id
+                    )
                 context.configure_tool_search(
                     refreshed_surface_snapshot.search_entries,
                     runtime_config.tool_search.top_k,
@@ -2807,7 +2918,9 @@ class AgentLoop:
                     if not dynamic_segment
                     else f"{dynamic_segment}\n\n{surface_snapshot.delta_notice}"
                 )
-            static_system_prompt = self._system_prompt_for_config(runtime_config, res.static_segments)
+            static_system_prompt = self._system_prompt_for_config(
+                runtime_config, res.static_segments
+            )
             turn_system_prompt = (
                 static_system_prompt
                 if not dynamic_segment
@@ -2840,7 +2953,7 @@ class AgentLoop:
             # assistant reply is appended after the call. The system prompt is NOT logged
             # here — it is regenerated per turn and travels via ``system_prompt``.
             if user_message is not None:
-                state.messages.append(user_message)
+                state.messages.append(normalize_json_ingress(user_message))
             for observation in state.pending_observations:
                 state.messages.append(_observation_message(observation, state.media_blobs))
             # Bound the by-value conversation log: a runaway multi-turn run must settle
@@ -2905,7 +3018,9 @@ class AgentLoop:
                 wire_messages = resolve_wire_messages(
                     wire_messages,
                     WorkspaceMediaResolver(
-                        res.workspace, blobs=state.media_blobs, blob_reader=self._media_blob_reader()
+                        res.workspace,
+                        blobs=state.media_blobs,
+                        blob_reader=self._media_blob_reader(),
                     ),
                     encoding=getattr(self.model_adapter, "wire_image_encoding", "base64"),
                 )
@@ -2994,7 +3109,7 @@ class AgentLoop:
                         "model": (runtime_config.model or ModelConfig()).model,
                         "items": [dict(item) for item in turn.reasoning],
                     }
-            state.messages.append(assistant_message)
+            state.messages.append(normalize_json_ingress(assistant_message))
             recorder.transcript(
                 {
                     "kind": "model_turn",
@@ -3020,7 +3135,9 @@ class AgentLoop:
                     # trust boundary, and real ids are short. A compromised or buggy proxy
                     # echoing an unbounded string onto the public stream is a channel no
                     # review of *tool* arguments would ever look at.
-                    "response_id": public_identifier(turn.response_id) if turn.response_id else turn.response_id,
+                    "response_id": public_identifier(turn.response_id)
+                    if turn.response_id
+                    else turn.response_id,
                     "tool_calls": len(turn.tool_calls),
                     "has_final": bool(turn.final_text),
                     "usage": turn.usage,
@@ -3155,7 +3272,10 @@ class AgentLoop:
         limits = self.spec.limits
         if len(state.messages) > limits.max_messages:
             return "message_count_exceeded"
-        size = sum(len(json.dumps(message, ensure_ascii=False)) for message in state.messages)
+        size = sum(
+            len(json.dumps(message, ensure_ascii=False, allow_nan=False))
+            for message in state.messages
+        )
         if size > limits.max_message_log_bytes:
             return "message_log_bytes_exceeded"
         return None
@@ -3166,11 +3286,20 @@ class AgentLoop:
         the authoritative provider actuals summed across turns, not an estimate."""
         limits = self.spec.limits
         usage = state.total_usage
-        if limits.max_input_tokens is not None and usage.get("input_tokens", 0) > limits.max_input_tokens:
+        if (
+            limits.max_input_tokens is not None
+            and usage.get("input_tokens", 0) > limits.max_input_tokens
+        ):
             return "input_tokens_exceeded"
-        if limits.max_output_tokens is not None and usage.get("output_tokens", 0) > limits.max_output_tokens:
+        if (
+            limits.max_output_tokens is not None
+            and usage.get("output_tokens", 0) > limits.max_output_tokens
+        ):
             return "output_tokens_exceeded"
-        if limits.max_total_tokens is not None and usage.get("total_tokens", 0) > limits.max_total_tokens:
+        if (
+            limits.max_total_tokens is not None
+            and usage.get("total_tokens", 0) > limits.max_total_tokens
+        ):
             return "total_tokens_exceeded"
         return None
 
@@ -3178,7 +3307,10 @@ class AgentLoop:
         """Return ``"wire_bytes_exceeded"`` if the resolved per-turn wire payload (inline
         base64 media included) outgrows ``max_message_log_bytes``, else ``None``. Distinct
         from the durable by-reference log cap, which never carries bytes."""
-        size = sum(len(json.dumps(message, ensure_ascii=False)) for message in wire_messages)
+        size = sum(
+            len(json.dumps(message, ensure_ascii=False, allow_nan=False))
+            for message in wire_messages
+        )
         if size > self.spec.limits.max_message_log_bytes:
             return "wire_bytes_exceeded"
         return None
@@ -3279,7 +3411,9 @@ class AgentLoop:
         delivered: list[ToolObservation] = []
         for observation in observations:
             if observation.output.get("type") == TOOL_APPROVAL_RESULT_TYPE:
-                observation = self._handle_tool_approval_result(observation, context, recorder, state)
+                observation = self._handle_tool_approval_result(
+                    observation, context, recorder, state
+                )
             recorder.transcript(
                 {
                     "kind": "tool_observation",
@@ -3972,6 +4106,11 @@ class AgentLoop:
         deadline: float | None,
         approved_tool_approval: Mapping[str, Any] | None = None,
     ) -> ToolObservation:
+        call_name = normalize_unicode_scalars(call_name)
+        call_id = normalize_unicode_scalars(call_id)
+        arguments = normalize_json_ingress(arguments)
+        if not isinstance(arguments, dict):
+            raise TypeError("tool call arguments must be an object")
         spec: ToolSpec | None = None
         bound_tool: BoundTool | None = None
         result: ToolResult
@@ -4088,20 +4227,26 @@ class AgentLoop:
                         # once the lease is granted. Not counted against the binding's call quota.
                         result = pending
                     else:
-                        call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
-                        outbox_count = (
-                            len(self._outbox.export()) if side_effect_admission.requires_outbox else 0
+                        call_counts[bound_tool.binding_id] = (
+                            call_counts.get(bound_tool.binding_id, 0) + 1
                         )
-                        result = await self._ainvoke_handler(
-                            bound_tool,
-                            context,
-                            arguments,
-                            call_id=call_id,
-                            turn_id=turn_id,
-                            recorder=recorder,
-                            started_event=started_event,
-                            authorization=authorization,
-                            deadline=deadline,
+                        outbox_count = (
+                            len(self._outbox.export())
+                            if side_effect_admission.requires_outbox
+                            else 0
+                        )
+                        result = normalize_tool_result(
+                            await self._ainvoke_handler(
+                                bound_tool,
+                                context,
+                                arguments,
+                                call_id=call_id,
+                                turn_id=turn_id,
+                                recorder=recorder,
+                                started_event=started_event,
+                                authorization=authorization,
+                                deadline=deadline,
+                            )
                         )
                         if result.ok:
                             if side_effect_admission.requires_outbox:
@@ -4168,6 +4313,10 @@ class AgentLoop:
                     parent_id=parent_id,
                 )
 
+        try:
+            result = normalize_tool_result(result)
+        except Exception as exc:
+            result = normalize_tool_result(_failure_result(exc))
         return self._finalize_tool_call(
             recorder,
             spec=spec,
@@ -4386,31 +4535,73 @@ class AgentLoop:
                 "max_snippets": 256,
             },
         }[feature]
-        max_calls = web_runtime.get("max_calls", web_runtime.get(f"max_{feature}_calls", defaults["max_calls"]))
+        max_calls = web_runtime.get(
+            "max_calls", web_runtime.get(f"max_{feature}_calls", defaults["max_calls"])
+        )
         scope.setdefault("max_calls", max(0, int(max_calls)))
         if feature == "search":
-            scope.setdefault("max_results", max(1, int(web_runtime.get("max_results", defaults["max_results"]))))
+            scope.setdefault(
+                "max_results", max(1, int(web_runtime.get("max_results", defaults["max_results"])))
+            )
         elif feature == "fetch":
             scope.setdefault(
                 "max_bytes",
-                max(1, int(web_runtime.get("max_response_bytes", web_runtime.get("max_bytes", defaults["max_bytes"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_response_bytes",
+                            web_runtime.get("max_bytes", defaults["max_bytes"]),
+                        )
+                    ),
+                ),
             )
             scope.setdefault(
                 "timeout_s",
-                max(1, int(web_runtime.get("max_timeout_s", web_runtime.get("timeout_s", defaults["timeout_s"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_timeout_s", web_runtime.get("timeout_s", defaults["timeout_s"])
+                        )
+                    ),
+                ),
             )
         else:
             scope.setdefault(
                 "max_tokens",
-                max(1, int(web_runtime.get("max_context_tokens", web_runtime.get("max_tokens", defaults["max_tokens"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_context_tokens",
+                            web_runtime.get("max_tokens", defaults["max_tokens"]),
+                        )
+                    ),
+                ),
             )
             scope.setdefault(
                 "max_urls",
-                max(1, int(web_runtime.get("max_context_urls", web_runtime.get("max_urls", defaults["max_urls"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_context_urls", web_runtime.get("max_urls", defaults["max_urls"])
+                        )
+                    ),
+                ),
             )
             scope.setdefault(
                 "max_snippets",
-                max(1, int(web_runtime.get("max_context_snippets", web_runtime.get("max_snippets", defaults["max_snippets"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_context_snippets",
+                            web_runtime.get("max_snippets", defaults["max_snippets"]),
+                        )
+                    ),
+                ),
             )
         return scope
 
@@ -4485,7 +4676,10 @@ class AgentLoop:
                 "workspace.file.read",
                 turn_id=turn_id,
                 parent_id=parent_id,
-                data={"tool": spec.id, "paths": _public_paths_from_args(spec, arguments, self.permission_policy)},
+                data={
+                    "tool": spec.id,
+                    "paths": _public_paths_from_args(spec, arguments, self.permission_policy),
+                },
             )
         elif spec.emits_workspace_diff:
             if (
@@ -4552,8 +4746,12 @@ def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
     priced sub-counts (cache_read/cache_creation/reasoning/audio) accumulate too when the
     adapter reports them, so they reach metrics and the token-budget check."""
     for key, value in turn.usage.items():
-        if isinstance(value, bool) or not isinstance(value, int):
-            continue
+        if type(value) is not int or value < 0:
+            raise ModelAdapterError(
+                f"model usage {key} must be a non-negative integer",
+                provider_error_code="model_bad_response",
+                retryable=False,
+            )
         total_usage[key] = total_usage.get(key, 0) + value
 
 
@@ -4593,7 +4791,11 @@ def _rank_tool_search_entries(
         return sum(1 for term in terms if term in haystack)
 
     scored = [(score(entry), index, entry) for index, entry in enumerate(entries)]
-    return [entry for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1])) if value > 0]
+    return [
+        entry
+        for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1]))
+        if value > 0
+    ]
 
 
 def _filter_tool_search_entries(
@@ -4684,7 +4886,9 @@ def _tool_start_data(
         "tool": public_identifier(call_name),
         "capability": spec.capability if spec is not None else None,
         "side_effect": spec.side_effect if spec is not None else None,
-        "paths": _public_paths_from_args(spec, arguments, permission_policy) if spec is not None else [],
+        "paths": _public_paths_from_args(spec, arguments, permission_policy)
+        if spec is not None
+        else [],
         "args_preview": preview,
     }
 

@@ -7,12 +7,23 @@ from pathlib import Path
 import pytest
 
 from monoid_agent_kernel import _proc
+from monoid_agent_kernel.errors import ToolExecutionError
 from monoid_agent_kernel.permissions import PermissionPolicy
-from monoid_agent_kernel.shell import ShellExecutionOptions, execute_shell
+from monoid_agent_kernel.shell import ShellCommandRule, ShellExecutionOptions, execute_shell
 from monoid_agent_kernel.workspace.local import LocalWorkspaceBackend
 from support.process import python_command as _python_command
 
 pytestmark = pytest.mark.integration
+
+
+def test_shell_rule_normalizes_authoritative_deny_prefix() -> None:
+    rule = ShellCommandRule(action="deny", prefix="\ud800-danger")
+    options = ShellExecutionOptions(enabled=True, command_rules=(rule,))
+
+    assert rule.prefix == "\ufffd-danger"
+    assert rule.matches("\ud800-danger now")
+    with pytest.raises(ToolExecutionError, match="denied by binding constraints"):
+        options.check_command("\ud800-danger now")
 
 
 def test_terminate_process_falls_back_to_kill_when_group_kill_stalls(
@@ -29,11 +40,13 @@ def test_terminate_process_falls_back_to_kill_when_group_kill_stalls(
             killed.append(True)
 
     if os.name == "nt":
+
         def _stall(*args: object, **kwargs: object) -> None:
             raise subprocess.TimeoutExpired(cmd="taskkill", timeout=_proc._TERMINATE_TIMEOUT_S)
 
         monkeypatch.setattr(_proc.subprocess, "run", _stall)
     else:
+
         def _fail(*args: object, **kwargs: object) -> None:
             raise ProcessLookupError()
 
@@ -74,7 +87,9 @@ def test_shell_exec_materializes_workspace_and_syncs_to_propose_overlay(tmp_path
         workspace=workspace,
         policy=ShellExecutionOptions(enabled=True, approval_mode="auto-approve"),
         permission_policy=PermissionPolicy(),
-        command=_python_command("from pathlib import Path; Path('SUMMARY.md').write_text('summary\\n', encoding='utf-8')"),
+        command=_python_command(
+            "from pathlib import Path; Path('SUMMARY.md').write_text('summary\\n', encoding='utf-8')"
+        ),
         cwd=".",
         timeout_s=5,
         max_output_bytes=100_000,
@@ -99,7 +114,9 @@ def test_shell_exec_direct_workspace_for_staging_backend(tmp_path: Path) -> None
         workspace=workspace,
         policy=policy,
         permission_policy=PermissionPolicy(),
-        command=_python_command("from pathlib import Path; Path('SUMMARY.md').write_text('summary\\n', encoding='utf-8')"),
+        command=_python_command(
+            "from pathlib import Path; Path('SUMMARY.md').write_text('summary\\n', encoding='utf-8')"
+        ),
         cwd=".",
         timeout_s=policy.effective_timeout(None),
         max_output_bytes=policy.effective_output_limit(None),
@@ -113,7 +130,9 @@ def test_shell_exec_direct_workspace_for_staging_backend(tmp_path: Path) -> None
     assert workspace.changed_paths() == ["SUMMARY.md"]
 
 
-def test_shell_requested_limits_are_recorded_separately_from_effective_limits(tmp_path: Path) -> None:
+def test_shell_requested_limits_are_recorded_separately_from_effective_limits(
+    tmp_path: Path,
+) -> None:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     workspace = LocalWorkspaceBackend(workspace_root, mode="propose", backend_kind="staging")
@@ -155,7 +174,9 @@ def test_direct_shell_leaves_generated_paths_for_backend_policy(tmp_path: Path) 
         workspace=workspace,
         policy=ShellExecutionOptions(enabled=True, approval_mode="auto-approve"),
         permission_policy=PermissionPolicy(),
-        command=_python_command("from pathlib import Path; Path('.env').write_text('secret', encoding='utf-8')"),
+        command=_python_command(
+            "from pathlib import Path; Path('.env').write_text('secret', encoding='utf-8')"
+        ),
         cwd=".",
         timeout_s=5,
         max_output_bytes=100_000,
@@ -176,7 +197,9 @@ def test_isolated_copy_shell_allows_secret_looking_paths_by_default(tmp_path: Pa
         workspace=workspace,
         policy=ShellExecutionOptions(enabled=True, approval_mode="auto-approve"),
         permission_policy=PermissionPolicy(),
-        command=_python_command("from pathlib import Path; Path('.env').write_text('secret', encoding='utf-8')"),
+        command=_python_command(
+            "from pathlib import Path; Path('.env').write_text('secret', encoding='utf-8')"
+        ),
         cwd=".",
         timeout_s=5,
         max_output_bytes=100_000,
@@ -202,7 +225,14 @@ def test_shell_env_filters_provider_keys(
         enabled=True,
         approval_mode="auto-approve",
         env_allowlist=("SAFE_VAR", "OPENAI_API_KEY"),
-        inherit_env_allowlist=("PATH", "SystemRoot", "COMSPEC", "PATHEXT", "OPENAI_API_KEY", "SAFE_VAR"),
+        inherit_env_allowlist=(
+            "PATH",
+            "SystemRoot",
+            "COMSPEC",
+            "PATHEXT",
+            "OPENAI_API_KEY",
+            "SAFE_VAR",
+        ),
     )
 
     result = execute_shell(
@@ -246,7 +276,9 @@ def test_shell_rejects_bad_cwd_and_explicitly_denied_output_path(tmp_path: Path)
             workspace=workspace,
             policy=policy,
             permission_policy=PermissionPolicy(deny_patterns=(".env",)),
-            command=_python_command("from pathlib import Path; Path('.env').write_text('x', encoding='utf-8')"),
+            command=_python_command(
+                "from pathlib import Path; Path('.env').write_text('x', encoding='utf-8')"
+            ),
             cwd=".",
             timeout_s=5,
             max_output_bytes=100_000,

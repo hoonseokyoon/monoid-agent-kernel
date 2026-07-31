@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -27,6 +26,7 @@ from monoid_agent_kernel.core.result import (
     Suspension,
     suspension_from_checkpoint_payload,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference.backend.ports import (
     DriveOpenSessionPort,
@@ -206,7 +206,9 @@ class RecoveryService:
             meta,
         )
         self._context.register_record(record)
-        loop_build = self._context.build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
+        loop_build = self._context.build_loop(
+            run_id, request, workspace_root, llm_gateway_token, web_gateway_token
+        )
         loop = loop_build.loop
         loop.restore(checkpoint, blobs=stored.blob)
         self._context.attach_loop(record, loop_build)
@@ -230,7 +232,9 @@ class RecoveryService:
         await self._context.acquire_run_slot()
         try:
             if loop.has_pending_tasks():
-                suspension = Suspension(reason="awaiting_tasks", status="running", has_external=True)
+                suspension = Suspension(
+                    reason="awaiting_tasks", status="running", has_external=True
+                )
             record = self._context.record(run_id)
             result = await self._context.drive_open_session(
                 record,
@@ -276,7 +280,9 @@ class RecoveryService:
 
     def read_recover_attempts(self, run_dir: Path) -> int:
         try:
-            payload = json.loads(self._recover_attempts_path(run_dir).read_text(encoding="utf-8"))
+            payload = loads_json_ingress(
+                self._recover_attempts_path(run_dir).read_text(encoding="utf-8")
+            )
             return int(payload["count"])
         except (FileNotFoundError, ValueError, KeyError, OSError, TypeError):
             return 0
