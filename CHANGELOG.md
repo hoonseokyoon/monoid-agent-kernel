@@ -7,6 +7,26 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — policy-gated OpenTelemetry preset (W9)
+
+- `OtelEventSink` now accepts `parent_context`, `span_mode`, and `capture_policy`. A valid
+  `InvocationContext` attaches `invoke_agent` or a standalone model-call span to its W3C parent;
+  malformed trace metadata is ignored and an omitted parent retains the ambient OTel context.
+- The default `agent` mode preserves the existing `invoke_agent → chat/tool/subagent` tree. Its
+  paired `model_io_subscription()` enriches the already-open chat span with receipt metadata and
+  the policy-approved capture, keeping one inference span per call. The `model_call` mode emits one
+  chat span per standalone `ModelCallRunner` receipt and ignores the agent event facet.
+- OTel capture defaults to `none`, preserving the previous metadata-only and no-content contract.
+  `digest`, `redacted`, and `full` are explicit opt-ins; redaction failure downgrades to digest and
+  records the downgrade without exposing the raw payload. Successful redaction records the applied
+  policy digest; digest/length maps describe raw fields in every content-revealing mode. The
+  content attribute is an opaque Monoid JSON shape rather than the OTel GenAI content schema.
+  Capture stays on the model-I/O channel and never widens `events.jsonl`.
+- Recovered activations lazily create their run root when the first child event arrives, and
+  runtime receipt metadata corrects the active chat span's provider/model. Close is idempotent
+  across the EventSink and model-observer ownership paths. OTel exporter and serialization failures
+  are contained, and error span status no longer copies public error prose into its description.
+
 ### Added — AgentLoop model-call provenance, receipts, and capture-policy subscriptions
 
 - `AgentLoop` now sends every one-shot, async, and streamed model call through its configured

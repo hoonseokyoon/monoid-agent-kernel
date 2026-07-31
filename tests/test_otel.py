@@ -16,12 +16,21 @@ import pytest
 pytest.importorskip("opentelemetry.sdk")
 
 from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import SpanProcessor
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from support.runtime import runtime_config, runtime_provider
 
-from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.core.events import make_agent_event
+from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.model_io import (
+    CapturePolicy,
+    ModelCallCapture,
+    ModelCallReceipt,
+    RedactionPolicy,
+)
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.observability.otel import OtelEventSink
 from monoid_agent_kernel.providers.base import ModelTurn
@@ -35,7 +44,9 @@ def _spans_and_run(tmp_path: Path, adapter: FakeModelAdapter, *tool_ids: str):
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
     loop = AgentLoop(
-        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs", limits=RunLimits(max_steps=4)),
+        spec=AgentRunSpec(
+            workspace_root=workspace, run_root=tmp_path / "runs", limits=RunLimits(max_steps=4)
+        ),
         model_adapter=adapter,
         runtime_config_provider=runtime_provider(runtime_config(*tool_ids)),
         event_sinks=(OtelEventSink(tracer_provider=provider),),
@@ -48,6 +59,45 @@ def _by_name(spans):
     return {s.name: s for s in spans}
 
 
+def _provider_and_exporter():
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
+
+
+def _run_with_preset(
+    tmp_path: Path,
+    adapter: FakeModelAdapter,
+    *,
+    policy: CapturePolicy,
+    instruction: str,
+    invocation_context: InvocationContext | None = None,
+):
+    provider, exporter = _provider_and_exporter()
+    preset = OtelEventSink(
+        tracer_provider=provider,
+        parent_context=invocation_context,
+        capture_policy=policy,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    loop = AgentLoop(
+        spec=AgentRunSpec(
+            workspace_root=workspace,
+            run_root=tmp_path / "runs",
+            limits=RunLimits(max_steps=2),
+        ),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+        invocation_context=invocation_context,
+        event_sinks=(preset,),
+        model_io_subscriptions=(preset.model_io_subscription(),),
+    )
+    result = asyncio.run(loop.arun_once(instruction))
+    return exporter.get_finished_spans(), result
+
+
 def test_otel_sink_builds_genai_span_tree(tmp_path: Path) -> None:
     adapter = FakeModelAdapter(
         turns=[
@@ -56,7 +106,11 @@ def test_otel_sink_builds_genai_span_tree(tmp_path: Path) -> None:
                 tool_calls=(fake_tool_call("fs_write", {"path": "A.md", "content": "x"}, "c1"),),
                 usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
             ),
-            ModelTurn(response_id="r2", final_text="done", usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}),
+            ModelTurn(
+                response_id="r2",
+                final_text="done",
+                usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            ),
         ]
     )
     spans, result = _spans_and_run(tmp_path, adapter, "fs.write", "run.finish")
@@ -89,8 +143,13 @@ def test_otel_sink_builds_genai_span_tree(tmp_path: Path) -> None:
     # Token usage rolled onto the chat span(s); finish reasons reflect tool-call vs final.
     chats = [s for s in spans if s.name == "chat gpt-5.5"]
     assert any(s.attributes.get("gen_ai.usage.input_tokens") == 7 for s in chats)
-    assert any(tuple(s.attributes.get("gen_ai.response.finish_reasons") or ()) == ("tool_calls",) for s in chats)
-    assert any(tuple(s.attributes.get("gen_ai.response.finish_reasons") or ()) == ("stop",) for s in chats)
+    assert any(
+        tuple(s.attributes.get("gen_ai.response.finish_reasons") or ()) == ("tool_calls",)
+        for s in chats
+    )
+    assert any(
+        tuple(s.attributes.get("gen_ai.response.finish_reasons") or ()) == ("stop",) for s in chats
+    )
 
 
 def test_otel_sink_marks_failed_tool_span(tmp_path: Path) -> None:
@@ -136,7 +195,9 @@ def test_otel_records_output_validation_failure_on_run_span(tmp_path: Path) -> N
         ]
     )
     loop = AgentLoop(
-        spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs", limits=RunLimits(max_steps=4)),
+        spec=AgentRunSpec(
+            workspace_root=workspace, run_root=tmp_path / "runs", limits=RunLimits(max_steps=4)
+        ),
         model_adapter=adapter,
         runtime_config_provider=runtime_provider(runtime_config("run.finish")),
         output_validators=(_RequireDone(),),
@@ -164,7 +225,9 @@ def test_otel_records_output_validator_exhausted_on_run_span(tmp_path: Path) -> 
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
-    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x", stop_reason="stop")])
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(response_id="r1", final_text="x", stop_reason="stop")]
+    )
     loop = AgentLoop(
         spec=AgentRunSpec(
             workspace_root=workspace,
@@ -181,3 +244,425 @@ def test_otel_records_output_validator_exhausted_on_run_span(tmp_path: Path) -> 
 
     root = next(s for s in exporter.get_finished_spans() if s.name == "invoke_agent")
     assert "output.validator.exhausted" in [e.name for e in root.events]
+
+
+def test_otel_preset_preserves_upstream_parent_and_defaults_to_no_capture(tmp_path: Path) -> None:
+    trace_id = "1" * 32
+    parent_span_id = "2" * 16
+    invocation = InvocationContext(
+        traceparent=f"00-{trace_id}-{parent_span_id}-01",
+        tracestate="vendor=value",
+    )
+    spans, result = _run_with_preset(
+        tmp_path,
+        FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="SECRET output")]),
+        policy=CapturePolicy(mode="none"),
+        instruction="SECRET input",
+        invocation_context=invocation,
+    )
+    assert result.status == "completed"
+
+    root = next(span for span in spans if span.name == "invoke_agent")
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    assert f"{root.context.trace_id:032x}" == trace_id
+    assert root.parent is not None
+    assert f"{root.parent.span_id:016x}" == parent_span_id
+    assert chat.parent.span_id == root.context.span_id
+    assert chat.attributes["monoid.model.capture.mode"] == "none"
+    exported = repr([(span.attributes, span.events) for span in spans])
+    assert "SECRET" not in exported
+    assert "monoid.model.capture.digests" not in exported
+    assert "monoid.model.capture.lengths" not in exported
+    assert "monoid.model.capture.content" not in exported
+
+
+def test_otel_preset_digest_enriches_existing_chat_without_duplicate(tmp_path: Path) -> None:
+    spans, result = _run_with_preset(
+        tmp_path,
+        FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="private answer")]),
+        policy=CapturePolicy(mode="digest"),
+        instruction="private question",
+    )
+    assert result.status == "completed"
+    chats = [span for span in spans if span.name.startswith("chat")]
+    assert len(chats) == 1
+    chat = chats[0]
+    assert chat.attributes["monoid.model.capture.mode"] == "digest"
+    assert "instruction" in chat.attributes["monoid.model.capture.digests"]
+    assert "monoid.model.capture.content" not in chat.attributes
+    assert "private question" not in repr(chat.attributes)
+    assert "private answer" not in repr(chat.attributes)
+
+
+def test_otel_preset_redaction_failure_downgrades_without_disclosure(tmp_path: Path) -> None:
+    class _FailingRedactor:
+        def redact(self, value, *, policy: RedactionPolicy):
+            del value, policy
+            raise RuntimeError("redactor unavailable")
+
+    spans, result = _run_with_preset(
+        tmp_path,
+        FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="TOP SECRET")]),
+        policy=CapturePolicy(mode="redacted", redactor=_FailingRedactor()),
+        instruction="TOP SECRET",
+    )
+    assert result.status == "completed"
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    assert chat.attributes["monoid.model.capture.mode"] == "digest"
+    assert chat.attributes["monoid.model.capture.downgraded_from"] == "redacted"
+    assert "monoid.model.capture.content" not in chat.attributes
+    assert "TOP SECRET" not in repr(chat.attributes)
+
+
+def test_otel_preset_full_capture_is_explicit(tmp_path: Path) -> None:
+    spans, result = _run_with_preset(
+        tmp_path,
+        FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="VISIBLE output")]),
+        policy=CapturePolicy(mode="full"),
+        instruction="VISIBLE input",
+    )
+    assert result.status == "completed"
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    content = chat.attributes["monoid.model.capture.content"]
+    assert "VISIBLE input" in content
+    assert "VISIBLE output" in content
+
+
+def test_otel_model_call_mode_emits_one_span_under_receipt_parent() -> None:
+    provider, exporter = _provider_and_exporter()
+    trace_id = "3" * 32
+    parent_span_id = "4" * 16
+    context = InvocationContext(
+        traceparent=f"00-{trace_id}-{parent_span_id}-01", step_id="skill-step"
+    )
+    preset = OtelEventSink(
+        tracer_provider=provider,
+        span_mode="model_call",
+        capture_policy=CapturePolicy(mode="none"),
+    )
+    preset.on_model_call(
+        ModelCallCapture(
+            receipt=ModelCallReceipt(
+                context=context,
+                model=ModelConfig(model="standalone-model"),
+                provider_name="gateway",
+                stop_reason="stop",
+                usage={"input_tokens": 3, "output_tokens": 2},
+                latency_ms=5,
+            )
+        )
+    )
+    preset.close()
+
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["chat standalone-model"]
+    span = spans[0]
+    assert f"{span.context.trace_id:032x}" == trace_id
+    assert span.parent is not None
+    assert f"{span.parent.span_id:016x}" == parent_span_id
+    assert span.attributes["gen_ai.usage.input_tokens"] == 3
+    assert span.attributes["monoid.model.capture.mode"] == "none"
+
+
+def test_otel_agent_mode_lazily_opens_root_for_restored_activation() -> None:
+    provider, exporter = _provider_and_exporter()
+    preset = OtelEventSink(
+        tracer_provider=provider,
+        capture_policy=CapturePolicy(mode="digest"),
+    )
+    started = make_agent_event(
+        run_id="restored-run",
+        seq=9,
+        event_type="model.turn.started",
+        turn_id="turn_0009",
+    )
+    preset.emit(started)
+    preset.on_model_call(
+        ModelCallCapture(
+            receipt=ModelCallReceipt(
+                context=InvocationContext(run_id="restored-run", step_id="turn_0009"),
+                model=ModelConfig(model="restored-model"),
+                provider_name="gateway",
+                stop_reason="stop",
+            ),
+            mode="digest",
+            digests={"instruction": "a" * 64},
+        )
+    )
+    preset.emit(
+        make_agent_event(
+            run_id="restored-run",
+            seq=10,
+            event_type="model.turn.finished",
+            turn_id="turn_0009",
+            parent_id=started.event_id,
+            data={"has_final": True},
+        )
+    )
+    preset.close()
+    preset.close()
+
+    spans = exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "invoke_agent")
+    chat = next(span for span in spans if span.name == "chat restored-model")
+    assert root.attributes["run_id"] == "restored-run"
+    assert chat.parent.span_id == root.context.span_id
+    assert len([span for span in spans if span.name.startswith("chat")]) == 1
+
+
+def test_otel_rejects_unknown_span_mode() -> None:
+    with pytest.raises(ValueError, match="span_mode"):
+        OtelEventSink(span_mode="both")  # type: ignore[arg-type]
+
+
+def test_otel_defaults_to_none_capture_policy() -> None:
+    provider, _exporter = _provider_and_exporter()
+    preset = OtelEventSink(tracer_provider=provider)
+    assert preset.capture_policy.mode == "none"
+    assert preset.model_io_subscription().policy.mode == "none"
+    preset.close()
+
+
+def test_otel_ignores_malformed_parent_and_never_copies_error_prose_to_status() -> None:
+    from opentelemetry.trace.status import StatusCode
+
+    provider, exporter = _provider_and_exporter()
+    preset = OtelEventSink(
+        tracer_provider=provider,
+        parent_context=InvocationContext(traceparent="malformed"),
+    )
+    preset.emit(
+        make_agent_event(
+            run_id="failed-run",
+            seq=1,
+            event_type="run.started",
+            data={"model": "gpt-5.5", "model_provider": "gateway"},
+        )
+    )
+    preset.emit(
+        make_agent_event(
+            run_id="failed-run",
+            seq=2,
+            event_type="run.failed",
+            data={"error": "SECRET provider body", "error_code": "model_error"},
+        )
+    )
+    preset.close()
+
+    root = next(span for span in exporter.get_finished_spans() if span.name == "invoke_agent")
+    assert root.parent is None
+    assert root.status.status_code == StatusCode.ERROR
+    assert not root.status.description
+    assert "SECRET provider body" not in repr(root)
+
+
+def test_otel_close_contains_processor_failure_and_still_attempts_every_span() -> None:
+    class _RaisingEndProcessor(SpanProcessor):
+        def on_start(self, span, parent_context=None) -> None:
+            del span, parent_context
+
+        def on_end(self, span) -> None:
+            del span
+            raise RuntimeError("exporter unavailable")
+
+        def shutdown(self) -> None:
+            return None
+
+        def force_flush(self, timeout_millis: int = 30_000) -> bool:
+            del timeout_millis
+            return True
+
+    provider, exporter = _provider_and_exporter()
+    provider.add_span_processor(_RaisingEndProcessor())
+    preset = OtelEventSink(tracer_provider=provider)
+    preset.emit(
+        make_agent_event(
+            run_id="run-close",
+            seq=1,
+            event_type="run.started",
+            data={"model": "gpt-5.5"},
+        )
+    )
+    preset.emit(
+        make_agent_event(
+            run_id="run-close",
+            seq=2,
+            event_type="model.turn.started",
+            turn_id="turn_0001",
+        )
+    )
+
+    preset.close()
+    preset.close()
+    assert sorted(span.name for span in exporter.get_finished_spans()) == [
+        "chat gpt-5.5",
+        "invoke_agent",
+    ]
+
+
+def test_otel_standalone_serialization_failure_still_ends_fixed_duration_span() -> None:
+    provider, exporter = _provider_and_exporter()
+    preset = OtelEventSink(tracer_provider=provider, span_mode="model_call")
+    preset.on_model_call(
+        ModelCallCapture(
+            receipt=ModelCallReceipt(latency_ms=5),
+            mode="full",
+            content={"not_portable_json": float("nan")},
+        )
+    )
+    preset.close()
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].end_time - spans[0].start_time == 5_000_000
+
+
+def test_otel_agent_abort_is_interruption_not_error() -> None:
+    from opentelemetry.trace.status import StatusCode
+
+    provider, exporter = _provider_and_exporter()
+    preset = OtelEventSink(
+        tracer_provider=provider,
+        capture_policy=CapturePolicy(mode="none"),
+    )
+    preset.emit(make_agent_event(run_id="run-abort", seq=1, event_type="run.started"))
+    started = make_agent_event(
+        run_id="run-abort",
+        seq=2,
+        event_type="model.turn.started",
+        turn_id="turn_0001",
+    )
+    preset.emit(started)
+    preset.on_model_call(
+        ModelCallCapture(
+            receipt=ModelCallReceipt(
+                context=InvocationContext(run_id="run-abort", step_id="turn_0001"),
+                error_code="model_call_aborted",
+            )
+        )
+    )
+    preset.emit(make_agent_event(run_id="run-abort", seq=3, event_type="turn.interrupted"))
+    preset.close()
+
+    chat = next(span for span in exporter.get_finished_spans() if span.name.startswith("chat"))
+    assert chat.status.status_code == StatusCode.UNSET
+    assert "error.type" not in chat.attributes
+
+
+def test_otel_agent_non_abort_failure_keeps_receipt_taxonomy() -> None:
+    from opentelemetry.trace.status import StatusCode
+
+    provider, exporter = _provider_and_exporter()
+    preset = OtelEventSink(
+        tracer_provider=provider,
+        capture_policy=CapturePolicy(mode="none"),
+    )
+    preset.emit(make_agent_event(run_id="run-failed-call", seq=1, event_type="run.started"))
+    started = make_agent_event(
+        run_id="run-failed-call",
+        seq=2,
+        event_type="model.turn.started",
+        turn_id="turn_0001",
+    )
+    preset.emit(started)
+    preset.on_model_call(
+        ModelCallCapture(
+            receipt=ModelCallReceipt(
+                context=InvocationContext(run_id="run-failed-call", step_id="turn_0001"),
+                error_code="model_error",
+                provider_error_code="quota",
+                retryable=True,
+                http_status=429,
+            )
+        )
+    )
+    preset.emit(
+        make_agent_event(
+            run_id="run-failed-call",
+            seq=3,
+            event_type="run.failed",
+            data={"error_code": "model_error"},
+        )
+    )
+    preset.close()
+
+    chat = next(span for span in exporter.get_finished_spans() if span.name.startswith("chat"))
+    assert chat.status.status_code == StatusCode.ERROR
+    assert chat.attributes["error.type"] == "quota"
+    assert chat.attributes["monoid.model.retryable"] is True
+    assert chat.attributes["monoid.model.http_status"] == 429
+
+
+def test_otel_receipt_stop_reason_wins_over_event_fallback(tmp_path: Path) -> None:
+    spans, result = _run_with_preset(
+        tmp_path,
+        FakeModelAdapter(
+            turns=[
+                ModelTurn(
+                    response_id="r1",
+                    final_text="truncated",
+                    stop_reason="length",
+                )
+            ]
+        ),
+        policy=CapturePolicy(mode="none"),
+        instruction="go",
+    )
+    assert result.status == "limited"
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    assert tuple(chat.attributes["gen_ai.response.finish_reasons"]) == ("length",)
+
+
+def test_otel_terminal_only_restored_activation_still_emits_root() -> None:
+    from opentelemetry.trace.status import StatusCode
+
+    provider, exporter = _provider_and_exporter()
+    preset = OtelEventSink(tracer_provider=provider)
+    preset.emit(
+        make_agent_event(
+            run_id="restored-terminal",
+            seq=12,
+            event_type="run.failed",
+            data={"error_code": "cancelled"},
+        )
+    )
+    # Some terminal failure paths emit the same boundary again during finalization. The preset is
+    # per activation and must not turn that duplicate into a second root span.
+    preset.emit(
+        make_agent_event(
+            run_id="restored-terminal",
+            seq=13,
+            event_type="run.failed",
+            data={"error_code": "cancelled"},
+        )
+    )
+    preset.close()
+
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["invoke_agent"]
+    assert spans[0].attributes["run_id"] == "restored-terminal"
+    assert spans[0].status.status_code == StatusCode.ERROR
+
+
+def test_otel_successful_redaction_records_policy_and_masks_content(tmp_path: Path) -> None:
+    policy = CapturePolicy(
+        mode="redacted",
+        redaction=RedactionPolicy(literals=("SECRET",)),
+    )
+    spans, result = _run_with_preset(
+        tmp_path,
+        FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="SECRET output")]),
+        policy=policy,
+        instruction="SECRET input",
+    )
+    assert result.status == "completed"
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    assert chat.attributes["monoid.model.capture.mode"] == "redacted"
+    assert (
+        chat.attributes["monoid.model.capture.redaction_digest"]
+        == policy.effective_redaction.digest
+    )
+    assert "SECRET" not in chat.attributes["monoid.model.capture.content"]
+    assert "[redacted]" in chat.attributes["monoid.model.capture.content"]
+    assert "monoid.model.capture.digests" in chat.attributes
+    assert "monoid.model.capture.lengths" in chat.attributes
