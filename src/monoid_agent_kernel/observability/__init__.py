@@ -4,6 +4,6 @@ The core stays zero-dependency: ``OtelEventSink`` lazily imports ``opentelemetry
 instantiated, so importing this package without the ``[otel]`` extra is fine.
 """
 
-from monoid_agent_kernel.observability.otel import OtelEventSink
+from monoid_agent_kernel.observability.otel import OtelEventSink, OtelSpanMode
 
-__all__ = ["OtelEventSink"]
+__all__ = ["OtelEventSink", "OtelSpanMode"]

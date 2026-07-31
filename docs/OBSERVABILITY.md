@@ -210,7 +210,7 @@ invoke_agent
 
 `chat` and `execute_tool` are siblings under `invoke_agent` (linked by a `turn_id` attribute,
 not nested), and spans carry GenAI attributes (`gen_ai.operation.name`, `gen_ai.request.model`,
-`gen_ai.tool.name`, token usage). Wire it in with one line:
+`gen_ai.tool.name`, token usage). The zero-argument form preserves this metadata-only behavior:
 
 ```python
 from monoid_agent_kernel import AgentLoop
@@ -218,6 +218,64 @@ from monoid_agent_kernel.observability.otel import OtelEventSink
 
 loop = AgentLoop.from_config(spec, adapter, config, event_sinks=(OtelEventSink(),))
 ```
+
+W9 adds three controls to the same preset:
+
+- `parent_context` accepts an `InvocationContext` carrying W3C `traceparent` / `tracestate`, or an
+  OpenTelemetry `Context`. The `invoke_agent` span becomes its child. Invalid W3C headers are
+  ignored, and omitting the argument preserves OpenTelemetry's ambient-current-context behavior.
+- `span_mode="agent"` is the default and retains the tree above. `span_mode="model_call"` is for a
+  standalone `ModelCallRunner`: the observer emits exactly one `chat` span per settled call and its
+  event-sink facet is inactive. The modes are mutually exclusive, so the preset never creates two
+  inference spans for one call.
+- `capture_policy` governs model-I/O attributes. Its OTel-specific default is
+  `CapturePolicy(mode="none")`, retaining metadata and withholding content-derived digests,
+  lengths, and payloads. `digest`, `redacted`, and `full` are explicit opt-ins.
+
+For an AgentLoop, register both facets from the same instance. The event facet owns chat span
+timing and topology; the model-I/O facet receives content only after `CapturePolicy` has been
+applied and enriches that already-open span:
+
+```python
+from monoid_agent_kernel import AgentLoop, CapturePolicy, InvocationContext
+from monoid_agent_kernel.observability.otel import OtelEventSink
+
+caller = InvocationContext(traceparent=incoming_traceparent, tracestate=incoming_tracestate)
+otel = OtelEventSink(
+    parent_context=caller,
+    span_mode="agent",
+    capture_policy=CapturePolicy(mode="digest"),
+)
+loop = AgentLoop.from_config(
+    spec,
+    adapter,
+    config,
+    invocation_context=caller,
+    event_sinks=(otel,),
+    model_io_subscriptions=(otel.model_io_subscription(),),
+)
+```
+
+The applied mode is recorded as `monoid.model.capture.mode`. Digest and text-length maps use
+`monoid.model.capture.digests` and `monoid.model.capture.lengths`; these describe the **raw** fields
+and accompany `digest`, successful `redacted`, and `full` captures. A digest of short or
+low-entropy text can be matched against guessed inputs, so digest mode is correlation metadata,
+not an anonymization guarantee. Successful redaction records the applied policy's digest in
+`monoid.model.capture.redaction_digest`. Redaction failure records
+`monoid.model.capture.downgraded_from="redacted"` and emits raw-field digest metadata without the
+payload.
+
+Redacted or full content is a JSON string in `monoid.model.capture.content`. This is an opaque,
+Monoid-specific capture shape; the preset does not claim the exact OpenTelemetry
+`gen_ai.system_instructions` / `gen_ai.input.messages` / `gen_ai.output.messages` content schema.
+Treat those two modes as content-bearing exports and configure collector access and retention
+accordingly. Capture never changes `events.jsonl`, and raw delta events are not mirrored into span
+attributes.
+
+Fresh sinks created for a restored activation lazily open `invoke_agent` on the first child event,
+because recovery does not replay `run.started`. Model receipts then update the runtime provider and
+model on the open chat span. Telemetry and serialization failures are contained inside the preset;
+they do not fail the model call or agent run.
 
 `OtelEventSink` depends only on `opentelemetry-api` (a no-op until your app installs an SDK +
 exporter). To actually export spans, install the SDK and an OTLP exporter and configure a global
