@@ -1435,6 +1435,25 @@ kbd {
   font-weight: 540;
 }
 
+.plan-truncation-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 7px;
+  border: 1px solid #665c3d;
+  border-radius: 7px;
+  background: #2a2518;
+  color: #c9b978;
+  font-size: 9px;
+  line-height: 1.45;
+  padding: 8px;
+}
+
+.plan-truncation-note > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
 .file-search {
   display: flex;
   min-height: 40px;

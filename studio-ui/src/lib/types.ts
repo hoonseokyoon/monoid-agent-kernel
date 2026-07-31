@@ -289,6 +289,7 @@ export interface RunViewState {
   approvals: ApprovalRequest[];
   usage: UsageSummary;
   plan: PlanItem[];
+  planTruncatedItems: number;
   eventLogError: string | null;
   error: string | null;
   errorRetryable: boolean;

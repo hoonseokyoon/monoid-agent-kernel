@@ -28,6 +28,7 @@ export function initialRunState(runId: string | null = null): RunViewState {
     approvals: [],
     usage: { input: 0, output: 0, total: 0 },
     plan: [],
+    planTruncatedItems: 0,
     eventLogError: null,
     error: null,
     errorRetryable: false,
@@ -265,8 +266,18 @@ export function reduceRunEvent(state: RunViewState, event: RunEvent): RunViewSta
           total: Number(data.total_tokens ?? next.usage.total),
         },
       };
-    case "plan.updated":
-      return { ...next, plan: Array.isArray(data.items) ? (data.items as unknown as PlanItem[]) : [] };
+    case "plan.updated": {
+      const truncatedItems = data.truncated_items;
+      return {
+        ...next,
+        plan: Array.isArray(data.items) ? (data.items as unknown as PlanItem[]) : [],
+        planTruncatedItems: typeof truncatedItems === "number"
+          && Number.isSafeInteger(truncatedItems)
+          && truncatedItems >= 0
+          ? truncatedItems
+          : 0,
+      };
+    }
     case "proposal.ready":
     case "workspace.diff.updated":
     case "workspace.proposal.updated":
