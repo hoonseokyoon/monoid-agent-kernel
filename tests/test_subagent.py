@@ -281,6 +281,29 @@ def test_subagent_events_correlate_to_spawn_call(tmp_path: Path) -> None:
     assert subagent_result["traceparent"] == traceparent
 
 
+def test_invalid_parent_invocation_trace_does_not_block_subagent_spawn(tmp_path: Path) -> None:
+    sink = MemoryEventSink()
+    context = InvocationContext()
+    object.__setattr__(context, "traceparent", 7)
+    adapter = RoutingAdapter(
+        parent=[_spawn_call("do X", call_id="c1"), ModelTurn(final_text="parent done")],
+        child=[ModelTurn(final_text="CHILD_OUTPUT")],
+    )
+    loop = _loop(
+        tmp_path,
+        adapter,
+        _parent_config(),
+        event_sinks=(sink,),
+        invocation_context=context,
+    )
+
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    started = next(event for event in sink.events if event.type == "subagent.started")
+    assert trace_id_of(str(started.data["traceparent"]))
+
+
 # --- Claude-parity permissions (P2.5) ----------------------------------------------
 
 

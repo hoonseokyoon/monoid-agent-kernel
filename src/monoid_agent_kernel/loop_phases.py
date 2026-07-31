@@ -168,6 +168,7 @@ class LoopBootstrapper:
         jobs_service = JobsService(job_manager=job_manager)
         from monoid_agent_kernel.loop import AgentToolContext
 
+        safe_invocation_context = loop._safe_invocation_context()
         context = AgentToolContext(
             loop.spec.run_id,
             workspace,
@@ -179,9 +180,7 @@ class LoopBootstrapper:
             permission_policy=loop.permission_policy,
             capability_vault=loop._capability_vault,
             outbox=loop._outbox,
-            invocation_traceparent=(
-                loop.invocation_context.traceparent if loop.invocation_context is not None else ""
-            ),
+            invocation_traceparent=safe_invocation_context.traceparent,
         )
         started = time.time()
         deadline = (

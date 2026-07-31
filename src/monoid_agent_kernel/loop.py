@@ -1894,7 +1894,7 @@ class AgentLoop:
     def _model_invocation_context(self, turn_id: str) -> InvocationContext:
         """Bind caller provenance to this loop's durable, monotonic model-call address."""
 
-        base = self.invocation_context or InvocationContext()
+        base = self._safe_invocation_context()
         step_id = f"{base.step_id}/{turn_id}" if base.step_id else turn_id
         return replace(
             base,
@@ -1904,6 +1904,19 @@ class AgentLoop:
             # not alter it; provider retries live in the receipt and later loop calls get new turns.
             attempt=base.attempt,
         )
+
+    def _safe_invocation_context(self) -> InvocationContext:
+        """Snapshot valid caller provenance without letting observability metadata fail the run."""
+
+        if self.invocation_context is None:
+            return InvocationContext()
+        try:
+            # ``InvocationContext`` is frozen but callers can still force-mutate fields and its
+            # copied attributes map remains mutable. The wire round-trip validates every scalar as
+            # well as the attributes before AgentLoop derives per-turn or child provenance.
+            return InvocationContext.from_json(self.invocation_context.to_json())
+        except Exception:
+            return InvocationContext()
 
     def _close_model_io_subscriptions(self, resources: _RunResources | None = None) -> None:
         """Close this activation's observer snapshot once, tolerating observer failures."""
@@ -2552,7 +2565,7 @@ class AgentLoop:
                 **subagent.child_metadata(),
             },
         )
-        parent_invocation = self.invocation_context or InvocationContext()
+        parent_invocation = self._safe_invocation_context()
         child_step = f"subagent:{subagent.task_id}"
         if parent_invocation.step_id:
             child_step = f"{parent_invocation.step_id}/{child_step}"

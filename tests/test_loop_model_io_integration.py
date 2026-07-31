@@ -146,6 +146,55 @@ def test_agent_loop_delivers_every_turn_with_durable_context_and_closes_once(
     assert observer.close_count == 1
 
 
+def test_agent_loop_drops_mutated_invalid_provenance_without_failing_the_call(
+    tmp_path: Path,
+) -> None:
+    observer = RecordingObserver()
+    context = InvocationContext(step_id="caller-step", attributes={"tenant": "alpha"})
+    assert isinstance(context.attributes, dict)
+    context.attributes["tenant"] = 7  # type: ignore[assignment]
+    loop = _loop(
+        tmp_path,
+        FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")]),
+        observer,
+        context=context,
+    )
+
+    result = loop.run_once("finish")
+
+    assert result.status == "completed"
+    assert len(observer.captures) == 1
+    receipt_context = observer.captures[0].receipt.context
+    assert receipt_context.run_id == "run-model-io"
+    assert receipt_context.step_id == "turn_0001"
+    assert receipt_context.attributes == {}
+
+
+def test_agent_loop_drops_a_force_mutated_scalar_without_coercing_it(tmp_path: Path) -> None:
+    class RaisingString:
+        def __str__(self) -> str:
+            raise RuntimeError("must not stringify observational metadata")
+
+    observer = RecordingObserver()
+    context = InvocationContext(step_id="caller-step", attributes={"tenant": "alpha"})
+    object.__setattr__(context, "step_id", RaisingString())
+    loop = _loop(
+        tmp_path,
+        FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")]),
+        observer,
+        context=context,
+    )
+
+    result = loop.run_once("finish")
+
+    assert result.status == "completed"
+    assert len(observer.captures) == 1
+    receipt_context = observer.captures[0].receipt.context
+    assert receipt_context.run_id == "run-model-io"
+    assert receipt_context.step_id == "turn_0001"
+    assert receipt_context.attributes == {}
+
+
 def test_agent_loop_delivers_a_failed_receipt_before_terminal_cleanup(tmp_path: Path) -> None:
     class FailingAdapter(FakeModelAdapter):
         def next_turn(self, request: ModelRequest) -> ModelTurn:

@@ -324,6 +324,10 @@ Observer failure remains contained and never changes the run outcome.
 - appends the durable `turn_NNNN` id to a non-empty caller `step_id`, or uses it directly;
 - preserves the caller's `attempt`, Skill/batch/case fields, trace context, and attributes.
 
+Caller provenance is observational. If a caller force-mutates an `InvocationContext` into an
+invalid state after construction, AgentLoop drops those caller-supplied fields and still records its
+authoritative run and turn identity; malformed metadata cannot prevent the adapter call.
+
 The receipt is delivered through subscriptions only. AgentLoop continues to use the provider turn
 for usage/budget accounting and does not add receipt data to `events.jsonl`, `transcript.jsonl`, the
 run result, or checkpoints. A subscription's `CapturePolicy` governs only that model-I/O delivery;
