@@ -7,6 +7,27 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — AgentLoop model-call provenance, receipts, and capture-policy subscriptions
+
+- `AgentLoop` now sends every one-shot, async, and streamed model call through its configured
+  `model_io_subscriptions`. Successful and failed calls reach observers with the
+  `ModelCallReceipt` produced by `ModelCallRunner`; the existing turn usage accounting remains the
+  control-flow source. Capture delivery stays opt-in and each subscription applies its own
+  `CapturePolicy`.
+- `AgentLoop.invocation_context` carries caller Skill, batch, trace, and attribute provenance into
+  every receipt. The loop replaces `run_id` with its authoritative run id, appends its durable
+  `turn_NNNN` address to a caller step id, and preserves the caller attempt. Receipts remain an
+  observer surface: this change does not add them to event, transcript, result, or checkpoint
+  schemas.
+- Model-I/O subscriptions are run-owned resources, matching `event_sinks`: normal close, durable
+  release, discard, bootstrap failure, and recovery failure close each observer once. The Reference
+  backend accepts per-run subscription factories, materializes fresh ownership-unique observers for
+  every activation, cleans partial factory failure, and does not let failed recovery setup leave a
+  provisional record that suppresses later retry.
+- Parent subscription instances are not shared with in-process subagents. Child invocation context
+  retains caller provenance and adds its run/task lineage. Current in-process child calls are not
+  delivered to observers; child-scoped observer composition is deferred.
+
 ### Fixed — kernel ingress and artifacts now stay inside portable JSON
 
 - **Strings and numbers are normalized once at semantic ingress.** Valid UTF-16 surrogate pairs

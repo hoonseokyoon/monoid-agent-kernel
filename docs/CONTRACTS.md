@@ -311,6 +311,42 @@ because a refused call belongs in the audit trail — so a consumer summing `att
 adapter still counts as 1: the kernel did begin the call there. A payload that omits the field reads
 as 1, which is what older records mean.
 
+#### AgentLoop model-I/O subscriptions
+
+`AgentLoop.model_io_subscriptions` is the opt-in bridge from agent turns to
+`ModelIOObserver`. Every adapter shape reaches the same `ModelCallRunner`, so observers receive one
+settled capture for success, provider failure, cancellation, deadline, or streamed interruption.
+Observer failure remains contained and never changes the run outcome.
+
+`AgentLoop.invocation_context` is a base context supplied by the caller. For each call, the loop:
+
+- sets `run_id` to `AgentRunSpec.run_id`;
+- appends the durable `turn_NNNN` id to a non-empty caller `step_id`, or uses it directly;
+- preserves the caller's `attempt`, Skill/batch/case fields, trace context, and attributes.
+
+Caller provenance is observational. If a caller force-mutates an `InvocationContext` into an
+invalid state after construction, AgentLoop drops those caller-supplied fields and still records its
+authoritative run and turn identity; malformed metadata cannot prevent the adapter call.
+
+The receipt is delivered through subscriptions only. AgentLoop continues to use the provider turn
+for usage/budget accounting and does not add receipt data to `events.jsonl`, `transcript.jsonl`, the
+run result, or checkpoints. A subscription's `CapturePolicy` governs only that model-I/O delivery;
+it does not rewrite the private transcript or the separate event-sink channel.
+
+Subscriptions passed to AgentLoop are owned by that run activation, like `event_sinks`. The loop
+identity-de-duplicates and closes observers at normal close, successful durable release, discard,
+and bootstrap/restore failure. A loop whose subscriptions have closed rejects reactivation; build a
+fresh AgentLoop with fresh observers. `RunnerBackend.model_io_subscription_factories` is the
+Reference composition seam and each factory must return an ownership-unique subscription on every
+call. Partial construction is cleaned before the build error propagates.
+
+In-process subagents do not inherit a parent's observer instances: simultaneous parent/child calls
+would share callbacks and a child close could terminate the parent's exporter. Their
+`InvocationContext` does preserve the caller unit and attempt while appending a subagent task segment
+and child turn id, and adds root/parent/task/definition/depth attributes. Current in-process child
+calls are therefore not delivered to model-I/O observers. A child-scoped observer composition seam
+is deferred to a later change.
+
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
 cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provider task is detached

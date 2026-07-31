@@ -175,9 +175,19 @@ class EventBus:
 
     def close(self) -> None:
         with self._lock:
-            for sink in self.sinks:
-                sink.close()
+            if self._closed:
+                return
+            # Mark closed before invoking user sinks so a failing sink cannot make a retry call
+            # already-closed peers again. Emitters serialize on the same lock and stop here too.
             self._closed = True
+            errors: list[BaseException] = []
+            for sink in self.sinks:
+                try:
+                    sink.close()
+                except BaseException as exc:
+                    errors.append(exc)
+            if errors:
+                raise errors[0]
 
 
 def make_agent_event(

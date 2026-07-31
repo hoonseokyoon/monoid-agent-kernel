@@ -168,6 +168,7 @@ class LoopBootstrapper:
         jobs_service = JobsService(job_manager=job_manager)
         from monoid_agent_kernel.loop import AgentToolContext
 
+        safe_invocation_context = loop._safe_invocation_context()
         context = AgentToolContext(
             loop.spec.run_id,
             workspace,
@@ -179,6 +180,7 @@ class LoopBootstrapper:
             permission_policy=loop.permission_policy,
             capability_vault=loop._capability_vault,
             outbox=loop._outbox,
+            invocation_traceparent=safe_invocation_context.traceparent,
         )
         started = time.time()
         deadline = (
@@ -199,6 +201,9 @@ class LoopBootstrapper:
             cancel_grace_s=loop.async_model_cancel_grace_s,
             current_cancel_grace_s=lambda: loop.async_model_cancel_grace_s,
             thread_name=f"nar-model-call-{loop.spec.run_id}",
+            # AgentLoop owns this activation-scoped snapshot. The runner only delivers calls;
+            # lifecycle cleanup stays with the loop alongside its recorder and event sinks.
+            subscriptions=tuple(loop.model_io_subscriptions),
         )
         # Publish partial ownership as soon as recorder/task resources exist. If a provider,
         # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.

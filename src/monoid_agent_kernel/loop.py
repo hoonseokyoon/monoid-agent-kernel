@@ -29,6 +29,11 @@ from monoid_agent_kernel.core.checkpoint import (
     RunCheckpoint,
 )
 from monoid_agent_kernel.core.events import AgentEvent, EventSink
+from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.model_io import (
+    ModelIOSubscription,
+    close_model_io_subscriptions,
+)
 from monoid_agent_kernel.core.content import (
     ContentPart,
     content_part_from_json,
@@ -162,7 +167,7 @@ from monoid_agent_kernel.core.outbox import (
     normalize_outbox_receipt,
 )
 from monoid_agent_kernel.core.runtime_controls import exact_runtime_bool, exact_runtime_string
-from monoid_agent_kernel.core.trace_context import new_traceparent
+from monoid_agent_kernel.core.trace_context import child_traceparent, new_traceparent
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.tasks import (
     HostedResultInjector,
@@ -294,6 +299,9 @@ class AgentToolContext(ToolContext):
     shell_service: ShellService
     web_service: WebService
     jobs_service: JobsService
+    # Trace parent of the enclosing AgentLoop invocation. Subagent spawn derives a child span from
+    # this value so parent receipts, delegation events, and child receipts remain in one trace.
+    invocation_traceparent: str = ""
     # The final answer, set by ``run.finish`` (None until then). Cleared (back to None) when a
     # finish is REJECTED by an output validator. The four former fields (final_text/final_outputs/
     # final_notes/finished) collapsed into this one value so the clear is all-or-nothing.
@@ -568,7 +576,7 @@ class AgentToolContext(ToolContext):
                 # Correlation so subagent.* events nest under this spawn tool call.
                 "parent_event_id": call.tool_event_id,
                 "turn_id": call.turn_id,
-                "traceparent": new_traceparent(),
+                "traceparent": child_traceparent(self.invocation_traceparent),
             },
         )
         if background:
@@ -857,6 +865,12 @@ class AgentLoop:
     dynamic_tool_providers: tuple[DynamicToolProvider, ...] = ()
     tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
     event_sinks: tuple[EventSink, ...] = ()
+    # Base provenance for model calls made by this run. AgentLoop supplies the authoritative
+    # run/turn identity per call while preserving caller-owned Skill, batch, trace, and attributes.
+    invocation_context: InvocationContext | None = None
+    # Run-owned observers of settled model calls. They receive an activation snapshot and are
+    # closed with the loop, like event sinks. Use fresh instances for every loop/restore activation.
+    model_io_subscriptions: tuple[ModelIOSubscription, ...] = ()
     status_file: bool = True
     # Opt-in token streaming for the autonomous (non-RunStream) drive: when set and the model
     # adapter supports ``astream_turn``, each text fragment is emitted as a ``model.output.delta``
@@ -915,6 +929,7 @@ class AgentLoop:
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
+    _model_io_subscriptions_closed: bool = field(default=False, init=False, repr=False)
     # Core-owned per-run event loop for sync callers. Runs continuously on a dedicated
     # daemon thread for the whole run (not just during a call), so background asyncio tasks
     # (subprocess monitors) keep progressing between turns even when a turn-by-turn driver
@@ -1083,14 +1098,29 @@ class AgentLoop:
         session so close() still returns a failed result rather than raising."""
         if self._session is not None:
             raise NativeAgentError("run is already open", error_code="run_already_open")
+        if self.model_io_subscriptions and self._model_io_subscriptions_closed:
+            raise NativeAgentError(
+                "model-I/O subscriptions are closed; construct a fresh AgentLoop activation",
+                error_code="model_io_subscriptions_closed",
+            )
         try:
             res = self._bootstrap()
         except Exception as exc:  # controlled recording boundary for standalone CLI
             res = self._bootstrap_resources
             if res is None:
+                self._close_model_io_subscriptions()
                 raise
             state = RunState()
-            self._record_failure(state, res, exc)
+            try:
+                self._record_failure(state, res, exc)
+            except BaseException:
+                # A failure recorder is an owned sink too. If it fails, no terminal session can be
+                # returned, so discard every partially published bootstrap resource before raising.
+                try:
+                    self.discard_uncommitted()
+                except BaseException:
+                    pass
+                raise
             self._session = _Session(state=state, res=res, terminal=True)
             return
         self._session = _Session(state=RunState(), res=res)
@@ -1532,17 +1562,34 @@ class AgentLoop:
         """Finalize the run: cancel jobs, write the terminal proposal, emit
         run.finished, close the recorder, and return the cumulative result."""
         session = self._require_open()
-        result = self._finalize(session.state, session.res)
-        # A successfully completed run has nothing to recover: drop its checkpoints. A
-        # failed/limited run KEEPS its checkpoints so the last-good one (named in
-        # failure.json) is available for an operator-driven restore.
-        if session.state.status == "completed":
-            self._checkpoint_store().delete(self.spec.run_id)
-        self._session = None
-        # Multi-turn sync usage (open/submit*/close) ends here, in the caller thread, so the
-        # owned loop is torn down now. The run_once path calls close() from within the loop;
-        # there _maybe_close_loop is a no-op and run_once's finally does the teardown.
-        self._maybe_close_loop()
+        try:
+            result = self._finalize(session.state, session.res)
+        except BaseException:
+            # A failed terminal transition cannot remain submit-capable with already-closed
+            # observers. Finish best-effort activation cleanup while preserving the original
+            # finalization/checkpoint error for the caller.
+            try:
+                self.discard_uncommitted()
+            except BaseException:
+                pass
+            raise
+        self._close_model_io_subscriptions(session.res)
+        try:
+            # A successfully completed run has nothing to recover: drop its checkpoints. A
+            # failed/limited run KEEPS its checkpoints so the last-good one (named in
+            # failure.json) is available for an operator-driven restore.
+            if session.state.status == "completed":
+                self._checkpoint_store().delete(self.spec.run_id)
+        finally:
+            # Finalization already closed the recorder. A checkpoint-delete failure must end this
+            # activation without asking recorder/event sinks to close a second time.
+            self._session = None
+            self._bootstrap_resources = None
+            self._stream_sink = None
+            # Multi-turn sync usage (open/submit*/close) ends here, in the caller thread, so the
+            # owned loop is torn down now. The run_once path calls close() from within the loop;
+            # there _maybe_close_loop is a no-op and run_once's finally does the teardown.
+            self._maybe_close_loop()
         return result
 
     def release_parked(self) -> None:
@@ -1566,7 +1613,17 @@ class AgentLoop:
                 "run has no current committed suspension boundary",
                 error_code="run_not_durably_parked",
             )
-        session.res.recorder.close()
+        try:
+            self._close_model_io_subscriptions(session.res)
+            session.res.recorder.close()
+        except BaseException:
+            # The committed boundary remains recoverable, but this process-local activation is no
+            # longer usable after its observers close. Discard it while preserving the close error.
+            try:
+                self.discard_uncommitted()
+            except BaseException:
+                pass
+            raise
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None
@@ -1575,7 +1632,14 @@ class AgentLoop:
     async def arelease_parked(self) -> None:
         """Async facade for :meth:`release_parked`."""
 
-        await asyncio.to_thread(self.release_parked)
+        try:
+            await self._await_lifecycle_thread(self.release_parked)
+        except asyncio.CancelledError:
+            try:
+                await self._await_lifecycle_thread(self.discard_uncommitted)
+            except BaseException:
+                pass
+            raise
 
     def discard_uncommitted(self) -> None:
         """Discard process-local activation state and keep the last durable checkpoint.
@@ -1601,6 +1665,7 @@ class AgentLoop:
                 resources.recorder.close()
             except BaseException as exc:  # cleanup continues through the owned event loop
                 cleanup_errors.append(exc)
+        self._close_model_io_subscriptions(resources)
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None
@@ -1614,7 +1679,7 @@ class AgentLoop:
     async def adiscard_uncommitted(self) -> None:
         """Async facade for :meth:`discard_uncommitted`."""
 
-        await asyncio.to_thread(self.discard_uncommitted)
+        await self._await_lifecycle_thread(self.discard_uncommitted)
 
     def run_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
         """One-shot convenience: open() + submit(user_input) + close().
@@ -1655,11 +1720,51 @@ class AgentLoop:
     async def aopen(self) -> None:
         """Async form of :meth:`open` — offloads the (sync) bootstrap I/O to a thread so
         an event loop is not blocked during workspace/manifest setup."""
-        await asyncio.to_thread(self.open)
+        try:
+            await self._await_lifecycle_thread(self.open)
+        except asyncio.CancelledError:
+            # ``to_thread`` work cannot be force-cancelled. Wait until bootstrap stops publishing
+            # resources, then discard them before the cancellation reaches the backend driver.
+            try:
+                await self._await_lifecycle_thread(self.discard_uncommitted)
+            except BaseException:
+                pass
+            raise
 
     async def aclose(self) -> AgentRunResult:
         """Async form of :meth:`close` — offloads the (sync) finalize I/O to a thread."""
-        return await asyncio.to_thread(self.close)
+        try:
+            return await self._await_lifecycle_thread(self.close)
+        except asyncio.CancelledError:
+            try:
+                await self._await_lifecycle_thread(self.discard_uncommitted)
+            except BaseException:
+                pass
+            raise
+
+    @staticmethod
+    async def _await_lifecycle_thread(operation: Callable[[], Any]) -> Any:
+        """Wait for non-cancellable thread I/O to settle before propagating task cancellation."""
+
+        task = asyncio.create_task(asyncio.to_thread(operation))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A second cancellation request must not reopen the race. Retrieve the worker outcome
+            # after it settles, then propagate cancellation from the original await.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if task.done() and not task.cancelled():
+                try:
+                    task.result()
+                except BaseException:
+                    pass
+            raise
 
     def _run_sync(self, coro: Any) -> Any:
         """Drive an async core method to completion from a synchronous caller.
@@ -1730,7 +1835,12 @@ class AgentLoop:
         self._owned_loop_thread = None
 
     async def _acall_model(
-        self, request: ModelRequest, deadline: float | None, runner: ModelCallRunner
+        self,
+        request: ModelRequest,
+        deadline: float | None,
+        runner: ModelCallRunner,
+        *,
+        invocation_context: InvocationContext,
     ) -> ModelTurn:
         """Run one model call through the runner, choosing what this run wants to see of it.
 
@@ -1772,6 +1882,7 @@ class AgentLoop:
         try:
             turn, _receipt = await runner.acall(
                 request,
+                context=invocation_context,
                 deadline=deadline,
                 delta_consumer=delta_consumer,
                 should_abort=should_abort,
@@ -1779,6 +1890,46 @@ class AgentLoop:
         except ModelCallAborted as exc:
             raise TurnInterrupted("turn interrupted") from exc
         return turn
+
+    def _model_invocation_context(self, turn_id: str) -> InvocationContext:
+        """Bind caller provenance to this loop's durable, monotonic model-call address."""
+
+        base = self._safe_invocation_context()
+        step_id = f"{base.step_id}/{turn_id}" if base.step_id else turn_id
+        return replace(
+            base,
+            run_id=self.spec.run_id,
+            step_id=step_id,
+            # The caller's attempt identifies the enclosing Skill/pipeline unit. AgentLoop does
+            # not alter it; provider retries live in the receipt and later loop calls get new turns.
+            attempt=base.attempt,
+        )
+
+    def _safe_invocation_context(self) -> InvocationContext:
+        """Snapshot valid caller provenance without letting observability metadata fail the run."""
+
+        if self.invocation_context is None:
+            return InvocationContext()
+        try:
+            # ``InvocationContext`` is frozen but callers can still force-mutate fields and its
+            # copied attributes map remains mutable. The wire round-trip validates every scalar as
+            # well as the attributes before AgentLoop derives per-turn or child provenance.
+            return InvocationContext.from_json(self.invocation_context.to_json())
+        except Exception:
+            return InvocationContext()
+
+    def _close_model_io_subscriptions(self, resources: _RunResources | None = None) -> None:
+        """Close this activation's observer snapshot once, tolerating observer failures."""
+
+        if self._model_io_subscriptions_closed:
+            return
+        self._model_io_subscriptions_closed = True
+        subscriptions = (
+            tuple(resources.model_runner.subscriptions)
+            if resources is not None
+            else self.model_io_subscriptions
+        )
+        close_model_io_subscriptions(subscriptions)
 
     def _record_failure(
         self,
@@ -2081,6 +2232,11 @@ class AgentLoop:
         the agent's delta on top."""
         if self._session is not None:
             raise NativeAgentError("run is already open", error_code="run_already_open")
+        if self.model_io_subscriptions and self._model_io_subscriptions_closed:
+            raise NativeAgentError(
+                "model-I/O subscriptions are closed; construct a fresh AgentLoop activation",
+                error_code="model_io_subscriptions_closed",
+            )
         self._restoring = True
         try:
             res = self._bootstrap()
@@ -2409,10 +2565,29 @@ class AgentLoop:
                 **subagent.child_metadata(),
             },
         )
+        parent_invocation = self._safe_invocation_context()
+        child_step = f"subagent:{subagent.task_id}"
+        if parent_invocation.step_id:
+            child_step = f"{parent_invocation.step_id}/{child_step}"
         child = AgentLoop(
             spec=child_spec,
             model_adapter=self.model_adapter,
             runtime_config_provider=child_config,
+            invocation_context=replace(
+                parent_invocation,
+                run_id=subagent.child_run_id,
+                step_id=child_step,
+                attempt=parent_invocation.attempt,
+                traceparent=subagent.traceparent,
+                attributes={
+                    **parent_invocation.attributes,
+                    "root_run_id": subagent.root_run_id,
+                    "parent_run_id": subagent.parent_run_id,
+                    "parent_task_id": subagent.task_id,
+                    "subagent_definition_id": subagent.definition_id,
+                    "subagent_depth": str(subagent.depth),
+                },
+            ),
             # Inherit the parent's tool providers so MCP/custom tools are in the child's
             # registry (the inherited bindings reference them).
             tool_providers=self.tool_providers,
@@ -3065,7 +3240,12 @@ class AgentLoop:
                 }
             )
             try:
-                turn = await self._acall_model(request, deadline, res.model_runner)
+                turn = await self._acall_model(
+                    request,
+                    deadline,
+                    res.model_runner,
+                    invocation_context=self._model_invocation_context(turn_id),
+                )
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status

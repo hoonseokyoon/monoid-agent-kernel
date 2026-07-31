@@ -20,7 +20,7 @@ uses instead of depending on the whole facade.
 | `BackendSessionService` | Session control actions, task callbacks, inbound messages, and `resume_run` entrypoint. |
 | `SessionDriveService` | Open multi-turn session driving, message waits, checkpoint park points. |
 | `RunExecutionService` | Autonomous and stream-driven run execution from a prepared run: loop attach, first turn drive, stream frames, terminal result/failure handoff, run slot accounting. |
-| `BackendLoopFactory` | Reference `AgentLoop` assembly: run spec, model adapter, gateway clients, runtime-config provider, event sinks, capability broker, outbox sender, and checkpoint callback. |
+| `BackendLoopFactory` | Reference `AgentLoop` assembly: run spec, model adapter, gateway clients, runtime-config provider, event sinks, activation-scoped model-I/O subscriptions, capability broker, outbox sender, and checkpoint callback. |
 | `OutboxDispatchService` | Reference outbox edge dispatch: due-request drain, retry backoff, ack staging, checkpoint persistence, watchdog redrive scheduling. |
 | `ProposalService` | Reference proposal/package/artifact/approve/reject/apply operations. |
 | `RuntimeConfigService` | Runtime config projection, validation, hot-swap, durable metadata commit. |

@@ -85,6 +85,8 @@ class LoopPort(Protocol):
 
     def restore(self, checkpoint: RunCheckpoint, *, blobs: Mapping[str, bytes]) -> None: ...
 
+    def discard_uncommitted(self) -> None: ...
+
 
 class RunStreamPort(Protocol):
     suspension: Suspension | None
