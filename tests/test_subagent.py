@@ -9,8 +9,9 @@ from support.runtime import tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
 from monoid_agent_kernel.core.capability import AutoGrantBroker
+from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
-from monoid_agent_kernel.core.trace_context import trace_id_of
+from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 from monoid_agent_kernel.providers.fake import fake_tool_call
@@ -90,6 +91,7 @@ def _loop(
     event_sinks: tuple = (),
     tool_providers: tuple = (),
     capability_broker: object | None = None,
+    invocation_context: InvocationContext | None = None,
 ) -> AgentLoop:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
@@ -105,6 +107,7 @@ def _loop(
         event_sinks=event_sinks,
         tool_providers=tool_providers,
         capability_broker=capability_broker,  # type: ignore[arg-type]
+        invocation_context=invocation_context,
     )
 
 
@@ -142,7 +145,11 @@ def test_child_workspace_is_isolated_from_parent(tmp_path: Path) -> None:
     adapter = RoutingAdapter(
         parent=[_spawn_call("write a file"), ModelTurn(final_text="parent done")],
         child=[
-            ModelTurn(tool_calls=(fake_tool_call("fs_write", {"path": "child.txt", "content": "hi"}, "w1"),)),
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call("fs_write", {"path": "child.txt", "content": "hi"}, "w1"),
+                )
+            ),
             ModelTurn(final_text="wrote child.txt"),
         ],
     )
@@ -221,7 +228,17 @@ def test_subagent_events_correlate_to_spawn_call(tmp_path: Path) -> None:
         parent=[_spawn_call("do X", call_id="c1"), ModelTurn(final_text="parent done")],
         child=[ModelTurn(final_text="CHILD_OUTPUT")],
     )
-    loop = _loop(tmp_path, adapter, _parent_config(), event_sinks=(sink,))
+    parent_traceparent = new_traceparent()
+    loop = _loop(
+        tmp_path,
+        adapter,
+        _parent_config(),
+        event_sinks=(sink,),
+        invocation_context=InvocationContext(
+            traceparent=parent_traceparent,
+            tracestate="vendor=value",
+        ),
+    )
 
     loop.run_once("go")
 
@@ -245,11 +262,21 @@ def test_subagent_events_correlate_to_spawn_call(tmp_path: Path) -> None:
     assert started.data["depth"] == 1
     traceparent = str(started.data["traceparent"])
     assert trace_id_of(traceparent)
+    assert trace_id_of(traceparent) == trace_id_of(parent_traceparent)
+    assert traceparent != parent_traceparent
     assert finished.data["root_run_id"] == started.run_id
     assert finished.data["parent_run_id"] == started.run_id
     assert finished.data["task_id"] == started.data["task_id"]
     assert finished.data["traceparent"] == traceparent
-    task_path = tmp_path / "runs" / started.run_id / "artifacts" / "tasks" / started.data["task_id"] / "task.json"
+    task_path = (
+        tmp_path
+        / "runs"
+        / started.run_id
+        / "artifacts"
+        / "tasks"
+        / started.data["task_id"]
+        / "task.json"
+    )
     subagent_result = json.loads(task_path.read_text(encoding="utf-8"))["result"]
     assert subagent_result["traceparent"] == traceparent
 
@@ -454,7 +481,9 @@ def test_child_model_inherits_and_overrides(tmp_path: Path) -> None:
         child=_child_def(),
     )
     loop.run_once("go")
-    child_models = {r.model.model for r in adapter.requests if CHILD_MARK in r.system_prompt and r.model}
+    child_models = {
+        r.model.model for r in adapter.requests if CHILD_MARK in r.system_prompt and r.model
+    }
     assert child_models == {"M-parent"}
 
     # Override: child def sets its own model.
@@ -469,7 +498,9 @@ def test_child_model_inherits_and_overrides(tmp_path: Path) -> None:
         child=_child_def(model=ModelConfig(model="M-child")),
     )
     loop2.run_once("go")
-    child_models2 = {r.model.model for r in adapter2.requests if CHILD_MARK in r.system_prompt and r.model}
+    child_models2 = {
+        r.model.model for r in adapter2.requests if CHILD_MARK in r.system_prompt and r.model
+    }
     assert child_models2 == {"M-child"}
 
 
@@ -591,7 +622,9 @@ def test_fresh_subagent_starts_with_empty_context(tmp_path: Path) -> None:
 
     loop.run_once("go")
 
-    child_first = next(r for r in adapter.requests if r.instruction == "do X" and CHILD_MARK in r.system_prompt)
+    child_first = next(
+        r for r in adapter.requests if r.instruction == "do X" and CHILD_MARK in r.system_prompt
+    )
     # A fresh child sees only its own task prompt — none of the parent's conversation.
     assert "go" not in json.dumps(list(child_first.messages or ()))
 
@@ -599,7 +632,12 @@ def test_fresh_subagent_starts_with_empty_context(tmp_path: Path) -> None:
 def test_metrics_report_subagent_usage_separately(tmp_path: Path) -> None:
     adapter = RoutingAdapter(
         parent=[_spawn_call("do X"), ModelTurn(final_text="parent done")],
-        child=[ModelTurn(final_text="child done", usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})],
+        child=[
+            ModelTurn(
+                final_text="child done",
+                usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+            )
+        ],
     )
     loop = _loop(tmp_path, adapter, _parent_config())
 
@@ -614,7 +652,12 @@ def test_metrics_report_subagent_usage_separately(tmp_path: Path) -> None:
 def test_subagent_usage_counts_against_parent_token_budget(tmp_path: Path) -> None:
     adapter = RoutingAdapter(
         parent=[_spawn_call("do X"), ModelTurn(final_text="should not be called")],
-        child=[ModelTurn(final_text="child done", usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})],
+        child=[
+            ModelTurn(
+                final_text="child done",
+                usage={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+            )
+        ],
     )
     loop = _loop(tmp_path, adapter, _parent_config(), limits=RunLimits(max_total_tokens=5))
 
@@ -622,5 +665,7 @@ def test_subagent_usage_counts_against_parent_token_budget(tmp_path: Path) -> No
 
     assert result.status == "limited"
     assert result.error_code == "total_tokens_exceeded"
-    parent_requests = [request for request in adapter.requests if PARENT_MARK in request.system_prompt]
+    parent_requests = [
+        request for request in adapter.requests if PARENT_MARK in request.system_prompt
+    ]
     assert len(parent_requests) == 1

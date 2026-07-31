@@ -473,8 +473,12 @@ class AgentRecorder:
         return path
 
     def close(self) -> None:
-        self.event_bus.close()
-        self._transcript_file.close()
+        try:
+            self.event_bus.close()
+        finally:
+            # Event-sink failure must not retain the private transcript handle. TextIO close is
+            # idempotent, while EventBus separately guarantees each configured sink is called once.
+            self._transcript_file.close()
 
     def _write_proposal_entry(self, entry: ChangedEntry, files_dir: Path) -> dict[str, Any]:
         payload: dict[str, Any] = {

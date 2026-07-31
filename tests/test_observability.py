@@ -171,6 +171,30 @@ def test_emit_after_close_is_a_noop(tmp_path: Path) -> None:
     assert events_path.read_bytes() == bytes_before  # the closed sink is not written
 
 
+def test_event_bus_closes_each_sink_once_even_when_one_close_fails() -> None:
+    class ClosingSink:
+        def __init__(self, *, fail: bool = False) -> None:
+            self.fail = fail
+            self.close_count = 0
+
+        def emit(self, event: AgentEvent) -> None:
+            del event
+
+        def close(self) -> None:
+            self.close_count += 1
+            if self.fail:
+                raise RuntimeError("sink close failed")
+
+    sinks = (ClosingSink(), ClosingSink(fail=True), ClosingSink())
+    bus = EventBus("run-close-once", sinks)
+
+    with pytest.raises(RuntimeError, match="sink close failed"):
+        bus.close()
+    bus.close()
+
+    assert [sink.close_count for sink in sinks] == [1, 1, 1]
+
+
 def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

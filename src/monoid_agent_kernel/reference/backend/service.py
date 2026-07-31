@@ -30,6 +30,7 @@ from monoid_agent_kernel.core.durable_metadata import (
 from monoid_agent_kernel.core.capability import CapabilityBroker
 from monoid_agent_kernel.core.context import ContextProvider
 from monoid_agent_kernel.core.events import AgentEvent, EventSink
+from monoid_agent_kernel.core.model_io import ModelIOSubscription
 from monoid_agent_kernel.core.event_subscription import EventSubscription, SequenceCursor
 from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
@@ -391,6 +392,9 @@ class RunnerBackend:
     # uses to attach observability without a core dep — e.g. studio sets ``(OtelEventSink,)`` when
     # OTel is toggled on. Read at loop-build time so it can change at runtime. Empty → no deps.
     extra_event_sink_factories: tuple[Callable[[], EventSink], ...] = ()
+    # Per-run model-I/O subscriptions. Factories must return ownership-unique observers because
+    # AgentLoop closes each activation's instances at its terminal/release/discard boundary.
+    model_io_subscription_factories: tuple[Callable[[], ModelIOSubscription], ...] = ()
     # Tool/context providers attached to every run the backend builds (Skills, MCP, custom).
     # The embedder-facing seam for the loop's tool_providers/context_providers (the CLI passes
     # these to AgentLoop directly; without these fields an out-of-process embedder could not
@@ -577,6 +581,9 @@ class RunnerBackend:
                 checkpoint_store_provider=lambda: self.checkpoint_store,
                 emit_output_deltas_provider=lambda: self.emit_output_deltas,
                 extra_event_sink_factories_provider=lambda: self.extra_event_sink_factories,
+                model_io_subscription_factories_provider=lambda: (
+                    self.model_io_subscription_factories
+                ),
                 subagent_definitions_provider=lambda: self.subagent_definitions,
                 tool_providers_provider=lambda: self.tool_providers,
                 context_providers_provider=lambda: self.context_providers,
@@ -665,6 +672,7 @@ class RunnerBackend:
                 issue_web_gateway_token=self._issue_recovery_web_gateway_token,
                 build_loop=self._build_loop_build,
                 register_record=self._register_recovered_record,
+                unregister_record=self._unregister_recovered_record,
                 attach_loop=self._attach_loop_build,
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
                 spawn=self._spawn,
@@ -892,8 +900,19 @@ class RunnerBackend:
             metadata={"agent_config_hash": runtime_config.config_hash},
         )
 
-    def _register_recovered_record(self, record: BackendRunRecord) -> None:
-        self._register_record(record)
+    def _register_recovered_record(self, record: BackendRunRecord) -> bool:
+        """Atomically claim one in-process activation for a recovered run id."""
+
+        with self._lock:
+            if record.run_id in self._records:
+                return False
+            self._records[record.run_id] = record
+            return True
+
+    def _unregister_recovered_record(self, record: BackendRunRecord) -> None:
+        with self._lock:
+            if self._records.get(record.run_id) is record:
+                self._records.pop(record.run_id, None)
 
     def _attach_loop_build(
         self,

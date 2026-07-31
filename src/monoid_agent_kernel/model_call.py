@@ -412,9 +412,9 @@ class ModelCallRunner:
     Identifying the call is not: `prompt_digest` and `request_digest` are computed on every call,
     before anything looks at this field, because they describe the call whether or not anyone is
     watching. That costs two canonical-JSON encodes and two SHA-256 passes over the serialized
-    prompt per call, which is why `_MAX_DIGEST_BYTES` bounds it. `AgentLoop` builds its runner with
-    no subscriptions and still pays that; anyone trimming the cost should start there and not
-    expect this field to gate it."""
+    prompt per call, which is why `_MAX_DIGEST_BYTES` bounds it. An `AgentLoop` with no model-I/O
+    subscriptions still pays that; anyone trimming the cost should start there and not expect this
+    field to gate it."""
 
     def _effective_model(
         self,

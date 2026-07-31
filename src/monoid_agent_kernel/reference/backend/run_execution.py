@@ -76,6 +76,9 @@ class RunExecutionService:
 
     async def run_prepared(self, prepared: PreparedRunPort, request: RunRequestPort) -> None:
         await self._context.acquire_run_slot()
+        loop: RunExecutionLoopPort | None = None
+        released = False
+        discarded = False
         try:
             try:
                 loop_build = self._context.build_loop(
@@ -88,10 +91,26 @@ class RunExecutionService:
                 loop = loop_build.loop
                 self._context.attach_loop(prepared.record, loop_build)
                 result = await self.drive_session(prepared.run_id, request, loop)
+                released = True
                 self._context.record_run_result(prepared.run_id, result)
             except Exception as exc:
+                if loop is not None and not released:
+                    try:
+                        await asyncio.to_thread(loop.discard_uncommitted)
+                        discarded = True
+                    except BaseException:
+                        # The original execution failure remains the actionable cause. AgentLoop
+                        # already attempts every owned resource before surfacing cleanup failure.
+                        pass
                 self._context.record_run_failure(prepared.run_id, exc)
         finally:
+            # Cancellation derives from BaseException, so it bypasses the failure-recording branch.
+            # It still owns every resource materialized before the cancellation point.
+            if loop is not None and not released and not discarded:
+                try:
+                    await asyncio.to_thread(loop.discard_uncommitted)
+                except BaseException:
+                    pass
             self._context.release_run_slot()
 
     async def drive_session(
@@ -171,9 +190,7 @@ class RunExecutionService:
                         # emptiness check stays on the loop and only real work crosses the
                         # boundary.
                         if needs_settled_text([frame]):
-                            await asyncio.to_thread(
-                                hydrate_settled_text, [frame], stream_run_dir
-                            )
+                            await asyncio.to_thread(hydrate_settled_text, [frame], stream_run_dir)
                     yield frame
                 suspension = stream.suspension
             result = await loop.aclose()
@@ -184,9 +201,15 @@ class RunExecutionService:
             if loop is not None and not closed:
                 try:
                     await loop.aclose()
+                    closed = True
                 except Exception:  # noqa: BLE001 - finalization best-effort; the failure is recorded below
                     pass
             self._context.record_run_failure(prepared.run_id, exc)
             yield failure_frame(exc)
         finally:
+            if loop is not None and not closed:
+                try:
+                    await asyncio.to_thread(loop.discard_uncommitted)
+                except BaseException:
+                    pass
             self._context.release_run_slot()

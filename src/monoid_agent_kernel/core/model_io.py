@@ -1045,7 +1045,12 @@ def close_model_io_subscriptions(subscriptions: Sequence[ModelIOSubscription]) -
         if id(observer) in seen:
             continue
         seen.add(id(observer))
-        close = getattr(observer, "close", None)
+        try:
+            close = getattr(observer, "close", None)
+        except Exception:
+            # ``close`` is optional and may be exposed through a descriptor. A broken probe is an
+            # observer failure, not permission to alter the run outcome or skip later observers.
+            continue
         if not callable(close):
             continue
         try:

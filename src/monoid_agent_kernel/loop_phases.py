@@ -179,6 +179,9 @@ class LoopBootstrapper:
             permission_policy=loop.permission_policy,
             capability_vault=loop._capability_vault,
             outbox=loop._outbox,
+            invocation_traceparent=(
+                loop.invocation_context.traceparent if loop.invocation_context is not None else ""
+            ),
         )
         started = time.time()
         deadline = (
@@ -199,6 +202,9 @@ class LoopBootstrapper:
             cancel_grace_s=loop.async_model_cancel_grace_s,
             current_cancel_grace_s=lambda: loop.async_model_cancel_grace_s,
             thread_name=f"nar-model-call-{loop.spec.run_id}",
+            # AgentLoop owns this activation-scoped snapshot. The runner only delivers calls;
+            # lifecycle cleanup stays with the loop alongside its recorder and event sinks.
+            subscriptions=tuple(loop.model_io_subscriptions),
         )
         # Publish partial ownership as soon as recorder/task resources exist. If a provider,
         # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.
