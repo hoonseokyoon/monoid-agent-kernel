@@ -8,6 +8,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import KW_ONLY, dataclass, field, replace
@@ -20,7 +21,7 @@ from monoid_agent_kernel.core._sync_bridge import (
     is_async_callable,
     start_abandonable_sync_call,
 )
-from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
+from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes, utc_timestamp
 from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import (
@@ -33,6 +34,16 @@ from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
     ModelIOSubscription,
     close_model_io_subscriptions,
+)
+from monoid_agent_kernel.core.model_stream import (
+    ModelStreamContext,
+    ModelStreamDelta,
+    ModelStreamObserver,
+    ModelStreamObserverFactory,
+    ModelStreamOutcome,
+    ModelStreamStatus,
+    ModelStreamWriter,
+    safe_open_model_stream,
 )
 from monoid_agent_kernel.core.content import (
     ContentPart,
@@ -95,7 +106,10 @@ from monoid_agent_kernel.core.output_validator import (
     OutputValidator,
 )
 from monoid_agent_kernel.core.streaming import QueueEventSink, RunStream
-from monoid_agent_kernel.core.subagent_runtime import SubagentRuntimeContext
+from monoid_agent_kernel.core.subagent_runtime import (
+    SubagentRuntimeContext,
+    is_descendant_run_id,
+)
 from monoid_agent_kernel.core.spec import (
     AgentRunSpec,
     ModelConfig,
@@ -851,6 +865,12 @@ class _Session:
     persisted_hosted_task_ids: set[str] = field(default_factory=set)
     active_input: dict[str, Any] | None = None
     applied_input_receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Correlation for the model turn currently being pumped. Deliberately activation-local rather
+    # than checkpointed: a restored activation starts a fresh ``model.turn.started`` before it can
+    # fail, interrupt, or settle. Keeping the pair here lets those terminal turn events point back
+    # to that durable start event without expanding the checkpoint contract.
+    active_turn_id: str | None = None
+    active_turn_parent_id: str | None = None
 
 
 @dataclass
@@ -871,15 +891,24 @@ class AgentLoop:
     # Run-owned observers of settled model calls. They receive an activation snapshot and are
     # closed with the loop, like event sinks. Use fresh instances for every loop/restore activation.
     model_io_subscriptions: tuple[ModelIOSubscription, ...] = ()
+    # Factories, rather than observer instances, make the observer lifecycle activation-scoped:
+    # open/restore and every spawned child materialize a fresh snapshot. Each observer then opens
+    # one isolated writer per provider stream. Observer failures never affect the model result.
+    model_stream_observer_factories: tuple[ModelStreamObserverFactory, ...] = ()
     status_file: bool = True
-    # Opt-in token streaming for the autonomous (non-RunStream) drive: when set and the model
-    # adapter supports ``astream_turn``, each text fragment is emitted as a ``model.output.delta``
-    # event so an event-stream consumer (e.g. the studio app over SSE) can render tokens live.
-    # Falls back to a one-shot ``next_turn`` for adapters that can't stream. Off by default here,
-    # but the shipped Studio turns it on whenever ``httpx`` is importable — so for the product most
-    # people run, this is on. ``MONOID_OUTPUT_DELTAS=0`` forces it off for a whole deployment;
-    # see ``__post_init__``.
+    # Compatibility channel for embedders that explicitly requested durable token events. When set
+    # and the adapter supports ``astream_turn``, text/reasoning fragments are mirrored to
+    # ``events.jsonl`` as ``model.*.delta``. New live/private consumers use the stream observer seam
+    # and can leave this off. ``MONOID_OUTPUT_DELTAS=0`` remains the deployment kill switch; see
+    # ``__post_init__``.
     emit_output_deltas: bool = False
+    # Drive ``astream_turn`` for autonomous submits even when no output channel is configured.
+    # This preserves token-boundary interrupt responsiveness without requiring durable delta
+    # events. A RunStream still owns its historical step-boundary interrupt semantics.
+    stream_model_calls: bool = False
+    # Persist private streamed model content to ``model-content.jsonl``. The recorder owns the
+    # file and returns a failure-shielded writer; public events/status remain content-free.
+    model_content_file: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
     # Native async handlers receive cancellation immediately. Cleanup gets a bounded grace
@@ -986,6 +1015,35 @@ class AgentLoop:
         self._bootstrapper = LoopBootstrapper(self)
         self._settle_coordinator = LoopSettleCoordinator(self)
         self._finalizer = LoopFinalizer(self)
+
+    def _materialize_model_stream_observers(self) -> tuple[ModelStreamObserver, ...]:
+        """Build this activation's observer snapshot without making diagnostics a run gate."""
+
+        observers: list[ModelStreamObserver] = []
+        for factory in tuple(self.model_stream_observer_factories):
+            try:
+                observer = factory()
+            except Exception:  # noqa: BLE001 - content observers cannot fail an agent activation
+                _LOGGER.debug("model stream observer factory failed", exc_info=True)
+                continue
+            if observer is not None:
+                observers.append(observer)
+        return tuple(observers)
+
+    def _validated_root_run_id(self) -> str:
+        """Return a routing root only when it is proven by this run's generated lineage."""
+
+        try:
+            candidate = self.spec.metadata.get("root_run_id")
+        except Exception:
+            return self.spec.run_id
+        if (
+            isinstance(candidate, str)
+            and candidate
+            and is_descendant_run_id(candidate, self.spec.run_id)
+        ):
+            return candidate
+        return self.spec.run_id
 
     @classmethod
     def from_config(
@@ -1160,8 +1218,8 @@ class AgentLoop:
         event loop. Yields ``AgentEvent`` (orchestration) interleaved with ``ModelStreamChunk``
         (token deltas, when the adapter exposes ``astream_turn``); read ``stream.result`` after
         the stream drains. Auto-waits in-process background jobs like ``asubmit`` and ends the
-        stream when the run parks on an external hosted task (surfaced as ``stream.suspension``,
-        alongside a ``run.awaiting_input`` event)::
+        stream when the run parks before producing a turn result (surfaced as
+        ``stream.suspension``; external tasks also emit ``run.awaiting_input``)::
 
             await loop.aopen()
             async with loop.astream("go") as stream:
@@ -1186,8 +1244,7 @@ class AgentLoop:
     async def _astream_drive(
         self, user_input: str | tuple[ContentPart, ...]
     ) -> AgentTurnResult | Suspension:
-        """``asubmit``'s body, but yields (instead of blocking) when the run parks on an
-        external hosted task — the caller resumes via a fresh stream after reporting it."""
+        """``asubmit``'s body, returning any non-settled park through ``RunStream``."""
         session = self._require_open()
         suspension = await self.arun_until_suspended(user_input)
         while suspension.reason == "awaiting_tasks":
@@ -1200,7 +1257,8 @@ class AgentLoop:
                 session.res.deadline,
             )
             suspension = await self.arun_until_suspended(None)
-        assert suspension.turn is not None  # non-awaiting reasons always checkpoint
+        if suspension.turn is None:
+            return suspension
         return suspension.turn
 
     def run_until_suspended(
@@ -1221,9 +1279,10 @@ class AgentLoop:
         continues the conversation). Thread-safe one-way signal (a bare flag set, mirroring
         ``cancellation_token.cancel()``). A no-op if no turn is in flight: the flag is cleared
         when the next submit starts, so it never kills a turn the user did not mean to stop.
-        With token streaming (``emit_output_deltas`` + an ``astream_turn`` adapter) it takes
-        effect mid-generation — the in-flight stream is aborted at the next token. Otherwise it
-        lands at the next step boundary (a non-streamed model call finishes first)."""
+        With autonomous model streaming (``stream_model_calls``, a configured content observer,
+        the private content file, or legacy ``emit_output_deltas``) it takes effect mid-generation
+        — the in-flight stream is aborted at the next token. Otherwise it lands at the next step
+        boundary (a non-streamed model call finishes first)."""
         self._interrupt_requested = True
 
     def pause_turn(self) -> None:
@@ -1360,6 +1419,8 @@ class AgentLoop:
         session.last_suspension = None
         state, res = session.state, session.res
         if user_input is not None:
+            session.active_turn_id = None
+            session.active_turn_parent_id = None
             # Per-submit outcome fields describe this turn; reset before running.
             state.status = "completed"
             state.error = ""
@@ -1433,6 +1494,8 @@ class AgentLoop:
             state.provider_http_status = exc.http_status
             res.recorder.emit(
                 "turn.failed",
+                turn_id=session.active_turn_id,
+                parent_id=session.active_turn_parent_id,
                 data={
                     "error": public_error_message(str(exc)),
                     "error_code": exc.error_code,
@@ -1458,7 +1521,13 @@ class AgentLoop:
             # pending_observations so a re-issue doesn't re-append tool outputs. The driver parks
             # for the next user message. ``status`` is cosmetic here; branch on ``reason``.
             self._interrupt_requested = False
-            res.recorder.emit("turn.interrupted", data={"reason": "user_stop"}, level="info")
+            res.recorder.emit(
+                "turn.interrupted",
+                turn_id=session.active_turn_id,
+                parent_id=session.active_turn_parent_id,
+                data={"reason": "user_stop"},
+                level="info",
+            )
             state.pending_observations = ()
             result = Suspension(reason="interrupted", status="completed")
             self._persist_checkpoint(session, result)
@@ -1841,6 +1910,8 @@ class AgentLoop:
         runner: ModelCallRunner,
         *,
         invocation_context: InvocationContext,
+        step: int,
+        turn_id: str,
     ) -> ModelTurn:
         """Run one model call through the runner, choosing what this run wants to see of it.
 
@@ -1848,12 +1919,11 @@ class AgentLoop:
         stays here is the part that is genuinely about *this* run: which consumer the chunks go to,
         and whether a cooperative stop applies.
 
-        Three cases, and they are not symmetric. A live ``RunStream`` relays every chunk to its
-        queue and does **not** honour the turn interrupt -- that has always been a step-boundary
-        signal on this path, and making the stream stop early here would be a behaviour change
-        wearing a refactor's clothes. An autonomous run emitting deltas turns text and reasoning
-        into events and *does* stop immediately, which is what ``interrupt_turn`` means to a caller
-        with no queue to close. Everything else takes the one-shot path.
+        A live ``RunStream`` relays every provider chunk and does **not** honour the turn interrupt
+        -- that has always been a step-boundary signal on this path. Autonomous streaming honours
+        it after the next delivered chunk. Public legacy events and private/live observers receive
+        only text/reasoning; tool fragments remain inside model-turn assembly (except on the
+        explicit RunStream API, whose all-chunk contract predates this seam).
 
         ``ModelCallAborted`` is translated here because the runner knows nothing about turns. Left
         untranslated it would reach the loop's generic failure handler and terminalize a session
@@ -1863,22 +1933,98 @@ class AgentLoop:
         delta_consumer: Callable[[ModelStreamChunk], None] | None = None
         should_abort: Callable[[], bool] | None = None
         sink = self._stream_sink
-        if sink is not None and sink.active:
-            delta_consumer = sink.push_delta
-        elif self.emit_output_deltas:
-            assert self._session is not None
-            recorder = self._session.res.recorder
+        stream_sink_active = sink is not None and sink.active
+        session = self._session
+        recorder = session.res.recorder if session is not None else None
+        observers = session.res.model_stream_observers if session is not None else ()
+        wants_content_stream = self.model_content_file or bool(observers)
+        # RunStream has always taken precedence over the legacy durable mirror: its raw chunks are
+        # the execution owner's live content channel. Mirroring the same token through EventBus
+        # would both persist it and enqueue a second representation on that very RunStream.
+        durable_delta_mirror = self.emit_output_deltas and not stream_sink_active
+        wants_stream = (
+            stream_sink_active
+            or durable_delta_mirror
+            or self.stream_model_calls
+            or wants_content_stream
+        )
+        observer_writers: tuple[ModelStreamWriter, ...] = ()
+        output_fragments: list[str] = []
+
+        if wants_stream:
+            if wants_content_stream:
+                try:
+                    provider_value = getattr(self.model_adapter, "provider_name", None)
+                    if not provider_value and request.model is not None:
+                        provider_value = request.model.provider
+                    provider = str(provider_value) if provider_value else None
+                except Exception:
+                    provider = None
+                try:
+                    model_value = request.model.model if request.model is not None else None
+                    model = str(model_value) if model_value else None
+                except Exception:
+                    model = None
+                stream_context = ModelStreamContext(
+                    run_id=self.spec.run_id,
+                    root_run_id=self._validated_root_run_id(),
+                    turn_id=turn_id,
+                    stream_id=f"stream_{uuid.uuid4().hex}",
+                    step=step,
+                    provider=provider,
+                    model=model,
+                    started_at=utc_timestamp(),
+                )
+                writers: list[ModelStreamWriter] = []
+                if self.model_content_file and recorder is not None:
+                    # AgentRecorder owns and shields the private sidecar writer. This direct method
+                    # keeps the recorder from pretending to implement the external observer API.
+                    try:
+                        writers.append(recorder.open_model_stream(stream_context))
+                    except Exception:  # transitional/third-party recorder safety boundary
+                        _LOGGER.debug("private model stream open failed", exc_info=True)
+                writers.extend(
+                    safe_open_model_stream(observer, stream_context) for observer in observers
+                )
+                observer_writers = tuple(writers)
 
             def delta_consumer(chunk: ModelStreamChunk) -> None:  # noqa: F811
+                if stream_sink_active and sink is not None:
+                    sink.push_delta(chunk)
+
+                stream_delta: ModelStreamDelta | None = None
                 if isinstance(chunk, TextDelta) and chunk.text:
-                    recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
+                    if durable_delta_mirror and recorder is not None:
+                        recorder.emit(
+                            "model.output.delta", data={"text": chunk.text}, level="debug"
+                        )
+                    if observer_writers:
+                        output_fragments.append(chunk.text)
+                        stream_delta = ModelStreamDelta(channel="output", text=chunk.text)
                 elif isinstance(chunk, ReasoningDelta) and chunk.text:
-                    # Display-only reasoning summary (DX-13b): a separate event so a consumer
-                    # renders it in a "thinking" view, distinct from the answer text.
-                    recorder.emit("model.reasoning.delta", data={"text": chunk.text}, level="debug")
+                    if durable_delta_mirror and recorder is not None:
+                        # Display-only reasoning summary (DX-13b): a separate event so a consumer
+                        # renders it in a "thinking" view, distinct from the answer text.
+                        recorder.emit(
+                            "model.reasoning.delta", data={"text": chunk.text}, level="debug"
+                        )
+                    if observer_writers:
+                        stream_delta = ModelStreamDelta(channel="reasoning", text=chunk.text)
 
-            should_abort = lambda: self._interrupt_requested  # noqa: E731
+                if stream_delta is not None:
+                    for writer in observer_writers:
+                        try:
+                            writer.push(stream_delta)
+                        except Exception:  # observers cannot fail a paid provider call
+                            _LOGGER.debug("model stream observer push failed", exc_info=True)
 
+            if not stream_sink_active:
+                should_abort = lambda: self._interrupt_requested  # noqa: E731
+
+        outcome_status: ModelStreamStatus | None = None
+        outcome_final_text: str | None = None
+        outcome_usage: Mapping[str, Any] | None = None
+        outcome_error_code: str | None = None
         try:
             turn, _receipt = await runner.acall(
                 request,
@@ -1888,7 +2034,56 @@ class AgentLoop:
                 should_abort=should_abort,
             )
         except ModelCallAborted as exc:
+            outcome_status = "interrupted"
+            outcome_final_text = "".join(output_fragments) or None
+            outcome_error_code = "interrupted"
             raise TurnInterrupted("turn interrupted") from exc
+        except RunCancelled:
+            outcome_status = "cancelled"
+            outcome_final_text = "".join(output_fragments) or None
+            outcome_error_code = "cancelled"
+            raise
+        except RunTimeout:
+            outcome_status = "timed_out"
+            outcome_final_text = "".join(output_fragments) or None
+            outcome_error_code = "run_timeout"
+            raise
+        except asyncio.CancelledError:
+            outcome_status = "cancelled"
+            outcome_final_text = "".join(output_fragments) or None
+            outcome_error_code = "cancelled"
+            raise
+        except BaseException as exc:
+            outcome_status = "failed"
+            outcome_final_text = "".join(output_fragments) or None
+            try:
+                outcome_error_code = str(getattr(exc, "error_code", None) or "internal_error")
+            except Exception:
+                outcome_error_code = "internal_error"
+            raise
+        else:
+            outcome_status = "completed"
+            outcome_final_text = turn.final_text
+            outcome_usage = turn.usage
+        finally:
+            if outcome_status is not None and observer_writers:
+                try:
+                    outcome = ModelStreamOutcome(
+                        status=outcome_status,
+                        final_text=outcome_final_text,
+                        usage=outcome_usage,
+                        error_code=outcome_error_code,
+                    )
+                except Exception:
+                    # Outcome capture is diagnostic too. Preserve the terminal status even if a
+                    # hostile extension value refuses to copy/normalize its optional metadata.
+                    _LOGGER.debug("model stream outcome normalization failed", exc_info=True)
+                    outcome = ModelStreamOutcome(status=outcome_status)
+                for writer in observer_writers:
+                    try:
+                        writer.close(outcome)
+                    except Exception:  # observers cannot replace the provider outcome
+                        _LOGGER.debug("model stream observer close failed", exc_info=True)
         return turn
 
     def _model_invocation_context(self, turn_id: str) -> InvocationContext:
@@ -2520,7 +2715,7 @@ class AgentLoop:
             task_id=task.job_id,
             definition_id=definition_id,
             parent_depth=depth,
-            root_run_id=str(self.spec.metadata.get("root_run_id") or self.spec.run_id),
+            root_run_id=self._validated_root_run_id(),
             traceparent=str(task.request.get("traceparent") or ""),
         )
         # At the depth cap the child must not delegate further: the resolver drops any
@@ -2601,9 +2796,13 @@ class AgentLoop:
             subagent_definitions=child_definitions,
             capability_broker=self.capability_broker,
             status_file=False,
-            # Inherit token streaming so a child's work streams into its own events.jsonl too
-            # (an observer can tail run_root/<child_run_id>/events.jsonl for live subagent output).
+            # Inherit stream policy and the factories (not materialized observers), so every child
+            # gets isolated per-activation instances while a root-aware live observer may still
+            # multiplex its frames through the shared factory closure.
             emit_output_deltas=self.emit_output_deltas,
+            stream_model_calls=self.stream_model_calls,
+            model_content_file=self.model_content_file,
+            model_stream_observer_factories=self.model_stream_observer_factories,
         )
         child._capability_vault = self._capability_vault.fork_for_child()
         result = await child.arun_once(
@@ -2941,6 +3140,8 @@ class AgentLoop:
                     ),
                 },
             )
+            session.active_turn_id = turn_id
+            session.active_turn_parent_id = turn_started.event_id
             turn_context = self._turn_context(state, res, step, max(0, max_steps - local_step))
             turn_registry = self._registry_for_turn(context, turn_context, res)
             runtime_config = self._current_runtime_config(turn_registry)
@@ -3245,6 +3446,8 @@ class AgentLoop:
                     deadline,
                     res.model_runner,
                     invocation_context=self._model_invocation_context(turn_id),
+                    step=step,
+                    turn_id=turn_id,
                 )
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code

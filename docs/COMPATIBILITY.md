@@ -54,6 +54,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `backend-run` | durable | `monoid.backend-run.v1` | checked | `monoid.backend-run.v1`<br>`native-agent-runner.backend-run.v1` |
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
+| `model-content` | durable | `monoid.model-content.v1` | json-schema | `monoid.model-content.v1`<br>`native-agent-runner.model-content.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
 | `workspace-index` | durable | `monoid.workspace-index.v1` | json-schema | `monoid.workspace-index.v1`<br>`native-agent-runner.workspace-index.v1` |
@@ -179,11 +180,17 @@ blobs. Treat both stores as one backup boundary.
 | Artifact class | Required evolution behavior |
 |---|---|
 | Checkpoint and backend run metadata | Register an ordered, pure migration before changing the writer. Preserve unknown fields where possible. Recovery must distinguish corrupt, unsupported, and transient store failures. |
-| Append-only events and Studio chat JSONL | Readers must handle every retained record version. A file can contain records written by different releases. Keep record-level version checks. |
+| Append-only events, model content, and Studio chat JSONL | Readers must handle every retained record version. A file can contain records written by different releases. Keep record-level version checks. |
 | Manifest, workspace snapshots, and indexes | Bump the version when a strict schema changes incompatibly. Existing run directories remain readable through the listed old-version schema or an explicit migration. |
 | Proposal packages, approvals, and apply results | Content participates in hashes and approval identity. Generate a new artifact after a shape change; never mutate an existing signed or hashed artifact. |
 | Hosted task and background-job projections | Recovery state lives in checkpoints. Projection schema changes must preserve operator visibility and must not be treated as checkpoint migrations. |
 | Wire requests and responses | Deploy accepting readers before emitting the new version. Unknown versions fail closed at strict boundaries. |
+
+`model-content.jsonl` is optional for retained run directories. Each new sidecar record carries
+its own `monoid.model-content.v1` identifier, and readers also accept the legacy
+`native-agent-runner.model-content.v1` namespace. When the sidecar is enabled during this
+compatibility window, settled text is written to both it and `transcript.jsonl`; hydration reads
+the sidecar first and falls back to the transcript for any unresolved digest.
 
 A checkpoint schema bump affects every non-terminal run. The release that first writes the new
 version must also read the previous version and restore its message queue, inbox dedupe set,

@@ -61,6 +61,7 @@ class _RunResources:
     deadline: float | None
     static_segments: tuple[str, ...]
     model_runner: ModelCallRunner
+    model_stream_observers: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -144,8 +145,10 @@ class LoopBootstrapper:
             loop.spec.run_id,
             extra_event_sinks=(*loop.event_sinks, loop._stream_sink),
             status_file=loop.status_file,
+            model_content_file=loop.model_content_file,
             reopen=loop._restoring,
         )
+        model_stream_observers = loop._materialize_model_stream_observers()
         job_manager = TaskManager(
             run_id=loop.spec.run_id,
             workspace=workspace,
@@ -216,6 +219,7 @@ class LoopBootstrapper:
             deadline=deadline,
             static_segments=(),
             model_runner=model_runner,
+            model_stream_observers=model_stream_observers,
         )
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))
@@ -233,6 +237,7 @@ class LoopBootstrapper:
             deadline=deadline,
             static_segments=(),
             model_runner=model_runner,
+            model_stream_observers=model_stream_observers,
         )
         initial_runtime_config = loop._current_runtime_config(base_registry)
         initial_bound_catalog = compile_bound_tool_catalog(initial_runtime_config, base_registry)
@@ -318,6 +323,7 @@ class LoopBootstrapper:
             deadline=deadline,
             static_segments=tuple(static_segments),
             model_runner=model_runner,
+            model_stream_observers=model_stream_observers,
         )
 
 
@@ -665,6 +671,7 @@ class LoopFinalizer:
         loop = self._loop
         recorder = res.recorder
         workspace = res.workspace
+        session = loop._session
         _diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(workspace)
         metrics = self.build_metrics(state, res)
         recorder.write_metrics(metrics)
@@ -682,6 +689,8 @@ class LoopFinalizer:
         # remembering not to repeat itself.
         recorder.emit(
             "turn.settled",
+            turn_id=session.active_turn_id if session is not None else None,
+            parent_id=session.active_turn_parent_id if session is not None else None,
             data={
                 "status": state.status,
                 **_settled_text_fields(recorder, state),

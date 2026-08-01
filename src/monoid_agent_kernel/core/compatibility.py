@@ -235,6 +235,22 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         ),
     ),
     _monoid_artifact(
+        "model-content.v1",
+        kind="durable",
+        reader_policy="json-schema",
+        source=(
+            "core/schemas.py:MODEL_CONTENT_RECORD_SCHEMA",
+            "core/model_content.py:MODEL_CONTENT_SCHEMA_VERSION",
+        ),
+        legacy_reader=True,
+        notes=(
+            "Optional private run-dir sidecar for streamed model content. Older run directories "
+            "may omit it. When the sidecar is enabled, settled text is dual-written to "
+            "transcript.v1 during the compatibility window, and entitled readers fall back to "
+            "that transcript when the sidecar cannot resolve a digest."
+        ),
+    ),
+    _monoid_artifact(
         "manifest.v1",
         kind="durable",
         reader_policy="json-schema",
