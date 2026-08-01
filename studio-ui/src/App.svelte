@@ -23,6 +23,7 @@
     initialRunState,
     reduceRunEvent,
   } from "./lib/run-state";
+  import { operationTraceEvents } from "./lib/trace";
   import type {
     ApplyResponse,
     ApprovalRequest,
@@ -125,6 +126,7 @@
     [...run.events, ...subagentList.flatMap((activity: SubagentActivity) => activity.events)]
       .sort((left: RunEvent, right: RunEvent) => eventTime(left) - eventTime(right)),
   );
+  const traceOperationEvents = $derived(operationTraceEvents(traceEvents));
   const workspaceName = $derived(config.workspace.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) || config.workspace);
   const sessionStatus = $derived(run.status);
   const topModes: Array<{ id: StudioMode; label: string; icon: string }> = [
@@ -1048,10 +1050,11 @@
           {:else}
             <div class="mini-trace-inspector">
               <header class="inspector-heading"><div><div class="eyebrow">Live events</div><h2>Trace</h2></div><button class="icon-button" title="Open full trace" onclick={openFullTrace}><Icon name="chevron" size={14} /></button></header>
-              {#if traceEvents.length}
-                {#each traceEvents.slice(-30).reverse() as event}
+              {#if traceOperationEvents.length}
+                {#each traceOperationEvents.slice(-30).reverse() as event}
                   <button onclick={openFullTrace}><span class:error={event.level === "error"}></span><div><strong>{event.data.studio_scope === "subagent" ? `subagent · ${event.type}` : event.type}</strong><small>seq {event.seq ?? "—"}</small></div></button>
                 {/each}
+              {:else if traceEvents.length}<div class="inspector-empty large"><Icon name="trace" size={20} />Only token delta events are hidden. Open the full trace to inspect them.</div>
               {:else}<div class="inspector-empty large"><Icon name="trace" size={20} />Trace events appear after the run starts.</div>{/if}
             </div>
           {/if}

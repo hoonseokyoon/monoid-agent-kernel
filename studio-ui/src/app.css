@@ -2923,7 +2923,8 @@ input:focus-visible + .switch {
 .trace-layout { overflow: hidden; }
 .trace-list { min-height: 220px; max-height: 42vh; overflow: auto; }
 .trace-list-head { display: flex; min-height: 45px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); color: var(--fg-secondary); padding: 0 12px; font-size: 10px; font-weight: 650; }
-.trace-list-head small { color: var(--success); font-size: 8px; }
+.trace-list-head small { color: var(--fg-muted); font-size: 8px; }
+.trace-delta-toggle[aria-pressed="true"] { border-color: #466c9f; background: var(--selected); color: #cfe2ff; }
 .trace-list > button { display: flex; width: 100%; min-height: 54px; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); background: transparent; color: var(--fg-secondary); padding: 6px 9px; text-align: left; }
 .trace-list > button:hover { background: var(--raised); }
 .trace-list > button.active { box-shadow: inset 3px 0 var(--accent); background: var(--selected); color: var(--fg-primary); }
