@@ -25,8 +25,10 @@ def getenv(name: str) -> str | None:
     return None
 
 
-# Operator kill switch for the durable ``model.output.delta`` / ``model.reasoning.delta`` channel.
-# Named here rather than in ``loop`` so the documentation and the Studio CLI reference one constant.
+# Operator content-egress switch. AgentLoop applies it to the legacy durable
+# ``model.output.delta`` / ``model.reasoning.delta`` mirror; Studio additionally applies it to its
+# live broker and private incremental sidecar. Named here so both composition layers share one
+# spelling while retaining their deliberately different scopes.
 OUTPUT_DELTAS_ENV = "MONOID_OUTPUT_DELTAS"
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})

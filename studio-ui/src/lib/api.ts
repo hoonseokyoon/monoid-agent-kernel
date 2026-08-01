@@ -145,6 +145,8 @@ export const studioApi = {
     decodeChatTranscriptResponse(
       await json<unknown>(`/api/chat-transcript?run_id=${encodeURIComponent(runId)}`),
     ),
+  modelContent: (runId: string) =>
+    json<unknown>(`/api/model-content?run_id=${encodeURIComponent(runId)}`),
   subagentEvents: (childRunId: string, from = 0, signal?: AbortSignal) =>
     json<EventsResponse>(
       `/api/subagent-events?run_id=${encodeURIComponent(childRunId)}&from=${Math.max(0, from)}`,

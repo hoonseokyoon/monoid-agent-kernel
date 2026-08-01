@@ -52,6 +52,7 @@ from monoid_agent_kernel.core.schemas import (
 )
 from monoid_agent_kernel.core.workspace_index import WORKSPACE_INDEX_SCHEMA_VERSION
 from monoid_agent_kernel.reference.llm_gateway.service import LLM_TURN_PROTOCOL_VERSION
+from monoid_agent_kernel.reference.backend.model_stream import MODEL_STREAM_LIVE_SCHEMA_VERSION
 from monoid_agent_kernel.reference.command_inbox import (
     COMMAND_ENVELOPE_VERSION,
     COMMAND_RECEIPT_VERSION,
@@ -66,6 +67,7 @@ from monoid_agent_kernel.reference.studio.chat_projection import (
     CHAT_SCHEMA_VERSION,
     SUPPORTED_CHAT_SCHEMA_VERSIONS,
 )
+from monoid_agent_kernel.reference.studio.server import STUDIO_MODEL_CONTENT_SCHEMA_VERSION
 from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCE,
     LEGACY_BACKEND_AUDIENCE,
@@ -84,7 +86,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 37
+    assert len(artifacts) == 39
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -116,6 +118,7 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "outbox-request": OUTBOX_REQUEST_VERSION,
         "external-agent-envelope": EXTERNAL_AGENT_ENVELOPE_VERSION,
         "llm-turn": LLM_TURN_PROTOCOL_VERSION,
+        "model-stream-live": MODEL_STREAM_LIVE_SCHEMA_VERSION,
         "checkpoint": CHECKPOINT_SCHEMA_VERSION,
         "backend-run": RUN_METADATA_SCHEMA_VERSION,
         "event": EVENT_SCHEMA_VERSION,
@@ -134,6 +137,7 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "command-receipt": COMMAND_RECEIPT_VERSION,
         "studio-chat": CHAT_SCHEMA_VERSION,
         "studio-chat-message": CHAT_MESSAGE_SCHEMA_VERSION,
+        "studio-model-content": STUDIO_MODEL_CONTENT_SCHEMA_VERSION,
     }
 
     assert {key: compatibility_artifact(key).current_writer for key in expected} == expected

@@ -64,6 +64,7 @@ wheel and sdist users can run Studio without Node.js.
 | `--mcp` | off | Attach the bundled offline reference MCP server and expose its tools. |
 | `--env-file` | `.env` | Load simple `KEY=VALUE` entries before provider checks and server start. |
 | `--no-env-file` | off | Skip env-file loading. |
+| `--no-output-deltas` | off | Disable Studio's live/private model-content egress. Provider streaming and token-boundary Stop remain enabled when the async HTTP transport is installed. |
 
 **Offline vs. live.** With `--provider offline` (the default), the model is a keyless *echo* model:
 it replies but does not reason or call tools — handy for a zero-setup look at the UI. For a real
@@ -106,8 +107,17 @@ Profiles are Studio-owned presets; the kernel contract stays unchanged.
 
 Studio chat state is stored per run in `studio.chat.jsonl`. The chat panel restores user,
 assistant, and error messages from `/api/chat-transcript` before replaying `events.jsonl` for
-trace and activity state. `events.jsonl` remains the public trace stream, and `transcript.jsonl`
-remains the private model-call log.
+trace and activity state. A second, passive EventSource renders root and subagent model output from
+`/api/model-stream`; those frames never enter the run event reducer or Trace. Its bounded replay
+ring uses a generation/sequence cursor. A gap triggers hydration from the private
+`model-content.jsonl` sidecars, then retained live frames resume from the broker's baseline without
+duplicating content. Closing or reconnecting the browser stream does not interrupt the run.
+
+`events.jsonl` remains the public operation stream. `transcript.jsonl` remains the private
+model-call log, and `model-content.jsonl` is the private incremental output/reasoning store.
+`MONOID_OUTPUT_DELTAS=0` and `--no-output-deltas` disable Studio's live channel and model-content
+sidecar together. Studio continues to select provider streaming when available so Stop can land at
+a token boundary. Direct AgentLoop users may separately enable the legacy durable delta events.
 The transcript route writes `studio.chat.v2`; its required `event_log_error` is empty for a
 complete read and explains when the returned messages stop at event-log corruption.
 

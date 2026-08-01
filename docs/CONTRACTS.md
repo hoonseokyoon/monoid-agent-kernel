@@ -376,7 +376,16 @@ Records use `monoid.model-content.v1` and the kinds `stream_opened`, `stream_seg
 `stream_closed`, and `settled_text`. Existing run directories may omit the file. While this option
 is enabled during the compatibility window, settled text is written to both the sidecar and
 `transcript.jsonl`. Entitled readers resolve a digest from the sidecar before falling back to the
-transcript.
+transcript. `flush_active_model_content(path)` gives an in-process presentation layer a coordinated
+flush point for currently buffered segments while a stream remains open. Ordinary sidecar reads
+remain side-effect free.
+
+The Reference backend can attach one `LiveModelStreamBroker` through
+`RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run
+and inherited by in-process descendants, producing one passive root-multiplexed presentation
+channel. This observer does not write durable events and holds no run control handle. The separate
+`RunnerBackend.stream_model_calls` and `model_content_file` switches let a host independently select
+provider streaming, private retention, and live delivery.
 
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
@@ -879,6 +888,33 @@ frame carries `id: <seq>`; reconnects send `Last-Event-ID`, which takes preceden
 `from_seq` query and resumes at the following sequence. Idle streams emit `: keep-alive` comments.
 Terminal streams re-read the event page after observing terminal lifecycle state, verify the
 lifecycle watermark has been drained, then emit one named `end` frame and close.
+
+`GET /v1/runs/{root_run_id}/model-stream` exposes the optional Reference live-content broker as
+SSE after validating the root run token. `Last-Event-ID` takes precedence over the initial
+`cursor` query. Named `model-stream` frames use `monoid.model-stream.live.v1` and carry an
+`id: <generation>:<sequence>` cursor. `opened`, `delta`, and `closed` frames multiplex the root and
+all validated descendant run ids. A delta includes separate output/reasoning-channel UTF-8 byte
+`start_offset` and `end_offset` values; clients use them to merge private snapshots with a replayed
+suffix without duplicating content.
+
+Each root ring retains at most 1,024 frames and 512 KiB. The broker retains 64 root rings with
+least-recently-used eviction. A missing sequence, stale/ahead cursor, generation replacement, or
+oversized frame produces a `reset` with the retained baseline and latest cursor. The client hydrates
+the missing prefix from an entitled private store, then resumes from that baseline. Closing the SSE
+subscription removes only that reader. It never interrupts or cancels model execution. Backend
+shutdown closes the broker, wakes blocking subscribers, and makes later observer writes inert.
+
+Studio composes this into `/api/model-stream` and exposes a separate authorized
+`/api/model-content?run_id=<root>` snapshot route for reset hydration. The snapshot response uses
+`studio.model-content.v1`, verifies every root/descendant sidecar context against its run directory,
+and returns output/reasoning text with their UTF-8 end offsets. Studio flushes active in-process
+sidecar batches before reading the snapshot, so the snapshot covers the broker prefix represented
+by a reset cursor. Sidecar access requires a regular, single-link file whose path and open file
+descriptor keep the same identity across each read, write, and flush. An unsafe or unavailable
+sidecar, including an active-flush failure, returns `model_content_unavailable` with HTTP 503; the
+browser retries hydration without advancing its broker cursor. Both routes reject content requests
+with HTTP 403 when Studio's live/private egress gate is disabled. Their frames and snapshots stay
+out of the durable event reducer and Trace.
 
 ### Diagnostics
 

@@ -187,7 +187,13 @@ def test_an_unparseable_switch_value_is_an_error_rather_than_a_silent_default() 
     try:
         with pytest.raises(ValueError, match="not a boolean"):
             getenv_bool(OUTPUT_DELTAS_ENV, default=True)
-        for value, expected in (("0", False), ("off", False), ("no", False), ("1", True), ("on", True)):
+        for value, expected in (
+            ("0", False),
+            ("off", False),
+            ("no", False),
+            ("1", True),
+            ("on", True),
+        ):
             os.environ[OUTPUT_DELTAS_ENV] = value
             assert getenv_bool(OUTPUT_DELTAS_ENV, default=True) is expected
         # An *empty* value is the one string that must not raise. `MONOID_FOO=` is how a dotenv file
@@ -206,18 +212,10 @@ def test_an_unparseable_switch_value_is_an_error_rather_than_a_silent_default() 
             os.environ[OUTPUT_DELTAS_ENV] = previous
 
 
-def test_studio_wires_the_switch_from_the_flag_through_to_the_backend(
+def test_studio_wires_content_permission_without_disabling_provider_streaming(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The Studio half, bound at the two places that actually decide it.
-
-    An earlier version of this test only read `StudioConfig(...).stream_output_deltas` back. That is
-    the builder, not the wiring: reverting *both* `server.py`'s
-    `stream_gateway_output = _gateway_streaming_available() and self.config.stream_output_deltas` and
-    `cli.py`'s `stream_output_deltas=not no_output_deltas` left the entire Studio suite green. The
-    half the commit calls the whole point — "for the shipped app the channel was ON, with no
-    supported way to close it" — was unbound. Same gap as the policy-threading one, one commit later.
-    """
+    """Studio keeps streaming/Stop responsive while gating both content egress surfaces."""
     from monoid_agent_kernel.reference.studio.cli import _studio_config
     from monoid_agent_kernel.reference.studio.server import StudioConfig, StudioServer
 
@@ -242,34 +240,40 @@ def test_studio_wires_the_switch_from_the_flag_through_to_the_backend(
     # same `stream`, and keying the workspace on the value alone collided on the second.
     calls = itertools.count()
 
-    def backend_deltas(*, stream: bool) -> bool:
-        workspace = tmp_path / f"ws-{stream}-{next(calls)}"
+    def backend_stream_state(*, egress: bool) -> tuple[bool, bool, bool, bool]:
+        workspace = tmp_path / f"ws-{egress}-{next(calls)}"
         workspace.mkdir()
         server = StudioServer(
             StudioConfig(
                 workspace=workspace,
                 port=0,
                 run_root=tmp_path / f"runs-{workspace.name}",
-                stream_output_deltas=stream,
+                stream_output_deltas=egress,
             )
         )
         try:
             server.start()
-            return bool(server._backend.emit_output_deltas)
+            assert server._backend is not None
+            return (
+                server._backend.emit_output_deltas,
+                server._backend.stream_model_calls,
+                server._backend.model_content_file,
+                server._backend.model_stream_broker is not None,
+            )
         finally:
             server.shutdown()
 
-    assert backend_deltas(stream=False) is False, "the flag never reached the backend"
-    # With the flag on, the transport decides. Pinned by *forcing* the transport answer rather than
-    # comparing against the same function the source ANDs in -- `x is _gateway_streaming_available()`
-    # holds whether or not the config participates at all, and on a minimal install (no httpx) both
-    # sides are False, so the whole test went quiet exactly where it mattered.
+    monkeypatch.delenv("MONOID_OUTPUT_DELTAS", raising=False)
     monkeypatch.setattr(server_module, "_gateway_streaming_available", lambda: True)
-    assert backend_deltas(stream=True) is True
-    assert backend_deltas(stream=False) is False, "the config must still be able to veto"
+    assert backend_stream_state(egress=False) == (False, True, False, False)
+    assert backend_stream_state(egress=True) == (False, True, True, True)
 
+    monkeypatch.setenv("MONOID_OUTPUT_DELTAS", "0")
+    assert backend_stream_state(egress=True) == (False, True, False, False)
+
+    monkeypatch.delenv("MONOID_OUTPUT_DELTAS", raising=False)
     monkeypatch.setattr(server_module, "_gateway_streaming_available", lambda: False)
-    assert backend_deltas(stream=True) is False, "no transport, no deltas"
+    assert backend_stream_state(egress=True) == (False, False, False, False)
 
 
 def test_kernel_authored_limit_text_stays_inline(tmp_path: Path) -> None:

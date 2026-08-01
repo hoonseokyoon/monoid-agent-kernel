@@ -151,6 +151,19 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         accepts_missing_version=True,
         notes="The current client parses the response shape without enforcing protocol.",
     ),
+    CompatibilityArtifact(
+        key="model-stream-live",
+        kind="wire",
+        current_writer="monoid.model-stream.live.v1",
+        supported_readers=("monoid.model-stream.live.v1",),
+        namespace_aliases=(),
+        reader_policy="strict",
+        source=("reference/backend/model_stream.py:LiveModelStreamFrame.to_json",),
+        notes=(
+            "Passive root-multiplexed Studio SSE transport with generation/sequence resume and "
+            "explicit reset frames. Raw chunks are process-local and never enter the durable log."
+        ),
+    ),
     _monoid_artifact(
         "web-search.v1",
         kind="wire",
@@ -417,6 +430,19 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         notes=(
             "The JSONL reader skips invalid JSON and non-object records without gating by version; "
             "strict transcript readers require the renderable core fields and allow extensions."
+        ),
+    ),
+    CompatibilityArtifact(
+        key="studio-model-content",
+        kind="reference",
+        current_writer="studio.model-content.v1",
+        supported_readers=("studio.model-content.v1",),
+        namespace_aliases=(),
+        reader_policy="strict",
+        source=("reference/studio/server.py:STUDIO_MODEL_CONTENT_SCHEMA_VERSION",),
+        notes=(
+            "Entitled Studio snapshot projection for reset hydration and retained final or partial "
+            "model output; source sidecars remain private run-directory artifacts."
         ),
     ),
 )

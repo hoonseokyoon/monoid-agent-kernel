@@ -425,18 +425,11 @@ def test_list_files_returns_workspace_tree(studio: StudioServer) -> None:
 def test_the_ui_still_gets_a_final_answer_with_the_delta_channel_switched_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The kill switch does not cost the answer.
+    """The content-egress gate keeps the hydrated completed answer available.
 
-    Not "and nothing else" — that phrasing was corrected in four other places and survived here.
-    It also converts mid-turn interruption into step-boundary interruption, which
-    `tests/test_model_call_runner.py::test_interruption_is_mid_turn_only_while_something_consumes_deltas`
-    pins. What this test guards is narrower and is the thing an operator actually fears: that
-    switching the channel off leaves the completed answer reaching no surface at all.
-
-    Both halves of the switch are engaged at once — the config flag and the environment variable —
-    because they disable different things (Studio's gateway streaming, and the loop's delta emission
-    for a run and every subagent it spawns), and the failure being guarded against is the one where
-    the answer reaches no surface at all.
+    Both policy inputs are engaged at once. Provider streaming remains independently selected when
+    its transport is installed, so Stop keeps its token boundary while live/private content stays
+    closed.
 
     The assertion order is what makes this load-bearing rather than tautological: `events.jsonl` is
     checked *first* to confirm the settled event on disk carries only a digest, so the text that then
@@ -475,6 +468,64 @@ def test_the_ui_still_gets_a_final_answer_with_the_delta_channel_switched_off(
         assert settled[0]["data"]["final_text"] == answer
     finally:
         server.shutdown()
+
+
+def test_studio_without_async_transport_uses_one_shot_and_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The base install must not select GatewayModelAdapter.astream_turn without httpx."""
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.server._gateway_streaming_available",
+        lambda: False,
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    server = StudioServer(
+        StudioConfig(
+            workspace=workspace,
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+        )
+    )
+    server.start()
+    try:
+        assert server._backend is not None
+        assert server._backend.stream_model_calls is False
+        assert server._backend.model_content_file is False
+        assert server._backend.model_stream_broker is None
+
+        run_id = server.start_chat("one shot still works")["run_id"]
+        settled = _wait_settled(server, run_id, 1)
+        assert settled
+        assert "one shot still works" in settled[0]["data"]["final_text"]
+    finally:
+        server.shutdown()
+
+
+def test_studio_rejects_invalid_content_egress_env_before_opening_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MONOID_OUTPUT_DELTAS", "of")
+    server = StudioServer(
+        StudioConfig(
+            workspace=tmp_path / "ws",
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+        )
+    )
+
+    with pytest.raises(ValueError, match="MONOID_OUTPUT_DELTAS"):
+        server.start()
+
+    assert server._gateway_server is None
+    assert server._web_gateway_server is None
+    assert server._mcp_server is None
+    assert server._ui_server is None
+    assert server._backend is None
+    server.shutdown()
 
 
 def test_agent_reads_a_file_and_emits_activity(tmp_path: Path) -> None:

@@ -31,7 +31,10 @@ from pathlib import Path
 from typing import Any
 
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
-from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
+from monoid_agent_kernel.core.model_content import (
+    MODEL_CONTENT_FILENAME,
+    open_model_content_for_read,
+)
 from monoid_agent_kernel.core.model_io import content_digest, content_length
 from monoid_agent_kernel.identifiers import accepts_namespaced_id
 
@@ -146,7 +149,16 @@ def _resolve(record_path: Path, wanted: set[str]) -> dict[str, str]:
         # ``OSError`` handler below and turned every read needing a digest into a failed request
         # rather than the promised absent field. A replaced line then fails to parse as JSON, or
         # fails the digest check, and is skipped like any other malformed record.
-        with record_path.open("rb") as handle:
+        handle = (
+            open_model_content_for_read(record_path)
+            if require_model_content_version
+            else record_path.open("rb")
+        )
+        if handle is None:
+            # A private run artifact is not an indirection seam. The verified opener rejects a
+            # planted or concurrently swapped link/special file before any content is read.
+            return found
+        with handle:
             for raw_line in handle:
                 try:
                     line = raw_line.decode(

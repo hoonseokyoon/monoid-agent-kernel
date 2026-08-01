@@ -216,10 +216,9 @@ def _common_server_options(fn):
         is_flag=True,
         default=False,
         help=(
-            "Stop publishing model.output.delta / model.reasoning.delta to events.jsonl. "
-            "The run result and transcript.jsonl are unaffected. Costs live token rendering, and "
-            "makes Stop wait for the in-flight model call instead of aborting mid-token. "
-            "MONOID_OUTPUT_DELTAS=0 does the same for every run in a deployment."
+            "Disable Studio's live model-content channel and private model-content.jsonl sidecar. "
+            "The durable operation log and token-boundary Stop behavior are unchanged. "
+            "MONOID_OUTPUT_DELTAS=0 applies the same content-egress gate to every Studio run."
         ),
     )(fn)
     fn = click.option("--host", type=str, default="127.0.0.1", show_default=True)(fn)
@@ -575,10 +574,9 @@ def studio_doctor(
     # `AgentLoop.__post_init__` on the next command. `doctor` loads the same `.env` this reads from,
     # which is exactly where the typo lives.
     #
-    # The effective state is reported even when the value parses, because this switch's failure mode
-    # is silent: an operator who believes they disabled a channel that publishes raw model text, and
-    # did not, learns nothing from "PASS". The env var can only turn deltas off — it is ANDed with
-    # the loop's own setting — so both inputs are named.
+    # The effective state is reported even when the value parses because this switch governs both
+    # live model text and its private sidecar. The env var can only deny egress — it is ANDed with
+    # Studio's own setting — so both inputs are named.
     try:
         deltas_env_permits = getenv_bool(OUTPUT_DELTAS_ENV, default=True)
     except ValueError as exc:
@@ -589,28 +587,21 @@ def studio_doctor(
             str(exc),
         )
     else:
-        # Three inputs decide this, and `StudioServer.start` ANDs all three:
-        # `_gateway_streaming_available() and config.stream_output_deltas`, with the loop applying
-        # the env var on top. Reporting on two of them told a minimal install -- no `httpx`, which
-        # is the base package's own default -- that raw model text "will be published" when the
-        # server was about to use one-shot turns and publish none. A preflight that names the wrong
-        # cause is worse than one that stays quiet: it sends someone to disable a switch that was
-        # never the reason.
         if not deltas_env_permits:
-            report(True, f"model-text deltas are disabled by {OUTPUT_DELTAS_ENV}")
+            report(True, f"live/private model content is disabled by {OUTPUT_DELTAS_ENV}")
         elif no_output_deltas:
-            report(True, "model-text deltas are disabled by --no-output-deltas")
+            report(True, "live/private model content is disabled by --no-output-deltas")
         elif not _gateway_streaming_available():
             report(
                 True,
-                "model-text deltas are off because the async transport is not installed "
-                "(Studio uses one-shot turns without the [http-async] extra)",
+                "live/private model content needs the [http-async] extra "
+                "(Studio currently uses one-shot turns and transcript hydration)",
             )
         else:
             report(
                 True,
-                "model.output.delta / model.reasoning.delta will be published to events.jsonl "
-                "(these carry raw model text)",
+                "live model content and private model-content.jsonl are enabled; events.jsonl "
+                "remains operation-only",
             )
 
     # --- soft checks (warnings only) ---

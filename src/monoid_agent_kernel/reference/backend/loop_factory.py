@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.model_io import (
     ModelIOSubscription,
     close_model_io_subscriptions,
 )
+from monoid_agent_kernel.core.model_stream import ModelStreamObserverFactory
 from monoid_agent_kernel.core.outbox import OutboxSender
 from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
@@ -51,6 +52,11 @@ class BackendLoopFactoryContext:
     llm_gateway_token_ttl_s_provider: Callable[[], int]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     emit_output_deltas_provider: Callable[[], bool]
+    stream_model_calls_provider: Callable[[], bool]
+    model_content_file_provider: Callable[[], bool]
+    model_stream_observer_factories_provider: Callable[
+        [str], tuple[ModelStreamObserverFactory, ...]
+    ]
     extra_event_sink_factories_provider: Callable[[], tuple[Callable[[], EventSink], ...]]
     model_io_subscription_factories_provider: Callable[
         [], tuple[Callable[[], ModelIOSubscription], ...]
@@ -176,6 +182,11 @@ class BackendLoopFactory:
                 runtime_config_provider=runtime_config_provider,
                 checkpoint_store=self._context.checkpoint_store_provider(),
                 emit_output_deltas=self._context.emit_output_deltas_provider(),
+                stream_model_calls=self._context.stream_model_calls_provider(),
+                model_content_file=self._context.model_content_file_provider(),
+                model_stream_observer_factories=(
+                    self._context.model_stream_observer_factories_provider(run_id)
+                ),
                 subagent_definitions=self._context.subagent_definitions_provider(),
                 tool_providers=self._context.tool_providers_provider(),
                 context_providers=self._context.context_providers_provider(),

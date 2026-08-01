@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from support.studio_harness import (
@@ -27,8 +29,100 @@ from monoid_agent_kernel.core.external_agent_envelope import (
     ExternalAgentPart,
     ExternalAgentResult,
 )
+from monoid_agent_kernel.core.model_content import ModelContentStore, read_model_content
+from monoid_agent_kernel.core.model_stream import (
+    ModelStreamContext,
+    ModelStreamDelta,
+    ModelStreamOutcome,
+    ModelStreamStatus,
+)
+from monoid_agent_kernel.errors import NativeAgentError
 
 pytestmark = pytest.mark.integration
+
+
+def _write_model_content_snapshot(
+    run_dir: Path,
+    *,
+    root_run_id: str,
+    run_id: str,
+    stream_id: str,
+    output: str,
+    reasoning: str = "",
+    status: ModelStreamStatus = "completed",
+    step: int = 1,
+    turn_id: str | None = None,
+    started_at: str = "2026-08-01T00:00:00Z",
+) -> None:
+    store = ModelContentStore(run_dir / "model-content.jsonl", run_id=run_id)
+    writer = store.open(
+        ModelStreamContext(
+            run_id=run_id,
+            root_run_id=root_run_id,
+            turn_id=turn_id or f"turn_{step:04d}",
+            stream_id=stream_id,
+            step=step,
+            provider="test",
+            model="test-model",
+            started_at=started_at,
+        )
+    )
+    if reasoning:
+        writer.push(ModelStreamDelta(channel="reasoning", text=reasoning))
+    if output:
+        writer.push(ModelStreamDelta(channel="output", text=output))
+    writer.close(
+        ModelStreamOutcome(
+            status=status,
+            final_text=output,
+            usage={"output_tokens": 1},
+        )
+    )
+    store.close()
+
+
+def _write_open_model_content_snapshot(
+    run_dir: Path,
+    *,
+    root_run_id: str,
+    run_id: str,
+    stream_id: str,
+    turn_id: str,
+    output: str,
+) -> None:
+    store = ModelContentStore(run_dir / "model-content.jsonl", run_id=run_id)
+    writer = store.open(
+        ModelStreamContext(
+            run_id=run_id,
+            root_run_id=root_run_id,
+            turn_id=turn_id,
+            stream_id=stream_id,
+            step=1,
+            provider="test",
+            model="test-model",
+            started_at="2026-08-01T00:00:00Z",
+        )
+    )
+    writer.push(ModelStreamDelta(channel="output", text=output))
+    # Closing the store flushes the prefix but intentionally writes no terminal sidecar record.
+    store.close()
+
+
+def _write_events(run_dir: Path, run_id: str, events: list[tuple[str, str | None]]) -> None:
+    records = [
+        {
+            "seq": seq,
+            "run_id": run_id,
+            "turn_id": turn_id,
+            "type": event_type,
+            "data": {},
+        }
+        for seq, (event_type, turn_id) in enumerate(events, start=1)
+    ]
+    (run_dir / "events.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
 
 
 def test_studio_surfaces_turn_failed_without_terminating(tmp_path: Path) -> None:
@@ -138,7 +232,9 @@ def test_studio_retry_recovers_a_parked_session_before_enqueue(tmp_path: Path) -
             assert (received_run_id, received_token) == (run_id, token)
             return {"state": "awaiting_input", "terminal": False}
 
-        def events(self, received_run_id: str, received_token: str, *, from_seq: int) -> dict[str, object]:
+        def events(
+            self, received_run_id: str, received_token: str, *, from_seq: int
+        ) -> dict[str, object]:
             assert (received_run_id, received_token, from_seq) == (run_id, token, 0)
             return {
                 "events": [
@@ -306,11 +402,19 @@ def test_studio_pause_and_resume_routes_continue_the_frozen_turn(tmp_path: Path)
         server.shutdown()
 
 
-def test_studio_streams_output_deltas(tmp_path: Path) -> None:
+def test_studio_streams_content_without_mirroring_tokens_into_durable_events(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     adapter = FakeStreamingModelAdapter(
-        chunk_turns=[[TextDelta("Hel"), TextDelta("lo"), TurnComplete(response_id="r1", usage={"total_tokens": 3})]]
+        chunk_turns=[
+            [
+                TextDelta("Hel"),
+                TextDelta("lo"),
+                TurnComplete(response_id="r1", usage={"total_tokens": 3}),
+            ]
+        ]
     )
     server = StudioServer(
         StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"),
@@ -320,11 +424,668 @@ def test_studio_streams_output_deltas(tmp_path: Path) -> None:
     try:
         run_id = server.start_chat("hi")["run_id"]
         _wait_settled(server, run_id, 1)
+        assert server._backend is not None
+        assert server._backend.emit_output_deltas is False
+        assert server._backend.stream_model_calls is True
+        assert server._backend.model_content_file is True
+        assert server._backend.model_stream_broker is not None
+
+        subscription = server.model_stream_subscription(run_id)
+        frames = subscription.poll()
+        subscription.close()
+        assert [frame.kind for frame in frames] == ["opened", "delta", "delta", "closed"]
+        assert [frame.text for frame in frames if frame.kind == "delta"] == ["Hel", "lo"]
+        assert frames[-1].status == "completed"
+        assert frames[-1].final_text == "Hello"
+
         events = server.poll_events(run_id, 0).get("events", [])
-        deltas = [e for e in events if e.get("type") == "model.output.delta"]
-        assert [d["data"]["text"] for d in deltas] == ["Hel", "lo"]
+        assert not [event for event in events if str(event.get("type") or "").endswith(".delta")]
         settled = [e for e in events if e.get("type") == "turn.settled"]
         assert settled and settled[0]["data"]["final_text"] == "Hello"
+
+        run_dir = server._run_dir_for(run_id)
+        event_text = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+        assert "Hello" not in event_text
+        assert "model.output.delta" not in event_text
+        content = read_model_content(run_dir)
+        assert content.snapshots[0].best_output_text == "Hello"
+        assert content.snapshots[0].status == "completed"
+    finally:
+        server.shutdown()
+
+
+def test_studio_model_stream_sse_resumes_and_disconnect_is_passive(
+    studio: StudioServer,
+) -> None:
+    run_id = studio.start_chat("stream route")["run_id"]
+    assert _wait_settled(studio, run_id, 1)
+    assert studio.model_stream_enabled is True
+
+    def read_one(*, last_event_id: str | None = None) -> tuple[str, dict]:
+        headers = {"Accept": "text/event-stream"}
+        if last_event_id is not None:
+            headers["Last-Event-ID"] = last_event_id
+        request = Request(
+            f"{studio.base_url}/api/model-stream?run_id={run_id}",
+            headers=headers,
+        )
+        with urlopen(request, timeout=5) as response:
+            assert response.headers["Content-Type"].startswith("text/event-stream")
+            event_id = ""
+            while True:
+                line = response.readline().decode("utf-8").rstrip("\r\n")
+                if line.startswith("id: "):
+                    event_id = line.removeprefix("id: ")
+                if line.startswith("data: "):
+                    return event_id, json.loads(line.removeprefix("data: "))
+
+    first_id, first = read_one()
+    resumed_id, resumed = read_one(last_event_id=first_id)
+
+    assert first["schema_version"] == "monoid.model-stream.live.v1"
+    assert first["kind"] == "opened"
+    assert first["root_run_id"] == run_id
+    assert resumed["sequence"] > first["sequence"]
+    assert resumed_id != first_id
+    # Closing either browser response released only its subscription. The multi-turn run remains
+    # parked and ready for another message.
+    assert studio.run_status(run_id)["terminal"] is False
+
+
+def test_studio_model_stream_rejects_bad_cursor_and_unknown_run_before_sse(
+    studio: StudioServer,
+) -> None:
+    run_id = studio.start_chat("cursor check")["run_id"]
+    assert _wait_settled(studio, run_id, 1)
+
+    for url in (
+        f"{studio.base_url}/api/model-stream?run_id={run_id}&cursor=malformed",
+        f"{studio.base_url}/api/model-stream?run_id={run_id}&cursor=",
+        f"{studio.base_url}/api/model-stream?run_id=unknown-run",
+    ):
+        with pytest.raises(HTTPError) as exc_info:
+            urlopen(Request(url, headers={"Accept": "text/event-stream"}), timeout=5)
+        assert exc_info.value.code == 400
+        assert exc_info.value.headers["Content-Type"].startswith("application/json")
+
+
+def test_studio_model_content_snapshot_multiplexes_only_authorized_lineage(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    adapter = FakeStreamingModelAdapter(
+        chunk_turns=[[TextDelta("한"), TurnComplete(response_id="r1")]]
+    )
+    server = StudioServer(
+        StudioConfig(
+            workspace=workspace,
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+        ),
+        provider_factory=lambda _claims, _config: adapter,
+    )
+    server.start()
+    try:
+        root_run_id = server.start_chat("snapshot")["run_id"]
+        assert _wait_settled(server, root_run_id, 1)
+        run_root = server._backend.run_root  # type: ignore[union-attr]
+        root_stream_id = read_model_content(run_root / root_run_id).snapshots[-1].context.stream_id
+
+        child_run_id = f"{root_run_id}.sub.child"
+        child_dir = run_root / child_run_id
+        child_dir.mkdir()
+        _write_model_content_snapshot(
+            child_dir,
+            root_run_id=root_run_id,
+            run_id=child_run_id,
+            stream_id="stream-child-old",
+            output="old child history",
+            step=1,
+            started_at="2026-08-01T00:00:00Z",
+        )
+        _write_model_content_snapshot(
+            child_dir,
+            root_run_id=root_run_id,
+            run_id=child_run_id,
+            # A stream id collision across runs must preserve both root and child snapshots.
+            stream_id=root_stream_id,
+            output="child",
+            reasoning="왜",
+            status="interrupted",
+            step=2,
+            started_at="2026-08-01T00:00:01Z",
+        )
+
+        # Prefix-shaped directory with a context that disagrees with its path: never returned.
+        forged_dir = run_root / f"{root_run_id}.sub.forged"
+        forged_dir.mkdir()
+        _write_model_content_snapshot(
+            forged_dir,
+            root_run_id=root_run_id,
+            run_id=f"{root_run_id}.sub.somewhere-else",
+            stream_id="stream-forged",
+            output="must stay private",
+        )
+        # A fully valid foreign run is outside the requested lineage.
+        foreign_dir = run_root / "foreign-root"
+        foreign_dir.mkdir()
+        _write_model_content_snapshot(
+            foreign_dir,
+            root_run_id="foreign-root",
+            run_id="foreign-root",
+            stream_id="stream-foreign",
+            output="foreign private text",
+        )
+        # A descendant-shaped directory link must never escape the configured run root. This may
+        # be unavailable on Windows hosts without Developer Mode; the lineage/context tests above
+        # still exercise the non-link authorization checks there.
+        linked_run_id = f"{root_run_id}.sub.linked"
+        outside_dir = tmp_path / "outside-private-run"
+        outside_dir.mkdir()
+        _write_model_content_snapshot(
+            outside_dir,
+            root_run_id=root_run_id,
+            run_id=linked_run_id,
+            stream_id="stream-linked",
+            output="linked escape text",
+        )
+        try:
+            (run_root / linked_run_id).symlink_to(outside_dir, target_is_directory=True)
+        except OSError:
+            pass
+
+        query = urlencode({"run_id": root_run_id})
+        with urlopen(f"{server.base_url}/api/model-content?{query}", timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        assert set(payload) == {"schema_version", "root_run_id", "streams"}
+        assert payload["schema_version"] == "studio.model-content.v1"
+        assert payload["root_run_id"] == root_run_id
+        assert len(payload["streams"]) == 2
+        assert {stream["run_id"] for stream in payload["streams"]} == {
+            root_run_id,
+            child_run_id,
+        }
+        root = next(stream for stream in payload["streams"] if stream["run_id"] == root_run_id)
+        child = next(stream for stream in payload["streams"] if stream["run_id"] == child_run_id)
+        assert root["output_text"] == "한"
+        assert root["output_end_offset"] == 3
+        assert child["reasoning_text"] == "왜"
+        assert child["reasoning_end_offset"] == 3
+        assert child["output_text"] == "child"
+        assert child["output_end_offset"] == 5
+        assert child["status"] == "interrupted"
+        assert child["partial"] is True
+        assert child["final_text"] == "child"
+        assert child["step"] == 2
+        assert root["stream_id"] == child["stream_id"] == root_stream_id
+        serialized = json.dumps(payload, ensure_ascii=False)
+        assert "old child history" not in serialized
+        assert "must stay private" not in serialized
+        assert "foreign private text" not in serialized
+        assert "linked escape text" not in serialized
+
+        for invalid_root in ("", child_run_id, "../foreign-root", "unknown-root"):
+            invalid_query = urlencode({"run_id": invalid_root})
+            with pytest.raises(HTTPError) as exc_info:
+                urlopen(f"{server.base_url}/api/model-content?{invalid_query}", timeout=5)
+            assert exc_info.value.code == 400
+            assert exc_info.value.headers["Content-Type"].startswith("application/json")
+    finally:
+        server.shutdown()
+
+
+def test_studio_model_content_rejects_unknown_root_before_reading_private_files(
+    studio: StudioServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_read(_path):  # noqa: ANN001
+        raise AssertionError("private content was read before root authorization")
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.server.read_model_content",
+        unexpected_read,
+    )
+    with pytest.raises(NativeAgentError, match="unknown run_id"):
+        studio.model_content_snapshot("unknown-root")
+
+
+def test_studio_model_content_promotes_only_durably_active_abandoned_streams(
+    studio: StudioServer,
+) -> None:
+    root_run_id = studio.start_chat("active stream recovery")["run_id"]
+    assert _wait_settled(studio, root_run_id, 1)
+    run_root = studio._backend.run_root  # type: ignore[union-attr]
+
+    active_run_id = f"{root_run_id}.sub.active"
+    active_dir = run_root / active_run_id
+    active_dir.mkdir()
+    active_store = ModelContentStore(
+        active_dir / "model-content.jsonl",
+        run_id=active_run_id,
+        batch_interval_s=60.0,
+    )
+    active_writer = active_store.open(
+        ModelStreamContext(
+            run_id=active_run_id,
+            root_run_id=root_run_id,
+            turn_id="turn_active",
+            stream_id="stream-active",
+            step=1,
+            provider="test",
+            model="test-model",
+            started_at="2026-08-01T00:00:00Z",
+        )
+    )
+    active_writer.push(ModelStreamDelta(channel="output", text="still arriving"))
+    _write_events(active_dir, active_run_id, [("model.turn.started", "turn_active")])
+
+    # This is the durable shape left by a process kill: an open sidecar prefix and a committed
+    # turn start, with no terminal record and no process-local writer after restart.
+    crashed_run_id = f"{root_run_id}.sub.crashed"
+    crashed_dir = run_root / crashed_run_id
+    crashed_dir.mkdir()
+    _write_open_model_content_snapshot(
+        crashed_dir,
+        root_run_id=root_run_id,
+        run_id=crashed_run_id,
+        stream_id="stream-crashed",
+        turn_id="turn_crashed",
+        output="stale prefix",
+    )
+    _write_events(
+        crashed_dir,
+        crashed_run_id,
+        [("model.turn.started", "turn_crashed")],
+    )
+
+    corrupt_run_id = f"{root_run_id}.sub.corrupt"
+    corrupt_dir = run_root / corrupt_run_id
+    corrupt_dir.mkdir()
+    _write_open_model_content_snapshot(
+        corrupt_dir,
+        root_run_id=root_run_id,
+        run_id=corrupt_run_id,
+        stream_id="stream-corrupt",
+        turn_id="turn_corrupt",
+        output="untrusted prefix",
+    )
+    _write_events(corrupt_dir, corrupt_run_id, [("model.turn.started", "turn_corrupt")])
+    with (corrupt_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{not-json}\n")
+
+    try:
+        payload = studio.model_content_snapshot(root_run_id)
+        by_run = {stream["run_id"]: stream for stream in payload["streams"]}
+
+        assert by_run[active_run_id]["status"] == "running"
+        assert by_run[active_run_id]["partial"] is True
+        assert by_run[crashed_run_id]["status"] == "abandoned"
+        assert by_run[crashed_run_id]["partial"] is True
+        assert by_run[corrupt_run_id]["status"] == "abandoned"
+        assert by_run[corrupt_run_id]["partial"] is True
+    finally:
+        active_store.close()
+
+
+def test_studio_model_content_snapshot_flushes_the_active_private_batch(
+    studio: StudioServer,
+) -> None:
+    root_run_id = studio.start_chat("flush reset hydration")["run_id"]
+    _wait_settled(studio, root_run_id, 1)
+    assert studio._backend is not None
+    child_run_id = f"{root_run_id}.sub.buffered"
+    child_dir = studio._backend.run_root / child_run_id
+    child_dir.mkdir()
+    store = ModelContentStore(
+        child_dir / "model-content.jsonl",
+        run_id=child_run_id,
+        batch_interval_s=60.0,
+    )
+    turn_id = "turn_buffered"
+    writer = store.open(
+        ModelStreamContext(
+            run_id=child_run_id,
+            root_run_id=root_run_id,
+            turn_id=turn_id,
+            stream_id="stream-buffered",
+            step=1,
+            provider="test",
+            model="test-model",
+            started_at="2026-08-01T00:00:00Z",
+        )
+    )
+    writer.push(ModelStreamDelta(channel="output", text="persisted"))
+    writer.push(ModelStreamDelta(channel="output", text=" buffered tail"))
+    _write_events(child_dir, child_run_id, [("model.turn.started", turn_id)])
+    try:
+        assert read_model_content(child_dir).snapshots[0].output_text == "persisted"
+
+        payload = studio.model_content_snapshot(root_run_id)
+        snapshot = next(item for item in payload["streams"] if item["run_id"] == child_run_id)
+
+        assert snapshot["status"] == "running"
+        assert snapshot["output_text"] == "persisted buffered tail"
+        assert snapshot["output_end_offset"] == len("persisted buffered tail".encode("utf-8"))
+    finally:
+        store.close()
+
+
+def test_studio_model_content_retries_an_unsettled_stream_closed_during_read(
+    studio: StudioServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_run_id = studio.start_chat("close during reset hydration")["run_id"]
+    assert _wait_settled(studio, root_run_id, 1)
+    assert studio._backend is not None
+    child_run_id = f"{root_run_id}.sub.closing"
+    child_dir = studio._backend.run_root / child_run_id
+    child_dir.mkdir()
+    store = ModelContentStore(child_dir / "model-content.jsonl", run_id=child_run_id)
+    turn_id = "turn_closing"
+    writer = store.open(
+        ModelStreamContext(
+            run_id=child_run_id,
+            root_run_id=root_run_id,
+            turn_id=turn_id,
+            stream_id="stream-closing",
+            step=1,
+            provider="test",
+            model="test-model",
+            started_at="2026-08-01T00:00:00Z",
+        )
+    )
+    writer.push(ModelStreamDelta(channel="output", text="prefix before close"))
+    _write_events(child_dir, child_run_id, [("model.turn.started", turn_id)])
+
+    from monoid_agent_kernel.reference.studio import server as server_module
+
+    original_read = server_module.read_model_content
+    closed = False
+
+    def close_after_read(path: Path, **kwargs):  # noqa: ANN003, ANN202
+        nonlocal closed
+        result = original_read(path, **kwargs)
+        if Path(path).name == child_run_id and not closed:
+            closed = True
+            writer.close(
+                ModelStreamOutcome(
+                    status="interrupted",
+                    final_text="prefix before close",
+                )
+            )
+        return result
+
+    monkeypatch.setattr(server_module, "read_model_content", close_after_read)
+    try:
+        with pytest.raises(
+            NativeAgentError,
+            match="model content snapshot is temporarily unavailable",
+        ) as exc_info:
+            studio.model_content_snapshot(root_run_id)
+        assert exc_info.value.error_code == "model_content_unavailable"
+    finally:
+        store.close()
+
+
+def test_studio_model_content_retries_an_unsettled_stream_opened_during_read(
+    studio: StudioServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_run_id = studio.start_chat("open during reset hydration")["run_id"]
+    assert _wait_settled(studio, root_run_id, 1)
+    assert studio._backend is not None
+    child_run_id = f"{root_run_id}.sub.opening"
+    child_dir = studio._backend.run_root / child_run_id
+    child_dir.mkdir()
+    _write_model_content_snapshot(
+        child_dir,
+        root_run_id=root_run_id,
+        run_id=child_run_id,
+        stream_id="stream-history",
+        output="settled history",
+        step=1,
+    )
+    turn_id = "turn_opening"
+    _write_events(child_dir, child_run_id, [("model.turn.started", turn_id)])
+
+    from monoid_agent_kernel.reference.studio import server as server_module
+
+    original_read = server_module.read_model_content
+    opened_store: ModelContentStore | None = None
+
+    def open_before_read(path: Path, **kwargs):  # noqa: ANN003, ANN202
+        nonlocal opened_store
+        if Path(path).name == child_run_id and opened_store is None:
+            opened_store = ModelContentStore(
+                child_dir / "model-content.jsonl",
+                run_id=child_run_id,
+            )
+            writer = opened_store.open(
+                ModelStreamContext(
+                    run_id=child_run_id,
+                    root_run_id=root_run_id,
+                    turn_id=turn_id,
+                    stream_id="stream-opening",
+                    step=2,
+                    provider="test",
+                    model="test-model",
+                    started_at="2026-08-01T00:00:01Z",
+                )
+            )
+            writer.push(ModelStreamDelta(channel="output", text="new live prefix"))
+        return original_read(path, **kwargs)
+
+    monkeypatch.setattr(server_module, "read_model_content", open_before_read)
+    try:
+        with pytest.raises(
+            NativeAgentError,
+            match="model content snapshot is temporarily unavailable",
+        ) as exc_info:
+            studio.model_content_snapshot(root_run_id)
+        assert exc_info.value.error_code == "model_content_unavailable"
+    finally:
+        if opened_store is not None:
+            opened_store.close()
+
+
+def test_studio_model_content_retries_a_complete_open_close_aba_during_read(
+    studio: StudioServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_run_id = studio.start_chat("ABA during reset hydration")["run_id"]
+    assert _wait_settled(studio, root_run_id, 1)
+    assert studio._backend is not None
+    child_run_id = f"{root_run_id}.sub.aba"
+    child_dir = studio._backend.run_root / child_run_id
+    child_dir.mkdir()
+    _write_model_content_snapshot(
+        child_dir,
+        root_run_id=root_run_id,
+        run_id=child_run_id,
+        stream_id="stream-history",
+        output="settled history",
+        step=1,
+    )
+    turn_id = "turn_aba"
+    _write_events(child_dir, child_run_id, [("model.turn.started", turn_id)])
+
+    from monoid_agent_kernel.reference.studio import server as server_module
+
+    original_read = server_module.read_model_content
+    churned = False
+
+    def churn_during_read(path: Path, **kwargs):  # noqa: ANN003, ANN202
+        nonlocal churned
+        if Path(path).name != child_run_id or churned:
+            return original_read(path, **kwargs)
+        churned = True
+        store = ModelContentStore(child_dir / "model-content.jsonl", run_id=child_run_id)
+        writer = store.open(
+            ModelStreamContext(
+                run_id=child_run_id,
+                root_run_id=root_run_id,
+                turn_id=turn_id,
+                stream_id="stream-aba",
+                step=2,
+                provider="test",
+                model="test-model",
+                started_at="2026-08-01T00:00:01Z",
+            )
+        )
+        writer.push(ModelStreamDelta(channel="output", text="short-lived live prefix"))
+        result = original_read(path, **kwargs)
+        writer.close(
+            ModelStreamOutcome(
+                status="completed",
+                final_text="short-lived live prefix",
+            )
+        )
+        store.close()
+        return result
+
+    monkeypatch.setattr(server_module, "read_model_content", churn_during_read)
+    with pytest.raises(
+        NativeAgentError,
+        match="model content snapshot is temporarily unavailable",
+    ) as exc_info:
+        studio.model_content_snapshot(root_run_id)
+
+    assert exc_info.value.error_code == "model_content_unavailable"
+    assert churned
+
+
+def test_studio_model_content_flush_failure_returns_service_unavailable(
+    studio: StudioServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_run_id = studio.start_chat("failed reset hydration")["run_id"]
+    assert _wait_settled(studio, root_run_id, 1)
+
+    def fail_flush(_path: Path) -> int:
+        raise OSError("simulated private sidecar failure")
+
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.server.flush_active_model_content",
+        fail_flush,
+    )
+    query = urlencode({"run_id": root_run_id})
+
+    with pytest.raises(HTTPError) as exc_info:
+        urlopen(f"{studio.base_url}/api/model-content?{query}", timeout=5)
+
+    assert exc_info.value.code == 503
+    assert exc_info.value.headers["Content-Type"].startswith("application/json")
+    payload = json.loads(exc_info.value.read().decode("utf-8"))
+    assert payload == {"error": "model content snapshot is temporarily unavailable"}
+
+
+def test_studio_model_content_rejects_replaced_active_sidecar_with_service_unavailable(
+    studio: StudioServer,
+) -> None:
+    root_run_id = studio.start_chat("replaced reset hydration")["run_id"]
+    assert _wait_settled(studio, root_run_id, 1)
+    assert studio._backend is not None
+    child_run_id = f"{root_run_id}.sub.replaced"
+    child_dir = studio._backend.run_root / child_run_id
+    child_dir.mkdir()
+    path = child_dir / "model-content.jsonl"
+    store = ModelContentStore(path, run_id=child_run_id, batch_interval_s=60.0)
+    turn_id = "turn_replaced"
+    writer = store.open(
+        ModelStreamContext(
+            run_id=child_run_id,
+            root_run_id=root_run_id,
+            turn_id=turn_id,
+            stream_id="stream-replaced",
+            step=1,
+            provider="test",
+            model="test-model",
+            started_at="2026-08-01T00:00:00Z",
+        )
+    )
+    writer.push(ModelStreamDelta(channel="output", text="persisted"))
+    writer.push(ModelStreamDelta(channel="output", text=" buffered tail"))
+    _write_events(child_dir, child_run_id, [("model.turn.started", turn_id)])
+    displaced = child_dir / "displaced-model-content.jsonl"
+    try:
+        path.replace(displaced)
+        path.write_text("replacement must remain untouched\n", encoding="utf-8")
+    except OSError as exc:
+        store.close()
+        pytest.skip(f"open-file replacement is unavailable: {exc}")
+
+    try:
+        query = urlencode({"run_id": root_run_id})
+        with pytest.raises(HTTPError) as exc_info:
+            urlopen(f"{studio.base_url}/api/model-content?{query}", timeout=5)
+
+        assert exc_info.value.code == 503
+        assert path.read_text(encoding="utf-8") == "replacement must remain untouched\n"
+    finally:
+        store.close()
+
+
+def test_studio_model_content_rejects_hardlinked_sidecar_with_service_unavailable(
+    studio: StudioServer,
+    tmp_path: Path,
+) -> None:
+    root_run_id = studio.start_chat("hardlinked reset hydration")["run_id"]
+    assert _wait_settled(studio, root_run_id, 1)
+    assert studio._backend is not None
+    child_run_id = f"{root_run_id}.sub.hardlinked"
+    child_dir = studio._backend.run_root / child_run_id
+    child_dir.mkdir()
+    outside_dir = tmp_path / "outside-hardlinked-sidecar"
+    outside_dir.mkdir()
+    _write_model_content_snapshot(
+        outside_dir,
+        root_run_id=root_run_id,
+        run_id=child_run_id,
+        stream_id="stream-hardlinked",
+        output="outside hardlinked content",
+    )
+    try:
+        (child_dir / "model-content.jsonl").hardlink_to(outside_dir / "model-content.jsonl")
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+    query = urlencode({"run_id": root_run_id})
+
+    with pytest.raises(HTTPError) as exc_info:
+        urlopen(f"{studio.base_url}/api/model-content?{query}", timeout=5)
+
+    assert exc_info.value.code == 503
+    assert exc_info.value.headers["Content-Type"].startswith("application/json")
+    assert "outside hardlinked content" not in exc_info.value.read().decode("utf-8")
+
+
+def test_studio_model_stream_denied_egress_returns_403_before_run_lookup(
+    tmp_path: Path,
+) -> None:
+    server = StudioServer(
+        StudioConfig(
+            workspace=tmp_path / "ws",
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+            stream_output_deltas=False,
+        )
+    )
+    server.start()
+    try:
+        for path in ("/api/model-stream", "/api/model-content"):
+            with pytest.raises(HTTPError) as exc_info:
+                urlopen(
+                    Request(
+                        f"{server.base_url}{path}?run_id=unknown-run",
+                        headers={"Accept": "text/event-stream"},
+                    ),
+                    timeout=5,
+                )
+            assert exc_info.value.code == 403
+            assert exc_info.value.headers["Content-Type"].startswith("application/json")
     finally:
         server.shutdown()
 
@@ -338,10 +1099,12 @@ def test_studio_renders_plan_updates(tmp_path: Path) -> None:
                 tool_calls=(
                     fake_tool_call(
                         "run_update_plan",
-                        {"items": [
-                            {"step": "Read the files", "status": "completed"},
-                            {"step": "Edit the code", "status": "in_progress"},
-                        ]},
+                        {
+                            "items": [
+                                {"step": "Read the files", "status": "completed"},
+                                {"step": "Edit the code", "status": "in_progress"},
+                            ]
+                        },
                         "c1",
                     ),
                 )
@@ -423,6 +1186,7 @@ def test_studio_sessions_lists_started_chats_newest_first(studio: StudioServer) 
     # each entry carries a live state (active multi-turn sessions are not terminal)
     by_id = {s["run_id"]: s for s in sessions}
     assert by_id[r1]["terminal"] is False
+    assert by_id[r1]["last_event_seq"] >= 1
     assert by_id[r1]["state"] == "awaiting_input"
 
 
@@ -439,10 +1203,16 @@ def test_studio_profiles_scope_session_history(studio: StudioServer) -> None:
 
     default_sessions = studio.sessions(profile_id="default")["sessions"]
     reviewer_sessions = studio.sessions(profile_id="reviewer")["sessions"]
+    all_sessions = studio.sessions()["sessions"]
 
     assert {s["run_id"] for s in default_sessions} == {default_run}
     assert {s["run_id"] for s in reviewer_sessions} == {reviewer_run}
     assert reviewer_sessions[0]["profile_id"] == "reviewer"
+    reviewer_summary = next(
+        session for session in all_sessions if session["run_id"] == reviewer_run
+    )
+    assert reviewer_summary["profile_id"] == "reviewer"
+    assert reviewer_summary["last_event_seq"] >= 1
 
 
 def test_studio_profile_preview_resolves_model_request_surface(studio: StudioServer) -> None:
@@ -463,7 +1233,14 @@ def test_studio_profile_preview_resolves_model_request_surface(studio: StudioSer
     assert preview["request_config"]["model"] == "gpt-preview"
     assert preview["request_config"]["reasoning"] == {"effort": "high", "summary": "off"}
     tool_names = {tool["name"] for tool in preview["tools"]}
-    assert {"run_update_plan", "fs_read", "fs_list", "fs_patch", "fs_delete", "agent_spawn"} <= tool_names
+    assert {
+        "run_update_plan",
+        "fs_read",
+        "fs_list",
+        "fs_patch",
+        "fs_delete",
+        "agent_spawn",
+    } <= tool_names
     assert "tool_surface" in preview
     assert preview["tool_surface"]["authorizations"]["fs.copy"]["decision"] == "ask"
     assert preview["tool_surface"]["authorizations"]["fs.move"]["decision"] == "ask"
@@ -507,7 +1284,11 @@ def test_studio_profile_history_survives_restart(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     run_root = tmp_path / "runs"
-    s1 = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root))
+    s1 = StudioServer(
+        StudioConfig(
+            workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root
+        )
+    )
     s1.start()
     try:
         rid = s1.start_chat("remember reviewer", profile_id="reviewer")["run_id"]
@@ -515,13 +1296,21 @@ def test_studio_profile_history_survives_restart(tmp_path: Path) -> None:
     finally:
         s1.shutdown()
 
-    s2 = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root))
+    s2 = StudioServer(
+        StudioConfig(
+            workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root
+        )
+    )
     s2.start()
     try:
         reviewer_sessions = s2.sessions(profile_id="reviewer")["sessions"]
         default_sessions = s2.sessions(profile_id="default")["sessions"]
+        all_sessions = s2.sessions()["sessions"]
         assert any(x["run_id"] == rid and x["profile_id"] == "reviewer" for x in reviewer_sessions)
         assert all(x["run_id"] != rid for x in default_sessions)
+        restarted_summary = next(session for session in all_sessions if session["run_id"] == rid)
+        assert restarted_summary["profile_id"] == "reviewer"
+        assert restarted_summary["last_event_seq"] >= 1
     finally:
         s2.shutdown()
 
@@ -557,7 +1346,11 @@ def test_studio_history_survives_restart(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     run_root = tmp_path / "runs"
-    s1 = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root))
+    s1 = StudioServer(
+        StudioConfig(
+            workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root
+        )
+    )
     s1.start()
     try:
         rid = s1.start_chat("remember me")["run_id"]
@@ -565,7 +1358,11 @@ def test_studio_history_survives_restart(tmp_path: Path) -> None:
     finally:
         s1.shutdown()
     # A fresh studio over the same run_root == a restart (no in-memory records/tokens).
-    s2 = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root))
+    s2 = StudioServer(
+        StudioConfig(
+            workspace=workspace, host="127.0.0.1", port=0, provider="offline", run_root=run_root
+        )
+    )
     s2.start()
     try:
         sessions = s2.sessions()["sessions"]
@@ -620,7 +1417,12 @@ def test_studio_followup_user_timestamp_precedes_fast_reply(studio: StudioServer
     users = [message for message in messages if message["role"] == "user"]
     assistants = [message for message in messages if message["role"] == "assistant"]
 
-    assert [message["role"] for message in messages[:4]] == ["user", "assistant", "user", "assistant"]
+    assert [message["role"] for message in messages[:4]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
     assert users[1]["created_at"] <= assistants[1]["created_at"]
 
 
@@ -657,9 +1459,7 @@ def test_studio_sse_uses_event_ids_and_last_event_id_resume(studio: StudioServer
         with urlopen(request, timeout=10) as response:
             body = response.read().decode("utf-8")
         ids = [
-            int(line.removeprefix("id: "))
-            for line in body.splitlines()
-            if line.startswith("id: ")
+            int(line.removeprefix("id: ")) for line in body.splitlines() if line.startswith("id: ")
         ]
         return ids, body
 
@@ -697,7 +1497,9 @@ def test_a2a_demo_preset_wires_two_peers(studio: StudioServer) -> None:
 def test_studio_a2a_delivery_preserves_external_agent_metadata(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    server = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"))
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs")
+    )
     captured: dict[str, object] = {}
 
     class BackendStub:

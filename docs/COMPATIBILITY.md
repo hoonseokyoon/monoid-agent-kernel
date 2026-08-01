@@ -44,6 +44,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `external-agent-envelope` | wire | `monoid.external-agent-envelope.v1` | strict | `monoid.external-agent-envelope.v1`<br>`native-agent-runner.external-agent-envelope.v1` |
 | `llm-turn` | wire | `monoid.llm-turn.v1` | strict | `monoid.llm-turn.v1`<br>`native-agent-runner.llm-turn.v1` |
 | `llm-turn-result` | wire | `monoid.llm-turn-result.v1` | permissive; missing id accepted | `monoid.llm-turn-result.v1`<br>`native-agent-runner.llm-turn-result.v1` |
+| `model-stream-live` | wire | `monoid.model-stream.live.v1` | strict | `monoid.model-stream.live.v1` |
 | `web-search` | wire | `monoid.web-search.v1` | permissive; missing id accepted | `monoid.web-search.v1`<br>`native-agent-runner.web-search.v1` |
 | `web-search-result` | wire | `monoid.web-search-result.v1` | permissive; missing id accepted | `monoid.web-search-result.v1`<br>`native-agent-runner.web-search-result.v1` |
 | `web-fetch` | wire | `monoid.web-fetch.v1` | permissive; missing id accepted | `monoid.web-fetch.v1`<br>`native-agent-runner.web-fetch.v1` |
@@ -73,6 +74,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `conformance-fixtures` | reference | `monoid.conformance-fixtures.v1` | strict | `monoid.conformance-fixtures.v1` |
 | `studio-chat` | reference | `studio.chat.v2` | strict | `studio.chat.v1`<br>`studio.chat.v2` |
 | `studio-chat-message` | reference | `studio.chat.message.v1` | permissive; missing id accepted | `studio.chat.message.v1` |
+| `studio-model-content` | reference | `studio.model-content.v1` | strict | `studio.model-content.v1` |
 <!-- compatibility-registry:end -->
 
 The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in

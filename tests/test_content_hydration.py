@@ -18,6 +18,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from support.backend_harness import (
     BackendRunRequest,
     RunnerBackend,
@@ -97,6 +99,40 @@ def test_absent_text_is_filled_from_the_model_content_sidecar(tmp_path: Path) ->
     hydrate_settled_text(events, tmp_path)
 
     assert events[0]["data"]["final_text"] == "the sidecar answer"
+
+
+def test_model_content_hydration_rejects_a_planted_file_symlink(tmp_path: Path) -> None:
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    digest = _write_model_content_record(outside_dir, "outside private answer")
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    try:
+        (run_dir / "model-content.jsonl").symlink_to(outside_dir / "model-content.jsonl")
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, run_dir)
+
+    assert "final_text" not in events[0]["data"]
+
+
+def test_model_content_hydration_rejects_a_planted_hardlink(tmp_path: Path) -> None:
+    outside_dir = tmp_path / "outside-hardlink"
+    outside_dir.mkdir()
+    digest = _write_model_content_record(outside_dir, "outside hardlinked answer")
+    run_dir = tmp_path / "run-hardlink"
+    run_dir.mkdir()
+    try:
+        (run_dir / "model-content.jsonl").hardlink_to(outside_dir / "model-content.jsonl")
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, run_dir)
+
+    assert "final_text" not in events[0]["data"]
 
 
 def test_invalid_sidecar_version_falls_back_to_the_transcript(tmp_path: Path) -> None:
