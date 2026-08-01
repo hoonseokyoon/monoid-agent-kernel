@@ -11,10 +11,12 @@ claim that the shipped defaults contradict.
 
 ## Outputs
 
-Each run writes:
+The run-directory artifact set is:
 
 - `events.jsonl`: public redacted event stream
 - `transcript.jsonl`: private debug/replay transcript with full tool payloads
+- `model-content.jsonl`: optional private model-stream sidecar with output/reasoning segments and
+  settled text (`monoid.model-content.v1`)
 - `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`)
 - `metrics.json`: final counters and timing
 - `manifest.json`: run contract, agent config metadata, binding-aware tool surface, workspace backend
@@ -55,10 +57,10 @@ here is what a redacting sink, an OTel exporter, and `monoid watch --json` all s
 Not carried:
 
 - **Model-authored settled text.** `turn.settled` and `run.finished` carry `final_text_digest` and
-  `final_text_len`. Entitled readers join the text back from `transcript.jsonl`; the run result
-  itself is unaffected. Kernel-authored text (for example `Stopped after reaching max steps.`) stays
-  inline, because digesting it would cost an operator the line explaining why a run stopped and buy
-  no privacy.
+  `final_text_len`. Entitled readers join the text from `model-content.jsonl` and fall back to
+  `transcript.jsonl` for old or partially written runs; the run result itself is unaffected.
+  Kernel-authored text (for example `Stopped after reaching max steps.`) stays inline, because
+  digesting it would cost an operator the line explaining why a run stopped and buy no privacy.
 - **File contents** in tool arguments and results (`content`, `old`, `new`, `old_text`, `new_text`)
   — **on the trace surface**. The approval surface deliberately shows them, bounded; see "Carried,
   deliberately" below. This list said "file contents" unqualified while the entry 45 lines down said
@@ -67,34 +69,22 @@ Not carried:
   reaches a preview builder: those are capped by a **byte** budget, so the cap does not depend on
   the script the text is written in. Several routes bypass the builders entirely and are listed
   under "Carried, deliberately" below — read that list rather than counting exceptions here. An
-  earlier revision of this line said "three exceptions" and was wrong twice over: it omitted
-  `model.output.delta`, which the very next section describes as carrying raw model text, and
-  `task.started.data.choices`.
+  Legacy raw delta events and the other explicit routes appear under "Carried, deliberately"
+  below.
 
 Carried, deliberately:
 
-- **`model.output.delta` and `model.reasoning.delta` carry raw model text**, and Studio enables them
-  whenever the optional `httpx` extra is installed. These are durable events, not a live-only side
-  channel, so the assembled answer is reconstructible from the file. **Do not use a grep for a known
-  string to decide whether the answer is present**: the text is split at whatever boundaries the
-  provider streamed, so a substring search finds it when the answer happened to arrive in one chunk
-  and misses it when it did not. Absence of a grep hit is not absence of the content — concatenate
-  `data.text` across the run's `model.output.delta` records instead. Disable with
-  `MONOID_OUTPUT_DELTAS=0` (whole deployment, subagents included),
-  `monoid studio serve --no-output-deltas` (the flag sits on the `serve` / `app` / `doctor`
-  subcommands, not on the `studio` group), or `StudioConfig(stream_output_deltas=False)`. The
-  completed answer still arrives. Two things do change, and the second is easy to be surprised by:
-  live token rendering stops, and **mid-turn interruption becomes step-boundary interruption** —
-  Stop waits for the in-flight model call to finish rather than aborting within a token. That
-  coupling is not new and is not the switch's doing: the kernel only takes the streaming path when
-  something is consuming deltas, and `emit_output_deltas` is `False` by default, so turning this off
-  returns you to the kernel's own default rather than degrading past it. Studio turns it on, which
-  is why the difference is visible there. The
-  reason is not obvious from the emit site, so: `turn.settled` carries only `final_text_digest` on
-  the durable stream either way, and `RunProjectionService.events` refills `final_text` from
-  `transcript.jsonl` (`backend/content_hydration.py`) before the event reaches a reader. The Studio
-  UI polls that projection, not `events.jsonl`, so its reducer still gets the text. `AgentLoop.astream`
-  is unaffected, since it takes a different path.
+- **Legacy `model.output.delta` and `model.reasoning.delta` events carry raw model text** when an
+  integrating application explicitly sets `AgentLoop.emit_output_deltas=True`. These remain a
+  compatibility surface for existing durable-event consumers. Provider chunk boundaries are
+  arbitrary; reconstruct output by concatenating `data.text` in sequence order. The operator
+  switch `MONOID_OUTPUT_DELTAS=0` disables this durable mirror for the root run and its subagents.
+  A live presentation can use the model-stream observer channel and leave the durable mirror
+  disabled. `AgentLoop.stream_model_calls=True` keeps provider streaming and token-boundary Stop
+  behavior active without writing raw deltas into `events.jsonl`. `turn.settled` still carries only
+  a digest, and `RunProjectionService.events` refills the text from `model-content.jsonl`, then
+  `transcript.jsonl`, before an entitled reader receives it. `AgentLoop.astream` keeps its separate
+  execution-owning stream contract.
 - **Bounded previews of tool arguments** (`args_preview`, `arguments_preview`), including a preview
   of paths, commands, plan steps and artifact metadata.
 - **Secret-named argument values, on the ordinary tool-call path.** The core does *not* guess at
@@ -130,9 +120,9 @@ Carried, deliberately:
 - **A subagent's answer** on `task.finished`.
 - **Hosted-task prompts** (`task.started.data.prompt`) — the model-authored delegation brief or HITL
   question, **uncapped**. Model-authored prose on a public surface, neither previewed nor digested.
-  It is not the only such route on this list: `model.output.delta` carries raw model text by
-  construction, and an error message passes through `public_error_message`, which substitutes only
-  when the text contains `PRIVATE KEY` and otherwise returns it whole.
+  Legacy `model.output.delta` carries raw model text when explicitly enabled, and an error message
+  passes through `public_error_message`, which substitutes only when the text contains `PRIVATE KEY`
+  and otherwise returns it whole.
 - **The model-chosen `call_id`**, uncapped because it is a join key, not prose: `events.jsonl`,
   `task.json` and `approval_key` are matched on it, so a shortened copy would fail to correlate.
 - **Hosted-task `choices`** (`task.started.data.choices`) — the options a HITL card offers, uncapped
@@ -143,25 +133,27 @@ Carried, deliberately:
 Studio adds `studio.chat.jsonl` inside each Studio run directory as the browser-facing chat
 projection. The Studio UI restores user, assistant, and error messages from
 `/api/chat-transcript`, then replays `events.jsonl` for trace and activity panels.
-`transcript.jsonl` remains the private model-call log.
+`transcript.jsonl` remains the private model-call log. `model-content.jsonl` is the private streamed
+content and settled-text sidecar.
 
 The `/api/chat-transcript` response is `studio.chat.v2`. It requires `event_log_error`, which is
 empty after a complete read and carries the failure reason when Studio returns only the committed
 prefix of a corrupt `events.jsonl`. This member is the wire-format change from v1.
 
 **`studio.chat.jsonl` carries whole model answers and whole user prompts**, and is content-bearing
-and served over HTTP. It is not the only one: `RunProjectionService.events` hydrates `final_text`
-out of `transcript.jsonl` before returning an events page, and `diagnostics()` returns the whole
+and served over HTTP. Other content-bearing routes include `RunProjectionService.events`, which
+hydrates `final_text` from `model-content.jsonl` with a `transcript.jsonl` fallback before returning
+an events page, and `diagnostics()`, which returns the whole
 `failure.json` — both behind a run token, which `studio.chat.jsonl`'s route is not. It has to be: a chat UI
-that cannot re-render the conversation is not a chat UI, and the text is joined back out of
-`transcript.jsonl` by the same hydration seam the projection uses. Three consequences worth stating
+that cannot re-render the conversation is not a chat UI, and the text is joined from
+`model-content.jsonl` with a legacy `transcript.jsonl` fallback by the same hydration seam the
+projection uses. Three consequences worth stating
 rather than leaving to be discovered:
 
-- It is **not** covered by `MONOID_OUTPUT_DELTAS=0`. That switch stops model text reaching
-  `events.jsonl`; with it engaged, the assembled answer still lands here. The switch bounds the
-  *durable event stream*, not the run directory.
+- `MONOID_OUTPUT_DELTAS=0` governs the legacy delta mirror in `events.jsonl`. The assembled answer
+  still lands here because private run-directory content has its own retention path.
 - The read path **writes**. Deleting the file and requesting `/api/chat-transcript` regenerates it
-  from `transcript.jsonl`, so removing it does not remove the content.
+  from the private content artifacts, so removing it does not remove the content.
 - Treat it as **private by location**, like `artifacts/tasks/<id>/task.json` — with the difference
   that Studio serves it, so "do not expose the run directory" is not by itself sufficient. Studio is
   reference code and binds `127.0.0.1` by default; a deployment that fronts it needs to gate this
@@ -270,7 +262,8 @@ Monoid-specific capture shape; the preset does not claim the exact OpenTelemetry
 `gen_ai.system_instructions` / `gen_ai.input.messages` / `gen_ai.output.messages` content schema.
 Treat those two modes as content-bearing exports and configure collector access and retention
 accordingly. Capture never changes `events.jsonl`, and raw delta events are not mirrored into span
-attributes.
+attributes. Model-stream observers are a separate live/private content channel and do not add
+content to OTel spans unless an integrating observer explicitly exports it.
 
 Fresh sinks created for a restored activation lazily open `invoke_agent` on the first child event,
 because recovery does not replay `run.started`. Model receipts then update the runtime provider and
@@ -290,13 +283,24 @@ span tree to the console (via a local `ConsoleSpanExporter`, no collector) for a
 
 ## Live streaming
 
-Beyond the durable event sinks, `AgentLoop.astream(user_input)` returns a
-`RunStream` — an async context manager + iterator that yields `AgentEvent` (orchestration)
-interleaved with `ModelStreamChunk` (token deltas: `TextDelta` / `ReasoningDelta` /
-`ToolCallDelta` / `TurnComplete`) when the adapter exposes `astream_turn`. Read `stream.result`
-after the stream drains. Gateway token streaming uses Server-Sent Events and needs the
-`[http-async]` extra. Studio uses complete one-shot gateway turns when that extra is absent and
-enables live token deltas when it is installed.
+`AgentLoop.astream(user_input)` is the execution-owning stream API. It returns a `RunStream`, an
+async context manager and iterator that yields orchestration `AgentEvent` values interleaved with
+every provider `ModelStreamChunk` variant (`TextDelta`, `ReasoningDelta`, `ToolCallDelta`, and
+`TurnComplete`). Read `stream.result` after the stream drains.
+
+Autonomous runs use `AgentLoop.stream_model_calls=True` to select provider streaming independently
+from egress. `model_stream_observer_factories` creates passive observers for live presentation or
+private persistence. Each observer receives output/reasoning fragments and a terminal outcome for
+one provider call; tool-call fragments remain inside model-turn assembly. A fresh observer is
+created for every activation and subagent, and observer failures remain isolated from the model
+call. `model_content_file=True` adds a writer owned by the run recorder and persists
+`stream_opened`, `stream_segment`, `stream_closed`, and `settled_text` records to the optional
+private `model-content.jsonl` sidecar.
+
+Gateway token streaming uses Server-Sent Events and needs the `[http-async]` extra. A presentation
+layer can connect its chat UI to the live observer channel while `events.jsonl` retains
+operation-level events. A reconnect hydrates completed content from the sidecar; retained v0.20 and
+older runs use the transcript fallback.
 
 Durable event subscriptions use `EventSubscription` over the append-only `events.jsonl` sequence.
 They support page polling and SSE, sequence IDs, `Last-Event-ID` reconnects, heartbeat comments,

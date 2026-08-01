@@ -29,6 +29,7 @@ from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION
 from monoid_agent_kernel.core.external_agent_envelope import EXTERNAL_AGENT_ENVELOPE_VERSION
 from monoid_agent_kernel.core.inbox import INBOX_PROTOCOL_VERSION
 from monoid_agent_kernel.core.manifest import MANIFEST_SCHEMA_VERSION
+from monoid_agent_kernel.core.model_content import MODEL_CONTENT_SCHEMA_VERSION
 from monoid_agent_kernel.core.outbox import OUTBOX_REQUEST_VERSION
 from monoid_agent_kernel.core.packages import (
     APPLY_RESULT_SCHEMA_VERSION,
@@ -41,6 +42,7 @@ from monoid_agent_kernel.core.schemas import (
     EVENT_SCHEMA,
     JOB_SCHEMA,
     MANIFEST_SCHEMA,
+    MODEL_CONTENT_RECORD_SCHEMA,
     PACKAGE_SCHEMA,
     PUBLIC_JOB_SCHEMA,
     PUBLIC_JOB_SCHEMA_VERSION,
@@ -82,7 +84,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 36
+    assert len(artifacts) == 37
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -117,6 +119,7 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "checkpoint": CHECKPOINT_SCHEMA_VERSION,
         "backend-run": RUN_METADATA_SCHEMA_VERSION,
         "event": EVENT_SCHEMA_VERSION,
+        "model-content": MODEL_CONTENT_SCHEMA_VERSION,
         "manifest": MANIFEST_SCHEMA_VERSION,
         "workspace-base": WORKSPACE_BASE_SCHEMA_VERSION,
         "workspace-index": WORKSPACE_INDEX_SCHEMA_VERSION,
@@ -182,6 +185,13 @@ def test_json_schema_reader_versions_match_registry() -> None:
         assert registered.reader_policy == "json-schema"
         assert tuple(schema["properties"]["schema_version"]["enum"]) == registered.supported_readers
 
+    model_content = compatibility_artifact("model-content")
+    assert model_content.reader_policy == "json-schema"
+    assert {
+        tuple(variant["properties"]["schema_version"]["enum"])
+        for variant in MODEL_CONTENT_RECORD_SCHEMA["oneOf"]
+    } == {model_content.supported_readers}
+
 
 def test_registry_source_locations_exist() -> None:
     for artifact in PUBLIC_ARTIFACT_COMPATIBILITY:
@@ -227,7 +237,8 @@ def test_documented_ledger_rows_match_registry_in_order() -> None:
         (
             artifact.key,
             artifact.current_writer,
-            artifact.reader_policy + ("; missing id accepted" if artifact.accepts_missing_version else ""),
+            artifact.reader_policy
+            + ("; missing id accepted" if artifact.accepts_missing_version else ""),
         )
         for artifact in PUBLIC_ARTIFACT_COMPATIBILITY
     ]
