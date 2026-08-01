@@ -7,6 +7,8 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-01
+
 ### Fixed — Studio plan truncation is visible (gap 9)
 
 - Studio now preserves `plan.updated.truncated_items` in its run state. The Workspace inspector
