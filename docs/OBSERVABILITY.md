@@ -84,7 +84,7 @@ Carried, deliberately:
   behavior active without writing raw deltas into `events.jsonl`. `turn.settled` still carries only
   a digest, and `RunProjectionService.events` refills the text from `model-content.jsonl`, then
   `transcript.jsonl`, before an entitled reader receives it. `AgentLoop.astream` keeps its separate
-  execution-owning stream contract.
+  execution-owning stream contract and suppresses the legacy durable mirror for its live call.
 - **Bounded previews of tool arguments** (`args_preview`, `arguments_preview`), including a preview
   of paths, commands, plan steps and artifact metadata.
 - **Secret-named argument values, on the ordinary tool-call path.** The core does *not* guess at

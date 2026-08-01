@@ -7,6 +7,7 @@ from pathlib import Path
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
+from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
     ModelStreamDelta,
@@ -477,6 +478,7 @@ def test_run_stream_and_passive_observer_receive_their_distinct_chunk_sets(
     tmp_path: Path,
 ) -> None:
     observer = _RecordingObserver()
+    sink = MemoryEventSink()
     tool_delta = ToolCallDelta(
         index=0,
         id="finish-1",
@@ -491,7 +493,13 @@ def test_run_stream_and_passive_observer_receive_their_distinct_chunk_sets(
             TurnComplete(response_id="r1"),
         ]
     )
-    loop = _loop(tmp_path, adapter, observer_factories=(lambda: observer,))
+    loop = _loop(
+        tmp_path,
+        adapter,
+        observer_factories=(lambda: observer,),
+        event_sink=sink,
+        emit_output_deltas=True,
+    )
 
     async def drive() -> tuple[list[object], object, object]:
         await loop.aopen()
@@ -508,10 +516,16 @@ def test_run_stream_and_passive_observer_receive_their_distinct_chunk_sets(
 
     assert suspension is None
     assert result.status == "completed"
-    assert ReasoningDelta("thinking") in items
-    assert TextDelta("visible") in items
+    assert [item for item in items if isinstance(item, ReasoningDelta)] == [
+        ReasoningDelta("thinking")
+    ]
+    assert [item for item in items if isinstance(item, TextDelta)] == [TextDelta("visible")]
     assert tool_delta in items
     assert any(isinstance(item, TurnComplete) for item in items)
+    assert not [event for event in sink.events if event.type.endswith(".delta")]
+    assert not [
+        item for item in items if isinstance(item, AgentEvent) and item.type.endswith(".delta")
+    ]
     assert observer.writers[0].deltas == [
         ModelStreamDelta(channel="reasoning", text="thinking"),
         ModelStreamDelta(channel="output", text="visible"),

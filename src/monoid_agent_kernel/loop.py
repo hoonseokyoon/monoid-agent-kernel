@@ -1938,9 +1938,13 @@ class AgentLoop:
         recorder = session.res.recorder if session is not None else None
         observers = session.res.model_stream_observers if session is not None else ()
         wants_content_stream = self.model_content_file or bool(observers)
+        # RunStream has always taken precedence over the legacy durable mirror: its raw chunks are
+        # the execution owner's live content channel. Mirroring the same token through EventBus
+        # would both persist it and enqueue a second representation on that very RunStream.
+        durable_delta_mirror = self.emit_output_deltas and not stream_sink_active
         wants_stream = (
             stream_sink_active
-            or self.emit_output_deltas
+            or durable_delta_mirror
             or self.stream_model_calls
             or wants_content_stream
         )
@@ -1990,7 +1994,7 @@ class AgentLoop:
 
                 stream_delta: ModelStreamDelta | None = None
                 if isinstance(chunk, TextDelta) and chunk.text:
-                    if self.emit_output_deltas and recorder is not None:
+                    if durable_delta_mirror and recorder is not None:
                         recorder.emit(
                             "model.output.delta", data={"text": chunk.text}, level="debug"
                         )
@@ -1998,7 +2002,7 @@ class AgentLoop:
                         output_fragments.append(chunk.text)
                         stream_delta = ModelStreamDelta(channel="output", text=chunk.text)
                 elif isinstance(chunk, ReasoningDelta) and chunk.text:
-                    if self.emit_output_deltas and recorder is not None:
+                    if durable_delta_mirror and recorder is not None:
                         # Display-only reasoning summary (DX-13b): a separate event so a consumer
                         # renders it in a "thinking" view, distinct from the answer text.
                         recorder.emit(

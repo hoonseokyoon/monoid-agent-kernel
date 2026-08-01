@@ -368,7 +368,8 @@ call's result. `safe_open_model_stream` applies the same failure shield to custo
 This keeps token-boundary interruption responsive while durable events remain compact.
 `emit_output_deltas=True` preserves the legacy opt-in behavior that writes raw
 `model.output.delta` and `model.reasoning.delta` events. `AgentLoop.astream` keeps its existing
-execution-owning stream contract and continues to expose all `ModelStreamChunk` variants.
+execution-owning stream contract, continues to expose all `ModelStreamChunk` variants, and takes
+precedence over the legacy durable mirror for that call.
 
 `AgentLoop.model_content_file=True` writes the optional private `model-content.jsonl` sidecar.
 Records use `monoid.model-content.v1` and the kinds `stream_opened`, `stream_segment`,
